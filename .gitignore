@@ -1,0 +1,140 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# Compiled object files
+*.o
+*.obj
+*.lo
+*.slo
+*.ko
+*.elf
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Compiled dynamic libraries
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Compiled static libraries
+*.a
+*.la
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Test executables
+test_address
+test_art
+test_bytes
+test_evm_memory
+test_evm_stack
+test_fork
+test_gas
+test_hash
+test_logger
+test_memory_gas
+test_mpt
+test_mpt_determinism
+test_mpt_vectors
+test_rlp
+test_stack_memory_helpers
+test_state_cache
+test_state_db
+test_state_journal
+test_interpreter
+test_opcodes_*
+test_runner_batch
+test_debug
+test_iter_debug
+test_stress
+benchmark_hash
+example_fork_usage
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+Testing/
+*.cmake
+!CMakeLists.txt
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel module compile results
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python files (from tools)
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+*.db
+*.sst
+MANIFEST-*
+CURRENT
+LOCK
+LOG*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Archive directory
+__archive/
+
+# Temporary test fixtures
+integration_tests/fixture_01/
+integration_tests/fixture_02/
+
+# Root directory test/benchmark files
+/*.c
+
+# Core dumps
+core
+core.*
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
