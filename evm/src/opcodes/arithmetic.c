@@ -153,8 +153,8 @@ evm_status_t op_div(evm_t *evm)
 
     // Pop two operands
     uint256_t a, b;
-    evm_stack_pop(evm->stack, &b);
-    evm_stack_pop(evm->stack, &a);
+    evm_stack_pop(evm->stack, &a);  // First pop: dividend (top of stack)
+    evm_stack_pop(evm->stack, &b);  // Second pop: divisor
 
     // Compute a / b (or 0 if b == 0)
     uint256_t result;
@@ -201,8 +201,8 @@ evm_status_t op_sdiv(evm_t *evm)
 
     // Pop two operands
     uint256_t a, b;
-    evm_stack_pop(evm->stack, &b);
-    evm_stack_pop(evm->stack, &a);
+    evm_stack_pop(evm->stack, &a);  // First pop: dividend (top of stack)
+    evm_stack_pop(evm->stack, &b);  // Second pop: divisor
 
     // Compute a / b (signed, or 0 if b == 0)
     uint256_t result;
@@ -249,8 +249,8 @@ evm_status_t op_mod(evm_t *evm)
 
     // Pop two operands
     uint256_t a, b;
-    evm_stack_pop(evm->stack, &b);
-    evm_stack_pop(evm->stack, &a);
+    evm_stack_pop(evm->stack, &a);  // First pop: numerator (top of stack)
+    evm_stack_pop(evm->stack, &b);  // Second pop: modulus
 
     // Compute a % b (or 0 if b == 0)
     uint256_t result;
@@ -297,8 +297,8 @@ evm_status_t op_smod(evm_t *evm)
 
     // Pop two operands
     uint256_t a, b;
-    evm_stack_pop(evm->stack, &b);
-    evm_stack_pop(evm->stack, &a);
+    evm_stack_pop(evm->stack, &a);  // First pop: numerator (top of stack)
+    evm_stack_pop(evm->stack, &b);  // Second pop: modulus
 
     // Compute a % b (signed, or 0 if b == 0)
     uint256_t result;
@@ -345,9 +345,9 @@ evm_status_t op_addmod(evm_t *evm)
 
     // Pop three operands
     uint256_t a, b, n;
-    evm_stack_pop(evm->stack, &n);
-    evm_stack_pop(evm->stack, &b);
-    evm_stack_pop(evm->stack, &a);
+    evm_stack_pop(evm->stack, &a);  // First pop (top)
+    evm_stack_pop(evm->stack, &b);  // Second pop
+    evm_stack_pop(evm->stack, &n);  // Third pop: modulus
 
     // Compute (a + b) % N (or 0 if N == 0)
     uint256_t result;
@@ -394,11 +394,11 @@ evm_status_t op_mulmod(evm_t *evm)
 
     // Pop three operands
     uint256_t a, b, n;
-    evm_stack_pop(evm->stack, &n);
-    evm_stack_pop(evm->stack, &b);
-    evm_stack_pop(evm->stack, &a);
+    evm_stack_pop(evm->stack, &a);  // First pop (top)
+    evm_stack_pop(evm->stack, &b);  // Second pop
+    evm_stack_pop(evm->stack, &n);  // Third pop: modulus  // Third pop: modulus
 
-    // Compute (a * b) % N (or 0 if N == 0)
+    // Compute (a + b) % N (or 0 if N == 0)
     uint256_t result;
     if (uint256_is_zero(&n))
     {
@@ -437,8 +437,8 @@ evm_status_t op_exp(evm_t *evm)
 
     // Pop two operands
     uint256_t a, exponent;
-    evm_stack_pop(evm->stack, &exponent);
-    evm_stack_pop(evm->stack, &a);
+    evm_stack_pop(evm->stack, &a);         // First pop: base (top of stack)
+    evm_stack_pop(evm->stack, &exponent);  // Second pop: exponent
 
     // Calculate number of significant bytes in exponent
     uint8_t exponent_bytes = 0;
@@ -495,8 +495,8 @@ evm_status_t op_signextend(evm_t *evm)
 
     // Pop two operands
     uint256_t b, x;
-    evm_stack_pop(evm->stack, &x);
-    evm_stack_pop(evm->stack, &b);
+    evm_stack_pop(evm->stack, &b);  // First pop: byte position (top of stack)
+    evm_stack_pop(evm->stack, &x);  // Second pop: value to extend
 
     // Sign extend x from (b+1) bytes
     // Convert b to uint64 for byte number

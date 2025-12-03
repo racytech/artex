@@ -32,8 +32,7 @@ evm_status_t op_address(evm_t *evm)
 
     // Convert address to uint256 and push to stack
     uint256_t addr_value;
-    memset(&addr_value, 0, sizeof(uint256_t));
-    memcpy(&addr_value, &evm->msg.recipient, sizeof(address_t));
+    address_to_uint256(&evm->msg.recipient, &addr_value);
 
     if (!evm_stack_push(evm->stack, &addr_value))
     {
@@ -62,7 +61,7 @@ evm_status_t op_balance(evm_t *evm)
 
     // Convert uint256 to address (take lower 20 bytes)
     address_t addr;
-    memcpy(&addr, &addr_value, sizeof(address_t));
+    address_from_uint256(&addr_value, &addr);
 
     // TODO: Check if address is cold/warm and charge appropriate gas (GAS_SLOAD_COLD vs GAS_SLOAD_WARM)
     if (!evm_use_gas(evm, GAS_SLOAD_WARM))
@@ -103,8 +102,7 @@ evm_status_t op_origin(evm_t *evm)
 
     // Convert address to uint256 and push to stack
     uint256_t origin_value;
-    memset(&origin_value, 0, sizeof(uint256_t));
-    memcpy(&origin_value, &evm->tx.origin, sizeof(address_t));
+    address_to_uint256(&evm->tx.origin, &origin_value);
 
     if (!evm_stack_push(evm->stack, &origin_value))
     {
@@ -131,8 +129,7 @@ evm_status_t op_caller(evm_t *evm)
 
     // Convert address to uint256 and push to stack
     uint256_t caller_value;
-    memset(&caller_value, 0, sizeof(uint256_t));
-    memcpy(&caller_value, &evm->msg.caller, sizeof(address_t));
+    address_to_uint256(&evm->msg.caller, &caller_value);
 
     if (!evm_stack_push(evm->stack, &caller_value))
     {
@@ -194,16 +191,18 @@ evm_status_t op_calldataload(evm_t *evm)
     // Convert to uint64 (if offset is too large, we'll just get zeros)
     uint64_t offset = uint256_to_uint64(&offset_256);
 
-    // Load 32 bytes from calldata
-    uint256_t data;
-    memset(&data, 0, sizeof(uint256_t));
-
+    // Load 32 bytes from calldata (big-endian)
+    uint8_t data_bytes[32] = {0};
+    
     if (offset < evm->msg.input_size)
     {
         size_t available = evm->msg.input_size - offset;
         size_t to_copy = available < 32 ? available : 32;
-        memcpy(&data, evm->msg.input_data + offset, to_copy);
+        memcpy(data_bytes, evm->msg.input_data + offset, to_copy);
     }
+
+    // Convert bytes to uint256 (handles big-endian conversion)
+    uint256_t data = uint256_from_bytes(data_bytes, 32);
 
     if (!evm_stack_push(evm->stack, &data))
     {

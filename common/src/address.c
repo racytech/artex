@@ -84,3 +84,15 @@ void address_from_uint256(const void* uint256_ptr, address_t* out) {
     const uint8_t* bytes = (const uint8_t*)uint256_ptr;
     memcpy(out->bytes, bytes, ADDRESS_SIZE);
 }
+
+void address_to_uint256(const address_t* addr, void* uint256_ptr) {
+    if (!addr || !uint256_ptr) return;
+    
+    // Clear the uint256_t first (zero out all 32 bytes)
+    memset(uint256_ptr, 0, 32);
+    
+    // Copy address to lowest 20 bytes of uint256_t (right-aligned)
+    // In EVM, addresses are right-aligned when represented as 256-bit values
+    uint8_t* bytes = (uint8_t*)uint256_ptr;
+    memcpy(bytes, addr->bytes, ADDRESS_SIZE);
+}

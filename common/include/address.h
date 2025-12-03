@@ -42,6 +42,9 @@ void address_copy(address_t* dest, const address_t* src);
 // Convert uint256_t to address (takes lowest 20 bytes)
 void address_from_uint256(const void* uint256_ptr, address_t* out);
 
+// Convert address to uint256_t (right-aligned in 256 bits - address in lowest 20 bytes)
+void address_to_uint256(const address_t* addr, void* uint256_ptr);
+
 #ifdef __cplusplus
 }
 #endif

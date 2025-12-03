@@ -5,6 +5,7 @@
 #include "opcodes/block.h"
 #include "evm_stack.h"
 #include "uint256.h"
+#include "address.h"
 #include "gas.h"
 #include "hash.h"
 #include <string.h>
@@ -96,8 +97,7 @@ evm_status_t op_coinbase(evm_t *evm)
 
     // Convert address to uint256 and push to stack
     uint256_t coinbase;
-    memset(&coinbase, 0, sizeof(uint256_t));
-    memcpy(&coinbase, &evm->block.coinbase, sizeof(address_t));
+    address_to_uint256(&evm->block.coinbase, &coinbase);
 
     if (!evm_stack_push(evm->stack, &coinbase))
     {
