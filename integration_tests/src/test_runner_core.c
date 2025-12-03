@@ -3,10 +3,84 @@
  */
 
 #include "test_runner.h"
+#include "fork.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+//==============================================================================
+// Test Chain Configuration
+//==============================================================================
+
+/**
+ * Create a chain config for testing where all forks up to the specified fork
+ * are activated at block 0
+ */
+chain_config_t *create_test_chain_config(const char *fork_name) {
+    static chain_config_t test_config = {
+        .chain_id = 1,
+        .name = "test",
+        .fork_blocks = {0}
+    };
+    
+    // If no fork specified, use sepolia config (all forks at block 0 up to latest)
+    if (!fork_name) {
+        return (chain_config_t *)chain_config_sepolia();
+    }
+    
+    // Determine which fork this test is for
+    // Set all forks up to this one at block 0, rest at UINT64_MAX
+    test_config.fork_blocks.frontier = 0;
+    test_config.fork_blocks.homestead = 0;
+    test_config.fork_blocks.tangerine_whistle = 0;
+    test_config.fork_blocks.spurious_dragon = 0;
+    test_config.fork_blocks.byzantium = 0;
+    test_config.fork_blocks.constantinople = UINT64_MAX;
+    test_config.fork_blocks.petersburg = 0;
+    test_config.fork_blocks.istanbul = UINT64_MAX;
+    test_config.fork_blocks.muir_glacier = UINT64_MAX;
+    test_config.fork_blocks.berlin = UINT64_MAX;
+    test_config.fork_blocks.london = UINT64_MAX;
+    test_config.fork_blocks.arrow_glacier = UINT64_MAX;
+    test_config.fork_blocks.gray_glacier = UINT64_MAX;
+    test_config.fork_blocks.paris = UINT64_MAX;
+    test_config.fork_blocks.shanghai = UINT64_MAX;
+    test_config.fork_blocks.cancun = UINT64_MAX;
+    
+    // Enable forks based on test fork name
+    if (strcmp(fork_name, "Frontier") == 0) {
+        // Only Frontier active
+        test_config.fork_blocks.homestead = UINT64_MAX;
+    } else if (strcmp(fork_name, "Homestead") == 0) {
+        test_config.fork_blocks.homestead = 0;
+    } else if (strcmp(fork_name, "Istanbul") == 0) {
+        test_config.fork_blocks.istanbul = 0;
+    } else if (strcmp(fork_name, "Berlin") == 0) {
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.berlin = 0;
+    } else if (strcmp(fork_name, "London") == 0) {
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.berlin = 0;
+        test_config.fork_blocks.london = 0;
+    } else if (strcmp(fork_name, "Shanghai") == 0) {
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.berlin = 0;
+        test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.shanghai = 0;
+    } else if (strcmp(fork_name, "Cancun") == 0) {
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.berlin = 0;
+        test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.shanghai = 0;
+        test_config.fork_blocks.cancun = 0;
+    } else {
+        // Unknown fork, use sepolia (all forks active)
+        return (chain_config_t *)chain_config_sepolia();
+    }
+    
+    return &test_config;
+}
 
 //==============================================================================
 // Helper Functions

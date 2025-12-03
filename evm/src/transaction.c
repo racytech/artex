@@ -97,14 +97,14 @@ bool transaction_validate(
     uint64_t current_nonce;
     if (state_db_get_nonce(state, &tx->sender, &current_nonce)) {
         if (tx->nonce != current_nonce) {
-            LOG_ERROR("Transaction nonce mismatch: expected %lu, got %lu", 
+            LOG_EVM_ERROR("Transaction nonce mismatch: expected %lu, got %lu", 
                      current_nonce, tx->nonce);
             return false;
         }
     } else {
         // Account doesn't exist - nonce must be 0
         if (tx->nonce != 0) {
-            LOG_ERROR("Transaction nonce must be 0 for new account");
+            LOG_EVM_ERROR("Transaction nonce must be 0 for new account");
             return false;
         }
     }
@@ -121,7 +121,7 @@ bool transaction_validate(
     uint256_t total_cost = uint256_add(&tx->value, &gas_cost);
 
     if (uint256_lt(&sender_balance, &total_cost)) {
-        LOG_ERROR("Insufficient balance: need %s, have %s",
+        LOG_EVM_ERROR("Insufficient balance: need %s, have %s",
                  uint256_to_hex(&total_cost),
                  uint256_to_hex(&sender_balance));
         return false;
@@ -129,7 +129,7 @@ bool transaction_validate(
 
     // Check gas limit
     if (tx->gas_limit > env->gas_limit) {
-        LOG_ERROR("Transaction gas limit exceeds block gas limit");
+        LOG_EVM_ERROR("Transaction gas limit exceeds block gas limit");
         return false;
     }
 
@@ -154,6 +154,18 @@ bool transaction_execute(
     memset(result, 0, sizeof(transaction_result_t));
     result->status = EVM_SUCCESS;
 
+    // Set block environment in EVM (this will determine the fork)
+    evm_block_env_t block_env = {
+        .number = env->block_number,
+        .timestamp = env->timestamp,
+        .gas_limit = env->gas_limit,
+        .difficulty = env->difficulty,
+        .coinbase = env->coinbase,
+        .base_fee = env->base_fee,
+        .chain_id = evm->chain_config ? uint256_from_uint64(evm->chain_config->chain_id) : uint256_from_uint64(1)
+    };
+    evm_set_block_env(evm, &block_env);
+
     // Calculate effective gas price
     uint256_t effective_gas_price = transaction_effective_gas_price(tx, env);
     uint256_t gas_limit_u256 = uint256_from_uint64(tx->gas_limit);
@@ -173,14 +185,14 @@ bool transaction_execute(
     }
     
     if (!state_db_set_nonce(state, &tx->sender, sender_nonce + 1)) {
-        LOG_ERROR("Failed to increment sender nonce");
+        LOG_EVM_ERROR("Failed to increment sender nonce");
         state_db_revert_to_snapshot(state, snapshot);
         return false;
     }
 
     // Deduct upfront gas cost from sender
     if (!state_db_sub_balance(state, &tx->sender, &gas_cost)) {
-        LOG_ERROR("Failed to deduct gas cost from sender");
+        LOG_EVM_ERROR("Failed to deduct gas cost from sender");
         state_db_revert_to_snapshot(state, snapshot);
         return false;
     }
@@ -188,13 +200,13 @@ bool transaction_execute(
     // Transfer value (if any)
     if (!uint256_is_zero(&tx->value)) {
         if (!state_db_sub_balance(state, &tx->sender, &tx->value)) {
-            LOG_ERROR("Failed to deduct value from sender");
+            LOG_EVM_ERROR("Failed to deduct value from sender");
             state_db_revert_to_snapshot(state, snapshot);
             return false;
         }
         
         if (!state_db_add_balance(state, &tx->to, &tx->value)) {
-            LOG_ERROR("Failed to add value to recipient");
+            LOG_EVM_ERROR("Failed to add value to recipient");
             state_db_revert_to_snapshot(state, snapshot);
             return false;
         }
@@ -209,7 +221,7 @@ bool transaction_execute(
     
     // Check if transaction has enough gas for intrinsic cost
     if (tx->gas_limit < intrinsic_gas) {
-        LOG_ERROR("Insufficient gas: limit=%lu, intrinsic=%lu", 
+        LOG_EVM_ERROR("Insufficient gas: limit=%lu, intrinsic=%lu", 
                  tx->gas_limit, intrinsic_gas);
         state_db_revert_to_snapshot(state, snapshot);
         return false;
@@ -235,7 +247,7 @@ bool transaction_execute(
     // Execute EVM
     evm_result_t evm_result;
     if (!evm_execute(evm, &msg, &evm_result)) {
-        LOG_ERROR("EVM execution failed");
+        LOG_EVM_ERROR("EVM execution failed");
         state_db_revert_to_snapshot(state, snapshot);
         return false;
     }
@@ -263,7 +275,7 @@ bool transaction_execute(
             if (!state_db_set_code(state, &tx->to, 
                                   evm_result.output_data, 
                                   evm_result.output_size)) {
-                LOG_ERROR("Failed to store contract code");
+                LOG_EVM_ERROR("Failed to store contract code");
                 state_db_revert_to_snapshot(state, snapshot);
                 evm_result_free(&evm_result);
                 return false;
@@ -302,7 +314,7 @@ bool transaction_execute(
 
     // Refund unused gas to sender
     if (!state_db_add_balance(state, &tx->sender, &refund_amount)) {
-        LOG_ERROR("Failed to refund gas to sender");
+        LOG_EVM_ERROR("Failed to refund gas to sender");
         state_db_revert_to_snapshot(state, snapshot);
         return false;
     }
@@ -313,7 +325,7 @@ bool transaction_execute(
     uint256_t coinbase_payment = uint256_mul(&effective_gas_price, &gas_paid_u256);
     
     if (!state_db_add_balance(state, &env->coinbase, &coinbase_payment)) {
-        LOG_ERROR("Failed to pay coinbase");
+        LOG_EVM_ERROR("Failed to pay coinbase");
         state_db_revert_to_snapshot(state, snapshot);
         return false;
     }
@@ -324,7 +336,7 @@ bool transaction_execute(
 
     // Commit all state changes
     if (!state_db_commit_transaction(state)) {
-        LOG_ERROR("Failed to commit transaction");
+        LOG_EVM_ERROR("Failed to commit transaction");
         return false;
     }
 

@@ -17,6 +17,7 @@
 #include "opcodes/crypto.h"
 #include "opcodes/logging.h"
 #include "opcodes/call.h"
+#include "opcodes/create.h"
 #include "logger.h"
 #include <string.h>
 

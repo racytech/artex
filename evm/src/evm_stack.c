@@ -18,7 +18,7 @@ evm_stack_t *evm_stack_create(void)
     evm_stack_t *stack = (evm_stack_t *)calloc(1, sizeof(evm_stack_t));
     if (!stack)
     {
-        LOG_ERROR("Failed to allocate stack");
+        LOG_EVM_ERROR("Failed to allocate stack");
         return NULL;
     }
 
@@ -26,14 +26,14 @@ evm_stack_t *evm_stack_create(void)
     stack->items = (uint256_t *)calloc(stack->capacity, sizeof(uint256_t));
     if (!stack->items)
     {
-        LOG_ERROR("Failed to allocate stack items");
+        LOG_EVM_ERROR("Failed to allocate stack items");
         free(stack);
         return NULL;
     }
 
     stack->size = 0;
 
-    LOG_DEBUG("Created EVM stack with initial capacity %zu", stack->capacity);
+    LOG_EVM_DEBUG("Created EVM stack with initial capacity %zu", stack->capacity);
     return stack;
 }
 
@@ -48,7 +48,7 @@ void evm_stack_destroy(evm_stack_t *stack)
     }
 
     free(stack);
-    LOG_DEBUG("Destroyed EVM stack");
+    LOG_EVM_DEBUG("Destroyed EVM stack");
 }
 
 void evm_stack_reset(evm_stack_t *stack)
@@ -78,14 +78,14 @@ bool evm_stack_push(evm_stack_t *stack, const uint256_t *value)
 {
     if (!stack || !value)
     {
-        LOG_ERROR("Invalid parameters");
+        LOG_EVM_ERROR("Invalid parameters");
         return false;
     }
 
     // Check for overflow
     if (stack->size >= EVM_STACK_MAX_DEPTH)
     {
-        LOG_DEBUG("Stack overflow: size=%zu, max=%d", stack->size, EVM_STACK_MAX_DEPTH);
+        LOG_EVM_DEBUG("Stack overflow: size=%zu, max=%d", stack->size, EVM_STACK_MAX_DEPTH);
         return false;
     }
 
@@ -101,13 +101,13 @@ bool evm_stack_push(evm_stack_t *stack, const uint256_t *value)
         uint256_t *new_items = (uint256_t *)realloc(stack->items, new_capacity * sizeof(uint256_t));
         if (!new_items)
         {
-            LOG_ERROR("Failed to expand stack capacity");
+            LOG_EVM_ERROR("Failed to expand stack capacity");
             return false;
         }
 
         stack->items = new_items;
         stack->capacity = new_capacity;
-        LOG_DEBUG("Expanded stack capacity to %zu", new_capacity);
+        LOG_EVM_DEBUG("Expanded stack capacity to %zu", new_capacity);
     }
 
     // Push value
@@ -121,14 +121,14 @@ bool evm_stack_pop(evm_stack_t *stack, uint256_t *value)
 {
     if (!stack || !value)
     {
-        LOG_ERROR("Invalid parameters");
+        LOG_EVM_ERROR("Invalid parameters");
         return false;
     }
 
     // Check for underflow
     if (stack->size == 0)
     {
-        LOG_DEBUG("Stack underflow");
+        LOG_EVM_DEBUG("Stack underflow");
         return false;
     }
 
@@ -146,13 +146,13 @@ bool evm_stack_peek(const evm_stack_t *stack, uint256_t *value)
 {
     if (!stack || !value)
     {
-        LOG_ERROR("Invalid parameters");
+        LOG_EVM_ERROR("Invalid parameters");
         return false;
     }
 
     if (stack->size == 0)
     {
-        LOG_DEBUG("Cannot peek empty stack");
+        LOG_EVM_DEBUG("Cannot peek empty stack");
         return false;
     }
 
@@ -164,13 +164,13 @@ bool evm_stack_get(const evm_stack_t *stack, size_t index, uint256_t *value)
 {
     if (!stack || !value)
     {
-        LOG_ERROR("Invalid parameters");
+        LOG_EVM_ERROR("Invalid parameters");
         return false;
     }
 
     if (index >= stack->size)
     {
-        LOG_DEBUG("Stack index out of bounds: index=%zu, size=%zu", index, stack->size);
+        LOG_EVM_DEBUG("Stack index out of bounds: index=%zu, size=%zu", index, stack->size);
         return false;
     }
 
@@ -183,13 +183,13 @@ bool evm_stack_set(evm_stack_t *stack, size_t index, const uint256_t *value)
 {
     if (!stack || !value)
     {
-        LOG_ERROR("Invalid parameters");
+        LOG_EVM_ERROR("Invalid parameters");
         return false;
     }
 
     if (index >= stack->size)
     {
-        LOG_DEBUG("Stack index out of bounds: index=%zu, size=%zu", index, stack->size);
+        LOG_EVM_DEBUG("Stack index out of bounds: index=%zu, size=%zu", index, stack->size);
         return false;
     }
 
@@ -206,28 +206,28 @@ bool evm_stack_dup(evm_stack_t *stack, uint8_t n)
 {
     if (!stack)
     {
-        LOG_ERROR("Invalid stack");
+        LOG_EVM_ERROR("Invalid stack");
         return false;
     }
 
     // DUP1-DUP16: n must be 1-16
     if (n < 1 || n > 16)
     {
-        LOG_ERROR("Invalid DUP parameter: n=%u (must be 1-16)", n);
+        LOG_EVM_ERROR("Invalid DUP parameter: n=%u (must be 1-16)", n);
         return false;
     }
 
     // Check if we have enough items (need n items on stack)
     if (stack->size < n)
     {
-        LOG_DEBUG("Stack underflow for DUP%u: size=%zu", n, stack->size);
+        LOG_EVM_DEBUG("Stack underflow for DUP%u: size=%zu", n, stack->size);
         return false;
     }
 
     // Check if we can push one more item
     if (stack->size >= EVM_STACK_MAX_DEPTH)
     {
-        LOG_DEBUG("Stack overflow for DUP%u", n);
+        LOG_EVM_DEBUG("Stack overflow for DUP%u", n);
         return false;
     }
 
@@ -242,21 +242,21 @@ bool evm_stack_swap(evm_stack_t *stack, uint8_t n)
 {
     if (!stack)
     {
-        LOG_ERROR("Invalid stack");
+        LOG_EVM_ERROR("Invalid stack");
         return false;
     }
 
     // SWAP1-SWAP16: n must be 1-16
     if (n < 1 || n > 16)
     {
-        LOG_ERROR("Invalid SWAP parameter: n=%u (must be 1-16)", n);
+        LOG_EVM_ERROR("Invalid SWAP parameter: n=%u (must be 1-16)", n);
         return false;
     }
 
     // Check if we have enough items (need n+1 items: top and nth)
     if (stack->size < n + 1)
     {
-        LOG_DEBUG("Stack underflow for SWAP%u: size=%zu, need=%u", n, stack->size, n + 1);
+        LOG_EVM_DEBUG("Stack underflow for SWAP%u: size=%zu, need=%u", n, stack->size, n + 1);
         return false;
     }
 

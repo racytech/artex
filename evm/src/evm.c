@@ -12,6 +12,70 @@
 #include <string.h>
 
 //==============================================================================
+// Internal Structures
+//==============================================================================
+
+/**
+ * Saved execution context for call stack isolation
+ * Used to preserve parent context during subcalls
+ */
+typedef struct {
+    evm_stack_t *stack;
+    evm_memory_t *memory;
+    const uint8_t *code;
+    size_t code_size;
+    uint64_t pc;
+    uint64_t gas_left;
+    uint64_t gas_refund;
+    evm_message_t msg;
+    bool stopped;
+    evm_status_t status;
+    uint8_t *return_data;
+    size_t return_data_size;
+} evm_context_t;
+
+/**
+ * Save current EVM execution context
+ */
+static evm_context_t evm_save_context(evm_t *evm)
+{
+    evm_context_t ctx = {
+        .stack = evm->stack,
+        .memory = evm->memory,
+        .code = evm->code,
+        .code_size = evm->code_size,
+        .pc = evm->pc,
+        .gas_left = evm->gas_left,
+        .gas_refund = evm->gas_refund,
+        .msg = evm->msg,
+        .stopped = evm->stopped,
+        .status = evm->status,
+        .return_data = evm->return_data,
+        .return_data_size = evm->return_data_size
+    };
+    return ctx;
+}
+
+/**
+ * Restore EVM execution context
+ */
+static void evm_restore_context(evm_t *evm, const evm_context_t *ctx)
+{
+    evm->stack = ctx->stack;
+    evm->memory = ctx->memory;
+    evm->code = ctx->code;
+    evm->code_size = ctx->code_size;
+    evm->pc = ctx->pc;
+    evm->gas_left = ctx->gas_left;
+    evm->gas_refund = ctx->gas_refund;
+    evm->msg = ctx->msg;
+    evm->stopped = ctx->stopped;
+    evm->status = ctx->status;
+    evm->return_data = ctx->return_data;
+    evm->return_data_size = ctx->return_data_size;
+}
+
+//==============================================================================
 // EVM Lifecycle
 //==============================================================================
 
@@ -19,14 +83,14 @@ evm_t *evm_create(state_db_t *state, const chain_config_t *chain_config)
 {
     if (!state)
     {
-        LOG_ERROR("Cannot create EVM without StateDB");
+        LOG_EVM_ERROR("Cannot create EVM without StateDB");
         return NULL;
     }
 
     evm_t *evm = calloc(1, sizeof(evm_t));
     if (!evm)
     {
-        LOG_ERROR("Failed to allocate EVM");
+        LOG_EVM_ERROR("Failed to allocate EVM");
         return NULL;
     }
 
@@ -38,7 +102,7 @@ evm_t *evm_create(state_db_t *state, const chain_config_t *chain_config)
     evm->stack = evm_stack_create();
     if (!evm->stack)
     {
-        LOG_ERROR("Failed to create EVM stack");
+        LOG_EVM_ERROR("Failed to create EVM stack");
         free(evm);
         return NULL;
     }
@@ -46,13 +110,13 @@ evm_t *evm_create(state_db_t *state, const chain_config_t *chain_config)
     evm->memory = evm_memory_create();
     if (!evm->memory)
     {
-        LOG_ERROR("Failed to create EVM memory");
+        LOG_EVM_ERROR("Failed to create EVM memory");
         evm_stack_destroy(evm->stack);
         free(evm);
         return NULL;
     }
 
-    LOG_DEBUG("Created EVM instance (chain: %s, id: %lu)",
+    LOG_EVM_DEBUG("Created EVM instance (chain: %s, id: %lu)",
               evm->chain_config->name, evm->chain_config->chain_id);
 
     return evm;
@@ -135,7 +199,7 @@ void evm_set_block_env(evm_t *evm, const evm_block_env_t *block)
     // Recompute fork based on new block number
     evm->fork = fork_get_active(block->number, evm->chain_config);
 
-    LOG_DEBUG("Set block environment: number=%lu, fork=%s",
+    LOG_EVM_DEBUG("Set block environment: number=%lu, fork=%s",
               block->number, fork_get_name(evm->fork));
 }
 
@@ -349,24 +413,65 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
 {
     if (!evm || !msg || !result)
     {
-        LOG_ERROR("Invalid arguments to evm_execute");
+        LOG_EVM_ERROR("Invalid arguments to evm_execute");
         return false;
     }
 
     // Check call depth limit (Ethereum allows max 1024 depth)
     if (msg->depth >= 1024)
     {
-        LOG_ERROR("Call depth limit exceeded (depth=%d, max=1024)", msg->depth);
+        LOG_EVM_ERROR("Call depth limit exceeded (depth=%d, max=1024)", msg->depth);
         *result = evm_result_error(EVM_CALL_DEPTH_EXCEEDED, msg->gas);
         return true; // Not an internal error, just depth exceeded
     }
 
-    // Reset EVM state
-    evm_reset(evm);
+    //==========================================================================
+    // Context Isolation for Subcalls
+    //==========================================================================
+    
+    // Determine if this is a subcall (depth > 0)
+    bool is_subcall = (msg->depth > 0);
+    evm_context_t saved_context;
+    
+    if (is_subcall)
+    {
+        // Save parent's execution context
+        saved_context = evm_save_context(evm);
+        
+        // Create new stack and memory for this subcall
+        evm->stack = evm_stack_create();
+        evm->memory = evm_memory_create();
+        
+        if (!evm->stack || !evm->memory)
+        {
+            LOG_EVM_ERROR("Failed to create stack/memory for subcall");
+            if (evm->stack) evm_stack_destroy(evm->stack);
+            if (evm->memory) evm_memory_destroy(evm->memory);
+            evm_restore_context(evm, &saved_context);
+            *result = evm_result_error(EVM_INTERNAL_ERROR, 0);
+            return false;
+        }
+        
+        // Clear return data for this subcall
+        evm->return_data = NULL;
+        evm->return_data_size = 0;
+    }
+    else
+    {
+        // Top-level call - reset EVM state
+        evm_reset(evm);
+    }
 
+    //==========================================================================
+    // Setup Message Context
+    //==========================================================================
+    
     // Set up message context
     evm->msg = *msg;
     evm->gas_left = msg->gas;
+    evm->pc = 0;
+    evm->stopped = false;
+    evm->status = EVM_SUCCESS;
 
     // Handle contract creation
     if (msg->kind == EVM_CREATE || msg->kind == EVM_CREATE2)
@@ -375,7 +480,7 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         evm->code = msg->input_data;
         evm->code_size = msg->input_size;
         
-        LOG_DEBUG("CREATE: Running init code (%zu bytes)", evm->code_size);
+        LOG_EVM_DEBUG("CREATE: Running init code (%zu bytes)", evm->code_size);
     }
     else
     {
@@ -393,13 +498,22 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
             evm->code = contract_code;
             evm->code_size = contract_code_size;
             printf("DEBUG EVM: Loaded %zu bytes of code from state\n", evm->code_size);
-            LOG_DEBUG("CALL: Executing code from state (%zu bytes)", evm->code_size);
+            LOG_EVM_DEBUG("CALL: Executing code from state (%zu bytes)", evm->code_size);
         }
         else
         {
             // No code at address - simple value transfer
             printf("DEBUG EVM: No code at address, treating as value transfer\n");
-            LOG_DEBUG("No code at address, simple value transfer");
+            LOG_EVM_DEBUG("No code at address, simple value transfer");
+            
+            // Cleanup and restore context if subcall
+            if (is_subcall)
+            {
+                evm_stack_destroy(evm->stack);
+                evm_memory_destroy(evm->memory);
+                evm_restore_context(evm, &saved_context);
+            }
+            
             *result = evm_result_success(msg->gas, NULL, 0);
             return true;
         }
@@ -408,13 +522,53 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     // Check if there's any code to execute
     if (evm->code_size == 0)
     {
-        LOG_DEBUG("No code to execute");
+        LOG_EVM_DEBUG("No code to execute");
+        
+        // Cleanup and restore context if subcall
+        if (is_subcall)
+        {
+            evm_stack_destroy(evm->stack);
+            evm_memory_destroy(evm->memory);
+            evm_restore_context(evm, &saved_context);
+        }
+        
         *result = evm_result_success(evm->gas_left, NULL, 0);
         return true;
     }
 
+    //==========================================================================
+    // Execute Bytecode
+    //==========================================================================
+    
     // Execute the code via interpreter
     *result = evm_interpret(evm);
+    
+    //==========================================================================
+    // Restore Context for Subcalls
+    //==========================================================================
+    
+    if (is_subcall)
+    {
+        // Save subcall's return data before destroying its context
+        uint8_t *subcall_return_data = evm->return_data;
+        size_t subcall_return_size = evm->return_data_size;
+        
+        // Destroy subcall's stack and memory
+        evm_stack_destroy(evm->stack);
+        evm_memory_destroy(evm->memory);
+        
+        // Restore parent's context
+        evm_restore_context(evm, &saved_context);
+        
+        // Update parent's return data with subcall's output
+        // (This makes it available for RETURNDATASIZE/RETURNDATACOPY)
+        if (evm->return_data)
+        {
+            free(evm->return_data);
+        }
+        evm->return_data = subcall_return_data;
+        evm->return_data_size = subcall_return_size;
+    }
     
     return true;
 }
@@ -427,7 +581,7 @@ evm_status_t evm_run(evm_t *evm)
     }
 
     // TODO: This will be replaced by evm_interpret() or integrated with it
-    LOG_DEBUG("evm_run stub - not yet implemented");
+    LOG_EVM_DEBUG("evm_run stub - not yet implemented");
     
     return EVM_INTERNAL_ERROR;
 }

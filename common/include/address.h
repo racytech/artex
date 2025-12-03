@@ -39,6 +39,9 @@ bool address_is_zero(const address_t* addr);
 // Copy address
 void address_copy(address_t* dest, const address_t* src);
 
+// Convert uint256_t to address (takes lowest 20 bytes)
+void address_from_uint256(const void* uint256_ptr, address_t* out);
+
 #ifdef __cplusplus
 }
 #endif

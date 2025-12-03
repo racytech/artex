@@ -75,3 +75,12 @@ bool address_is_zero(const address_t* addr) {
 void address_copy(address_t* dest, const address_t* src) {
     memcpy(dest->bytes, src->bytes, ADDRESS_SIZE);
 }
+
+void address_from_uint256(const void* uint256_ptr, address_t* out) {
+    if (!uint256_ptr || !out) return;
+    
+    // uint256_t is stored in little-endian (lowest bytes first)
+    // Address is the lowest 20 bytes of the uint256_t
+    const uint8_t* bytes = (const uint8_t*)uint256_ptr;
+    memcpy(out->bytes, bytes, ADDRESS_SIZE);
+}

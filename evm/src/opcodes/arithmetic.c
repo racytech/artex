@@ -113,10 +113,10 @@ evm_status_t op_sub(evm_t *evm)
 
     // Pop two operands
     uint256_t a, b;
-    evm_stack_pop(evm->stack, &b);
-    evm_stack_pop(evm->stack, &a);
+    evm_stack_pop(evm->stack, &a);  // First pop (top of stack)
+    evm_stack_pop(evm->stack, &b);  // Second pop
 
-    // Compute a - b
+    // Compute a - b (first_pop - second_pop)
     uint256_t result = uint256_sub(&a, &b);
 
     // Push result

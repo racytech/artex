@@ -521,7 +521,7 @@ evm_status_t op_extcodesize(evm_t *evm)
 
     // TODO: Get code size from StateDB
     // For now, push 0 (no code)
-    LOG_DEBUG("EXTCODESIZE: stub - returning size=0");
+    LOG_EVM_DEBUG("EXTCODESIZE: stub - returning size=0");
 
     uint256_t size = UINT256_ZERO;
     if (!evm_stack_push(evm->stack, &size))
@@ -578,7 +578,7 @@ evm_status_t op_extcodecopy(evm_t *evm)
 
         // TODO: Copy code from StateDB to memory
         // For now, just fill with zeros
-        LOG_DEBUG("EXTCODECOPY: stub - filling memory with zeros");
+        LOG_EVM_DEBUG("EXTCODECOPY: stub - filling memory with zeros");
         
         for (uint64_t i = 0; i < size; i++)
         {
@@ -619,7 +619,7 @@ evm_status_t op_extcodehash(evm_t *evm)
 
     // TODO: Get code hash from StateDB
     // For now, push 0 (account doesn't exist or has no code)
-    LOG_DEBUG("EXTCODEHASH: stub - returning hash=0");
+    LOG_EVM_DEBUG("EXTCODEHASH: stub - returning hash=0");
 
     uint256_t hash = UINT256_ZERO;
     if (!evm_stack_push(evm->stack, &hash))

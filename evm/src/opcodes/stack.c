@@ -23,7 +23,7 @@ evm_status_t op_pop(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 1))
     {
-        LOG_ERROR("POP: Stack underflow");
+        LOG_EVM_ERROR("POP: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -48,14 +48,14 @@ evm_status_t op_push(evm_t *evm, uint8_t num_bytes)
 
     if (num_bytes < 1 || num_bytes > 32)
     {
-        LOG_ERROR("PUSH: Invalid number of bytes: %u", num_bytes);
+        LOG_EVM_ERROR("PUSH: Invalid number of bytes: %u", num_bytes);
         return EVM_INVALID_OPCODE;
     }
 
     // Check if we have enough code bytes to read
     if (evm->pc + 1 + num_bytes > evm->code_size)
     {
-        LOG_ERROR("PUSH: Not enough code bytes (pc=%lu, bytes=%u, code_size=%lu)",
+        LOG_EVM_ERROR("PUSH: Not enough code bytes (pc=%lu, bytes=%u, code_size=%lu)",
                   evm->pc, num_bytes, evm->code_size);
         return EVM_INVALID_OPCODE;
     }
@@ -129,7 +129,7 @@ evm_status_t op_dup(evm_t *evm, uint8_t n)
 
     if (n < 1 || n > 16)
     {
-        LOG_ERROR("DUP: Invalid dup position: %u", n);
+        LOG_EVM_ERROR("DUP: Invalid dup position: %u", n);
         return EVM_INVALID_OPCODE;
     }
 
@@ -174,7 +174,7 @@ evm_status_t op_swap(evm_t *evm, uint8_t n)
 
     if (n < 1 || n > 16)
     {
-        LOG_ERROR("SWAP: Invalid swap position: %u", n);
+        LOG_EVM_ERROR("SWAP: Invalid swap position: %u", n);
         return EVM_INVALID_OPCODE;
     }
 

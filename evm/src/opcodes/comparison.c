@@ -23,7 +23,7 @@ evm_status_t op_lt(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_ERROR("LT: Stack underflow");
+        LOG_EVM_ERROR("LT: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -56,7 +56,7 @@ evm_status_t op_gt(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_ERROR("GT: Stack underflow");
+        LOG_EVM_ERROR("GT: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -89,7 +89,7 @@ evm_status_t op_slt(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_ERROR("SLT: Stack underflow");
+        LOG_EVM_ERROR("SLT: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -122,7 +122,7 @@ evm_status_t op_sgt(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_ERROR("SGT: Stack underflow");
+        LOG_EVM_ERROR("SGT: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -155,7 +155,7 @@ evm_status_t op_eq(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_ERROR("EQ: Stack underflow");
+        LOG_EVM_ERROR("EQ: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -188,7 +188,7 @@ evm_status_t op_iszero(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 1))
     {
-        LOG_ERROR("ISZERO: Stack underflow");
+        LOG_EVM_ERROR("ISZERO: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -220,7 +220,7 @@ evm_status_t op_and(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_ERROR("AND: Stack underflow");
+        LOG_EVM_ERROR("AND: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -253,7 +253,7 @@ evm_status_t op_or(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_ERROR("OR: Stack underflow");
+        LOG_EVM_ERROR("OR: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -286,7 +286,7 @@ evm_status_t op_xor(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_ERROR("XOR: Stack underflow");
+        LOG_EVM_ERROR("XOR: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -319,7 +319,7 @@ evm_status_t op_not(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 1))
     {
-        LOG_ERROR("NOT: Stack underflow");
+        LOG_EVM_ERROR("NOT: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -351,7 +351,7 @@ evm_status_t op_byte(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_ERROR("BYTE: Stack underflow");
+        LOG_EVM_ERROR("BYTE: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -397,7 +397,7 @@ evm_status_t op_shl(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_ERROR("SHL: Stack underflow");
+        LOG_EVM_ERROR("SHL: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -441,7 +441,7 @@ evm_status_t op_shr(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_ERROR("SHR: Stack underflow");
+        LOG_EVM_ERROR("SHR: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -485,7 +485,7 @@ evm_status_t op_sar(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_ERROR("SAR: Stack underflow");
+        LOG_EVM_ERROR("SAR: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 

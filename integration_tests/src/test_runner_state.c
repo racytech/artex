@@ -10,6 +10,7 @@
 
 // Forward declaration from test_runner_core.c
 extern uint64_t get_time_microseconds(void);
+extern chain_config_t *create_test_chain_config(const char *fork_name);
 
 //==============================================================================
 // State Test Runner
@@ -72,6 +73,13 @@ bool test_runner_run_state_test(test_runner_t *runner,
         }
         
         result->fork = test_fork ? strdup(test_fork) : NULL;
+        
+        // Update EVM chain config for this fork
+        chain_config_t *fork_config = create_test_chain_config(test_fork);
+        if (runner->evm) {
+            runner->evm->chain_config = fork_config;
+            // Note: fork will be recomputed from block number in evm_set_block_env()
+        }
         
         // Test each post-condition for this fork
         for (size_t cond_idx = 0; cond_idx < test->post[fork_idx].condition_count; cond_idx++) {

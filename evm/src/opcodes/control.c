@@ -433,7 +433,7 @@ evm_status_t op_selfdestruct(evm_t *evm)
     // Check for static call violation
     if (evm->msg.is_static)
     {
-        LOG_ERROR("SELFDESTRUCT: Cannot selfdestruct in static call");
+        LOG_EVM_ERROR("SELFDESTRUCT: Cannot selfdestruct in static call");
         return EVM_STATIC_CALL_VIOLATION;
     }
 
@@ -460,7 +460,7 @@ evm_status_t op_selfdestruct(evm_t *evm)
     // 3. Track gas refund
     // 4. Set stopped flag
 
-    LOG_DEBUG("SELFDESTRUCT: stub - halting execution");
+    LOG_EVM_DEBUG("SELFDESTRUCT: stub - halting execution");
 
     // For now, just halt execution
     evm->stopped = true;
