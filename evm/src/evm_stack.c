@@ -82,7 +82,8 @@ bool evm_stack_push(evm_stack_t *stack, const uint256_t *value)
         return false;
     }
 
-    // Check for overflow
+    // Check for overflow - EVM stack can hold UP TO 1024 items (indices 0-1023)
+    // So we reject when size would become > 1024 after the push
     if (stack->size >= EVM_STACK_MAX_DEPTH)
     {
         LOG_EVM_DEBUG("Stack overflow: size=%zu, max=%d", stack->size, EVM_STACK_MAX_DEPTH);

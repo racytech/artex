@@ -138,3 +138,7 @@ core.*
 *.temp
 *.bak
 *.backup
+
+evm/src/opcodes/reference
+failing_test.json
+failure.txt

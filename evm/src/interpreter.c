@@ -19,13 +19,24 @@
 #include "opcodes/call.h"
 #include "opcodes/create.h"
 #include "logger.h"
+#include <stdlib.h>
 #include <string.h>
 
 //==============================================================================
 // Dispatch Table - Maps opcodes to label addresses
 //==============================================================================
 
-#define DISPATCH() goto *dispatch_table[evm->code[evm->pc]]
+#define DISPATCH()                                  \
+    do                                              \
+    {                                               \
+        if (evm->pc >= evm->code_size)              \
+        {                                           \
+            status = EVM_SUCCESS;                   \
+            goto done;                              \
+        }                                           \
+        goto *dispatch_table[evm->code[evm->pc]];  \
+    } while (0)
+
 #define NEXT()      \
     do              \
     {               \
@@ -47,8 +58,19 @@ evm_result_t evm_result_create(evm_status_t status,
     result.status = status;
     result.gas_left = gas_left;
     result.gas_refund = gas_refund;
-    result.output_data = output_data;
     result.output_size = output_size;
+    result.output_data = NULL;
+    
+    // Allocate and copy output data to avoid double-free issues
+    if (output_data && output_size > 0)
+    {
+        result.output_data = malloc(output_size);
+        if (result.output_data)
+        {
+            memcpy(result.output_data, output_data, output_size);
+        }
+    }
+    
     return result;
 }
 

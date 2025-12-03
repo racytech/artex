@@ -71,10 +71,15 @@ static evm_status_t prepare_call(
         uint64_t args_end = args_offset + args_size;
         uint64_t mem_expansion_cost = evm_memory_expansion_cost(evm->memory->size, args_end);
         
+        fprintf(stderr, "  Memory expansion for args: cost=%lu, gas_left_before=%lu\n", 
+                mem_expansion_cost, evm->gas_left);
+        
         if (!evm_use_gas(evm, mem_expansion_cost))
         {
             return EVM_OUT_OF_GAS;
         }
+        
+        fprintf(stderr, "  After args memory expansion: gas_left=%lu\n", evm->gas_left);
         
         if (!evm_memory_expand(evm->memory, args_offset, args_size))
         {
@@ -88,10 +93,15 @@ static evm_status_t prepare_call(
         uint64_t ret_end = ret_offset + ret_size;
         uint64_t mem_expansion_cost = evm_memory_expansion_cost(evm->memory->size, ret_end);
         
+        fprintf(stderr, "  Memory expansion for return: cost=%lu, gas_left_before=%lu\n", 
+                mem_expansion_cost, evm->gas_left);
+        
         if (!evm_use_gas(evm, mem_expansion_cost))
         {
             return EVM_OUT_OF_GAS;
         }
+        
+        fprintf(stderr, "  After return memory expansion: gas_left=%lu\n", evm->gas_left);
         
         if (!evm_memory_expand(evm->memory, ret_offset, ret_size))
         {
@@ -100,44 +110,11 @@ static evm_status_t prepare_call(
     }
 
     //==========================================================================
-    // Gas Calculation
-    //==========================================================================
-
-    // Check if account exists
-    // TODO: Implement proper account existence check
-    bool account_exists = true; // Stub: assume account exists
-
-    // Check if this is a cold access
-    // TODO: Check evm->accessed_addresses for warm/cold tracking
-    bool is_cold = true; // Stub: assume cold access (worst case)
-
-    // Calculate CALL gas cost
-    uint64_t call_cost = gas_call_cost(evm->fork, is_cold, has_value, account_exists);
-
-    // Deduct call cost
-    if (!evm_use_gas(evm, call_cost))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    //==========================================================================
-    // Call Depth Check
-    //==========================================================================
-
-    // Check call depth limit (1024)
-    if (evm->msg.depth >= 1024)
-    {
-        LOG_EVM_DEBUG("CALL: Call depth limit exceeded");
-        // Signal that call should fail gracefully (push 0)
-        *gas_forwarded = 0;
-        return EVM_SUCCESS;
-    }
-
-    //==========================================================================
-    // Balance Check
+    // Balance Check (done before gas calculation to avoid charging for account creation)
     //==========================================================================
 
     // Check if caller has enough balance for value transfer
+    bool balance_sufficient = true;
     if (has_value)
     {
         uint256_t caller_balance;
@@ -148,27 +125,118 @@ static evm_status_t prepare_call(
 
         if (uint256_lt(&caller_balance, value))
         {
-            LOG_EVM_DEBUG("CALL: Insufficient balance for value transfer");
-            // Signal that call should fail gracefully (push 0)
-            *gas_forwarded = 0;
-            return EVM_SUCCESS;
+            balance_sufficient = false;
+            fprintf(stderr, "CALL: Insufficient balance for value transfer (need=%lu, have=%lu)\n",
+                    uint256_to_uint64(value), uint256_to_uint64(&caller_balance));
         }
+    }
+
+    //==========================================================================
+    // Gas Calculation
+    //==========================================================================
+
+    // Check if account exists
+    bool account_exists = state_db_exist(evm->state, target_addr);
+
+    // Check if this is a cold access (Berlin+)
+    bool is_cold = !evm_is_address_warm(evm, target_addr);
+    
+    // Mark address as warm for future accesses
+    if (is_cold)
+    {
+        evm_mark_address_warm(evm, target_addr);
+    }
+
+    // Only charge for account creation if balance is sufficient
+    // (don't charge if we know the call will fail)
+    // UPDATE: Always charge for account creation per EIP spec
+    bool treat_as_existing = account_exists; // Always use actual account state
+
+    // Calculate CALL gas cost  
+    uint64_t call_cost = gas_call_cost(evm->fork, is_cold, has_value, treat_as_existing);
+    
+    // Calculate stipend (will be reserved upfront and refunded if call doesn't execute)
+    uint64_t stipend = has_value ? gas_call_stipend(value) : 0;
+
+    // DEBUG: Log gas calculation details
+    fprintf(stderr, "CALL GAS DEBUG: fork=%d, is_cold=%d, has_value=%d, account_exists=%d, balance_sufficient=%d, call_cost=%lu, stipend=%lu\n",
+            evm->fork, is_cold, has_value, account_exists, balance_sufficient, call_cost, stipend);
+    
+    fprintf(stderr, "  Before deducting call_cost: gas_left=%lu\n", evm->gas_left);
+
+    // Deduct call cost
+    if (!evm_use_gas(evm, call_cost))
+    {
+        return EVM_OUT_OF_GAS;
+    }
+    
+    // Add stipend to caller's gas (it's free bonus gas for value transfers)
+    // The stipend will be included in gas_forwarded to the callee
+    if (stipend > 0)
+    {
+        evm->gas_left += stipend;
+        fprintf(stderr, "  Added stipend to gas_left: +%lu gas\n", stipend);
+    }
+    
+    fprintf(stderr, "  After deducting call_cost and adding stipend: gas_left=%lu\n", evm->gas_left);
+
+    //==========================================================================
+    // Final Balance Check and Call Depth Check
+    //==========================================================================
+
+    // Check call depth limit (1024)
+    if (evm->msg.depth >= 1024)
+    {
+        fprintf(stderr, "CALL: Call depth limit exceeded (depth=%d)\n", evm->msg.depth);
+        // Signal that call should fail gracefully (push 0)
+        *gas_forwarded = 0;
+        return EVM_SUCCESS;
+    }
+
+    // If balance was insufficient, fail gracefully (DON'T reserve stipend)
+    if (!balance_sufficient)
+    {
+        fprintf(stderr, "CALL: Insufficient balance, failing gracefully (caller keeps stipend bonus)\n");
+        // Signal that call should fail gracefully (push 0)
+        *gas_forwarded = 0;
+        return EVM_SUCCESS;
     }
 
     //==========================================================================
     // Gas Forwarding (63/64 rule)
     //==========================================================================
 
-    // Calculate maximum gas that can be forwarded (EIP-150)
+    // Calculate maximum gas that can be forwarded (EIP-150: 63/64 of remaining gas)
     uint64_t gas_available = gas_max_call_gas(evm->gas_left);
     
-    // Use minimum of requested gas and available gas
+    // Determine how much gas to forward
+    // If gas_param >= gas_available OR gas_param == 0, forward all available gas
     uint64_t gas_requested = uint256_to_uint64(gas_param);
-    uint64_t gas_to_forward = gas_requested < gas_available ? gas_requested : gas_available;
+    uint64_t gas_to_forward;
+    
+    if (gas_requested == 0 || gas_requested >= gas_available)
+    {
+        gas_to_forward = gas_available;
+    }
+    else
+    {
+        gas_to_forward = gas_requested;
+    }
 
-    // Add stipend if transferring value
-    uint64_t stipend = gas_call_stipend(value);
+    // Add stipend if transferring value (already added to gas_left above)
     *gas_forwarded = gas_to_forward + stipend;
+
+    fprintf(stderr, "PREPARE_CALL DEBUG: gas_to_forward=%lu, stipend=%lu, total gas_forwarded=%lu\n",
+            gas_to_forward, stipend, *gas_forwarded);
+    
+    // Deduct the forwarded gas from caller (will be refunded after subcall completes)
+    // Note: stipend was already added to gas_left, so we're only deducting gas_to_forward
+    if (!evm_use_gas(evm, gas_to_forward))
+    {
+        return EVM_OUT_OF_GAS;
+    }
+    fprintf(stderr, "PREPARE_CALL: Reserved %lu gas for subcall, gas_left now=%lu\n", 
+            gas_to_forward, evm->gas_left);
 
     return EVM_SUCCESS;
 }
@@ -188,16 +256,20 @@ evm_status_t op_call(evm_t *evm)
         return EVM_INTERNAL_ERROR;
     }
 
-    // Pop 7 arguments from stack
-    uint256_t ret_size, ret_offset, args_size, args_offset, value, addr, gas;
+    fprintf(stderr, "\n=== CALL OPCODE START: gas_left=%lu ===\n", evm->gas_left);
+
+    // Pop 7 arguments from stack (in reverse order of how they were pushed)
+    // Stack has: [... gas addr value argsOffset argsSize retOffset retSize] <- top
+    // Pop order: gas (top) -> addr -> value -> argsOffset -> argsSize -> retOffset -> retSize (bottom)
+    uint256_t gas, addr, value, args_offset, args_size, ret_offset, ret_size;
     
-    if (!evm_stack_pop(evm->stack, &ret_size) ||
-        !evm_stack_pop(evm->stack, &ret_offset) ||
-        !evm_stack_pop(evm->stack, &args_size) ||
-        !evm_stack_pop(evm->stack, &args_offset) ||
-        !evm_stack_pop(evm->stack, &value) ||
+    if (!evm_stack_pop(evm->stack, &gas) ||
         !evm_stack_pop(evm->stack, &addr) ||
-        !evm_stack_pop(evm->stack, &gas))
+        !evm_stack_pop(evm->stack, &value) ||
+        !evm_stack_pop(evm->stack, &args_offset) ||
+        !evm_stack_pop(evm->stack, &args_size) ||
+        !evm_stack_pop(evm->stack, &ret_offset) ||
+        !evm_stack_pop(evm->stack, &ret_size))
     {
         return EVM_STACK_UNDERFLOW;
     }
@@ -212,12 +284,17 @@ evm_status_t op_call(evm_t *evm)
     uint64_t ret_size_u64 = uint256_to_uint64(&ret_size);
     uint64_t ret_offset_u64 = uint256_to_uint64(&ret_offset);
 
+    fprintf(stderr, "Before prepare_call: gas_left=%lu\n", evm->gas_left);
+
     // Prepare call (memory expansion, gas calculation, checks)
     uint64_t gas_forwarded;
     evm_status_t status = prepare_call(evm, &target_addr, &value, &gas,
                                        args_offset_u64, args_size_u64,
                                        ret_offset_u64, ret_size_u64,
                                        true, &gas_forwarded);
+    
+    fprintf(stderr, "PREPARE_CALL returned: status=%d, gas_forwarded=%lu, evm->gas_left=%lu\n",
+            status, gas_forwarded, evm->gas_left);
     
     if (status != EVM_SUCCESS)
     {
@@ -227,11 +304,13 @@ evm_status_t op_call(evm_t *evm)
     // If gas_forwarded is 0, call failed gracefully (depth/balance check)
     if (gas_forwarded == 0)
     {
+        fprintf(stderr, "CALL failed gracefully (gas_forwarded=0), pushing 0 to stack\n");
         uint256_t result = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &result))
         {
             return EVM_STACK_OVERFLOW;
         }
+        fprintf(stderr, "=== CALL OPCODE END (early): gas_left=%lu ===\n\n", evm->gas_left);
         return EVM_SUCCESS;
     }
 
@@ -276,6 +355,9 @@ evm_status_t op_call(evm_t *evm)
     evm_result_t subcall_result;
     bool exec_ok = evm_execute(evm, &subcall_msg, &subcall_result);
     
+    fprintf(stderr, "CALL RESULT DEBUG: exec_ok=%d, status=%d, gas_left=%lu\n",
+            exec_ok, subcall_result.status, subcall_result.gas_left);
+    
     if (call_args) free(call_args);
 
     if (!exec_ok)
@@ -300,8 +382,17 @@ evm_status_t op_call(evm_t *evm)
 
     bool call_succeeded = (subcall_result.status == EVM_SUCCESS);
     
+    // DEBUG: Log gas refund details
+    uint64_t stipend_debug = gas_call_stipend(&value);
+    fprintf(stderr, "CALL GAS REFUND DEBUG: subcall_result.gas_left=%lu, stipend=%lu\n",
+            subcall_result.gas_left, stipend_debug);
+    
     if (call_succeeded)
     {
+        // Refund ALL unused gas to caller
+        // (The EVM interpreter handles gas reservation for subcalls internally)
+        fprintf(stderr, "CALL GAS REFUND DEBUG: refunding %lu gas to caller\n", subcall_result.gas_left);
+        
         evm->gas_left += subcall_result.gas_left;
         evm->gas_refund += subcall_result.gas_refund;
     }
@@ -315,6 +406,8 @@ evm_status_t op_call(evm_t *evm)
     {
         return EVM_STACK_OVERFLOW;
     }
+
+    fprintf(stderr, "=== CALL OPCODE END: gas_left=%lu ===\n\n", evm->gas_left);
 
     return EVM_SUCCESS;
 }
@@ -331,16 +424,17 @@ evm_status_t op_callcode(evm_t *evm)
         return EVM_INTERNAL_ERROR;
     }
 
-    // Pop 7 arguments from stack
-    uint256_t ret_size, ret_offset, args_size, args_offset, value, addr, gas;
+    // Pop 7 arguments from stack (in reverse order of how they were pushed)
+    // Stack: gas addr value argsOffset argsSize retOffset retSize
+    uint256_t gas, addr, value, args_offset, args_size, ret_offset, ret_size;
     
-    if (!evm_stack_pop(evm->stack, &ret_size) ||
-        !evm_stack_pop(evm->stack, &ret_offset) ||
-        !evm_stack_pop(evm->stack, &args_size) ||
-        !evm_stack_pop(evm->stack, &args_offset) ||
-        !evm_stack_pop(evm->stack, &value) ||
+    if (!evm_stack_pop(evm->stack, &gas) ||
         !evm_stack_pop(evm->stack, &addr) ||
-        !evm_stack_pop(evm->stack, &gas))
+        !evm_stack_pop(evm->stack, &value) ||
+        !evm_stack_pop(evm->stack, &args_offset) ||
+        !evm_stack_pop(evm->stack, &args_size) ||
+        !evm_stack_pop(evm->stack, &ret_offset) ||
+        !evm_stack_pop(evm->stack, &ret_size))
     {
         return EVM_STACK_UNDERFLOW;
     }
@@ -440,6 +534,8 @@ evm_status_t op_callcode(evm_t *evm)
     
     if (call_succeeded)
     {
+        // Refund ALL unused gas to caller
+        // (The EVM interpreter handles gas reservation for subcalls internally)
         evm->gas_left += subcall_result.gas_left;
         evm->gas_refund += subcall_result.gas_refund;
     }
@@ -470,14 +566,15 @@ evm_status_t op_delegatecall(evm_t *evm)
     }
 
     // Pop 6 arguments from stack (no value in delegatecall)
-    uint256_t ret_size, ret_offset, args_size, args_offset, addr, gas;
+    // Stack: gas addr argsOffset argsSize retOffset retSize
+    uint256_t gas, addr, args_offset, args_size, ret_offset, ret_size;
     
-    if (!evm_stack_pop(evm->stack, &ret_size) ||
-        !evm_stack_pop(evm->stack, &ret_offset) ||
-        !evm_stack_pop(evm->stack, &args_size) ||
-        !evm_stack_pop(evm->stack, &args_offset) ||
+    if (!evm_stack_pop(evm->stack, &gas) ||
         !evm_stack_pop(evm->stack, &addr) ||
-        !evm_stack_pop(evm->stack, &gas))
+        !evm_stack_pop(evm->stack, &args_offset) ||
+        !evm_stack_pop(evm->stack, &args_size) ||
+        !evm_stack_pop(evm->stack, &ret_offset) ||
+        !evm_stack_pop(evm->stack, &ret_size))
     {
         return EVM_STACK_UNDERFLOW;
     }
@@ -611,14 +708,15 @@ evm_status_t op_staticcall(evm_t *evm)
     }
 
     // Pop 6 arguments from stack (no value in staticcall)
-    uint256_t ret_size, ret_offset, args_size, args_offset, addr, gas;
+    // Stack: gas addr argsOffset argsSize retOffset retSize
+    uint256_t gas, addr, args_offset, args_size, ret_offset, ret_size;
     
-    if (!evm_stack_pop(evm->stack, &ret_size) ||
-        !evm_stack_pop(evm->stack, &ret_offset) ||
-        !evm_stack_pop(evm->stack, &args_size) ||
-        !evm_stack_pop(evm->stack, &args_offset) ||
+    if (!evm_stack_pop(evm->stack, &gas) ||
         !evm_stack_pop(evm->stack, &addr) ||
-        !evm_stack_pop(evm->stack, &gas))
+        !evm_stack_pop(evm->stack, &args_offset) ||
+        !evm_stack_pop(evm->stack, &args_size) ||
+        !evm_stack_pop(evm->stack, &ret_offset) ||
+        !evm_stack_pop(evm->stack, &ret_size))
     {
         return EVM_STACK_UNDERFLOW;
     }

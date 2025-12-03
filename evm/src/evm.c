@@ -116,6 +116,26 @@ evm_t *evm_create(state_db_t *state, const chain_config_t *chain_config)
         return NULL;
     }
 
+    // Initialize access tracking (EIP-2929)
+    if (!art_tree_init(&evm->accessed_addresses))
+    {
+        LOG_EVM_ERROR("Failed to initialize accessed addresses tree");
+        evm_memory_destroy(evm->memory);
+        evm_stack_destroy(evm->stack);
+        free(evm);
+        return NULL;
+    }
+
+    if (!art_tree_init(&evm->accessed_storage))
+    {
+        LOG_EVM_ERROR("Failed to initialize accessed storage tree");
+        art_tree_destroy(&evm->accessed_addresses);
+        evm_memory_destroy(evm->memory);
+        evm_stack_destroy(evm->stack);
+        free(evm);
+        return NULL;
+    }
+
     LOG_EVM_DEBUG("Created EVM instance (chain: %s, id: %lu)",
               evm->chain_config->name, evm->chain_config->chain_id);
 
@@ -143,6 +163,10 @@ void evm_destroy(evm_t *evm)
     {
         free(evm->return_data);
     }
+
+    // Destroy access tracking trees
+    art_tree_destroy(&evm->accessed_addresses);
+    art_tree_destroy(&evm->accessed_storage);
 
     free(evm);
 }
@@ -172,6 +196,12 @@ void evm_reset(evm_t *evm)
         evm->return_data = NULL;
         evm->return_data_size = 0;
     }
+
+    // Clear access tracking (for new transaction)
+    art_tree_destroy(&evm->accessed_addresses);
+    art_tree_destroy(&evm->accessed_storage);
+    art_tree_init(&evm->accessed_addresses);
+    art_tree_init(&evm->accessed_storage);
 
     // Reset runtime state
     evm->pc = 0;
@@ -248,6 +278,62 @@ void evm_refund_gas(evm_t *evm, uint64_t amount)
 uint64_t evm_get_gas_left(const evm_t *evm)
 {
     return evm ? evm->gas_left : 0;
+}
+
+//==============================================================================
+// Access List Operations (EIP-2929)
+//==============================================================================
+
+bool evm_is_address_warm(const evm_t *evm, const address_t *addr)
+{
+    if (!evm || !addr)
+    {
+        return false;
+    }
+
+    return art_contains(&evm->accessed_addresses, addr->bytes, 20);
+}
+
+void evm_mark_address_warm(evm_t *evm, const address_t *addr)
+{
+    if (!evm || !addr)
+    {
+        return;
+    }
+
+    // Insert with NULL value (we only care about presence, not value)
+    art_insert(&evm->accessed_addresses, addr->bytes, 20, NULL, 0);
+}
+
+bool evm_is_storage_warm(const evm_t *evm, const address_t *addr, const uint256_t *key)
+{
+    if (!evm || !addr || !key)
+    {
+        return false;
+    }
+
+    // Create composite key: address (20 bytes) + storage key (32 bytes)
+    uint8_t composite_key[52];
+    memcpy(composite_key, addr->bytes, 20);
+    uint256_to_bytes(key, composite_key + 20);
+
+    return art_contains(&evm->accessed_storage, composite_key, 52);
+}
+
+void evm_mark_storage_warm(evm_t *evm, const address_t *addr, const uint256_t *key)
+{
+    if (!evm || !addr || !key)
+    {
+        return;
+    }
+
+    // Create composite key: address (20 bytes) + storage key (32 bytes)
+    uint8_t composite_key[52];
+    memcpy(composite_key, addr->bytes, 20);
+    uint256_to_bytes(key, composite_key + 20);
+
+    // Insert with NULL value (we only care about presence, not value)
+    art_insert(&evm->accessed_storage, composite_key, 52, NULL, 0);
 }
 
 //==============================================================================
@@ -460,6 +546,14 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     {
         // Top-level call - reset EVM state
         evm_reset(evm);
+        
+        // Initialize access list with sender and recipient (EIP-2929)
+        // These addresses are warm from the start of the transaction
+        if (evm->fork >= FORK_BERLIN)
+        {
+            evm_mark_address_warm(evm, &msg->caller);
+            evm_mark_address_warm(evm, &msg->recipient);
+        }
     }
 
     //==========================================================================

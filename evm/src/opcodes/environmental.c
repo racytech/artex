@@ -63,10 +63,19 @@ evm_status_t op_balance(evm_t *evm)
     address_t addr;
     address_from_uint256(&addr_value, &addr);
 
-    // TODO: Check if address is cold/warm and charge appropriate gas (GAS_SLOAD_COLD vs GAS_SLOAD_WARM)
-    if (!evm_use_gas(evm, GAS_SLOAD_WARM))
+    // Check if address is cold/warm and charge appropriate gas (Berlin+)
+    bool is_warm = evm_is_address_warm(evm, &addr);
+    uint64_t gas_cost = is_warm ? GAS_SLOAD_WARM : GAS_SLOAD_COLD;
+    
+    if (!evm_use_gas(evm, gas_cost))
     {
         return EVM_OUT_OF_GAS;
+    }
+    
+    // Mark address as warm for future accesses
+    if (!is_warm)
+    {
+        evm_mark_address_warm(evm, &addr);
     }
 
     // Get balance from state
@@ -511,11 +520,23 @@ evm_status_t op_extcodesize(evm_t *evm)
         return EVM_STACK_UNDERFLOW;
     }
 
-    // TODO: Check if address is cold/warm and charge appropriate gas
-    // For now, charge warm access cost
-    if (!evm_use_gas(evm, GAS_SLOAD_WARM))
+    // Convert to address
+    address_t addr;
+    address_from_uint256(&address_u256, &addr);
+
+    // Check if address is cold/warm and charge appropriate gas (Berlin+)
+    bool is_warm = evm_is_address_warm(evm, &addr);
+    uint64_t gas_cost = is_warm ? GAS_SLOAD_WARM : GAS_SLOAD_COLD;
+    
+    if (!evm_use_gas(evm, gas_cost))
     {
         return EVM_OUT_OF_GAS;
+    }
+    
+    // Mark address as warm for future accesses
+    if (!is_warm)
+    {
+        evm_mark_address_warm(evm, &addr);
     }
 
     // TODO: Get code size from StateDB
@@ -558,13 +579,26 @@ evm_status_t op_extcodecopy(evm_t *evm)
     uint64_t dest_offset = uint256_to_uint64(&dest_offset_u256);
     uint64_t size = uint256_to_uint64(&size_u256);
 
-    // TODO: Check if address is cold/warm and charge appropriate gas
+    // Convert to address
+    address_t addr;
+    address_from_uint256(&address_u256, &addr);
+
+    // Check if address is cold/warm and charge appropriate gas (Berlin+)
+    bool is_warm = evm_is_address_warm(evm, &addr);
+    uint64_t access_cost = is_warm ? GAS_SLOAD_WARM : GAS_SLOAD_COLD;
+    
     // Calculate dynamic gas: base + copy cost + memory expansion
     uint64_t copy_gas = gas_copy_cost(size);
     uint64_t mem_gas = evm_memory_access_cost(evm->memory, dest_offset, size);
-    if (!evm_use_gas(evm, GAS_SLOAD_WARM + copy_gas + mem_gas))
+    if (!evm_use_gas(evm, access_cost + copy_gas + mem_gas))
     {
         return EVM_OUT_OF_GAS;
+    }
+    
+    // Mark address as warm for future accesses
+    if (!is_warm)
+    {
+        evm_mark_address_warm(evm, &addr);
     }
 
     // Expand memory if needed
@@ -609,11 +643,23 @@ evm_status_t op_extcodehash(evm_t *evm)
         return EVM_STACK_UNDERFLOW;
     }
 
-    // TODO: Check if address is cold/warm and charge appropriate gas
-    // For now, charge warm access cost
-    if (!evm_use_gas(evm, GAS_SLOAD_WARM))
+    // Convert to address
+    address_t addr;
+    address_from_uint256(&address_u256, &addr);
+
+    // Check if address is cold/warm and charge appropriate gas (Berlin+)
+    bool is_warm = evm_is_address_warm(evm, &addr);
+    uint64_t gas_cost = is_warm ? GAS_SLOAD_WARM : GAS_SLOAD_COLD;
+    
+    if (!evm_use_gas(evm, gas_cost))
     {
         return EVM_OUT_OF_GAS;
+    }
+    
+    // Mark address as warm for future accesses
+    if (!is_warm)
+    {
+        evm_mark_address_warm(evm, &addr);
     }
 
     // TODO: Get code hash from StateDB

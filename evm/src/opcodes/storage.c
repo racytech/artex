@@ -23,12 +23,14 @@
  * - Berlin+ (EIP-2929): Added cold/warm access costs
  * 
  * @param evm EVM context (for fork detection)
+ * @param key Storage key (for access list tracking)
  * @param current_value Current value in storage
  * @param new_value New value to store
  * @return Gas cost for this SSTORE operation
  */
 static uint64_t calculate_sstore_gas(
     evm_t *evm,
+    const uint256_t *key,
     const uint256_t *current_value,
     const uint256_t *new_value)
 {
@@ -38,23 +40,34 @@ static uint64_t calculate_sstore_gas(
     // Berlin+ (EIP-2929 + EIP-2200)
     // Adds cold/warm storage access costs
     if (evm->fork >= FORK_BERLIN) {
-        // TODO: Implement proper cold/warm tracking
-        // For now, assume all accesses are cold (worst case)
-        bool is_cold = true;  // Should check evm->accessed_storage
-        uint64_t access_cost = is_cold ? GAS_SLOAD_COLD : GAS_SLOAD_WARM;
+        // Check if storage slot is warm
+        bool is_warm = evm_is_storage_warm(evm, &evm->msg.recipient, key);
+        uint64_t access_cost = is_warm ? 0 : GAS_SLOAD_COLD;  // Cold penalty: 0 (warm) or 2100 (cold)
         
-        if (current_is_zero && !new_is_zero) {
-            // Setting from zero to non-zero (most expensive)
-            return GAS_SSTORE_SET + access_cost;  // 20000 + 2100 = 22100
+        // Mark as warm for future accesses
+        if (!is_warm)
+        {
+            evm_mark_storage_warm(evm, &evm->msg.recipient, key);
+        }
+        
+        // Check if value is changing
+        bool value_unchanged = uint256_eq(current_value, new_value);
+        
+        if (value_unchanged) {
+            // No change - ASSIGNED status
+            // Base cost: warm_access (100) + cold access penalty if needed
+            return GAS_SLOAD_WARM + access_cost;  // 100 + 2100 = 2200 (cold) or 100 + 0 = 100 (warm)
+        } else if (current_is_zero && !new_is_zero) {
+            // Setting from zero to non-zero - ADDED status
+            return GAS_SSTORE_SET + access_cost;  // 20000 + (2100 or 0)
         } else if (!current_is_zero && new_is_zero) {
-            // Clearing storage (reset + access cost)
-            return GAS_SSTORE_RESET + access_cost;  // 5000 + 2100 = 7100
-        } else if (!current_is_zero) {
-            // Modifying existing non-zero value
-            return GAS_SSTORE_RESET + access_cost;  // 5000 + 2100 = 7100
+            // Clearing storage - DELETED status  
+            // Berlin reset = 5000 - 2100 = 2900, total = 2900 + 2100 = 5000 (cold)
+            return (GAS_SSTORE_RESET - GAS_SLOAD_COLD) + access_cost;  // 2900 + (2100 or 0)
         } else {
-            // Setting zero to zero (no-op, just access cost + minimal)
-            return GAS_SLOAD_WARM + access_cost;  // 100 + 2100 = 2200
+            // Modifying existing non-zero value - MODIFIED status
+            // Same as DELETED
+            return (GAS_SSTORE_RESET - GAS_SLOAD_COLD) + access_cost;  // 2900 + (2100 or 0)
         }
     }
     
@@ -111,9 +124,26 @@ evm_status_t op_sload(evm_t *evm)
     uint256_t key;
     evm_stack_pop(evm->stack, &key);
 
-    // TODO: Check if key is cold/warm and charge appropriate gas
-    // For now, charge warm access cost (100 gas)
-    if (!evm_use_gas(evm, GAS_SLOAD_WARM))
+    // Check if storage slot is cold/warm and charge appropriate gas (EIP-2929)
+    uint64_t gas_cost;
+    if (evm->fork >= FORK_BERLIN)
+    {
+        bool is_warm = evm_is_storage_warm(evm, &evm->msg.recipient, &key);
+        gas_cost = is_warm ? GAS_SLOAD_WARM : GAS_SLOAD_COLD;
+        
+        // Mark as warm for future accesses
+        if (!is_warm)
+        {
+            evm_mark_storage_warm(evm, &evm->msg.recipient, &key);
+        }
+    }
+    else
+    {
+        // Pre-Berlin: use legacy gas cost
+        gas_cost = GAS_SLOAD_WARM;
+    }
+    
+    if (!evm_use_gas(evm, gas_cost))
     {
         return EVM_OUT_OF_GAS;
     }
@@ -165,9 +195,9 @@ evm_status_t op_sstore(evm_t *evm)
         // If key doesn't exist, treat as zero
         current_value = uint256_from_uint64(0);
     }
-
+    
     // Calculate fork-specific SSTORE gas cost
-    uint64_t gas_cost = calculate_sstore_gas(evm, &current_value, &value);
+    uint64_t gas_cost = calculate_sstore_gas(evm, &key, &current_value, &value);
     
     // Deduct gas
     if (!evm_use_gas(evm, gas_cost)) {

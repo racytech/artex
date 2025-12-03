@@ -24,6 +24,7 @@
 #include "hash.h"
 #include "address.h"
 #include "fork.h"
+#include "art.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -188,9 +189,9 @@ struct evm_t
     bool stopped;     // Execution stopped (STOP, RETURN, REVERT)
     evm_status_t status; // Execution status
 
-    // Access tracking (EIP-2929)
-    void *accessed_addresses; // Set of accessed addresses (warm)
-    void *accessed_storage;   // Set of accessed storage slots (warm)
+    // Access tracking (EIP-2929 - Berlin fork)
+    art_tree_t accessed_addresses; // Warm addresses (20-byte keys)
+    art_tree_t accessed_storage;   // Warm storage slots (52-byte keys: 20-byte address + 32-byte key)
 };
 
 //==============================================================================
@@ -292,6 +293,46 @@ void evm_refund_gas(evm_t *evm, uint64_t amount);
  * @return Remaining gas
  */
 uint64_t evm_get_gas_left(const evm_t *evm);
+
+//==============================================================================
+// Access List Operations (EIP-2929)
+//==============================================================================
+
+/**
+ * Check if an address is warm (already accessed)
+ *
+ * @param evm EVM instance
+ * @param addr Address to check
+ * @return true if address is warm, false if cold
+ */
+bool evm_is_address_warm(const evm_t *evm, const address_t *addr);
+
+/**
+ * Mark an address as warm (accessed)
+ *
+ * @param evm EVM instance
+ * @param addr Address to mark as warm
+ */
+void evm_mark_address_warm(evm_t *evm, const address_t *addr);
+
+/**
+ * Check if a storage slot is warm (already accessed)
+ *
+ * @param evm EVM instance
+ * @param addr Contract address
+ * @param key Storage key
+ * @return true if storage slot is warm, false if cold
+ */
+bool evm_is_storage_warm(const evm_t *evm, const address_t *addr, const uint256_t *key);
+
+/**
+ * Mark a storage slot as warm (accessed)
+ *
+ * @param evm EVM instance
+ * @param addr Contract address
+ * @param key Storage key
+ */
+void evm_mark_storage_warm(evm_t *evm, const address_t *addr, const uint256_t *key);
 
 //==============================================================================
 // Result Helpers

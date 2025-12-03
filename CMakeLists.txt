@@ -192,6 +192,10 @@ if(BUILD_TESTS)
         add_executable(test_runner_batch integration_tests/test_runner_batch_main.c)
         target_link_libraries(test_runner_batch art_integration_tests)
         # Note: This is the main integration test runner
+        
+        add_executable(test_runner_failfast integration_tests/test_runner_failfast_main.c)
+        target_link_libraries(test_runner_failfast art_integration_tests)
+        # Note: Fail-fast runner that stops on first failure and writes test case to file
     endif()
 endif()
 
