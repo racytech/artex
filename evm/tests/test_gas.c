@@ -259,9 +259,9 @@ void test_word_size_conversion(void)
     printf("  ✓ Word size conversion correct\n");
 }
 
-void test_sstore_basic(void)
+void test_sstore_pre_istanbul(void)
 {
-    printf("Testing basic SSTORE costs...\n");
+    printf("Testing Pre-Istanbul SSTORE costs...\n");
     
     uint256_t zero = uint256_from_uint64(0);
     uint256_t one = uint256_from_uint64(1);
@@ -271,17 +271,206 @@ void test_sstore_basic(void)
     // Pre-Istanbul: Setting zero to non-zero = 20000
     uint64_t cost = gas_sstore_cost(FORK_BYZANTIUM, &zero, &zero, &one, false, &refund);
     assert(cost == 20000);
+    assert(refund == 0);
     
     // Pre-Istanbul: Modifying non-zero = 5000
     cost = gas_sstore_cost(FORK_BYZANTIUM, &one, &one, &two, false, &refund);
     assert(cost == 5000);
+    assert(refund == 0);
     
-    // Pre-Istanbul: Clearing slot = 5000 + refund
+    // Pre-Istanbul: Clearing slot = 5000 + 15000 refund
+    refund = 0;
     cost = gas_sstore_cost(FORK_BYZANTIUM, &one, &one, &zero, false, &refund);
     assert(cost == 5000);
     assert(refund == 15000);
     
-    printf("  ✓ Basic SSTORE costs correct\n");
+    // Pre-Istanbul: No-op (same value) = 5000
+    refund = 0;
+    cost = gas_sstore_cost(FORK_BYZANTIUM, &one, &one, &one, false, &refund);
+    assert(cost == 5000);
+    assert(refund == 0);
+    
+    printf("  ✓ Pre-Istanbul costs correct\n");
+}
+
+void test_sstore_istanbul(void)
+{
+    printf("Testing Istanbul (EIP-2200) SSTORE costs...\n");
+    
+    uint256_t zero = uint256_from_uint64(0);
+    uint256_t one = uint256_from_uint64(1);
+    uint256_t two = uint256_from_uint64(2);
+    int64_t refund = 0;
+    
+    // Istanbul: No-op (current == new) = 800 (warm access)
+    uint64_t cost = gas_sstore_cost(FORK_ISTANBUL, &one, &one, &one, false, &refund);
+    assert(cost == 800);  // GAS_SLOAD_ISTANBUL
+    assert(refund == 0);
+    
+    // Istanbul: First write, zero to non-zero = 800 + 20000 = 20800
+    refund = 0;
+    cost = gas_sstore_cost(FORK_ISTANBUL, &zero, &zero, &one, false, &refund);
+    assert(cost == 20800);  // 800 (base) + 20000 (set)
+    assert(refund == 0);
+    
+    // Istanbul: First write, non-zero to zero = 800 + 5000 = 5800, refund 15000
+    refund = 0;
+    cost = gas_sstore_cost(FORK_ISTANBUL, &one, &one, &zero, false, &refund);
+    assert(cost == 5800);  // 800 (base) + 5000 (reset)
+    assert(refund == 15000);
+    
+    // Istanbul: First write, non-zero to different non-zero = 800 + 5000 = 5800
+    refund = 0;
+    cost = gas_sstore_cost(FORK_ISTANBUL, &one, &one, &two, false, &refund);
+    assert(cost == 5800);  // 800 (base) + 5000 (modify)
+    assert(refund == 0);
+    
+    // Istanbul: Subsequent write (original=0, current=1, new=2) = 800
+    refund = 0;
+    cost = gas_sstore_cost(FORK_ISTANBUL, &one, &zero, &two, false, &refund);
+    assert(cost == 800);  // Just base cost for subsequent write
+    assert(refund == 0);
+    
+    // Istanbul: Reset to original zero (original=0, current=1, new=0) = 800 + refund
+    refund = 0;
+    cost = gas_sstore_cost(FORK_ISTANBUL, &one, &zero, &zero, false, &refund);
+    assert(cost == 800);
+    assert(refund == 19200);  // 20000 - 800 (SSTORE_SET - SLOAD)
+    
+    printf("  ✓ Istanbul (EIP-2200) costs correct\n");
+}
+
+void test_sstore_berlin(void)
+{
+    printf("Testing Berlin (EIP-2929) SSTORE costs...\n");
+    
+    uint256_t zero = uint256_from_uint64(0);
+    uint256_t one = uint256_from_uint64(1);
+    uint256_t two = uint256_from_uint64(2);
+    int64_t refund = 0;
+    
+    // Berlin: No-op, warm access = 100
+    uint64_t cost = gas_sstore_cost(FORK_BERLIN, &one, &one, &one, false, &refund);
+    assert(cost == 100);  // GAS_SLOAD_WARM
+    assert(refund == 0);
+    
+    // Berlin: No-op, cold access = 2100
+    refund = 0;
+    cost = gas_sstore_cost(FORK_BERLIN, &one, &one, &one, true, &refund);
+    assert(cost == 2100);  // GAS_SLOAD_COLD
+    assert(refund == 0);
+    
+    // Berlin: First write, zero to non-zero, warm = 100 + 20000 = 20100
+    refund = 0;
+    cost = gas_sstore_cost(FORK_BERLIN, &zero, &zero, &one, false, &refund);
+    assert(cost == 20100);
+    assert(refund == 0);
+    
+    // Berlin: First write, zero to non-zero, cold = 2100 + 20000 = 22100
+    refund = 0;
+    cost = gas_sstore_cost(FORK_BERLIN, &zero, &zero, &one, true, &refund);
+    assert(cost == 22100);
+    assert(refund == 0);
+    
+    // Berlin: First write, non-zero to zero, warm = 100 + 2900 = 3000, refund 15000
+    refund = 0;
+    cost = gas_sstore_cost(FORK_BERLIN, &one, &one, &zero, false, &refund);
+    assert(cost == 3000);  // 100 + (5000 - 2100)
+    assert(refund == 15000);
+    
+    // Berlin: First write, non-zero to zero, cold = 2100 + 2900 = 5000, refund 15000
+    refund = 0;
+    cost = gas_sstore_cost(FORK_BERLIN, &one, &one, &zero, true, &refund);
+    assert(cost == 5000);  // 2100 + (5000 - 2100)
+    assert(refund == 15000);
+    
+    // Berlin: First write, non-zero to different non-zero, warm = 100 + 2900 = 3000
+    refund = 0;
+    cost = gas_sstore_cost(FORK_BERLIN, &one, &one, &two, false, &refund);
+    assert(cost == 3000);
+    assert(refund == 0);
+    
+    // Berlin: First write, non-zero to different non-zero, cold = 2100 + 2900 = 5000
+    refund = 0;
+    cost = gas_sstore_cost(FORK_BERLIN, &one, &one, &two, true, &refund);
+    assert(cost == 5000);
+    assert(refund == 0);
+    
+    // Berlin: Subsequent write (original=0, current=1, new=2), warm = 100
+    refund = 0;
+    cost = gas_sstore_cost(FORK_BERLIN, &one, &zero, &two, false, &refund);
+    assert(cost == 100);
+    assert(refund == 0);
+    
+    // Berlin: Reset to original zero (original=0, current=1, new=0), warm = 100
+    refund = 0;
+    cost = gas_sstore_cost(FORK_BERLIN, &one, &zero, &zero, false, &refund);
+    assert(cost == 100);
+    assert(refund == 18000);  // 20000 - 2100 + 100
+    
+    printf("  ✓ Berlin (EIP-2929) costs correct\n");
+}
+
+void test_sstore_london(void)
+{
+    printf("Testing London (EIP-3529) SSTORE costs...\n");
+    
+    uint256_t zero = uint256_from_uint64(0);
+    uint256_t one = uint256_from_uint64(1);
+    int64_t refund = 0;
+    
+    // London: First write, non-zero to zero, warm = 100 + 2900 = 3000, refund 4800 (reduced)
+    uint64_t cost = gas_sstore_cost(FORK_LONDON, &one, &one, &zero, false, &refund);
+    assert(cost == 3000);
+    assert(refund == 4800);  // Reduced from 15000 to 4800
+    
+    // London: First write, non-zero to zero, cold = 2100 + 2900 = 5000, refund 4800
+    refund = 0;
+    cost = gas_sstore_cost(FORK_LONDON, &one, &one, &zero, true, &refund);
+    assert(cost == 5000);
+    assert(refund == 4800);  // Reduced from 15000 to 4800
+    
+    // London: Other costs should be same as Berlin
+    refund = 0;
+    cost = gas_sstore_cost(FORK_LONDON, &zero, &zero, &one, false, &refund);
+    assert(cost == 20100);  // Same as Berlin
+    assert(refund == 0);
+    
+    printf("  ✓ London (EIP-3529) reduced refunds correct\n");
+}
+
+void test_sstore_edge_cases(void)
+{
+    printf("Testing SSTORE edge cases...\n");
+    
+    uint256_t zero = uint256_from_uint64(0);
+    uint256_t one = uint256_from_uint64(1);
+    uint256_t two = uint256_from_uint64(2);
+    int64_t refund = 0;
+    
+    // Edge: NULL refund parameter should not crash
+    uint64_t cost = gas_sstore_cost(FORK_BERLIN, &one, &one, &two, false, NULL);
+    assert(cost == 3000);
+    
+    // Edge: Clearing already cleared (original=0, current=0, new=0) = no-op
+    refund = 0;
+    cost = gas_sstore_cost(FORK_BERLIN, &zero, &zero, &zero, false, &refund);
+    assert(cost == 100);  // Just base cost
+    assert(refund == 0);
+    
+    // Edge: Subsequent write clearing slot (original=1, current=2, new=0), warm
+    refund = 0;
+    cost = gas_sstore_cost(FORK_BERLIN, &two, &one, &zero, false, &refund);
+    assert(cost == 100);  // Just base cost for subsequent write
+    assert(refund == 15000);  // Grant clear refund
+    
+    // Edge: Subsequent write then undo clear (original=1, current=0, new=2), warm
+    refund = 0;
+    cost = gas_sstore_cost(FORK_BERLIN, &zero, &one, &two, false, &refund);
+    assert(cost == 100);  // Just base cost for subsequent write
+    assert(refund == -15000);  // Remove clear refund (negative)
+    
+    printf("  ✓ Edge cases handled correctly\n");
 }
 
 void test_opcode_info(void)
@@ -322,7 +511,11 @@ int main(void)
     test_call_stipend();
     test_max_call_gas();
     test_word_size_conversion();
-    test_sstore_basic();
+    test_sstore_pre_istanbul();
+    test_sstore_istanbul();
+    test_sstore_berlin();
+    test_sstore_london();
+    test_sstore_edge_cases();
     test_opcode_info();
     
     printf("\n=== All Gas Tests Passed ===\n\n");

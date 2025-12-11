@@ -41,6 +41,16 @@ evm_status_t op_create(evm_t *evm);
  */
 evm_status_t op_create2(evm_t *evm);
 
+//==============================================================================
+// Helper Functions
+//==============================================================================
+
+/**
+ * Calculate CREATE contract address: keccak256(rlp([sender, nonce]))[12:]
+ * Used by both CREATE opcode and transaction-level contract creation
+ */
+address_t calculate_create_address(const address_t *sender, uint64_t nonce);
+
 #ifdef __cplusplus
 }
 #endif

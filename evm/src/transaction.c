@@ -4,6 +4,7 @@
 
 #include "transaction.h"
 #include "evm.h"
+#include "opcodes/create.h"
 #include "logger.h"
 #include <stdlib.h>
 #include <string.h>
@@ -184,6 +185,12 @@ bool transaction_execute(
         sender_nonce = 0;
     }
     
+    // Calculate contract address BEFORE incrementing nonce
+    address_t contract_address = {0};
+    if (tx->is_create) {
+        contract_address = calculate_create_address(&tx->sender, sender_nonce);
+    }
+    
     if (!state_db_set_nonce(state, &tx->sender, sender_nonce + 1)) {
         LOG_EVM_ERROR("Failed to increment sender nonce");
         state_db_revert_to_snapshot(state, snapshot);
@@ -197,6 +204,23 @@ bool transaction_execute(
         return false;
     }
 
+    // For contract creation, create empty account at contract address
+    if (tx->is_create) {
+        // Try to create account - will fail if collision
+        if (!state_db_create_account(state, &contract_address)) {
+            // Account already exists - check if it's a collision
+            uint64_t existing_nonce;
+            if (state_db_get_nonce(state, &contract_address, &existing_nonce)) {
+                if (existing_nonce > 0) {
+                    LOG_EVM_ERROR("Contract address collision: nonce=%lu", existing_nonce);
+                    state_db_revert_to_snapshot(state, snapshot);
+                    return false;
+                }
+            }
+            // If nonce is 0, account was just accessed in cache
+        }
+    }
+    
     // Transfer value (if any)
     if (!uint256_is_zero(&tx->value)) {
         if (!state_db_sub_balance(state, &tx->sender, &tx->value)) {
@@ -205,7 +229,8 @@ bool transaction_execute(
             return false;
         }
         
-        if (!state_db_add_balance(state, &tx->to, &tx->value)) {
+        address_t recipient = tx->is_create ? contract_address : tx->to;
+        if (!state_db_add_balance(state, &recipient, &tx->value)) {
             LOG_EVM_ERROR("Failed to add value to recipient");
             state_db_revert_to_snapshot(state, snapshot);
             return false;
@@ -231,11 +256,14 @@ bool transaction_execute(
     uint64_t gas_for_execution = tx->gas_limit - intrinsic_gas;
 
     // Create EVM message
+    address_t recipient = tx->is_create ? contract_address : tx->to;
+    address_t code_addr = tx->is_create ? contract_address : tx->to;
+    
     evm_message_t msg = {
         .kind = tx->is_create ? EVM_CREATE : EVM_CALL,
         .caller = tx->sender,
-        .recipient = tx->to,
-        .code_addr = tx->to,
+        .recipient = recipient,
+        .code_addr = code_addr,
         .value = tx->value,
         .input_data = tx->data,
         .input_size = tx->data_size,
@@ -257,29 +285,56 @@ bool transaction_execute(
     result->gas_used = intrinsic_gas + (gas_for_execution - evm_result.gas_left);
     result->gas_refund = evm_result.gas_refund;
 
-    // Handle EVM revert
-    if (evm_result.status == EVM_REVERT) {
-        // Revert state changes but keep nonce increment and gas payment
-        // TODO: More sophisticated revert handling
-    }
-
     // Handle contract creation
-    if (tx->is_create && evm_result.status == EVM_SUCCESS) {
-        // Store deployed code
-        if (evm_result.output_data && evm_result.output_size > 0) {
-            // Calculate contract address (simplified - should use CREATE2 for type 2)
-            // For now, just use the 'to' address
-            result->contract_address = tx->to;
-            result->contract_created = true;
-            
-            if (!state_db_set_code(state, &tx->to, 
-                                  evm_result.output_data, 
-                                  evm_result.output_size)) {
-                LOG_EVM_ERROR("Failed to store contract code");
-                state_db_revert_to_snapshot(state, snapshot);
-                evm_result_free(&evm_result);
-                return false;
+    if (tx->is_create) {
+        if (evm_result.status == EVM_SUCCESS) {
+            // Store deployed code
+            if (evm_result.output_data && evm_result.output_size > 0) {
+                // Charge deployment gas (200 gas per byte)
+                const uint64_t G_CODE_DEPOSIT = 200;
+                uint64_t deployment_gas = evm_result.output_size * G_CODE_DEPOSIT;
+                
+                // Check if enough gas left for deployment
+                if (evm_result.gas_left < deployment_gas) {
+                    LOG_EVM_DEBUG("Insufficient gas for code deployment");
+                    // Out of gas during deployment - delete contract account
+                    state_db_suicide(state, &contract_address);
+                    result->status = EVM_OUT_OF_GAS;
+                    result->gas_used = tx->gas_limit - intrinsic_gas;  // All execution gas consumed
+                    result->contract_created = false;
+                } else {
+                    // Deduct deployment gas
+                    result->gas_used += deployment_gas;
+                    
+                    // Store contract code
+                    if (!state_db_set_code(state, &contract_address, 
+                                          evm_result.output_data, 
+                                          evm_result.output_size)) {
+                        LOG_EVM_ERROR("Failed to store contract code");
+                        state_db_revert_to_snapshot(state, snapshot);
+                        evm_result_free(&evm_result);
+                        return false;
+                    }
+                    
+                    result->contract_address = contract_address;
+                    result->contract_created = true;
+                }
+            } else {
+                // Empty code - contract created with no code
+                result->contract_address = contract_address;
+                result->contract_created = true;
             }
+        } else if (evm_result.status == EVM_REVERT) {
+            // REVERT during contract creation
+            // Delete contract account and revert state changes
+            state_db_suicide(state, &contract_address);
+            result->status = EVM_SUCCESS;  // Transaction succeeds even if init code reverts
+            result->contract_created = false;
+        } else {
+            // Other errors (out of gas, stack underflow, etc.)
+            // Delete contract account
+            state_db_suicide(state, &contract_address);
+            result->contract_created = false;
         }
     }
 

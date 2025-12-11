@@ -13,27 +13,36 @@
 //==============================================================================
 
 /**
- * Calculate SSTORE gas cost based on fork rules
+ * Calculate SSTORE gas cost and refund based on fork rules
  * 
  * Implements fork-specific gas calculation for SSTORE:
- * - Frontier/Homestead: Simple set (20000) or reset (5000)
+ * - Frontier/Homestead: Simple set (20000) or reset (5000) with refunds
  * - Constantinople (EIP-1283): Net gas metering with refunds
  * - Petersburg: Reverted EIP-1283, back to Homestead rules
- * - Istanbul (EIP-2200): Improved net gas metering
+ * - Istanbul (EIP-2200): Improved net gas metering with refunds
  * - Berlin+ (EIP-2929): Added cold/warm access costs
+ * - London+ (EIP-3529): Reduced refunds (4800 vs 15000)
  * 
- * @param evm EVM context (for fork detection)
+ * @param evm EVM context (for fork detection and warm/cold tracking)
  * @param key Storage key (for access list tracking)
  * @param current_value Current value in storage
  * @param new_value New value to store
+ * @param gas_refund Output parameter for gas refund amount (can be NULL)
  * @return Gas cost for this SSTORE operation
  */
 static uint64_t calculate_sstore_gas(
     evm_t *evm,
     const uint256_t *key,
     const uint256_t *current_value,
-    const uint256_t *new_value)
+    const uint256_t *new_value,
+    int64_t *gas_refund)
 {
+    // Initialize refund
+    if (gas_refund)
+    {
+        *gas_refund = 0;
+    }
+    
     bool current_is_zero = uint256_is_zero(current_value);
     bool new_is_zero = uint256_is_zero(new_value);
     
@@ -63,6 +72,15 @@ static uint64_t calculate_sstore_gas(
         } else if (!current_is_zero && new_is_zero) {
             // Clearing storage - DELETED status  
             // Berlin reset = 5000 - 2100 = 2900, total = 2900 + 2100 = 5000 (cold)
+            
+            // Grant refund for clearing storage
+            if (gas_refund)
+            {
+                // London (EIP-3529): reduced refund of 4800
+                // Pre-London: full refund of 15000
+                *gas_refund = (evm->fork >= FORK_LONDON) ? 4800 : GAS_SSTORE_REFUND;
+            }
+            
             return (GAS_SSTORE_RESET - GAS_SLOAD_COLD) + access_cost;  // 2900 + (2100 or 0)
         } else {
             // Modifying existing non-zero value - MODIFIED status
@@ -77,6 +95,13 @@ static uint64_t calculate_sstore_gas(
         // Simplified Istanbul rules (full implementation needs original value tracking)
         if (current_is_zero && !new_is_zero) {
             return GAS_SSTORE_SET;  // 20000
+        } else if (!current_is_zero && new_is_zero) {
+            // Clearing storage - grant refund
+            if (gas_refund)
+            {
+                *gas_refund = GAS_SSTORE_REFUND; // 15000
+            }
+            return GAS_SLOAD_ISTANBUL;  // 800
         } else {
             return GAS_SLOAD_ISTANBUL;  // 800
         }
@@ -88,6 +113,13 @@ static uint64_t calculate_sstore_gas(
         // Simplified Constantinople rules
         if (current_is_zero && !new_is_zero) {
             return GAS_SSTORE_SET;  // 20000
+        } else if (!current_is_zero && new_is_zero) {
+            // Clearing storage - grant refund
+            if (gas_refund)
+            {
+                *gas_refund = GAS_SSTORE_REFUND; // 15000
+            }
+            return GAS_SLOAD_ISTANBUL;  // 800
         } else {
             return GAS_SLOAD_ISTANBUL;  // 800
         }
@@ -97,6 +129,13 @@ static uint64_t calculate_sstore_gas(
     else {
         if (current_is_zero && !new_is_zero) {
             return GAS_SSTORE_SET;    // 20000
+        } else if (!current_is_zero && new_is_zero) {
+            // Clearing storage - grant refund
+            if (gas_refund)
+            {
+                *gas_refund = GAS_SSTORE_REFUND; // 15000
+            }
+            return GAS_SSTORE_RESET;  // 5000
         } else {
             return GAS_SSTORE_RESET;  // 5000
         }
@@ -196,12 +235,21 @@ evm_status_t op_sstore(evm_t *evm)
         current_value = uint256_from_uint64(0);
     }
     
-    // Calculate fork-specific SSTORE gas cost
-    uint64_t gas_cost = calculate_sstore_gas(evm, &key, &current_value, &value);
+    // Calculate fork-specific SSTORE gas cost and refund
+    int64_t gas_refund = 0;
+    uint64_t gas_cost = calculate_sstore_gas(evm, &key, &current_value, &value, &gas_refund);
+    
+    LOG_EVM_ERROR("SSTORE: cost=%lu, refund=%ld", gas_cost, gas_refund);
     
     // Deduct gas
     if (!evm_use_gas(evm, gas_cost)) {
         return EVM_OUT_OF_GAS;
+    }
+    
+    // Apply gas refund if any
+    if (gas_refund > 0) {
+        LOG_EVM_ERROR("SSTORE: Granting refund of %ld gas", gas_refund);
+        evm_refund_gas(evm, (uint64_t)gas_refund);
     }
 
     // Store value to storage using current contract address

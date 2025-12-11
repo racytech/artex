@@ -154,7 +154,7 @@ bool parse_transaction(const cJSON *json, test_transaction_t *out) {
     
     // To address
     if (json_get_string(json, "to", &str)) {
-        if (strlen(str) == 2 || strcmp(str, "0x") == 0) {
+        if (strlen(str) == 0 || strlen(str) == 2 || strcmp(str, "0x") == 0) {
             // Empty address = contract creation
             out->is_create = true;
             memset(&out->to, 0, sizeof(out->to));

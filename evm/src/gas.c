@@ -315,6 +315,23 @@ uint64_t gas_exp_cost(uint8_t exponent_bytes, evm_fork_t fork)
 // SSTORE Gas Costs (Complex)
 //==============================================================================
 
+/**
+ * Calculate SSTORE gas cost and refund based on EIP-2200 (Istanbul) and EIP-3529 (London)
+ * 
+ * Implements:
+ * - Pre-Istanbul: Simple set (20000) or reset (5000) with 15000 refund for clearing
+ * - Istanbul (EIP-2200): Net gas metering with refunds based on original value
+ * - Berlin (EIP-2929): Cold/warm storage access costs
+ * - London (EIP-3529): Reduced refunds (4800 instead of 15000)
+ * 
+ * @param fork Current EVM fork
+ * @param current_value Current value in storage (before this write)
+ * @param original_value Original value at transaction start
+ * @param new_value New value being written
+ * @param is_cold Whether storage slot is cold (first access in tx)
+ * @param gas_refund Output parameter for gas refund amount
+ * @return Gas cost for this SSTORE operation
+ */
 uint64_t gas_sstore_cost(evm_fork_t fork,
                          const uint256_t *current_value,
                          const uint256_t *original_value,
@@ -332,67 +349,159 @@ uint64_t gas_sstore_cost(evm_fork_t fork,
     bool new_is_zero = uint256_is_zero(new_value);
     bool original_is_zero = uint256_is_zero(original_value);
 
-    // Pre-Istanbul: Simple model
+    // Pre-Istanbul: Simple model (Frontier/Homestead/Petersburg)
     if (fork < FORK_ISTANBUL)
     {
         if (current_is_zero && !new_is_zero)
         {
             // Setting a zero slot to non-zero
-            return 20000;
+            return GAS_SSTORE_SET;
         }
         else if (!current_is_zero && new_is_zero)
         {
             // Clearing a slot (refund)
             if (gas_refund)
             {
-                *gas_refund = 15000;
+                *gas_refund = GAS_SSTORE_REFUND; // 15000
             }
-            return 5000;
+            return GAS_SSTORE_RESET;
         }
         else
         {
             // Modifying existing slot
-            return 5000;
+            return GAS_SSTORE_RESET;
         }
     }
 
-    // Istanbul+: EIP-2200 (more complex, gas-dependent)
+    // Istanbul+: EIP-2200 (complex, state-dependent)
     // Berlin+: Add cold storage access cost (EIP-2929)
     // London+: Reduce refunds (EIP-3529)
 
-    uint64_t base_cost = 100; // Warm access
-    if (fork >= FORK_BERLIN && is_cold)
+    // Calculate base cost (warm/cold access)
+    uint64_t base_cost;
+    if (fork >= FORK_BERLIN)
     {
-        base_cost = 2100; // Cold access
+        // Berlin+: Cold/warm access costs
+        base_cost = is_cold ? GAS_SLOAD_COLD : GAS_SLOAD_WARM; // 2100 or 100
+    }
+    else
+    {
+        // Istanbul to pre-Berlin: Fixed cost
+        base_cost = GAS_SLOAD_ISTANBUL; // 800
     }
 
-    // EIP-2200 logic (simplified)
+    // No change - just pay access cost
     if (uint256_eq(current_value, new_value))
     {
-        // No change
         return base_cost;
     }
 
-    if (uint256_eq(original_value, current_value))
+    // Value is changing - apply EIP-2200 logic
+    
+    // Check if this is the first write to this slot in the transaction
+    bool is_first_write = uint256_eq(original_value, current_value);
+    
+    if (is_first_write)
     {
-        // First write in transaction
-        if (original_is_zero)
+        // First write in transaction - charge full cost
+        if (original_is_zero && !new_is_zero)
         {
-            return base_cost + 20000; // Setting from zero
+            // Setting from zero to non-zero - ADDED
+            return base_cost + GAS_SSTORE_SET; // 100/2100 + 20000
+        }
+        else if (!original_is_zero && new_is_zero)
+        {
+            // Clearing storage - DELETED
+            // Berlin+: 2900 base, pre-Berlin: 5000
+            uint64_t clear_cost = fork >= FORK_BERLIN ? 
+                (GAS_SSTORE_RESET - GAS_SLOAD_COLD) : GAS_SSTORE_RESET;
+            
+            // Grant refund for clearing storage
+            if (gas_refund)
+            {
+                // London (EIP-3529): reduced refund of 4800
+                // Pre-London: full refund of 15000
+                *gas_refund = (fork >= FORK_LONDON) ? 4800 : GAS_SSTORE_REFUND;
+            }
+            
+            return base_cost + clear_cost; // 100/2100 + 2900/5000
         }
         else
         {
-            return base_cost + 2900; // Modifying non-zero
+            // Modifying non-zero to different non-zero - MODIFIED
+            // Berlin+: 2900, pre-Berlin: 5000
+            uint64_t modify_cost = fork >= FORK_BERLIN ? 
+                (GAS_SSTORE_RESET - GAS_SLOAD_COLD) : GAS_SSTORE_RESET;
+            return base_cost + modify_cost; // 100/2100 + 2900/5000
         }
     }
     else
     {
-        // Subsequent write
+        // Subsequent write to same slot in transaction - cheap
+        // Only pay access cost, but grant refunds if we're resetting
+        
+        if (gas_refund)
+        {
+            // Refund logic for subsequent writes
+            bool original_equals_new = uint256_eq(original_value, new_value);
+            
+            if (!original_is_zero && current_is_zero && !new_is_zero)
+            {
+                // Was cleared earlier, now resetting - remove clear refund
+                int64_t clear_refund = (fork >= FORK_LONDON) ? 4800 : GAS_SSTORE_REFUND;
+                *gas_refund = -clear_refund;
+            }
+            else if (!original_is_zero && !current_is_zero && new_is_zero)
+            {
+                // Clearing now (wasn't cleared before) - grant refund
+                *gas_refund = (fork >= FORK_LONDON) ? 4800 : GAS_SSTORE_REFUND;
+            }
+            else if (original_equals_new)
+            {
+                // Resetting to original value
+                if (original_is_zero)
+                {
+                    // Original was zero, we set it, now resetting - refund set cost minus base
+                    if (fork >= FORK_BERLIN)
+                    {
+                        *gas_refund = GAS_SSTORE_SET - GAS_SLOAD_COLD + base_cost;
+                    }
+                    else
+                    {
+                        // Istanbul: Refund SSTORE_SET_GAS - SLOAD_GAS
+                        *gas_refund = GAS_SSTORE_SET - base_cost;
+                    }
+                }
+                else if (current_is_zero)
+                {
+                    // Was cleared, now resetting to original non-zero
+                    int64_t clear_refund = (fork >= FORK_LONDON) ? 4800 : GAS_SSTORE_REFUND;
+                    if (fork >= FORK_BERLIN)
+                    {
+                        *gas_refund = GAS_SSTORE_RESET - GAS_SLOAD_COLD - base_cost - clear_refund;
+                    }
+                    else
+                    {
+                        *gas_refund = -clear_refund;
+                    }
+                }
+                else
+                {
+                    // Was modified, now resetting to original non-zero
+                    if (fork >= FORK_BERLIN)
+                    {
+                        *gas_refund = GAS_SSTORE_RESET - GAS_SLOAD_COLD - base_cost;
+                    }
+                    else
+                    {
+                        *gas_refund = GAS_SSTORE_RESET - GAS_SSTORE_RESET;
+                    }
+                }
+            }
+        }
+        
         return base_cost;
     }
-
-    // Note: Refund logic is more complex and depends on London fork
-    // This is a simplified version
 }
 
 //==============================================================================

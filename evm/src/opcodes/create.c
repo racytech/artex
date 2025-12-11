@@ -24,7 +24,7 @@
 /**
  * Calculate CREATE contract address: keccak256(rlp([sender, nonce]))
  */
-static address_t calculate_create_address(const address_t *sender, uint64_t nonce)
+address_t calculate_create_address(const address_t *sender, uint64_t nonce)
 {
     // Create RLP list [sender, nonce]
     rlp_item_t *list = rlp_list_new();

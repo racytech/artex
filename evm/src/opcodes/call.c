@@ -233,6 +233,7 @@ static evm_status_t prepare_call(
     // Note: stipend was already added to gas_left, so we're only deducting gas_to_forward
     if (!evm_use_gas(evm, gas_to_forward))
     {
+        *gas_forwarded = 0;  // Initialize to prevent garbage value
         return EVM_OUT_OF_GAS;
     }
     fprintf(stderr, "PREPARE_CALL: Reserved %lu gas for subcall, gas_left now=%lu\n", 
