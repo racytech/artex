@@ -9,6 +9,11 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <cJSON.h>
+
+// Forward declarations
+extern cJSON* load_json_file(const char *filepath);
+extern bool parse_state_test_from_json(const cJSON *test_obj, const char *test_name, state_test_t **out);
 
 //==============================================================================
 // File Test Execution
@@ -47,16 +52,65 @@ bool test_runner_run_file(test_runner_t *runner,
     bool success = false;
     
     if (is_state_test) {
-        state_test_t *test = NULL;
-        if (!parse_state_test(filepath, &test)) {
+        // State test files can contain multiple test objects
+        cJSON *root = load_json_file(filepath);
+        if (!root) {
             if (runner->config.verbose) {
-                fprintf(stderr, "  ERROR: Failed to parse state test\n");
+                fprintf(stderr, "  ERROR: Failed to load JSON file\n");
             }
             return false;
         }
         
-        success = test_runner_run_state_test(runner, test, NULL, &result);
-        state_test_free(test);
+        // Count test objects in the file
+        int total_tests = 0;
+        cJSON *test_obj;
+        cJSON_ArrayForEach(test_obj, root) {
+            if (test_obj->string) total_tests++;
+        }
+        
+        if (total_tests == 0) {
+            if (runner->config.verbose) {
+                fprintf(stderr, "  ERROR: No test objects found in file\n");
+            }
+            cJSON_Delete(root);
+            return false;
+        }
+        
+        // Run each test object
+        int tests_run = 0;
+        cJSON_ArrayForEach(test_obj, root) {
+            if (!test_obj->string) continue;
+            
+            // Parse this test object
+            state_test_t *test = NULL;
+            if (!parse_state_test_from_json(test_obj, test_obj->string, &test)) {
+                if (runner->config.verbose) {
+                    fprintf(stderr, "  ERROR: Failed to parse test: %s\n", test_obj->string);
+                }
+                continue;
+            }
+            
+            // Run the test
+            success = test_runner_run_state_test(runner, test, NULL, &result);
+            tests_run++;
+            
+            if (success) {
+                test_results_add(results, &result);
+                test_result_free(&result);
+            }
+            
+            state_test_free(test);
+            
+            // If test failed, stop (fail-fast)
+            if (!success) {
+                break;
+            }
+        }
+        
+        cJSON_Delete(root);
+        
+        // Return true if we ran at least one test
+        return tests_run > 0;
         
     } else if (is_blockchain_test) {
         blockchain_test_t *test = NULL;

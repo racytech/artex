@@ -118,6 +118,62 @@ bool state_db_commit_transaction(state_db_t *db)
     return result;
 }
 
+bool state_db_finalize_transaction(state_db_t *db)
+{
+    if (!db)
+        return false;
+
+    // EIP-161: Delete all empty accounts
+    // An account is empty if balance=0, nonce=0, and no code
+    
+    // Collect addresses of empty accounts to delete
+    address_t empty_accounts[256];  // Reasonable max for one transaction
+    size_t empty_count = 0;
+    
+    // Iterate through cache to find empty accounts
+    state_cache_iterator_t *iter = state_cache_iterator_create(&db->cache);
+    if (!iter)
+    {
+        LOG_STATE_ERROR("state_db_finalize_transaction: failed to create iterator");
+        return false;
+    }
+    
+    while (state_cache_iterator_next(iter) && empty_count < 256)
+    {
+        const address_t *addr = state_cache_iterator_address(iter);
+        const account_object_t *account = state_cache_iterator_account(iter);
+        
+        if (!addr || !account || !account->exists)
+            continue;
+            
+        // Check if account is empty (EIP-161)
+        bool is_empty = uint256_is_zero(&account->balance) && 
+                        account->nonce == 0 && 
+                        account->code_size == 0;
+        
+        if (is_empty)
+        {
+            address_copy(&empty_accounts[empty_count++], addr);
+            LOG_STATE_DEBUG("state_db_finalize_transaction: marking empty account for deletion");
+        }
+    }
+    
+    state_cache_iterator_destroy(iter);
+    
+    // Delete empty accounts
+    for (size_t i = 0; i < empty_count; i++)
+    {
+        state_db_suicide(db, &empty_accounts[i]);
+    }
+    
+    if (empty_count > 0)
+    {
+        LOG_STATE_DEBUG("state_db_finalize_transaction: deleted %zu empty accounts", empty_count);
+    }
+    
+    return true;
+}
+
 bool state_db_revert_to_snapshot(state_db_t *db, uint32_t snapshot_id)
 {
     if (!db)
@@ -189,6 +245,8 @@ bool state_db_set_balance(state_db_t *db, const address_t *addr, const uint256_t
     if (!account)
         return false;
 
+    bool was_existing = account->exists;
+
     // Record old state in journal if this is the first modification
     if (!account->dirty && account->exists)
     {
@@ -197,7 +255,19 @@ bool state_db_set_balance(state_db_t *db, const address_t *addr, const uint256_t
     }
 
     account->balance = *balance;
-    account->exists = true;
+    // Only mark as existing if it already exists or has non-zero value
+    bool should_exist = (was_existing || !uint256_is_zero(balance) || account->nonce > 0 || account->code_size > 0);
+    
+    // If account is transitioning from non-existent to existent, record ACCOUNT_CREATED
+    if (!was_existing && should_exist)
+    {
+        if (!state_journal_account_created(&db->journal, addr))
+        {
+            return false;
+        }
+    }
+    
+    account->exists = should_exist;
     state_cache_mark_dirty(&db->cache, account);
 
     return true;
@@ -257,6 +327,8 @@ bool state_db_set_nonce(state_db_t *db, const address_t *addr, uint64_t nonce)
     if (!account)
         return false;
 
+    bool was_existing = account->exists;
+
     // Record old state in journal if this is the first modification
     if (!account->dirty && account->exists)
     {
@@ -265,7 +337,19 @@ bool state_db_set_nonce(state_db_t *db, const address_t *addr, uint64_t nonce)
     }
 
     account->nonce = nonce;
-    account->exists = true;
+    // Only mark as existing if it already exists or has non-zero value
+    bool should_exist = (was_existing || nonce > 0 || !uint256_is_zero(&account->balance) || account->code_size > 0);
+    
+    // If account is transitioning from non-existent to existent, record ACCOUNT_CREATED
+    if (!was_existing && should_exist)
+    {
+        if (!state_journal_account_created(&db->journal, addr))
+        {
+            return false;
+        }
+    }
+    
+    account->exists = should_exist;
     state_cache_mark_dirty(&db->cache, account);
 
     return true;
@@ -314,6 +398,16 @@ bool state_db_get_code(const state_db_t *db, const address_t *addr,
         return false;
 
     account_object_t *account = state_cache_get_account((state_cache_t *)&db->cache, addr);
+    
+    // Debug: Track 0x100b
+    if (addr->bytes[19] == 0x0b && addr->bytes[18] == 0x10) {
+        printf("DEBUG state_db_get_code: 0x100b - account=%p, exists=%d, code=%p, code_size=%zu\n",
+               (void*)account,
+               account ? account->exists : -1,
+               account ? (void*)account->code : NULL,
+               account ? account->code_size : 0);
+    }
+    
     if (!account || !account->exists || !account->code || account->code_size == 0)
     {
         *code = NULL;
@@ -332,9 +426,26 @@ bool state_db_set_code(state_db_t *db, const address_t *addr,
     if (!db || !addr)
         return false;
 
+    // Debug: Track 0x100b code setting
+    if (addr->bytes[19] == 0x0b && addr->bytes[18] == 0x10) {
+        printf("DEBUG state_db_set_code: Called for 0x100b, code_size=%zu\n", code_size);
+    }
+
     account_object_t *account = state_cache_get_account(&db->cache, addr);
-    if (!account)
+    if (!account) {
+        if (addr->bytes[19] == 0x0b && addr->bytes[18] == 0x10) {
+            printf("DEBUG state_db_set_code: FAILED to get account for 0x100b!\n");
+        }
         return false;
+    }
+    
+    // Debug: Track 0x100b account state
+    if (addr->bytes[19] == 0x0b && addr->bytes[18] == 0x10) {
+        printf("DEBUG state_db_set_code: Got 0x100b account=%p, exists=%d, old_code_size=%zu\n",
+               (void*)account, account->exists, account->code_size);
+    }
+
+    bool was_existing = account->exists;
 
     // Record old state in journal if this is the first modification
     if (!account->dirty && account->exists)
@@ -370,7 +481,23 @@ bool state_db_set_code(state_db_t *db, const address_t *addr,
         account->code_hash = HASH_EMPTY_CODE;
     }
 
+    // If account is transitioning from non-existent to existent, record ACCOUNT_CREATED
+    if (!was_existing)
+    {
+        if (!state_journal_account_created(&db->journal, addr))
+        {
+            return false;
+        }
+    }
+
     account->exists = true;
+    
+    // Debug: Confirm 0x100b code was set
+    if (addr->bytes[19] == 0x0b && addr->bytes[18] == 0x10) {
+        printf("DEBUG state_db_set_code: COMPLETED for 0x100b, new_code_size=%zu, exists=%d\n",
+               account->code_size, account->exists);
+    }
+    
     state_cache_mark_dirty(&db->cache, account);
 
     return true;

@@ -120,7 +120,7 @@ static const void *search(const art_node_t *node, const uint8_t *key,
 static int check_prefix(const art_node_t *node, const uint8_t *key,
                         size_t key_len, size_t depth);
 static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child);
-static void remove_child(art_node_t *node, uint8_t byte, art_node_t **child_out);
+static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **child_out);
 static art_node_t *find_child(const art_node_t *node, uint8_t byte);
 
 //==============================================================================
@@ -171,11 +171,20 @@ const void *art_get(const art_tree_t *tree, const uint8_t *key, size_t key_len,
 bool art_delete(art_tree_t *tree, const uint8_t *key, size_t key_len) {
     if (!tree || !key || key_len == 0) return false;
     
+    // Debug for 0x100b deletions
+    if (key_len == 20 && key[18] == 0x10 && key[19] == 0x0b) {
+        printf("DEBUG ART delete: Attempting to delete 0x100b from tree=%p\n", (void*)tree);
+    }
+    
     bool deleted = false;
     tree->root = delete_recursive(tree->root, key, key_len, 0, &deleted);
     
     if (deleted) {
         tree->size--;
+        // Debug for 0x100b deletions
+        if (key_len == 20 && key[18] == 0x10 && key[19] == 0x0b) {
+            printf("DEBUG ART delete: Successfully DELETED 0x100b, tree size now=%zu\n", tree->size);
+        }
     }
     
     return deleted;
@@ -731,8 +740,42 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
                         depth, prefix_len, node->partial_len);
             *inserted = true;
             
-            // Save the discriminating byte BEFORE modifying the partial array
-            uint8_t old_byte = node->partial[prefix_len];
+            // Need to get the discriminating byte for the old node
+            // If prefix_len >= 10, we can't trust node->partial[prefix_len]
+            uint8_t old_byte;
+            if (prefix_len < 10) {
+                // Simple case: byte is in the partial array
+                old_byte = node->partial[prefix_len];
+            } else {
+                // Need to get it from a leaf in the subtree
+                art_node_t *current = node;
+                while (!is_leaf(current)) {
+                    // Find first non-null child
+                    if (current->type == NODE_4) {
+                        current = current->node4.children[0];
+                    } else if (current->type == NODE_16) {
+                        current = current->node16.children[0];
+                    } else if (current->type == NODE_48) {
+                        for (int i = 0; i < NODE48_MAX; i++) {
+                            if (current->node48.children[i]) {
+                                current = current->node48.children[i];
+                                break;
+                            }
+                        }
+                    } else { // NODE_256
+                        for (int i = 0; i < NODE256_MAX; i++) {
+                            if (current->node256.children[i]) {
+                                current = current->node256.children[i];
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Get the discriminating byte from the leaf's key
+                const uint8_t *leaf_key_bytes = leaf_key(current);
+                old_byte = leaf_key_bytes[depth + prefix_len];
+            }
+            
             LOG_DB_DEBUG("insert_recursive: splitting node, old_byte=0x%02X", old_byte);
             
             art_node_t *new_node = alloc_node(NODE_4);
@@ -825,7 +868,7 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
                 // Update existing leaf
                 art_node_t *new_leaf = alloc_leaf(key, key_len, value, value_len);
                 if (new_leaf) {
-                    remove_child(node, byte, NULL);
+                    node = remove_child(node, byte, NULL);  // node might shrink
                     node = add_child(node, byte, new_leaf);
                     free(child);
                     *inserted = false;  // Updated, not inserted
@@ -838,7 +881,7 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
                                                   value, value_len, inserted);
         if (new_child != child) {
             // Child was replaced - update parent
-            remove_child(node, byte, NULL);
+            node = remove_child(node, byte, NULL);  // node might shrink
             node = add_child(node, byte, new_child);
         }
     } else {
@@ -921,6 +964,9 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             new_node->partial_len = node->partial_len;
             memcpy(new_node->partial, node->partial, 10);
             
+            // Initialize index array to NODE48_EMPTY
+            memset(new_node->node48.index, NODE48_EMPTY, 256);
+            
             // Copy children
             for (int i = 0; i < NODE16_MAX; i++) {
                 new_node->node48.index[node->node16.keys[i]] = i;
@@ -959,12 +1005,16 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
                     new_node->node256.children[i] = node->node48.children[node->node48.index[i]];
                 }
             }
+            new_node->num_children = node->num_children;  // Preserve count
             
             free(node);
             return add_child(new_node, byte, child);
         }
         
         case NODE_256: {
+            if (!node->node256.children[byte]) {
+                node->num_children++;
+            }
             node->node256.children[byte] = child;
             return node;
         }
@@ -974,7 +1024,9 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
     }
 }
 
-static void remove_child(art_node_t *node, uint8_t byte, art_node_t **child_out) {
+static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **child_out) {
+    if (!node) return NULL;
+    
     switch (node->type) {
         case NODE_4: {
             for (int i = 0; i < node->num_children; i++) {
@@ -985,7 +1037,7 @@ static void remove_child(art_node_t *node, uint8_t byte, art_node_t **child_out)
                     memmove(&node->node4.children[i], &node->node4.children[i + 1],
                             (node->num_children - i - 1) * sizeof(art_node_t *));
                     node->num_children--;
-                    return;
+                    return node;  // NODE_4 cannot shrink further
                 }
             }
             break;
@@ -998,7 +1050,22 @@ static void remove_child(art_node_t *node, uint8_t byte, art_node_t **child_out)
                     memmove(&node->node16.children[i], &node->node16.children[i + 1],
                             (node->num_children - i - 1) * sizeof(art_node_t *));
                     node->num_children--;
-                    return;
+                    
+                    // Shrink NODE_16 → NODE_4 if children <= 4
+                    if (node->num_children <= NODE4_MAX) {
+                        art_node_t *new_node = alloc_node(NODE_4);
+                        if (new_node) {
+                            new_node->num_children = node->num_children;
+                            new_node->partial_len = node->partial_len;
+                            memcpy(new_node->partial, node->partial, 10);
+                            memcpy(new_node->node4.keys, node->node16.keys, node->num_children);
+                            memcpy(new_node->node4.children, node->node16.children, 
+                                   node->num_children * sizeof(art_node_t *));
+                            free(node);
+                            return new_node;
+                        }
+                    }
+                    return node;
                 }
             }
             break;
@@ -1010,17 +1077,63 @@ static void remove_child(art_node_t *node, uint8_t byte, art_node_t **child_out)
                 node->node48.children[idx] = NULL;
                 node->node48.index[byte] = NODE48_EMPTY;
                 node->num_children--;
+                
+                // Shrink NODE_48 → NODE_16 if children <= 16
+                if (node->num_children <= NODE16_MAX) {
+                    art_node_t *new_node = alloc_node(NODE_16);
+                    if (new_node) {
+                        new_node->num_children = 0;
+                        new_node->partial_len = node->partial_len;
+                        memcpy(new_node->partial, node->partial, 10);
+                        // Copy non-null children
+                        for (int i = 0; i < NODE256_MAX; i++) {
+                            if (node->node48.index[i] != NODE48_EMPTY) {
+                                uint8_t child_idx = node->node48.index[i];
+                                new_node->node16.keys[new_node->num_children] = (uint8_t)i;
+                                new_node->node16.children[new_node->num_children] = node->node48.children[child_idx];
+                                new_node->num_children++;
+                            }
+                        }
+                        free(node);
+                        return new_node;
+                    }
+                }
+                return node;
             }
             break;
         }
         case NODE_256: {
             if (child_out) *child_out = node->node256.children[byte];
             node->node256.children[byte] = NULL;
+            node->num_children--;
+            
+            // Shrink NODE_256 → NODE_48 if children <= 48
+            if (node->num_children <= NODE48_MAX) {
+                art_node_t *new_node = alloc_node(NODE_48);
+                if (new_node) {
+                    new_node->num_children = 0;
+                    new_node->partial_len = node->partial_len;
+                    memcpy(new_node->partial, node->partial, 10);
+                    // Initialize index array
+                    memset(new_node->node48.index, NODE48_EMPTY, NODE256_MAX);
+                    // Copy non-null children
+                    for (int i = 0; i < NODE256_MAX; i++) {
+                        if (node->node256.children[i]) {
+                            new_node->node48.index[i] = (uint8_t)new_node->num_children;
+                            new_node->node48.children[new_node->num_children] = node->node256.children[i];
+                            new_node->num_children++;
+                        }
+                    }
+                    free(node);
+                    return new_node;
+                }
+            }
             break;
         }
         default:
             break;
     }
+    return node;
 }
 
 static art_node_t *delete_recursive(art_node_t *node, const uint8_t *key,
@@ -1058,8 +1171,7 @@ static art_node_t *delete_recursive(art_node_t *node, const uint8_t *key,
         if (is_leaf(child) && leaf_matches(child, key, key_len)) {
             *deleted = true;
             free(child);
-            remove_child(node, byte, NULL);
-            // TODO: Implement node shrinking if needed
+            node = remove_child(node, byte, NULL);  // node might shrink
             return node;
         }
         return node;
@@ -1070,13 +1182,10 @@ static art_node_t *delete_recursive(art_node_t *node, const uint8_t *key,
     if (new_child != child) {
         if (!new_child) {
             // Child was deleted
-            remove_child(node, byte, NULL);
-            
-            // TODO: Implement node shrinking (Node16->Node4, Node48->Node16, Node256->Node48)
-            // For now, just keep the node as-is
+            node = remove_child(node, byte, NULL);  // node might shrink
         } else {
             // Child was replaced
-            remove_child(node, byte, NULL);
+            node = remove_child(node, byte, NULL);  // node might shrink
             node = add_child(node, byte, new_child);
         }
     }

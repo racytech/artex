@@ -115,21 +115,29 @@ static bool deploy_code(evm_t *evm, const address_t *contract_addr,
 
 /**
  * Common contract creation logic shared between CREATE and CREATE2
+ * @param sender_nonce Current nonce of the sender (will be incremented on success)
  */
 static evm_status_t execute_create(evm_t *evm, 
                                    const uint256_t *value,
                                    const address_t *contract_addr,
                                    uint8_t *init_code,
                                    uint64_t init_code_size,
-                                   evm_call_type_t msg_kind)
+                                   evm_call_type_t msg_kind,
+                                   uint64_t sender_nonce)
 {
+    fprintf(stderr, "execute_create: addr=");
+    for (int i = 0; i < 20; i++) fprintf(stderr, "%02x", contract_addr->bytes[i]);
+    fprintf(stderr, ", init_code_size=%lu\n", init_code_size);
+    
     //==========================================================================
     // Depth Check
     //==========================================================================
 
+    fprintf(stderr, "CREATE: Depth check - current depth=%d\n", evm->msg.depth);
     if (evm->msg.depth >= 1024)
     {
         LOG_EVM_DEBUG("CREATE: Call depth limit exceeded");
+        fprintf(stderr, "CREATE: DEPTH EXCEEDED - returning early\n");
         if (init_code) free(init_code);
         uint256_t zero = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &zero)) {
@@ -137,11 +145,39 @@ static evm_status_t execute_create(evm_t *evm,
         }
         return EVM_SUCCESS;
     }
+    fprintf(stderr, "CREATE: Depth check passed\n");
 
     //==========================================================================
-    // Balance Check
+    // Balance Check & Value Transfer
     //==========================================================================
 
+    fprintf(stderr, "CREATE: Value to transfer: %d\n", !uint256_is_zero(value));
+    
+    // Take snapshot before any state changes
+    uint32_t snapshot = state_db_begin_transaction(evm->state);
+    if (snapshot == UINT32_MAX) {
+        LOG_EVM_ERROR("CREATE: Failed to create snapshot");
+        if (init_code) free(init_code);
+        uint256_t zero = UINT256_ZERO;
+        if (!evm_stack_push(evm->stack, &zero)) {
+            return EVM_STACK_OVERFLOW;
+        }
+        return EVM_SUCCESS;
+    }
+    
+    // Increment sender nonce AFTER taking snapshot so it can be reverted
+    if (!state_db_set_nonce(evm->state, &evm->msg.recipient, sender_nonce + 1))
+    {
+        LOG_EVM_ERROR("CREATE: Failed to increment sender nonce");
+        state_db_revert_to_snapshot(evm->state, snapshot);
+        if (init_code) free(init_code);
+        uint256_t zero = UINT256_ZERO;
+        if (!evm_stack_push(evm->stack, &zero)) {
+            return EVM_STACK_OVERFLOW;
+        }
+        return EVM_SUCCESS;
+    }
+    
     if (!uint256_is_zero(value))
     {
         uint256_t sender_balance;
@@ -150,9 +186,13 @@ static evm_status_t execute_create(evm_t *evm,
             sender_balance = uint256_from_uint64(0);
         }
 
+        // Check if sender has sufficient balance for the value transfer
         if (uint256_lt(&sender_balance, value))
         {
+            // Insufficient balance - CREATE fails completely
             LOG_EVM_DEBUG("CREATE: Insufficient balance for value transfer");
+            fprintf(stderr, "CREATE: INSUFFICIENT BALANCE - failing CREATE\n");
+            state_db_revert_to_snapshot(evm->state, snapshot);
             if (init_code) free(init_code);
             uint256_t zero = UINT256_ZERO;
             if (!evm_stack_push(evm->stack, &zero)) {
@@ -160,21 +200,11 @@ static evm_status_t execute_create(evm_t *evm,
             }
             return EVM_SUCCESS;
         }
-    }
 
-    //==========================================================================
-    // Transfer Value
-    //==========================================================================
-
-    if (!uint256_is_zero(value))
-    {
-        // Deduct from sender
-        uint256_t sender_balance;
-        state_db_get_balance(evm->state, &evm->msg.recipient, &sender_balance);
+        // Transfer value from sender to new contract
         uint256_t new_sender_balance = uint256_sub(&sender_balance, value);
         state_db_set_balance(evm->state, &evm->msg.recipient, &new_sender_balance);
 
-        // Add to new contract
         uint256_t contract_balance;
         if (!state_db_get_balance(evm->state, contract_addr, &contract_balance))
         {
@@ -182,6 +212,8 @@ static evm_status_t execute_create(evm_t *evm,
         }
         uint256_t new_contract_balance = uint256_add(&contract_balance, value);
         state_db_set_balance(evm->state, contract_addr, &new_contract_balance);
+        
+        fprintf(stderr, "CREATE: Value transferred successfully\n");
     }
 
     //==========================================================================
@@ -207,8 +239,20 @@ static evm_status_t execute_create(evm_t *evm,
         .is_static = false
     };
 
+    // DEBUG: Track problematic address
+    bool is_problem_addr = (contract_addr->bytes[0] == 0x7e && 
+                           contract_addr->bytes[1] == 0x2f && 
+                           contract_addr->bytes[2] == 0xf5);
+    if (is_problem_addr) {
+        printf("DEBUG CREATE: Creating problematic address 0x7e2ff..., value=%d, depth=%d\n",
+               !uint256_is_zero(value), evm->msg.depth);
+    }
+
     evm_result_t init_result;
+    fprintf(stderr, "CREATE: About to call evm_execute with init_code_size=%lu\n", init_code_size);
     evm_execute(evm, &init_msg, &init_result);
+
+    fprintf(stderr, "CREATE: After evm_execute, status=%d\n", init_result.status);
 
     // Return unused gas
     evm->gas_left += init_result.gas_left;
@@ -222,13 +266,57 @@ static evm_status_t execute_create(evm_t *evm,
 
     bool success = (init_result.status == EVM_SUCCESS);
     
-    if (success && init_result.output_data && init_result.output_size > 0)
+    if (is_problem_addr) {
+        printf("DEBUG CREATE: Result for 0x7e2ff... status=%d, success=%d, output_size=%zu\n",
+               init_result.status, success, init_result.output_size);
+    }
+    fprintf(stderr, "CREATE: init_result.status=%d, output_size=%zu, output_data=%p\n", 
+            init_result.status, init_result.output_size, (void*)init_result.output_data);
+    
+    // Per EIP-161: CREATE that returns 0 bytes of code is treated as failure
+    // This prevents creation of accounts with nonce but no code
+    if (success && init_result.output_size == 0)
     {
+        fprintf(stderr, "CREATE: Init code returned 0 bytes - treating as failure (EIP-161)\n");
+        if (is_problem_addr) {
+            printf("DEBUG CREATE: Init code returned 0 bytes for 0x7e2ff..., treating as failure\n");
+        }
+        success = false;
+    }
+    
+    if (success)
+    {
+        // Deploy the returned code
+        fprintf(stderr, "CREATE: Deploying %zu bytes of code to ", init_result.output_size);
+        for (int i = 0; i < 20; i++) fprintf(stderr, "%02x", contract_addr->bytes[i]);
+        fprintf(stderr, "\n");
         success = deploy_code(evm, contract_addr, init_result.output_data, init_result.output_size);
+    }
+    else
+    {
+        fprintf(stderr, "CREATE: Init code execution failed with status=%d\n", init_result.status);
     }
 
     if (init_result.output_data) {
         free(init_result.output_data);
+    }
+
+    //==========================================================================
+    // Commit or Revert State Changes
+    //==========================================================================
+
+    if (success) {
+        // Commit all state changes (balance transfer, nonce, code)
+        state_db_commit_transaction(evm->state);
+        if (is_problem_addr) {
+            printf("DEBUG CREATE: Committing state for 0x7e2ff...\n");
+        }
+    } else {
+        // Revert all state changes
+        state_db_revert_to_snapshot(evm->state, snapshot);
+        if (is_problem_addr) {
+            printf("DEBUG CREATE: Reverting state for 0x7e2ff...\n");
+        }
     }
 
     //==========================================================================
@@ -258,6 +346,11 @@ static evm_status_t execute_create(evm_t *evm,
  */
 evm_status_t op_create(evm_t *evm)
 {
+    fprintf(stderr, "=== CREATE OPCODE CALLED ===\n");
+    char* msg_value_hex = uint256_to_hex(&evm->msg.value);
+    fprintf(stderr, "op_create: evm->msg.value (value sent to THIS contract) = %s\n", msg_value_hex);
+    free(msg_value_hex);
+    
     if (!evm || !evm->stack || !evm->memory || !evm->state)
     {
         return EVM_INTERNAL_ERROR;
@@ -280,8 +373,11 @@ evm_status_t op_create(evm_t *evm)
         return EVM_STACK_UNDERFLOW;
     }
 
+    char* value_hex = uint256_to_hex(&value);
     uint64_t size_u64 = uint256_to_uint64(&size);
     uint64_t offset_u64 = uint256_to_uint64(&offset);
+    fprintf(stderr, "op_create: popped value=%s, offset=%lu, size=%lu\n", value_hex, offset_u64, size_u64);
+    free(value_hex);
 
     //==========================================================================
     // Gas Calculation
@@ -310,13 +406,9 @@ evm_status_t op_create(evm_t *evm)
     }
 
     address_t contract_addr = calculate_create_address(&evm->msg.recipient, nonce);
-
-    if (!state_db_set_nonce(evm->state, &evm->msg.recipient, nonce + 1))
-    {
-        LOG_EVM_ERROR("CREATE: Failed to increment nonce");
-        return EVM_INTERNAL_ERROR;
-    }
-
+    
+    // Note: sender nonce will be incremented inside execute_create AFTER snapshot
+    
     //==========================================================================
     // Extract Init Code
     //==========================================================================
@@ -343,7 +435,7 @@ evm_status_t op_create(evm_t *evm)
     // Execute Contract Creation
     //==========================================================================
 
-    return execute_create(evm, &value, &contract_addr, init_code, size_u64, EVM_CREATE);
+    return execute_create(evm, &value, &contract_addr, init_code, size_u64, EVM_CREATE, nonce);
 }
 
 /**
@@ -437,9 +529,16 @@ evm_status_t op_create2(evm_t *evm)
     address_t contract_addr = calculate_create2_address(&evm->msg.recipient, &salt, 
                                                         init_code, size_u64);
 
+    // Get sender nonce for incrementing inside execute_create
+    uint64_t nonce;
+    if (!state_db_get_nonce(evm->state, &evm->msg.recipient, &nonce))
+    {
+        nonce = 0;
+    }
+
     //==========================================================================
     // Execute Contract Creation
     //==========================================================================
 
-    return execute_create(evm, &value, &contract_addr, init_code, size_u64, EVM_CREATE2);
+    return execute_create(evm, &value, &contract_addr, init_code, size_u64, EVM_CREATE2, nonce);
 }

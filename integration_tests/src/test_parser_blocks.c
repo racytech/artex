@@ -123,9 +123,18 @@ bool parse_transaction(const cJSON *json, test_transaction_t *out) {
         if (!parse_uint256(str, &out->nonce)) return false;
     }
     
-    // Gas price
+    // Gas price (legacy transactions)
     if (json_get_string(json, "gasPrice", &str)) {
         if (!parse_uint256(str, &out->gas_price)) return false;
+    }
+    
+    // EIP-1559 gas fields
+    if (json_get_string(json, "maxFeePerGas", &str)) {
+        if (!parse_uint256(str, &out->max_fee_per_gas)) return false;
+    }
+    
+    if (json_get_string(json, "maxPriorityFeePerGas", &str)) {
+        if (!parse_uint256(str, &out->max_priority_fee_per_gas)) return false;
     }
     
     // Gas limit (can be array for multiple test cases)
@@ -242,6 +251,57 @@ bool parse_transaction(const cJSON *json, test_transaction_t *out) {
     }
     if (json_get_string(json, "s", &str)) {
         parse_uint256(str, &out->s);
+    }
+    
+    // Access lists (EIP-2930) - can be array for multiple test cases
+    const cJSON *access_lists = cJSON_GetObjectItemCaseSensitive(json, "accessLists");
+    if (access_lists && cJSON_IsArray(access_lists)) {
+        int count = cJSON_GetArraySize(access_lists);
+        out->access_lists = calloc(count, sizeof(test_access_list_t));
+        if (!out->access_lists) return false;
+        
+        out->access_lists_count = count;
+        const cJSON *list_item;
+        int idx = 0;
+        cJSON_ArrayForEach(list_item, access_lists) {
+            if (cJSON_IsArray(list_item)) {
+                // Parse each access list entry
+                int entry_count = cJSON_GetArraySize(list_item);
+                out->access_lists[idx].entries = calloc(entry_count, sizeof(test_access_list_entry_t));
+                if (!out->access_lists[idx].entries) return false;
+                
+                out->access_lists[idx].entries_count = entry_count;
+                const cJSON *entry;
+                int entry_idx = 0;
+                cJSON_ArrayForEach(entry, list_item) {
+                    // Parse address
+                    const char *addr_str;
+                    if (json_get_string(entry, "address", &addr_str)) {
+                        parse_address(addr_str, &out->access_lists[idx].entries[entry_idx].address);
+                    }
+                    
+                    // Parse storage keys
+                    const cJSON *storage_keys = cJSON_GetObjectItemCaseSensitive(entry, "storageKeys");
+                    if (storage_keys && cJSON_IsArray(storage_keys)) {
+                        int key_count = cJSON_GetArraySize(storage_keys);
+                        out->access_lists[idx].entries[entry_idx].storage_keys = calloc(key_count, sizeof(uint256_t));
+                        if (!out->access_lists[idx].entries[entry_idx].storage_keys) return false;
+                        
+                        out->access_lists[idx].entries[entry_idx].storage_keys_count = key_count;
+                        const cJSON *key_item;
+                        int key_idx = 0;
+                        cJSON_ArrayForEach(key_item, storage_keys) {
+                            if (cJSON_IsString(key_item)) {
+                                parse_uint256(key_item->valuestring, &out->access_lists[idx].entries[entry_idx].storage_keys[key_idx++]);
+                            }
+                        }
+                    }
+                    
+                    entry_idx++;
+                }
+            }
+            idx++;
+        }
     }
     
     return true;

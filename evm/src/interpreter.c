@@ -31,7 +31,6 @@
     {                                               \
         if (evm->pc >= evm->code_size)              \
         {                                           \
-            status = EVM_SUCCESS;                   \
             goto done;                              \
         }                                           \
         goto *dispatch_table[evm->code[evm->pc]];  \

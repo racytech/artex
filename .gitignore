@@ -142,3 +142,5 @@ core.*
 evm/src/opcodes/reference
 failing_test.json
 failure.txt
+
+reference/

@@ -240,6 +240,14 @@ bool parse_state_test(const char *filepath, state_test_t **out) {
                             cond->tx_bytes = parse_hex_alloc(hash_str, &cond->tx_bytes_len);
                         }
                         
+                        // Exception expectation
+                        const char *exception_str;
+                        if (json_get_string(cond_item, "expectException", &exception_str)) {
+                            cond->expect_exception = strdup(exception_str);
+                        } else {
+                            cond->expect_exception = NULL;
+                        }
+                        
                         // Indexes
                         const cJSON *indexes = json_get_object(cond_item, "indexes");
                         if (indexes) {
@@ -262,6 +270,109 @@ bool parse_state_test(const char *filepath, state_test_t **out) {
     }
     
     cJSON_Delete(root);
+    *out = test;
+    return true;
+}
+
+/**
+ * Parse a single state test from a JSON object (not a file)
+ * Used when a file contains multiple test objects
+ */
+bool parse_state_test_from_json(const cJSON *test_obj, const char *test_name, state_test_t **out) {
+    if (!test_obj || !test_name || !out) return false;
+    
+    state_test_t *test = calloc(1, sizeof(state_test_t));
+    if (!test) return false;
+    
+    // Set test name
+    test->name = strdup(test_name);
+    
+    // Environment
+    const cJSON *env = json_get_object(test_obj, "env");
+    if (env) {
+        parse_environment(env, &test->env);
+    }
+    
+    // Pre-state
+    const cJSON *pre = json_get_object(test_obj, "pre");
+    if (pre) {
+        parse_account_map(pre, &test->pre_state, &test->pre_state_count);
+    }
+    
+    // Transaction
+    const cJSON *tx = json_get_object(test_obj, "transaction");
+    if (tx) {
+        parse_transaction(tx, &test->transaction);
+    }
+    
+    // Post-conditions (by fork)
+    const cJSON *post = json_get_object(test_obj, "post");
+    if (post) {
+        int fork_count = cJSON_GetArraySize(post);
+        if (fork_count > 0) {
+            test->post = calloc(fork_count, sizeof(*test->post));
+            test->post_count = fork_count;
+            
+            const cJSON *fork_item;
+            int fork_idx = 0;
+            cJSON_ArrayForEach(fork_item, post) {
+                if (!fork_item->string) continue;
+                
+                test->post[fork_idx].fork_name = strdup(fork_item->string);
+                
+                // Each fork can have multiple post-conditions
+                if (cJSON_IsArray(fork_item)) {
+                    int cond_count = cJSON_GetArraySize(fork_item);
+                    test->post[fork_idx].conditions = calloc(cond_count, sizeof(test_post_condition_t));
+                    test->post[fork_idx].condition_count = cond_count;
+                    
+                    const cJSON *cond_item;
+                    int cond_idx = 0;
+                    cJSON_ArrayForEach(cond_item, fork_item) {
+                        test_post_condition_t *cond = &test->post[fork_idx].conditions[cond_idx++];
+                        
+                        const char *hash_str;
+                        if (json_get_string(cond_item, "hash", &hash_str)) {
+                            parse_hash(hash_str, &cond->state_root);
+                        }
+                        
+                        if (json_get_string(cond_item, "logs", &hash_str)) {
+                            parse_hash(hash_str, &cond->logs_hash);
+                        }
+                        
+                        if (json_get_string(cond_item, "txbytes", &hash_str)) {
+                            cond->tx_bytes = parse_hex_alloc(hash_str, &cond->tx_bytes_len);
+                        }
+                        
+                        // Exception expectation
+                        const char *exception_str;
+                        if (json_get_string(cond_item, "expectException", &exception_str)) {
+                            cond->expect_exception = strdup(exception_str);
+                        } else {
+                            cond->expect_exception = NULL;
+                        }
+                        
+                        // Indexes
+                        const cJSON *indexes = json_get_object(cond_item, "indexes");
+                        if (indexes) {
+                            const cJSON *idx;
+                            if ((idx = cJSON_GetObjectItemCaseSensitive(indexes, "data")) && cJSON_IsNumber(idx)) {
+                                cond->data_index = idx->valueint;
+                            }
+                            if ((idx = cJSON_GetObjectItemCaseSensitive(indexes, "gas")) && cJSON_IsNumber(idx)) {
+                                cond->gas_index = idx->valueint;
+                            }
+                            if ((idx = cJSON_GetObjectItemCaseSensitive(indexes, "value")) && cJSON_IsNumber(idx)) {
+                                cond->value_index = idx->valueint;
+                            }
+                        }
+                    }
+                }
+                fork_idx++;
+            }
+        }
+    }
+    
     *out = test;
     return true;
 }

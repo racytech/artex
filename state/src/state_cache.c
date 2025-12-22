@@ -11,6 +11,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+//==============================================================================
+// Debug Configuration
+//==============================================================================
+
+// Helper macro to check if an address matches a debug pattern
+#define ART_DEBUG_ADDR(addr, b18, b19) \
+    ((addr)->bytes[18] == (b18) && (addr)->bytes[19] == (b19))
+
 /**
  * Iterator structure
  */
@@ -183,11 +191,13 @@ account_object_t *state_cache_get_account(state_cache_t *cache, const address_t 
         // Retrieve the stored pointer
         account_object_t *account;
         memcpy(&account, value, sizeof(account_object_t *));
+        
         LOG_STATE_DEBUG("state_cache_get_account: found existing account");
         return account;
     }
 
     // Account doesn't exist - create new account object
+    
     account_object_t *account = create_account_object(addr);
     if (!account)
     {
@@ -238,6 +248,7 @@ bool state_cache_has_account(const state_cache_t *cache, const address_t *addr)
     {
         account_object_t *account;
         memcpy(&account, value, sizeof(account_object_t *));
+        
         return (account && account->exists && !account->deleted);
     }
 
@@ -320,9 +331,9 @@ bool state_cache_set_storage(state_cache_t *cache, account_object_t *account,
     uint8_t key_bytes[32];
     uint256_to_bytes(key, key_bytes);
 
-    // Insert/update storage slot
-    if (!art_insert(storage, key_bytes, 32,
-                    value, sizeof(uint256_t)))
+    // Store the value (even if zero). Storage slots are kept with zero values
+    // during transaction execution and only cleaned up during finalization.
+    if (!art_insert(storage, key_bytes, 32, value, sizeof(uint256_t)))
     {
         LOG_STATE_ERROR("state_cache_set_storage: failed to insert storage slot");
         return false;
@@ -383,9 +394,13 @@ void state_cache_reset(state_cache_t *cache)
     if (!cache || !cache->accounts)
         return;
 
+    printf("DEBUG state_cache_reset: CALLED! cache=%p, old_tree=%p\n", (void*)cache, cache->accounts);
+
     // Destroy and reinitialize
     state_cache_destroy(cache);
     state_cache_init(cache);
+    
+    printf("DEBUG state_cache_reset: Tree destroyed and recreated. New tree=%p\n", cache->accounts);
 
     LOG_STATE_DEBUG("state_cache_reset: cache reset to empty state");
 }

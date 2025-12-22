@@ -260,18 +260,48 @@ uint64_t gas_memory_expansion(uint64_t current_size, uint64_t new_size)
     }
 
     // Convert to words (round up to 32-byte boundary)
-    uint64_t current_words = (current_size + 31) / 32;
-    uint64_t new_words = (new_size + 31) / 32;
+    // Check for overflow in word size calculation
+    uint64_t current_words = (current_size > UINT64_MAX - 31) ? UINT64_MAX : (current_size + 31) / 32;
+    uint64_t new_words = (new_size > UINT64_MAX - 31) ? UINT64_MAX : (new_size + 31) / 32;
 
     // Memory cost formula: (words^2 / 512) + (3 * words)
-    uint64_t current_cost = (current_words * current_words) / 512 + (3 * current_words);
-    uint64_t new_cost = (new_words * new_words) / 512 + (3 * new_words);
+    // For new_words calculation, check if it would overflow
+    if (new_words == UINT64_MAX) {
+        return UINT64_MAX; // Impossibly large memory expansion
+    }
+    
+    // Check linear term overflow: 3 * words
+    if (current_words > UINT64_MAX / 3 || new_words > UINT64_MAX / 3) {
+        return UINT64_MAX;
+    }
+    
+    // Check quadratic term overflow: words * words
+    // Safe because we divide by 512, but check if words is too large
+    if (new_words > 4294967296ULL) { // sqrt(2^64) ≈ 4.3 billion
+        return UINT64_MAX;
+    }
+    
+    uint64_t current_linear = 3 * current_words;
+    uint64_t current_quadratic = (current_words * current_words) / 512;
+    uint64_t current_cost = current_linear + current_quadratic;
+    
+    uint64_t new_linear = 3 * new_words;
+    uint64_t new_quadratic = (new_words * new_words) / 512;
+    uint64_t new_cost = new_linear + new_quadratic;
 
-    return new_cost - current_cost;
+    return (new_cost > current_cost) ? (new_cost - current_cost) : UINT64_MAX;
 }
 
 uint64_t gas_to_word_size(uint64_t size)
 {
+    // Check for overflow when adding 31
+    // Per Ethereum spec: operations requiring impossibly large memory
+    // should fail during gas calculation
+    if (size > UINT64_MAX - 31) {
+        // Return UINT64_MAX so any gas calculation will definitely exceed available gas
+        // This ensures operations with near-max sizes properly run out of gas
+        return UINT64_MAX;
+    }
     return (size + 31) / 32;
 }
 
@@ -283,6 +313,11 @@ uint64_t gas_copy_cost(uint64_t size)
 {
     // 3 gas per word (rounded up)
     uint64_t words = gas_to_word_size(size);
+    
+    // Check for multiplication overflow
+    if (words > UINT64_MAX / 3) {
+        return UINT64_MAX; // Will definitely exceed any available gas
+    }
     return 3 * words;
 }
 
@@ -290,7 +325,18 @@ uint64_t gas_sha3_cost(uint64_t size)
 {
     // 30 gas base + 6 gas per word
     uint64_t words = gas_to_word_size(size);
-    return 30 + (6 * words);
+    
+    // Check for multiplication overflow
+    if (words > UINT64_MAX / 6) {
+        return UINT64_MAX; // Will definitely exceed any available gas
+    }
+    
+    uint64_t word_cost = 6 * words;
+    // Check for addition overflow
+    if (word_cost > UINT64_MAX - 30) {
+        return UINT64_MAX;
+    }
+    return 30 + word_cost;
 }
 
 uint64_t gas_log_cost(uint8_t topic_count, uint64_t data_size)

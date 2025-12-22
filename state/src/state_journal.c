@@ -178,7 +178,88 @@ bool state_journal_revert_to_snapshot(state_journal_t *journal, uint32_t snapsho
     journal_snapshot_t *snapshot = &journal->snapshots[snapshot_id];
     size_t target_length = snapshot->journal_length;
 
-    // Discard all entries added after this snapshot
+    // CRITICAL: Roll back all entries added after this snapshot BEFORE discarding them
+    // Otherwise the cache will have stale state from reverted operations
+    for (size_t i = journal->num_entries; i > target_length; i--)
+    {
+        journal_entry_t *entry = &journal->entries[i - 1];
+
+        switch (entry->type)
+        {
+        case JOURNAL_ACCOUNT_CREATED:
+        {
+            // Account was created after snapshot, so mark it as non-existent
+            account_object_t *account = state_cache_get_account(journal->cache, &entry->address);
+            if (account)
+            {
+                account->exists = false;
+                account->deleted = true;
+                account->dirty = false;
+            }
+            break;
+        }
+
+        case JOURNAL_ACCOUNT_MODIFIED:
+        {
+            // Restore old account state from before this modification
+            account_object_t *account = state_cache_get_account(journal->cache, &entry->address);
+            if (account)
+            {
+                account->balance = entry->old_state.account.balance;
+                account->nonce = entry->old_state.account.nonce;
+                account->code_hash = entry->old_state.account.code_hash;
+                account->storage_root = entry->old_state.account.storage_root;
+                account->exists = entry->old_state.account.existed;
+                account->dirty = false;
+                account->deleted = false;
+            }
+            break;
+        }
+
+        case JOURNAL_ACCOUNT_DELETED:
+        {
+            // Account was deleted after snapshot, so restore it
+            account_object_t *account = state_cache_get_account(journal->cache, &entry->address);
+            if (account)
+            {
+                account->balance = entry->old_state.account.balance;
+                account->nonce = entry->old_state.account.nonce;
+                account->code_hash = entry->old_state.account.code_hash;
+                account->storage_root = entry->old_state.account.storage_root;
+                account->exists = entry->old_state.account.existed;
+                account->dirty = false;
+                account->deleted = false;
+            }
+            break;
+        }
+
+        case JOURNAL_STORAGE_CHANGED:
+        {
+            // Restore old storage value
+            account_object_t *account = state_cache_get_account(journal->cache, &entry->address);
+            if (account)
+            {
+                state_cache_set_storage(journal->cache, account, &entry->old_state.storage.key,
+                                        &entry->old_state.storage.old_value);
+            }
+            break;
+        }
+
+        case JOURNAL_CODE_CHANGED:
+        {
+            // Code changes rollback not yet implemented
+            // For now, just restore code_hash
+            account_object_t *account = state_cache_get_account(journal->cache, &entry->address);
+            if (account)
+            {
+                account->code_hash = entry->old_state.code.old_code_hash;
+            }
+            break;
+        }
+        }
+    }
+
+    // Now discard the rolled-back entries
     journal->num_entries = target_length;
 
     // Discard all snapshots created after this one

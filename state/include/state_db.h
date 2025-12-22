@@ -103,6 +103,17 @@ uint32_t state_db_begin_transaction(state_db_t *db);
 bool state_db_commit_transaction(state_db_t *db);
 
 /**
+ * Finalize transaction (EIP-161)
+ * Deletes all empty accounts that were touched during transaction.
+ * An account is empty if balance=0, nonce=0, and no code.
+ * Should be called before commit_transaction.
+ *
+ * @param db StateDB instance
+ * @return true on success, false on failure
+ */
+bool state_db_finalize_transaction(state_db_t *db);
+
+/**
  * Revert to a previous snapshot
  * Rolls back all changes since the snapshot
  *

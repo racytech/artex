@@ -52,20 +52,22 @@ evm_status_t op_push(evm_t *evm, uint8_t num_bytes)
         return EVM_INVALID_OPCODE;
     }
 
-    // Check if we have enough code bytes to read
-    if (evm->pc + 1 + num_bytes > evm->code_size)
-    {
-        LOG_EVM_ERROR("PUSH: Not enough code bytes (pc=%lu, bytes=%u, code_size=%lu)",
-                  evm->pc, num_bytes, evm->code_size);
-        return EVM_INVALID_OPCODE;
-    }
-
     // Read bytes from code (starting from PC+1, after the PUSH opcode)
+    // If we reach the end of code, remaining bytes are implicitly zero (EVM spec)
     uint8_t bytes[32] = {0};
-    for (uint8_t i = 0; i < num_bytes; i++)
+    uint8_t bytes_to_read = num_bytes;
+    uint64_t available_bytes = evm->code_size > (evm->pc + 1) ? evm->code_size - (evm->pc + 1) : 0;
+    
+    if (bytes_to_read > available_bytes)
+    {
+        bytes_to_read = (uint8_t)available_bytes;
+    }
+    
+    for (uint8_t i = 0; i < bytes_to_read; i++)
     {
         bytes[31 - (num_bytes - 1 - i)] = evm->code[evm->pc + 1 + i];
     }
+    // Remaining bytes stay as zero (already initialized)
 
     uint256_t value = uint256_from_bytes(bytes, 32);
 

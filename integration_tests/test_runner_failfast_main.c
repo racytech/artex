@@ -7,6 +7,8 @@
 
 #include "test_runner.h"
 #include "test_parser.h"
+#include "state_cache.h"
+#include "art.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -153,6 +155,143 @@ static bool write_test_case_json(const char *test_file,
 }
 
 /**
+ * Export post-state from state_db to JSON file
+ */
+static bool write_post_state_json(state_db_t *state_db, const char *output_file) {
+    if (!state_db || !output_file) {
+        return false;
+    }
+    
+    // Create JSON object for post-state
+    cJSON *post_state = cJSON_CreateObject();
+    if (!post_state) {
+        return false;
+    }
+    
+    // Iterate through all accounts in the state cache
+    state_cache_iterator_t *iter = state_cache_iterator_create(&state_db->cache);
+    if (!iter) {
+        cJSON_Delete(post_state);
+        return false;
+    }
+    
+    while (state_cache_iterator_next(iter)) {
+        const address_t *addr = state_cache_iterator_address(iter);
+        const account_object_t *acc = state_cache_iterator_account(iter);
+        
+        if (!addr || !acc) continue;
+        
+        // Skip deleted accounts
+        if (acc->deleted) continue;
+        
+        // Skip non-existent accounts (e.g., accounts that were queried but never materialized)
+        if (!acc->exists) continue;
+        
+        // Convert address to hex string
+        char addr_str[43];  // "0x" + 40 hex chars + null
+        snprintf(addr_str, sizeof(addr_str), "0x");
+        for (int i = 0; i < 20; i++) {
+            snprintf(addr_str + 2 + (i * 2), 3, "%02x", addr->bytes[i]);
+        }
+        
+        // Create account object
+        cJSON *account = cJSON_CreateObject();
+        
+        // Add nonce
+        char nonce_str[32];
+        snprintf(nonce_str, sizeof(nonce_str), "0x%lx", acc->nonce);
+        cJSON_AddStringToObject(account, "nonce", nonce_str);
+        
+        // Add balance
+        char *balance_str = uint256_to_hex(&acc->balance);
+        if (balance_str) {
+            cJSON_AddStringToObject(account, "balance", balance_str);
+            free(balance_str);
+        }
+        
+        // Add code (if present)
+        if (acc->code && acc->code_size > 0) {
+            char *code_hex = malloc(2 + acc->code_size * 2 + 1);
+            if (code_hex) {
+                code_hex[0] = '0';
+                code_hex[1] = 'x';
+                for (size_t i = 0; i < acc->code_size; i++) {
+                    snprintf(code_hex + 2 + (i * 2), 3, "%02x", acc->code[i]);
+                }
+                cJSON_AddStringToObject(account, "code", code_hex);
+                free(code_hex);
+            }
+        }
+        
+        // Add storage
+        cJSON *storage = cJSON_CreateObject();
+        if (acc->storage_cache) {
+            art_tree_t *storage_tree = (art_tree_t *)acc->storage_cache;
+            art_iterator_t *storage_iter = art_iterator_create(storage_tree);
+            if (storage_iter) {
+                while (art_iterator_next(storage_iter)) {
+                    size_t key_len, value_len;
+                    const uint8_t *key_bytes = art_iterator_key(storage_iter, &key_len);
+                    const void *value_ptr = art_iterator_value(storage_iter, &value_len);
+                    
+                    if (key_bytes && value_ptr && key_len == 32 && value_len == sizeof(uint256_t)) {
+                        const uint256_t *storage_value = (const uint256_t *)value_ptr;
+                        
+                        // Convert key to hex string
+                        char key_str[67];  // "0x" + 64 hex chars + null
+                        key_str[0] = '0';
+                        key_str[1] = 'x';
+                        for (size_t i = 0; i < 32; i++) {
+                            snprintf(key_str + 2 + (i * 2), 3, "%02x", key_bytes[i]);
+                        }
+                        
+                        // Convert value to uint256_t hex
+                        char *value_str = uint256_to_hex(storage_value);
+                        
+                        // Check if value is non-zero
+                        uint256_t zero = uint256_from_uint64(0);
+                        bool is_zero = uint256_eq(storage_value, &zero);
+                        
+                        // Only add non-zero storage slots
+                        if (!is_zero && value_str) {
+                            cJSON_AddStringToObject(storage, key_str, value_str);
+                        }
+                        
+                        if (value_str) free(value_str);
+                    }
+                }
+                art_iterator_destroy(storage_iter);
+            }
+        }
+        cJSON_AddItemToObject(account, "storage", storage);
+        
+        // Add account to post-state
+        cJSON_AddItemToObject(post_state, addr_str, account);
+    }
+    
+    state_cache_iterator_destroy(iter);
+    
+    // Write to file
+    char *json_str = cJSON_Print(post_state);
+    if (json_str) {
+        FILE *fp = fopen(output_file, "w");
+        if (fp) {
+            fprintf(fp, "%s\n", json_str);
+            fclose(fp);
+            free(json_str);
+            cJSON_Delete(post_state);
+            
+            printf("Post-state JSON written to: %s\n", output_file);
+            return true;
+        }
+        free(json_str);
+    }
+    
+    cJSON_Delete(post_state);
+    return false;
+}
+
+/**
  * Write failure details to output file
  */
 static void write_failure_details(const char *output_file, 
@@ -221,6 +360,8 @@ typedef struct {
     bool found_failure;
     const char *failing_file;
     test_result_t first_failure;
+    size_t total_tests;  // Total test cases executed
+    size_t total_passed; // Total test cases passed
 } failfast_results_t;
 
 /**
@@ -278,10 +419,20 @@ static bool run_file_failfast(test_runner_t *runner,
                 
                 ff_results->found_failure = true;
                 ff_results->failing_file = filepath;
+                
+                // Export post-state to JSON file
+                char post_state_file[PATH_MAX];
+                snprintf(post_state_file, sizeof(post_state_file), "post_state.json");
+                write_post_state_json(runner->state_db, post_state_file);
+                
                 break;
             }
         }
     }
+    
+    // Track test counts
+    ff_results->total_tests += results.result_count;
+    ff_results->total_passed += results.passed;
     
     test_results_free(&results);
     return success;
@@ -436,7 +587,9 @@ int main(int argc, char **argv) {
     failfast_results_t ff_results = {
         .found_failure = false,
         .failing_file = NULL,
-        .first_failure = {0}
+        .first_failure = {0},
+        .total_tests = 0,
+        .total_passed = 0
     };
     
     // Process each test path
@@ -505,8 +658,12 @@ int main(int argc, char **argv) {
         test_result_free(&ff_results.first_failure);
         
         exit_code = 1;
+    } else if (ff_results.total_tests == 0) {
+        printf("\nNo tests were executed (all tests skipped or filtered).\n");
+        exit_code = 0;
     } else {
-        printf("\nAll tests passed!\n");
+        printf("\nAll tests passed! (%zu/%zu)\n", ff_results.total_passed, ff_results.total_tests);
+        exit_code = 0;
     }
     
     // Cleanup

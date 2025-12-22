@@ -27,6 +27,8 @@ static uint64_t calculate_intrinsic_gas(const transaction_t *tx) {
     const uint64_t G_TX_DATA_ZERO = 4;
     const uint64_t G_TX_DATA_NONZERO = 16;  // 68 for post-Istanbul
     const uint64_t G_TX_CREATE = 32000;
+    const uint64_t G_ACCESS_LIST_ADDRESS = 2400;  // EIP-2930
+    const uint64_t G_ACCESS_LIST_STORAGE_KEY = 1900;  // EIP-2930
     
     uint64_t gas = G_TRANSACTION;
     
@@ -46,9 +48,13 @@ static uint64_t calculate_intrinsic_gas(const transaction_t *tx) {
         }
     }
     
-    // TODO: Add cost for access list (EIP-2930)
-    // Each address costs 2400 gas
-    // Each storage key costs 1900 gas
+    // Add cost for access list (EIP-2930)
+    if (tx->access_list && tx->access_list_count > 0) {
+        for (size_t i = 0; i < tx->access_list_count; i++) {
+            gas += G_ACCESS_LIST_ADDRESS;
+            gas += tx->access_list[i].storage_keys_count * G_ACCESS_LIST_STORAGE_KEY;
+        }
+    }
     
     return gas;
 }
@@ -363,7 +369,19 @@ bool transaction_execute(
         gas_refund = max_refund;
     }
     
+    // Calculate gas to refund: unused gas + capped refund
     uint64_t gas_to_refund = tx->gas_limit - gas_used + gas_refund;
+    
+    // Debug gas calculation
+    fprintf(stderr, "GAS REFUND DEBUG:\n");
+    fprintf(stderr, "  gas_limit:      %lu\n", tx->gas_limit);
+    fprintf(stderr, "  gas_used:       %lu\n", gas_used);
+    fprintf(stderr, "  gas_refund_raw: %lu\n", result->gas_refund);
+    fprintf(stderr, "  max_refund:     %lu\n", max_refund);
+    fprintf(stderr, "  gas_refund_cap: %lu\n", gas_refund);
+    fprintf(stderr, "  gas_to_refund:  %lu\n", gas_to_refund);
+    fprintf(stderr, "  gas_paid:       %lu\n", gas_used - gas_refund);
+    
     uint256_t gas_to_refund_u256 = uint256_from_uint64(gas_to_refund);
     uint256_t refund_amount = uint256_mul(&effective_gas_price, &gas_to_refund_u256);
 
@@ -374,20 +392,29 @@ bool transaction_execute(
         return false;
     }
 
-    // Pay coinbase (miner) for gas used
-    uint64_t gas_paid = gas_used - gas_refund;
-    uint256_t gas_paid_u256 = uint256_from_uint64(gas_paid);
-    uint256_t coinbase_payment = uint256_mul(&effective_gas_price, &gas_paid_u256);
-    
-    if (!state_db_add_balance(state, &env->coinbase, &coinbase_payment)) {
-        LOG_EVM_ERROR("Failed to pay coinbase");
-        state_db_revert_to_snapshot(state, snapshot);
-        return false;
+    // Pay coinbase (miner) for gas used (skip for state tests)
+    if (!env->skip_coinbase_payment) {
+        uint64_t gas_paid = gas_used - gas_refund;
+        uint256_t gas_paid_u256 = uint256_from_uint64(gas_paid);
+        uint256_t coinbase_payment = uint256_mul(&effective_gas_price, &gas_paid_u256);
+        
+        if (!state_db_add_balance(state, &env->coinbase, &coinbase_payment)) {
+            LOG_EVM_ERROR("Failed to pay coinbase");
+            state_db_revert_to_snapshot(state, snapshot);
+            return false;
+        }
     }
 
     //==========================================================================
     // Finalize
     //==========================================================================
+
+    // EIP-161: Delete empty accounts (balance=0, nonce=0, no code)
+    if (!state_db_finalize_transaction(state)) {
+        LOG_EVM_ERROR("Failed to finalize transaction");
+        state_db_revert_to_snapshot(state, snapshot);
+        return false;
+    }
 
     // Commit all state changes
     if (!state_db_commit_transaction(state)) {

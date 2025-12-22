@@ -258,6 +258,18 @@ evm_status_t op_sstore(evm_t *evm)
         LOG_EVM_ERROR("SSTORE: Failed to set storage");
         return EVM_INTERNAL_ERROR;
     }
+    
+    // Debug: Track SSTORE for specific account
+    if (evm->msg.recipient.bytes[19] == 0x0f && evm->msg.recipient.bytes[18] == 0xa4) {
+        char *key_hex = uint256_to_hex(&key);
+        char *val_hex = uint256_to_hex(&value);
+        fprintf(stderr, "SSTORE: addr=...a40f, key=%s, value=%s, depth=%d\n", 
+                key_hex ? key_hex : "NULL",
+                val_hex ? val_hex : "NULL",
+                evm->msg.depth);
+        free(key_hex);
+        free(val_hex);
+    }
 
     return EVM_SUCCESS;
 }

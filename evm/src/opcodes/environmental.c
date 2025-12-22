@@ -356,6 +356,22 @@ evm_status_t op_codecopy(evm_t *evm)
     uint64_t offset = uint256_to_uint64(&offset_256);
     uint64_t size = uint256_to_uint64(&size_256);
 
+    // Check for unreasonably large sizes that would cause issues
+    // Any size close to UINT64_MAX is impossible to handle correctly
+    // Maximum reasonable memory size is much smaller than this
+    if (size > (UINT64_MAX / 2)) {
+        // Size too large - would cause overflow in various calculations
+        return EVM_OUT_OF_GAS;
+    }
+
+    // Check for overflow in offset + size calculation
+    if (size > 0 && offset > UINT64_MAX - size) {
+        return EVM_OUT_OF_GAS;
+    }
+    if (size > 0 && dest_offset > UINT64_MAX - size) {
+        return EVM_OUT_OF_GAS;
+    }
+
     // Calculate dynamic gas: base + copy cost + memory expansion
     uint64_t copy_gas = gas_copy_cost(size);
     uint64_t mem_gas = evm_memory_access_cost(evm->memory, dest_offset, size);
@@ -501,10 +517,8 @@ evm_status_t op_returndatacopy(evm_t *evm)
 //==============================================================================
 
 /**
- * EXTCODESIZE - Get size of an account's code (stub)
+ * EXTCODESIZE - Get size of an account's code
  * Stack: address => size
- * 
- * TODO: Requires StateDB code storage API
  */
 evm_status_t op_extcodesize(evm_t *evm)
 {
@@ -539,15 +553,20 @@ evm_status_t op_extcodesize(evm_t *evm)
         evm_mark_address_warm(evm, &addr);
     }
 
-    // TODO: Get code size from StateDB
-    // For now, push 0 (no code)
-    LOG_EVM_DEBUG("EXTCODESIZE: stub - returning size=0");
+    // Get code size from StateDB
+    const uint8_t *code = NULL;
+    size_t code_size = 0;
+    state_db_get_code(evm->state, &addr, &code, &code_size);
 
-    uint256_t size = UINT256_ZERO;
+    // Push code size onto stack
+    uint256_t size = uint256_from_uint64(code_size);
     if (!evm_stack_push(evm->stack, &size))
     {
         return EVM_STACK_OVERFLOW;
     }
+
+    LOG_EVM_DEBUG("EXTCODESIZE: address=0x...%02x%02x, size=%zu", 
+                  addr.bytes[18], addr.bytes[19], code_size);
 
     return EVM_SUCCESS;
 }
@@ -609,25 +628,37 @@ evm_status_t op_extcodecopy(evm_t *evm)
             return EVM_INTERNAL_ERROR;
         }
 
-        // TODO: Copy code from StateDB to memory
-        // For now, just fill with zeros
-        LOG_EVM_DEBUG("EXTCODECOPY: stub - filling memory with zeros");
-        
+        // Get code from StateDB
+        const uint8_t *code = NULL;
+        size_t code_size = 0;
+        state_db_get_code(evm->state, &addr, &code, &code_size);
+
+        // Copy code to memory (out of bounds reads return 0)
+        uint64_t code_offset = uint256_to_uint64(&offset_u256);
         for (uint64_t i = 0; i < size; i++)
         {
-            evm_memory_write_byte(evm->memory, dest_offset + i, 0);
+            uint8_t byte = 0;
+            uint64_t src_idx = code_offset + i;
+            if (code && src_idx < code_size)
+            {
+                byte = code[src_idx];
+            }
+            evm_memory_write_byte(evm->memory, dest_offset + i, byte);
         }
+
+        LOG_EVM_DEBUG("EXTCODECOPY: code_size=%zu, offset=%lu, size=%lu", 
+                      code_size, code_offset, size);
     }
 
     return EVM_SUCCESS;
 }
 
 /**
- * EXTCODEHASH - Get hash of an account's code (stub)
+ * EXTCODEHASH - Get hash of an account's code
  * Stack: address => hash
  * 
- * TODO: Requires StateDB code storage API
- * Returns keccak256 hash of code, or 0 if account doesn't exist
+ * Returns keccak256 hash of code, or 0 if account doesn't exist or is empty.
+ * Empty account returns empty hash (0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470)
  */
 evm_status_t op_extcodehash(evm_t *evm)
 {
@@ -662,15 +693,28 @@ evm_status_t op_extcodehash(evm_t *evm)
         evm_mark_address_warm(evm, &addr);
     }
 
-    // TODO: Get code hash from StateDB
-    // For now, push 0 (account doesn't exist or has no code)
-    LOG_EVM_DEBUG("EXTCODEHASH: stub - returning hash=0");
-
+    // Get code hash from StateDB
     uint256_t hash = UINT256_ZERO;
+    
+    // Check if account exists
+    if (state_db_exist(evm->state, &addr))
+    {
+        hash_t code_hash;
+        if (state_db_get_code_hash(evm->state, &addr, &code_hash))
+        {
+            // Convert hash_t (32 bytes) to uint256_t
+            hash = uint256_from_bytes(code_hash.bytes, 32);
+        }
+    }
+    // If account doesn't exist, hash remains 0
+
     if (!evm_stack_push(evm->stack, &hash))
     {
         return EVM_STACK_OVERFLOW;
     }
+
+    LOG_EVM_DEBUG("EXTCODEHASH: address=0x...%02x%02x", 
+                  addr.bytes[18], addr.bytes[19]);
 
     return EVM_SUCCESS;
 }

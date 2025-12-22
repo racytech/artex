@@ -567,6 +567,30 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     evm->stopped = false;
     evm->status = EVM_SUCCESS;
 
+    //==========================================================================
+    // Value Transfer
+    //==========================================================================
+    
+    // Transfer value if non-zero (for CALL family, not CREATE - CREATE handles it separately)
+    // Only transfer for internal calls (depth > 0) - top-level calls already transferred in transaction layer
+    if (msg->depth > 0 && (msg->kind == EVM_CALL || msg->kind == EVM_CALLCODE) && !uint256_is_zero(&msg->value))
+    {
+        // Deduct from caller
+        uint256_t caller_balance;
+        state_db_get_balance(evm->state, &msg->caller, &caller_balance);
+        uint256_t new_caller_balance = uint256_sub(&caller_balance, &msg->value);
+        state_db_set_balance(evm->state, &msg->caller, &new_caller_balance);
+        
+        // Add to recipient
+        uint256_t recipient_balance;
+        if (!state_db_get_balance(evm->state, &msg->recipient, &recipient_balance))
+        {
+            recipient_balance = uint256_from_uint64(0);
+        }
+        uint256_t new_recipient_balance = uint256_add(&recipient_balance, &msg->value);
+        state_db_set_balance(evm->state, &msg->recipient, &new_recipient_balance);
+    }
+
     // Handle contract creation
     if (msg->kind == EVM_CREATE || msg->kind == EVM_CREATE2)
     {

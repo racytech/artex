@@ -36,6 +36,15 @@ typedef enum {
 } transaction_type_t;
 
 /**
+ * Access list entry (EIP-2930)
+ */
+typedef struct {
+    address_t address;
+    uint256_t *storage_keys;
+    size_t storage_keys_count;
+} access_list_entry_t;
+
+/**
  * Transaction structure
  */
 typedef struct {
@@ -57,6 +66,10 @@ typedef struct {
     const uint8_t *data;
     size_t data_size;
     
+    // Access list (EIP-2930)
+    access_list_entry_t *access_list;
+    size_t access_list_count;
+    
     // Flags
     bool is_create;            // True if this is a contract creation
 } transaction_t;
@@ -72,6 +85,7 @@ typedef struct {
     uint256_t difficulty;
     uint256_t base_fee;        // EIP-1559 base fee
     hash_t prev_randao;        // Post-merge: PREVRANDAO (replaces difficulty)
+    bool skip_coinbase_payment; // Skip coinbase payment (for state tests)
 } block_env_t;
 
 /**

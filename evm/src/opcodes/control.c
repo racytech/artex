@@ -236,7 +236,8 @@ evm_status_t op_jumpi(evm_t *evm)
     // Check if condition is non-zero (true)
     if (uint256_is_zero(&cond_256))
     {
-        // Condition is false, don't jump
+        // Condition is false, don't jump - increment PC
+        evm->pc++;
         return EVM_SUCCESS;
     }
 
@@ -410,18 +411,15 @@ evm_status_t op_revert(evm_t *evm)
 }
 
 //==============================================================================
-// SELFDESTRUCT Opcode (Stub)
+// SELFDESTRUCT Opcode
 //==============================================================================
 
 /**
- * SELFDESTRUCT - Destroy current contract and send funds (stub)
+ * SELFDESTRUCT - Destroy current contract and send funds
  * Stack: beneficiary =>
  * 
- * TODO: Full implementation requires:
- * - Account deletion mechanism in StateDB
- * - Balance transfer to beneficiary
- * - Gas refund tracking
- * - Proper handling of recreated contracts (EIP-6780)
+ * Transfers contract balance to beneficiary and marks contract for deletion.
+ * Note: EIP-6780 (Cancun) changes behavior - only deletes if created in same transaction.
  */
 evm_status_t op_selfdestruct(evm_t *evm)
 {
@@ -444,25 +442,54 @@ evm_status_t op_selfdestruct(evm_t *evm)
         return EVM_STACK_UNDERFLOW;
     }
 
-    // TODO: Implement SELFDESTRUCT gas logic
-    // Base cost: 5000 gas
-    // + 25000 gas if creating new account (beneficiary doesn't exist)
-    // + cold access cost if beneficiary is cold
-    // Note: Gas refund was removed in EIP-3529 (London)
-    if (!evm_use_gas(evm, 5000))
+    // Convert beneficiary from uint256 to address
+    address_t beneficiary_addr;
+    address_from_uint256(&beneficiary, &beneficiary_addr);
+
+    // Get current contract balance
+    uint256_t balance;
+    state_db_get_balance(evm->state, &evm->msg.recipient, &balance);
+
+    // Check if beneficiary exists for gas calculation
+    bool beneficiary_exists = state_db_exist(evm->state, &beneficiary_addr);
+
+    // Calculate gas cost
+    uint64_t gas_cost = 5000;  // Base cost
+
+    // Pre-EIP-3529: Add 25000 gas if creating new account
+    // For now, we'll use the simple pre-London rules
+    if (!beneficiary_exists && !uint256_is_zero(&balance))
+    {
+        gas_cost += 25000;
+    }
+
+    if (!evm_use_gas(evm, gas_cost))
     {
         return EVM_OUT_OF_GAS;
     }
 
-    // TODO: Implement actual selfdestruct logic:
-    // 1. Transfer balance to beneficiary
-    // 2. Mark contract for deletion
-    // 3. Track gas refund
-    // 4. Set stopped flag
+    // Transfer balance to beneficiary (if non-zero)
+    if (!uint256_is_zero(&balance))
+    {
+        // Get beneficiary current balance
+        uint256_t beneficiary_balance;
+        state_db_get_balance(evm->state, &beneficiary_addr, &beneficiary_balance);
 
-    LOG_EVM_DEBUG("SELFDESTRUCT: stub - halting execution");
+        // Add contract balance to beneficiary
+        uint256_t new_beneficiary_balance = uint256_add(&beneficiary_balance, &balance);
+        state_db_set_balance(evm->state, &beneficiary_addr, &new_beneficiary_balance);
 
-    // For now, just halt execution
+        // Zero out contract balance before deletion
+        uint256_t zero = uint256_from_uint64(0);
+        state_db_set_balance(evm->state, &evm->msg.recipient, &zero);
+    }
+
+    // Mark contract for deletion
+    state_db_suicide(evm->state, &evm->msg.recipient);
+
+    LOG_EVM_DEBUG("SELFDESTRUCT: contract deleted, balance transferred");
+
+    // Halt execution
     evm->stopped = true;
 
     return EVM_SUCCESS;

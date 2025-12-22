@@ -80,11 +80,31 @@ typedef struct {
 } test_block_header_t;
 
 /**
+ * Access list entry (EIP-2930)
+ * Contains an address and its associated storage keys
+ */
+typedef struct {
+    address_t address;
+    uint256_t *storage_keys;
+    size_t storage_keys_count;
+} test_access_list_entry_t;
+
+/**
+ * Access list for a transaction
+ */
+typedef struct {
+    test_access_list_entry_t *entries;
+    size_t entries_count;
+} test_access_list_t;
+
+/**
  * Transaction data
  */
 typedef struct {
     uint256_t nonce;
-    uint256_t gas_price;
+    uint256_t gas_price;                    // Legacy transactions
+    uint256_t max_fee_per_gas;              // EIP-1559
+    uint256_t max_priority_fee_per_gas;     // EIP-1559
     uint256_t *gas_limit;   // Array for multiple test cases
     size_t gas_limit_count;
     address_t to;
@@ -101,6 +121,10 @@ typedef struct {
     uint256_t v;
     uint256_t r;
     uint256_t s;
+    
+    // Access lists (EIP-2930) - Array for multiple test cases
+    test_access_list_t *access_lists;
+    size_t access_lists_count;
 } test_transaction_t;
 
 /**
@@ -181,6 +205,9 @@ typedef struct {
     uint32_t data_index;
     uint32_t gas_index;
     uint32_t value_index;
+    
+    // Exception expectation (NULL if transaction should succeed)
+    char *expect_exception;
 } test_post_condition_t;
 
 /**
