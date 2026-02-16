@@ -24,7 +24,7 @@
 /**
  * Get the fixed size of a node based on its type
  */
-static size_t get_node_size(data_art_node_type_t type) {
+size_t get_node_size(data_art_node_type_t type) {
     switch (type) {
         case DATA_NODE_4:   return sizeof(data_art_node4_t);
         case DATA_NODE_16:  return sizeof(data_art_node16_t);
@@ -342,7 +342,7 @@ static bool is_leaf_ref(data_art_tree_t *tree, node_ref_t ref) {
 /**
  * Find child node reference by byte key
  */
-static node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) {
+node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) {
     const void *node = data_art_load_node(tree, node_ref);
     if (!node) {
         LOG_INFO("find_child: failed to load node at page=%lu offset=%u",
@@ -487,7 +487,7 @@ static const data_art_leaf_t* find_any_leaf_for_prefix(data_art_tree_t *tree, no
  * Check prefix match (path compression) with lazy expansion support
  * For search operations, we use optimistic matching for lazy expansion
  */
-static int check_prefix(data_art_tree_t *tree, node_ref_t node_ref,
+int check_prefix(data_art_tree_t *tree, node_ref_t node_ref,
                        const void *node, const uint8_t *key, 
                        size_t key_len, size_t depth) {
     const uint8_t *node_bytes = (const uint8_t *)node;
@@ -512,7 +512,7 @@ static int check_prefix(data_art_tree_t *tree, node_ref_t node_ref,
 /**
  * Check if leaf matches key
  */
-static bool leaf_matches(const data_art_leaf_t *leaf, const uint8_t *key, size_t key_len) {
+bool leaf_matches(const data_art_leaf_t *leaf, const uint8_t *key, size_t key_len) {
     if (leaf->key_len != key_len) {
         return false;
     }
@@ -530,7 +530,13 @@ const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_l
         return NULL;
     }
     
+    // Log search start
+    char key_str[64];
+    snprintf(key_str, sizeof(key_str), "%.*s", (int)(key_len < 50 ? key_len : 50), key);
+    LOG_INFO(">>> SEARCHING for key: '%s' (len=%zu)", key_str, key_len);
+    
     if (node_ref_is_null(tree->root)) {
+        LOG_INFO(">>> Tree is empty, returning NULL");
         return NULL;  // Empty tree
     }
     
@@ -585,11 +591,37 @@ const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_l
         uint8_t partial_len = node_bytes[2];
         
         if (partial_len > 0) {
+            LOG_INFO("Checking prefix: node at page=%lu has partial_len=%u, current depth=%zu", 
+                     current.page_id, partial_len, depth);
+            
             int prefix_match = check_prefix(tree, current, node, key, key_len, depth);
             
             // Check inline portion (up to 10 bytes)
             int expected_match = (partial_len < 10) ? partial_len : 10;
+            
+            LOG_INFO("Prefix check result: prefix_match=%d, expected_match=%d", 
+                     prefix_match, expected_match);
+            
             if (prefix_match < expected_match) {
+                // Show what mismatched - use hex for clarity
+                char key_hex[64];
+                char node_hex[64];
+                int show_bytes = (expected_match < 10) ? expected_match : 10;
+                
+                for (int i = 0; i < show_bytes; i++) {
+                    if (depth + i < key_len) {
+                        snprintf(key_hex + i*3, 4, "%02x ", key[depth + i]);
+                    } else {
+                        snprintf(key_hex + i*3, 4, "?? ");
+                    }
+                    snprintf(node_hex + i*3, 4, "%02x ", node_bytes[4 + i]);
+                }
+                
+                LOG_INFO("PREFIX MISMATCH at depth=%zu (matched %d/%d bytes)", 
+                         depth, prefix_match, expected_match);
+                LOG_INFO("  Key bytes:  %s", key_hex);
+                LOG_INFO("  Node bytes: %s", node_hex);
+                
                 return NULL;  // Prefix mismatch in inline portion
             }
             

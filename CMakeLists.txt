@@ -80,6 +80,7 @@ add_library(art_persistent STATIC
     database/src/data_art_core.c
     database/src/data_art_overflow.c
     database/src/data_art_insert.c
+    database/src/data_art_delete.c
     database/src/data_art_node_ops.c
     database/src/logger.c
 )
@@ -158,6 +159,24 @@ add_executable(test_data_art_stress
     database/tests/test_data_art_stress.c
 )
 target_link_libraries(test_data_art_stress art_persistent pthread)
+
+# Benchmark: Persistent ART Performance
+add_executable(benchmark_data_art
+    database/tests/benchmark_data_art.c
+)
+target_link_libraries(benchmark_data_art art_persistent pthread)
+
+# Test: Persistent ART Edge Cases
+add_executable(test_data_art_edge_cases
+    database/tests/test_data_art_edge_cases.c
+)
+target_link_libraries(test_data_art_edge_cases art_persistent pthread)
+
+# Test: Persistent ART Delete Operations
+add_executable(test_data_art_delete
+    database/tests/test_data_art_delete.c
+)
+target_link_libraries(test_data_art_delete art_persistent pthread)
 
 # Test: Persistent ART Node Operations
 add_executable(test_data_art_node_ops

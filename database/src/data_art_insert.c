@@ -436,9 +436,19 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                                     const uint8_t *key, size_t key_len, size_t depth,
                                     const void *value, size_t value_len,
                                     bool *inserted) {
+    // Debug: Print key being inserted
+    if (depth == 0) {
+        char key_str[256];
+        size_t copy_len = key_len < 255 ? key_len : 255;
+        memcpy(key_str, key, copy_len);
+        key_str[copy_len] = '\0';
+        LOG_INFO("=== INSERTING KEY: %s (len=%zu) ===", key_str, key_len);
+    }
+    
     // Base case: create new leaf
     if (node_ref_is_null(node_ref)) {
         *inserted = true;
+        LOG_INFO("  depth=%zu: Creating new leaf", depth);
         return alloc_leaf(tree, key, key_len, value, value_len);
     }
     
@@ -449,6 +459,8 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
     }
     
     uint8_t type = *(const uint8_t *)node;
+    LOG_INFO("  depth=%zu: node_type=%u at page=%u offset=%u", 
+             depth, type, node_ref.page_id, node_ref.offset);
     
     // If it's a leaf, check for match or split
     if (type == DATA_NODE_LEAF) {
@@ -549,6 +561,8 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
     const uint8_t *node_bytes = (const uint8_t *)node;
     uint8_t partial_len = node_bytes[2];
     
+    LOG_INFO("  depth=%zu: checking prefix, partial_len=%u", depth, partial_len);
+    
     if (partial_len > 0) {
         // IMPORTANT: Make a copy of the node BEFORE calling check_prefix_match,
         // because check_prefix_match may call find_any_leaf which overwrites temp_page
@@ -562,9 +576,13 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         
         int prefix_match = check_prefix_match(tree, node_ref, node, key, key_len, depth);
         
+        LOG_INFO("  depth=%zu: prefix_match=%d/%u", depth, prefix_match, partial_len);
+        
         if (prefix_match < partial_len) {
             // Prefix mismatch - need to split the node at the mismatch point
             *inserted = true;
+            
+            LOG_INFO("  depth=%zu: PREFIX SPLIT needed at position %d", depth, prefix_match);
             
             // Create new NODE_4 to become the parent
             node_ref_t new_parent_ref = data_art_alloc_node(tree, sizeof(data_art_node4_t));
@@ -580,11 +598,17 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             new_parent.num_children = 0;
             new_parent.partial_len = prefix_match;  // Common portion
             
+            // Debug: show what the original partial prefix was
+            LOG_INFO("  Original partial prefix (%u bytes): '%.*s'", 
+                     partial_len, partial_len < 10 ? partial_len : 10, node_bytes + 4);
+            
             // Copy prefix from the KEY, not from old node's partial array
             // (old node's partial may only have first 10 bytes if partial_len > 10)
             size_t prefix_to_store = (prefix_match > 10) ? 10 : prefix_match;
             if (prefix_to_store > 0) {
                 memcpy(new_parent.partial, key + depth, prefix_to_store);
+                LOG_INFO("  New parent prefix (%zu bytes): '%.*s'", 
+                         prefix_to_store, (int)prefix_to_store, new_parent.partial);
             }
             
             // Write new parent
@@ -605,29 +629,39 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             memcpy(modified_node, node_copy, node_size);
             free(node_copy);  // Done with node_copy
             
+            // Log old node structure before modification
+            if (type == DATA_NODE_4) {
+                const data_art_node4_t *old_n4 = (const data_art_node4_t *)modified_node;
+                LOG_INFO("  OLD NODE_4 before modification: num_children=%u, partial_len=%u", 
+                         old_n4->num_children, old_n4->partial_len);
+                for (int i = 0; i < old_n4->num_children; i++) {
+                    LOG_INFO("    child[%d]: key=0x%02x, page=%u, offset=%u", 
+                             i, old_n4->keys[i], old_n4->child_page_ids[i], old_n4->child_offsets[i]);
+                }
+            }
+            
             uint8_t *mod_bytes = (uint8_t *)modified_node;
             uint8_t remaining_prefix_len = partial_len - prefix_match - 1;
             mod_bytes[2] = remaining_prefix_len;  // Update partial_len
             
-            // Reconstruct the remaining prefix from the key
+            LOG_INFO("  PREFIX SPLIT: partial_len %u -> new_parent %u, modified_node %u", 
+                     partial_len, prefix_match, remaining_prefix_len);
+            
+            // Reconstruct the remaining prefix from the OLD node's prefix
             // After split: parent has [0..prefix_match-1], byte at prefix_match becomes discriminator,
             // old node keeps [prefix_match+1..partial_len-1]
             if (remaining_prefix_len > 0) {
                 size_t bytes_to_copy = (remaining_prefix_len > 10) ? 10 : remaining_prefix_len;
-                // Copy from key starting at (depth + prefix_match + 1)
-                if (depth + prefix_match + 1 + bytes_to_copy <= key_len) {
-                    memcpy(mod_bytes + 4, key + depth + prefix_match + 1, bytes_to_copy);
+                
+                // Copy from old node's prefix, NOT from the new key being inserted!
+                if (prefix_match + 1 < 10 && prefix_match + 1 + bytes_to_copy <= 10 && partial_len <= 10) {
+                    // Old node had non-lazy prefix, copy from partial array
+                    memmove(mod_bytes + 4, node_bytes + 4 + prefix_match + 1, bytes_to_copy);
                 } else {
-                    // Key is too short, need to get bytes from the old node's descendant leaf
-                    // For now, try to copy what we can from old partial if available
-                    if (prefix_match + 1 < 10 && partial_len <= 10) {
-                        memmove(mod_bytes + 4, node_bytes + 4 + prefix_match + 1, bytes_to_copy);
-                    } else {
-                        // Old node had lazy expansion - need to get bytes from a leaf
-                        const data_art_leaf_t *leaf = find_any_leaf(tree, node_ref);
-                        if (leaf && depth + prefix_match + 1 + bytes_to_copy <= leaf->key_len) {
-                            memcpy(mod_bytes + 4, leaf->data + depth + prefix_match + 1, bytes_to_copy);
-                        }
+                    // Old node had lazy expansion - need to get bytes from a leaf in old subtree
+                    const data_art_leaf_t *leaf = find_any_leaf(tree, node_ref);
+                    if (leaf && depth + prefix_match + 1 + bytes_to_copy <= leaf->key_len) {
+                        memcpy(mod_bytes + 4, leaf->data + depth + prefix_match + 1, bytes_to_copy);
                     }
                 }
             }
@@ -655,16 +689,31 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                 // Can read from partial array
                 const uint8_t *partial = node_bytes + 4;
                 old_byte = partial[prefix_match];
+                LOG_INFO("  Getting old_byte from partial[%d] = 0x%02x ('%c')", 
+                         prefix_match, old_byte, old_byte >= 32 && old_byte < 127 ? old_byte : '?');
             } else {
                 // Need to read from a leaf descendant
                 const data_art_leaf_t *leaf = find_any_leaf(tree, node_ref);
                 if (leaf && depth + prefix_match < leaf->key_len) {
                     old_byte = leaf->data[depth + prefix_match];
+                    
+                    // Debug: show what leaf we got and what byte
+                    char leaf_key[256];
+                    size_t copy_len = leaf->key_len < 255 ? leaf->key_len : 255;
+                    memcpy(leaf_key, leaf->data, copy_len);
+                    leaf_key[copy_len] = '\0';
+                    LOG_INFO("  Getting old_byte from leaf key '%s' at position %zu = 0x%02x ('%c')", 
+                             leaf_key, depth + prefix_match, old_byte, 
+                             old_byte >= 32 && old_byte < 127 ? old_byte : '?');
                 } else {
                     // Fallback: use NULL byte
                     old_byte = 0x00;
+                    LOG_INFO("  Using fallback old_byte = 0x00");
                 }
             }
+            
+            LOG_INFO("  Adding modified_node (page=%lu) as child with key=0x%02x to new_parent (page=%lu)", 
+                     modified_node_ref.page_id, old_byte, new_parent_ref.page_id);
             
             // Add modified old node as child
             new_parent_ref = add_child_to_node(tree, new_parent_ref, old_byte, modified_node_ref);
@@ -683,6 +732,9 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             uint8_t new_byte = (depth + prefix_match < key_len) ? 
                                key[depth + prefix_match] : 0x00;
             
+            LOG_INFO("  Creating new_leaf for key 149, will add as child with key=0x%02x ('%c')", 
+                     new_byte, new_byte >= 32 && new_byte < 127 ? new_byte : '?');
+            
             new_parent_ref = add_child_to_node(tree, new_parent_ref, new_byte, new_leaf_ref);
             if (node_ref_is_null(new_parent_ref)) {
                 LOG_ERROR("Failed to add new leaf to new parent");
@@ -698,16 +750,22 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
     // Determine which byte to insert for (NULL byte if key is consumed)
     uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
     
+    LOG_INFO("  depth=%zu: looking for child with byte=0x%02x", depth, byte);
+    
     // Find child for this byte
     node_ref_t child_ref = find_child_ref(tree, node_ref, byte);
     
     if (!node_ref_is_null(child_ref)) {
+        LOG_INFO("  depth=%zu: child found at page=%u offset=%u, recursing...", 
+                 depth, child_ref.page_id, child_ref.offset);
         // Child exists - recurse
         node_ref_t new_child_ref = insert_recursive(tree, child_ref, key, key_len,
                                                      depth + 1, value, value_len, inserted);
         
         // If child changed (due to split or growth), update parent's reference
         if (!node_ref_equals(new_child_ref, child_ref)) {
+            LOG_INFO("  depth=%zu: child changed from page=%u to page=%u, updating parent", 
+                     depth, child_ref.page_id, new_child_ref.page_id);
             if (!replace_child_in_node(tree, node_ref, byte, child_ref, new_child_ref)) {
                 LOG_ERROR("Failed to update child reference in parent");
             }
@@ -715,12 +773,16 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         
         return node_ref;
     } else {
-        // No child - create new leaf
+        // No child - add new leaf here
+        LOG_INFO("  depth=%zu: no child found, creating new leaf for byte=0x%02x", depth, byte);
         *inserted = true;
         node_ref_t leaf_ref = alloc_leaf(tree, key, key_len, value, value_len);
         if (!node_ref_is_null(leaf_ref)) {
+            LOG_INFO("  depth=%zu: adding leaf at page=%u as child", depth, leaf_ref.page_id);
             // Add leaf as child
             node_ref_t new_node_ref = add_child_to_node(tree, node_ref, byte, leaf_ref);
+            LOG_INFO("  depth=%zu: after adding child, node ref: page=%u offset=%u", 
+                     depth, new_node_ref.page_id, new_node_ref.offset);
             return new_node_ref;
         }
     }

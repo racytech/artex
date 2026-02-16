@@ -60,9 +60,9 @@ static void generate_key(int index, int seed, char *buf, size_t buf_size, size_t
  * Test: Incremental stress test - start small and increase
  */
 static bool test_incremental_stress(void) {
-    TEST("incremental stress test - debugging");
+    TEST("incremental stress test - up to 2000 keys");
     
-    const int sizes[] = {100, 150, 200, 250, 300};  // Binary search
+    const int sizes[] = {100, 250, 500, 750, 1000, 1500, 2000};
     const int num_sizes = sizeof(sizes) / sizeof(sizes[0]);
     
     for (int s = 0; s < num_sizes; s++) {
@@ -146,28 +146,35 @@ static bool test_incremental_stress(void) {
                 }
             }
             
-            // Check key 2 every insertion after key 10 to find when it disappears
-            if (i > 2 && i <= 50) {
-                srand(12345);
-                for (int skip = 0; skip < 2; skip++) {
-                    char dummy[128];
-                    size_t dummy_len;
-                    generate_key(skip, 12345, dummy, sizeof(dummy), &dummy_len);
+            // Check ALL previously inserted keys after key 149 to see which ones disappear
+            if (i == 149) {
+                printf("\n    After inserting key 149, checking all previous keys...\n");
+                srand(12345); // Reset
+                int missing_count = 0;
+                for (int check = 0; check < 149; check++) {
+                    char check_key[128];
+                    size_t check_len;
+                    generate_key(check, 12345, check_key, sizeof(check_key), &check_len);
+                    size_t test_len;
+                    void *check_val = data_art_get(tree, (const uint8_t *)check_key, check_len, &test_len);
+                    if (!check_val) {
+                        if (missing_count < 10) {  // Only print first 10
+                            printf("      Key %d MISSING: %s\n", check, check_key);
+                        }
+                        missing_count++;
+                    } else {
+                        free(check_val);
+                    }
                 }
-                char key2[128];
-                size_t key2_len;
-                generate_key(2, 12345, key2, sizeof(key2), &key2_len);
-                size_t test_len;
-                void *test2 = data_art_get(tree, (const uint8_t *)key2, key2_len, &test_len);
-                if (!test2) {
-                    fprintf(stderr, "\n    KEY 2 DISAPPEARED after inserting key %d!\n", i);
-                    fprintf(stderr, "    Key 2: %s\n", key2);
-                    fprintf(stderr, "    Last inserted key %d: %s\n", i, key);
+                if (missing_count > 0) {
+                    printf("      Total missing keys: %d out of 149\n", missing_count);
+                    printf("      STOPPING TEST - major corruption detected\n");
                     data_art_destroy(tree);
                     page_manager_destroy(pm);
-                    FAIL("key corruption detected");
+                    FAIL("massive corruption after key 149");
+                } else {
+                    printf("      All 149 keys verified OK after key 149\n");
                 }
-                free(test2);
                 // Restore RNG state
                 srand(12345);
                 for (int skip = 0; skip <= i; skip++) {
@@ -287,10 +294,10 @@ static bool test_incremental_stress(void) {
 }
 
 /**
- * Test: Focused test around the failure point
+ * Test: Focused test with large dataset
  */
 static bool test_focused_2000(void) {
-    TEST("focused test - exactly 2000 keys");
+    TEST("focused test - exactly 10000 keys");
     
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
@@ -298,7 +305,7 @@ static bool test_focused_2000(void) {
     data_art_tree_t *tree = data_art_create(pm, NULL);
     assert(tree != NULL);
     
-    const int NUM_KEYS = 2000;
+    const int NUM_KEYS = 10000;
     
     // Seed RNG
     srand(54321);
@@ -399,6 +406,155 @@ cleanup_fail:
 }
 
 /**
+ * Test: Minimal reproduction with just 3 keys
+ * Keys 32, 34, and 149 where 149 corrupts 32 and 34
+ */
+static bool test_minimal_reproduction(void) {
+    printf("\n  === MINIMAL REPRODUCTION TEST ===\n");
+    printf("  This test inserts 3 keys that trigger corruption:\n");
+    printf("    1. Key 32:  stress_key_602419417_0032\n");
+    printf("    2. Key 34:  stress_key_60241667_0034 (shares 16-byte prefix with key 32)\n");
+    printf("    3. Key 149: stress_key_601177067_0149 (shares 13-byte prefix with keys 32/34)\n");
+    printf("  Expected: Key 149 insertion corrupts keys 32 and 34\n\n");
+    
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    if (!pm) {
+        FAIL("Failed to create page manager");
+    }
+    
+    data_art_tree_t *tree = data_art_create(pm, false);
+    if (!tree) {
+        page_manager_destroy(pm);
+        FAIL("Failed to create tree");
+    }
+    
+    printf("  Inserting 3 specific keys to reproduce corruption...\n");
+    
+    // Generate the exact keys
+    srand(12345);
+    
+    // Key 32
+    for (int i = 0; i < 32; i++) rand();
+    char key32[128];
+    size_t len32 = snprintf(key32, sizeof(key32), "stress_key_%08d_%04d", rand(), 32);
+    char val32[32];
+    size_t vallen32 = snprintf(val32, sizeof(val32), "value_%04d", 32);
+    
+    // Key 34
+    srand(12345);
+    for (int i = 0; i < 34; i++) rand();
+    char key34[128];
+    size_t len34 = snprintf(key34, sizeof(key34), "stress_key_%08d_%04d", rand(), 34);
+    char val34[32];
+    size_t vallen34 = snprintf(val34, sizeof(val34), "value_%04d", 34);
+    
+    // Key 149
+    srand(12345);
+    for (int i = 0; i < 149; i++) rand();
+    char key149[128];
+    size_t len149 = snprintf(key149, sizeof(key149), "stress_key_%08d_%04d", rand(), 149);
+    char val149[32];
+    size_t vallen149 = snprintf(val149, sizeof(val149), "value_%04d", 149);
+    
+    printf("  Key 32:  %s\n", key32);
+    printf("  Key 34:  %s\n", key34);
+    printf("  Key 149: %s\n", key149);
+    
+    // Insert key 32
+    printf("\n  Inserting key 32...\n");
+    if (!data_art_insert(tree, (const uint8_t *)key32, len32, 
+                         (const uint8_t *)val32, vallen32)) {
+        data_art_destroy(tree);
+        page_manager_destroy(pm);
+        FAIL("Failed to insert key 32");
+    }
+    
+    // Verify key 32
+    size_t test_len;
+    const void *test32 = data_art_get(tree, (const uint8_t *)key32, len32, &test_len);
+    if (!test32) {
+        data_art_destroy(tree);
+        page_manager_destroy(pm);
+        FAIL("Key 32 not found after insertion");
+    }
+    printf("  Key 32 verified OK\n");
+    
+    // Insert key 34
+    printf("\n  Inserting key 34...\n");
+    if (!data_art_insert(tree, (const uint8_t *)key34, len34, 
+                         (const uint8_t *)val34, vallen34)) {
+        data_art_destroy(tree);
+        page_manager_destroy(pm);
+        FAIL("Failed to insert key 34");
+    }
+    
+    // Verify both keys
+    test32 = data_art_get(tree, (const uint8_t *)key32, len32, &test_len);
+    if (!test32) {
+        data_art_destroy(tree);
+        page_manager_destroy(pm);
+        FAIL("Key 32 disappeared after key 34");
+    }
+    printf("  Key 32 still OK after key 34\n");
+    
+    const void *test34 = data_art_get(tree, (const uint8_t *)key34, len34, &test_len);
+    if (!test34) {
+        data_art_destroy(tree);
+        page_manager_destroy(pm);
+        FAIL("Key 34 not found after insertion");
+    }
+    printf("  Key 34 verified OK\n");
+    
+    // Now insert key 149 - this should corrupt keys 32 and 34
+    printf("\n  Inserting key 149 (the corruption trigger)...\n");
+    if (!data_art_insert(tree, (const uint8_t *)key149, len149, 
+                         (const uint8_t *)val149, vallen149)) {
+        data_art_destroy(tree);
+        page_manager_destroy(pm);
+        FAIL("Failed to insert key 149");
+    }
+    
+    printf("  Key 149 inserted successfully\n");
+    
+    // Now check all three keys
+    printf("\n  Verifying all keys after key 149 insertion...\n");
+    
+    test32 = data_art_get(tree, (const uint8_t *)key32, len32, &test_len);
+    if (!test32) {
+        printf("  ✗ Key 32 DISAPPEARED!\n");
+        data_art_destroy(tree);
+        page_manager_destroy(pm);
+        FAIL("Key 32 corrupted by key 149 insertion");
+    }
+    printf("  ✓ Key 32 OK\n");
+    
+    test34 = data_art_get(tree, (const uint8_t *)key34, len34, &test_len);
+    if (!test34) {
+        printf("  ✗ Key 34 DISAPPEARED!\n");
+        data_art_destroy(tree);
+        page_manager_destroy(pm);
+        FAIL("Key 34 corrupted by key 149 insertion");
+    }
+    printf("  ✓ Key 34 OK\n");
+    
+    const void *test149 = data_art_get(tree, (const uint8_t *)key149, len149, &test_len);
+    if (!test149) {
+        printf("  ✗ Key 149 not found!\n");
+        data_art_destroy(tree);
+        page_manager_destroy(pm);
+        FAIL("Key 149 not retrievable");
+    }
+    printf("  ✓ Key 149 OK\n");
+    
+    printf("\n  All 3 keys verified successfully!\n");
+    
+    data_art_destroy(tree);
+    page_manager_destroy(pm);
+    
+    PASS();
+}
+
+/**
  * Test: Sequential insertion order
  */
 static bool test_sequential_keys(void) {
@@ -491,10 +647,21 @@ int main(int argc, char **argv) {
     printf("========================================\n");
     printf("\n");
     
-    // Run tests
-    test_sequential_keys();
-    test_incremental_stress();
-    test_focused_2000();
+    // Run tests based on argument
+    if (argc > 1 && strcmp(argv[1], "minimal") == 0) {
+        printf("Running MINIMAL reproduction test only...\n\n");
+        test_minimal_reproduction();
+    } else if (argc > 1 && strcmp(argv[1], "incremental") == 0) {
+        test_incremental_stress();
+    } else if (argc > 1 && strcmp(argv[1], "focused") == 0) {
+        test_focused_2000();
+    } else {
+        // Run all tests
+        test_minimal_reproduction();
+        test_sequential_keys();
+        test_incremental_stress();
+        test_focused_2000();
+    }
     
     // Summary
     printf("========================================\n");
