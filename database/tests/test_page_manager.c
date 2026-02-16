@@ -1,0 +1,418 @@
+/*
+ * Page Manager Tests
+ * 
+ * Tests for page allocation, I/O, and free space management.
+ */
+
+#include "page_manager.h"
+#include "logger.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
+
+#define TEST_DB_PATH "/tmp/test_page_manager_db"
+#define ANSI_COLOR_GREEN   "\x1b[32m"
+#define ANSI_COLOR_RED     "\x1b[31m"
+#define ANSI_COLOR_RESET   "\x1b[0m"
+
+static int tests_passed = 0;
+static int tests_failed = 0;
+
+// Test helper macros
+#define TEST_ASSERT(condition, message) \
+    do { \
+        if (condition) { \
+            printf("  " ANSI_COLOR_GREEN "✓" ANSI_COLOR_RESET " %s\n", message); \
+            tests_passed++; \
+        } else { \
+            printf("  " ANSI_COLOR_RED "✗" ANSI_COLOR_RESET " %s\n", message); \
+            tests_failed++; \
+        } \
+    } while (0)
+
+#define RUN_TEST(test_func) \
+    do { \
+        printf("\nRunning: %s\n", #test_func); \
+        test_func(); \
+    } while (0)
+
+// Cleanup test directory
+static void cleanup_test_db(void) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", TEST_DB_PATH);
+    system(cmd);
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+void test_page_manager_create_destroy(void) {
+    cleanup_test_db();
+    
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+    TEST_ASSERT(pm->allocator != NULL, "Allocator should be initialized");
+    TEST_ASSERT(pm->allocator->next_page_id == 1, "Next page ID should start at 1");
+    TEST_ASSERT(pm->allocator->num_data_files == 1, "Should have one data file");
+    
+    page_manager_destroy(pm);
+    
+    // Verify data file was created
+    char filename[256];
+    snprintf(filename, sizeof(filename), "%s/pages_00000.dat", TEST_DB_PATH);
+    struct stat st;
+    TEST_ASSERT(stat(filename, &st) == 0, "Data file should exist");
+    
+    cleanup_test_db();
+}
+
+void test_page_allocation(void) {
+    cleanup_test_db();
+    
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+    
+    // Allocate first page (should be page 1)
+    uint64_t page_id1 = page_manager_alloc(pm, 0);
+    TEST_ASSERT(page_id1 == 1, "First allocated page should be ID 1");
+    TEST_ASSERT(pm->allocator->total_pages == 1, "Total pages should be 1");
+    TEST_ASSERT(pm->allocator->allocated_pages == 1, "Allocated pages should be 1");
+    
+    // Allocate second page
+    uint64_t page_id2 = page_manager_alloc(pm, 0);
+    TEST_ASSERT(page_id2 == 2, "Second allocated page should be ID 2");
+    TEST_ASSERT(pm->allocator->total_pages == 2, "Total pages should be 2");
+    
+    // Allocate third page
+    uint64_t page_id3 = page_manager_alloc(pm, 0);
+    TEST_ASSERT(page_id3 == 3, "Third allocated page should be ID 3");
+    
+    page_manager_destroy(pm);
+    cleanup_test_db();
+}
+
+void test_page_free_and_reuse(void) {
+    cleanup_test_db();
+    
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+    
+    // Allocate pages
+    uint64_t page_id1 = page_manager_alloc(pm, 0);
+    uint64_t page_id2 = page_manager_alloc(pm, 0);
+    uint64_t page_id3 = page_manager_alloc(pm, 0);
+    
+    TEST_ASSERT(pm->allocator->allocated_pages == 3, "Should have 3 allocated pages");
+    TEST_ASSERT(pm->allocator->free_pages == 0, "Should have 0 free pages");
+    
+    // Free page 2
+    page_result_t result = page_manager_free(pm, page_id2);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Page free should succeed");
+    TEST_ASSERT(pm->allocator->allocated_pages == 2, "Should have 2 allocated pages");
+    TEST_ASSERT(pm->allocator->free_pages == 1, "Should have 1 free page");
+    
+    // Allocate new page - should reuse freed page
+    uint64_t page_id4 = page_manager_alloc(pm, 0);
+    TEST_ASSERT(page_id4 == page_id2, "Should reuse freed page 2");
+    TEST_ASSERT(pm->allocator->free_pages == 0, "Should have 0 free pages after reuse");
+    
+    page_manager_destroy(pm);
+    cleanup_test_db();
+}
+
+void test_page_init_and_checksum(void) {
+    cleanup_test_db();
+    
+    page_t page;
+    page_init(&page, 42, 100);
+    
+    TEST_ASSERT(page.header.page_id == 42, "Page ID should be 42");
+    TEST_ASSERT(page.header.version == 100, "Version should be 100");
+    TEST_ASSERT(page.header.free_offset == PAGE_HEADER_SIZE, 
+               "Free offset should start at header size");
+    TEST_ASSERT(page.header.num_nodes == 0, "Num nodes should be 0");
+    TEST_ASSERT(page.header.compression_type == 0, "Compression type should be 0");
+    
+    // Verify checksum
+    TEST_ASSERT(page_verify_checksum(&page), "Checksum should be valid after init");
+    
+    // Modify data and verify checksum fails
+    page.data[0] = 0xFF;
+    TEST_ASSERT(!page_verify_checksum(&page), "Checksum should be invalid after modification");
+    
+    // Recompute and verify
+    page_compute_checksum(&page);
+    TEST_ASSERT(page_verify_checksum(&page), "Checksum should be valid after recompute");
+    
+    cleanup_test_db();
+}
+
+void test_page_write_and_read(void) {
+    cleanup_test_db();
+    
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+    
+    // Allocate a page
+    uint64_t page_id = page_manager_alloc(pm, 0);
+    TEST_ASSERT(page_id > 0, "Page allocation should succeed");
+    
+    // Initialize page with test data
+    page_t write_page;
+    page_init(&write_page, page_id, 1);
+    
+    const char *test_data = "Hello, Page Manager!";
+    memcpy(write_page.data, test_data, strlen(test_data) + 1);
+    write_page.header.free_offset = PAGE_HEADER_SIZE + strlen(test_data) + 1;
+    write_page.header.num_nodes = 1;
+    // Must recompute checksum after modifying data
+    page_compute_checksum(&write_page);
+    
+    // Write page to disk
+    page_result_t result = page_manager_write(pm, &write_page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Page write should succeed");
+    TEST_ASSERT(pm->pages_written == 1, "Pages written counter should be 1");
+    
+    // Read page back
+    page_t read_page;
+    result = page_manager_read(pm, page_id, &read_page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Page read should succeed");
+    TEST_ASSERT(pm->pages_read == 1, "Pages read counter should be 1");
+    
+    // Verify page contents
+    TEST_ASSERT(read_page.header.page_id == page_id, "Page ID should match");
+    TEST_ASSERT(read_page.header.version == 1, "Version should match");
+    TEST_ASSERT(read_page.header.num_nodes == 1, "Num nodes should match");
+    TEST_ASSERT(strcmp((char*)read_page.data, test_data) == 0, "Data should match");
+    TEST_ASSERT(page_verify_checksum(&read_page), "Checksum should be valid");
+    
+    page_manager_destroy(pm);
+    cleanup_test_db();
+}
+
+void test_multiple_pages_io(void) {
+    cleanup_test_db();
+    
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+    
+    const int num_pages = 10;
+    uint64_t page_ids[num_pages];
+    
+    // Allocate and write multiple pages
+    for (int i = 0; i < num_pages; i++) {
+        page_ids[i] = page_manager_alloc(pm, 0);
+        
+        page_t page;
+        page_init(&page, page_ids[i], i + 1);
+        
+        // Write unique data to each page
+        snprintf((char*)page.data, 100, "Page %d data", i);
+        page.header.num_nodes = i;
+        // Must recompute checksum after modifying data
+        page_compute_checksum(&page);
+        
+        page_result_t result = page_manager_write(pm, &page);
+        TEST_ASSERT(result == PAGE_SUCCESS, "Page write should succeed");
+    }
+    
+    TEST_ASSERT(pm->pages_written == num_pages, "Should have written all pages");
+    
+    // Read and verify all pages
+    for (int i = 0; i < num_pages; i++) {
+        page_t page;
+        page_result_t result = page_manager_read(pm, page_ids[i], &page);
+        
+        TEST_ASSERT(result == PAGE_SUCCESS, "Page read should succeed");
+        TEST_ASSERT(page.header.page_id == page_ids[i], "Page ID should match");
+        TEST_ASSERT(page.header.version == (uint64_t)(i + 1), "Version should match");
+        TEST_ASSERT(page.header.num_nodes == (uint32_t)i, "Num nodes should match");
+        
+        char expected_data[100];
+        snprintf(expected_data, 100, "Page %d data", i);
+        TEST_ASSERT(strcmp((char*)page.data, expected_data) == 0, "Data should match");
+        TEST_ASSERT(page_verify_checksum(&page), "Checksum should be valid");
+    }
+    
+    TEST_ASSERT(pm->pages_read == num_pages, "Should have read all pages");
+    
+    page_manager_destroy(pm);
+    cleanup_test_db();
+}
+
+void test_size_class_calculation(void) {
+    TEST_ASSERT(page_get_size_class(0) == SIZE_CLASS_TINY, 
+               "0 bytes should be TINY");
+    TEST_ASSERT(page_get_size_class(100) == SIZE_CLASS_TINY, 
+               "100 bytes should be TINY");
+    TEST_ASSERT(page_get_size_class(512) == SIZE_CLASS_SMALL, 
+               "512 bytes should be SMALL");
+    TEST_ASSERT(page_get_size_class(1024) == SIZE_CLASS_MEDIUM, 
+               "1024 bytes should be MEDIUM");
+    TEST_ASSERT(page_get_size_class(2048) == SIZE_CLASS_LARGE, 
+               "2048 bytes should be LARGE");
+    TEST_ASSERT(page_get_size_class(3072) == SIZE_CLASS_HUGE, 
+               "3072 bytes should be HUGE");
+    TEST_ASSERT(page_get_size_class(PAGE_SIZE - PAGE_HEADER_SIZE) == SIZE_CLASS_EMPTY, 
+               "Full page should be EMPTY");
+}
+
+void test_free_space_tracking(void) {
+    cleanup_test_db();
+    
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+    
+    // Allocate a page
+    uint64_t page_id = page_manager_alloc(pm, 0);
+    
+    // Update free space to SMALL class
+    page_result_t result = page_manager_update_free_space(pm, page_id, 600);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Update free space should succeed");
+    TEST_ASSERT(pm->allocator->pages_per_class[SIZE_CLASS_SMALL] == 1,
+               "Should have 1 page in SMALL class");
+    
+    // Update to LARGE class
+    result = page_manager_update_free_space(pm, page_id, 2500);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Update free space should succeed");
+    TEST_ASSERT(pm->allocator->pages_per_class[SIZE_CLASS_SMALL] == 0,
+               "Should have 0 pages in SMALL class");
+    TEST_ASSERT(pm->allocator->pages_per_class[SIZE_CLASS_LARGE] == 1,
+               "Should have 1 page in LARGE class");
+    
+    // Update to no free space
+    result = page_manager_update_free_space(pm, page_id, 0);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Update free space should succeed");
+    TEST_ASSERT(pm->allocator->pages_per_class[SIZE_CLASS_LARGE] == 0,
+               "Should have 0 pages in LARGE class");
+    TEST_ASSERT(pm->allocator->free_pages == 0, "Should have no free pages");
+    
+    page_manager_destroy(pm);
+    cleanup_test_db();
+}
+
+void test_page_manager_sync(void) {
+    cleanup_test_db();
+    
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+    
+    // Write some pages
+    for (int i = 0; i < 5; i++) {
+        uint64_t page_id = page_manager_alloc(pm, 0);
+        page_t page;
+        page_init(&page, page_id, 1);
+        page_manager_write(pm, &page);
+    }
+    
+    // Sync all files
+    page_result_t result = page_manager_sync(pm);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Page manager sync should succeed");
+    
+    page_manager_destroy(pm);
+    cleanup_test_db();
+}
+
+void test_statistics(void) {
+    cleanup_test_db();
+    
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+    
+    // Allocate and write some pages
+    for (int i = 0; i < 5; i++) {
+        uint64_t page_id = page_manager_alloc(pm, 0);
+        page_t page;
+        page_init(&page, page_id, 1);
+        page_manager_write(pm, &page);
+    }
+    
+    // Get statistics
+    page_manager_stats_t stats;
+    page_manager_get_stats(pm, &stats);
+    
+    TEST_ASSERT(stats.total_pages == 5, "Total pages should be 5");
+    TEST_ASSERT(stats.allocated_pages == 5, "Allocated pages should be 5");
+    TEST_ASSERT(stats.pages_written == 5, "Pages written should be 5");
+    TEST_ASSERT(stats.bytes_written == 5 * PAGE_SIZE, "Bytes written should match");
+    TEST_ASSERT(stats.num_data_files == 1, "Should have 1 data file");
+    
+    // Print statistics (visual verification)
+    printf("\n");
+    page_manager_print_stats(pm);
+    
+    page_manager_destroy(pm);
+    cleanup_test_db();
+}
+
+void test_error_handling(void) {
+    cleanup_test_db();
+    
+    // Test NULL page manager
+    uint64_t page_id = page_manager_alloc(NULL, 0);
+    TEST_ASSERT(page_id == 0, "Alloc with NULL manager should return 0");
+    
+    page_result_t result = page_manager_free(NULL, 1);
+    TEST_ASSERT(result == PAGE_ERROR_INVALID_ARG, "Free with NULL manager should fail");
+    
+    // Test invalid page ID
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+    
+    result = page_manager_free(pm, 0);
+    TEST_ASSERT(result == PAGE_ERROR_INVALID_ARG, "Cannot free page 0");
+    
+    // Test read of non-existent page
+    page_t page;
+    result = page_manager_read(pm, 9999, &page);
+    TEST_ASSERT(result == PAGE_ERROR_IO, "Read of non-existent page should return IO error");
+    
+    page_manager_destroy(pm);
+    cleanup_test_db();
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+int main(void) {
+    // Initialize logger
+    log_init(LOG_LEVEL_INFO, stderr);
+    
+    printf("\n");
+    printf("========================================\n");
+    printf("   Page Manager Tests\n");
+    printf("========================================\n");
+    
+    RUN_TEST(test_page_manager_create_destroy);
+    RUN_TEST(test_page_allocation);
+    RUN_TEST(test_page_free_and_reuse);
+    RUN_TEST(test_page_init_and_checksum);
+    RUN_TEST(test_page_write_and_read);
+    RUN_TEST(test_multiple_pages_io);
+    RUN_TEST(test_size_class_calculation);
+    RUN_TEST(test_free_space_tracking);
+    RUN_TEST(test_page_manager_sync);
+    RUN_TEST(test_statistics);
+    RUN_TEST(test_error_handling);
+    
+    printf("\n");
+    printf("========================================\n");
+    printf("Results: %s%d passed%s, %s%d failed%s\n",
+           ANSI_COLOR_GREEN, tests_passed, ANSI_COLOR_RESET,
+           tests_failed > 0 ? ANSI_COLOR_RED : "",
+           tests_failed,
+           tests_failed > 0 ? ANSI_COLOR_RESET : "");
+    printf("========================================\n");
+    printf("\n");
+    
+    cleanup_test_db();
+    
+    return tests_failed > 0 ? 1 : 0;
+}

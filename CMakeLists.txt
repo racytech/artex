@@ -1,225 +1,201 @@
 cmake_minimum_required(VERSION 3.15)
-project(art C CXX)
+project(art_database C)
 
+# Set C standard
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Build type
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release)
-endif()
 
 # Compiler flags
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra")
-set(CMAKE_C_FLAGS_DEBUG "-g -O0")
-set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -g")
+set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -O0 -DDEBUG")
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG")
 
-# ============================================================================
-# Dependencies
-# ============================================================================
+# Find required packages
+find_package(PkgConfig REQUIRED)
 
-# Find cJSON library
-find_package(PkgConfig)
-if(PkgConfig_FOUND)
-    pkg_check_modules(CJSON libcjson)
-endif()
+# Find compression libraries (optional for Phase 1, required for Phase 3)
+pkg_check_modules(LZ4 liblz4)
+pkg_check_modules(ZSTD libzstd)
 
-# If not found via pkg-config, try find_library
-if(NOT CJSON_FOUND)
-    find_library(CJSON_LIBRARY NAMES cjson)
-    find_path(CJSON_INCLUDE_DIR NAMES cjson/cJSON.h)
-    
-    if(CJSON_LIBRARY AND CJSON_INCLUDE_DIR)
-        set(CJSON_FOUND TRUE)
-        set(CJSON_LIBRARIES ${CJSON_LIBRARY})
-        set(CJSON_INCLUDE_DIRS ${CJSON_INCLUDE_DIR})
-    endif()
-endif()
-
-if(NOT CJSON_FOUND)
-    message(STATUS "cJSON not found. Install with: sudo apt-get install libcjson-dev")
-    message(STATUS "Or on macOS: brew install cjson")
-    message(FATAL_ERROR "cJSON library is required but not found")
-endif()
-
-message(STATUS "Found cJSON: ${CJSON_LIBRARIES}")
-
-# ============================================================================
-# Common Library
-# ============================================================================
-
-file(GLOB_RECURSE COMMON_SOURCES "common/src/*.c")
-if(COMMON_SOURCES)
-    add_library(art_common STATIC ${COMMON_SOURCES})
-    target_include_directories(art_common PUBLIC common/include)
+if(LZ4_FOUND)
+    message(STATUS "LZ4 found: ${LZ4_VERSION}")
+    add_definitions(-DHAVE_LZ4)
 else()
-    # Create interface library if no sources
-    add_library(art_common INTERFACE)
-    target_include_directories(art_common INTERFACE common/include)
+    message(WARNING "LZ4 not found - compression disabled")
 endif()
 
-# ============================================================================
-# Database Library
-# ============================================================================
-
-file(GLOB DATABASE_SOURCES "database/src/*.c")
-add_library(art_database STATIC ${DATABASE_SOURCES})
-target_include_directories(art_database PUBLIC 
-    database/include
-)
-target_link_libraries(art_database PUBLIC 
-    art_common
-)
-
-# ============================================================================
-# State Library
-# ============================================================================
-
-file(GLOB_RECURSE STATE_SOURCES "state/src/*.c")
-if(STATE_SOURCES)
-    add_library(art_state STATIC ${STATE_SOURCES})
-    target_include_directories(art_state PUBLIC state/include)
-    target_link_libraries(art_state PUBLIC 
-        art_database
-        art_common
-    )
+if(ZSTD_FOUND)
+    message(STATUS "ZSTD found: ${ZSTD_VERSION}")
+    add_definitions(-DHAVE_ZSTD)
+else()
+    message(WARNING "ZSTD not found - compression disabled")
 endif()
 
-# ============================================================================
-# EVM Library
-# ============================================================================
-
-file(GLOB_RECURSE EVM_SOURCES "evm/src/*.c")
-if(EVM_SOURCES)
-    add_library(art_evm STATIC ${EVM_SOURCES})
-    target_include_directories(art_evm PUBLIC evm/include ${CMAKE_SOURCE_DIR}/third_party)
-    target_link_libraries(art_evm PUBLIC 
-        art_state
-        art_common
-    )
-endif()
-
-# ============================================================================
-# Integration Tests Library
-# ============================================================================
-
-file(GLOB_RECURSE INTEGRATION_TEST_SOURCES "integration_tests/src/*.c")
-if(INTEGRATION_TEST_SOURCES)
-    add_library(art_integration_tests STATIC ${INTEGRATION_TEST_SOURCES})
-    target_include_directories(art_integration_tests PUBLIC 
-        integration_tests/include
-        ${CJSON_INCLUDE_DIRS}
-    )
-    target_link_libraries(art_integration_tests PUBLIC 
-        art_state
-        art_evm
-        art_common
-        ${CJSON_LIBRARIES}
-    )
-endif()
-
-# ============================================================================
-# Tests (optional)
-# ============================================================================
-
-option(BUILD_TESTS "Build tests" ON)
-if(BUILD_TESTS)
-    enable_testing()
-    
-    # Common tests
-    file(GLOB COMMON_TEST_SOURCES "common/tests/*.c")
-    if(COMMON_TEST_SOURCES)
-        foreach(test_file ${COMMON_TEST_SOURCES})
-            get_filename_component(test_name ${test_file} NAME_WE)
-            add_executable(${test_name} ${test_file})
-            target_link_libraries(${test_name} art_common)
-            add_test(NAME ${test_name} COMMAND ${test_name})
-        endforeach()
-    endif()
-    
-    # Database tests
-    file(GLOB DATABASE_TEST_SOURCES "database/tests/*.c")
-    if(DATABASE_TEST_SOURCES)
-        foreach(test_file ${DATABASE_TEST_SOURCES})
-            get_filename_component(test_name ${test_file} NAME_WE)
-            add_executable(${test_name} ${test_file})
-            target_link_libraries(${test_name} art_database)
-            add_test(NAME ${test_name} COMMAND ${test_name})
-        endforeach()
-    endif()
-    
-    # State tests
-    file(GLOB STATE_TEST_SOURCES "state/tests/*.c")
-    if(STATE_TEST_SOURCES)
-        foreach(test_file ${STATE_TEST_SOURCES})
-            get_filename_component(test_name ${test_file} NAME_WE)
-            add_executable(${test_name} ${test_file})
-            target_link_libraries(${test_name} art_state)
-            
-            # Link cJSON for tests that need JSON parsing
-            if(test_name STREQUAL "test_mpt_vectors")
-                target_include_directories(${test_name} PRIVATE ${CJSON_INCLUDE_DIRS})
-                target_link_libraries(${test_name} ${CJSON_LIBRARIES})
-            endif()
-            
-            add_test(NAME ${test_name} COMMAND ${test_name})
-        endforeach()
-    endif()
-    
-    # EVM tests
-    file(GLOB EVM_TEST_SOURCES "evm/tests/*.c")
-    if(EVM_TEST_SOURCES)
-        foreach(test_file ${EVM_TEST_SOURCES})
-            get_filename_component(test_name ${test_file} NAME_WE)
-            add_executable(${test_name} ${test_file})
-            target_link_libraries(${test_name} art_evm)
-            add_test(NAME ${test_name} COMMAND ${test_name})
-        endforeach()
-    endif()
-    
-    # Integration test parser verification
-    if(TARGET art_integration_tests)
-        add_executable(test_parser_verify integration_tests/test_parser_verify.c)
-        target_link_libraries(test_parser_verify art_integration_tests)
-        # Note: This is a manual test, not added to CTest
-        
-        add_executable(test_runner_example integration_tests/test_runner_example.c)
-        target_link_libraries(test_runner_example art_integration_tests)
-        # Note: This is a manual test, not added to CTest
-        
-        add_executable(test_runner_batch integration_tests/test_runner_batch_main.c)
-        target_link_libraries(test_runner_batch art_integration_tests)
-        # Note: This is the main integration test runner
-        
-        add_executable(test_runner_failfast integration_tests/test_runner_failfast_main.c)
-        target_link_libraries(test_runner_failfast art_integration_tests)
-        # Note: Fail-fast runner that stops on first failure and writes test case to file
-    endif()
-endif()
-
-# ============================================================================
-# Installation
-# ============================================================================
-
-set(INSTALL_TARGETS art_common art_database)
-if(TARGET art_state)
-    list(APPEND INSTALL_TARGETS art_state)
-endif()
-if(TARGET art_evm)
-    list(APPEND INSTALL_TARGETS art_evm)
-endif()
-
-install(TARGETS ${INSTALL_TARGETS}
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib
+# Include directories
+include_directories(
+    ${CMAKE_SOURCE_DIR}/database/include
+    ${CMAKE_SOURCE_DIR}/third_party
+    ${LZ4_INCLUDE_DIRS}
+    ${ZSTD_INCLUDE_DIRS}
 )
 
-install(DIRECTORY 
-    common/include/
-    database/include/
-    state/include/
-    evm/include/
-    DESTINATION include/art
+#==============================================================================
+# Database Library (Persistent ART - Page Manager)
+#==============================================================================
+
+add_library(art_page_manager STATIC
+    database/src/page_manager.c
+    database/src/logger.c
 )
+
+target_link_libraries(art_page_manager
+    ${LZ4_LIBRARIES}
+    ${ZSTD_LIBRARIES}
+)
+
+target_include_directories(art_page_manager PRIVATE
+    ${LZ4_INCLUDE_DIRS}
+    ${ZSTD_INCLUDE_DIRS}
+)
+
+#==============================================================================
+# Database Library (Buffer Pool - LRU Cache)
+#==============================================================================
+
+add_library(art_buffer_pool STATIC
+    database/src/buffer_pool.c
+    database/src/logger.c
+)
+
+target_link_libraries(art_buffer_pool
+    art_page_manager
+    pthread
+)
+
+#==============================================================================
+# Database Library (Persistent ART - Disk-backed Tree)
+#==============================================================================
+
+add_library(art_persistent STATIC
+    database/src/data_art_core.c
+    database/src/data_art_overflow.c
+    database/src/data_art_insert.c
+    database/src/data_art_node_ops.c
+    database/src/logger.c
+)
+
+target_link_libraries(art_persistent
+    art_page_manager
+    art_buffer_pool
+)
+
+#==============================================================================
+# Database Library (In-Memory ART Tree)
+#==============================================================================
+
+add_library(art_database STATIC
+    database/src/mem_art.c
+    database/src/logger.c
+)
+
+#==============================================================================
+# Database Tests
+#==============================================================================
+
+enable_testing()
+
+# Test: In-Memory ART
+add_executable(test_mem_art
+    database/tests/test_mem_art.c
+)
+target_link_libraries(test_mem_art art_database)
+add_test(NAME test_mem_art COMMAND test_mem_art)
+
+# Test: Page Manager
+add_executable(test_page_manager
+    database/tests/test_page_manager.c
+)
+target_link_libraries(test_page_manager art_page_manager)
+add_test(NAME test_page_manager COMMAND test_page_manager)
+
+# Test: Page Manager Edge Cases
+add_executable(test_page_manager_edge_cases
+    database/tests/test_page_manager_edge_cases.c
+)
+target_link_libraries(test_page_manager_edge_cases art_page_manager)
+add_test(NAME test_page_manager_edge_cases COMMAND test_page_manager_edge_cases)
+
+# Test: Buffer Pool
+add_executable(test_buffer_pool
+    database/tests/test_buffer_pool.c
+)
+target_link_libraries(test_buffer_pool art_buffer_pool)
+add_test(NAME test_buffer_pool COMMAND test_buffer_pool)
+
+# Test: Buffer Pool Edge Cases
+add_executable(test_buffer_pool_edge
+    database/tests/test_buffer_pool_edge.c
+)
+target_link_libraries(test_buffer_pool_edge art_buffer_pool pthread)
+add_test(NAME test_buffer_pool_edge COMMAND test_buffer_pool_edge)
+
+# Test: Persistent ART Basic
+add_executable(test_data_art_basic
+    database/tests/test_data_art_basic.c
+)
+target_link_libraries(test_data_art_basic art_persistent pthread)
+add_test(NAME test_data_art_basic COMMAND test_data_art_basic)
+
+# Test: Persistent ART Node Growth
+add_executable(test_data_art_growth
+    database/tests/test_data_art_growth.c
+)
+target_link_libraries(test_data_art_growth art_persistent pthread)
+add_test(NAME test_data_art_growth COMMAND test_data_art_growth)
+
+# Test: Persistent ART Stress Tests
+add_executable(test_data_art_stress
+    database/tests/test_data_art_stress.c
+)
+target_link_libraries(test_data_art_stress art_persistent pthread)
+
+# Test: Persistent ART Node Operations
+add_executable(test_data_art_node_ops
+    database/tests/test_data_art_node_ops.c
+)
+target_link_libraries(test_data_art_node_ops art_persistent pthread)
+add_test(NAME test_data_art_node_ops COMMAND test_data_art_node_ops)
+
+# Benchmark: ART vs uthash
+add_executable(benchmark_art_vs_uthash
+    benchmark_art_vs_uthash.c
+)
+target_link_libraries(benchmark_art_vs_uthash art_database)
+
+#==============================================================================
+# Build Summary
+#==============================================================================
+
+message(STATUS "")
+message(STATUS "========================================")
+message(STATUS "ART Database Configuration")
+message(STATUS "========================================")
+message(STATUS "Build type:        ${CMAKE_BUILD_TYPE}")
+message(STATUS "C Compiler:        ${CMAKE_C_COMPILER}")
+message(STATUS "C Flags:           ${CMAKE_C_FLAGS}")
+message(STATUS "Install prefix:    ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "")
+message(STATUS "Components:")
+message(STATUS "  - ART Database Library (in-memory)")
+message(STATUS "  - ART Page Manager (persistent)")
+message(STATUS "  - ART Buffer Pool (LRU cache)")
+message(STATUS "  - Compression: LZ4=${LZ4_FOUND}, ZSTD=${ZSTD_FOUND}")
+message(STATUS "")
+message(STATUS "Tests:")
+message(STATUS "  - test_mem_art (in-memory ART)")
+message(STATUS "  - test_page_manager (persistent page manager)")
+message(STATUS "  - test_page_manager_edge_cases (edge cases & stress tests)")
+message(STATUS "  - test_buffer_pool (buffer pool basic tests)")
+message(STATUS "  - test_buffer_pool_edge (buffer pool edge cases)")
+message(STATUS "========================================")
+message(STATUS "")
