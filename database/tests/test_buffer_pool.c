@@ -523,6 +523,222 @@ void test_buffer_pool_memory_usage(void) {
 }
 
 // ============================================================================
+// Test: Buffer Pool Reload
+// ============================================================================
+
+void test_buffer_pool_reload(void) {
+    TEST("buffer_pool_reload") {
+        // Setup
+        page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
+        ASSERT(pm != NULL, "Created page manager");
+        
+        buffer_pool_t *bp = buffer_pool_create(NULL, pm);
+        ASSERT(bp != NULL, "Created buffer pool");
+        
+        // Allocate and write a page
+        uint64_t page_id = page_manager_alloc(pm, 100);
+        ASSERT(page_id > 0, "Allocated page");
+        
+        page_t test_page;
+        memset(&test_page, 0, sizeof(test_page));
+        test_page.header.page_id = page_id;
+        strcpy((char *)test_page.data, "Version 1");
+        page_compute_checksum(&test_page);
+        page_manager_write(pm, &test_page);
+        
+        // Load into buffer pool
+        page_t *cached = buffer_pool_get(bp, page_id);
+        ASSERT(cached != NULL, "Page loaded into buffer pool");
+        ASSERT(strcmp((char *)cached->data, "Version 1") == 0, "Cache has Version 1");
+        
+        // Write new version directly to disk (bypassing buffer pool)
+        strcpy((char *)test_page.data, "Version 2");
+        page_compute_checksum(&test_page);
+        page_manager_write(pm, &test_page);
+        
+        // Cache still has old version
+        cached = buffer_pool_get(bp, page_id);
+        ASSERT(strcmp((char *)cached->data, "Version 1") == 0, "Cache still has Version 1");
+        
+        // Reload from disk
+        bool reloaded = buffer_pool_reload(bp, page_id);
+        ASSERT(reloaded, "Page reloaded successfully");
+        
+        // Cache should now have new version
+        cached = buffer_pool_get(bp, page_id);
+        ASSERT(strcmp((char *)cached->data, "Version 2") == 0, "Cache updated to Version 2");
+        
+        // Cleanup
+        buffer_pool_destroy(bp);
+        page_manager_destroy(pm);
+    } TEST_END();
+}
+
+// ============================================================================
+// Test: Buffer Pool Invalidate
+// ============================================================================
+
+void test_buffer_pool_invalidate(void) {
+    TEST("buffer_pool_invalidate") {
+        // Setup
+        page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
+        ASSERT(pm != NULL, "Created page manager");
+        
+        buffer_pool_t *bp = buffer_pool_create(NULL, pm);
+        ASSERT(bp != NULL, "Created buffer pool");
+        
+        // Allocate and load a page
+        uint64_t page_id = page_manager_alloc(pm, 100);
+        page_t test_page;
+        memset(&test_page, 0, sizeof(test_page));
+        test_page.header.page_id = page_id;
+        strcpy((char *)test_page.data, "Test Data");
+        page_compute_checksum(&test_page);
+        page_manager_write(pm, &test_page);
+        
+        page_t *cached = buffer_pool_get(bp, page_id);
+        ASSERT(cached != NULL, "Page loaded");
+        ASSERT(buffer_pool_contains(bp, page_id), "Page in cache");
+        
+        // Invalidate
+        bool invalidated = buffer_pool_invalidate(bp, page_id);
+        ASSERT(invalidated, "Page invalidated");
+        
+        // Should no longer be in cache
+        ASSERT(!buffer_pool_contains(bp, page_id), "Page removed from cache");
+        
+        // Getting it again should reload from disk
+        cached = buffer_pool_get(bp, page_id);
+        ASSERT(cached != NULL, "Page reloaded from disk");
+        ASSERT(strcmp((char *)cached->data, "Test Data") == 0, "Data correct after reload");
+        
+        // Cleanup
+        buffer_pool_destroy(bp);
+        page_manager_destroy(pm);
+    } TEST_END();
+}
+
+// ============================================================================
+// Test: Buffer Pool Clear
+// ============================================================================
+
+void test_buffer_pool_clear(void) {
+    TEST("buffer_pool_clear") {
+        // Setup
+        page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
+        ASSERT(pm != NULL, "Created page manager");
+        
+        buffer_pool_t *bp = buffer_pool_create(NULL, pm);
+        ASSERT(bp != NULL, "Created buffer pool");
+        
+        // Load 5 pages into cache
+        uint64_t page_ids[5];
+        for (int i = 0; i < 5; i++) {
+            page_ids[i] = page_manager_alloc(pm, 100);
+            page_t test_page;
+            memset(&test_page, 0, sizeof(test_page));
+            test_page.header.page_id = page_ids[i];
+            sprintf((char *)test_page.data, "Page %d", i);
+            page_compute_checksum(&test_page);
+            page_manager_write(pm, &test_page);
+            
+            page_t *cached = buffer_pool_get(bp, page_ids[i]);
+            ASSERT(cached != NULL, "Page loaded");
+        }
+        
+        // Verify all are in cache
+        for (int i = 0; i < 5; i++) {
+            ASSERT(buffer_pool_contains(bp, page_ids[i]), "Page in cache");
+        }
+        
+        // Clear all pages
+        int cleared = buffer_pool_clear(bp);
+        ASSERT(cleared == 5, "All 5 pages cleared");
+        
+        // Verify all are removed from cache
+        for (int i = 0; i < 5; i++) {
+            ASSERT(!buffer_pool_contains(bp, page_ids[i]), "Page removed from cache");
+        }
+        
+        // Pages can still be loaded from disk
+        page_t *cached = buffer_pool_get(bp, page_ids[0]);
+        ASSERT(cached != NULL, "Page 0 reloaded from disk");
+        ASSERT(strcmp((char *)cached->data, "Page 0") == 0, "Data correct after clear");
+        
+        // Cleanup
+        buffer_pool_destroy(bp);
+        page_manager_destroy(pm);
+    } TEST_END();
+}
+
+// ============================================================================
+// Test: Clear Flushes Dirty Pages
+// ============================================================================
+
+void test_buffer_pool_clear_flushes_dirty(void) {
+    TEST("buffer_pool_clear_flushes_dirty") {
+        // Setup
+        page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
+        ASSERT(pm != NULL, "Created page manager");
+        
+        buffer_pool_t *bp = buffer_pool_create(NULL, pm);
+        ASSERT(bp != NULL, "Created buffer pool");
+        
+        // Allocate a page
+        uint64_t page_id = page_manager_alloc(pm, 100);
+        page_t test_page;
+        memset(&test_page, 0, sizeof(test_page));
+        test_page.header.page_id = page_id;
+        strcpy((char *)test_page.data, "Original");
+        page_compute_checksum(&test_page);
+        page_manager_write(pm, &test_page);
+        
+        // Load and modify
+        page_t *cached = buffer_pool_get(bp, page_id);
+        strcpy((char *)cached->data, "Modified");
+        page_compute_checksum(cached);
+        buffer_pool_mark_dirty(bp, page_id);
+        
+        // Clear (should flush dirty page)
+        int cleared = buffer_pool_clear(bp);
+        ASSERT(cleared == 1, "One page cleared");
+        
+        // Destroy and recreate to verify persistence
+        buffer_pool_destroy(bp);
+        bp = buffer_pool_create(NULL, pm);
+        
+        // Reload and verify modification persisted
+        cached = buffer_pool_get(bp, page_id);
+        ASSERT(strcmp((char *)cached->data, "Modified") == 0, "Dirty page flushed on clear");
+        
+        // Cleanup
+        buffer_pool_destroy(bp);
+        page_manager_destroy(pm);
+    } TEST_END();
+}
+
+// ============================================================================
+// Test: Reload Handles Non-Existent Page
+// ============================================================================
+
+void test_buffer_pool_reload_nonexistent(void) {
+    TEST("buffer_pool_reload on non-existent page") {
+        // Setup
+        page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
+        buffer_pool_t *bp = buffer_pool_create(NULL, pm);
+        
+        // Try to reload a page that doesn't exist in cache
+        // Should succeed since there's nothing to reload
+        bool reloaded = buffer_pool_reload(bp, 99999);
+        ASSERT(reloaded, "Reload succeeds for page not in cache (no-op)");
+        
+        // Cleanup
+        buffer_pool_destroy(bp);
+        page_manager_destroy(pm);
+    } TEST_END();
+}
+
+// ============================================================================
 // Main Test Runner
 // ============================================================================
 
@@ -550,6 +766,13 @@ int main(void) {
     test_buffer_pool_manual_evict_pinned_fails();
     test_buffer_pool_reset_stats();
     test_buffer_pool_memory_usage();
+    
+    // Cache coherency tests
+    test_buffer_pool_reload();
+    test_buffer_pool_invalidate();
+    test_buffer_pool_clear();
+    test_buffer_pool_clear_flushes_dirty();
+    test_buffer_pool_reload_nonexistent();
     
     // Summary
     printf("\n==============================================\n");

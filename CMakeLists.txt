@@ -178,6 +178,30 @@ add_executable(test_data_art_delete
 )
 target_link_libraries(test_data_art_delete art_persistent pthread)
 
+# Test: Persistent ART Insert & Search Stress Tests
+add_executable(test_data_art_insert_search_stress
+    database/tests/test_data_art_insert_search_stress.c
+)
+target_link_libraries(test_data_art_insert_search_stress art_persistent pthread)
+
+# Test: Full Stress Test (Insert + Search + Delete)
+add_executable(test_data_art_full_stress
+    database/tests/test_data_art_full_stress.c
+)
+target_link_libraries(test_data_art_full_stress art_persistent pthread)
+
+# Test: Prefix Key Debug
+add_executable(test_prefix_debug
+    database/tests/test_prefix_debug.c
+)
+target_link_libraries(test_prefix_debug art_persistent pthread)
+
+# Test: Reproduce Seed
+add_executable(test_reproduce_seed
+    database/tests/test_reproduce_seed.c
+)
+target_link_libraries(test_reproduce_seed art_persistent pthread)
+
 # Test: Persistent ART Node Operations
 add_executable(test_data_art_node_ops
     database/tests/test_data_art_node_ops.c

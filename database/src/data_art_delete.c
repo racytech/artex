@@ -6,9 +6,24 @@
  * - NODE_48 -> NODE_16 (at 16 children)
  * - NODE_16 -> NODE_4 (at 4 children)
  * - NODE_4 -> collapse to single child or leaf
+ * 
+ * KNOWN LIMITATION:
+ * Delete operations use copy-on-write semantics, creating new page versions
+ * but NOT freeing the old pages. This causes:
+ * 1. Disk space leaks (old pages remain allocated)
+ * 2. Potential cache coherency issues with buffer pool
+ * 
+ * TODO: Implement proper page garbage collection to:
+ * - Track reference counts for pages
+ * - Free unreachable pages after delete
+ * - Compact database file periodically
+ * 
+ * For now, delete operations work but may be slower and use more disk space
+ * than necessary. Insert and search operations are fully optimized.
  */
 
 #include "data_art.h"
+#include "buffer_pool.h"
 #include "logger.h"
 
 #include <stdlib.h>
@@ -92,7 +107,8 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         return node_ref;
     }
     
-    // It's an inner node, check prefix
+    // It's an inner node
+    // CRITICAL: Extract values BEFORE any recursive calls that might invalidate the temp buffer
     const uint8_t *node_bytes = (const uint8_t *)node;
     uint8_t partial_len = node_bytes[2];
     
@@ -111,55 +127,37 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
     }
     
     // Get next byte to search
+    uint8_t search_byte;
+    size_t next_depth;
     if (depth >= key_len) {
-        // Key exhausted, look for NULL byte child
-        node_ref_t child_ref = find_child(tree, node_ref, 0x00);
-        if (node_ref_is_null(child_ref)) {
-            return node_ref;  // No NULL child, key doesn't exist
-        }
-        
-        // Recursively delete in child
-        node_ref_t new_child = delete_recursive(tree, child_ref, key, key_len, depth, deleted);
-        
-        if (*deleted) {
-            if (node_ref_is_null(new_child)) {
-                // Child was removed, remove it from this node
-                bool did_remove;
-                node_ref_t updated = remove_child(tree, node_ref, 0x00, &did_remove);
-                
-                // Try to shrink the node if needed
-                return try_shrink_node(tree, updated);
-            } else {
-                // Child was updated, update the pointer
-                return update_child(tree, node_ref, 0x00, new_child);
-            }
-        }
-        
-        return node_ref;
+        search_byte = 0x00;  // Key exhausted, look for NULL byte child
+        next_depth = depth;  // Don't increment depth for NULL byte
+    } else {
+        search_byte = key[depth];
+        next_depth = depth + 1;  // Move to next depth
     }
     
-    uint8_t byte = key[depth];
-    node_ref_t child_ref = find_child(tree, node_ref, byte);
-    
+    // Find child BEFORE recursion (uses data_art_load_node internally, might corrupt temp buffer)
+    node_ref_t child_ref = find_child(tree, node_ref, search_byte);
     if (node_ref_is_null(child_ref)) {
-        // Child doesn't exist, key not in tree
-        return node_ref;
+        return node_ref;  // Child doesn't exist, key not in tree
     }
     
     // Recursively delete in child
-    node_ref_t new_child = delete_recursive(tree, child_ref, key, key_len, depth + 1, deleted);
+    // WARNING: This will corrupt the `node` pointer in temp_pages!
+    node_ref_t new_child = delete_recursive(tree, child_ref, key, key_len, next_depth, deleted);
     
     if (*deleted) {
         if (node_ref_is_null(new_child)) {
             // Child was removed, remove it from this node
             bool did_remove;
-            node_ref_t updated = remove_child(tree, node_ref, byte, &did_remove);
+            node_ref_t updated = remove_child(tree, node_ref, search_byte, &did_remove);
             
             // Try to shrink the node if needed
             return try_shrink_node(tree, updated);
         } else {
-            // Child was updated but not removed
-            return update_child(tree, node_ref, byte, new_child);
+            // Child was updated, update the pointer
+            return update_child(tree, node_ref, search_byte, new_child);
         }
     }
     
@@ -478,11 +476,12 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref) {
                 // Special case: collapse to single child
                 // If the child is a leaf, return it
                 // If the child is a node, we might be able to merge prefixes
-                uint8_t *children = (uint8_t *)node_bytes + 16 + 4;
+                const data_art_node4_t *n4 = (const data_art_node4_t *)node;
                 
-                node_ref_t child_ref;
-                memcpy(&child_ref.page_id, children, 8);
-                memcpy(&child_ref.offset, children + 8, 4);
+                node_ref_t child_ref = {
+                    .page_id = n4->child_page_ids[0],
+                    .offset = n4->child_offsets[0]
+                };
                 
                 const void *child_node = data_art_load_node(tree, child_ref);
                 if (child_node) {
@@ -531,49 +530,44 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref) {
     // Copy children based on conversion
     if (type == DATA_NODE_256 && new_type == DATA_NODE_48) {
         // NODE_256 -> NODE_48
-        uint8_t *new_index = new_bytes + 16;
-        uint8_t *new_children = new_bytes + 16 + 256;
+        const data_art_node256_t *old_n256 = (const data_art_node256_t *)node;
+        data_art_node48_t *new_n48 = (data_art_node48_t *)new_node;
         
-        memset(new_index, 0xFF, 256);
+        memset(new_n48->keys, 0xFF, 256);
         
         int pos = 0;
         for (int i = 0; i < 256; i++) {
-            uint64_t page_id;
-            memcpy(&page_id, node_bytes + 16 + i * 12, 8);
-            
-            if (page_id != 0) {
-                new_index[i] = pos;
-                memcpy(new_children + pos * 12, node_bytes + 16 + i * 12, 12);
+            if (old_n256->child_page_ids[i] != 0) {
+                new_n48->keys[i] = pos;
+                new_n48->child_page_ids[pos] = old_n256->child_page_ids[i];
+                new_n48->child_offsets[pos] = old_n256->child_offsets[i];
                 pos++;
             }
         }
     } else if (type == DATA_NODE_48 && new_type == DATA_NODE_16) {
         // NODE_48 -> NODE_16
-        const uint8_t *old_index = node_bytes + 16;
-        const uint8_t *old_children = node_bytes + 16 + 256;
-        
-        uint8_t *new_keys = new_bytes + 16;
-        uint8_t *new_children = new_bytes + 16 + 16;
+        const data_art_node48_t *old_n48 = (const data_art_node48_t *)node;
+        data_art_node16_t *new_n16 = (data_art_node16_t *)new_node;
         
         int pos = 0;
         for (int i = 0; i < 256; i++) {
-            if (old_index[i] != 0xFF) {
-                new_keys[pos] = i;
-                memcpy(new_children + pos * 12, old_children + old_index[i] * 12, 12);
+            if (old_n48->keys[i] != 0xFF) {
+                uint8_t child_idx = old_n48->keys[i];
+                new_n16->keys[pos] = i;
+                new_n16->child_page_ids[pos] = old_n48->child_page_ids[child_idx];
+                new_n16->child_offsets[pos] = old_n48->child_offsets[child_idx];
                 pos++;
             }
         }
     } else if (type == DATA_NODE_16 && new_type == DATA_NODE_4) {
         // NODE_16 -> NODE_4
-        const uint8_t *old_keys = node_bytes + 16;
-        const uint8_t *old_children = node_bytes + 16 + 16;
-        
-        uint8_t *new_keys = new_bytes + 16;
-        uint8_t *new_children = new_bytes + 16 + 4;
+        const data_art_node16_t *old_n16 = (const data_art_node16_t *)node;
+        data_art_node4_t *new_n4 = (data_art_node4_t *)new_node;
         
         for (int i = 0; i < num_children; i++) {
-            new_keys[i] = old_keys[i];
-            memcpy(new_children + i * 12, old_children + i * 12, 12);
+            new_n4->keys[i] = old_n16->keys[i];
+            new_n4->child_page_ids[i] = old_n16->child_page_ids[i];
+            new_n4->child_offsets[i] = old_n16->child_offsets[i];
         }
     }
     

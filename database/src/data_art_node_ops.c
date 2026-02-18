@@ -316,6 +316,18 @@ static node_ref_t shrink_node256_to_node48(data_art_tree_t *tree, node_ref_t old
  */
 static node_ref_t add_child_node4(data_art_tree_t *tree, node_ref_t node_ref,
                                    const data_art_node4_t *n4, uint8_t byte, node_ref_t child_ref) {
+    // Check for duplicate key first
+    for (int i = 0; i < n4->num_children; i++) {
+        if (n4->keys[i] == byte) {
+            LOG_ERROR("BUG: Attempted to add duplicate child byte=0x%02x to NODE_4 at page=%lu (already has %u children)", 
+                     byte, node_ref.page_id, n4->num_children);
+            LOG_ERROR("  Existing child at index %d points to page=%lu", i, n4->child_page_ids[i]);
+            LOG_ERROR("  New child would point to page=%lu", child_ref.page_id);
+            // Return error to prevent corruption
+            return NULL_NODE_REF;
+        }
+    }
+    
     // If full, grow to NODE_16
     if (n4->num_children >= 4) {
         node_ref_t n16_ref = grow_node4_to_node16(tree, node_ref, n4);
@@ -392,6 +404,16 @@ static node_ref_t add_child_node16(data_art_tree_t *tree, node_ref_t node_ref,
     // Add to NODE_16 (keep sorted)
     data_art_node16_t new_n16 = *n16;
     
+    // Check for duplicate key - this should never happen in normal operation
+    for (int i = 0; i < n16->num_children; i++) {
+        if (n16->keys[i] == byte) {
+            LOG_ERROR("BUG: Attempted to add duplicate child byte=0x%02x to NODE_16 at page=%lu "
+                     "(num_children=%u)",
+                     byte, node_ref.page_id, n16->num_children);
+            return NULL_NODE_REF;
+        }
+    }
+    
     // Find insertion position
     int pos = 0;
     while (pos < new_n16.num_children && new_n16.keys[pos] < byte) {
@@ -448,6 +470,14 @@ static node_ref_t add_child_node48(data_art_tree_t *tree, node_ref_t node_ref,
     // Add to NODE_48
     data_art_node48_t new_n48 = *n48;
     
+    // Check for duplicate key - this should never happen in normal operation
+    if (n48->keys[byte] != 255) {
+        LOG_ERROR("BUG: Attempted to add duplicate child byte=0x%02x to NODE_48 at page=%lu "
+                 "(num_children=%u, slot=%u)",
+                 byte, node_ref.page_id, n48->num_children, n48->keys[byte]);
+        return NULL_NODE_REF;
+    }
+    
     // Find empty slot
     int slot = 0;
     while (slot < 48) {
@@ -483,6 +513,14 @@ static node_ref_t add_child_node48(data_art_tree_t *tree, node_ref_t node_ref,
 static node_ref_t add_child_node256(data_art_tree_t *tree, node_ref_t node_ref,
                                      const data_art_node256_t *n256, uint8_t byte, node_ref_t child_ref) {
     data_art_node256_t new_n256 = *n256;
+    
+    // Check for duplicate key - this should never happen in normal operation
+    if (n256->child_page_ids[byte] != 0) {
+        LOG_ERROR("BUG: Attempted to add duplicate child byte=0x%02x to NODE_256 at page=%lu "
+                 "(existing child at page=%lu)",
+                 byte, node_ref.page_id, n256->child_page_ids[byte]);
+        return NULL_NODE_REF;
+    }
     
     // Direct assignment
     if (new_n256.child_page_ids[byte] == 0) {

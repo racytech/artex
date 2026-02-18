@@ -166,36 +166,24 @@ const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref) {
         return NULL;
     }
     
-    // Use buffer pool if available for caching
-    if (tree->buffer_pool) {
-        page_t *page = buffer_pool_get(tree->buffer_pool, ref.page_id);
-        if (!page) {
-            LOG_ERROR("Failed to load page %lu from buffer pool", ref.page_id);
-            tree->cache_misses++;
-            return NULL;
-        }
-        tree->cache_hits++;
-        
-        // Return pointer to node at offset within page data
-        return page->data + ref.offset;
+    // Buffer pool is required for correct operation
+    // The old temp_pages fallback had corruption issues with deep recursion
+    if (!tree->buffer_pool) {
+        LOG_ERROR("Buffer pool is required but not configured");
+        return NULL;
     }
     
-    // Fallback: direct page manager access
-    // Note: We need to allocate a temporary page buffer since page_manager_read
-    // writes into the provided buffer, not returns a pointer
-    static __thread page_t temp_page;  // Thread-local to avoid races
-    page_result_t result = page_manager_read(tree->page_manager, ref.page_id, &temp_page);
-    if (result != PAGE_SUCCESS) {
-        LOG_ERROR("Failed to read page %lu", ref.page_id);
+    page_t *page = buffer_pool_get(tree->buffer_pool, ref.page_id);
+    if (!page) {
+        LOG_ERROR("Failed to load page %lu from buffer pool", ref.page_id);
         tree->cache_misses++;
         return NULL;
     }
     
-    tree->cache_misses++;
+    tree->cache_hits++;
     
-    // Return pointer to node at offset
-    // WARNING: This pointer is only valid until next data_art_load_node call in this thread
-    return temp_page.data + ref.offset;
+    // Return pointer to node at offset within page data
+    return page->data + ref.offset;
 }
 
 bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
@@ -210,53 +198,88 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
         return false;
     }
     
+    // Buffer pool is required
+    if (!tree->buffer_pool) {
+        LOG_ERROR("Buffer pool is required but not configured");
+        return false;
+    }
+    
     size_t max_size = PAGE_SIZE - PAGE_HEADER_SIZE;
     if (size > max_size) {
         LOG_ERROR("Node size %zu exceeds page capacity %zu", size, max_size);
         return false;
     }
     
-    // Get or create page
-    page_t *page = NULL;
+    // Try to get page from buffer pool
+    page_t *page = buffer_pool_get(tree->buffer_pool, ref.page_id);
     bool page_is_temp = false;
     
-    if (tree->buffer_pool) {
-        page = buffer_pool_get(tree->buffer_pool, ref.page_id);
-        if (!page) {
-            LOG_ERROR("Failed to get page %lu from buffer pool", ref.page_id);
-            return false;
-        }
-    } else {
-        // For newly allocated pages, we need to initialize them first
-        static __thread page_t temp_page;
-        page_result_t result = page_manager_read(tree->page_manager, ref.page_id, &temp_page);
+    if (!page) {
+        // Page doesn't exist in buffer pool yet - might be a new page
+        // Use temporary page on stack for writing, then reload into buffer pool
+        page_t temp_page_storage;
+        page_t *temp_page = &temp_page_storage;
+        
+        memset(temp_page, 0, sizeof(*temp_page));
+        
+        // Try to read existing page data
+        page_result_t result = page_manager_read(tree->page_manager, ref.page_id, temp_page);
         if (result != PAGE_SUCCESS) {
-            // Page doesn't exist yet - initialize it
-            memset(&temp_page, 0, sizeof(temp_page));
-            temp_page.header.page_id = ref.page_id;
+            // Page doesn't exist yet - already zeroed
+            temp_page->header.page_id = ref.page_id;
+            LOG_TRACE("Page %lu doesn't exist yet, using zero-initialized page", ref.page_id);
+        } else {
+            LOG_TRACE("Successfully read existing page %lu from disk", ref.page_id);
         }
-        page = &temp_page;
+        page = temp_page;
         page_is_temp = true;
     }
     
+    // Zero out the entire data area first to prevent stale data
+    // This is critical when pages are reused or when old data persists on disk
+    LOG_ERROR("[WRITE_NODE] Zeroing page=%lu data area (%zu bytes) before writing | first_byte_before=0x%02x last_byte_before=0x%02x", 
+              ref.page_id, PAGE_SIZE - PAGE_HEADER_SIZE, page->data[0], page->data[PAGE_SIZE - PAGE_HEADER_SIZE - 1]);
+    memset(page->data, 0, PAGE_SIZE - PAGE_HEADER_SIZE);
+    LOG_ERROR("[WRITE_NODE] After zeroing page=%lu | first_byte_after=0x%02x last_byte_after=0x%02x", 
+              ref.page_id, page->data[0], page->data[PAGE_SIZE - PAGE_HEADER_SIZE - 1]);
+    
     // Copy node data to page at offset
+    LOG_ERROR("[WRITE_NODE] Copying %zu bytes to page=%lu offset=%u", size, ref.page_id, ref.offset);
     memcpy(page->data + ref.offset, node, size);
+    
+    // Debug: Log what we're about to write
+    uint8_t node_type = *(const uint8_t *)node;
+    if (node_type == 0) {  // DATA_NODE_LEAF
+        const data_art_leaf_t *debug_leaf = (const data_art_leaf_t *)node;
+        LOG_TRACE("About to write leaf to page=%lu: key_len=%u, value_len=%u, size=%zu",
+                  ref.page_id, debug_leaf->key_len, debug_leaf->value_len, size);
+        LOG_ERROR("[WRITE_NODE] Leaf in page buffer: type=%u flags=0x%02x key_len=%u value_len=%u",
+                  debug_leaf->type, debug_leaf->flags, debug_leaf->key_len, debug_leaf->value_len);
+    }
     
     // Compute checksum before writing
     page_compute_checksum(page);
     
-    // Mark page as dirty or write directly
-    if (tree->buffer_pool) {
+    if (!page_is_temp) {
+        // Page is in buffer pool - mark as dirty for later flush
         buffer_pool_mark_dirty(tree->buffer_pool, ref.page_id);
     } else {
-        // Direct write through page manager
+        // Temp page for new allocation - write directly and reload into buffer pool
+        LOG_ERROR("[WRITE_NODE] Writing new page=%lu to disk", ref.page_id);
         page_result_t result = page_manager_write(tree->page_manager, page);
         if (result != PAGE_SUCCESS) {
             LOG_ERROR("Failed to write page %lu", ref.page_id);
             return false;
         }
+        LOG_ERROR("[WRITE_NODE] Page %lu written to disk successfully", ref.page_id);
+        
+        // Reload into buffer pool cache for subsequent reads
+        buffer_pool_reload(tree->buffer_pool, ref.page_id);
+        LOG_ERROR("[WRITE_NODE] Reloaded page %lu into buffer pool cache", ref.page_id);
+        
         // Sync to ensure data is persisted
         page_manager_sync(tree->page_manager);
+        LOG_ERROR("[WRITE_NODE] Page %lu synced to disk", ref.page_id);
     }
     
     return true;
@@ -556,10 +579,34 @@ const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_l
         // Check if leaf
         if (type == DATA_NODE_LEAF) {
             const data_art_leaf_t *leaf = (const data_art_leaf_t *)node;
+            LOG_TRACE("Found leaf at page=%lu: key_len=%u, value_len=%u, flags=0x%02x",
+                      current.page_id, leaf->key_len, leaf->value_len, leaf->flags);
+            LOG_ERROR("[READ_LEAF] page=%lu offset=%u | type=%u flags=0x%02x key_len=%u value_len=%u overflow_page=%lu inline_data_len=%u",
+                      current.page_id, current.offset, leaf->type, leaf->flags, leaf->key_len, leaf->value_len, leaf->overflow_page, leaf->inline_data_len);
+            
+            // Debug: Verify the leaf structure makes sense
+            if (leaf->value_len > 1024) {  // Suspiciously large
+                LOG_ERROR("CORRUPTION DETECTED: leaf at page=%lu offset=%u has suspiciously large value_len=%u, key_len=%u",
+                          current.page_id, current.offset, leaf->value_len, leaf->key_len);
+                LOG_ERROR("Leaf dump: type=%u flags=0x%02x, overflow_page=%lu, inline_data_len=%u",
+                          leaf->type, leaf->flags, leaf->overflow_page, leaf->inline_data_len);
+                // Dump raw bytes of entire leaf header
+                const uint8_t *raw = (const uint8_t *)leaf;
+                LOG_ERROR("Raw bytes [0-23]: %02x %02x %02x %02x | %02x %02x %02x %02x | %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x",
+                          raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+                          raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
+                          raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23]);
+                LOG_ERROR("Field breakdown: type@0=%02x flags@1=%02x pad@2-3=%02x%02x | key_len@4-7=%02x%02x%02x%02x | value_len@8-11=%02x%02x%02x%02x | overflow@12-19=%02x%02x%02x%02x%02x%02x%02x%02x | inline_len@20-23=%02x%02x%02x%02x",
+                          raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+                          raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
+                          raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23]);
+            }
+            
             if (leaf_matches(leaf, key, key_len)) {
                 if (value_len) {
                     *value_len = leaf->value_len;
                 }
+                LOG_TRACE("Leaf matches! Returning value_len=%u", leaf->value_len);
                 
                 // Allocate buffer for value (caller must free)
                 void *value_copy = malloc(leaf->value_len);

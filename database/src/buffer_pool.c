@@ -476,6 +476,47 @@ int buffer_pool_flush_all(buffer_pool_t *bp) {
     return flushed;
 }
 
+int buffer_pool_clear(buffer_pool_t *bp) {
+    if (!bp) {
+        return -1;
+    }
+    
+    pthread_rwlock_wrlock(&bp->lock);
+    
+    int cleared = 0;
+    buffer_frame_t *frame, *tmp;
+    
+    HASH_ITER(hh, bp->frames_hash, frame, tmp) {
+        // Flush if dirty
+        if (frame->is_dirty) {
+            flush_frame(bp, frame);
+        }
+        
+        // Remove from LRU list
+        if (frame->lru_prev) {
+            frame->lru_prev->lru_next = frame->lru_next;
+        } else {
+            bp->lru_head = frame->lru_next;
+        }
+        
+        if (frame->lru_next) {
+            frame->lru_next->lru_prev = frame->lru_prev;
+        } else {
+            bp->lru_tail = frame->lru_prev;
+        }
+        
+        // Remove from hash table
+        HASH_DEL(bp->frames_hash, frame);
+        
+        // Free frame
+        free(frame);
+        cleared++;
+    }
+    
+    pthread_rwlock_unlock(&bp->lock);
+    return cleared;
+}
+
 bool buffer_pool_evict(buffer_pool_t *bp, uint64_t page_id) {
     if (!bp) {
         return false;
@@ -529,6 +570,76 @@ bool buffer_pool_contains(buffer_pool_t *bp, uint64_t page_id) {
     pthread_rwlock_unlock(&bp->lock);
     
     return frame != NULL;
+}
+
+bool buffer_pool_invalidate(buffer_pool_t *bp, uint64_t page_id) {
+    if (!bp) {
+        return true;  // No buffer pool, nothing to invalidate
+    }
+    
+    pthread_rwlock_wrlock(&bp->lock);
+    
+    buffer_frame_t *frame = find_frame(bp, page_id);
+    if (!frame) {
+        // Page not in cache, nothing to do
+        pthread_rwlock_unlock(&bp->lock);
+        return true;
+    }
+    
+    // Check if page is pinned
+    if (frame->pin_count > 0) {
+        LOG_WARN("Cannot invalidate pinned page %lu (pin_count=%u)", 
+                 page_id, frame->pin_count);
+        pthread_rwlock_unlock(&bp->lock);
+        return false;
+    }
+    
+    // Remove from LRU list and hash table
+    lru_remove(bp, frame);
+    remove_frame(bp, frame);
+    free(frame);
+    
+    // Update stats
+    bp->stats.num_frames = HASH_COUNT(bp->frames_hash);
+    
+    pthread_rwlock_unlock(&bp->lock);
+    
+    LOG_DEBUG("Invalidated page %lu from buffer pool", page_id);
+    return true;
+}
+
+bool buffer_pool_reload(buffer_pool_t *bp, uint64_t page_id) {
+    if (!bp) {
+        return true;  // No buffer pool, nothing to reload
+    }
+    
+    pthread_rwlock_wrlock(&bp->lock);
+    
+    buffer_frame_t *frame = find_frame(bp, page_id);
+    if (!frame) {
+        // Page not in cache, nothing to reload
+        pthread_rwlock_unlock(&bp->lock);
+        return true;
+    }
+    
+    // Reload page from disk
+    page_result_t result = page_manager_read(bp->page_manager, page_id, &frame->page);
+    if (result != PAGE_SUCCESS) {
+        LOG_ERROR("Failed to reload page %lu from disk", page_id);
+        pthread_rwlock_unlock(&bp->lock);
+        return false;
+    }
+    
+    // Clear dirty flag since we just loaded fresh data
+    frame->is_dirty = false;
+    
+    // Update last access time
+    frame->last_access_time = (uint64_t)time(NULL);
+    
+    pthread_rwlock_unlock(&bp->lock);
+    
+    LOG_DEBUG("Reloaded page %lu from disk into buffer pool", page_id);
+    return true;
 }
 
 void buffer_pool_get_stats(buffer_pool_t *bp, buffer_pool_stats_t *stats_out) {

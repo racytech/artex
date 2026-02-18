@@ -234,6 +234,47 @@ bool buffer_pool_evict(buffer_pool_t *bp, uint64_t page_id);
  */
 bool buffer_pool_contains(buffer_pool_t *bp, uint64_t page_id);
 
+/**
+ * Clear all pages from the buffer pool
+ * 
+ * Flushes all dirty pages and removes all entries from cache.
+ * Use this after operations that invalidate the entire cache
+ * (e.g., delete with copy-on-write semantics).
+ * 
+ * @param bp Buffer pool
+ * @return Number of pages cleared, or -1 on error
+ */
+int buffer_pool_clear(buffer_pool_t *bp);
+
+/**
+ * Invalidate a page in the cache after external write
+ * 
+ * Use this when a page is written to disk outside the buffer pool
+ * (e.g., via direct page_manager_write). This ensures cache coherency
+ * by removing the stale cached copy.
+ * 
+ * WARNING: Only call this when you're certain no pointers to this
+ * page are still in use. Otherwise, use buffer_pool_reload instead.
+ * 
+ * @param bp Buffer pool
+ * @param page_id Page ID to invalidate
+ * @return true on success (or if page not in cache), false on error
+ */
+bool buffer_pool_invalidate(buffer_pool_t *bp, uint64_t page_id);
+
+/**
+ * Reload a page from disk after external write
+ * 
+ * Use this when a page is written to disk outside the buffer pool
+ * to refresh the cached copy with the latest data from disk.
+ * Safer than invalidate when pointers to the page might still be in use.
+ * 
+ * @param bp Buffer pool
+ * @param page_id Page ID to reload
+ * @return true on success, false if page not in cache or reload failed
+ */
+bool buffer_pool_reload(buffer_pool_t *bp, uint64_t page_id);
+
 // ============================================================================
 // Statistics & Monitoring
 // ============================================================================

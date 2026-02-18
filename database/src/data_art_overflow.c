@@ -144,12 +144,16 @@ uint64_t data_art_write_overflow_value(data_art_tree_t *tree,
         // Link previous page to this one
         if (prev_page != 0) {
             // Update previous page's next_page pointer
+            // CRITICAL: Load and COPY immediately before any other operations
+            // that might call data_art_load_node and invalidate the pointer
             const data_art_overflow_t *prev_overflow = 
                 (const data_art_overflow_t *)data_art_load_node(tree,
                     (node_ref_t){.page_id = prev_page, .offset = 0});
             
             if (prev_overflow) {
+                // IMPORTANT: Copy immediately to avoid stale pointer issues
                 data_art_overflow_t updated = *prev_overflow;
+                // Now safe to do other operations that might call data_art_load_node
                 updated.next_page = ref.page_id;
                 data_art_write_node(tree, 
                     (node_ref_t){.page_id = prev_page, .offset = 0},

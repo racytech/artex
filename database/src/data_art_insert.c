@@ -200,12 +200,20 @@ static node_ref_t find_child_ref(data_art_tree_t *tree, node_ref_t node_ref, uin
     switch (type) {
         case DATA_NODE_4: {
             const data_art_node4_t *n = (const data_art_node4_t *)node;
+            LOG_ERROR("[FIND_CHILD] NODE_4 at page=%lu: looking for byte=0x%02x, num_children=%u, keys=[0x%02x 0x%02x 0x%02x 0x%02x]",
+                     node_ref.page_id, byte, n->num_children,
+                     n->num_children > 0 ? n->keys[0] : 0xFF,
+                     n->num_children > 1 ? n->keys[1] : 0xFF,
+                     n->num_children > 2 ? n->keys[2] : 0xFF,
+                     n->num_children > 3 ? n->keys[3] : 0xFF);
             for (int i = 0; i < n->num_children; i++) {
                 if (n->keys[i] == byte) {
+                    LOG_ERROR("[FIND_CHILD] Found child at index %d → page=%lu", i, n->child_page_ids[i]);
                     return (node_ref_t){.page_id = n->child_page_ids[i], 
                                        .offset = n->child_offsets[i]};
                 }
             }
+            LOG_ERROR("[FIND_CHILD] Child byte=0x%02x NOT FOUND in NODE_4 at page=%lu", byte, node_ref.page_id);
             return NULL_NODE_REF;
         }
         case DATA_NODE_16: {
@@ -274,11 +282,13 @@ static node_ref_t alloc_leaf(data_art_tree_t *tree, const uint8_t *key, size_t k
     
     // Copy key
     memcpy(leaf->data, key, key_len);
+    LOG_ERROR("[ALLOC_LEAF] Copied key: %zu bytes at offset 0", key_len);
     
     // Copy value (inline portion)
     if (needs_overflow) {
         size_t inline_value_size = inline_data_len - key_len;
         memcpy(leaf->data + key_len, value, inline_value_size);
+        LOG_ERROR("[ALLOC_LEAF] Copied inline value: %zu bytes at offset %zu (overflow mode)", inline_value_size, key_len);
         
         // Write overflow pages
         uint64_t overflow_page = data_art_write_overflow_value(tree, value, 
@@ -292,14 +302,23 @@ static node_ref_t alloc_leaf(data_art_tree_t *tree, const uint8_t *key, size_t k
         leaf->overflow_page = overflow_page;
     } else {
         memcpy(leaf->data + key_len, value, value_len);
+        LOG_ERROR("[ALLOC_LEAF] Copied full value: %zu bytes at offset %zu (inline mode)", value_len, key_len);
     }
     
     // Write leaf to disk
+    LOG_TRACE("Writing leaf: page=%lu, key_len=%u, value_len=%u, leaf_size=%zu",
+              leaf_ref.page_id, leaf->key_len, leaf->value_len, leaf_size);
+    LOG_ERROR("[WRITE_LEAF] BEFORE write: page=%lu offset=%u | type=%u flags=0x%02x key_len=%u value_len=%u overflow_page=%lu inline_data_len=%u",
+              leaf_ref.page_id, leaf_ref.offset, leaf->type, leaf->flags, leaf->key_len, leaf->value_len, leaf->overflow_page, leaf->inline_data_len);
     if (!data_art_write_node(tree, leaf_ref, leaf, leaf_size)) {
         LOG_ERROR("Failed to write leaf node");
         free(leaf);
         return NULL_NODE_REF;
     }
+    LOG_ERROR("[WRITE_LEAF] AFTER write: page=%lu offset=%u | value_len=%u (should be unchanged)",
+              leaf_ref.page_id, leaf_ref.offset, leaf->value_len);
+    LOG_TRACE("Leaf written successfully: page=%lu, value_len=%u", 
+              leaf_ref.page_id, leaf->value_len);
     
     free(leaf);
     return leaf_ref;
@@ -390,13 +409,33 @@ static bool replace_child_in_node(data_art_tree_t *tree, node_ref_t node_ref,
     
     if (!found) {
         free(modified_node);
-        LOG_ERROR("Child not found for replacement");
+        LOG_ERROR("[REPLACE_CHILD] FAILED: Child byte=0x%02x not found in node type=%u at page=%lu (num_children=%u)", 
+                 byte, type, node_ref.page_id, 
+                 (type == DATA_NODE_4) ? ((data_art_node4_t*)modified_node)->num_children :
+                 (type == DATA_NODE_16) ? ((data_art_node16_t*)modified_node)->num_children :
+                 (type == DATA_NODE_48) ? ((data_art_node48_t*)modified_node)->num_children :
+                 (type == DATA_NODE_256) ? ((data_art_node256_t*)modified_node)->num_children : 0);
+        if (type == DATA_NODE_4) {
+            data_art_node4_t *n = (data_art_node4_t *)modified_node;
+            LOG_ERROR("[REPLACE_CHILD] NODE_4 keys: 0x%02x 0x%02x 0x%02x 0x%02x", 
+                     n->num_children > 0 ? n->keys[0] : 0xFF,
+                     n->num_children > 1 ? n->keys[1] : 0xFF,
+                     n->num_children > 2 ? n->keys[2] : 0xFF,
+                     n->num_children > 3 ? n->keys[3] : 0xFF);
+        }
         return false;
     }
     
     // Write modified node back
     bool success = data_art_write_node(tree, node_ref, modified_node, node_size);
     free(modified_node);
+    
+    if (!success) {
+        LOG_ERROR("[REPLACE_CHILD] FAILED: data_art_write_node failed for page=%lu", node_ref.page_id);
+    } else {
+        LOG_ERROR("[REPLACE_CHILD] SUCCESS: Updated child byte=0x%02x in node at page=%lu (old_page=%lu → new_page=%lu)", 
+                 byte, node_ref.page_id, old_child_ref.page_id, new_child_ref.page_id);
+    }
     
     return success;
 }
@@ -469,9 +508,24 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         // Update existing leaf
         if (leaf_matches_key(leaf, key, key_len)) {
             *inserted = false;  // Updated, not inserted
+            LOG_ERROR("[UPDATE_LEAF] Replacing leaf at page=%lu (old value_len=%u) with new leaf", 
+                     node_ref.page_id, leaf->value_len);
             node_ref_t new_leaf_ref = alloc_leaf(tree, key, key_len, value, value_len);
             if (!node_ref_is_null(new_leaf_ref)) {
-                // TODO: Free old leaf and overflow pages
+                LOG_ERROR("[UPDATE_LEAF] New leaf allocated at page=%lu (new value_len=%zu)", 
+                         new_leaf_ref.page_id, value_len);
+                
+                // TODO: Free old leaf page AFTER parent is successfully updated
+                // For now, we leak the old page to avoid use-after-free bugs
+                // page_manager_free(tree->page_manager, node_ref.page_id);
+                
+                // TODO: Also free overflow pages if leaf had any
+                if (leaf->flags & LEAF_FLAG_OVERFLOW) {
+                    LOG_WARN("Old leaf has overflow pages - not yet freeing them");
+                }
+                
+                LOG_ERROR("[UPDATE_LEAF] Returning new leaf ref (page=%lu) to parent", 
+                         new_leaf_ref.page_id);
                 return new_leaf_ref;
             }
             return node_ref;
@@ -540,6 +594,25 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                                  existing_key_copy[depth + common_prefix_len] : 0x00;
         uint8_t new_byte = (depth + common_prefix_len < key_len) ? 
                             key[depth + common_prefix_len] : 0x00;
+        
+        // Sanity check: if both bytes are the same, this indicates a duplicate key.
+        // This happens when both keys are identical or when both keys end at the same
+        // position (both beyond their length, so both default to 0x00).
+        // In either case, this should have been caught by leaf_matches_key() above.
+        if (existing_byte == new_byte) {
+            LOG_ERROR("BUG: Both split bytes are 0x%02x at depth %zu + common_prefix %zu", 
+                     existing_byte, depth, common_prefix_len);
+            LOG_ERROR("  Existing key len=%zu, new key len=%zu", existing_key_len, key_len);
+            LOG_ERROR("  max_compare_from_depth=%zu", max_compare_from_depth);
+            LOG_ERROR("  This indicates duplicate keys that should have been caught by leaf_matches_key()");
+            
+            // Verify leaf_matches_key would have caught this
+            bool would_match = (leaf->key_len == key_len) && 
+                              (memcmp(leaf->data, key, key_len) == 0);
+            LOG_ERROR("  Verification: leaf_matches_key would return %s", would_match ? "TRUE (BUG!)" : "FALSE (inconsistent)");
+            
+            return node_ref;
+        }
         
         // Add both leaves as children to the new node
         new_node_ref = add_child_to_node(tree, new_node_ref, existing_byte, node_ref);
@@ -640,6 +713,38 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                 }
             }
             
+            // *** CRITICAL: Get the discriminating byte BEFORE modifying the node! ***
+            // Get the byte where the old node diverges
+            // For lazy expansion: if prefix_match >= 10, we need to get the byte from a leaf
+            // since the partial array only stores first 10 bytes
+            uint8_t old_byte;
+            if (prefix_match < 10 && partial_len <= 10) {
+                // Can read from original partial array (before we modify it)
+                const uint8_t *partial = node_bytes + 4;
+                old_byte = partial[prefix_match];
+                LOG_INFO("  Getting old_byte from original partial[%d] = 0x%02x ('%c')", 
+                         prefix_match, old_byte, old_byte >= 32 && old_byte < 127 ? old_byte : '?');
+            } else {
+                // Need to read from a leaf descendant (lazy expansion case)
+                const data_art_leaf_t *leaf = find_any_leaf(tree, node_ref);
+                if (leaf && depth + prefix_match < leaf->key_len) {
+                    old_byte = leaf->data[depth + prefix_match];
+                    
+                    // Debug: show what leaf we got and what byte
+                    char leaf_key[256];
+                    size_t copy_len = leaf->key_len < 255 ? leaf->key_len : 255;
+                    memcpy(leaf_key, leaf->data, copy_len);
+                    leaf_key[copy_len] = '\0';
+                    LOG_INFO("  Getting old_byte from leaf key '%s' at position %zu = 0x%02x ('%c')", 
+                             leaf_key, depth + prefix_match, old_byte, 
+                             old_byte >= 32 && old_byte < 127 ? old_byte : '?');
+                } else {
+                    // Fallback: use NULL byte
+                    old_byte = 0x00;
+                    LOG_INFO("  Using fallback old_byte = 0x00");
+                }
+            }
+            
             uint8_t *mod_bytes = (uint8_t *)modified_node;
             uint8_t remaining_prefix_len = partial_len - prefix_match - 1;
             mod_bytes[2] = remaining_prefix_len;  // Update partial_len
@@ -680,37 +785,6 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                 return node_ref;
             }
             free(modified_node);
-            
-            // Get the byte where the old node diverges
-            // For lazy expansion: if prefix_match >= 10, we need to get the byte from a leaf
-            // since the partial array only stores first 10 bytes
-            uint8_t old_byte;
-            if (prefix_match < 10) {
-                // Can read from partial array
-                const uint8_t *partial = node_bytes + 4;
-                old_byte = partial[prefix_match];
-                LOG_INFO("  Getting old_byte from partial[%d] = 0x%02x ('%c')", 
-                         prefix_match, old_byte, old_byte >= 32 && old_byte < 127 ? old_byte : '?');
-            } else {
-                // Need to read from a leaf descendant
-                const data_art_leaf_t *leaf = find_any_leaf(tree, node_ref);
-                if (leaf && depth + prefix_match < leaf->key_len) {
-                    old_byte = leaf->data[depth + prefix_match];
-                    
-                    // Debug: show what leaf we got and what byte
-                    char leaf_key[256];
-                    size_t copy_len = leaf->key_len < 255 ? leaf->key_len : 255;
-                    memcpy(leaf_key, leaf->data, copy_len);
-                    leaf_key[copy_len] = '\0';
-                    LOG_INFO("  Getting old_byte from leaf key '%s' at position %zu = 0x%02x ('%c')", 
-                             leaf_key, depth + prefix_match, old_byte, 
-                             old_byte >= 32 && old_byte < 127 ? old_byte : '?');
-                } else {
-                    // Fallback: use NULL byte
-                    old_byte = 0x00;
-                    LOG_INFO("  Using fallback old_byte = 0x00");
-                }
-            }
             
             LOG_INFO("  Adding modified_node (page=%lu) as child with key=0x%02x to new_parent (page=%lu)", 
                      modified_node_ref.page_id, old_byte, new_parent_ref.page_id);
@@ -764,11 +838,16 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         
         // If child changed (due to split or growth), update parent's reference
         if (!node_ref_equals(new_child_ref, child_ref)) {
-            LOG_INFO("  depth=%zu: child changed from page=%u to page=%u, updating parent", 
-                     depth, child_ref.page_id, new_child_ref.page_id);
+            LOG_ERROR("  [UPDATE_PARENT] depth=%zu: child changed from page=%u to page=%u, updating parent at page=%u", 
+                     depth, child_ref.page_id, new_child_ref.page_id, node_ref.page_id);
             if (!replace_child_in_node(tree, node_ref, byte, child_ref, new_child_ref)) {
-                LOG_ERROR("Failed to update child reference in parent");
+                LOG_ERROR("  [UPDATE_PARENT] FAILED to update child reference in parent");
+            } else {
+                LOG_ERROR("  [UPDATE_PARENT] SUCCESS - parent updated");
             }
+        } else {
+            LOG_DEBUG("  depth=%zu: child unchanged (page=%u), no parent update needed", 
+                     depth, child_ref.page_id);
         }
         
         return node_ref;
