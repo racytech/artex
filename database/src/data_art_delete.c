@@ -24,6 +24,7 @@
 
 #include "data_art.h"
 #include "buffer_pool.h"
+#include "page_gc.h"
 #include "logger.h"
 
 #include <stdlib.h>
@@ -40,6 +41,7 @@ extern node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t
 extern size_t get_node_size(data_art_node_type_t node_type);
 extern node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size);
 extern bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref, const void *data, size_t size);
+extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
 
 // Forward declarations
 static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
@@ -69,7 +71,6 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
     if (deleted) {
         tree->root = new_root;
         tree->size--;
-        LOG_DEBUG("Deleted key, new size: %zu", tree->size);
     }
     
     return deleted;
@@ -248,6 +249,10 @@ static node_ref_t update_child(data_art_tree_t *tree, node_ref_t node_ref,
     }
     
     free(new_node);
+    
+    // Release old page - decrement ref count and mark dead if 0
+    data_art_release_page(tree, node_ref);
+    
     return new_ref;
 }
 
@@ -428,6 +433,12 @@ static node_ref_t remove_child(data_art_tree_t *tree, node_ref_t node_ref,
     free(new_node);
     *did_remove = true;
     
+    LOG_DEBUG("[REMOVE_CHILD] Created new node at page=%lu, releasing old page=%lu",
+              new_ref.page_id, node_ref.page_id);
+    
+    // Release old page - decrement ref count and mark dead if 0
+    data_art_release_page(tree, node_ref);
+    
     return new_ref;
 }
 
@@ -588,6 +599,9 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref) {
     free(new_node);
     
     LOG_DEBUG("Successfully shrunk node from type %d to type %d", type, new_type);
+    
+    // Release old page - decrement ref count and mark dead if 0
+    data_art_release_page(tree, node_ref);
     
     return new_ref;
 }

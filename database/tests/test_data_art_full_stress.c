@@ -112,6 +112,9 @@ static void make_hash_key(const uint8_t *key, size_t key_len, char *hash_key, si
  * Main stress test with insert, search, and delete
  */
 static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, unsigned int base_seed) {
+    // Disable debug logging to reduce output
+    log_set_level(LOG_LEVEL_ERROR);
+    
     printf("\n");
     printf("================================================================\n");
     printf("  FULL STRESS TEST - INSERT + SEARCH + DELETE                  \n");
@@ -187,10 +190,12 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
             HASH_FIND_STR(all_keys, hash_key, entry);
             
             if (entry) {
-                // Duplicate - update value
+                // Duplicate key - update value and reset deleted flag
                 free(entry->value);
                 entry->value = strdup(value);
                 entry->value_len = strlen(value);
+                entry->deleted = false;  // Key is back in the tree
+                entry->insert_index = next_key_index;  // Update to latest insert
             } else {
                 // New key
                 entry = malloc(sizeof(key_entry_t));
@@ -221,6 +226,16 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
                 size_t value_len;
                 const void *retrieved = data_art_get(tree, entry->key, entry->key_len, &value_len);
                 if (retrieved != NULL) {
+                    fprintf(stderr, "\n=== BUG DETAILS ===");
+                    fprintf(stderr, "\nDeleted key found: insert_index=%d, delete_index=%d",
+                            entry->insert_index, entry->delete_index);
+                    fprintf(stderr, "\nKey (first 32 bytes): ");
+                    for (size_t i = 0; i < entry->key_len && i < 32; i++) {
+                        fprintf(stderr, "%02x ", entry->key[i]);
+                    }
+                    fprintf(stderr, "\nKey length: %zu", entry->key_len);
+                    fprintf(stderr, "\nValue length retrieved: %zu", value_len);
+                    fprintf(stderr, "\n===================\n");
                     free((void *)retrieved);
                     FAIL_FAST("Deleted key still exists! Iteration %lu, deleted at index %d",
                              stats.iterations, entry->delete_index);

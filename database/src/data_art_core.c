@@ -11,6 +11,7 @@
  */
 
 #include "data_art.h"
+#include "page_gc.h"
 #include "logger.h"
 
 #include <stdlib.h>
@@ -144,12 +145,49 @@ node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size) {
         return NULL_NODE_REF;
     }
     
+    // Initialize reference count to 1 (caller holds initial reference)
+    if (!page_gc_init_ref(tree->page_manager, page_id)) {
+        LOG_ERROR("Failed to initialize ref count for page %lu", page_id);
+        // Note: page is allocated but orphaned - will be cleaned up during compaction
+        return NULL_NODE_REF;
+    }
+    
     tree->nodes_allocated++;
     
     // Node starts at offset 0 in the page
     node_ref_t ref = {.page_id = page_id, .offset = 0};
     
     return ref;
+}
+
+/**
+ * Release reference to an old page
+ * 
+ * Called when a page is no longer referenced by the tree (e.g., after
+ * copy-on-write creates a new version). Decrements ref count and invalidates
+ * buffer pool entry if ref count reaches 0.
+ * 
+ * @param tree ART tree
+ * @param old_ref Reference to old page
+ */
+void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref) {
+    if (!tree || node_ref_is_null(old_ref)) {
+        return;
+    }
+    
+    uint32_t ref_count = page_gc_decref(tree->page_manager, old_ref.page_id);
+    
+    LOG_DEBUG("[RELEASE_PAGE] page=%lu | ref_count after decrement=%u",
+              old_ref.page_id, ref_count);
+    
+    // If ref count reached 0, invalidate buffer pool entry
+    if (ref_count == 0) {
+        LOG_DEBUG("[RELEASE_PAGE] page=%lu reached ref_count=0, invalidating from buffer pool",
+                  old_ref.page_id);
+        buffer_pool_invalidate(tree->buffer_pool, old_ref.page_id);
+        LOG_DEBUG("[RELEASE_PAGE] page=%lu marked as dead and removed from buffer pool",
+                  old_ref.page_id);
+    }
 }
 
 // ============================================================================
@@ -553,13 +591,7 @@ const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_l
         return NULL;
     }
     
-    // Log search start
-    char key_str[64];
-    snprintf(key_str, sizeof(key_str), "%.*s", (int)(key_len < 50 ? key_len : 50), key);
-    LOG_INFO(">>> SEARCHING for key: '%s' (len=%zu)", key_str, key_len);
-    
     if (node_ref_is_null(tree->root)) {
-        LOG_INFO(">>> Tree is empty, returning NULL");
         return NULL;  // Empty tree
     }
     

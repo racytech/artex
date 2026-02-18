@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <pthread.h>
 
 // Page size (fixed at 4KB)
 #define PAGE_SIZE 4096
@@ -81,10 +82,24 @@ typedef struct {
     int *data_file_fds;  // Array of open file descriptors
 } page_allocator_t;
 
+// Forward declaration - full definition in page_gc.h
+struct page_gc_metadata;
+
+// Page index (tracks all pages with GC metadata)
+typedef struct {
+    struct page_gc_metadata *entries;  // Array of page metadata
+    size_t count;                      // Number of entries
+    size_t capacity;                   // Array capacity
+    uint64_t total_file_size;          // Sum of all compressed sizes
+    uint64_t dead_bytes;               // Bytes consumed by dead pages
+    pthread_rwlock_t lock;             // Protects concurrent access
+} page_index_t;
+
 // Page manager (coordinates allocation + I/O)
 typedef struct {
     char *db_path;              // Database directory path
     page_allocator_t *allocator;
+    page_index_t *index;        // Page index with GC metadata
     
     // File handles
     int metadata_fd;
@@ -332,5 +347,62 @@ size_class_t page_get_size_class(uint32_t free_bytes);
  * @param version Version number
  */
 void page_init(page_t *page, uint64_t page_id, uint64_t version);
+
+// ============================================================================
+// Page Index Access (for page_gc integration)
+// ============================================================================
+
+// Forward declaration - actual struct defined in page_gc.h
+struct page_gc_metadata;
+
+/**
+ * Get page metadata from index by page ID
+ * 
+ * Used by page_gc for reference counting.
+ * Returns pointer to metadata in page index (not a copy).
+ * 
+ * @param pm Page manager instance
+ * @param page_id Page ID to look up
+ * @return Pointer to metadata, or NULL if not found
+ */
+struct page_gc_metadata *page_manager_get_metadata(page_manager_t *pm, uint64_t page_id);
+
+/**
+ * Get page metadata from index by array index
+ * 
+ * Used by page_gc for scanning all pages.
+ * 
+ * @param pm Page manager instance  
+ * @param index Array index (0 to num_pages-1)
+ * @return Pointer to metadata, or NULL if out of bounds
+ */
+struct page_gc_metadata *page_manager_get_metadata_by_index(page_manager_t *pm, size_t index);
+
+/**
+ * Get total number of pages in index
+ * 
+ * @param pm Page manager instance
+ * @return Number of pages
+ */
+size_t page_manager_get_num_pages(page_manager_t *pm);
+
+/**
+ * Get total size of all data files
+ * 
+ * @param pm Page manager instance
+ * @return Total bytes across all data files
+ */
+uint64_t page_manager_get_total_file_size(page_manager_t *pm);
+
+/**
+ * Update dead page statistics
+ * 
+ * Called by page_gc when marking a page as dead.
+ * Updates internal counters for dead page tracking.
+ * 
+ * @param pm Page manager instance
+ * @param dead_bytes Bytes consumed by newly dead page
+ */
+void page_manager_update_dead_stats(page_manager_t *pm, uint32_t dead_bytes);
 
 #endif // PAGE_MANAGER_H

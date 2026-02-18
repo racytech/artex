@@ -6,6 +6,7 @@
  */
 
 #include "page_manager.h"
+#include "page_gc.h"
 #include "logger.h"
 
 #include <stdlib.h>
@@ -40,6 +41,10 @@ static uint32_t compute_crc32(const uint8_t *data, size_t len) {
     }
     return ~crc;
 }
+
+// Forward declaration for page index management
+static void page_index_insert_or_update(page_manager_t *pm, uint64_t page_id,
+                                        uint32_t compressed_size);
 
 // ============================================================================
 // Free List Management
@@ -136,6 +141,32 @@ page_manager_t *page_manager_create(const char *db_path, bool read_only) {
     pm->allocator->num_data_files = 0;
     pm->allocator->data_file_fds = NULL;
     
+    // Allocate and initialize page index
+    pm->index = calloc(1, sizeof(page_index_t));
+    if (!pm->index) {
+        LOG_ERROR("Failed to allocate page index");
+        free(pm->allocator);
+        free(pm->db_path);
+        free(pm);
+        return NULL;
+    }
+    
+    pm->index->capacity = 1024;  // Initial capacity
+    pm->index->entries = (struct page_gc_metadata *)calloc(pm->index->capacity, sizeof(page_gc_metadata_t));
+    if (!pm->index->entries) {
+        LOG_ERROR("Failed to allocate page index entries");
+        free(pm->index);
+        free(pm->allocator);
+        free(pm->db_path);
+        free(pm);
+        return NULL;
+    }
+    
+    pthread_rwlock_init(&pm->index->lock, NULL);
+    pm->index->count = 0;
+    pm->index->total_file_size = 0;
+    pm->index->dead_bytes = 0;
+    
     // Create first data file
     if (!read_only) {
         if (page_manager_create_data_file(pm) != PAGE_SUCCESS) {
@@ -177,6 +208,13 @@ void page_manager_destroy(page_manager_t *pm) {
             }
         }
         free(pm->allocator);
+    }
+    
+    // Destroy page index
+    if (pm->index) {
+        pthread_rwlock_destroy(&pm->index->lock);
+        free(pm->index->entries);
+        free(pm->index);
     }
     
     // Close metadata file
@@ -235,6 +273,9 @@ uint64_t page_manager_alloc(page_manager_t *pm, size_t size_needed) {
             return 0;
         }
     }
+    
+    // Add to page index (will be initialized with ref_count by caller)
+    page_index_insert_or_update(pm, page_id, PAGE_SIZE);
     
     return page_id;
 }
@@ -409,6 +450,10 @@ page_result_t page_manager_write(page_manager_t *pm, const page_t *page) {
     pm->pages_written++;
     pm->bytes_written += PAGE_SIZE;
     
+    // Update page index with current compressed size
+    // Note: Using PAGE_SIZE for now; real compression would update this
+    page_index_insert_or_update(pm, page_id, PAGE_SIZE);
+    
     LOG_TRACE("Wrote page %lu successfully", page_id);
     
     return PAGE_SUCCESS;
@@ -549,6 +594,78 @@ void page_compute_checksum(page_t *page) {
 }
 
 // ============================================================================
+// Page Index Management
+// ============================================================================
+
+// Helper: Insert or update page in index (maintains sorted order by page_id)
+static void page_index_insert_or_update(page_manager_t *pm, uint64_t page_id,
+                                        uint32_t compressed_size) {
+    if (!pm || !pm->index) return;
+    
+    page_index_t *index = pm->index;
+    pthread_rwlock_wrlock(&index->lock);
+    
+    page_gc_metadata_t *entries = (page_gc_metadata_t *)index->entries;
+    
+    // Binary search to find existing entry or insertion point
+    size_t left = 0, right = index->count;
+    while (left < right) {
+        size_t mid = left + (right - left) / 2;
+        if (entries[mid].page_id == page_id) {
+            // Update existing entry
+            entries[mid].compressed_size = compressed_size;
+            entries[mid].version++;
+            pthread_rwlock_unlock(&index->lock);
+            return;
+        } else if (entries[mid].page_id < page_id) {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    
+    // Not found - need to insert at position 'left'
+    // Expand capacity if needed
+    if (index->count >= index->capacity) {
+        size_t new_capacity = index->capacity * 2;
+        page_gc_metadata_t *new_entries = realloc(index->entries,
+                                                   new_capacity * sizeof(page_gc_metadata_t));
+        if (!new_entries) {
+            LOG_ERROR("Failed to expand page index capacity");
+            pthread_rwlock_unlock(&index->lock);
+            return;
+        }
+        index->entries = (struct page_gc_metadata *)new_entries;
+        index->capacity = new_capacity;
+        entries = new_entries;  // Update local pointer
+    }
+    
+    // Shift entries to make room
+    if (left < index->count) {
+        memmove(&entries[left + 1], &entries[left],
+                (index->count - left) * sizeof(page_gc_metadata_t));
+    }
+    
+    // Insert new entry
+    memset(&entries[left], 0, sizeof(page_gc_metadata_t));
+    entries[left].page_id = page_id;
+    entries[left].file_offset = index->total_file_size;
+    entries[left].compressed_size = compressed_size;
+    entries[left].compression_type = 0;  // No compression
+    entries[left].version = 1;
+    entries[left].ref_count = 0;  // Will be initialized by page_gc_init_ref
+    entries[left].flags = 0;
+    
+    index->count++;
+    index->total_file_size += compressed_size;
+    
+    pthread_rwlock_unlock(&index->lock);
+    
+    LOG_TRACE("Added page %lu to index (count=%zu, total_size=%lu)",
+             page_id, index->count, index->total_file_size);
+}
+
+// ============================================================================
 // Statistics
 // ============================================================================
 
@@ -631,4 +748,101 @@ page_result_t page_manager_write_compressed(page_manager_t *pm, const page_t *pa
     (void)compression_type;
     LOG_WARN("Compressed write not yet implemented, falling back to uncompressed");
     return page_manager_write(pm, page);
+}
+
+// ============================================================================
+// Page GC Helper Functions
+// ============================================================================
+
+#include "page_gc.h"
+
+struct page_gc_metadata *page_manager_get_metadata(page_manager_t *pm, uint64_t page_id) {
+    if (!pm || !pm->index) {
+        return NULL;
+    }
+    
+    page_index_t *index = pm->index;
+    pthread_rwlock_rdlock(&index->lock);
+    
+    // Cast to page_gc_metadata_t * for indexing (since full definition is available here)
+    page_gc_metadata_t *entries = (page_gc_metadata_t *)index->entries;
+    
+    // Binary search by page_id (assumes entries are sorted)
+    size_t left = 0;
+    size_t right = index->count;
+    struct page_gc_metadata *result = NULL;
+    
+    while (left < right) {
+        size_t mid = left + (right - left) / 2;
+        page_gc_metadata_t *entry = &entries[mid];
+        
+        if (entry->page_id == page_id) {
+            result = (struct page_gc_metadata *)entry;
+            break;
+        } else if (entry->page_id < page_id) {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    
+    pthread_rwlock_unlock(&index->lock);
+    return result;
+}
+
+struct page_gc_metadata *page_manager_get_metadata_by_index(page_manager_t *pm, size_t index) {
+    if (!pm || !pm->index) {
+        return NULL;
+    }
+    
+    page_index_t *idx = pm->index;
+    pthread_rwlock_rdlock(&idx->lock);
+    
+    // Cast to page_gc_metadata_t * for indexing
+    page_gc_metadata_t *entries = (page_gc_metadata_t *)idx->entries;
+    
+    struct page_gc_metadata *result = NULL;
+    if (index < idx->count) {
+        result = (struct page_gc_metadata *)&entries[index];
+    }
+    
+    pthread_rwlock_unlock(&idx->lock);
+    return result;
+}
+
+size_t page_manager_get_num_pages(page_manager_t *pm) {
+    if (!pm || !pm->index) {
+        return 0;
+    }
+    
+    page_index_t *index = pm->index;
+    pthread_rwlock_rdlock(&index->lock);
+    size_t count = index->count;
+    pthread_rwlock_unlock(&index->lock);
+    
+    return count;
+}
+
+uint64_t page_manager_get_total_file_size(page_manager_t *pm) {
+    if (!pm || !pm->index) {
+        return 0;
+    }
+    
+    page_index_t *index = pm->index;
+    pthread_rwlock_rdlock(&index->lock);
+    uint64_t size = index->total_file_size;
+    pthread_rwlock_unlock(&index->lock);
+    
+    return size;
+}
+
+void page_manager_update_dead_stats(page_manager_t *pm, uint32_t dead_bytes) {
+    if (!pm || !pm->index) {
+        return;
+    }
+    
+    page_index_t *index = pm->index;
+    pthread_rwlock_wrlock(&index->lock);
+    index->dead_bytes += dead_bytes;
+    pthread_rwlock_unlock(&index->lock);
 }

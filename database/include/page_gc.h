@@ -1,19 +1,24 @@
 /**
- * Page Garbage Collection - Reference Counting and Free List
+ * Page Garbage Collection - Reference Counting for Append-Only Storage
  * 
  * Manages page-level garbage collection within a single tree version.
  * Solves the copy-on-write page leak problem where delete operations
  * create new page versions but don't free old unreachable pages.
  * 
+ * IMPORTANT: Works with append-only variable-size storage (see COMPRESSION.md)
+ * - Pages are appended to data files with variable compressed sizes
+ * - Cannot reuse old page locations (different sizes)
+ * - Instead: Mark pages as "dead" and reclaim space during compaction
+ * 
  * Two-part system:
  * 1. Reference counting: Track which pages are reachable from tree root
- * 2. Free list: Maintain recyclable page IDs for reallocation
+ * 2. Dead page tracking: Mark unreachable pages for future compaction
  * 
  * Key operations:
  * - Increment ref count when page is linked (insert, update)
  * - Decrement ref count when page is unlinked (delete, shrink)
- * - Add pages with ref_count=0 to free list
- * - Allocate from free list before extending file
+ * - Mark pages with ref_count=0 as "dead" in page index
+ * - Compaction reclaims space from dead pages (see db_compaction.h)
  */
 
 #ifndef PAGE_GC_H
@@ -36,14 +41,29 @@ extern "C" {
 /**
  * Page metadata with reference counting
  * 
- * Extended page header that includes reference count for GC.
+ * Extended page index entry that includes reference count for GC.
  * ref_count tracks how many tree nodes reference this page.
+ * 
+ * This extends the page_index_entry_t from COMPRESSION.md with GC metadata.
  */
 typedef struct {
+    // From COMPRESSION.md page_index_entry_t
+    uint64_t page_id;
+    uint64_t file_offset;        // Physical location in data file
+    uint32_t compressed_size;    // Bytes on disk
+    uint8_t compression_type;    // NONE, LZ4, ZSTD_5, ZSTD_19
+    uint32_t checksum;
+    uint64_t version;
+    
+    // GC extensions
     uint32_t ref_count;          // Number of references to this page
-    uint32_t flags;              // Flags: DIRTY, PINNED, etc.
-    uint64_t last_modified;      // Timestamp of last modification
+    uint32_t flags;              // Flags: DEAD, PINNED, etc.
+    uint64_t last_access_time;   // For compression tier decisions
 } page_gc_metadata_t;
+
+// Flags for page GC state
+#define PAGE_GC_FLAG_DEAD   (1 << 0)  // ref_count=0, eligible for compaction
+#define PAGE_GC_FLAG_PINNED (1 << 1)  // Pinned in buffer pool, don't compress
 
 /**
  * Initialize reference counting for a page
@@ -99,157 +119,123 @@ uint32_t page_gc_decref(page_manager_t *pm, uint64_t page_id);
 uint32_t page_gc_get_refcount(page_manager_t *pm, uint64_t page_id);
 
 // ============================================================================
-// Free List Management
+// Dead Page Tracking (replaces free list for append-only storage)
 // ============================================================================
 
 /**
- * Free list node (linked list of available page IDs)
+ * Dead page statistics
  * 
- * Stored in a dedicated metadata page or memory structure.
- * Each node contains a batch of freed page IDs.
- */
-typedef struct free_list_node {
-    uint64_t page_ids[63];           // Batch of free page IDs (63 × 8 = 504 bytes)
-    uint32_t count;                  // Number of valid entries (0-63)
-    uint32_t reserved;
-    struct free_list_node *next;     // Next batch (page_id stored here)
-} free_list_node_t;
-
-/**
- * Free list manager
- * 
- * Maintains recyclable page IDs. Pages are added when ref_count
- * reaches 0, and consumed during allocation.
+ * Tracks pages with ref_count=0 that are consuming disk space.
+ * Used to determine when compaction is needed.
  */
 typedef struct {
-    page_manager_t *pm;              // Associated page manager
-    free_list_node_t *head;          // Head of free list
-    pthread_rwlock_t lock;           // Protects free list access
-    
-    // Statistics
-    uint64_t total_freed;            // Total pages ever freed
-    uint64_t total_reused;           // Total pages reused from free list
-    uint64_t current_free_count;     // Current number of free pages
-} free_list_t;
+    uint64_t total_pages;         // Total pages in index
+    uint64_t live_pages;          // Pages with ref_count > 0
+    uint64_t dead_pages;          // Pages with ref_count = 0
+    uint64_t dead_bytes;          // Disk space wasted by dead pages
+    double fragmentation_pct;     // Percentage of wasted space
+} dead_page_stats_t;
 
 /**
- * Create free list manager
- * 
- * @param pm Page manager to associate with
- * @return Initialized free list, or NULL on error
- */
-free_list_t *free_list_create(page_manager_t *pm);
-
-/**
- * Destroy free list manager
- * 
- * Persists free list to disk before destruction.
- * 
- * @param fl Free list to destroy
- */
-void free_list_destroy(free_list_t *fl);
-
-/**
- * Add page to free list
+ * Mark page as dead (ref_count reached 0)
  * 
  * Called automatically when page ref_count reaches 0.
- * Page is available for reallocation.
+ * Page remains on disk but is marked as eligible for compaction.
  * 
- * Thread-safe.
+ * Thread-safe - updates page index atomically.
  * 
- * @param fl Free list
- * @param page_id Page to add
+ * @param pm Page manager
+ * @param page_id Page to mark dead
  * @return true on success
  */
-bool free_list_add(free_list_t *fl, uint64_t page_id);
+bool page_gc_mark_dead(page_manager_t *pm, uint64_t page_id);
 
 /**
- * Allocate page from free list
+ * Check if page is dead
  * 
- * Returns a page ID from free list if available, otherwise 0.
- * Caller should allocate new page if this returns 0.
- * 
- * Thread-safe.
- * 
- * @param fl Free list
- * @return Page ID from free list, or 0 if empty
+ * @param pm Page manager
+ * @param page_id Page to check
+ * @return true if page has ref_count=0
  */
-uint64_t free_list_pop(free_list_t *fl);
+bool page_gc_is_dead(page_manager_t *pm, uint64_t page_id);
 
 /**
- * Check if free list is empty
+ * Get dead page statistics
  * 
- * @param fl Free list
- * @return true if no free pages available
+ * Scans page index to count dead pages and calculate fragmentation.
+ * Used to determine if compaction is recommended.
+ * 
+ * @param pm Page manager
+ * @param stats_out Statistics output
  */
-bool free_list_is_empty(free_list_t *fl);
+void page_gc_get_dead_stats(page_manager_t *pm, dead_page_stats_t *stats_out);
 
 /**
- * Get free list statistics
+ * Collect dead pages (list all pages with ref_count=0)
  * 
- * @param fl Free list
- * @param total_freed_out Total pages ever freed
- * @param total_reused_out Total pages reused
- * @param current_free_out Current free page count
+ * Returns array of page IDs that are dead (for compaction).
+ * Caller must free the returned array.
+ * 
+ * @param pm Page manager
+ * @param count_out Number of dead pages returned
+ * @return Array of dead page IDs, or NULL if none
  */
-void free_list_stats(free_list_t *fl, 
-                     uint64_t *total_freed_out,
-                     uint64_t *total_reused_out, 
-                     uint64_t *current_free_out);
-
-/**
- * Persist free list to disk
- * 
- * Writes free list to special metadata page(s).
- * Called during checkpoint or shutdown.
- * 
- * @param fl Free list
- * @return true on success
- */
-bool free_list_persist(free_list_t *fl);
-
-/**
- * Load free list from disk
- * 
- * Reads free list from metadata page(s).
- * Called during database open.
- * 
- * @param fl Free list
- * @return true on success
- */
-bool free_list_load(free_list_t *fl);
+uint64_t *page_gc_collect_dead_pages(page_manager_t *pm, size_t *count_out);
 
 // ============================================================================
-// Integration with Page Manager
+// Integration with Page Manager (Append-Only Model)
 // ============================================================================
 
 /**
- * Modified page allocation that checks free list first
+ * Page allocation in append-only model
+ * 
+ * Always allocates NEW page IDs (monotonically increasing).
+ * Dead pages are NOT reused - space reclaimed during compaction.
  * 
  * Usage:
  * ```c
- * uint64_t page_id = free_list_pop(tree->free_list);
- * if (page_id == 0) {
- *     page_id = page_manager_alloc(tree->pm, size);
- * }
+ * // Allocate new page (always appends to end)
+ * uint64_t page_id = page_manager_alloc(tree->pm, size);
  * page_gc_init_ref(tree->pm, page_id);
+ * 
+ * // Write page (appends to data file, updates index)
+ * page_manager_write(tree->pm, page_id, data, COMPRESSION_LZ4);
  * ```
  */
 
 /**
- * Page deallocation (decrements ref count, possibly frees)
+ * Page deallocation (decrements ref count, marks dead if zero)
  * 
  * Usage during delete/update:
  * ```c
  * // Old child being replaced
  * node_ref_t old_child = find_child(tree, node_ref, byte);
  * 
- * // Create new version
+ * // Create new version (allocates new page)
  * node_ref_t new_node = update_child(tree, node_ref, byte, new_child);
  * 
  * // Decrement ref count on old version
  * page_gc_decref(tree->pm, old_child.page_id);
- * // → If ref_count reaches 0, automatically added to free list
+ * // → If ref_count reaches 0, marked as dead (PAGE_GC_FLAG_DEAD)
+ * // → Space reclaimed later during compaction
+ * 
+ * // Buffer pool should invalidate old page to avoid cache coherency issues
+ * buffer_pool_invalidate(tree->buffer_pool, old_child.page_id);
+ * ```
+ */
+
+/**
+ * When to run compaction
+ * 
+ * Check fragmentation periodically and compact when needed:
+ * ```c
+ * dead_page_stats_t stats;
+ * page_gc_get_dead_stats(tree->pm, &stats);
+ * 
+ * if (stats.fragmentation_pct > 30.0) {
+ *     // More than 30% wasted space - run compaction
+ *     db_compaction_run(tree, &config, &compact_stats);
+ * }
  * ```
  */
 

@@ -73,6 +73,20 @@ target_link_libraries(art_buffer_pool
 )
 
 #==============================================================================
+# Database Library (Page Garbage Collection)
+#==============================================================================
+
+add_library(art_page_gc STATIC
+    database/src/page_gc.c
+    database/src/logger.c
+)
+
+target_link_libraries(art_page_gc
+    art_page_manager
+    pthread
+)
+
+#==============================================================================
 # Database Library (Persistent ART - Disk-backed Tree)
 #==============================================================================
 
@@ -88,6 +102,7 @@ add_library(art_persistent STATIC
 target_link_libraries(art_persistent
     art_page_manager
     art_buffer_pool
+    art_page_gc
 )
 
 #==============================================================================
@@ -208,6 +223,31 @@ add_executable(test_data_art_node_ops
 )
 target_link_libraries(test_data_art_node_ops art_persistent pthread)
 add_test(NAME test_data_art_node_ops COMMAND test_data_art_node_ops)
+
+# Test: Page GC - Unit tests with mocks
+add_executable(test_page_gc_mock
+    database/tests/test_page_gc_mock.c
+)
+target_link_libraries(test_page_gc_mock art_page_gc pthread)
+add_test(NAME test_page_gc_mock COMMAND test_page_gc_mock)
+
+# Test: Page GC - Integration tests with real page_manager
+add_executable(test_page_gc_integration
+    database/tests/test_page_gc_integration.c
+)
+target_link_libraries(test_page_gc_integration art_page_gc art_page_manager pthread)
+add_test(NAME test_page_gc_integration COMMAND test_page_gc_integration)
+
+# Test: Simple delete test
+add_executable(test_delete_simple
+    database/tests/test_delete_simple.c
+)
+target_link_libraries(test_delete_simple art_persistent pthread)
+
+add_executable(test_delete_debug
+    database/tests/test_delete_debug.c
+)
+target_link_libraries(test_delete_debug art_persistent pthread)
 
 # Benchmark: ART vs uthash
 add_executable(benchmark_art_vs_uthash

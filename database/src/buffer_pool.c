@@ -582,9 +582,13 @@ bool buffer_pool_invalidate(buffer_pool_t *bp, uint64_t page_id) {
     buffer_frame_t *frame = find_frame(bp, page_id);
     if (!frame) {
         // Page not in cache, nothing to do
+        LOG_DEBUG("[BP_INVALIDATE] Page %lu not in cache (already evicted)", page_id);
         pthread_rwlock_unlock(&bp->lock);
         return true;
     }
+    
+    LOG_DEBUG("[BP_INVALIDATE] Found page %lu in cache (dirty=%d, pin_count=%u)",
+              page_id, frame->is_dirty, frame->pin_count);
     
     // Check if page is pinned
     if (frame->pin_count > 0) {
@@ -604,7 +608,7 @@ bool buffer_pool_invalidate(buffer_pool_t *bp, uint64_t page_id) {
     
     pthread_rwlock_unlock(&bp->lock);
     
-    LOG_DEBUG("Invalidated page %lu from buffer pool", page_id);
+    LOG_DEBUG("[BP_INVALIDATE] Successfully removed page %lu from buffer pool", page_id);
     return true;
 }
 
