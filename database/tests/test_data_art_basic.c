@@ -62,7 +62,7 @@ static void test_create_destroy(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
     ASSERT(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     ASSERT(tree != NULL);
     ASSERT(data_art_size(tree) == 0);
     ASSERT(data_art_is_empty(tree));
@@ -90,7 +90,7 @@ static void test_create_with_buffer_pool(void) {
     buffer_pool_t *bp = buffer_pool_create(&config, pm);
     ASSERT(bp != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, bp);
+    data_art_tree_t *tree = data_art_create(pm, bp, 32);
     ASSERT(tree != NULL);
     ASSERT(tree->buffer_pool == bp);
     
@@ -110,7 +110,7 @@ static void test_insert_single_small_value(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
     ASSERT(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     ASSERT(tree != NULL);
     
     const char *key = "hello";
@@ -144,7 +144,7 @@ static void test_insert_large_value_overflow(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
     ASSERT(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     ASSERT(tree != NULL);
     
     const char *key = "bigkey";
@@ -177,7 +177,7 @@ static void test_get_nonexistent(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
     ASSERT(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     ASSERT(tree != NULL);
     
     size_t value_len = 0;
@@ -200,7 +200,7 @@ static void test_statistics(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
     ASSERT(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     ASSERT(tree != NULL);
     
     const char *key = "test";
@@ -239,7 +239,7 @@ static void test_flush_and_persistence(void) {
     buffer_pool_t *bp = buffer_pool_create(&config, pm);
     ASSERT(bp != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, bp);
+    data_art_tree_t *tree = data_art_create(pm, bp, 32);
     ASSERT(tree != NULL);
     
     const char *key = "persist";

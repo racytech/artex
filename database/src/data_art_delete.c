@@ -61,6 +61,13 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
         return false;
     }
     
+    // Validate key size matches tree's configured size
+    if (key_len != tree->key_size) {
+        LOG_ERROR("Key size mismatch: expected %zu bytes, got %zu bytes",
+                  tree->key_size, key_len);
+        return false;
+    }
+    
     if (node_ref_is_null(tree->root)) {
         return false;  // Empty tree, nothing to delete
     }
@@ -128,15 +135,9 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
     }
     
     // Get next byte to search
-    uint8_t search_byte;
-    size_t next_depth;
-    if (depth >= key_len) {
-        search_byte = 0x00;  // Key exhausted, look for NULL byte child
-        next_depth = depth;  // Don't increment depth for NULL byte
-    } else {
-        search_byte = key[depth];
-        next_depth = depth + 1;  // Move to next depth
-    }
+    // Fixed-size keys: simplified byte extraction
+    uint8_t search_byte = (depth < key_len) ? key[depth] : 0x00;
+    size_t next_depth = (depth < key_len) ? depth + 1 : depth;
     
     // Find child BEFORE recursion (uses data_art_load_node internally, might corrupt temp buffer)
     node_ref_t child_ref = find_child(tree, node_ref, search_byte);

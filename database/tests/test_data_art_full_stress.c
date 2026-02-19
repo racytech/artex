@@ -1,15 +1,19 @@
 /**
  * Comprehensive Stress Test for Persistent ART - Insert, Search, Delete
  * 
+ * FIXED-SIZE KEYS: Uses either 20-byte (address) or 32-byte (hash) keys
+ * to match Ethereum use case. Variable-length values.
+ * 
  * FAIL-FAST MODE: Tests all operations in realistic patterns:
- * - Insert random keys
+ * - Insert random keys (20 or 32 bytes)
  * - Search to verify all keys exist
  * - Delete random subset of keys
  * - Verify deleted keys are gone and remaining keys still exist
  * - Repeat with new keys
  * 
  * Usage:
- *   ./test_data_art_full_stress <seconds> [use_buffer_pool]
+ *   ./test_data_art_full_stress <seconds> [use_buffer_pool] [key_size]
+ *   key_size: 20 (address) or 32 (hash), default=32
  */
 
 #include "data_art.h"
@@ -110,8 +114,14 @@ static void make_hash_key(const uint8_t *key, size_t key_len, char *hash_key, si
 
 /**
  * Main stress test with insert, search, and delete
+ * key_size: 20 for addresses, 32 for hashes
  */
-static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, unsigned int base_seed) {
+static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, unsigned int base_seed, size_t key_size) {
+    // Validate key size
+    if (key_size != 20 && key_size != 32) {
+        FAIL_FAST("Invalid key size %zu - must be 20 (address) or 32 (hash)", key_size);
+    }
+    
     // Disable debug logging to reduce output
     log_set_level(LOG_LEVEL_ERROR);
     
@@ -119,6 +129,7 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
     printf("================================================================\n");
     printf("  FULL STRESS TEST - INSERT + SEARCH + DELETE                  \n");
     printf("  Duration: %d seconds                                         \n", duration_seconds);
+    printf("  Key Size: %zu bytes (%s)                                     \n", key_size, key_size == 20 ? "Address" : "Hash");
     printf("  Buffer Pool: %s                                              \n", use_buffer_pool ? "ENABLED" : "DISABLED");
     printf("  Press Ctrl+C to stop early                                   \n");
     printf("================================================================\n");
@@ -141,6 +152,14 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
         FAIL_FAST("Failed to create page manager");
     }
     
+    // Log CRC32 implementation
+    printf("Note: CRC32 implementation is ");
+#ifdef __x86_64__
+    printf("hardware-accelerated (SSE4.2)\n");
+#else
+    printf("software table lookup\n");
+#endif
+    
     buffer_pool_t *bp = NULL;
     if (use_buffer_pool) {
         buffer_pool_config_t config = buffer_pool_default_config();
@@ -152,7 +171,7 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
         }
     }
     
-    data_art_tree_t *tree = data_art_create(pm, bp);
+    data_art_tree_t *tree = data_art_create(pm, bp, key_size);
     if (!tree) {
         if (bp) buffer_pool_destroy(bp);
         page_manager_destroy(pm);
@@ -167,24 +186,26 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
         stats.iterations++;
         unsigned int seed = base_seed + stats.iterations;
         
-        // Phase 1: INSERT new keys
+        // Phase 1: INSERT new keys (fixed size!)
         int insert_batch = 50 + (rand_r(&seed) % 151);  // 50-200 keys
         
         for (int i = 0; i < insert_batch; i++) {
-            size_t key_len = 1 + (rand_r(&seed) % 128);
-            uint8_t *key = malloc(key_len);
-            generate_random_key(key, key_len, &seed);
+            // FIXED-SIZE KEY: Use specified key_size (20 or 32 bytes)
+            uint8_t *key = malloc(key_size);
+            generate_random_key(key, key_size, &seed);
             
-            char *value = malloc(512);
-            generate_random_value(value, 512, next_key_index, &seed);
+            // VARIABLE-LENGTH VALUE: 16 to 511 bytes
+            size_t max_value_len = 512;
+            char *value = malloc(max_value_len);
+            generate_random_value(value, max_value_len, next_key_index, &seed);
             
-            if (!data_art_insert(tree, key, key_len, value, strlen(value))) {
+            if (!data_art_insert(tree, key, key_size, value, strlen(value))) {
                 FAIL_FAST("Insert failed at iteration %lu, key %d", stats.iterations, i);
             }
             
             // Track this key
             char hash_key[300];
-            make_hash_key(key, key_len, hash_key, sizeof(hash_key));
+            make_hash_key(key, key_size, hash_key, sizeof(hash_key));
             
             key_entry_t *entry = NULL;
             HASH_FIND_STR(all_keys, hash_key, entry);
@@ -200,9 +221,9 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
                 // New key
                 entry = malloc(sizeof(key_entry_t));
                 strcpy(entry->hash_key, hash_key);
-                entry->key = malloc(key_len);
-                memcpy(entry->key, key, key_len);
-                entry->key_len = key_len;
+                entry->key = malloc(key_size);
+                memcpy(entry->key, key, key_size);
+                entry->key_len = key_size;
                 entry->value = strdup(value);
                 entry->value_len = strlen(value);
                 entry->deleted = false;
@@ -353,10 +374,11 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <duration_seconds> [use_buffer_pool] [seed]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <duration_seconds> [use_buffer_pool] [seed] [key_size]\n", argv[0]);
         fprintf(stderr, "  duration_seconds: How long to run the test\n");
         fprintf(stderr, "  use_buffer_pool: 1 to enable, 0 to disable (default: 0)\n");
         fprintf(stderr, "  seed: Random seed for reproducibility (default: current time)\n");
+        fprintf(stderr, "  key_size: 20 (address) or 32 (hash) bytes (default: 32)\n");
         return 1;
     }
     
@@ -376,6 +398,15 @@ int main(int argc, char *argv[]) {
         base_seed = (unsigned int)atoi(argv[3]);
     }
     
-    run_full_stress_test(duration, use_buffer_pool, base_seed);
+    size_t key_size = 32;  // Default: 32-byte hash
+    if (argc > 4) {
+        key_size = (size_t)atoi(argv[4]);
+        if (key_size != 20 && key_size != 32) {
+            fprintf(stderr, "Invalid key_size: %zu - must be 20 or 32\n", key_size);
+            return 1;
+        }
+    }
+    
+    run_full_stress_test(duration, use_buffer_pool, base_seed, key_size);
     return 0;
 }

@@ -54,7 +54,7 @@ static bool test_empty_key(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     // Insert empty key
@@ -101,7 +101,7 @@ static bool test_single_byte_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     // Insert all 256 possible single-byte keys
@@ -165,7 +165,7 @@ static bool test_common_prefixes(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     // Test various prefix lengths (up to 20 bytes)
@@ -255,7 +255,7 @@ static bool test_last_byte_difference(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     // Create keys with same 15-byte prefix, different last byte
@@ -325,7 +325,7 @@ static bool test_key_updates(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     const int num_keys = 100;
@@ -417,7 +417,7 @@ static bool test_very_long_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     // Test keys of increasing length
@@ -517,7 +517,7 @@ static bool test_binary_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     // Create keys with null bytes at different positions
@@ -603,7 +603,7 @@ static bool test_node_growth(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     const char *prefix = "prefix_";
@@ -711,7 +711,7 @@ static bool test_nonexistent_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     // Insert some keys
@@ -773,7 +773,7 @@ static bool test_prefix_splits(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     // Insert keys that will cause prefix splits at various matching points

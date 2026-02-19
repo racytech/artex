@@ -1,6 +1,10 @@
 /*
  * Persistent Adaptive Radix Tree (data_art)
  * 
+ * DESIGNED FOR FIXED-SIZE KEYS (e.g., 20-byte addresses, 32-byte hashes)
+ * This implementation does NOT support variable-length keys or prefix relationships.
+ * All keys must have the same length (e.g., Ethereum: 20 bytes for addresses, 32 bytes for storage keys).
+ * 
  * Disk-backed ART implementation with:
  * - Page references instead of pointers
  * - Copy-on-Write (CoW) for MVCC
@@ -212,6 +216,8 @@ typedef struct data_art_tree {
     node_ref_t root;             // Root node reference
     uint64_t version;            // Current version number
     size_t size;                 // Number of key-value pairs
+    size_t key_size;             // Fixed key size (20 or 32 bytes for Ethereum)
+    size_t max_depth;            // Precomputed: key_size + 1 (for 0x00 terminator)
     
     // Versioning (CoW support)
     bool cow_enabled;            // Enable copy-on-write
@@ -232,14 +238,16 @@ typedef struct data_art_tree {
 // ============================================================================
 
 /**
- * Create a new persistent ART tree
+ * Create a new persistent ART tree with fixed-size keys
  * 
  * @param page_manager Page manager for disk I/O
  * @param buffer_pool Buffer pool for caching (optional, can be NULL)
+ * @param key_size Fixed size for all keys (must be 20 or 32 for Ethereum)
  * @return Tree instance, or NULL on failure
  */
 data_art_tree_t *data_art_create(page_manager_t *page_manager,
-                                   buffer_pool_t *buffer_pool);
+                                   buffer_pool_t *buffer_pool,
+                                   size_t key_size);
 
 /**
  * Destroy tree and free resources
@@ -459,11 +467,13 @@ bool data_art_flush(data_art_tree_t *tree);
  * 
  * @param page_manager Page manager
  * @param buffer_pool Buffer pool (optional)
+ * @param key_size Fixed key size for the tree (20 or 32)
  * @param root_ref Root node reference from metadata
  * @return Tree instance, or NULL on failure
  */
 data_art_tree_t *data_art_load(page_manager_t *page_manager,
                                  buffer_pool_t *buffer_pool,
+                                 size_t key_size,
                                  node_ref_t root_ref);
 
 /**

@@ -43,8 +43,15 @@ void log_write(
  * Convenience Macros
  * ============================================================================ */
 
-#define LOG_TRACE(...) log_write(LOG_LEVEL_TRACE, __FILE__, __LINE__, __VA_ARGS__)
-#define LOG_DEBUG(...) log_write(LOG_LEVEL_DEBUG, __FILE__, __LINE__, __VA_ARGS__)
+// In Release builds, compile out TRACE and DEBUG logging completely
+#ifdef NDEBUG
+    #define LOG_TRACE(...) ((void)0)
+    #define LOG_DEBUG(...) ((void)0)
+#else
+    #define LOG_TRACE(...) log_write(LOG_LEVEL_TRACE, __FILE__, __LINE__, __VA_ARGS__)
+    #define LOG_DEBUG(...) log_write(LOG_LEVEL_DEBUG, __FILE__, __LINE__, __VA_ARGS__)
+#endif
+
 #define LOG_INFO(...)  log_write(LOG_LEVEL_INFO,  __FILE__, __LINE__, __VA_ARGS__)
 #define LOG_WARN(...)  log_write(LOG_LEVEL_WARN,  __FILE__, __LINE__, __VA_ARGS__)
 #define LOG_ERROR(...) log_write(LOG_LEVEL_ERROR, __FILE__, __LINE__, __VA_ARGS__)

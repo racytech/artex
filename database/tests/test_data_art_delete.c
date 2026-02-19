@@ -54,7 +54,7 @@ static bool test_delete_single_key(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     // Insert a key
@@ -117,7 +117,7 @@ static bool test_delete_multiple_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     // Insert multiple keys
@@ -198,7 +198,7 @@ static bool test_delete_nonexistent(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     // Insert a key
@@ -247,7 +247,7 @@ static bool test_delete_all(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     const int num_keys = 20;
@@ -322,7 +322,7 @@ static bool test_delete_and_reinsert(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
     assert(tree != NULL);
     
     const char *key = "test_key";

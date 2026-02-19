@@ -297,13 +297,14 @@ bool data_art_flush(data_art_tree_t *tree) {
 
 data_art_tree_t *data_art_load(page_manager_t *page_manager,
                                  buffer_pool_t *buffer_pool,
+                                 size_t key_size,
                                  node_ref_t root_ref) {
     if (!page_manager) {
         LOG_ERROR("page_manager cannot be NULL");
         return NULL;
     }
     
-    data_art_tree_t *tree = data_art_create(page_manager, buffer_pool);
+    data_art_tree_t *tree = data_art_create(page_manager, buffer_pool, key_size);
     if (!tree) {
         return NULL;
     }

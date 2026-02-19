@@ -8,6 +8,11 @@
 /**
  * In-Memory Adaptive Radix Tree (ART) Implementation
  * 
+ * DESIGNED FOR FIXED-SIZE KEYS (e.g., 20-byte addresses, 32-byte hashes)
+ * This implementation does NOT support variable-length keys or prefix relationships.
+ * All keys must have the same length (e.g., Ethereum: 20 bytes for addresses, 32 bytes for storage keys).
+ * For variable-length key support, see branch: feature/values-in-internal-nodes
+ * 
  * *** MEMORY-ONLY - NO PERSISTENCE ***
  * This implementation uses malloc/free and stores all data in RAM.
  * Data is lost when the process terminates.

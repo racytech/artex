@@ -47,9 +47,16 @@ size_t get_node_size(data_art_node_type_t type) {
 // ============================================================================
 
 data_art_tree_t *data_art_create(page_manager_t *page_manager,
-                                   buffer_pool_t *buffer_pool) {
+                                   buffer_pool_t *buffer_pool,
+                                   size_t key_size) {
     if (!page_manager) {
         LOG_ERROR("page_manager cannot be NULL");
+        return NULL;
+    }
+    
+    // Validate key_size for Ethereum (20-byte addresses, 32-byte hashes)
+    if (key_size != 20 && key_size != 32) {
+        LOG_ERROR("Invalid key_size: %zu (must be 20 or 32 for Ethereum)", key_size);
         return NULL;
     }
     
@@ -64,6 +71,8 @@ data_art_tree_t *data_art_create(page_manager_t *page_manager,
     tree->root = NULL_NODE_REF;
     tree->version = 1;
     tree->size = 0;
+    tree->key_size = key_size;
+    tree->max_depth = key_size + 1;  // +1 for 0x00 terminator at leaf level
     tree->cow_enabled = false;
     tree->active_versions = NULL;
     tree->num_active_versions = 0;
@@ -76,8 +85,8 @@ data_art_tree_t *data_art_create(page_manager_t *page_manager,
     tree->overflow_pages_allocated = 0;
     tree->overflow_chain_reads = 0;
     
-    LOG_INFO("Created persistent ART tree (buffer_pool=%s)", 
-             buffer_pool ? "enabled" : "disabled");
+    LOG_INFO("Created persistent ART tree (key_size=%zu, max_depth=%zu, buffer_pool=%s)", 
+             key_size, tree->max_depth, buffer_pool ? "enabled" : "disabled");
     
     return tree;
 }
@@ -251,38 +260,42 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
     // Try to get page from buffer pool
     page_t *page = buffer_pool_get(tree->buffer_pool, ref.page_id);
     bool page_is_temp = false;
+    page_t *temp_page_allocated = NULL;
     
     if (!page) {
         // Page doesn't exist in buffer pool yet - might be a new page
-        // Use temporary page on stack for writing, then reload into buffer pool
-        page_t temp_page_storage;
-        page_t *temp_page = &temp_page_storage;
+        // Allocate temporary page on heap for writing, then reload into buffer pool
+        temp_page_allocated = malloc(sizeof(page_t));
+        if (!temp_page_allocated) {
+            LOG_ERROR("Failed to allocate temporary page");
+            return false;
+        }
         
-        memset(temp_page, 0, sizeof(*temp_page));
+        memset(temp_page_allocated, 0, sizeof(*temp_page_allocated));
         
         // Try to read existing page data
-        page_result_t result = page_manager_read(tree->page_manager, ref.page_id, temp_page);
+        page_result_t result = page_manager_read(tree->page_manager, ref.page_id, temp_page_allocated);
         if (result != PAGE_SUCCESS) {
             // Page doesn't exist yet - already zeroed
-            temp_page->header.page_id = ref.page_id;
+            temp_page_allocated->header.page_id = ref.page_id;
             LOG_TRACE("Page %lu doesn't exist yet, using zero-initialized page", ref.page_id);
         } else {
             LOG_TRACE("Successfully read existing page %lu from disk", ref.page_id);
         }
-        page = temp_page;
+        page = temp_page_allocated;
         page_is_temp = true;
     }
     
     // Zero out the entire data area first to prevent stale data
     // This is critical when pages are reused or when old data persists on disk
-    LOG_ERROR("[WRITE_NODE] Zeroing page=%lu data area (%zu bytes) before writing | first_byte_before=0x%02x last_byte_before=0x%02x", 
+    LOG_DEBUG("[WRITE_NODE] Zeroing page=%lu data area (%zu bytes) before writing | first_byte_before=0x%02x last_byte_before=0x%02x", 
               ref.page_id, PAGE_SIZE - PAGE_HEADER_SIZE, page->data[0], page->data[PAGE_SIZE - PAGE_HEADER_SIZE - 1]);
     memset(page->data, 0, PAGE_SIZE - PAGE_HEADER_SIZE);
-    LOG_ERROR("[WRITE_NODE] After zeroing page=%lu | first_byte_after=0x%02x last_byte_after=0x%02x", 
+    LOG_DEBUG("[WRITE_NODE] After zeroing page=%lu | first_byte_after=0x%02x last_byte_after=0x%02x", 
               ref.page_id, page->data[0], page->data[PAGE_SIZE - PAGE_HEADER_SIZE - 1]);
     
     // Copy node data to page at offset
-    LOG_ERROR("[WRITE_NODE] Copying %zu bytes to page=%lu offset=%u", size, ref.page_id, ref.offset);
+    LOG_DEBUG("[WRITE_NODE] Copying %zu bytes to page=%lu offset=%u", size, ref.page_id, ref.offset);
     memcpy(page->data + ref.offset, node, size);
     
     // Debug: Log what we're about to write
@@ -291,7 +304,7 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
         const data_art_leaf_t *debug_leaf = (const data_art_leaf_t *)node;
         LOG_TRACE("About to write leaf to page=%lu: key_len=%u, value_len=%u, size=%zu",
                   ref.page_id, debug_leaf->key_len, debug_leaf->value_len, size);
-        LOG_ERROR("[WRITE_NODE] Leaf in page buffer: type=%u flags=0x%02x key_len=%u value_len=%u",
+        LOG_DEBUG("[WRITE_NODE] Leaf in page buffer: type=%u flags=0x%02x key_len=%u value_len=%u",
                   debug_leaf->type, debug_leaf->flags, debug_leaf->key_len, debug_leaf->value_len);
     }
     
@@ -303,21 +316,26 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
         buffer_pool_mark_dirty(tree->buffer_pool, ref.page_id);
     } else {
         // Temp page for new allocation - write directly and reload into buffer pool
-        LOG_ERROR("[WRITE_NODE] Writing new page=%lu to disk", ref.page_id);
+        LOG_DEBUG("[WRITE_NODE] Writing new page=%lu to disk", ref.page_id);
         page_result_t result = page_manager_write(tree->page_manager, page);
         if (result != PAGE_SUCCESS) {
             LOG_ERROR("Failed to write page %lu", ref.page_id);
             return false;
         }
-        LOG_ERROR("[WRITE_NODE] Page %lu written to disk successfully", ref.page_id);
+        LOG_DEBUG("[WRITE_NODE] Page %lu written to disk successfully", ref.page_id);
         
         // Reload into buffer pool cache for subsequent reads
         buffer_pool_reload(tree->buffer_pool, ref.page_id);
-        LOG_ERROR("[WRITE_NODE] Reloaded page %lu into buffer pool cache", ref.page_id);
+        LOG_DEBUG("[WRITE_NODE] Reloaded page %lu into buffer pool cache", ref.page_id);
         
         // Sync to ensure data is persisted
         page_manager_sync(tree->page_manager);
-        LOG_ERROR("[WRITE_NODE] Page %lu synced to disk", ref.page_id);
+        LOG_DEBUG("[WRITE_NODE] Page %lu synced to disk", ref.page_id);
+    }
+    
+    // Free temporary page if allocated
+    if (temp_page_allocated) {
+        free(temp_page_allocated);
     }
     
     return true;
@@ -591,6 +609,13 @@ const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_l
         return NULL;
     }
     
+    // Validate key size matches tree's configured size
+    if (key_len != tree->key_size) {
+        LOG_ERROR("Key size mismatch: expected %zu bytes, got %zu bytes",
+                  tree->key_size, key_len);
+        return NULL;
+    }
+    
     if (node_ref_is_null(tree->root)) {
         return NULL;  // Empty tree
     }
@@ -715,23 +740,26 @@ const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_l
         }
         
         // Get next byte to search
-        if (depth >= key_len) {
-            // Key exhausted, look for NULL byte child
-            current = find_child(tree, current, 0x00);
-        } else {
-            uint8_t byte = key[depth];
-            current = find_child(tree, current, byte);
-            if (node_ref_is_null(current)) {
-                // Debug: child not found
-                char key_str[64];
-                snprintf(key_str, sizeof(key_str), "%.*s", (int)(key_len < 40 ? key_len : 40), key);
-                LOG_INFO("Child lookup failed: key='%s', depth=%zu, byte=0x%02x('%c')", 
-                         key_str, depth, byte, (byte >= 32 && byte < 127) ? byte : '?');
-            } else {
-                LOG_INFO("Child found, advancing to page=%lu offset=%u", 
-                         current.page_id, current.offset);
-            }
+        // Fixed-size keys optimization: check exhaustion only when needed
+        uint8_t byte;
+        if (depth < key_len) {
+            byte = key[depth];
             depth++;  // Move past the byte we just used for lookup
+        } else {
+            // Key exhausted, look for NULL byte child (leaf level)
+            byte = 0x00;
+        }
+        
+        current = find_child(tree, current, byte);
+        if (node_ref_is_null(current)) {
+            // Debug: child not found
+            char key_str[64];
+            snprintf(key_str, sizeof(key_str), "%.*s", (int)(key_len < 40 ? key_len : 40), key);
+            LOG_INFO("Child lookup failed: key='%s', depth=%zu, byte=0x%02x('%c')", 
+                     key_str, depth, byte, (byte >= 32 && byte < 127) ? byte : '?');
+        } else {
+            LOG_INFO("Child found, advancing to page=%lu offset=%u", 
+                     current.page_id, current.offset);
         }
     }
     
