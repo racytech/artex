@@ -84,6 +84,9 @@ struct art_node {
     uint32_t num_children;
     uint32_t partial_len;
     uint8_t partial[10];
+    // Value storage for keys that end at this node
+    void *value;           // NULL if no key ends here
+    uint32_t value_len;    // Length of value (0 if no value)
     union {
         art_node4_t node4;
         art_node16_t node16;
@@ -403,6 +406,8 @@ static art_node_t *alloc_node(art_node_type_t type) {
     node->type = type;
     node->num_children = 0;
     node->partial_len = 0;
+    node->value = NULL;
+    node->value_len = 0;
     
     // Initialize Node48 index array
     if (type == NODE_48) {
@@ -418,6 +423,11 @@ static void free_node(art_node_t *node) {
     if (is_leaf(node)) {
         free(node);
         return;
+    }
+    
+    // Free node's value if it has one
+    if (node->value) {
+        free(node->value);
     }
     
     // Recursively free children
@@ -607,8 +617,19 @@ static const void *search(const art_node_t *node, const uint8_t *key,
         LOG_TRACE("search: after compressed path, depth=%zu", depth);
     }
     
-    // Determine which byte to look for (NULL byte if key is consumed)
-    uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
+    // If key is fully consumed at this node, check if this node has a value
+    if (depth >= key_len) {
+        if (node->value) {
+            if (value_len) *value_len = node->value_len;
+            LOG_TRACE("search: key exhausted at internal node, returning node value");
+            return node->value;
+        }
+        LOG_TRACE("search: key exhausted but node has no value");
+        return NULL;
+    }
+    
+    // Determine which byte to look for
+    uint8_t byte = key[depth];
     LOG_TRACE("search: looking for child at byte=0x%02X (depth=%zu, key_len=%zu)",
                  byte, depth, key_len);
     
@@ -619,14 +640,6 @@ static const void *search(const art_node_t *node, const uint8_t *key,
         return NULL;
     }
     LOG_TRACE("search: found child, recursing");
-    
-    // If we've consumed the key, the child should be our leaf
-    if (depth >= key_len) {
-        if (is_leaf(child) && leaf_matches(child, key, key_len)) {
-            return leaf_value(child, value_len);
-        }
-        return NULL;
-    }
     
     return search(child, key, key_len, depth + 1, value_len);
 }
@@ -727,12 +740,38 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
         size_t new_depth = depth + prefix_len;
         
         // Add both leaves as children with their distinguishing bytes
-        // Use NULL byte (0x00) as terminator if key is fully consumed
-        uint8_t new_key_byte = (new_depth < key_len) ? key[new_depth] : 0x00;
-        uint8_t old_key_byte = (new_depth < leaf_key_len) ? leaf_key_bytes[new_depth] : 0x00;
+        // CRITICAL FIX: If a key is exhausted, store it in the node itself, not as a 0x00 child
+        uint8_t new_key_byte = (new_depth < key_len) ? key[new_depth] : 0xFF;  // sentinel
+        uint8_t old_key_byte = (new_depth < leaf_key_len) ? leaf_key_bytes[new_depth] : 0xFF;  // sentinel
         
-        new_node = add_child(new_node, new_key_byte, new_leaf);
-        new_node = add_child(new_node, old_key_byte, node);
+        // Handle case where new key is exhausted (is a prefix)
+        if (new_depth >= key_len) {
+            // New key ends here - store its value in the node
+            new_node->value = malloc(value_len);
+            if (new_node->value) {
+                memcpy(new_node->value, value, value_len);
+                new_node->value_len = value_len;
+            }
+            // Old key continues - add as child
+            new_node = add_child(new_node, old_key_byte, node);
+        }
+        // Handle case where old key is exhausted (is a prefix)
+        else if (new_depth >= leaf_key_len) {
+            // Old key ends here - store its value in the node
+            const void *leaf_value_ptr = leaf_value(node, &new_node->value_len);
+            new_node->value = malloc(new_node->value_len);
+            if (new_node->value) {
+                memcpy(new_node->value, leaf_value_ptr, new_node->value_len);
+            }
+            free(node);  // Free old leaf since its value is now in the node
+            // New key continues - add as child
+            new_node = add_child(new_node, new_key_byte, new_leaf);
+        }
+        // Both keys continue - add both as children
+        else {
+            new_node = add_child(new_node, new_key_byte, new_leaf);
+            new_node = add_child(new_node, old_key_byte, node);
+        }
         
         return new_node;
     }
@@ -849,11 +888,25 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
             }
             
             // Calculate discriminating byte for new key
-            uint8_t new_byte = (depth + prefix_len < key_len) ? key[depth + prefix_len] : 0x00;
-            
-            // Add both as children
-            new_node = add_child(new_node, old_byte, node);
-            new_node = add_child(new_node, new_byte, (art_node_t *)leaf);
+            // CRITICAL FIX: Don't use 0x00 for exhausted keys
+            if (depth + prefix_len >= key_len) {
+                // New key is exhausted - store value in node
+                new_node->value = malloc(value_len);
+                if (new_node->value) {
+                    memcpy(new_node->value, value, value_len);
+                    new_node->value_len = value_len;
+                }
+                free(leaf);  // Don't need the leaf
+                // Add old node as child
+                new_node = add_child(new_node, old_byte, node);
+            } else {
+                // Normal case - both have bytes
+                uint8_t new_byte = key[depth + prefix_len];
+                
+                // Add both as children
+                new_node = add_child(new_node, old_byte, node);
+                new_node = add_child(new_node, new_byte, (art_node_t *)leaf);
+            }
             
             return new_node;
         }
@@ -861,29 +914,38 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
         depth += node->partial_len;
     }
     
-    // Determine which byte to insert for (NULL byte if key is consumed)
-    uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
+    // CRITICAL FIX: If key is exhausted at this node, store/update value here
+    if (depth >= key_len) {
+        if (node->value) {
+            // Update existing value
+            void *new_value = malloc(value_len);
+            if (new_value) {
+                memcpy(new_value, value, value_len);
+                free(node->value);
+                node->value = new_value;
+                node->value_len = value_len;
+                *inserted = false;  // Updated, not inserted
+            }
+        } else {
+            // Insert new value
+            node->value = malloc(value_len);
+            if (node->value) {
+                memcpy(node->value, value, value_len);
+                node->value_len = value_len;
+                *inserted = true;
+            }
+        }
+        return node;
+    }
+    
+    // Determine which byte to insert for
+    uint8_t byte = key[depth];
     
     // Find child for this byte
     art_node_t *child = find_child(node, byte);
     
     if (child) {
-        // Child exists
-        if (depth >= key_len) {
-            // Key is consumed, child should be a leaf - update it
-            if (is_leaf(child) && leaf_matches(child, key, key_len)) {
-                // Update existing leaf
-                art_node_t *new_leaf = alloc_leaf(key, key_len, value, value_len);
-                if (new_leaf) {
-                    node = remove_child(node, byte, NULL);  // node might shrink
-                    node = add_child(node, byte, new_leaf);
-                    free(child);
-                    *inserted = false;  // Updated, not inserted
-                }
-            }
-            return node;
-        }
-        // Recurse with remaining key
+        // Child exists - recurse with remaining key
         art_node_t *new_child = insert_recursive(child, key, key_len, depth + 1,
                                                   value, value_len, inserted);
         if (new_child != child) {
@@ -934,12 +996,16 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             // Copy header
             new_node->partial_len = node->partial_len;
             memcpy(new_node->partial, node->partial, 10);
+            new_node->value = node->value;
+            new_node->value_len = node->value_len;
             
             // Copy children
             memcpy(new_node->node16.keys, node->node4.keys, NODE4_MAX);
             memcpy(new_node->node16.children, node->node4.children, NODE4_MAX * sizeof(art_node_t *));
             new_node->num_children = NODE4_MAX;
             
+            // Clear old node's value pointer so it doesn't get freed
+            node->value = NULL;
             free(node);
             return add_child(new_node, byte, child);
         }
@@ -970,6 +1036,8 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             // Copy header
             new_node->partial_len = node->partial_len;
             memcpy(new_node->partial, node->partial, 10);
+            new_node->value = node->value;
+            new_node->value_len = node->value_len;
             
             // Initialize index array to NODE48_EMPTY
             memset(new_node->node48.index, NODE48_EMPTY, 256);
@@ -981,6 +1049,8 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             }
             new_node->num_children = NODE16_MAX;
             
+            // Clear old node's value pointer so it doesn't get freed
+            node->value = NULL;
             free(node);
             return add_child(new_node, byte, child);
         }
@@ -1005,6 +1075,8 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             // Copy header
             new_node->partial_len = node->partial_len;
             memcpy(new_node->partial, node->partial, 10);
+            new_node->value = node->value;
+            new_node->value_len = node->value_len;
             
             // Copy children
             for (int i = 0; i < 256; i++) {
@@ -1014,6 +1086,8 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             }
             new_node->num_children = node->num_children;  // Preserve count
             
+            // Clear old node's value pointer so it doesn't get freed
+            node->value = NULL;
             free(node);
             return add_child(new_node, byte, child);
         }
@@ -1065,9 +1139,12 @@ static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **chi
                             new_node->num_children = node->num_children;
                             new_node->partial_len = node->partial_len;
                             memcpy(new_node->partial, node->partial, 10);
+                            new_node->value = node->value;
+                            new_node->value_len = node->value_len;
                             memcpy(new_node->node4.keys, node->node16.keys, node->num_children);
                             memcpy(new_node->node4.children, node->node16.children, 
                                    node->num_children * sizeof(art_node_t *));
+                            node->value = NULL;  // Prevent double-free
                             free(node);
                             return new_node;
                         }
@@ -1092,6 +1169,8 @@ static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **chi
                         new_node->num_children = 0;
                         new_node->partial_len = node->partial_len;
                         memcpy(new_node->partial, node->partial, 10);
+                        new_node->value = node->value;
+                        new_node->value_len = node->value_len;
                         // Copy non-null children
                         for (int i = 0; i < NODE256_MAX; i++) {
                             if (node->node48.index[i] != NODE48_EMPTY) {
@@ -1101,6 +1180,7 @@ static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **chi
                                 new_node->num_children++;
                             }
                         }
+                        node->value = NULL;  // Prevent double-free
                         free(node);
                         return new_node;
                     }
@@ -1121,6 +1201,8 @@ static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **chi
                     new_node->num_children = 0;
                     new_node->partial_len = node->partial_len;
                     memcpy(new_node->partial, node->partial, 10);
+                    new_node->value = node->value;
+                    new_node->value_len = node->value_len;
                     // Initialize index array
                     memset(new_node->node48.index, NODE48_EMPTY, NODE256_MAX);
                     // Copy non-null children
@@ -1131,6 +1213,7 @@ static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **chi
                             new_node->num_children++;
                         }
                     }
+                    node->value = NULL;  // Prevent double-free
                     free(node);
                     return new_node;
                 }
