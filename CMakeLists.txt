@@ -127,6 +127,36 @@ add_executable(test_mem_art
 target_link_libraries(test_mem_art art_database)
 add_test(NAME test_mem_art COMMAND test_mem_art)
 
+# Test: In-Memory ART - Single Byte Keys
+add_executable(test_mem_art_single_byte
+    database/tests/test_mem_art_single_byte.c
+)
+target_link_libraries(test_mem_art_single_byte art_database)
+
+# Test: In-Memory ART - Prefix Stress Test
+add_executable(test_mem_art_stress_prefixes
+    database/tests/test_mem_art_stress_prefixes.c
+)
+target_link_libraries(test_mem_art_stress_prefixes art_database)
+
+# Test: In-Memory ART - All Single Byte Keys
+add_executable(test_mem_art_all_single_bytes
+    database/tests/test_mem_art_all_single_bytes.c
+)
+target_link_libraries(test_mem_art_all_single_bytes art_database)
+
+# Test: In-Memory ART - Prefix Scenarios
+add_executable(test_mem_art_prefix_scenarios
+    database/tests/test_mem_art_prefix_scenarios.c
+)
+target_link_libraries(test_mem_art_prefix_scenarios art_database)
+
+# Test: In-Memory ART - Debug Key 186
+add_executable(test_mem_art_debug_186
+    database/tests/test_mem_art_debug_186.c
+)
+target_link_libraries(test_mem_art_debug_186 art_database)
+
 # Test: Page Manager
 add_executable(test_page_manager
     database/tests/test_page_manager.c

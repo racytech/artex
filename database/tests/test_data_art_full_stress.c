@@ -182,6 +182,18 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
                 FAIL_FAST("Insert failed at iteration %lu, key %d", stats.iterations, i);
             }
             
+            // Debug: Track specific insert index
+            if (next_key_index == 3775) {
+                fprintf(stderr, "\n[DEBUG] Inserted key index 3775:\n");
+                fprintf(stderr, "  Iteration: %lu\n", stats.iterations);
+                fprintf(stderr, "  Key length: %zu\n", key_len);
+                fprintf(stderr, "  Key bytes: ");
+                for (size_t j = 0; j < key_len; j++) {
+                    fprintf(stderr, "%02x ", key[j]);
+                }
+                fprintf(stderr, "\n\n");
+            }
+            
             // Track this key
             char hash_key[300];
             make_hash_key(key, key_len, hash_key, sizeof(hash_key));
@@ -245,6 +257,21 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
                 size_t value_len;
                 const void *retrieved = data_art_get(tree, entry->key, entry->key_len, &value_len);
                 if (!retrieved) {
+                    fprintf(stderr, "\n=== KEY NOT FOUND - DEBUG INFO ===\n");
+                    fprintf(stderr, "Iteration: %lu\n", stats.iterations);
+                    fprintf(stderr, "Insert index: %d\n", entry->insert_index);
+                    fprintf(stderr, "Key length: %zu\n", entry->key_len);
+                    fprintf(stderr, "Key bytes (all): ");
+                    for (size_t i = 0; i < entry->key_len; i++) {
+                        fprintf(stderr, "%02x ", entry->key[i]);
+                        if ((i + 1) % 16 == 0) fprintf(stderr, "\n                     ");
+                    }
+                    fprintf(stderr, "\nValue length: %zu\n", entry->value_len);
+                    fprintf(stderr, "Value (first 32 bytes): ");
+                    for (size_t i = 0; i < entry->value_len && i < 32; i++) {
+                        fprintf(stderr, "%02x ", ((uint8_t*)entry->value)[i]);
+                    }
+                    fprintf(stderr, "\n==================================\n");
                     FAIL_FAST("Key not found! Iteration %lu, inserted at index %d",
                              stats.iterations, entry->insert_index);
                 }

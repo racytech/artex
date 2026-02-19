@@ -128,15 +128,10 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
     }
     
     // Get next byte to search
-    uint8_t search_byte;
-    size_t next_depth;
-    if (depth >= key_len) {
-        search_byte = 0x00;  // Key exhausted, look for NULL byte child
-        next_depth = depth;  // Don't increment depth for NULL byte
-    } else {
-        search_byte = key[depth];
-        next_depth = depth + 1;  // Move to next depth
-    }
+    // Incoming keys don't have terminator yet, but stored keys do.
+    // If we've consumed all bytes, use terminator to find the leaf.
+    uint8_t search_byte = (depth < key_len) ? key[depth] : 0x00;
+    size_t next_depth = depth + 1;
     
     // Find child BEFORE recursion (uses data_art_load_node internally, might corrupt temp buffer)
     node_ref_t child_ref = find_child(tree, node_ref, search_byte);

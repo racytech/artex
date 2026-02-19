@@ -142,9 +142,11 @@ static const data_art_leaf_t* find_any_leaf(data_art_tree_t *tree, node_ref_t no
  */
 static bool leaf_matches_key(const data_art_leaf_t *leaf, 
                               const uint8_t *key, size_t key_len) {
+    // Compare exact key length and bytes (no terminator)
     if (leaf->key_len != key_len) {
         return false;
     }
+    // Compare key bytes
     return memcmp(leaf->data, key, key_len) == 0;
 }
 
@@ -250,7 +252,7 @@ static node_ref_t find_child_ref(data_art_tree_t *tree, node_ref_t node_ref, uin
  */
 static node_ref_t alloc_leaf(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
                               const void *value, size_t value_len) {
-    // Calculate leaf size
+    // Calculate leaf size (no terminator needed - we store exact key length)
     size_t total_data = key_len + value_len;
     bool needs_overflow = total_data > MAX_INLINE_DATA;
     
@@ -275,20 +277,18 @@ static node_ref_t alloc_leaf(data_art_tree_t *tree, const uint8_t *key, size_t k
     
     leaf->type = DATA_NODE_LEAF;
     leaf->flags = needs_overflow ? LEAF_FLAG_OVERFLOW : LEAF_FLAG_NONE;
-    leaf->key_len = key_len;
+    leaf->key_len = key_len;  // Store exact key length (no terminator)
     leaf->value_len = value_len;
     leaf->overflow_page = 0;
     leaf->inline_data_len = inline_data_len;
     
-    // Copy key
+    // Copy key (no terminator byte needed)
     memcpy(leaf->data, key, key_len);
-    LOG_ERROR("[ALLOC_LEAF] Copied key: %zu bytes at offset 0", key_len);
     
-    // Copy value (inline portion)
+    // Copy value (inline portion) - starts immediately after key
     if (needs_overflow) {
         size_t inline_value_size = inline_data_len - key_len;
         memcpy(leaf->data + key_len, value, inline_value_size);
-        LOG_ERROR("[ALLOC_LEAF] Copied inline value: %zu bytes at offset %zu (overflow mode)", inline_value_size, key_len);
         
         // Write overflow pages
         uint64_t overflow_page = data_art_write_overflow_value(tree, value, 
@@ -302,21 +302,16 @@ static node_ref_t alloc_leaf(data_art_tree_t *tree, const uint8_t *key, size_t k
         leaf->overflow_page = overflow_page;
     } else {
         memcpy(leaf->data + key_len, value, value_len);
-        LOG_ERROR("[ALLOC_LEAF] Copied full value: %zu bytes at offset %zu (inline mode)", value_len, key_len);
     }
     
     // Write leaf to disk
     LOG_TRACE("Writing leaf: page=%lu, key_len=%u, value_len=%u, leaf_size=%zu",
               leaf_ref.page_id, leaf->key_len, leaf->value_len, leaf_size);
-    LOG_ERROR("[WRITE_LEAF] BEFORE write: page=%lu offset=%u | type=%u flags=0x%02x key_len=%u value_len=%u overflow_page=%lu inline_data_len=%u",
-              leaf_ref.page_id, leaf_ref.offset, leaf->type, leaf->flags, leaf->key_len, leaf->value_len, leaf->overflow_page, leaf->inline_data_len);
     if (!data_art_write_node(tree, leaf_ref, leaf, leaf_size)) {
         LOG_ERROR("Failed to write leaf node");
         free(leaf);
         return NULL_NODE_REF;
     }
-    LOG_ERROR("[WRITE_LEAF] AFTER write: page=%lu offset=%u | value_len=%u (should be unchanged)",
-              leaf_ref.page_id, leaf_ref.offset, leaf->value_len);
     LOG_TRACE("Leaf written successfully: page=%lu, value_len=%u", 
               leaf_ref.page_id, leaf->value_len);
     
@@ -546,15 +541,27 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         }
         memcpy(existing_key_copy, existing_key, existing_key_len);
         
-        // Calculate longest common prefix between the two keys
-        // IMPORTANT: Start comparison from current depth, not from 0!
+        // Calculate longest common prefix between the two keys from current depth
+        // Match mem_art logic: compare up to the shorter key's length
         size_t common_prefix_len = 0;
-        size_t max_compare_from_depth = (key_len - depth < existing_key_len - depth) ? 
-                                         (key_len - depth) : (existing_key_len - depth);
+        size_t limit = (key_len < existing_key_len) ? key_len : existing_key_len;
         
-        while (common_prefix_len < max_compare_from_depth && 
+        // Debug for single-byte keys
+        if (key_len == 1 || existing_key_len == 1) {
+            LOG_ERROR("[LEAF_SPLIT] Single-byte key detected!");
+            LOG_ERROR("  depth=%zu, key_len=%zu, existing_key_len=%zu", depth, key_len, existing_key_len);
+            LOG_ERROR("  limit=%zu", limit);
+        }
+        
+        while (depth + common_prefix_len < limit && 
                existing_key_copy[depth + common_prefix_len] == key[depth + common_prefix_len]) {
             common_prefix_len++;
+        }
+        
+        // Debug for single-byte keys
+        if (key_len == 1 || existing_key_len == 1) {
+            LOG_ERROR("  common_prefix_len=%zu", common_prefix_len);
+            LOG_ERROR("  split_pos will be=%zu", depth + common_prefix_len);
         }
         
         // Create new NODE_4 to hold both leaves
@@ -590,29 +597,10 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         }
         
         // Determine the bytes where the keys differ
-        uint8_t existing_byte = (depth + common_prefix_len < existing_key_len) ? 
-                                 existing_key_copy[depth + common_prefix_len] : 0x00;
-        uint8_t new_byte = (depth + common_prefix_len < key_len) ? 
-                            key[depth + common_prefix_len] : 0x00;
-        
-        // Sanity check: if both bytes are the same, this indicates a duplicate key.
-        // This happens when both keys are identical or when both keys end at the same
-        // position (both beyond their length, so both default to 0x00).
-        // In either case, this should have been caught by leaf_matches_key() above.
-        if (existing_byte == new_byte) {
-            LOG_ERROR("BUG: Both split bytes are 0x%02x at depth %zu + common_prefix %zu", 
-                     existing_byte, depth, common_prefix_len);
-            LOG_ERROR("  Existing key len=%zu, new key len=%zu", existing_key_len, key_len);
-            LOG_ERROR("  max_compare_from_depth=%zu", max_compare_from_depth);
-            LOG_ERROR("  This indicates duplicate keys that should have been caught by leaf_matches_key()");
-            
-            // Verify leaf_matches_key would have caught this
-            bool would_match = (leaf->key_len == key_len) && 
-                              (memcmp(leaf->data, key, key_len) == 0);
-            LOG_ERROR("  Verification: leaf_matches_key would return %s", would_match ? "TRUE (BUG!)" : "FALSE (inconsistent)");
-            
-            return node_ref;
-        }
+        // Use 0x00 as the discriminating byte if key is exhausted (for prefix handling)
+        size_t split_pos = depth + common_prefix_len;
+        uint8_t existing_byte = (split_pos < existing_key_len) ? existing_key_copy[split_pos] : 0x00;
+        uint8_t new_byte = (split_pos < key_len) ? key[split_pos] : 0x00;
         
         // Add both leaves as children to the new node
         new_node_ref = add_child_to_node(tree, new_node_ref, existing_byte, node_ref);
@@ -821,7 +809,9 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         depth += partial_len;
     }
     
-    // Determine which byte to insert for (NULL byte if key is consumed)
+    // Keys have terminator bytes stored in leaves, but incoming keys don't have them yet.
+    // When navigating, if we've consumed all bytes of the incoming key, use terminator.
+    // Original key [0x87] needs to navigate: [0x87] at depth 0, then [0x00] at depth 1
     uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
     
     LOG_INFO("  depth=%zu: looking for child with byte=0x%02x", depth, byte);
