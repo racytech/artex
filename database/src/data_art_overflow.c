@@ -188,14 +188,28 @@ size_t data_art_free_overflow_chain(data_art_tree_t *tree, uint64_t first_page) 
             break;
         }
         
+        // Verify it's actually an overflow page
+        if (overflow->type != DATA_NODE_OVERFLOW) {
+            LOG_ERROR("Expected overflow page at %lu but got type %u", 
+                     current_page, overflow->type);
+            break;
+        }
+        
         uint64_t next_page = overflow->next_page;
         
-        // Free current page
-        page_manager_free(tree->page_manager, current_page);
+        // Release current page using reference counting
+        extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
+        data_art_release_page(tree, (node_ref_t){.page_id = current_page, .offset = 0});
         freed++;
+        
+        LOG_DEBUG("[FREE_OVERFLOW] Released overflow page %lu (next=%lu)", 
+                 current_page, next_page);
         
         current_page = next_page;
     }
+    
+    LOG_DEBUG("[FREE_OVERFLOW_CHAIN] Freed %zu overflow pages starting from %lu",
+             freed, first_page);
     
     return freed;
 }
@@ -304,7 +318,7 @@ data_art_tree_t *data_art_load(page_manager_t *page_manager,
         return NULL;
     }
     
-    data_art_tree_t *tree = data_art_create(page_manager, buffer_pool, key_size);
+    data_art_tree_t *tree = data_art_create(page_manager, buffer_pool, NULL, key_size);
     if (!tree) {
         return NULL;
     }

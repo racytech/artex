@@ -58,7 +58,7 @@ static bool test_node4_to_node16_growth(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Insert 5 keys (should trigger NODE_4 → NODE_16)
@@ -133,7 +133,7 @@ static bool test_node16_to_node48_growth(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Insert 17 keys with common prefix
@@ -189,7 +189,7 @@ static bool test_node48_to_node256_growth(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Insert 49 keys
@@ -245,7 +245,7 @@ static bool test_bulk_insert(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     const int NUM_KEYS = 100;
@@ -321,7 +321,7 @@ static bool test_random_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     const int NUM_KEYS = 500;
@@ -428,7 +428,7 @@ static bool test_long_prefix_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     const int NUM_KEYS = 100;
@@ -494,7 +494,7 @@ static bool test_single_byte_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Insert all possible single byte keys
@@ -560,7 +560,7 @@ static bool test_late_divergence_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     const int NUM_KEYS = 50;
@@ -616,7 +616,7 @@ static bool test_empty_and_short_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Test with 1-byte to 20-byte keys
@@ -683,7 +683,7 @@ static bool test_stress_10k_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     const int NUM_KEYS = 2000;

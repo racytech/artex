@@ -8,6 +8,7 @@
 #include "page_manager.h"
 #include "page_gc.h"
 #include "logger.h"
+#include "crc32.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -16,86 +17,6 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <time.h>
-
-// CRC32-C (Castagnoli) for checksums - compatible with SSE4.2 _mm_crc32 instructions
-static uint32_t crc32c_table[256];
-static int crc32c_initialized = 0;
-
-// Check if CPU supports SSE4.2 (hardware CRC32-C)
-#ifdef __x86_64__
-#include <cpuid.h>
-#include <nmmintrin.h>  // SSE4.2
-
-static int has_sse42 = -1;  // -1 = unknown, 0 = no, 1 = yes
-
-static int cpu_has_sse42(void) {
-    if (has_sse42 >= 0) return has_sse42;
-    
-    unsigned int eax, ebx, ecx, edx;
-    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
-        has_sse42 = (ecx & bit_SSE4_2) != 0;
-    } else {
-        has_sse42 = 0;
-    }
-    return has_sse42;
-}
-
-// Hardware CRC32-C using SSE4.2 instructions (10-20x faster than table lookup)
-static uint32_t compute_crc32_hw(const uint8_t *data, size_t len) {
-    uint32_t crc = 0xFFFFFFFF;
-    
-    // Process 8 bytes at a time with hardware instruction
-    while (len >= 8) {
-        uint64_t chunk;
-        memcpy(&chunk, data, 8);  // Safe unaligned load
-        crc = _mm_crc32_u64(crc, chunk);
-        data += 8;
-        len -= 8;
-    }
-    
-    // Process remaining bytes
-    while (len > 0) {
-        crc = _mm_crc32_u8(crc, *data);
-        data++;
-        len--;
-    }
-    
-    return ~crc;
-}
-#endif
-
-static void init_crc32_table(void) {
-    if (crc32c_initialized) return;
-    
-    // CRC32-C (Castagnoli) polynomial: 0x82F63B78 reversed = 0x1EDC6F41
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t crc = i;
-        for (int j = 0; j < 8; j++) {
-            crc = (crc >> 1) ^ (0x82F63B78 & -(crc & 1));
-        }
-        crc32c_table[i] = crc;
-    }
-    crc32c_initialized = 1;
-}
-
-// Software CRC32-C using table lookup (fallback for CPUs without SSE4.2)
-static uint32_t compute_crc32_sw(const uint8_t *data, size_t len) {
-    uint32_t crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < len; i++) {
-        crc = (crc >> 8) ^ crc32c_table[(crc ^ data[i]) & 0xFF];
-    }
-    return ~crc;
-}
-
-// Dispatch to hardware or software implementation based on CPU capability
-static uint32_t compute_crc32(const uint8_t *data, size_t len) {
-#ifdef __x86_64__
-    if (cpu_has_sse42()) {
-        return compute_crc32_hw(data, len);
-    }
-#endif
-    return compute_crc32_sw(data, len);
-}
 
 // Forward declaration for page index management
 static void page_index_insert_or_update(page_manager_t *pm, uint64_t page_id,
@@ -152,20 +73,8 @@ page_manager_t *page_manager_create(const char *db_path, bool read_only) {
     
     LOG_INFO("Creating page manager: path=%s, read_only=%d", db_path, read_only);
     
-    // Initialize CRC32 table (for software fallback)
-    init_crc32_table();
-    
-#ifdef __x86_64__
-    // Check CPU capabilities and log
-    if (cpu_has_sse42()) {
-        LOG_INFO("CPU supports SSE4.2 - using hardware CRC32");
-    } else {
-        LOG_INFO("CPU does not support SSE4.2 - using software CRC32");
-    }
-#else
-    LOG_INFO("Non-x86_64 platform - using software CRC32");
-#endif
-    init_crc32_table();
+    // Initialize CRC32 module
+    crc32_init();
     
     // Allocate page manager
     page_manager_t *pm = calloc(1, sizeof(page_manager_t));

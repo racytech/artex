@@ -162,7 +162,7 @@ static bool test_node4_add_children(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Create NODE_4
@@ -235,7 +235,7 @@ static bool test_node4_grows_to_node16(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Create NODE_4 with 4 children
@@ -315,7 +315,7 @@ static bool test_node16_add_children(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Create NODE_16
@@ -389,7 +389,7 @@ static bool test_node16_grows_to_node48(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Create NODE_16
@@ -470,7 +470,7 @@ static bool test_node48_add_children(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Create NODE_48
@@ -545,7 +545,7 @@ static bool test_node48_grows_to_node256(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Create NODE_48
@@ -627,7 +627,7 @@ static bool test_node256_add_children(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Create NODE_256

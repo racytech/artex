@@ -38,7 +38,7 @@ int main(void) {
     }
     
     // Create tree
-    data_art_tree_t *tree = data_art_create(pm, bp);
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     if (!tree) {
         fprintf(stderr, "Failed to create tree\n");
         buffer_pool_destroy(bp);

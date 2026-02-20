@@ -23,10 +23,16 @@
 
 #include "page_manager.h"
 #include "buffer_pool.h"
+#include "wal.h"
 
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+
+// Forward declarations
+typedef struct txn_buffer txn_buffer_t;
+typedef struct mvcc_manager mvcc_manager_t;
+typedef struct mvcc_snapshot mvcc_snapshot_t;
 
 // ============================================================================
 // Node Reference (Page-based addressing)
@@ -75,8 +81,8 @@ typedef enum {
 #define LEAF_FLAG_OVERFLOW 0x01  // Has overflow pages for large value
 
 // Maximum inline data size (conservative to leave room for metadata)
-// Page size (4096) - page header (64) - leaf header (24) = ~4008 bytes
-#define MAX_INLINE_DATA 3900  // Conservative limit, leaves ~108 bytes safety margin
+// Page size (4096) - page header (64) - leaf header (52 with MVCC + prev_version) = ~3980 bytes
+#define MAX_INLINE_DATA 3872  // Conservative limit, leaves ~108 bytes safety margin
 
 /**
  * NODE_4: Up to 4 children
@@ -154,7 +160,7 @@ typedef struct {
 } __attribute__((packed)) data_art_node256_t;
 
 /**
- * Leaf node: Stores key-value pair
+ * Leaf node: Stores key-value pair with MVCC versioning
  * 
  * For small values (key_len + value_len <= MAX_INLINE_DATA):
  *   - Data stored inline in data[] array
@@ -166,9 +172,20 @@ typedef struct {
  *   - Remaining value stored in overflow pages
  *   - overflow_page points to first overflow page
  * 
- * Size: 24 + inline_data_len (variable)
+ * MVCC fields:
+ *   - xmin: Transaction ID that created this version
+ *   - xmax: Transaction ID that deleted/superseded this version (0 = current)
+ *   - prev_version: Link to previous version of same key (for version chains)
+ * 
+ * Version chains:
+ *   Tree always points to LATEST version. Each version links to older version.
+ *   Example: Latest(xmin=3) -> Middle(xmin=2) -> Oldest(xmin=1) -> NULL
+ *   Snapshots walk chain to find visible version based on xmin/xmax.
+ * 
+ * Size: 52 + inline_data_len (variable) [+12 bytes for prev_version]
  * Layout: type(1) + flags(1) + pad(2) + key_len(4) + value_len(4) +
- *         overflow_page(8) + inline_data_len(4) + data[...]
+ *         overflow_page(8) + inline_data_len(4) + xmin(8) + xmax(8) +
+ *         prev_version(12) + data[...]
  */
 typedef struct {
     uint8_t type;               // DATA_NODE_LEAF
@@ -178,6 +195,9 @@ typedef struct {
     uint32_t value_len;         // Total value length (may span overflow pages)
     uint64_t overflow_page;     // First overflow page ID (0 if none)
     uint32_t inline_data_len;   // Bytes stored inline in data[]
+    uint64_t xmin;              // Transaction that created this version
+    uint64_t xmax;              // Transaction that deleted/superseded this version (0 = current)
+    node_ref_t prev_version;    // Previous version of same key (NULL_NODE_REF = no older version)
     uint8_t data[];             // key + value (or value prefix if overflow)
 } __attribute__((packed)) data_art_leaf_t;
 
@@ -211,6 +231,7 @@ typedef struct data_art_tree {
     // Storage backend
     page_manager_t *page_manager;
     buffer_pool_t *buffer_pool;
+    wal_t *wal;                  // Write-ahead log for durability
     
     // Current tree state
     node_ref_t root;             // Root node reference
@@ -218,6 +239,13 @@ typedef struct data_art_tree {
     size_t size;                 // Number of key-value pairs
     size_t key_size;             // Fixed key size (20 or 32 bytes for Ethereum)
     size_t max_depth;            // Precomputed: key_size + 1 (for 0x00 terminator)
+    
+    // Transaction support
+    uint64_t current_txn_id;     // Active transaction ID (0 = no transaction)
+    struct txn_buffer *txn_buffer; // Buffer for pending operations (NULL if not in transaction)
+    
+    // MVCC support
+    mvcc_manager_t *mvcc_manager; // MVCC manager for snapshot isolation
     
     // Versioning (CoW support)
     bool cow_enabled;            // Enable copy-on-write
@@ -242,11 +270,13 @@ typedef struct data_art_tree {
  * 
  * @param page_manager Page manager for disk I/O
  * @param buffer_pool Buffer pool for caching (optional, can be NULL)
+ * @param wal Write-ahead log for durability (optional, can be NULL)
  * @param key_size Fixed size for all keys (must be 20 or 32 for Ethereum)
  * @return Tree instance, or NULL on failure
  */
 data_art_tree_t *data_art_create(page_manager_t *page_manager,
                                    buffer_pool_t *buffer_pool,
+                                   wal_t *wal,
                                    size_t key_size);
 
 /**
@@ -483,6 +513,105 @@ data_art_tree_t *data_art_load(page_manager_t *page_manager,
  * @return Root node reference
  */
 node_ref_t data_art_get_root(const data_art_tree_t *tree);
+
+// ============================================================================
+// Transaction Support
+// ============================================================================
+
+/**
+ * Begin a new transaction
+ * 
+ * @param tree Tree instance
+ * @param txn_id_out Output parameter for transaction ID
+ * @return true on success
+ */
+bool data_art_begin_txn(data_art_tree_t *tree, uint64_t *txn_id_out);
+
+/**
+ * Commit the current transaction
+ * 
+ * @param tree Tree instance
+ * @return true on success
+ */
+bool data_art_commit_txn(data_art_tree_t *tree);
+
+/**
+ * Abort the current transaction
+ * 
+ * @param tree Tree instance
+ * @return true on success
+ */
+bool data_art_abort_txn(data_art_tree_t *tree);
+
+// ============================================================================
+// MVCC Snapshot Support
+// ============================================================================
+
+// Opaque snapshot handle - each thread owns one
+typedef struct data_art_snapshot data_art_snapshot_t;
+
+/**
+ * Create a snapshot for consistent read operations
+ * 
+ * Returns a snapshot handle that captures the current transaction state.
+ * Each thread should have its own snapshot for concurrent reads.
+ * The handle must be freed with data_art_end_snapshot().
+ * 
+ * @param tree Tree instance
+ * @return Snapshot handle, or NULL on failure
+ */
+data_art_snapshot_t *data_art_begin_snapshot(data_art_tree_t *tree);
+
+/**
+ * Release a snapshot
+ * 
+ * Releases the snapshot and frees its resources.
+ * 
+ * @param tree Tree instance
+ * @param snapshot Snapshot handle to release
+ */
+void data_art_end_snapshot(data_art_tree_t *tree, data_art_snapshot_t *snapshot);
+
+/**
+ * Get value with snapshot isolation
+ * 
+ * @param tree Tree instance
+ * @param key Key to search for
+ * @param key_len Length of key
+ * @param value_len Output: length of value (if found)
+ * @param snapshot Snapshot to use (NULL = read latest committed)
+ * @return Pointer to value, or NULL if not found
+ */
+const void *data_art_get_snapshot(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
+                                   size_t *value_len, data_art_snapshot_t *snapshot);
+
+// ============================================================================
+// Checkpoint and Recovery
+// ============================================================================
+
+/**
+ * Create a checkpoint of the current tree state
+ * 
+ * Flushes all dirty pages and logs checkpoint to WAL, enabling
+ * truncation of old WAL segments.
+ * 
+ * @param tree Tree instance
+ * @param checkpoint_lsn_out Output parameter for checkpoint LSN (optional)
+ * @return true on success
+ */
+bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out);
+
+/**
+ * Recover tree state from WAL after crash
+ * 
+ * Replays WAL entries from last checkpoint to rebuild tree state.
+ * Should be called after data_art_create() on startup.
+ * 
+ * @param tree Tree instance
+ * @param start_lsn LSN to start recovery from (0 = from beginning)
+ * @return Number of entries recovered, or -1 on error
+ */
+int64_t data_art_recover(data_art_tree_t *tree, uint64_t start_lsn);
 
 // ============================================================================
 // Statistics & Debugging

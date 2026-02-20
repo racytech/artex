@@ -90,7 +90,7 @@ static void benchmark_sequential_insert(int num_keys) {
         return;
     }
     
-    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     if (!tree) {
         page_manager_destroy(pm);
         fprintf(stderr, "Failed to create tree\n");
@@ -141,7 +141,7 @@ static void benchmark_random_insert(int num_keys) {
         return;
     }
     
-    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     if (!tree) {
         page_manager_destroy(pm);
         fprintf(stderr, "Failed to create tree\n");
@@ -195,7 +195,7 @@ static void benchmark_sequential_lookup(int num_keys) {
         return;
     }
     
-    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     if (!tree) {
         page_manager_destroy(pm);
         fprintf(stderr, "Failed to create tree\n");
@@ -264,7 +264,7 @@ static void benchmark_random_lookup(int num_keys) {
         return;
     }
     
-    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     if (!tree) {
         page_manager_destroy(pm);
         fprintf(stderr, "Failed to create tree\n");
@@ -336,7 +336,7 @@ static void benchmark_mixed_operations(int num_keys) {
         return;
     }
     
-    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     if (!tree) {
         page_manager_destroy(pm);
         fprintf(stderr, "Failed to create tree\n");
@@ -406,7 +406,7 @@ static void benchmark_variable_key_sizes(int num_keys) {
         return;
     }
     
-    data_art_tree_t *tree = data_art_create(pm, NULL, 32);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     if (!tree) {
         page_manager_destroy(pm);
         fprintf(stderr, "Failed to create tree\n");

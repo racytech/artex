@@ -11,12 +11,20 @@
  */
 
 #include "data_art.h"
+#include "txn_buffer.h"
+#include "mvcc.h"
 #include "page_gc.h"
 #include "logger.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+
+// Snapshot handle structure - each thread owns one
+struct data_art_snapshot {
+    mvcc_snapshot_t *mvcc_snapshot;  // Underlying MVCC snapshot
+    uint64_t txn_id;                 // Transaction ID for this snapshot
+};
 
 // ============================================================================
 // Helper Functions - Node Size Calculation
@@ -48,6 +56,7 @@ size_t get_node_size(data_art_node_type_t type) {
 
 data_art_tree_t *data_art_create(page_manager_t *page_manager,
                                    buffer_pool_t *buffer_pool,
+                                   wal_t *wal,
                                    size_t key_size) {
     if (!page_manager) {
         LOG_ERROR("page_manager cannot be NULL");
@@ -68,11 +77,23 @@ data_art_tree_t *data_art_create(page_manager_t *page_manager,
     
     tree->page_manager = page_manager;
     tree->buffer_pool = buffer_pool;
+    tree->wal = wal;
     tree->root = NULL_NODE_REF;
     tree->version = 1;
     tree->size = 0;
     tree->key_size = key_size;
     tree->max_depth = key_size + 1;  // +1 for 0x00 terminator at leaf level
+    tree->current_txn_id = 0;        // No active transaction
+    tree->txn_buffer = NULL;         // No transaction buffer initially
+    
+    // Initialize MVCC manager
+    tree->mvcc_manager = mvcc_manager_create();
+    if (!tree->mvcc_manager) {
+        LOG_ERROR("Failed to create MVCC manager");
+        free(tree);
+        return NULL;
+    }
+    
     tree->cow_enabled = false;
     tree->active_versions = NULL;
     tree->num_active_versions = 0;
@@ -85,8 +106,10 @@ data_art_tree_t *data_art_create(page_manager_t *page_manager,
     tree->overflow_pages_allocated = 0;
     tree->overflow_chain_reads = 0;
     
-    LOG_INFO("Created persistent ART tree (key_size=%zu, max_depth=%zu, buffer_pool=%s)", 
-             key_size, tree->max_depth, buffer_pool ? "enabled" : "disabled");
+    LOG_INFO("Created persistent ART tree (key_size=%zu, max_depth=%zu, buffer_pool=%s, wal=%s)", 
+             key_size, tree->max_depth, 
+             buffer_pool ? "enabled" : "disabled",
+             wal ? "enabled" : "disabled");
     
     return tree;
 }
@@ -94,6 +117,12 @@ data_art_tree_t *data_art_create(page_manager_t *page_manager,
 void data_art_destroy(data_art_tree_t *tree) {
     if (!tree) {
         return;
+    }
+    
+    // Destroy MVCC manager
+    if (tree->mvcc_manager) {
+        mvcc_manager_destroy(tree->mvcc_manager);
+        tree->mvcc_manager = NULL;
     }
     
     // Free active versions array if allocated
@@ -602,8 +631,9 @@ bool leaf_matches(const data_art_leaf_t *leaf, const uint8_t *key, size_t key_le
 // Core Operations - Search
 // ============================================================================
 
-const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
-                         size_t *value_len) {
+// Internal get with snapshot support
+static const void *data_art_get_internal(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
+                         size_t *value_len, mvcc_snapshot_t *snapshot, uint64_t snapshot_txn_id) {
     if (!tree || !key) {
         LOG_ERROR("Invalid parameters");
         return NULL;
@@ -636,10 +666,77 @@ const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_l
         // Check if leaf
         if (type == DATA_NODE_LEAF) {
             const data_art_leaf_t *leaf = (const data_art_leaf_t *)node;
-            LOG_TRACE("Found leaf at page=%lu: key_len=%u, value_len=%u, flags=0x%02x",
-                      current.page_id, leaf->key_len, leaf->value_len, leaf->flags);
-            LOG_ERROR("[READ_LEAF] page=%lu offset=%u | type=%u flags=0x%02x key_len=%u value_len=%u overflow_page=%lu inline_data_len=%u",
-                      current.page_id, current.offset, leaf->type, leaf->flags, leaf->key_len, leaf->value_len, leaf->overflow_page, leaf->inline_data_len);
+            LOG_DEBUG("Found LEAF at page=%lu: key_len=%u, value_len=%u, flags=0x%02x, xmin=%lu, xmax=%lu",
+                      current.page_id, leaf->key_len, leaf->value_len, leaf->flags, leaf->xmin, leaf->xmax);
+            
+            // Walk version chain to find visible version
+            node_ref_t version_ref = current;
+            const data_art_leaf_t *visible_leaf = NULL;
+            int chain_length = 0;
+            const int MAX_CHAIN_LENGTH = 1000;  // Prevent infinite loops
+            
+            LOG_TRACE("Starting version chain walk from page=%lu offset=%u", version_ref.page_id, version_ref.offset);
+            
+            // Start with the leaf we already loaded
+            const data_art_leaf_t *candidate = leaf;
+            
+            while (chain_length < MAX_CHAIN_LENGTH) {
+                if (!candidate || candidate->type != DATA_NODE_LEAF) {
+                    LOG_ERROR("Invalid version chain: candidate=%p, type=%u", 
+                              (void*)candidate, 
+                              candidate ? candidate->type : 255);
+                    break;
+                }
+                
+                LOG_TRACE("Checking version chain[%d]: page=%lu offset=%u xmin=%lu xmax=%lu",
+                         chain_length, version_ref.page_id, version_ref.offset, candidate->xmin, candidate->xmax);
+                
+                // MVCC visibility check
+                bool visible = true;
+                if (snapshot && tree->mvcc_manager) {
+                    visible = mvcc_is_visible(tree->mvcc_manager, snapshot,
+                                              candidate->xmin, candidate->xmax, snapshot_txn_id);
+                    if (!visible) {
+                        LOG_TRACE("Version not visible to snapshot (xmin=%lu, xmax=%lu)",
+                                 candidate->xmin, candidate->xmax);
+                    }
+                } else if (candidate->xmax != 0) {
+                    // No snapshot but leaf is deleted - not visible
+                    visible = false;
+                    LOG_TRACE("Version is deleted (xmax=%lu), not visible", candidate->xmax);
+                }
+                
+                if (visible) {
+                    visible_leaf = candidate;
+                    LOG_DEBUG("Found visible version at chain[%d]: xmin=%lu xmax=%lu", 
+                             chain_length, candidate->xmin, candidate->xmax);
+                    break;
+                }
+                
+                // Move to previous version
+                if (node_ref_is_null(candidate->prev_version)) {
+                    LOG_DEBUG("End of version chain (no prev_version)");
+                    break;
+                }
+                
+                version_ref = candidate->prev_version;
+                chain_length++;
+                
+                // Load next version in chain
+                candidate = (const data_art_leaf_t *)data_art_load_node(tree, version_ref);
+            }
+            
+            if (chain_length >= MAX_CHAIN_LENGTH) {
+                LOG_ERROR("Version chain too long (>%d), possible corruption", MAX_CHAIN_LENGTH);
+                return NULL;
+            }
+            
+            if (!visible_leaf) {
+                LOG_DEBUG("No visible version found in chain (length=%d)", chain_length);
+                return NULL;  // No visible version in chain
+            }
+            
+            leaf = visible_leaf;  // Use the visible version
             
             // Debug: Verify the leaf structure makes sense
             if (leaf->value_len > 1024) {  // Suspiciously large
@@ -767,6 +864,23 @@ const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_l
     return NULL;  // Not found
 }
 
+// Public API: Get with snapshot
+const void *data_art_get_snapshot(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
+                                   size_t *value_len, data_art_snapshot_t *snapshot) {
+    if (snapshot) {
+        return data_art_get_internal(tree, key, key_len, value_len,
+                                      snapshot->mvcc_snapshot, snapshot->txn_id);
+    } else {
+        return data_art_get_internal(tree, key, key_len, value_len, NULL, 0);
+    }
+}
+
+// Legacy API: Get without snapshot (reads latest committed)
+const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
+                         size_t *value_len) {
+    return data_art_get_snapshot(tree, key, key_len, value_len, NULL);
+}
+
 bool data_art_contains(data_art_tree_t *tree, const uint8_t *key, size_t key_len) {
     size_t len;
     return data_art_get(tree, key, key_len, &len) != NULL;
@@ -780,3 +894,341 @@ bool data_art_contains(data_art_tree_t *tree, const uint8_t *key, size_t key_len
 // Node growth/shrinking operations are in:
 // - data_art_node_ops.c (add_child, remove_child, node transitions)
 // ============================================================================
+
+// ============================================================================
+// Transaction Support
+// ============================================================================
+
+bool data_art_begin_txn(data_art_tree_t *tree, uint64_t *txn_id_out) {
+    if (!tree || !tree->wal) {
+        LOG_ERROR("Cannot begin transaction: WAL not enabled");
+        return false;
+    }
+    
+    if (tree->txn_buffer) {
+        LOG_ERROR("Transaction already active (txn_buffer exists)");
+        return false;
+    }
+    
+    // Allocate transaction ID from MVCC manager (unified ID space)
+    uint64_t txn_id;
+    if (!mvcc_begin_txn(tree->mvcc_manager, &txn_id)) {
+        LOG_ERROR("Failed to begin MVCC transaction");
+        return false;
+    }
+    
+    // Log to WAL
+    if (!wal_log_begin_txn(tree->wal, txn_id, NULL)) {
+        LOG_ERROR("Failed to log transaction to WAL");
+        mvcc_abort_txn(tree->mvcc_manager, txn_id);
+        return false;
+    }
+    
+    // Create transaction buffer
+    tree->txn_buffer = txn_buffer_create(txn_id, 16);
+    if (!tree->txn_buffer) {
+        LOG_ERROR("Failed to create transaction buffer");
+        wal_log_abort_txn(tree->wal, txn_id, NULL);
+        mvcc_abort_txn(tree->mvcc_manager, txn_id);
+        return false;
+    }
+    
+    // Set transaction ID (will be restored to snapshot's ID after commit/abort if snapshot active)
+    tree->current_txn_id = txn_id;
+    
+    if (txn_id_out) {
+        *txn_id_out = txn_id;
+    }
+    
+    LOG_INFO("Began transaction %lu (MVCC-allocated)", txn_id);
+    return true;
+}
+
+bool data_art_commit_txn(data_art_tree_t *tree) {
+    if (!tree || !tree->wal) {
+        LOG_ERROR("Cannot commit transaction: WAL not enabled");
+        return false;
+    }
+    
+    if (tree->current_txn_id == 0) {
+        LOG_ERROR("No active transaction to commit");
+        return false;
+    }
+    
+    if (!tree->txn_buffer) {
+        LOG_ERROR("Transaction buffer missing");
+        return false;
+    }
+    
+    uint64_t txn_id = tree->current_txn_id;
+    
+    // Apply all buffered operations to the tree
+    for (size_t i = 0; i < tree->txn_buffer->num_ops; i++) {
+        txn_operation_t *op = &tree->txn_buffer->operations[i];
+        
+        // Temporarily clear txn_buffer to prevent recursive buffering
+        txn_buffer_t *saved_buffer = tree->txn_buffer;
+        tree->txn_buffer = NULL;
+        
+        bool success;
+        if (op->type == TXN_OP_INSERT) {
+            success = data_art_insert(tree, op->key, op->key_len,
+                                     op->value, op->value_len);
+        } else { // TXN_OP_DELETE
+            success = data_art_delete(tree, op->key, op->key_len);
+        }
+        
+        tree->txn_buffer = saved_buffer;
+        
+        if (!success) {
+            LOG_ERROR("Failed to apply operation %zu during commit", i);
+            // Partial commit - some operations applied, some failed
+            // In production, need more sophisticated error handling
+            txn_buffer_destroy(tree->txn_buffer);
+            tree->txn_buffer = NULL;
+            tree->current_txn_id = 0;
+            return false;
+        }
+    }
+    
+    // Log commit to WAL
+    if (!wal_log_commit_txn(tree->wal, txn_id, NULL)) {
+        LOG_ERROR("Failed to commit transaction %lu to WAL", txn_id);
+        // Operations are already applied to tree - durability failure
+        txn_buffer_destroy(tree->txn_buffer);
+        tree->txn_buffer = NULL;
+        tree->current_txn_id = 0;
+        return false;
+    }
+    
+    // Commit MVCC transaction
+    if (!mvcc_commit_txn(tree->mvcc_manager, txn_id)) {
+        LOG_ERROR("Failed to commit MVCC transaction %lu", txn_id);
+    }
+    
+    // Clean up
+    txn_buffer_destroy(tree->txn_buffer);
+    tree->txn_buffer = NULL;
+    tree->current_txn_id = 0;
+    
+    LOG_INFO("Committed transaction %lu", txn_id);
+    return true;
+}
+
+bool data_art_abort_txn(data_art_tree_t *tree) {
+    if (!tree || !tree->wal) {
+        LOG_ERROR("Cannot abort transaction: WAL not enabled");
+        return false;
+    }
+    
+    if (tree->current_txn_id == 0) {
+        LOG_ERROR("No active transaction to abort");
+        return false;
+    }
+    
+    if (!tree->txn_buffer) {
+        LOG_ERROR("Transaction buffer missing");
+        return false;
+    }
+    
+    uint64_t txn_id = tree->current_txn_id;
+    size_t num_ops = txn_buffer_size(tree->txn_buffer);
+    
+    // Discard all buffered operations (no tree modification)
+    txn_buffer_destroy(tree->txn_buffer);
+    tree->txn_buffer = NULL;
+    
+    // Log abort to WAL
+    if (!wal_log_abort_txn(tree->wal, txn_id, NULL)) {
+        LOG_ERROR("Failed to abort transaction %lu", txn_id);
+        tree->current_txn_id = 0;
+        return false;
+    }
+    
+    // Abort MVCC transaction
+    if (!mvcc_abort_txn(tree->mvcc_manager, txn_id)) {
+        LOG_ERROR("Failed to abort MVCC transaction %lu", txn_id);
+    }
+    
+    tree->current_txn_id = 0;
+    
+    LOG_INFO("Aborted transaction %lu (discarded %zu operations)", 
+             txn_id, num_ops);
+    return true;
+}
+
+// ============================================================================
+// Snapshot API
+// ============================================================================
+
+data_art_snapshot_t *data_art_begin_snapshot(data_art_tree_t *tree) {
+    if (!tree || !tree->mvcc_manager) {
+        LOG_ERROR("Cannot begin snapshot: MVCC manager not initialized");
+        return NULL;
+    }
+    
+    // Allocate snapshot handle
+    data_art_snapshot_t *snapshot = malloc(sizeof(data_art_snapshot_t));
+    if (!snapshot) {
+        LOG_ERROR("Failed to allocate snapshot handle");
+        return NULL;
+    }
+    
+    // Allocate a transaction ID for the snapshot
+    if (!mvcc_begin_txn(tree->mvcc_manager, &snapshot->txn_id)) {
+        LOG_ERROR("Failed to begin MVCC transaction for snapshot");
+        free(snapshot);
+        return NULL;
+    }
+    
+    // Create MVCC snapshot
+    snapshot->mvcc_snapshot = mvcc_snapshot_create(tree->mvcc_manager);
+    if (!snapshot->mvcc_snapshot) {
+        LOG_ERROR("Failed to create MVCC snapshot");
+        mvcc_abort_txn(tree->mvcc_manager, snapshot->txn_id);
+        free(snapshot);
+        return NULL;
+    }
+    
+    LOG_DEBUG("Started snapshot %lu (txn_id=%lu, xmin=%lu, xmax=%lu, %zu active txns)",
+              snapshot->mvcc_snapshot->snapshot_id,
+              snapshot->txn_id,
+              snapshot->mvcc_snapshot->xmin,
+              snapshot->mvcc_snapshot->xmax,
+              snapshot->mvcc_snapshot->num_active);
+    
+    return snapshot;
+}
+
+void data_art_end_snapshot(data_art_tree_t *tree, data_art_snapshot_t *snapshot) {
+    if (!tree || !snapshot) {
+        return;
+    }
+    
+    LOG_DEBUG("Ending snapshot %lu", snapshot->mvcc_snapshot->snapshot_id);
+    
+    // Release MVCC snapshot
+    mvcc_snapshot_release(tree->mvcc_manager, snapshot->mvcc_snapshot);
+    
+    // Commit the snapshot's transaction
+    if (snapshot->txn_id > 0) {
+        mvcc_commit_txn(tree->mvcc_manager, snapshot->txn_id);
+    }
+    
+    // Free the handle
+    free(snapshot);
+}
+
+// ============================================================================
+// Checkpoint and Recovery
+// ============================================================================
+
+bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out) {
+    if (!tree || !tree->wal) {
+        LOG_ERROR("Cannot checkpoint: WAL not enabled");
+        return false;
+    }
+    
+    // Flush all dirty pages to disk
+    if (!data_art_flush(tree)) {
+        LOG_ERROR("Failed to flush tree pages during checkpoint");
+        return false;
+    }
+    
+    // Log checkpoint with current tree state
+    uint64_t lsn;
+    if (!wal_log_checkpoint(tree->wal, 
+                           tree->root.page_id,
+                           tree->root.offset,
+                           tree->size,
+                           tree->nodes_allocated,  // Use nodes allocated as proxy
+                           &lsn)) {
+        LOG_ERROR("Failed to log checkpoint to WAL");
+        return false;
+    }
+    
+    if (checkpoint_lsn_out) {
+        *checkpoint_lsn_out = lsn;
+    }
+    
+    LOG_INFO("Created checkpoint at LSN %lu (root=%lu:%u, size=%zu)",
+             lsn, tree->root.page_id, tree->root.offset, tree->size);
+    
+    return true;
+}
+
+// Callback for WAL replay
+static bool apply_wal_entry(void *context, const wal_entry_header_t *header, const void *payload) {
+    data_art_tree_t *tree = (data_art_tree_t *)context;
+    
+    switch (header->entry_type) {
+        case WAL_ENTRY_INSERT: {
+            const wal_insert_payload_t *insert = (const wal_insert_payload_t *)payload;
+            const uint8_t *key = insert->data;
+            const uint8_t *value = insert->data + insert->key_len;
+            
+            // Note: insert may fail if key already exists - that's ok during replay
+            data_art_insert(tree, key, insert->key_len, value, insert->value_len);
+            break;
+        }
+        
+        case WAL_ENTRY_DELETE: {
+            const wal_delete_payload_t *del = (const wal_delete_payload_t *)payload;
+            const uint8_t *key = del->key;
+            
+            // Note: delete may fail if key doesn't exist - that's ok during replay
+            data_art_delete(tree, key, del->key_len);
+            break;
+        }
+        
+        case WAL_ENTRY_BEGIN_TXN:
+        case WAL_ENTRY_COMMIT_TXN:
+        case WAL_ENTRY_ABORT_TXN:
+            // Transaction markers - already handled by WAL replay logic
+            break;
+            
+        case WAL_ENTRY_CHECKPOINT: {
+            const wal_checkpoint_payload_t *ckpt = (const wal_checkpoint_payload_t *)payload;
+            
+            // Restore tree state from checkpoint
+            tree->root.page_id = ckpt->root_page_id;
+            tree->root.offset = ckpt->root_offset;
+            tree->size = ckpt->tree_size;
+            
+            LOG_INFO("Restored checkpoint: root=%lu:%u, size=%zu",
+                     tree->root.page_id, tree->root.offset, tree->size);
+            break;
+        }
+        
+        default:
+            LOG_WARN("Unknown WAL entry type: %u", header->entry_type);
+            break;
+    }
+    
+    return true;  // Continue replay
+}
+
+int64_t data_art_recover(data_art_tree_t *tree, uint64_t start_lsn) {
+    if (!tree || !tree->wal) {
+        LOG_ERROR("Cannot recover: WAL not enabled");
+        return -1;
+    }
+    
+    LOG_INFO("Starting recovery from LSN %lu", start_lsn);
+    
+    // Replay WAL entries to rebuild tree state
+    // start_lsn == 0 means replay from beginning
+    uint64_t end_lsn = UINT64_MAX;  // Replay to end
+    
+    int64_t entries = wal_replay(tree->wal, start_lsn, end_lsn, tree, apply_wal_entry);
+    
+    if (entries < 0) {
+        LOG_ERROR("Recovery failed during WAL replay");
+        return -1;
+    }
+    
+    LOG_INFO("Recovery complete: replayed %ld entries, tree size=%zu",
+             entries, tree->size);
+    
+    return entries;
+}

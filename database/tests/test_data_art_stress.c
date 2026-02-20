@@ -77,7 +77,7 @@ static bool test_incremental_stress(void) {
             FAIL("page manager creation failed");
         }
         
-        data_art_tree_t *tree = data_art_create(pm, NULL);
+        data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
         if (!tree) {
             page_manager_destroy(pm);
             fprintf(stderr, "  Failed to create tree\n");
@@ -302,7 +302,7 @@ static bool test_focused_2000(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     const int NUM_KEYS = 10000;
@@ -422,7 +422,7 @@ static bool test_minimal_reproduction(void) {
         FAIL("Failed to create page manager");
     }
     
-    data_art_tree_t *tree = data_art_create(pm, false);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     if (!tree) {
         page_manager_destroy(pm);
         FAIL("Failed to create tree");
@@ -563,7 +563,7 @@ static bool test_sequential_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     const int NUM_KEYS = 2000;

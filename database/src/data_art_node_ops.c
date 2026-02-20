@@ -69,7 +69,9 @@ static node_ref_t grow_node4_to_node16(data_art_tree_t *tree, node_ref_t old_ref
         return NULL_NODE_REF;
     }
     
-    // TODO: Mark old node as free
+    // Release old page - decrement ref count and mark dead if 0
+    extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
+    data_art_release_page(tree, old_ref);
     
     LOG_DEBUG("Grew NODE_4 to NODE_16");
     return new_ref;
@@ -113,7 +115,9 @@ static node_ref_t grow_node16_to_node48(data_art_tree_t *tree, node_ref_t old_re
         return NULL_NODE_REF;
     }
     
-    // TODO: Mark old node as free
+    // Release old page - decrement ref count and mark dead if 0
+    extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
+    data_art_release_page(tree, old_ref);
     
     LOG_DEBUG("Grew NODE_16 to NODE_48");
     return new_ref;
@@ -155,7 +159,9 @@ static node_ref_t grow_node48_to_node256(data_art_tree_t *tree, node_ref_t old_r
         return NULL_NODE_REF;
     }
     
-    // TODO: Mark old node as free
+    // Release old page - decrement ref count and mark dead if 0
+    extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
+    data_art_release_page(tree, old_ref);
     
     LOG_DEBUG("Grew NODE_48 to NODE_256");
     return new_ref;
@@ -201,7 +207,9 @@ static node_ref_t shrink_node16_to_node4(data_art_tree_t *tree, node_ref_t old_r
         return NULL_NODE_REF;
     }
     
-    // TODO: Mark old node as free
+    // Release old page - decrement ref count and mark dead if 0
+    extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
+    data_art_release_page(tree, old_ref);
     
     LOG_DEBUG("Shrunk NODE_16 to NODE_4");
     return new_ref;
@@ -250,7 +258,9 @@ static node_ref_t shrink_node48_to_node16(data_art_tree_t *tree, node_ref_t old_
         return NULL_NODE_REF;
     }
     
-    // TODO: Mark old node as free
+    // Release old page - decrement ref count and mark dead if 0
+    extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
+    data_art_release_page(tree, old_ref);
     
     LOG_DEBUG("Shrunk NODE_48 to NODE_16");
     return new_ref;
@@ -301,7 +311,9 @@ static node_ref_t shrink_node256_to_node48(data_art_tree_t *tree, node_ref_t old
         return NULL_NODE_REF;
     }
     
-    // TODO: Mark old node as free
+    // Release old page - decrement ref count and mark dead if 0
+    extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
+    data_art_release_page(tree, old_ref);
     
     LOG_DEBUG("Shrunk NODE_256 to NODE_48");
     return new_ref;

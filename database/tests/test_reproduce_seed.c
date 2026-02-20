@@ -64,7 +64,7 @@ int main(int argc, char *argv[]) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Allocate arrays for this batch

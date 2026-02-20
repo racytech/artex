@@ -40,6 +40,14 @@ include_directories(
 )
 
 #==============================================================================
+# Database Library (CRC32 Utility)
+#==============================================================================
+
+add_library(art_crc32 STATIC
+    database/src/crc32.c
+)
+
+#==============================================================================
 # Database Library (Persistent ART - Page Manager)
 #==============================================================================
 
@@ -49,6 +57,7 @@ add_library(art_page_manager STATIC
 )
 
 target_link_libraries(art_page_manager
+    art_crc32
     ${LZ4_LIBRARIES}
     ${ZSTD_LIBRARIES}
 )
@@ -87,6 +96,20 @@ target_link_libraries(art_page_gc
 )
 
 #==============================================================================
+# Database Library (Write-Ahead Log)
+#==============================================================================
+
+add_library(art_wal STATIC
+    database/src/wal.c
+    database/src/logger.c
+)
+
+target_link_libraries(art_wal
+    art_crc32
+    pthread
+)
+
+#==============================================================================
 # Database Library (Persistent ART - Disk-backed Tree)
 #==============================================================================
 
@@ -96,6 +119,8 @@ add_library(art_persistent STATIC
     database/src/data_art_insert.c
     database/src/data_art_delete.c
     database/src/data_art_node_ops.c
+    database/src/txn_buffer.c
+    database/src/mvcc.c
     database/src/logger.c
 )
 
@@ -103,6 +128,7 @@ target_link_libraries(art_persistent
     art_page_manager
     art_buffer_pool
     art_page_gc
+    art_wal
 )
 
 #==============================================================================
@@ -205,6 +231,47 @@ add_executable(test_data_art_full_stress
 )
 target_link_libraries(test_data_art_full_stress art_persistent pthread)
 
+# Test: Transaction-Based Stress Test (Atomic Multi-Key Updates)
+add_executable(test_data_art_txn_stress
+    database/tests/test_data_art_txn_stress.c
+)
+target_link_libraries(test_data_art_txn_stress art_persistent pthread)
+
+# Test: Transaction Buffer (Atomic Multi-Key Updates)
+add_executable(test_txn_buffer
+    database/tests/test_txn_buffer.c
+)
+target_link_libraries(test_txn_buffer art_persistent pthread)
+add_test(NAME test_txn_buffer COMMAND test_txn_buffer)
+
+# Test: MVCC (Multi-Version Concurrency Control)
+add_executable(test_mvcc
+    database/tests/test_mvcc.c
+)
+target_link_libraries(test_mvcc art_persistent pthread)
+add_test(NAME test_mvcc COMMAND test_mvcc)
+
+# Test: MVCC Edge Cases
+add_executable(test_mvcc_edge_cases
+    database/tests/test_mvcc_edge_cases.c
+)
+target_link_libraries(test_mvcc_edge_cases art_persistent pthread)
+add_test(NAME test_mvcc_edge_cases COMMAND test_mvcc_edge_cases)
+
+# Test: Snapshot Isolation
+add_executable(test_snapshot_isolation
+    database/tests/test_snapshot_isolation.c
+)
+target_link_libraries(test_snapshot_isolation art_persistent pthread)
+add_test(NAME test_snapshot_isolation COMMAND test_snapshot_isolation)
+
+# Test: Concurrent Snapshots
+add_executable(test_concurrent_snapshots
+    database/tests/test_concurrent_snapshots.c
+)
+target_link_libraries(test_concurrent_snapshots art_persistent pthread)
+add_test(NAME test_concurrent_snapshots COMMAND test_concurrent_snapshots)
+
 # Test: Prefix Key Debug
 add_executable(test_prefix_debug
     database/tests/test_prefix_debug.c
@@ -237,6 +304,27 @@ add_executable(test_page_gc_integration
 )
 target_link_libraries(test_page_gc_integration art_page_gc art_page_manager pthread)
 add_test(NAME test_page_gc_integration COMMAND test_page_gc_integration)
+
+# Test: Write-Ahead Log
+add_executable(test_wal
+    database/tests/test_wal.c
+)
+target_link_libraries(test_wal art_wal pthread)
+add_test(NAME test_wal COMMAND test_wal)
+
+# Test: Write-Ahead Log Edge Cases
+add_executable(test_wal_edge_cases
+    database/tests/test_wal_edge_cases.c
+)
+target_link_libraries(test_wal_edge_cases art_wal pthread)
+add_test(NAME test_wal_edge_cases COMMAND test_wal_edge_cases)
+
+# Test: Write-Ahead Log Recovery Functions
+add_executable(test_wal_recovery
+    database/tests/test_wal_recovery.c
+)
+target_link_libraries(test_wal_recovery art_wal pthread)
+add_test(NAME test_wal_recovery COMMAND test_wal_recovery)
 
 # Test: Simple delete test
 add_executable(test_delete_simple

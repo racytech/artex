@@ -36,7 +36,7 @@ int main(void) {
     assert(bp);
     
     // Create tree
-    data_art_tree_t *tree = data_art_create(pm, bp);
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     assert(tree);
     
     printf("\n=== Testing Delete with Buffer Pool ===\n");

@@ -153,7 +153,7 @@ static bool test_random_keys_varying_length(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     // Generate and insert random keys
@@ -258,7 +258,7 @@ static bool test_random_printable_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     uint8_t **keys = malloc(NUM_KEYS * sizeof(uint8_t *));
@@ -335,7 +335,7 @@ static bool test_sequential_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     printf("  Inserting %d sequential keys...\n", NUM_KEYS);
@@ -416,7 +416,7 @@ static bool test_common_prefix_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     printf("  Inserting %d keys with %d prefixes...\n", TOTAL_KEYS, NUM_PREFIXES);
@@ -507,7 +507,7 @@ static bool test_binary_keys_with_nulls(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     uint8_t **keys = malloc(NUM_KEYS * sizeof(uint8_t *));
@@ -588,7 +588,7 @@ static bool test_very_long_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     uint8_t **keys = malloc(NUM_KEYS * sizeof(uint8_t *));
@@ -657,7 +657,7 @@ static bool test_update_keys(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
     
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     assert(tree != NULL);
     
     uint8_t **keys = malloc(NUM_KEYS * sizeof(uint8_t *));
@@ -787,7 +787,7 @@ static void run_continuous_stress_test(int duration_seconds, bool use_buffer_poo
             }
         }
         
-        data_art_tree_t *tree = data_art_create(pm, bp);
+        data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
         if (!tree) {
             if (bp) buffer_pool_destroy(bp);
             page_manager_destroy(pm);

@@ -11,6 +11,7 @@
  */
 
 #include "data_art.h"
+#include "txn_buffer.h"
 #include "logger.h"
 
 #include <stdlib.h>
@@ -283,6 +284,11 @@ static node_ref_t alloc_leaf(data_art_tree_t *tree, const uint8_t *key, size_t k
     leaf->overflow_page = 0;
     leaf->inline_data_len = inline_data_len;
     
+    // Set MVCC version fields
+    leaf->xmin = tree->current_txn_id > 0 ? tree->current_txn_id : 1;
+    leaf->xmax = 0;  // Not deleted
+    leaf->prev_version = NULL_NODE_REF;  // No older version (new insert)
+    
     // Copy key
     memcpy(leaf->data, key, key_len);
     LOG_DEBUG("[ALLOC_LEAF] Copied key: %zu bytes at offset 0", key_len);
@@ -511,27 +517,73 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         // Update existing leaf
         if (leaf_matches_key(leaf, key, key_len)) {
             *inserted = false;  // Updated, not inserted
-            LOG_ERROR("[UPDATE_LEAF] Replacing leaf at page=%lu (old value_len=%u) with new leaf", 
-                     node_ref.page_id, leaf->value_len);
+            LOG_DEBUG("[UPDATE_LEAF] Updating leaf at page=%lu (old value_len=%u, xmin=%lu, xmax=%lu)", 
+                     node_ref.page_id, leaf->value_len, leaf->xmin, leaf->xmax);
+            
+            // Save old leaf information
+            uint64_t old_overflow_page = leaf->overflow_page;
+            bool had_overflow = (leaf->flags & LEAF_FLAG_OVERFLOW) != 0;
+            node_ref_t old_leaf_ref = node_ref;
+            
+            // Create new version of the leaf
             node_ref_t new_leaf_ref = alloc_leaf(tree, key, key_len, value, value_len);
-            if (!node_ref_is_null(new_leaf_ref)) {
-                LOG_ERROR("[UPDATE_LEAF] New leaf allocated at page=%lu (new value_len=%zu)", 
-                         new_leaf_ref.page_id, value_len);
-                
-                // TODO: Free old leaf page AFTER parent is successfully updated
-                // For now, we leak the old page to avoid use-after-free bugs
-                // page_manager_free(tree->page_manager, node_ref.page_id);
-                
-                // TODO: Also free overflow pages if leaf had any
-                if (leaf->flags & LEAF_FLAG_OVERFLOW) {
-                    LOG_WARN("Old leaf has overflow pages - not yet freeing them");
-                }
-                
-                LOG_ERROR("[UPDATE_LEAF] Returning new leaf ref (page=%lu) to parent", 
-                         new_leaf_ref.page_id);
-                return new_leaf_ref;
+            if (node_ref_is_null(new_leaf_ref)) {
+                LOG_ERROR("Failed to allocate new leaf version");
+                return node_ref;
             }
-            return node_ref;
+            
+            // Link new version to old version (version chain)
+            data_art_leaf_t *new_leaf = (data_art_leaf_t *)data_art_load_node(tree, new_leaf_ref);
+            if (!new_leaf) {
+                LOG_ERROR("Failed to load newly created leaf");
+                return node_ref;
+            }
+            
+            // Create a modifiable copy
+            size_t new_leaf_size = sizeof(data_art_leaf_t) + new_leaf->inline_data_len;
+            data_art_leaf_t *new_leaf_copy = malloc(new_leaf_size);
+            if (!new_leaf_copy) {
+                LOG_ERROR("Failed to allocate memory for leaf copy");
+                return node_ref;
+            }
+            memcpy(new_leaf_copy, new_leaf, new_leaf_size);
+            
+            // Set version chain link
+            new_leaf_copy->prev_version = old_leaf_ref;
+            
+            // Write back the modified new leaf
+            if (!data_art_write_node(tree, new_leaf_ref, new_leaf_copy, new_leaf_size)) {
+                LOG_ERROR("Failed to write version chain link");
+                free(new_leaf_copy);
+                return node_ref;
+            }
+            free(new_leaf_copy);
+            
+            // Mark old version as superseded (set xmax) for MVCC version chains
+            if (tree->mvcc_manager) {
+                // Logical update: mark old version as superseded
+                size_t old_leaf_size = sizeof(data_art_leaf_t) + leaf->inline_data_len;
+                data_art_leaf_t *old_leaf_copy = malloc(old_leaf_size);
+                if (old_leaf_copy) {
+                    memcpy(old_leaf_copy, leaf, old_leaf_size);
+                    old_leaf_copy->xmax = tree->current_txn_id;
+                    data_art_write_node(tree, old_leaf_ref, old_leaf_copy, old_leaf_size);
+                    free(old_leaf_copy);
+                    LOG_DEBUG("[UPDATE_LEAF] Marked old version (page=%lu) as superseded: xmax=%lu",
+                             old_leaf_ref.page_id, tree->current_txn_id);
+                }
+            } else {
+                // Physical update: free old leaf page (but keep it accessible via prev_version)
+                // NOTE: We don't free overflow pages here because old versions might still need them
+                // Garbage collection will handle this later
+                LOG_DEBUG("[UPDATE_LEAF] Physical update: old version (page=%lu) kept for version chain",
+                         old_leaf_ref.page_id);
+            }
+            
+            LOG_DEBUG("[UPDATE_LEAF] Created new version at page=%lu (new value_len=%zu) -> prev_version=page=%lu",
+                     new_leaf_ref.page_id, value_len, old_leaf_ref.page_id);
+            
+            return new_leaf_ref;
         }
         
         // Keys differ - need to create a new node to hold both leaves
@@ -885,6 +937,11 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
         return false;
     }
     
+    // If in transaction, buffer the operation instead of applying immediately
+    if (tree->txn_buffer) {
+        return txn_buffer_add_insert(tree->txn_buffer, key, key_len, value, value_len);
+    }
+    
     bool inserted = false;
     node_ref_t new_root = insert_recursive(tree, tree->root, key, key_len, 0,
                                             value, value_len, &inserted);
@@ -893,6 +950,16 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
         tree->root = new_root;
         if (inserted) {
             tree->size++;
+            
+            // Log to WAL for durability (if WAL is enabled)
+            if (tree->wal) {
+                uint64_t txn_id = tree->current_txn_id;  // 0 if no active transaction
+                if (!wal_log_insert(tree->wal, txn_id, key, key_len, value, value_len, NULL)) {
+                    LOG_ERROR("Failed to log insert to WAL");
+                    // Note: Tree is already modified - this is a durability failure
+                    // In production, may need rollback logic here
+                }
+            }
         }
         return true;
     }

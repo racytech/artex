@@ -22,9 +22,9 @@
  * than necessary. Insert and search operations are fully optimized.
  */
 
-#include "data_art.h"
 #include "buffer_pool.h"
-#include "page_gc.h"
+#include "data_art.h"
+#include "txn_buffer.h"
 #include "logger.h"
 
 #include <stdlib.h>
@@ -68,6 +68,11 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
         return false;
     }
     
+    // If in transaction, buffer the operation instead of applying immediately
+    if (tree->txn_buffer) {
+        return txn_buffer_add_delete(tree->txn_buffer, key, key_len);
+    }
+    
     if (node_ref_is_null(tree->root)) {
         return false;  // Empty tree, nothing to delete
     }
@@ -78,6 +83,15 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
     if (deleted) {
         tree->root = new_root;
         tree->size--;
+        
+        // Log to WAL for durability (if WAL is enabled)
+        if (tree->wal) {
+            uint64_t txn_id = tree->current_txn_id;  // 0 if no active transaction
+            if (!wal_log_delete(tree->wal, txn_id, key, key_len, NULL)) {
+                LOG_ERROR("Failed to log delete to WAL");
+                // Note: Tree is already modified - this is a durability failure
+            }
+        }
     }
     
     return deleted;
@@ -106,7 +120,71 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         const data_art_leaf_t *leaf = (const data_art_leaf_t *)node;
         
         if (leaf_matches(leaf, key, key_len)) {
+            // MVCC logical deletion: Set xmax instead of physical removal
+            // ONLY do this when snapshots might exist (i.e., when we're using MVCC for real)
+            // For regular transactions without snapshots, do physical deletion
+            // BUT: If the leaf was created in the current transaction, do physical deletion
+            // because no other transaction can see it yet
+            bool should_do_logical_delete = tree->mvcc_manager && 
+                                           tree->current_txn_id > 0 && 
+                                           leaf->xmin != tree->current_txn_id;
+            
+            if (should_do_logical_delete) {
+                // Create modified copy of leaf with xmax set
+                size_t leaf_size = sizeof(data_art_leaf_t) + leaf->inline_data_len;
+                data_art_leaf_t *modified_leaf = malloc(leaf_size);
+                if (!modified_leaf) {
+                    LOG_ERROR("Failed to allocate modified leaf");
+                    return node_ref;
+                }
+                
+                // Copy entire leaf
+                memcpy(modified_leaf, leaf, leaf_size);
+                
+                // Set xmax to mark as deleted
+                modified_leaf->xmax = tree->current_txn_id;
+                
+                // Write modified leaf back (CoW)
+                node_ref_t new_ref = data_art_alloc_node(tree, leaf_size);
+                if (node_ref_is_null(new_ref)) {
+                    LOG_ERROR("Failed to allocate new leaf page");
+                    free(modified_leaf);
+                    return node_ref;
+                }
+                
+                if (!data_art_write_node(tree, new_ref, modified_leaf, leaf_size)) {
+                    LOG_ERROR("Failed to write modified leaf");
+                    free(modified_leaf);
+                    return node_ref;
+                }
+                
+                free(modified_leaf);
+                *deleted = true;
+                
+                LOG_DEBUG("[DELETE_LEAF] Logical deletion: set xmax=%lu on leaf (xmin=%lu)",
+                         tree->current_txn_id, leaf->xmin);
+                
+                return new_ref;  // Return modified leaf ref
+            }
+            
+            // Physical deletion for:
+            // 1. Non-MVCC mode
+            // 2. Outside transaction
+            // 3. Deleting a leaf created in the same transaction
+            // 4. Regular transactions without active snapshots
             *deleted = true;
+            
+            // Free overflow pages if this leaf has any
+            if ((leaf->flags & LEAF_FLAG_OVERFLOW) && leaf->overflow_page != 0) {
+                LOG_DEBUG("[DELETE_LEAF] Freeing overflow chain starting at page=%lu",
+                         leaf->overflow_page);
+                extern size_t data_art_free_overflow_chain(data_art_tree_t *tree, uint64_t first_overflow_page);
+                data_art_free_overflow_chain(tree, leaf->overflow_page);
+            }
+            
+            // Free the leaf page itself
+            data_art_release_page(tree, node_ref);
+            
             // Return NULL to indicate this node should be removed
             return NULL_NODE_REF;
         }

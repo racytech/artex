@@ -14,7 +14,7 @@ int main() {
     remove(db_path);
     
     page_manager_t *pm = page_manager_create(db_path, false);
-    data_art_tree_t *tree = data_art_create(pm, NULL);
+    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
     
     // Insert just a few keys
     for (int p = 0; p < 2; p++) {

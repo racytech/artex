@@ -1,22 +1,23 @@
 /**
- * Comprehensive Stress Test for Persistent ART - Insert, Search, Delete
+ * Transaction-Based Stress Test for Persistent ART
+ * 
+ * Uses atomic multi-key updates via transaction buffer to test:
+ * - Batched inserts within transactions
+ * - Batched deletes within transactions
+ * - Mixed insert/delete operations in single transaction
+ * - Random commit/abort to test rollback semantics
+ * - Verification that all operations are atomic
  * 
  * FIXED-SIZE KEYS: Uses either 20-byte (address) or 32-byte (hash) keys
  * to match Ethereum use case. Variable-length values.
  * 
- * FAIL-FAST MODE: Tests all operations in realistic patterns:
- * - Insert random keys (20 or 32 bytes)
- * - Search to verify all keys exist
- * - Delete random subset of keys
- * - Verify deleted keys are gone and remaining keys still exist
- * - Repeat with new keys
- * 
  * Usage:
- *   ./test_data_art_full_stress <seconds> [use_buffer_pool] [key_size]
+ *   ./test_data_art_txn_stress <seconds> [use_buffer_pool] [key_size]
  *   key_size: 20 (address) or 32 (hash), default=32
  */
 
 #include "data_art.h"
+#include "txn_buffer.h"
 #include "page_manager.h"
 #include "buffer_pool.h"
 #include "wal.h"
@@ -31,8 +32,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#define TEST_DB_PATH "/tmp/test_data_art_full_stress.db"
-#define TEST_WAL_PATH "/tmp/test_data_art_full_stress_wal"
+#define TEST_DB_PATH "/tmp/test_data_art_txn_stress.db"
+#define TEST_WAL_PATH "/tmp/test_data_art_txn_stress_wal"
 
 // ANSI color codes
 #define COLOR_GREEN  "\033[0;32m"
@@ -40,6 +41,7 @@
 #define COLOR_YELLOW "\033[0;33m"
 #define COLOR_BLUE   "\033[0;34m"
 #define COLOR_CYAN   "\033[0;36m"
+#define COLOR_MAGENTA "\033[0;35m"
 #define COLOR_RESET  "\033[0m"
 
 #define FAIL_FAST(msg, ...) do { \
@@ -74,6 +76,8 @@ typedef struct {
     uint64_t total_inserts;
     uint64_t total_searches;
     uint64_t total_deletes;
+    uint64_t total_commits;
+    uint64_t total_aborts;
     uint64_t iterations;
 } stats_t;
 
@@ -115,21 +119,21 @@ static void make_hash_key(const uint8_t *key, size_t key_len, char *hash_key, si
 }
 
 /**
- * Main stress test with insert, search, and delete
+ * Transaction-based stress test with batched operations
  * key_size: 20 for addresses, 32 for hashes
  */
-static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, unsigned int base_seed, size_t key_size) {
+static void run_txn_stress_test(int duration_seconds, bool use_buffer_pool, unsigned int base_seed, size_t key_size) {
     // Validate key size
     if (key_size != 20 && key_size != 32) {
         FAIL_FAST("Invalid key size %zu - must be 20 (address) or 32 (hash)", key_size);
     }
     
-    // Disable debug logging to reduce output
+    // Reduce logging noise
     log_set_level(LOG_LEVEL_ERROR);
     
     printf("\n");
     printf("================================================================\n");
-    printf("  FULL STRESS TEST - INSERT + SEARCH + DELETE                  \n");
+    printf("  TRANSACTION STRESS TEST - ATOMIC MULTI-KEY UPDATES           \n");
     printf("  Duration: %d seconds                                         \n", duration_seconds);
     printf("  Key Size: %zu bytes (%s)                                     \n", key_size, key_size == 20 ? "Address" : "Hash");
     printf("  Buffer Pool: %s                                              \n", use_buffer_pool ? "ENABLED" : "DISABLED");
@@ -153,14 +157,6 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
     if (!pm) {
         FAIL_FAST("Failed to create page manager");
     }
-    
-    // Log CRC32 implementation
-    printf("Note: CRC32 implementation is ");
-#ifdef __x86_64__
-    printf("hardware-accelerated (SSE4.2)\n");
-#else
-    printf("software table lookup\n");
-#endif
     
     buffer_pool_t *bp = NULL;
     if (use_buffer_pool) {
@@ -195,6 +191,9 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
     key_entry_t *all_keys = NULL;
     int next_key_index = 0;
     
+    // Track keys pending in current transaction
+    key_entry_t *pending_keys = NULL;
+    
     while (keep_running && time(NULL) < end_time) {
         stats.iterations++;
         unsigned int seed = base_seed + stats.iterations;
@@ -208,51 +207,54 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
             }
         }
         
-        // Phase 1: INSERT new keys (fixed size!)
-        int insert_batch = 50 + (rand_r(&seed) % 151);  // 50-200 keys
+        // =================================================================
+        // TRANSACTION BEGIN
+        // =================================================================
+        uint64_t txn_id;
+        if (!data_art_begin_txn(tree, &txn_id)) {
+            FAIL_FAST("Failed to begin transaction at iteration %lu", stats.iterations);
+        }
+        
+        // Clear pending keys tracker
+        key_entry_t *entry, *tmp;
+        HASH_ITER(hh, pending_keys, entry, tmp) {
+            HASH_DEL(pending_keys, entry);
+            free(entry->key);
+            free(entry->value);
+            free(entry);
+        }
+        pending_keys = NULL;
+        
+        // Phase 1: BATCH INSERT within transaction (20-100 keys)
+        int insert_batch = 20 + (rand_r(&seed) % 81);
         
         for (int i = 0; i < insert_batch; i++) {
-            // FIXED-SIZE KEY: Use specified key_size (20 or 32 bytes)
             uint8_t *key = malloc(key_size);
             generate_random_key(key, key_size, &seed);
             
-            // VARIABLE-LENGTH VALUE: 16 to 511 bytes
             size_t max_value_len = 512;
             char *value = malloc(max_value_len);
             generate_random_value(value, max_value_len, next_key_index, &seed);
             
             if (!data_art_insert(tree, key, key_size, value, strlen(value))) {
-                FAIL_FAST("Insert failed at iteration %lu, key %d", stats.iterations, i);
+                FAIL_FAST("Insert (txn) failed at iteration %lu, key %d", stats.iterations, i);
             }
             
-            // Track this key
+            // Track this key as pending
             char hash_key[300];
             make_hash_key(key, key_size, hash_key, sizeof(hash_key));
             
-            key_entry_t *entry = NULL;
-            HASH_FIND_STR(all_keys, hash_key, entry);
-            
-            if (entry) {
-                // Duplicate key - update value and reset deleted flag
-                free(entry->value);
-                entry->value = strdup(value);
-                entry->value_len = strlen(value);
-                entry->deleted = false;  // Key is back in the tree
-                entry->insert_index = next_key_index;  // Update to latest insert
-            } else {
-                // New key
-                entry = malloc(sizeof(key_entry_t));
-                strcpy(entry->hash_key, hash_key);
-                entry->key = malloc(key_size);
-                memcpy(entry->key, key, key_size);
-                entry->key_len = key_size;
-                entry->value = strdup(value);
-                entry->value_len = strlen(value);
-                entry->deleted = false;
-                entry->insert_index = next_key_index;
-                entry->delete_index = -1;
-                HASH_ADD_STR(all_keys, hash_key, entry);
-            }
+            key_entry_t *pending = malloc(sizeof(key_entry_t));
+            strcpy(pending->hash_key, hash_key);
+            pending->key = malloc(key_size);
+            memcpy(pending->key, key, key_size);
+            pending->key_len = key_size;
+            pending->value = strdup(value);
+            pending->value_len = strlen(value);
+            pending->deleted = false;
+            pending->insert_index = next_key_index;
+            pending->delete_index = -1;
+            HASH_ADD_STR(pending_keys, hash_key, pending);
             
             free(key);
             free(value);
@@ -260,41 +262,155 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
             stats.total_inserts++;
         }
         
-        // Phase 2: SEARCH - verify all non-deleted keys exist
+        // Phase 2: BATCH DELETE within same transaction (10-30% of active keys)
+        int active_count = 0;
+        HASH_ITER(hh, all_keys, entry, tmp) {
+            if (!entry->deleted) active_count++;
+        }
+        
+        if (active_count > 10) {
+            int delete_count = (active_count * (10 + (rand_r(&seed) % 21))) / 100;  // 10-30%
+            int deleted = 0;
+            
+            HASH_ITER(hh, all_keys, entry, tmp) {
+                if (deleted >= delete_count) break;
+                if (entry->deleted) continue;
+                
+                // Delete this key within transaction
+                if (!data_art_delete(tree, entry->key, entry->key_len)) {
+                    FAIL_FAST("Delete (txn) failed! Iteration %lu, key index %d",
+                             stats.iterations, entry->insert_index);
+                }
+                
+                // Track deletion in pending
+                char hash_key[300];
+                make_hash_key(entry->key, entry->key_len, hash_key, sizeof(hash_key));
+                
+                key_entry_t *pending = malloc(sizeof(key_entry_t));
+                strcpy(pending->hash_key, hash_key);
+                pending->key = malloc(entry->key_len);
+                memcpy(pending->key, entry->key, entry->key_len);
+                pending->key_len = entry->key_len;
+                pending->value = NULL;
+                pending->value_len = 0;
+                pending->deleted = true;
+                pending->insert_index = entry->insert_index;
+                pending->delete_index = deleted;
+                HASH_ADD_STR(pending_keys, hash_key, pending);
+                
+                deleted++;
+                stats.total_deletes++;
+            }
+        }
+        
+        // Verify tree size is unchanged during transaction (operations buffered)
+        size_t tree_size_before_commit = data_art_size(tree);
+        int expected_size_before = 0;
+        HASH_ITER(hh, all_keys, entry, tmp) {
+            if (!entry->deleted) expected_size_before++;
+        }
+        
+        if (tree_size_before_commit != (size_t)expected_size_before) {
+            FAIL_FAST("Tree modified before commit! Expected %d, got %zu at iteration %lu",
+                     expected_size_before, tree_size_before_commit, stats.iterations);
+        }
+        
+        // =================================================================
+        // RANDOM COMMIT OR ABORT (90% commit, 10% abort)
+        // =================================================================
+        bool should_commit = (rand_r(&seed) % 100) < 90;
+        
+        if (should_commit) {
+            // COMMIT - apply all operations atomically
+            if (!data_art_commit_txn(tree)) {
+                FAIL_FAST("Failed to commit transaction at iteration %lu", stats.iterations);
+            }
+            stats.total_commits++;
+            
+            // Apply pending operations to tracking
+            HASH_ITER(hh, pending_keys, entry, tmp) {
+                key_entry_t *tracked = NULL;
+                HASH_FIND_STR(all_keys, entry->hash_key, tracked);
+                
+                if (entry->deleted) {
+                    // Mark as deleted
+                    if (tracked) {
+                        tracked->deleted = true;
+                        tracked->delete_index = entry->delete_index;
+                    }
+                } else {
+                    // Insert/update
+                    if (tracked) {
+                        // Update existing
+                        free(tracked->value);
+                        tracked->value = strdup(entry->value);
+                        tracked->value_len = entry->value_len;
+                        tracked->deleted = false;
+                        tracked->insert_index = entry->insert_index;
+                    } else {
+                        // New key
+                        key_entry_t *new_entry = malloc(sizeof(key_entry_t));
+                        strcpy(new_entry->hash_key, entry->hash_key);
+                        new_entry->key = malloc(entry->key_len);
+                        memcpy(new_entry->key, entry->key, entry->key_len);
+                        new_entry->key_len = entry->key_len;
+                        new_entry->value = strdup(entry->value);
+                        new_entry->value_len = entry->value_len;
+                        new_entry->deleted = false;
+                        new_entry->insert_index = entry->insert_index;
+                        new_entry->delete_index = -1;
+                        HASH_ADD_STR(all_keys, hash_key, new_entry);
+                    }
+                }
+            }
+        } else {
+            // ABORT - discard all operations
+            if (!data_art_abort_txn(tree)) {
+                FAIL_FAST("Failed to abort transaction at iteration %lu", stats.iterations);
+            }
+            stats.total_aborts++;
+            
+            // Don't update tracking - operations were rolled back
+            printf(COLOR_YELLOW "Aborted transaction (iteration %lu, %d inserts, %d deletes rolled back)" COLOR_RESET "\n",
+                   stats.iterations, insert_batch, 
+                   HASH_COUNT(pending_keys) - insert_batch);
+        }
+        
+        // =================================================================
+        // VERIFICATION: Ensure atomicity guarantees hold
+        // =================================================================
+        
+        // Verify all non-deleted tracked keys exist in tree
         int search_count = 0;
-        key_entry_t *entry, *tmp;
         HASH_ITER(hh, all_keys, entry, tmp) {
             if (entry->deleted) {
                 // Should NOT exist
                 size_t value_len;
                 const void *retrieved = data_art_get(tree, entry->key, entry->key_len, &value_len);
                 if (retrieved != NULL) {
-                    fprintf(stderr, "\n=== BUG DETAILS ===");
+                    fprintf(stderr, "\n=== ATOMICITY VIOLATION ===");
                     fprintf(stderr, "\nDeleted key found: insert_index=%d, delete_index=%d",
                             entry->insert_index, entry->delete_index);
                     fprintf(stderr, "\nKey (first 32 bytes): ");
                     for (size_t i = 0; i < entry->key_len && i < 32; i++) {
                         fprintf(stderr, "%02x ", entry->key[i]);
                     }
-                    fprintf(stderr, "\nKey length: %zu", entry->key_len);
-                    fprintf(stderr, "\nValue length retrieved: %zu", value_len);
-                    fprintf(stderr, "\n===================\n");
+                    fprintf(stderr, "\n===========================\n");
                     free((void *)retrieved);
-                    FAIL_FAST("Deleted key still exists! Iteration %lu, deleted at index %d",
-                             stats.iterations, entry->delete_index);
+                    FAIL_FAST("Deleted key still exists after transaction! Iteration %lu", stats.iterations);
                 }
             } else {
                 // Should exist
                 size_t value_len;
                 const void *retrieved = data_art_get(tree, entry->key, entry->key_len, &value_len);
                 if (!retrieved) {
-                    FAIL_FAST("Key not found! Iteration %lu, inserted at index %d",
+                    FAIL_FAST("Key not found after transaction! Iteration %lu, insert_index=%d",
                              stats.iterations, entry->insert_index);
                 }
                 
                 if (value_len != entry->value_len || memcmp(retrieved, entry->value, value_len) != 0) {
                     free((void *)retrieved);
-                    FAIL_FAST("Value mismatch! Iteration %lu, key index %d",
+                    FAIL_FAST("Value mismatch after transaction! Iteration %lu, insert_index=%d",
                              stats.iterations, entry->insert_index);
                 }
                 
@@ -304,41 +420,14 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
             stats.total_searches++;
         }
         
-        // Phase 3: DELETE random subset of keys (20-40%)
-        int active_count = 0;
-        HASH_ITER(hh, all_keys, entry, tmp) {
-            if (!entry->deleted) active_count++;
-        }
-        
-        if (active_count > 10) {
-            int delete_count = (active_count * (20 + (rand_r(&seed) % 21))) / 100;  // 20-40%
-            int deleted = 0;
-            
-            HASH_ITER(hh, all_keys, entry, tmp) {
-                if (deleted >= delete_count) break;
-                if (entry->deleted) continue;
-                
-                // Delete this key
-                if (!data_art_delete(tree, entry->key, entry->key_len)) {
-                    FAIL_FAST("Delete failed! Iteration %lu, key index %d",
-                             stats.iterations, entry->insert_index);
-                }
-                
-                entry->deleted = true;
-                entry->delete_index = deleted;
-                deleted++;
-                stats.total_deletes++;
-            }
-        }
-        
-        // Phase 4: Verify tree size matches active keys
+        // Verify tree size matches expected
         int expected_size = 0;
         HASH_ITER(hh, all_keys, entry, tmp) {
             if (!entry->deleted) expected_size++;
         }
         
         if (data_art_size(tree) != (size_t)expected_size) {
-            FAIL_FAST("Tree size mismatch! Expected %d, got %zu at iteration %lu",
+            FAIL_FAST("Tree size mismatch after transaction! Expected %d, got %zu at iteration %lu",
                      expected_size, data_art_size(tree), stats.iterations);
         }
         
@@ -346,11 +435,11 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
         time_t now = time(NULL);
         if (now - last_status >= 15) {
             int elapsed = now - start_time;
-            printf("[%02d:%02d/%02d:%02d] Iter: %4lu | Inserts: %7lu | Searches: %7lu | Deletes: %6lu | Active Keys: %5d\n",
+            printf("[%02d:%02d/%02d:%02d] Iter: %4lu | Commits: %4lu | Aborts: %3lu | Inserts: %7lu | Deletes: %6lu | Active: %5d\n",
                    elapsed / 60, elapsed % 60,
                    duration_seconds / 60, duration_seconds % 60,
-                   stats.iterations, stats.total_inserts, stats.total_searches, 
-                   stats.total_deletes, expected_size);
+                   stats.iterations, stats.total_commits, stats.total_aborts,
+                   stats.total_inserts, stats.total_deletes, expected_size);
             last_status = now;
         }
     }
@@ -374,6 +463,13 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
         free(entry);
     }
     
+    HASH_ITER(hh, pending_keys, entry, tmp) {
+        HASH_DEL(pending_keys, entry);
+        free(entry->key);
+        if (entry->value) free(entry->value);
+        free(entry);
+    }
+    
     data_art_destroy(tree);
     wal_close(wal);
     if (bp) buffer_pool_destroy(bp);
@@ -382,12 +478,16 @@ static void run_full_stress_test(int duration_seconds, bool use_buffer_pool, uns
     
     printf("\n");
     printf("================================================================\n");
-    printf(COLOR_GREEN "✓ STRESS TEST PASSED" COLOR_RESET "\n");
+    printf(COLOR_GREEN "✓ TRANSACTION STRESS TEST PASSED" COLOR_RESET "\n");
     printf("  Duration: %ld seconds\n", total_duration);
     printf("  Iterations: %lu\n", stats.iterations);
+    printf("  Total commits: %lu (%.1f%%)\n", stats.total_commits, 
+           100.0 * stats.total_commits / (stats.total_commits + stats.total_aborts));
+    printf("  Total aborts: %lu (%.1f%%)\n", stats.total_aborts,
+           100.0 * stats.total_aborts / (stats.total_commits + stats.total_aborts));
     printf("  Total inserts: %lu\n", stats.total_inserts);
-    printf("  Total searches: %lu\n", stats.total_searches);
     printf("  Total deletes: %lu\n", stats.total_deletes);
+    printf("  Total searches: %lu\n", stats.total_searches);
     printf("  Final active keys: %d\n", active_keys);
     printf("  Final deleted keys: %d\n", deleted_keys);
     printf("  Average throughput: %.1f ops/sec\n", 
@@ -402,7 +502,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  use_buffer_pool: 1 to enable, 0 to disable (default: 0)\n");
         fprintf(stderr, "  seed: Random seed for reproducibility (default: current time)\n");
         fprintf(stderr, "  key_size: 20 (address) or 32 (hash) bytes (default: 32)\n");
-        fprintf(stderr, "\nNote: WAL is always enabled for durability testing\n");
+        fprintf(stderr, "\nNote: Uses transaction buffer for atomic multi-key updates\n");
         return 1;
     }
     
@@ -431,6 +531,6 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    run_full_stress_test(duration, use_buffer_pool, base_seed, key_size);
+    run_txn_stress_test(duration, use_buffer_pool, base_seed, key_size);
     return 0;
 }
