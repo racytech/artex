@@ -19,6 +19,34 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <pthread.h>
+
+// Thread-local transaction context
+typedef struct {
+    data_art_tree_t *tree;           // Tree this transaction belongs to
+    uint64_t txn_id;                 // Transaction ID
+    txn_buffer_t *txn_buffer;        // Buffer for pending operations
+} thread_txn_context_t;
+
+static pthread_key_t txn_context_key;
+static pthread_once_t txn_context_key_once = PTHREAD_ONCE_INIT;
+
+// Initialize thread-local storage key
+static void make_txn_context_key() {
+    pthread_key_create(&txn_context_key, free);
+}
+
+// Get thread-local transaction context
+static thread_txn_context_t *get_txn_context() {
+    pthread_once(&txn_context_key_once, make_txn_context_key);
+    return (thread_txn_context_t *)pthread_getspecific(txn_context_key);
+}
+
+// Set thread-local transaction context
+static void set_txn_context(thread_txn_context_t *ctx) {
+    pthread_once(&txn_context_key_once, make_txn_context_key);
+    pthread_setspecific(txn_context_key, ctx);
+}
 
 // Snapshot handle structure - each thread owns one
 struct data_art_snapshot {
@@ -86,10 +114,18 @@ data_art_tree_t *data_art_create(page_manager_t *page_manager,
     tree->current_txn_id = 0;        // No active transaction
     tree->txn_buffer = NULL;         // No transaction buffer initially
     
+    // Initialize write lock for serializing write operations
+    if (pthread_rwlock_init(&tree->write_lock, NULL) != 0) {
+        LOG_ERROR("Failed to initialize write_lock");
+        free(tree);
+        return NULL;
+    }
+    
     // Initialize MVCC manager
     tree->mvcc_manager = mvcc_manager_create();
     if (!tree->mvcc_manager) {
         LOG_ERROR("Failed to create MVCC manager");
+        pthread_rwlock_destroy(&tree->write_lock);
         free(tree);
         return NULL;
     }
@@ -118,6 +154,9 @@ void data_art_destroy(data_art_tree_t *tree) {
     if (!tree) {
         return;
     }
+    
+    // Destroy write lock
+    pthread_rwlock_destroy(&tree->write_lock);
     
     // Destroy MVCC manager
     if (tree->mvcc_manager) {
@@ -286,8 +325,8 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
         return false;
     }
     
-    // Try to get page from buffer pool
-    page_t *page = buffer_pool_get(tree->buffer_pool, ref.page_id);
+    // Try to get page from buffer pool (and pin it atomically)
+    page_t *page = buffer_pool_get_pinned(tree->buffer_pool, ref.page_id);
     bool page_is_temp = false;
     page_t *temp_page_allocated = NULL;
     
@@ -315,14 +354,6 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
         page_is_temp = true;
     }
     
-    // Zero out the entire data area first to prevent stale data
-    // This is critical when pages are reused or when old data persists on disk
-    LOG_DEBUG("[WRITE_NODE] Zeroing page=%lu data area (%zu bytes) before writing | first_byte_before=0x%02x last_byte_before=0x%02x", 
-              ref.page_id, PAGE_SIZE - PAGE_HEADER_SIZE, page->data[0], page->data[PAGE_SIZE - PAGE_HEADER_SIZE - 1]);
-    memset(page->data, 0, PAGE_SIZE - PAGE_HEADER_SIZE);
-    LOG_DEBUG("[WRITE_NODE] After zeroing page=%lu | first_byte_after=0x%02x last_byte_after=0x%02x", 
-              ref.page_id, page->data[0], page->data[PAGE_SIZE - PAGE_HEADER_SIZE - 1]);
-    
     // Copy node data to page at offset
     LOG_DEBUG("[WRITE_NODE] Copying %zu bytes to page=%lu offset=%u", size, ref.page_id, ref.offset);
     memcpy(page->data + ref.offset, node, size);
@@ -343,12 +374,18 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
     if (!page_is_temp) {
         // Page is in buffer pool - mark as dirty for later flush
         buffer_pool_mark_dirty(tree->buffer_pool, ref.page_id);
+        
+        // Unpin the page now that we're done modifying it
+        buffer_pool_unpin(tree->buffer_pool, ref.page_id);
     } else {
         // Temp page for new allocation - write directly and reload into buffer pool
         LOG_DEBUG("[WRITE_NODE] Writing new page=%lu to disk", ref.page_id);
         page_result_t result = page_manager_write(tree->page_manager, page);
         if (result != PAGE_SUCCESS) {
             LOG_ERROR("Failed to write page %lu", ref.page_id);
+            if (temp_page_allocated) {
+                free(temp_page_allocated);
+            }
             return false;
         }
         LOG_DEBUG("[WRITE_NODE] Page %lu written to disk successfully", ref.page_id);
@@ -905,8 +942,10 @@ bool data_art_begin_txn(data_art_tree_t *tree, uint64_t *txn_id_out) {
         return false;
     }
     
-    if (tree->txn_buffer) {
-        LOG_ERROR("Transaction already active (txn_buffer exists)");
+    // Check if this thread already has an active transaction
+    thread_txn_context_t *ctx = get_txn_context();
+    if (ctx && ctx->txn_buffer) {
+        LOG_ERROR("Transaction already active for this thread (txn_id=%lu)", ctx->txn_id);
         return false;
     }
     
@@ -925,22 +964,40 @@ bool data_art_begin_txn(data_art_tree_t *tree, uint64_t *txn_id_out) {
     }
     
     // Create transaction buffer
-    tree->txn_buffer = txn_buffer_create(txn_id, 16);
-    if (!tree->txn_buffer) {
+    txn_buffer_t *buffer = txn_buffer_create(txn_id, 16);
+    if (!buffer) {
         LOG_ERROR("Failed to create transaction buffer");
         wal_log_abort_txn(tree->wal, txn_id, NULL);
         mvcc_abort_txn(tree->mvcc_manager, txn_id);
         return false;
     }
     
-    // Set transaction ID (will be restored to snapshot's ID after commit/abort if snapshot active)
+    // Create or update thread-local context
+    if (!ctx) {
+        ctx = malloc(sizeof(thread_txn_context_t));
+        if (!ctx) {
+            LOG_ERROR("Failed to allocate transaction context");
+            txn_buffer_destroy(buffer);
+            wal_log_abort_txn(tree->wal, txn_id, NULL);
+            mvcc_abort_txn(tree->mvcc_manager, txn_id);
+            return false;
+        }
+        set_txn_context(ctx);
+    }
+    
+    ctx->tree = tree;
+    ctx->txn_id = txn_id;
+    ctx->txn_buffer = buffer;
+    
+    // Also set on tree for backward compatibility (single-threaded access)
     tree->current_txn_id = txn_id;
+    tree->txn_buffer = buffer;
     
     if (txn_id_out) {
         *txn_id_out = txn_id;
     }
     
-    LOG_INFO("Began transaction %lu (MVCC-allocated)", txn_id);
+    LOG_INFO("Began transaction %lu (MVCC-allocated) for thread %p", txn_id, (void*)pthread_self());
     return true;
 }
 
@@ -950,24 +1007,27 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
         return false;
     }
     
-    if (tree->current_txn_id == 0) {
-        LOG_ERROR("No active transaction to commit");
+    // Get thread-local transaction context
+    thread_txn_context_t *ctx = get_txn_context();
+    if (!ctx || !ctx->txn_buffer) {
+        LOG_ERROR("No active transaction to commit for this thread");
         return false;
     }
     
-    if (!tree->txn_buffer) {
-        LOG_ERROR("Transaction buffer missing");
+    if (ctx->tree != tree) {
+        LOG_ERROR("Transaction belongs to different tree");
         return false;
     }
     
-    uint64_t txn_id = tree->current_txn_id;
+    uint64_t txn_id = ctx->txn_id;
+    txn_buffer_t *buffer = ctx->txn_buffer;
     
     // Apply all buffered operations to the tree
-    for (size_t i = 0; i < tree->txn_buffer->num_ops; i++) {
-        txn_operation_t *op = &tree->txn_buffer->operations[i];
+    for (size_t i = 0; i < buffer->num_ops; i++) {
+        txn_operation_t *op = &buffer->operations[i];
         
         // Temporarily clear txn_buffer to prevent recursive buffering
-        txn_buffer_t *saved_buffer = tree->txn_buffer;
+        ctx->txn_buffer = NULL;
         tree->txn_buffer = NULL;
         
         bool success;
@@ -978,15 +1038,18 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
             success = data_art_delete(tree, op->key, op->key_len);
         }
         
-        tree->txn_buffer = saved_buffer;
+        // Restore buffer
+        ctx->txn_buffer = buffer;
+        tree->txn_buffer = buffer;
         
         if (!success) {
             LOG_ERROR("Failed to apply operation %zu during commit", i);
-            // Partial commit - some operations applied, some failed
-            // In production, need more sophisticated error handling
-            txn_buffer_destroy(tree->txn_buffer);
+            // Cleanup and abort
+            txn_buffer_destroy(buffer);
+            ctx->txn_buffer = NULL;
             tree->txn_buffer = NULL;
             tree->current_txn_id = 0;
+            mvcc_abort_txn(tree->mvcc_manager, txn_id);
             return false;
         }
     }
@@ -994,8 +1057,9 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
     // Log commit to WAL
     if (!wal_log_commit_txn(tree->wal, txn_id, NULL)) {
         LOG_ERROR("Failed to commit transaction %lu to WAL", txn_id);
-        // Operations are already applied to tree - durability failure
-        txn_buffer_destroy(tree->txn_buffer);
+        // Operations already applied - durability failure
+        txn_buffer_destroy(buffer);
+        ctx->txn_buffer = NULL;
         tree->txn_buffer = NULL;
         tree->current_txn_id = 0;
         return false;
@@ -1007,11 +1071,12 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
     }
     
     // Clean up
-    txn_buffer_destroy(tree->txn_buffer);
+    txn_buffer_destroy(buffer);
+    ctx->txn_buffer = NULL;
     tree->txn_buffer = NULL;
     tree->current_txn_id = 0;
     
-    LOG_INFO("Committed transaction %lu", txn_id);
+    LOG_INFO("Committed transaction %lu for thread %p", txn_id, (void*)pthread_self());
     return true;
 }
 
@@ -1021,21 +1086,24 @@ bool data_art_abort_txn(data_art_tree_t *tree) {
         return false;
     }
     
-    if (tree->current_txn_id == 0) {
-        LOG_ERROR("No active transaction to abort");
+    // Get thread-local transaction context
+    thread_txn_context_t *ctx = get_txn_context();
+    if (!ctx || !ctx->txn_buffer) {
+        LOG_ERROR("No active transaction to abort for this thread");
         return false;
     }
     
-    if (!tree->txn_buffer) {
-        LOG_ERROR("Transaction buffer missing");
+    if (ctx->tree != tree) {
+        LOG_ERROR("Transaction belongs to different tree");
         return false;
     }
     
-    uint64_t txn_id = tree->current_txn_id;
-    size_t num_ops = txn_buffer_size(tree->txn_buffer);
+    uint64_t txn_id = ctx->txn_id;
+    size_t num_ops = txn_buffer_size(ctx->txn_buffer);
     
     // Discard all buffered operations (no tree modification)
-    txn_buffer_destroy(tree->txn_buffer);
+    txn_buffer_destroy(ctx->txn_buffer);
+    ctx->txn_buffer = NULL;
     tree->txn_buffer = NULL;
     
     // Log abort to WAL
@@ -1052,8 +1120,8 @@ bool data_art_abort_txn(data_art_tree_t *tree) {
     
     tree->current_txn_id = 0;
     
-    LOG_INFO("Aborted transaction %lu (discarded %zu operations)", 
-             txn_id, num_ops);
+    LOG_INFO("Aborted transaction %lu (discarded %zu operations) for thread %p", 
+             txn_id, num_ops, (void*)pthread_self());
     return true;
 }
 

@@ -244,6 +244,9 @@ typedef struct data_art_tree {
     uint64_t current_txn_id;     // Active transaction ID (0 = no transaction)
     struct txn_buffer *txn_buffer; // Buffer for pending operations (NULL if not in transaction)
     
+    // Concurrency control
+    pthread_rwlock_t write_lock; // Serializes all write operations (one writer at a time)
+    
     // MVCC support
     mvcc_manager_t *mvcc_manager; // MVCC manager for snapshot isolation
     

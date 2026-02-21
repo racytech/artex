@@ -77,6 +77,22 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
         return false;  // Empty tree, nothing to delete
     }
     
+    // Acquire write lock to serialize all write operations (one writer at a time)
+    pthread_rwlock_wrlock(&tree->write_lock);
+    
+    // Allocate unique transaction ID for auto-commit (even outside explicit transactions)
+    // This ensures every version has a unique xmax for MVCC visibility
+    uint64_t auto_txn_id = 0;
+    bool auto_commit = (tree->current_txn_id == 0);
+    if (auto_commit && tree->mvcc_manager) {
+        if (!mvcc_begin_txn(tree->mvcc_manager, &auto_txn_id)) {
+            pthread_rwlock_unlock(&tree->write_lock);
+            LOG_ERROR("Failed to begin auto-commit transaction");
+            return false;
+        }
+        tree->current_txn_id = auto_txn_id;
+    }
+    
     bool deleted = false;
     node_ref_t new_root = delete_recursive(tree, tree->root, key, key_len, 0, &deleted);
     
@@ -92,8 +108,21 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
                 // Note: Tree is already modified - this is a durability failure
             }
         }
+        
+        // Auto-commit the transaction if we started one
+        if (auto_commit && tree->mvcc_manager) {
+            mvcc_commit_txn(tree->mvcc_manager, auto_txn_id);
+            tree->current_txn_id = 0;  // Clear auto-commit txn
+        }
+    } else {
+        // Failed to delete - abort auto-commit transaction if we started one
+        if (auto_commit && tree->mvcc_manager) {
+            mvcc_abort_txn(tree->mvcc_manager, auto_txn_id);
+            tree->current_txn_id = 0;
+        }
     }
     
+    pthread_rwlock_unlock(&tree->write_lock);
     return deleted;
 }
 
@@ -120,12 +149,24 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         const data_art_leaf_t *leaf = (const data_art_leaf_t *)node;
         
         if (leaf_matches(leaf, key, key_len)) {
+            // Check if already deleted (prevents double-deletion bug)
+            if (leaf->xmax != 0) {
+                LOG_DEBUG("[DELETE_LEAF] Key already deleted (xmax=%lu), skipping", leaf->xmax);
+                *deleted = false;
+                return node_ref;
+            }
+            
             // MVCC logical deletion: Set xmax instead of physical removal
-            // ONLY do this when snapshots might exist (i.e., when we're using MVCC for real)
-            // For regular transactions without snapshots, do physical deletion
-            // BUT: If the leaf was created in the current transaction, do physical deletion
-            // because no other transaction can see it yet
-            bool should_do_logical_delete = tree->mvcc_manager && 
+            // Only use logical deletes when there are active snapshots that need
+            // to see the old version. Otherwise, use physical deletion for efficiency.
+            //
+            // Logical delete when:
+            // 1. MVCC manager exists
+            // 2. There are active snapshots (concurrent readers need versions preserved)
+            // 3. The leaf was created by a different transaction (not in-flight creation)
+            bool has_snapshots = tree->mvcc_manager && 
+                                mvcc_has_active_snapshots(tree->mvcc_manager);
+            bool should_do_logical_delete = has_snapshots && 
                                            tree->current_txn_id > 0 && 
                                            leaf->xmin != tree->current_txn_id;
             

@@ -942,6 +942,22 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
         return txn_buffer_add_insert(tree->txn_buffer, key, key_len, value, value_len);
     }
     
+    // Acquire write lock to serialize all write operations (one writer at a time)
+    pthread_rwlock_wrlock(&tree->write_lock);
+    
+    // Allocate unique transaction ID for auto-commit (even outside explicit transactions)
+    // This ensures every version has a unique xmin for MVCC visibility
+    uint64_t auto_txn_id = 0;
+    bool auto_commit = (tree->current_txn_id == 0);
+    if (auto_commit && tree->mvcc_manager) {
+        if (!mvcc_begin_txn(tree->mvcc_manager, &auto_txn_id)) {
+            pthread_rwlock_unlock(&tree->write_lock);
+            LOG_ERROR("Failed to begin auto-commit transaction");
+            return false;
+        }
+        tree->current_txn_id = auto_txn_id;
+    }
+    
     bool inserted = false;
     node_ref_t new_root = insert_recursive(tree, tree->root, key, key_len, 0,
                                             value, value_len, &inserted);
@@ -961,8 +977,23 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
                 }
             }
         }
+        
+        // Auto-commit the transaction if we started one
+        if (auto_commit && tree->mvcc_manager) {
+            mvcc_commit_txn(tree->mvcc_manager, auto_txn_id);
+            tree->current_txn_id = 0;  // Clear auto-commit txn
+        }
+        
+        pthread_rwlock_unlock(&tree->write_lock);
         return true;
     }
     
+    // Failed to insert - abort auto-commit transaction if we started one
+    if (auto_commit && tree->mvcc_manager) {
+        mvcc_abort_txn(tree->mvcc_manager, auto_txn_id);
+        tree->current_txn_id = 0;
+    }
+    
+    pthread_rwlock_unlock(&tree->write_lock);
     return false;
 }

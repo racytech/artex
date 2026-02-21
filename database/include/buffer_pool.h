@@ -157,6 +157,19 @@ void buffer_pool_destroy(buffer_pool_t *bp);
 page_t *buffer_pool_get(buffer_pool_t *bp, uint64_t page_id);
 
 /**
+ * Get and pin a page atomically
+ * 
+ * Like buffer_pool_get(), but pins the page before releasing the buffer pool lock.
+ * This prevents the page from being evicted between get and pin.
+ * Must call buffer_pool_unpin() when done with the page.
+ * 
+ * @param bp Buffer pool
+ * @param page_id Page ID to retrieve
+ * @return Pointer to page in cache, or NULL on error
+ */
+page_t *buffer_pool_get_pinned(buffer_pool_t *bp, uint64_t page_id);
+
+/**
  * Pin a page to prevent eviction
  * 
  * Increments pin count. Pinned pages (pin_count > 0) cannot be evicted.

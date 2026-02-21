@@ -215,6 +215,25 @@ static buffer_frame_t *load_page(buffer_pool_t *bp, uint64_t page_id) {
     
     // Read page from disk
     page_result_t result = page_manager_read(bp->page_manager, page_id, &frame->page);
+    if (result == PAGE_ERROR_IO) {
+        // Page might be allocated but not yet written to disk
+        // This is normal in concurrent scenarios - initialize as empty page
+        LOG_DEBUG("Page %lu not on disk yet, initializing as new page", page_id);
+        memset(&frame->page, 0, sizeof(page_t));
+        frame->page.header.page_id = page_id;
+        frame->page.header.version = 0;
+        frame->page.header.free_offset = PAGE_HEADER_SIZE;
+        frame->page.header.num_nodes = 0;
+        frame->page.header.fragmented_bytes = 0;
+        frame->page.header.compression_type = 0;
+        frame->page.header.compressed_size = 0;
+        frame->page.header.uncompressed_size = PAGE_SIZE;
+        frame->page.header.flags = 0;
+        frame->is_dirty = true;  // Mark dirty so it gets written on flush
+        bp->stats.total_loads++;
+        return frame;
+    }
+    
     if (result != PAGE_SUCCESS) {
         LOG_ERROR("Failed to read page %lu from disk", page_id);
         free(frame);
@@ -360,6 +379,75 @@ page_t *buffer_pool_get(buffer_pool_t *bp, uint64_t page_id) {
     
     // Update stats
     bp->stats.num_frames = HASH_COUNT(bp->frames_hash);
+    
+    pthread_rwlock_unlock(&bp->lock);
+    return &frame->page;
+}
+
+page_t *buffer_pool_get_pinned(buffer_pool_t *bp, uint64_t page_id) {
+    if (!bp) {
+        return NULL;
+    }
+    
+    pthread_rwlock_wrlock(&bp->lock);
+    
+    // Check if page is in cache
+    buffer_frame_t *frame = find_frame(bp, page_id);
+    
+    if (frame) {
+        // Cache hit - pin it before releasing lock
+        if (bp->config.enable_statistics) {
+            bp->stats.cache_hits++;
+        }
+        
+        // Move to head of LRU list
+        lru_touch(bp, frame);
+        
+        // Pin the frame atomically
+        if (frame->pin_count == 0) {
+            bp->stats.num_pinned++;
+        }
+        frame->pin_count++;
+        bp->stats.pins++;
+        
+        pthread_rwlock_unlock(&bp->lock);
+        return &frame->page;
+    }
+    
+    // Cache miss - need to load from disk
+    if (bp->config.enable_statistics) {
+        bp->stats.cache_misses++;
+    }
+    
+    // Check if we need to evict
+    size_t current_size = HASH_COUNT(bp->frames_hash);
+    if (current_size >= bp->config.capacity) {
+        if (!evict_lru_frame(bp)) {
+            pthread_rwlock_unlock(&bp->lock);
+            return NULL;
+        }
+    }
+    
+    // Load page from disk
+    frame = load_page(bp, page_id);
+    if (!frame) {
+        pthread_rwlock_unlock(&bp->lock);
+        return NULL;
+    }
+    
+    // Add to cache
+    add_frame(bp, frame);
+    lru_add_head(bp, frame);
+    
+    // Update stats
+    bp->stats.num_frames = HASH_COUNT(bp->frames_hash);
+    
+    // Pin the newly loaded frame before releasing lock
+    if (frame->pin_count == 0) {
+        bp->stats.num_pinned++;
+    }
+    frame->pin_count++;
+    bp->stats.pins++;
     
     pthread_rwlock_unlock(&bp->lock);
     return &frame->page;

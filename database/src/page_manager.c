@@ -366,8 +366,14 @@ page_result_t page_manager_read(page_manager_t *pm, uint64_t page_id,
     }
     
     if (bytes_read != PAGE_SIZE) {
-        LOG_ERROR("Short read for page %lu: got %zd bytes, expected %d",
-                 page_id, bytes_read, PAGE_SIZE);
+        if (bytes_read == 0) {
+            // Page allocated but not yet written - normal in concurrent scenarios
+            LOG_DEBUG("Page %lu not yet written to disk (0 bytes read)", page_id);
+        } else {
+            // Partial read - actual error
+            LOG_ERROR("Short read for page %lu: got %zd bytes, expected %d",
+                     page_id, bytes_read, PAGE_SIZE);
+        }
         // Clear the buffer to avoid using partial/garbage data
         memset(page_out, 0, sizeof(*page_out));
         return PAGE_ERROR_IO;

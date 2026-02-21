@@ -42,11 +42,14 @@ typedef enum {
  * Transaction information
  * 
  * Tracks state of a transaction for visibility checks.
+ * Forms linked list for hash map chaining.
  */
-typedef struct {
+typedef struct txn_info {
     uint64_t txn_id;           // Transaction ID
     txn_state_t state;         // Current state
     uint64_t commit_ts;        // Commit timestamp (0 if not committed)
+    uint64_t epoch;            // Epoch when entry was created
+    struct txn_info *next;     // Next in hash chain
 } txn_info_t;
 
 // ============================================================================
@@ -83,23 +86,55 @@ typedef struct mvcc_snapshot {
 // ============================================================================
 
 /**
+ * Retired transaction entry for epoch-based garbage collection
+ */
+typedef struct retired_txn {
+    txn_info_t *entry;              // Transaction entry to be freed
+    uint64_t retire_epoch;          // Epoch when entry was retired
+    struct retired_txn *next;       // Next in retirement queue
+} retired_txn_t;
+
+/**
+ * Transaction hash map for dynamic growth
+ */
+typedef struct {
+    txn_info_t **buckets;           // Array of hash buckets
+    size_t bucket_count;            // Number of buckets (power of 2)
+    size_t active_count;            // Number of active entries
+    size_t threshold;               // Resize threshold (75% of bucket_count)
+    pthread_rwlock_t resize_lock;   // Lock for concurrent resizing
+} txn_map_t;
+
+/**
+ * Epoch-based garbage collection system
+ */
+typedef struct {
+    uint64_t global_epoch;          // Current global epoch
+    pthread_mutex_t epoch_lock;     // Lock for epoch advancement
+    retired_txn_t *retired_queue;   // Queue of retired entries
+    size_t retired_count;           // Number of retired entries
+} epoch_gc_t;
+
+/**
  * MVCC Manager - coordinates transaction state and snapshots
  * 
  * Central coordinator for all MVCC operations:
  * - Assigns transaction IDs
- * - Tracks transaction states
+ * - Tracks transaction states (via dynamic hash map)
  * - Creates and manages snapshots
  * - Provides visibility checks
+ * - Garbage collects old transaction entries
  */
 typedef struct mvcc_manager {
     // Transaction ID allocation
     uint64_t next_txn_id;          // Next transaction ID to assign
     pthread_mutex_t txn_id_lock;   // Lock for txn_id allocation
     
-    // Transaction state tracking
-    txn_info_t *txn_table;         // Hash table of transaction states
-    size_t txn_table_size;         // Size of transaction table
-    pthread_rwlock_t txn_lock;     // RW lock for transaction table
+    // Transaction state tracking (dynamic hash map)
+    txn_map_t txn_map;             // Dynamic hash map for transaction states
+    
+    // Epoch-based garbage collection
+    epoch_gc_t gc;                 // GC system for safe reclamation
     
     // Active snapshots
     mvcc_snapshot_t *snapshots;    // Linked list of active snapshots
@@ -186,6 +221,17 @@ void mvcc_snapshot_acquire(mvcc_snapshot_t *snapshot);
  * @param snapshot Snapshot to release
  */
 void mvcc_snapshot_release(mvcc_manager_t *manager, mvcc_snapshot_t *snapshot);
+
+/**
+ * Check if there are any active snapshots
+ * 
+ * Used to determine if logical deletes are needed (to preserve versions
+ * for concurrent readers).
+ * 
+ * @param manager MVCC manager
+ * @return true if there are active snapshots, false otherwise
+ */
+bool mvcc_has_active_snapshots(mvcc_manager_t *manager);
 
 // ============================================================================
 // Visibility Checks

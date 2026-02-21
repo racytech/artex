@@ -272,6 +272,13 @@ add_executable(test_concurrent_snapshots
 target_link_libraries(test_concurrent_snapshots art_persistent pthread)
 add_test(NAME test_concurrent_snapshots COMMAND test_concurrent_snapshots)
 
+# Test: Fail-Fast Stress Test (60 seconds)
+add_executable(test_fail_fast_stress
+    database/tests/test_fail_fast_stress.c
+)
+target_link_libraries(test_fail_fast_stress art_persistent pthread)
+add_test(NAME test_fail_fast_stress COMMAND test_fail_fast_stress)
+
 # Test: Prefix Key Debug
 add_executable(test_prefix_debug
     database/tests/test_prefix_debug.c
