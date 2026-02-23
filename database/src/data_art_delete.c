@@ -42,6 +42,7 @@ extern size_t get_node_size(data_art_node_type_t node_type);
 extern node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size);
 extern bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref, const void *data, size_t size);
 extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
+extern void data_art_reset_arena(void);
 
 // Forward declarations
 static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
@@ -77,9 +78,12 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
         return false;  // Empty tree, nothing to delete
     }
     
+    // Reset thread-local arena — each delete starts fresh
+    data_art_reset_arena();
+
     // Acquire write lock to serialize all write operations (one writer at a time)
     pthread_rwlock_wrlock(&tree->write_lock);
-    
+
     // Allocate unique transaction ID for auto-commit (even outside explicit transactions)
     // This ensures every version has a unique xmax for MVCC visibility
     uint64_t auto_txn_id = 0;
@@ -98,6 +102,7 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
     
     if (deleted) {
         tree->root = new_root;
+
         tree->size--;
         
         // Log to WAL for durability (if WAL is enabled)

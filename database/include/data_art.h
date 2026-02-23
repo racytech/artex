@@ -246,7 +246,7 @@ typedef struct data_art_tree {
     
     // Concurrency control
     pthread_rwlock_t write_lock; // Serializes all write operations (one writer at a time)
-    
+
     // MVCC support
     mvcc_manager_t *mvcc_manager; // MVCC manager for snapshot isolation
     

@@ -23,6 +23,7 @@ extern node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size);
 extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
 extern bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
                                   const void *node, size_t size);
+extern void data_art_reset_arena(void);
 
 // Helper to get node size by type
 static size_t get_node_size(data_art_node_type_t type) {
@@ -942,9 +943,12 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
         return txn_buffer_add_insert(tree->txn_buffer, key, key_len, value, value_len);
     }
     
+    // Reset thread-local arena — each insert starts fresh
+    data_art_reset_arena();
+
     // Acquire write lock to serialize all write operations (one writer at a time)
     pthread_rwlock_wrlock(&tree->write_lock);
-    
+
     // Allocate unique transaction ID for auto-commit (even outside explicit transactions)
     // This ensures every version has a unique xmin for MVCC visibility
     uint64_t auto_txn_id = 0;
@@ -964,6 +968,7 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
     
     if (!node_ref_is_null(new_root)) {
         tree->root = new_root;
+
         if (inserted) {
             tree->size++;
             

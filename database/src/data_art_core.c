@@ -21,6 +21,41 @@
 #include <assert.h>
 #include <pthread.h>
 
+// ============================================================================
+// Thread-Local Arena for Safe Node Reads
+// ============================================================================
+//
+// data_art_load_node() previously returned raw pointers into buffer pool pages.
+// Under concurrent load, pages could be evicted (and freed) while threads still
+// held pointers — a use-after-free causing checksum corruption.
+//
+// Fix: pin the page, copy node data to this thread-local arena, unpin immediately.
+// The returned pointer is to stable arena memory, immune to buffer pool eviction.
+// Arena is reset at the start of each top-level operation (get/insert/delete).
+
+#define TLS_ARENA_SIZE (256 * 1024)  // 256KB per thread — fits ~80 Node256 or thousands of small nodes
+static __thread uint8_t tls_arena[TLS_ARENA_SIZE];
+static __thread size_t  tls_arena_offset = 0;
+
+static void tls_arena_reset(void) {
+    tls_arena_offset = 0;
+}
+
+static void *tls_arena_alloc(size_t size) {
+    size = (size + 7) & ~7;  // 8-byte align
+    if (tls_arena_offset + size > TLS_ARENA_SIZE) {
+        return NULL;
+    }
+    void *ptr = tls_arena + tls_arena_offset;
+    tls_arena_offset += size;
+    return ptr;
+}
+
+// Non-static wrapper so data_art_insert.c and data_art_delete.c can reset the arena
+void data_art_reset_arena(void) {
+    tls_arena_reset();
+}
+
 // Thread-local transaction context
 typedef struct {
     data_art_tree_t *tree;           // Tree this transaction belongs to
@@ -78,6 +113,28 @@ size_t get_node_size(data_art_node_type_t type) {
     }
 }
 
+/**
+ * Get the size of a node by inspecting its in-memory data.
+ * Unlike get_node_size(), this handles variable-size leaves.
+ */
+static size_t data_art_node_size_from_data(const void *node_data) {
+    uint8_t type = *(const uint8_t *)node_data;
+    switch (type) {
+        case DATA_NODE_4:      return sizeof(data_art_node4_t);
+        case DATA_NODE_16:     return sizeof(data_art_node16_t);
+        case DATA_NODE_48:     return sizeof(data_art_node48_t);
+        case DATA_NODE_256:    return sizeof(data_art_node256_t);
+        case DATA_NODE_OVERFLOW: return sizeof(data_art_overflow_t);
+        case DATA_NODE_LEAF: {
+            const data_art_leaf_t *leaf = (const data_art_leaf_t *)node_data;
+            return sizeof(data_art_leaf_t) + leaf->inline_data_len;
+        }
+        default:
+            LOG_ERROR("Unknown node type %u in data_art_node_size_from_data", type);
+            return PAGE_SIZE - PAGE_HEADER_SIZE;  // safe fallback: copy max possible
+    }
+}
+
 // ============================================================================
 // Tree Lifecycle
 // ============================================================================
@@ -114,12 +171,20 @@ data_art_tree_t *data_art_create(page_manager_t *page_manager,
     tree->current_txn_id = 0;        // No active transaction
     tree->txn_buffer = NULL;         // No transaction buffer initially
     
-    // Initialize write lock for serializing write operations
-    if (pthread_rwlock_init(&tree->write_lock, NULL) != 0) {
+    // Initialize write lock with writer-preference to prevent writer starvation.
+    // Default pthread_rwlock is reader-preferred: with many concurrent readers,
+    // a waiting writer can be starved indefinitely. Writer-preference queues new
+    // rdlocks behind a pending wrlock, bounding writer wait time.
+    pthread_rwlockattr_t rwlock_attr;
+    pthread_rwlockattr_init(&rwlock_attr);
+    pthread_rwlockattr_setkind_np(&rwlock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+    if (pthread_rwlock_init(&tree->write_lock, &rwlock_attr) != 0) {
         LOG_ERROR("Failed to initialize write_lock");
+        pthread_rwlockattr_destroy(&rwlock_attr);
         free(tree);
         return NULL;
     }
+    pthread_rwlockattr_destroy(&rwlock_attr);
     
     // Initialize MVCC manager
     tree->mvcc_manager = mvcc_manager_create();
@@ -288,17 +353,33 @@ const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref) {
         return NULL;
     }
     
-    page_t *page = buffer_pool_get(tree->buffer_pool, ref.page_id);
+    // Pin the page so it can't be evicted while we copy
+    page_t *page = buffer_pool_get_pinned(tree->buffer_pool, ref.page_id);
     if (!page) {
         LOG_ERROR("Failed to load page %lu from buffer pool", ref.page_id);
         tree->cache_misses++;
         return NULL;
     }
-    
+
     tree->cache_hits++;
-    
-    // Return pointer to node at offset within page data
-    return page->data + ref.offset;
+
+    // Copy node data to thread-local arena so the pointer remains valid
+    // even after the buffer pool page is evicted/freed
+    const void *src = page->data + ref.offset;
+    size_t node_size = data_art_node_size_from_data(src);
+
+    void *copy = tls_arena_alloc(node_size);
+    if (!copy) {
+        LOG_ERROR("TLS arena exhausted (%zu bytes used, need %zu more)",
+                  tls_arena_offset, node_size);
+        buffer_pool_unpin(tree->buffer_pool, ref.page_id);
+        return NULL;
+    }
+    memcpy(copy, src, node_size);
+
+    // Unpin immediately — caller uses the arena copy, not the page
+    buffer_pool_unpin(tree->buffer_pool, ref.page_id);
+    return copy;
 }
 
 bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
@@ -675,7 +756,10 @@ static const void *data_art_get_internal(data_art_tree_t *tree, const uint8_t *k
         LOG_ERROR("Invalid parameters");
         return NULL;
     }
-    
+
+    // Reset thread-local arena — each get operation starts fresh
+    tls_arena_reset();
+
     // Validate key size matches tree's configured size
     if (key_len != tree->key_size) {
         LOG_ERROR("Key size mismatch: expected %zu bytes, got %zu bytes",
@@ -683,11 +767,12 @@ static const void *data_art_get_internal(data_art_tree_t *tree, const uint8_t *k
         return NULL;
     }
     
-    if (node_ref_is_null(tree->root)) {
+    node_ref_t current = tree->root;
+
+    if (node_ref_is_null(current)) {
         return NULL;  // Empty tree
     }
-    
-    node_ref_t current = tree->root;
+
     size_t depth = 0;
     
     while (!node_ref_is_null(current)) {
@@ -902,14 +987,20 @@ static const void *data_art_get_internal(data_art_tree_t *tree, const uint8_t *k
 }
 
 // Public API: Get with snapshot
+// Readers acquire rdlock to prevent torn reads from in-place parent updates.
+// Writer-preference rwlock ensures waiting writers are not starved by readers.
 const void *data_art_get_snapshot(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
                                    size_t *value_len, data_art_snapshot_t *snapshot) {
+    pthread_rwlock_rdlock(&tree->write_lock);
+    const void *result;
     if (snapshot) {
-        return data_art_get_internal(tree, key, key_len, value_len,
-                                      snapshot->mvcc_snapshot, snapshot->txn_id);
+        result = data_art_get_internal(tree, key, key_len, value_len,
+                                        snapshot->mvcc_snapshot, snapshot->txn_id);
     } else {
-        return data_art_get_internal(tree, key, key_len, value_len, NULL, 0);
+        result = data_art_get_internal(tree, key, key_len, value_len, NULL, 0);
     }
+    pthread_rwlock_unlock(&tree->write_lock);
+    return result;
 }
 
 // Legacy API: Get without snapshot (reads latest committed)
@@ -1035,13 +1126,19 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
             success = data_art_insert(tree, op->key, op->key_len,
                                      op->value, op->value_len);
         } else { // TXN_OP_DELETE
+            // Delete may return false if key was already deleted by a
+            // concurrent transaction — this is expected, not an error.
             success = data_art_delete(tree, op->key, op->key_len);
+            if (!success) {
+                LOG_DEBUG("Delete for key not found during commit (concurrent delete) — skipping");
+                success = true;
+            }
         }
-        
+
         // Restore buffer
         ctx->txn_buffer = buffer;
         tree->txn_buffer = buffer;
-        
+
         if (!success) {
             LOG_ERROR("Failed to apply operation %zu during commit", i);
             // Cleanup and abort
