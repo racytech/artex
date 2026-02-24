@@ -16,7 +16,6 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 
 // Forward declarations (from data_art_core.c)
 extern node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size);
@@ -27,16 +26,8 @@ extern void data_art_reset_arena(void);
 extern void data_art_publish_root(data_art_tree_t *tree);
 extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
 
-// Helper to get node size by type
-static size_t get_node_size(data_art_node_type_t type) {
-    switch (type) {
-        case DATA_NODE_4:    return sizeof(data_art_node4_t);
-        case DATA_NODE_16:   return sizeof(data_art_node16_t);
-        case DATA_NODE_48:   return sizeof(data_art_node48_t);
-        case DATA_NODE_256:  return sizeof(data_art_node256_t);
-        default:             return 0;
-    }
-}
+// From data_art_core.c
+extern size_t get_node_size(data_art_node_type_t node_type);
 
 // Forward declarations (from data_art_overflow.c)
 extern uint64_t data_art_write_overflow_value(data_art_tree_t *tree, const void *value,
@@ -46,29 +37,9 @@ extern uint64_t data_art_write_overflow_value(data_art_tree_t *tree, const void 
 extern node_ref_t data_art_add_child(data_art_tree_t *tree, node_ref_t node_ref,
                                       uint8_t byte, node_ref_t child_ref);
 
-// Special value for Node48 index indicating no child
-#define NODE48_EMPTY 255
-
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/**
- * Check if a node reference points to a leaf
- */
-static bool is_leaf_ref(data_art_tree_t *tree, node_ref_t ref) {
-    if (node_ref_is_null(ref)) {
-        return false;
-    }
-    
-    const void *node = data_art_load_node(tree, ref);
-    if (!node) {
-        return false;
-    }
-    
-    uint8_t type = *(const uint8_t *)node;
-    return type == DATA_NODE_LEAF;
-}
 
 /**
  * Find any leaf descendant of a node (for lazy expansion prefix verification)

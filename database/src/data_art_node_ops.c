@@ -20,7 +20,7 @@ extern bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
 extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
 extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
 
-#define NODE48_EMPTY 255
+// NODE48_EMPTY is defined in data_art.h
 
 // Forward declarations for add_child functions
 static node_ref_t add_child_node4(data_art_tree_t *tree, node_ref_t node_ref,

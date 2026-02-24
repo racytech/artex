@@ -43,23 +43,6 @@ static inline node_ref_t data_art_read_committed_root(data_art_tree_t *tree) {
 // ============================================================================
 
 /**
- * Check if a node reference points to a leaf
- */
-static bool is_leaf_ref(data_art_tree_t *tree, node_ref_t ref) {
-    if (node_ref_is_null(ref)) {
-        return false;
-    }
-
-    const void *node = data_art_load_node(tree, ref);
-    if (!node) {
-        return false;
-    }
-
-    uint8_t type = *(const uint8_t *)node;
-    return type == DATA_NODE_LEAF;
-}
-
-/**
  * Find child node reference by byte key
  */
 node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) {
@@ -177,7 +160,7 @@ static const data_art_leaf_t* find_any_leaf_for_prefix(data_art_tree_t *tree, no
             const data_art_node48_t *n = (const data_art_node48_t *)node;
             // Find first non-empty slot
             for (int i = 0; i < 256; i++) {
-                if (n->keys[i] != 255) {  // NODE48_EMPTY
+                if (n->keys[i] != NODE48_EMPTY) {
                     uint8_t idx = n->keys[i];
                     child_ref = (node_ref_t){.page_id = n->child_page_ids[idx],
                                             .offset = n->child_offsets[idx]};

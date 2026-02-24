@@ -128,8 +128,10 @@ typedef struct {
  * NODE_48: Up to 48 children (indexed)
  * 
  * Size: 658 bytes (fixed)
- * Uses index array: keys[byte_value] = child_slot (0-47, 255=empty)
+ * Uses index array: keys[byte_value] = child_slot (0-47, NODE48_EMPTY=empty)
  */
+#define NODE48_EMPTY 255
+
 typedef struct {
     uint8_t type;               // DATA_NODE_48
     uint8_t num_children;       // 0-48
