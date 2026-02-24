@@ -280,6 +280,12 @@ add_executable(test_fail_fast_stress
 target_link_libraries(test_fail_fast_stress art_persistent pthread)
 add_test(NAME test_fail_fast_stress COMMAND test_fail_fast_stress)
 
+# Test: Real-World Stress Test (Ethereum access pattern: 1 writer, 8 readers)
+add_executable(test_realworld_stress
+    database/tests/test_realworld_stress.c
+)
+target_link_libraries(test_realworld_stress art_persistent pthread)
+
 # Test: Prefix Key Debug
 add_executable(test_prefix_debug
     database/tests/test_prefix_debug.c
