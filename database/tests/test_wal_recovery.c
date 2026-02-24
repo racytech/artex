@@ -246,8 +246,8 @@ TEST(test_wal_replay_all_entries) {
     ASSERT(wal != NULL, "WAL created");
     
     // Write mixed operations
-    uint64_t txn_id;
-    wal_log_begin_txn(wal, &txn_id, NULL);
+    uint64_t txn_id = 1;
+    wal_log_begin_txn(wal, txn_id, NULL);
     
     for (int i = 0; i < 10; i++) {
         char key[32], value[64];

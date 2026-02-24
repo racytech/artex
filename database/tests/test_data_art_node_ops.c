@@ -8,6 +8,7 @@
  */
 
 #include "data_art.h"
+#include "buffer_pool.h"
 #include "logger.h"
 
 #include <stdio.h>
@@ -30,6 +31,7 @@ extern node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size);
 extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
 extern bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
                                   const void *node, size_t size);
+extern void data_art_reset_arena(void);
 
 // Remove test database directory
 static void cleanup_test_db(void) {
@@ -161,67 +163,79 @@ static bool test_node4_add_children(void) {
     
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
+
+    buffer_pool_config_t bp_config = buffer_pool_default_config();
+    bp_config.capacity = 256;
+    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
+    assert(bp != NULL);
+
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     assert(tree != NULL);
-    
+
     // Create NODE_4
     node_ref_t n4_ref = data_art_alloc_node(tree, sizeof(data_art_node4_t));
     if (node_ref_is_null(n4_ref)) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to allocate NODE_4");
     }
-    
+
     data_art_node4_t n4;
     memset(&n4, 0, sizeof(n4));
     n4.type = DATA_NODE_4;
     n4.num_children = 0;
-    
+
     if (!data_art_write_node(tree, n4_ref, &n4, sizeof(n4))) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to write NODE_4");
     }
-    
+
     // Add 4 children
     uint8_t keys[] = {10, 20, 30, 40};
     for (int i = 0; i < 4; i++) {
         node_ref_t leaf = create_dummy_leaf(tree, keys[i]);
         if (node_ref_is_null(leaf)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to create leaf");
         }
-        
+
         n4_ref = data_art_add_child(tree, n4_ref, keys[i], leaf);
         if (node_ref_is_null(n4_ref)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to add child");
         }
     }
-    
+
     // Verify all children exist
     for (int i = 0; i < 4; i++) {
         if (!verify_child_exists(tree, n4_ref, keys[i], keys[i])) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("child verification failed");
         }
     }
-    
+
     // Verify it's still NODE_4
     const data_art_node4_t *final = (const data_art_node4_t *)data_art_load_node(tree, n4_ref);
     if (!final || final->type != DATA_NODE_4 || final->num_children != 4) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("node type or count incorrect");
     }
-    
+
     data_art_destroy(tree);
+    buffer_pool_destroy(bp);
     page_manager_destroy(pm);
-    
+
     PASS();
     return true;
 }
@@ -234,74 +248,87 @@ static bool test_node4_grows_to_node16(void) {
     
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
+
+    buffer_pool_config_t bp_config = buffer_pool_default_config();
+    bp_config.capacity = 256;
+    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
+    assert(bp != NULL);
+
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     assert(tree != NULL);
-    
+
     // Create NODE_4 with 4 children
     node_ref_t node_ref = data_art_alloc_node(tree, sizeof(data_art_node4_t));
     if (node_ref_is_null(node_ref)) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to allocate NODE_4");
     }
-    
+
     data_art_node4_t n4;
     memset(&n4, 0, sizeof(n4));
     n4.type = DATA_NODE_4;
     n4.num_children = 0;
-    
+
     if (!data_art_write_node(tree, node_ref, &n4, sizeof(n4))) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to write NODE_4");
     }
-    
+
     // Add 5 children (should trigger growth on the 5th)
     uint8_t keys[] = {10, 20, 30, 40, 50};
     for (int i = 0; i < 5; i++) {
         node_ref_t leaf = create_dummy_leaf(tree, keys[i]);
         if (node_ref_is_null(leaf)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to create leaf");
         }
-        
+
         node_ref = data_art_add_child(tree, node_ref, keys[i], leaf);
         if (node_ref_is_null(node_ref)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to add child");
         }
     }
-    
+
     // Verify it grew to NODE_16
     const void *node = data_art_load_node(tree, node_ref);
     if (!node || *(const uint8_t *)node != DATA_NODE_16) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("did not grow to NODE_16");
     }
-    
+
     const data_art_node16_t *n16 = (const data_art_node16_t *)node;
     if (n16->num_children != 5) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("incorrect child count");
     }
-    
+
     // Verify all children are accessible
     for (int i = 0; i < 5; i++) {
         if (!verify_child_exists(tree, node_ref, keys[i], keys[i])) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("child verification failed after growth");
         }
     }
-    
+
     data_art_destroy(tree);
+    buffer_pool_destroy(bp);
     page_manager_destroy(pm);
-    
+
     PASS();
     return true;
 }
@@ -314,68 +341,80 @@ static bool test_node16_add_children(void) {
     
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
+
+    buffer_pool_config_t bp_config = buffer_pool_default_config();
+    bp_config.capacity = 256;
+    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
+    assert(bp != NULL);
+
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     assert(tree != NULL);
-    
+
     // Create NODE_16
     node_ref_t n16_ref = data_art_alloc_node(tree, sizeof(data_art_node16_t));
     if (node_ref_is_null(n16_ref)) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to allocate NODE_16");
     }
-    
+
     data_art_node16_t n16;
     memset(&n16, 0, sizeof(n16));
     n16.type = DATA_NODE_16;
     n16.num_children = 0;
-    
+
     if (!data_art_write_node(tree, n16_ref, &n16, sizeof(n16))) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to write NODE_16");
     }
-    
+
     // Add 16 children
     for (int i = 0; i < 16; i++) {
         uint8_t key = 10 + i * 5;
         node_ref_t leaf = create_dummy_leaf(tree, key);
         if (node_ref_is_null(leaf)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to create leaf");
         }
-        
+
         n16_ref = data_art_add_child(tree, n16_ref, key, leaf);
         if (node_ref_is_null(n16_ref)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to add child");
         }
     }
-    
+
     // Verify all children exist
     for (int i = 0; i < 16; i++) {
         uint8_t key = 10 + i * 5;
         if (!verify_child_exists(tree, n16_ref, key, key)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("child verification failed");
         }
     }
-    
+
     // Verify it's still NODE_16
     const data_art_node16_t *final = (const data_art_node16_t *)data_art_load_node(tree, n16_ref);
     if (!final || final->type != DATA_NODE_16 || final->num_children != 16) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("node type or count incorrect");
     }
-    
+
     data_art_destroy(tree);
+    buffer_pool_destroy(bp);
     page_manager_destroy(pm);
-    
+
     PASS();
     return true;
 }
@@ -388,29 +427,36 @@ static bool test_node16_grows_to_node48(void) {
     
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
+
+    buffer_pool_config_t bp_config = buffer_pool_default_config();
+    bp_config.capacity = 256;
+    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
+    assert(bp != NULL);
+
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     assert(tree != NULL);
-    
+
     // Create NODE_16
     node_ref_t node_ref = data_art_alloc_node(tree, sizeof(data_art_node16_t));
     if (node_ref_is_null(node_ref)) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to allocate NODE_16");
     }
-    
+
     data_art_node16_t n16;
     memset(&n16, 0, sizeof(n16));
     n16.type = DATA_NODE_16;
     n16.num_children = 0;
-    
+
     if (!data_art_write_node(tree, node_ref, &n16, sizeof(n16))) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to write NODE_16");
     }
-    
+
     // Add 17 children (should trigger growth on the 17th)
     uint8_t keys[17];
     for (int i = 0; i < 17; i++) {
@@ -418,45 +464,51 @@ static bool test_node16_grows_to_node48(void) {
         node_ref_t leaf = create_dummy_leaf(tree, keys[i]);
         if (node_ref_is_null(leaf)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to create leaf");
         }
-        
+
         node_ref = data_art_add_child(tree, node_ref, keys[i], leaf);
         if (node_ref_is_null(node_ref)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to add child");
         }
     }
-    
+
     // Verify it grew to NODE_48
     const void *node = data_art_load_node(tree, node_ref);
     if (!node || *(const uint8_t *)node != DATA_NODE_48) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("did not grow to NODE_48");
     }
-    
+
     const data_art_node48_t *n48 = (const data_art_node48_t *)node;
     if (n48->num_children != 17) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("incorrect child count");
     }
-    
+
     // Verify all children are accessible
     for (int i = 0; i < 17; i++) {
         if (!verify_child_exists(tree, node_ref, keys[i], keys[i])) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("child verification failed after growth");
         }
     }
-    
+
     data_art_destroy(tree);
+    buffer_pool_destroy(bp);
     page_manager_destroy(pm);
-    
+
     PASS();
     return true;
 }
@@ -469,69 +521,83 @@ static bool test_node48_add_children(void) {
     
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
+
+    buffer_pool_config_t bp_config = buffer_pool_default_config();
+    bp_config.capacity = 256;
+    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
+    assert(bp != NULL);
+
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     assert(tree != NULL);
-    
+
     // Create NODE_48
     node_ref_t n48_ref = data_art_alloc_node(tree, sizeof(data_art_node48_t));
     if (node_ref_is_null(n48_ref)) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to allocate NODE_48");
     }
-    
+
     data_art_node48_t n48;
     memset(&n48, 0, sizeof(n48));
     n48.type = DATA_NODE_48;
     n48.num_children = 0;
     memset(n48.keys, 255, 256);  // Initialize index array
-    
+
     if (!data_art_write_node(tree, n48_ref, &n48, sizeof(n48))) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to write NODE_48");
     }
-    
+
     // Add 48 children
     uint8_t keys[48];
     for (int i = 0; i < 48; i++) {
         keys[i] = i * 5;
+        data_art_reset_arena();
         node_ref_t leaf = create_dummy_leaf(tree, keys[i]);
         if (node_ref_is_null(leaf)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to create leaf");
         }
-        
+
         n48_ref = data_art_add_child(tree, n48_ref, keys[i], leaf);
         if (node_ref_is_null(n48_ref)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to add child");
         }
     }
-    
+
     // Verify all children exist
     for (int i = 0; i < 48; i++) {
+        data_art_reset_arena();
         if (!verify_child_exists(tree, n48_ref, keys[i], keys[i])) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("child verification failed");
         }
     }
-    
+
     // Verify it's still NODE_48
     const data_art_node48_t *final = (const data_art_node48_t *)data_art_load_node(tree, n48_ref);
     if (!final || final->type != DATA_NODE_48 || final->num_children != 48) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("node type or count incorrect");
     }
-    
+
     data_art_destroy(tree);
+    buffer_pool_destroy(bp);
     page_manager_destroy(pm);
-    
+
     PASS();
     return true;
 }
@@ -544,76 +610,94 @@ static bool test_node48_grows_to_node256(void) {
     
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
+
+    buffer_pool_config_t bp_config = buffer_pool_default_config();
+    bp_config.capacity = 256;
+    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
+    assert(bp != NULL);
+
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     assert(tree != NULL);
-    
+
     // Create NODE_48
     node_ref_t node_ref = data_art_alloc_node(tree, sizeof(data_art_node48_t));
     if (node_ref_is_null(node_ref)) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to allocate NODE_48");
     }
-    
+
     data_art_node48_t n48;
     memset(&n48, 0, sizeof(n48));
     n48.type = DATA_NODE_48;
     n48.num_children = 0;
     memset(n48.keys, 255, 256);
-    
+
     if (!data_art_write_node(tree, node_ref, &n48, sizeof(n48))) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to write NODE_48");
     }
-    
+
     // Add 49 children (should trigger growth on the 49th)
     uint8_t keys[49];
     for (int i = 0; i < 49; i++) {
         keys[i] = i * 5;
+        data_art_reset_arena();
         node_ref_t leaf = create_dummy_leaf(tree, keys[i]);
         if (node_ref_is_null(leaf)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to create leaf");
         }
-        
+
         node_ref = data_art_add_child(tree, node_ref, keys[i], leaf);
         if (node_ref_is_null(node_ref)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to add child");
         }
     }
-    
+
+    // Reset arena before verification (add_child calls accumulated allocations)
+    data_art_reset_arena();
+
     // Verify it grew to NODE_256
     const void *node = data_art_load_node(tree, node_ref);
     if (!node || *(const uint8_t *)node != DATA_NODE_256) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("did not grow to NODE_256");
     }
-    
+
     const data_art_node256_t *n256 = (const data_art_node256_t *)node;
     if (n256->num_children != 49) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("incorrect child count");
     }
-    
+
     // Verify all children are accessible
     for (int i = 0; i < 49; i++) {
+        data_art_reset_arena();
         if (!verify_child_exists(tree, node_ref, keys[i], keys[i])) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("child verification failed after growth");
         }
     }
-    
+
     data_art_destroy(tree);
+    buffer_pool_destroy(bp);
     page_manager_destroy(pm);
-    
+
     PASS();
     return true;
 }
@@ -626,68 +710,83 @@ static bool test_node256_add_children(void) {
     
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     assert(pm != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
+
+    buffer_pool_config_t bp_config = buffer_pool_default_config();
+    bp_config.capacity = 256;
+    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
+    assert(bp != NULL);
+
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     assert(tree != NULL);
-    
+
     // Create NODE_256
     node_ref_t n256_ref = data_art_alloc_node(tree, sizeof(data_art_node256_t));
     if (node_ref_is_null(n256_ref)) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to allocate NODE_256");
     }
-    
+
     data_art_node256_t n256;
     memset(&n256, 0, sizeof(n256));
     n256.type = DATA_NODE_256;
     n256.num_children = 0;
-    
+
     if (!data_art_write_node(tree, n256_ref, &n256, sizeof(n256))) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("failed to write NODE_256");
     }
-    
+
     // Add 100 children at various positions
     uint8_t keys[100];
     for (int i = 0; i < 100; i++) {
         keys[i] = i;
+        data_art_reset_arena();
         node_ref_t leaf = create_dummy_leaf(tree, keys[i]);
         if (node_ref_is_null(leaf)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to create leaf");
         }
-        
+
         n256_ref = data_art_add_child(tree, n256_ref, keys[i], leaf);
         if (node_ref_is_null(n256_ref)) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("failed to add child");
         }
     }
-    
+
     // Verify all children exist
     for (int i = 0; i < 100; i++) {
+        data_art_reset_arena();
         if (!verify_child_exists(tree, n256_ref, keys[i], keys[i])) {
             data_art_destroy(tree);
+            buffer_pool_destroy(bp);
             page_manager_destroy(pm);
             FAIL("child verification failed");
         }
     }
-    
+
     // Verify it's still NODE_256
+    data_art_reset_arena();
     const data_art_node256_t *final = (const data_art_node256_t *)data_art_load_node(tree, n256_ref);
     if (!final || final->type != DATA_NODE_256 || final->num_children != 100) {
         data_art_destroy(tree);
+        buffer_pool_destroy(bp);
         page_manager_destroy(pm);
         FAIL("node type or count incorrect");
     }
-    
+
     data_art_destroy(tree);
+    buffer_pool_destroy(bp);
     page_manager_destroy(pm);
-    
+
     PASS();
     return true;
 }

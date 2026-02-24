@@ -216,7 +216,15 @@ static buffer_frame_t *load_page(buffer_pool_t *bp, uint64_t page_id) {
     // Read page from disk
     page_result_t result = page_manager_read(bp->page_manager, page_id, &frame->page);
     if (result == PAGE_ERROR_IO) {
-        // Page might be allocated but not yet written to disk
+        // Only create an empty fallback if the page was actually allocated.
+        // Pages beyond next_page_id were never allocated — return NULL.
+        if (page_id >= bp->page_manager->allocator->next_page_id) {
+            LOG_DEBUG("Page %lu was never allocated (next_page_id=%lu)",
+                      page_id, bp->page_manager->allocator->next_page_id);
+            free(frame);
+            return NULL;
+        }
+        // Page was allocated but not yet written to disk
         // This is normal in concurrent scenarios - initialize as empty page
         LOG_DEBUG("Page %lu not on disk yet, initializing as new page", page_id);
         memset(&frame->page, 0, sizeof(page_t));

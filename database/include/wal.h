@@ -367,11 +367,12 @@ bool wal_log_delete(wal_t *wal, uint64_t txn_id,
  * Append a transaction begin entry
  * 
  * Marks the start of a transaction.
- * Assigns a new transaction ID which will be used for all subsequent operations
- * until commit or abort.
+ * Logs a begin-transaction entry with the given transaction ID (allocated by
+ * the MVCC manager) which will be used for all subsequent operations until
+ * commit or abort.
  * 
  * @param wal WAL instance
- * @param txn_id_out Output: Assigned transaction ID
+ * @param txn_id Transaction ID (allocated by MVCC manager)
  * @param lsn_out Output: Assigned LSN for this entry
  * @return true on success, false on I/O error
  */

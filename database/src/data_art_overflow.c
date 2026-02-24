@@ -324,13 +324,17 @@ data_art_tree_t *data_art_load(page_manager_t *page_manager,
     }
     
     tree->root = root_ref;
-    
+
+    // Publish loaded root for lock-free readers
+    extern void data_art_publish_root(data_art_tree_t *tree);
+    data_art_publish_root(tree);
+
     // TODO: Traverse tree to calculate size and statistics
     // For now, assume metadata will be provided separately
-    
+
     LOG_INFO("Loaded ART tree from disk (root page=%lu, offset=%u)",
              root_ref.page_id, root_ref.offset);
-    
+
     return tree;
 }
 

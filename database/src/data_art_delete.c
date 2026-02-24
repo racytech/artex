@@ -43,6 +43,7 @@ extern node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size);
 extern bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref, const void *data, size_t size);
 extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
 extern void data_art_reset_arena(void);
+extern void data_art_publish_root(data_art_tree_t *tree);
 
 // Forward declarations
 static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
@@ -82,7 +83,7 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
     data_art_reset_arena();
 
     // Acquire write lock to serialize all write operations (one writer at a time)
-    pthread_rwlock_wrlock(&tree->write_lock);
+    pthread_mutex_lock(&tree->write_lock);
 
     // Allocate unique transaction ID for auto-commit (even outside explicit transactions)
     // This ensures every version has a unique xmax for MVCC visibility
@@ -90,35 +91,36 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
     bool auto_commit = (tree->current_txn_id == 0);
     if (auto_commit && tree->mvcc_manager) {
         if (!mvcc_begin_txn(tree->mvcc_manager, &auto_txn_id)) {
-            pthread_rwlock_unlock(&tree->write_lock);
+            pthread_mutex_unlock(&tree->write_lock);
             LOG_ERROR("Failed to begin auto-commit transaction");
             return false;
         }
         tree->current_txn_id = auto_txn_id;
     }
-    
+
     bool deleted = false;
     node_ref_t new_root = delete_recursive(tree, tree->root, key, key_len, 0, &deleted);
-    
+
     if (deleted) {
         tree->root = new_root;
-
         tree->size--;
-        
+
         // Log to WAL for durability (if WAL is enabled)
         if (tree->wal) {
-            uint64_t txn_id = tree->current_txn_id;  // 0 if no active transaction
+            uint64_t txn_id = tree->current_txn_id;
             if (!wal_log_delete(tree->wal, txn_id, key, key_len, NULL)) {
                 LOG_ERROR("Failed to log delete to WAL");
-                // Note: Tree is already modified - this is a durability failure
             }
         }
-        
+
         // Auto-commit the transaction if we started one
         if (auto_commit && tree->mvcc_manager) {
             mvcc_commit_txn(tree->mvcc_manager, auto_txn_id);
-            tree->current_txn_id = 0;  // Clear auto-commit txn
+            tree->current_txn_id = 0;
         }
+
+        // Publish new root for lock-free readers
+        data_art_publish_root(tree);
     } else {
         // Failed to delete - abort auto-commit transaction if we started one
         if (auto_commit && tree->mvcc_manager) {
@@ -126,8 +128,8 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
             tree->current_txn_id = 0;
         }
     }
-    
-    pthread_rwlock_unlock(&tree->write_lock);
+
+    pthread_mutex_unlock(&tree->write_lock);
     return deleted;
 }
 

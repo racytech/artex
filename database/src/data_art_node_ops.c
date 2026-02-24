@@ -18,6 +18,7 @@ extern node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size);
 extern bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
                                   const void *node, size_t size);
 extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
+extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
 
 #define NODE48_EMPTY 255
 
@@ -70,7 +71,6 @@ static node_ref_t grow_node4_to_node16(data_art_tree_t *tree, node_ref_t old_ref
     }
     
     // Release old page - decrement ref count and mark dead if 0
-    extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
     data_art_release_page(tree, old_ref);
     
     LOG_DEBUG("Grew NODE_4 to NODE_16");
@@ -116,7 +116,6 @@ static node_ref_t grow_node16_to_node48(data_art_tree_t *tree, node_ref_t old_re
     }
     
     // Release old page - decrement ref count and mark dead if 0
-    extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
     data_art_release_page(tree, old_ref);
     
     LOG_DEBUG("Grew NODE_16 to NODE_48");
@@ -160,7 +159,6 @@ static node_ref_t grow_node48_to_node256(data_art_tree_t *tree, node_ref_t old_r
     }
     
     // Release old page - decrement ref count and mark dead if 0
-    extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
     data_art_release_page(tree, old_ref);
     
     LOG_DEBUG("Grew NODE_48 to NODE_256");
@@ -208,7 +206,6 @@ static node_ref_t shrink_node16_to_node4(data_art_tree_t *tree, node_ref_t old_r
     }
     
     // Release old page - decrement ref count and mark dead if 0
-    extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
     data_art_release_page(tree, old_ref);
     
     LOG_DEBUG("Shrunk NODE_16 to NODE_4");
@@ -259,7 +256,6 @@ static node_ref_t shrink_node48_to_node16(data_art_tree_t *tree, node_ref_t old_
     }
     
     // Release old page - decrement ref count and mark dead if 0
-    extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
     data_art_release_page(tree, old_ref);
     
     LOG_DEBUG("Shrunk NODE_48 to NODE_16");
@@ -312,7 +308,6 @@ static node_ref_t shrink_node256_to_node48(data_art_tree_t *tree, node_ref_t old
     }
     
     // Release old page - decrement ref count and mark dead if 0
-    extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
     data_art_release_page(tree, old_ref);
     
     LOG_DEBUG("Shrunk NODE_256 to NODE_48");
@@ -382,13 +377,19 @@ static node_ref_t add_child_node4(data_art_tree_t *tree, node_ref_t node_ref,
     new_n4.child_offsets[pos] = child_ref.offset;
     new_n4.num_children++;
     
-    // Write back
-    if (!data_art_write_node(tree, node_ref, &new_n4, sizeof(new_n4))) {
+    // CoW: allocate new page, write there, release old
+    node_ref_t new_ref = data_art_alloc_node(tree, sizeof(data_art_node4_t));
+    if (node_ref_is_null(new_ref)) {
+        LOG_ERROR("Failed to allocate new NODE_4 for CoW");
+        return NULL_NODE_REF;
+    }
+    if (!data_art_write_node(tree, new_ref, &new_n4, sizeof(new_n4))) {
         LOG_ERROR("Failed to write NODE_4");
         return NULL_NODE_REF;
     }
-    
-    return node_ref;
+    data_art_release_page(tree, node_ref);
+
+    return new_ref;
 }
 
 /**
@@ -448,13 +449,19 @@ static node_ref_t add_child_node16(data_art_tree_t *tree, node_ref_t node_ref,
     new_n16.child_offsets[pos] = child_ref.offset;
     new_n16.num_children++;
     
-    // Write back
-    if (!data_art_write_node(tree, node_ref, &new_n16, sizeof(new_n16))) {
+    // CoW: allocate new page, write there, release old
+    node_ref_t new_ref = data_art_alloc_node(tree, sizeof(data_art_node16_t));
+    if (node_ref_is_null(new_ref)) {
+        LOG_ERROR("Failed to allocate new NODE_16 for CoW");
+        return NULL_NODE_REF;
+    }
+    if (!data_art_write_node(tree, new_ref, &new_n16, sizeof(new_n16))) {
         LOG_ERROR("Failed to write NODE_16");
         return NULL_NODE_REF;
     }
-    
-    return node_ref;
+    data_art_release_page(tree, node_ref);
+
+    return new_ref;
 }
 
 /**
@@ -510,13 +517,19 @@ static node_ref_t add_child_node48(data_art_tree_t *tree, node_ref_t node_ref,
     new_n48.child_offsets[slot] = child_ref.offset;
     new_n48.num_children++;
     
-    // Write back
-    if (!data_art_write_node(tree, node_ref, &new_n48, sizeof(new_n48))) {
+    // CoW: allocate new page, write there, release old
+    node_ref_t new_ref = data_art_alloc_node(tree, sizeof(data_art_node48_t));
+    if (node_ref_is_null(new_ref)) {
+        LOG_ERROR("Failed to allocate new NODE_48 for CoW");
+        return NULL_NODE_REF;
+    }
+    if (!data_art_write_node(tree, new_ref, &new_n48, sizeof(new_n48))) {
         LOG_ERROR("Failed to write NODE_48");
         return NULL_NODE_REF;
     }
-    
-    return node_ref;
+    data_art_release_page(tree, node_ref);
+
+    return new_ref;
 }
 
 /**
@@ -542,13 +555,19 @@ static node_ref_t add_child_node256(data_art_tree_t *tree, node_ref_t node_ref,
     new_n256.child_page_ids[byte] = child_ref.page_id;
     new_n256.child_offsets[byte] = child_ref.offset;
     
-    // Write back
-    if (!data_art_write_node(tree, node_ref, &new_n256, sizeof(new_n256))) {
+    // CoW: allocate new page, write there, release old
+    node_ref_t new_ref = data_art_alloc_node(tree, sizeof(data_art_node256_t));
+    if (node_ref_is_null(new_ref)) {
+        LOG_ERROR("Failed to allocate new NODE_256 for CoW");
+        return NULL_NODE_REF;
+    }
+    if (!data_art_write_node(tree, new_ref, &new_n256, sizeof(new_n256))) {
         LOG_ERROR("Failed to write NODE_256");
         return NULL_NODE_REF;
     }
-    
-    return node_ref;
+    data_art_release_page(tree, node_ref);
+
+    return new_ref;
 }
 
 // ============================================================================

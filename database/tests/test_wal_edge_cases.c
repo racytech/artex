@@ -108,7 +108,7 @@ TEST(test_wal_null_parameters) {
     const uint8_t value[] = "value";
     ASSERT(!wal_log_insert(NULL, 1, key, 4, value, 5, NULL), "insert on NULL fails");
     ASSERT(!wal_log_delete(NULL, 1, key, 4, NULL), "delete on NULL fails");
-    ASSERT(!wal_log_begin_txn(NULL, NULL, NULL), "begin_txn on NULL fails");
+    ASSERT(!wal_log_begin_txn(NULL, 0, NULL), "begin_txn on NULL fails");
     ASSERT(!wal_log_commit_txn(NULL, 1, NULL), "commit_txn on NULL fails");
     ASSERT(!wal_log_abort_txn(NULL, 1, NULL), "abort_txn on NULL fails");
     ASSERT(!wal_log_checkpoint(NULL, 0, 0, 0, 0, NULL), "checkpoint on NULL fails");
@@ -228,10 +228,9 @@ TEST(test_wal_transaction_boundaries) {
     ASSERT(wal != NULL, "WAL created");
     
     // Test multiple begin without commit
-    uint64_t txn1, txn2;
-    ASSERT(wal_log_begin_txn(wal, &txn1, NULL), "First begin succeeds");
-    ASSERT(wal_log_begin_txn(wal, &txn2, NULL), "Second begin succeeds");
-    ASSERT_NE(txn1, txn2, "Transaction IDs are unique");
+    uint64_t txn1 = 1, txn2 = 2;
+    ASSERT(wal_log_begin_txn(wal, txn1, NULL), "First begin succeeds");
+    ASSERT(wal_log_begin_txn(wal, txn2, NULL), "Second begin succeeds");
     
     // Test commit without begin
     ASSERT(wal_log_commit_txn(wal, 999999, NULL), "Commit unknown txn succeeds (no validation)");
@@ -244,8 +243,8 @@ TEST(test_wal_transaction_boundaries) {
     ASSERT(wal_log_commit_txn(wal, txn1, NULL), "Double commit succeeds (no validation)");
     
     // Test commit then abort
-    uint64_t txn3;
-    wal_log_begin_txn(wal, &txn3, NULL);
+    uint64_t txn3 = 3;
+    wal_log_begin_txn(wal, txn3, NULL);
     ASSERT(wal_log_commit_txn(wal, txn3, NULL), "Commit succeeds");
     ASSERT(wal_log_abort_txn(wal, txn3, NULL), "Abort after commit succeeds (no validation)");
     
@@ -398,8 +397,8 @@ TEST(test_wal_statistics_overflow) {
         }
         
         if (i % 500 == 0) {
-            uint64_t txn_id;
-            wal_log_begin_txn(wal, &txn_id, NULL);
+            uint64_t txn_id = i + 1;
+            wal_log_begin_txn(wal, txn_id, NULL);
             wal_log_commit_txn(wal, txn_id, NULL);
         }
     }
@@ -514,8 +513,8 @@ TEST(test_wal_fsync_stress) {
     
     // Stress test fsync with many small transactions
     for (int i = 0; i < 100; i++) {
-        uint64_t txn_id;
-        wal_log_begin_txn(wal, &txn_id, NULL);
+        uint64_t txn_id = i + 1;
+        wal_log_begin_txn(wal, txn_id, NULL);
         
         char key[32], value[64];
         snprintf(key, sizeof(key), "key_%d", i);
@@ -611,9 +610,9 @@ TEST(test_wal_mixed_operations_stress) {
         snprintf(key, sizeof(key), "mixed_key_%d", i);
         snprintf(value, sizeof(value), "mixed_value_%d_with_some_data", i);
         
-        uint64_t txn_id;
-        wal_log_begin_txn(wal, &txn_id, NULL);
-        
+        uint64_t txn_id = i + 1;
+        wal_log_begin_txn(wal, txn_id, NULL);
+
         // Insert
         wal_log_insert(wal, txn_id, (uint8_t *)key, strlen(key) + 1,
                       (uint8_t *)value, strlen(value) + 1, NULL);
@@ -668,17 +667,18 @@ TEST(test_wal_persistence_after_crash_simulation) {
     ASSERT(wal != NULL, "WAL created");
     
     // Write committed data
-    uint64_t txn_id;
-    wal_log_begin_txn(wal, &txn_id, NULL);
-    
+    uint64_t txn_id = 1;
+    wal_log_begin_txn(wal, txn_id, NULL);
+
     const uint8_t key1[] = "committed_key";
     const uint8_t value1[] = "committed_value";
     wal_log_insert(wal, txn_id, key1, sizeof(key1), value1, sizeof(value1), NULL);
     uint64_t committed_lsn;
     wal_log_commit_txn(wal, txn_id, &committed_lsn);
-    
+
     // Write uncommitted data (simulating crash before commit)
-    wal_log_begin_txn(wal, &txn_id, NULL);
+    txn_id = 2;
+    wal_log_begin_txn(wal, txn_id, NULL);
     const uint8_t key2[] = "uncommitted_key";
     const uint8_t value2[] = "uncommitted_value";
     wal_log_insert(wal, txn_id, key2, sizeof(key2), value2, sizeof(value2), NULL);

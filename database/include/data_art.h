@@ -28,6 +28,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 // Forward declarations
 typedef struct txn_buffer txn_buffer_t;
@@ -245,7 +246,10 @@ typedef struct data_art_tree {
     struct txn_buffer *txn_buffer; // Buffer for pending operations (NULL if not in transaction)
     
     // Concurrency control
-    pthread_rwlock_t write_lock; // Serializes all write operations (one writer at a time)
+    pthread_mutex_t write_lock;  // Serializes all write operations (one writer at a time)
+
+    // Lock-free read support: readers load committed root atomically, no lock needed
+    _Atomic uint64_t committed_root_page_id;
 
     // MVCC support
     mvcc_manager_t *mvcc_manager; // MVCC manager for snapshot isolation
@@ -550,8 +554,12 @@ bool data_art_abort_txn(data_art_tree_t *tree);
 // MVCC Snapshot Support
 // ============================================================================
 
-// Opaque snapshot handle - each thread owns one
-typedef struct data_art_snapshot data_art_snapshot_t;
+// Snapshot handle - each thread owns one
+typedef struct data_art_snapshot {
+    mvcc_snapshot_t *mvcc_snapshot;  // Underlying MVCC snapshot
+    uint64_t txn_id;                 // Transaction ID for this snapshot
+    uint64_t root_page_id;           // Committed root at snapshot creation time
+} data_art_snapshot_t;
 
 /**
  * Create a snapshot for consistent read operations

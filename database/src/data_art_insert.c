@@ -24,6 +24,8 @@ extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
 extern bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
                                   const void *node, size_t size);
 extern void data_art_reset_arena(void);
+extern void data_art_publish_root(data_art_tree_t *tree);
+extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
 
 // Helper to get node size by type
 static size_t get_node_size(data_art_node_type_t type) {
@@ -205,20 +207,16 @@ static node_ref_t find_child_ref(data_art_tree_t *tree, node_ref_t node_ref, uin
     switch (type) {
         case DATA_NODE_4: {
             const data_art_node4_t *n = (const data_art_node4_t *)node;
-            LOG_ERROR("[FIND_CHILD] NODE_4 at page=%lu: looking for byte=0x%02x, num_children=%u, keys=[0x%02x 0x%02x 0x%02x 0x%02x]",
-                     node_ref.page_id, byte, n->num_children,
-                     n->num_children > 0 ? n->keys[0] : 0xFF,
-                     n->num_children > 1 ? n->keys[1] : 0xFF,
-                     n->num_children > 2 ? n->keys[2] : 0xFF,
-                     n->num_children > 3 ? n->keys[3] : 0xFF);
+            LOG_DEBUG("[FIND_CHILD] NODE_4 at page=%lu: looking for byte=0x%02x, num_children=%u",
+                     node_ref.page_id, byte, n->num_children);
             for (int i = 0; i < n->num_children; i++) {
                 if (n->keys[i] == byte) {
-                    LOG_ERROR("[FIND_CHILD] Found child at index %d → page=%lu", i, n->child_page_ids[i]);
-                    return (node_ref_t){.page_id = n->child_page_ids[i], 
+                    LOG_DEBUG("[FIND_CHILD] Found child at index %d → page=%lu", i, n->child_page_ids[i]);
+                    return (node_ref_t){.page_id = n->child_page_ids[i],
                                        .offset = n->child_offsets[i]};
                 }
             }
-            LOG_ERROR("[FIND_CHILD] Child byte=0x%02x NOT FOUND in NODE_4 at page=%lu", byte, node_ref.page_id);
+            LOG_DEBUG("[FIND_CHILD] Child byte=0x%02x NOT FOUND in NODE_4 at page=%lu", byte, node_ref.page_id);
             return NULL_NODE_REF;
         }
         case DATA_NODE_16: {
@@ -342,29 +340,29 @@ static node_ref_t alloc_leaf(data_art_tree_t *tree, const uint8_t *key, size_t k
  * Replace a child in a node (when child reference changes due to split/growth)
  * This modifies the node in place by rewriting it
  */
-static bool replace_child_in_node(data_art_tree_t *tree, node_ref_t node_ref,
-                                    uint8_t byte, node_ref_t old_child_ref, 
-                                    node_ref_t new_child_ref) {
+static node_ref_t replace_child_in_node(data_art_tree_t *tree, node_ref_t node_ref,
+                                         uint8_t byte, node_ref_t old_child_ref,
+                                         node_ref_t new_child_ref) {
     if (node_ref_is_null(node_ref) || node_ref_equals(old_child_ref, new_child_ref)) {
-        return true;  // Nothing to do
+        return node_ref;  // Nothing to do
     }
-    
+
     const void *node = data_art_load_node(tree, node_ref);
     if (!node) {
-        return false;
+        return NULL_NODE_REF;
     }
-    
+
     uint8_t type = *(const uint8_t *)node;
     size_t node_size = get_node_size(type);
-    
+
     // Create a copy of the node to modify
     void *modified_node = malloc(node_size);
     if (!modified_node) {
         LOG_ERROR("Failed to allocate memory for node modification");
-        return false;
+        return NULL_NODE_REF;
     }
     memcpy(modified_node, node, node_size);
-    
+
     // Update the child reference based on node type
     bool found = false;
     switch (type) {
@@ -414,40 +412,38 @@ static bool replace_child_in_node(data_art_tree_t *tree, node_ref_t node_ref,
         default:
             free(modified_node);
             LOG_ERROR("Invalid node type for child replacement: %d", type);
-            return false;
+            return NULL_NODE_REF;
     }
-    
+
     if (!found) {
+        LOG_ERROR("[REPLACE_CHILD] FAILED: Child byte=0x%02x not found in node type=%u at page=%lu",
+                 byte, type, node_ref.page_id);
         free(modified_node);
-        LOG_ERROR("[REPLACE_CHILD] FAILED: Child byte=0x%02x not found in node type=%u at page=%lu (num_children=%u)", 
-                 byte, type, node_ref.page_id, 
-                 (type == DATA_NODE_4) ? ((data_art_node4_t*)modified_node)->num_children :
-                 (type == DATA_NODE_16) ? ((data_art_node16_t*)modified_node)->num_children :
-                 (type == DATA_NODE_48) ? ((data_art_node48_t*)modified_node)->num_children :
-                 (type == DATA_NODE_256) ? ((data_art_node256_t*)modified_node)->num_children : 0);
-        if (type == DATA_NODE_4) {
-            data_art_node4_t *n = (data_art_node4_t *)modified_node;
-            LOG_ERROR("[REPLACE_CHILD] NODE_4 keys: 0x%02x 0x%02x 0x%02x 0x%02x", 
-                     n->num_children > 0 ? n->keys[0] : 0xFF,
-                     n->num_children > 1 ? n->keys[1] : 0xFF,
-                     n->num_children > 2 ? n->keys[2] : 0xFF,
-                     n->num_children > 3 ? n->keys[3] : 0xFF);
-        }
-        return false;
+        return NULL_NODE_REF;
     }
-    
-    // Write modified node back
-    bool success = data_art_write_node(tree, node_ref, modified_node, node_size);
+
+    // CoW: allocate new page, write there, release old
+    node_ref_t new_ref = data_art_alloc_node(tree, node_size);
+    if (node_ref_is_null(new_ref)) {
+        LOG_ERROR("[REPLACE_CHILD] FAILED: Could not allocate new page for CoW");
+        free(modified_node);
+        return NULL_NODE_REF;
+    }
+
+    bool success = data_art_write_node(tree, new_ref, modified_node, node_size);
     free(modified_node);
-    
+
     if (!success) {
-        LOG_ERROR("[REPLACE_CHILD] FAILED: data_art_write_node failed for page=%lu", node_ref.page_id);
-    } else {
-        LOG_ERROR("[REPLACE_CHILD] SUCCESS: Updated child byte=0x%02x in node at page=%lu (old_page=%lu → new_page=%lu)", 
-                 byte, node_ref.page_id, old_child_ref.page_id, new_child_ref.page_id);
+        LOG_ERROR("[REPLACE_CHILD] FAILED: data_art_write_node failed for page=%lu", new_ref.page_id);
+        return NULL_NODE_REF;
     }
-    
-    return success;
+
+    data_art_release_page(tree, node_ref);
+
+    LOG_DEBUG("[REPLACE_CHILD] CoW: byte=0x%02x old_parent=%lu → new_parent=%lu (child %lu → %lu)",
+             byte, node_ref.page_id, new_ref.page_id, old_child_ref.page_id, new_child_ref.page_id);
+
+    return new_ref;
 }
 
 /**
@@ -884,20 +880,18 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         node_ref_t new_child_ref = insert_recursive(tree, child_ref, key, key_len,
                                                      depth + 1, value, value_len, inserted);
         
-        // If child changed (due to split or growth), update parent's reference
+        // If child changed (due to split or growth), update parent's reference via CoW
         if (!node_ref_equals(new_child_ref, child_ref)) {
-            LOG_ERROR("  [UPDATE_PARENT] depth=%zu: child changed from page=%u to page=%u, updating parent at page=%u", 
+            LOG_DEBUG("  [UPDATE_PARENT] depth=%zu: child changed from page=%lu to page=%lu, updating parent at page=%lu",
                      depth, child_ref.page_id, new_child_ref.page_id, node_ref.page_id);
-            if (!replace_child_in_node(tree, node_ref, byte, child_ref, new_child_ref)) {
+            node_ref_t new_node_ref = replace_child_in_node(tree, node_ref, byte, child_ref, new_child_ref);
+            if (node_ref_is_null(new_node_ref)) {
                 LOG_ERROR("  [UPDATE_PARENT] FAILED to update child reference in parent");
-            } else {
-                LOG_ERROR("  [UPDATE_PARENT] SUCCESS - parent updated");
+                return node_ref;
             }
-        } else {
-            LOG_DEBUG("  depth=%zu: child unchanged (page=%u), no parent update needed", 
-                     depth, child_ref.page_id);
+            return new_node_ref;  // Propagate CoW upward
         }
-        
+
         return node_ref;
     } else {
         // No child - add new leaf here
@@ -947,7 +941,7 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
     data_art_reset_arena();
 
     // Acquire write lock to serialize all write operations (one writer at a time)
-    pthread_rwlock_wrlock(&tree->write_lock);
+    pthread_mutex_lock(&tree->write_lock);
 
     // Allocate unique transaction ID for auto-commit (even outside explicit transactions)
     // This ensures every version has a unique xmin for MVCC visibility
@@ -955,50 +949,51 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
     bool auto_commit = (tree->current_txn_id == 0);
     if (auto_commit && tree->mvcc_manager) {
         if (!mvcc_begin_txn(tree->mvcc_manager, &auto_txn_id)) {
-            pthread_rwlock_unlock(&tree->write_lock);
+            pthread_mutex_unlock(&tree->write_lock);
             LOG_ERROR("Failed to begin auto-commit transaction");
             return false;
         }
         tree->current_txn_id = auto_txn_id;
     }
-    
+
     bool inserted = false;
     node_ref_t new_root = insert_recursive(tree, tree->root, key, key_len, 0,
                                             value, value_len, &inserted);
-    
+
     if (!node_ref_is_null(new_root)) {
         tree->root = new_root;
 
         if (inserted) {
             tree->size++;
-            
+
             // Log to WAL for durability (if WAL is enabled)
             if (tree->wal) {
                 uint64_t txn_id = tree->current_txn_id;  // 0 if no active transaction
                 if (!wal_log_insert(tree->wal, txn_id, key, key_len, value, value_len, NULL)) {
                     LOG_ERROR("Failed to log insert to WAL");
-                    // Note: Tree is already modified - this is a durability failure
-                    // In production, may need rollback logic here
                 }
             }
         }
-        
+
         // Auto-commit the transaction if we started one
         if (auto_commit && tree->mvcc_manager) {
             mvcc_commit_txn(tree->mvcc_manager, auto_txn_id);
-            tree->current_txn_id = 0;  // Clear auto-commit txn
+            tree->current_txn_id = 0;
         }
-        
-        pthread_rwlock_unlock(&tree->write_lock);
+
+        // Publish new root for lock-free readers
+        data_art_publish_root(tree);
+
+        pthread_mutex_unlock(&tree->write_lock);
         return true;
     }
-    
+
     // Failed to insert - abort auto-commit transaction if we started one
     if (auto_commit && tree->mvcc_manager) {
         mvcc_abort_txn(tree->mvcc_manager, auto_txn_id);
         tree->current_txn_id = 0;
     }
-    
-    pthread_rwlock_unlock(&tree->write_lock);
+
+    pthread_mutex_unlock(&tree->write_lock);
     return false;
 }

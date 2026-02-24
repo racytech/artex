@@ -116,6 +116,7 @@ target_link_libraries(art_wal
 add_library(art_persistent STATIC
     database/src/data_art_core.c
     database/src/data_art_overflow.c
+    database/src/data_art_search.c
     database/src/data_art_insert.c
     database/src/data_art_delete.c
     database/src/data_art_node_ops.c

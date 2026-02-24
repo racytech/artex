@@ -56,6 +56,17 @@ void data_art_reset_arena(void) {
     tls_arena_reset();
 }
 
+// ============================================================================
+// Lock-Free Read Helpers
+// ============================================================================
+
+// Publish the current tree->root so lock-free readers can see it.
+// Called after auto-commit, commit_txn, or tree initialization.
+void data_art_publish_root(data_art_tree_t *tree) {
+    atomic_store_explicit(&tree->committed_root_page_id,
+                          tree->root.page_id, memory_order_release);
+}
+
 // Thread-local transaction context
 typedef struct {
     data_art_tree_t *tree;           // Tree this transaction belongs to
@@ -82,12 +93,6 @@ static void set_txn_context(thread_txn_context_t *ctx) {
     pthread_once(&txn_context_key_once, make_txn_context_key);
     pthread_setspecific(txn_context_key, ctx);
 }
-
-// Snapshot handle structure - each thread owns one
-struct data_art_snapshot {
-    mvcc_snapshot_t *mvcc_snapshot;  // Underlying MVCC snapshot
-    uint64_t txn_id;                 // Transaction ID for this snapshot
-};
 
 // ============================================================================
 // Helper Functions - Node Size Calculation
@@ -171,26 +176,19 @@ data_art_tree_t *data_art_create(page_manager_t *page_manager,
     tree->current_txn_id = 0;        // No active transaction
     tree->txn_buffer = NULL;         // No transaction buffer initially
     
-    // Initialize write lock with writer-preference to prevent writer starvation.
-    // Default pthread_rwlock is reader-preferred: with many concurrent readers,
-    // a waiting writer can be starved indefinitely. Writer-preference queues new
-    // rdlocks behind a pending wrlock, bounding writer wait time.
-    pthread_rwlockattr_t rwlock_attr;
-    pthread_rwlockattr_init(&rwlock_attr);
-    pthread_rwlockattr_setkind_np(&rwlock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-    if (pthread_rwlock_init(&tree->write_lock, &rwlock_attr) != 0) {
+    // Initialize write lock (mutex). Readers are lock-free via atomic committed root,
+    // so only writers need serialization.
+    if (pthread_mutex_init(&tree->write_lock, NULL) != 0) {
         LOG_ERROR("Failed to initialize write_lock");
-        pthread_rwlockattr_destroy(&rwlock_attr);
         free(tree);
         return NULL;
     }
-    pthread_rwlockattr_destroy(&rwlock_attr);
     
     // Initialize MVCC manager
     tree->mvcc_manager = mvcc_manager_create();
     if (!tree->mvcc_manager) {
         LOG_ERROR("Failed to create MVCC manager");
-        pthread_rwlock_destroy(&tree->write_lock);
+        pthread_mutex_destroy(&tree->write_lock);
         free(tree);
         return NULL;
     }
@@ -207,11 +205,14 @@ data_art_tree_t *data_art_create(page_manager_t *page_manager,
     tree->overflow_pages_allocated = 0;
     tree->overflow_chain_reads = 0;
     
-    LOG_INFO("Created persistent ART tree (key_size=%zu, max_depth=%zu, buffer_pool=%s, wal=%s)", 
-             key_size, tree->max_depth, 
+    // Initialize committed root for lock-free readers (empty tree → page_id 0)
+    atomic_store_explicit(&tree->committed_root_page_id, 0, memory_order_release);
+
+    LOG_INFO("Created persistent ART tree (key_size=%zu, max_depth=%zu, buffer_pool=%s, wal=%s)",
+             key_size, tree->max_depth,
              buffer_pool ? "enabled" : "disabled",
              wal ? "enabled" : "disabled");
-    
+
     return tree;
 }
 
@@ -221,7 +222,7 @@ void data_art_destroy(data_art_tree_t *tree) {
     }
     
     // Destroy write lock
-    pthread_rwlock_destroy(&tree->write_lock);
+    pthread_mutex_destroy(&tree->write_lock);
     
     // Destroy MVCC manager
     if (tree->mvcc_manager) {
@@ -313,23 +314,12 @@ node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size) {
  * @param old_ref Reference to old page
  */
 void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref) {
-    if (!tree || node_ref_is_null(old_ref)) {
-        return;
-    }
-    
-    uint32_t ref_count = page_gc_decref(tree->page_manager, old_ref.page_id);
-    
-    LOG_DEBUG("[RELEASE_PAGE] page=%lu | ref_count after decrement=%u",
-              old_ref.page_id, ref_count);
-    
-    // If ref count reached 0, invalidate buffer pool entry
-    if (ref_count == 0) {
-        LOG_DEBUG("[RELEASE_PAGE] page=%lu reached ref_count=0, invalidating from buffer pool",
-                  old_ref.page_id);
-        buffer_pool_invalidate(tree->buffer_pool, old_ref.page_id);
-        LOG_DEBUG("[RELEASE_PAGE] page=%lu marked as dead and removed from buffer pool",
-                  old_ref.page_id);
-    }
+    // With lock-free reads, snapshots may still be traversing old pages.
+    // Releasing/invalidating pages here would cause readers to see corrupted data.
+    // Old pages are left alive; epoch-based GC will reclaim them when no snapshot
+    // can reference them.
+    (void)tree;
+    (void)old_ref;
 }
 
 // ============================================================================
@@ -545,477 +535,8 @@ node_ref_t data_art_cow_node(data_art_tree_t *tree, node_ref_t ref) {
 }
 
 // ============================================================================
-// Helper Functions - Node Navigation
-// ============================================================================
-
-/**
- * Check if a node reference points to a leaf
- */
-static bool is_leaf_ref(data_art_tree_t *tree, node_ref_t ref) {
-    if (node_ref_is_null(ref)) {
-        return false;
-    }
-    
-    const void *node = data_art_load_node(tree, ref);
-    if (!node) {
-        return false;
-    }
-    
-    uint8_t type = *(const uint8_t *)node;
-    return type == DATA_NODE_LEAF;
-}
-
-/**
- * Find child node reference by byte key
- */
-node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) {
-    const void *node = data_art_load_node(tree, node_ref);
-    if (!node) {
-        LOG_INFO("find_child: failed to load node at page=%lu offset=%u",
-                 node_ref.page_id, node_ref.offset);
-        return NULL_NODE_REF;
-    }
-    
-    uint8_t type = *(const uint8_t *)node;
-    LOG_INFO("find_child: looking for byte=0x%02x in node type=%d at page=%lu", 
-             byte, type, node_ref.page_id);
-    
-    switch (type) {
-        case DATA_NODE_4: {
-            const data_art_node4_t *n = (const data_art_node4_t *)node;
-            // Debug: log available keys
-            char keys_str[32] = {0};
-            for (int i = 0; i < n->num_children && i < 4; i++) {
-                char temp[8];
-                snprintf(temp, sizeof(temp), "0x%02x ", n->keys[i]);
-                strcat(keys_str, temp);
-            }
-            LOG_INFO("find_child NODE_4: looking for 0x%02x, available keys: %s", byte, keys_str);
-            
-            for (int i = 0; i < n->num_children; i++) {
-                if (n->keys[i] == byte) {
-                    return (node_ref_t){.page_id = n->child_page_ids[i], 
-                                       .offset = n->child_offsets[i]};
-                }
-            }
-            return NULL_NODE_REF;
-        }
-        case DATA_NODE_16: {
-            const data_art_node16_t *n = (const data_art_node16_t *)node;
-            // Debug: log available keys
-            char keys_str[128] = {0};
-            for (int i = 0; i < n->num_children && i < 16; i++) {
-                char temp[8];
-                snprintf(temp, sizeof(temp), "0x%02x ", n->keys[i]);
-                strcat(keys_str, temp);
-            }
-            LOG_INFO("find_child NODE_16: looking for 0x%02x, num_children=%d, available keys: %s", 
-                     byte, n->num_children, keys_str);
-            
-            for (int i = 0; i < n->num_children; i++) {
-                if (n->keys[i] == byte) {
-                    return (node_ref_t){.page_id = n->child_page_ids[i], 
-                                       .offset = n->child_offsets[i]};
-                }
-            }
-            return NULL_NODE_REF;
-        }
-        case DATA_NODE_48: {
-            const data_art_node48_t *n = (const data_art_node48_t *)node;
-            uint8_t idx = n->keys[byte];
-            if (idx == 255) return NULL_NODE_REF;  // Empty slot
-            return (node_ref_t){.page_id = n->child_page_ids[idx], 
-                               .offset = n->child_offsets[idx]};
-        }
-        case DATA_NODE_256: {
-            const data_art_node256_t *n = (const data_art_node256_t *)node;
-            uint64_t page_id = n->child_page_ids[byte];
-            if (page_id == 0) return NULL_NODE_REF;
-            return (node_ref_t){.page_id = page_id, 
-                               .offset = n->child_offsets[byte]};
-        }
-        default:
-            return NULL_NODE_REF;
-    }
-}
-
-/**
- * Find any leaf descendant of a node (for lazy expansion prefix verification)
- */
-static const data_art_leaf_t* find_any_leaf_for_prefix(data_art_tree_t *tree, node_ref_t node_ref) {
-    if (node_ref_is_null(node_ref)) {
-        return NULL;
-    }
-    
-    const void *node = data_art_load_node(tree, node_ref);
-    if (!node) {
-        return NULL;
-    }
-    
-    uint8_t type = *(const uint8_t *)node;
-    
-    // If it's a leaf, return it
-    if (type == DATA_NODE_LEAF) {
-        return (const data_art_leaf_t *)node;
-    }
-    
-    // Otherwise, recurse to first child
-    node_ref_t child_ref = NULL_NODE_REF;
-    
-    switch (type) {
-        case DATA_NODE_4: {
-            const data_art_node4_t *n = (const data_art_node4_t *)node;
-            if (n->num_children > 0) {
-                child_ref = (node_ref_t){.page_id = n->child_page_ids[0],
-                                        .offset = n->child_offsets[0]};
-            }
-            break;
-        }
-        case DATA_NODE_16: {
-            const data_art_node16_t *n = (const data_art_node16_t *)node;
-            if (n->num_children > 0) {
-                child_ref = (node_ref_t){.page_id = n->child_page_ids[0],
-                                        .offset = n->child_offsets[0]};
-            }
-            break;
-        }
-        case DATA_NODE_48: {
-            const data_art_node48_t *n = (const data_art_node48_t *)node;
-            // Find first non-empty slot
-            for (int i = 0; i < 256; i++) {
-                if (n->keys[i] != 255) {  // NODE48_EMPTY
-                    uint8_t idx = n->keys[i];
-                    child_ref = (node_ref_t){.page_id = n->child_page_ids[idx],
-                                            .offset = n->child_offsets[idx]};
-                    break;
-                }
-            }
-            break;
-        }
-        case DATA_NODE_256: {
-            const data_art_node256_t *n = (const data_art_node256_t *)node;
-            // Find first non-null child
-            for (int i = 0; i < 256; i++) {
-                if (n->child_page_ids[i] != 0) {
-                    child_ref = (node_ref_t){.page_id = n->child_page_ids[i],
-                                            .offset = n->child_offsets[i]};
-                    break;
-                }
-            }
-            break;
-        }
-    }
-    
-    return find_any_leaf_for_prefix(tree, child_ref);
-}
-
-/**
- * Check prefix match (path compression) with lazy expansion support
- * For search operations, we use optimistic matching for lazy expansion
- */
-int check_prefix(data_art_tree_t *tree, node_ref_t node_ref,
-                       const void *node, const uint8_t *key, 
-                       size_t key_len, size_t depth) {
-    const uint8_t *node_bytes = (const uint8_t *)node;
-    uint8_t partial_len = node_bytes[2];  // Offset of partial_len field
-    const uint8_t *partial = node_bytes + 4;  // Offset of partial array
-    
-    int max_cmp = (partial_len < 10) ? partial_len : 10;
-    
-    // Check inline portion
-    for (int i = 0; i < max_cmp; i++) {
-        if (depth + i >= key_len) return i;
-        if (partial[i] != key[depth + i]) return i;
-    }
-    
-    // For lazy expansion (partial_len > 10):
-    // We optimistically assume the remaining bytes match.
-    // The final leaf comparison will verify the full key.
-    // This avoids the cost of traversing to a leaf just for prefix verification.
-    return partial_len;
-}
-
-/**
- * Check if leaf matches key
- */
-bool leaf_matches(const data_art_leaf_t *leaf, const uint8_t *key, size_t key_len) {
-    if (leaf->key_len != key_len) {
-        return false;
-    }
-    return memcmp(leaf->data, key, key_len) == 0;
-}
-
-// ============================================================================
-// Core Operations - Search
-// ============================================================================
-
-// Internal get with snapshot support
-static const void *data_art_get_internal(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
-                         size_t *value_len, mvcc_snapshot_t *snapshot, uint64_t snapshot_txn_id) {
-    if (!tree || !key) {
-        LOG_ERROR("Invalid parameters");
-        return NULL;
-    }
-
-    // Reset thread-local arena — each get operation starts fresh
-    tls_arena_reset();
-
-    // Validate key size matches tree's configured size
-    if (key_len != tree->key_size) {
-        LOG_ERROR("Key size mismatch: expected %zu bytes, got %zu bytes",
-                  tree->key_size, key_len);
-        return NULL;
-    }
-    
-    node_ref_t current = tree->root;
-
-    if (node_ref_is_null(current)) {
-        return NULL;  // Empty tree
-    }
-
-    size_t depth = 0;
-    
-    while (!node_ref_is_null(current)) {
-        const void *node = data_art_load_node(tree, current);
-        if (!node) {
-            LOG_ERROR("Failed to load node at page=%lu, offset=%u", 
-                     current.page_id, current.offset);
-            return NULL;
-        }
-        
-        uint8_t type = *(const uint8_t *)node;
-        
-        // Check if leaf
-        if (type == DATA_NODE_LEAF) {
-            const data_art_leaf_t *leaf = (const data_art_leaf_t *)node;
-            LOG_DEBUG("Found LEAF at page=%lu: key_len=%u, value_len=%u, flags=0x%02x, xmin=%lu, xmax=%lu",
-                      current.page_id, leaf->key_len, leaf->value_len, leaf->flags, leaf->xmin, leaf->xmax);
-            
-            // Walk version chain to find visible version
-            node_ref_t version_ref = current;
-            const data_art_leaf_t *visible_leaf = NULL;
-            int chain_length = 0;
-            const int MAX_CHAIN_LENGTH = 1000;  // Prevent infinite loops
-            
-            LOG_TRACE("Starting version chain walk from page=%lu offset=%u", version_ref.page_id, version_ref.offset);
-            
-            // Start with the leaf we already loaded
-            const data_art_leaf_t *candidate = leaf;
-            
-            while (chain_length < MAX_CHAIN_LENGTH) {
-                if (!candidate || candidate->type != DATA_NODE_LEAF) {
-                    LOG_ERROR("Invalid version chain: candidate=%p, type=%u", 
-                              (void*)candidate, 
-                              candidate ? candidate->type : 255);
-                    break;
-                }
-                
-                LOG_TRACE("Checking version chain[%d]: page=%lu offset=%u xmin=%lu xmax=%lu",
-                         chain_length, version_ref.page_id, version_ref.offset, candidate->xmin, candidate->xmax);
-                
-                // MVCC visibility check
-                bool visible = true;
-                if (snapshot && tree->mvcc_manager) {
-                    visible = mvcc_is_visible(tree->mvcc_manager, snapshot,
-                                              candidate->xmin, candidate->xmax, snapshot_txn_id);
-                    if (!visible) {
-                        LOG_TRACE("Version not visible to snapshot (xmin=%lu, xmax=%lu)",
-                                 candidate->xmin, candidate->xmax);
-                    }
-                } else if (candidate->xmax != 0) {
-                    // No snapshot but leaf is deleted - not visible
-                    visible = false;
-                    LOG_TRACE("Version is deleted (xmax=%lu), not visible", candidate->xmax);
-                }
-                
-                if (visible) {
-                    visible_leaf = candidate;
-                    LOG_DEBUG("Found visible version at chain[%d]: xmin=%lu xmax=%lu", 
-                             chain_length, candidate->xmin, candidate->xmax);
-                    break;
-                }
-                
-                // Move to previous version
-                if (node_ref_is_null(candidate->prev_version)) {
-                    LOG_DEBUG("End of version chain (no prev_version)");
-                    break;
-                }
-                
-                version_ref = candidate->prev_version;
-                chain_length++;
-                
-                // Load next version in chain
-                candidate = (const data_art_leaf_t *)data_art_load_node(tree, version_ref);
-            }
-            
-            if (chain_length >= MAX_CHAIN_LENGTH) {
-                LOG_ERROR("Version chain too long (>%d), possible corruption", MAX_CHAIN_LENGTH);
-                return NULL;
-            }
-            
-            if (!visible_leaf) {
-                LOG_DEBUG("No visible version found in chain (length=%d)", chain_length);
-                return NULL;  // No visible version in chain
-            }
-            
-            leaf = visible_leaf;  // Use the visible version
-            
-            // Debug: Verify the leaf structure makes sense
-            if (leaf->value_len > 1024) {  // Suspiciously large
-                LOG_ERROR("CORRUPTION DETECTED: leaf at page=%lu offset=%u has suspiciously large value_len=%u, key_len=%u",
-                          current.page_id, current.offset, leaf->value_len, leaf->key_len);
-                LOG_ERROR("Leaf dump: type=%u flags=0x%02x, overflow_page=%lu, inline_data_len=%u",
-                          leaf->type, leaf->flags, leaf->overflow_page, leaf->inline_data_len);
-                // Dump raw bytes of entire leaf header
-                const uint8_t *raw = (const uint8_t *)leaf;
-                LOG_ERROR("Raw bytes [0-23]: %02x %02x %02x %02x | %02x %02x %02x %02x | %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x",
-                          raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-                          raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
-                          raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23]);
-                LOG_ERROR("Field breakdown: type@0=%02x flags@1=%02x pad@2-3=%02x%02x | key_len@4-7=%02x%02x%02x%02x | value_len@8-11=%02x%02x%02x%02x | overflow@12-19=%02x%02x%02x%02x%02x%02x%02x%02x | inline_len@20-23=%02x%02x%02x%02x",
-                          raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-                          raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
-                          raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23]);
-            }
-            
-            if (leaf_matches(leaf, key, key_len)) {
-                if (value_len) {
-                    *value_len = leaf->value_len;
-                }
-                LOG_TRACE("Leaf matches! Returning value_len=%u", leaf->value_len);
-                
-                // Allocate buffer for value (caller must free)
-                void *value_copy = malloc(leaf->value_len);
-                if (!value_copy) {
-                    LOG_ERROR("Failed to allocate memory for value");
-                    return NULL;
-                }
-                
-                // Handle overflow if needed
-                if (leaf->flags & LEAF_FLAG_OVERFLOW) {
-                    // Read full value from overflow chain
-                    if (!data_art_read_overflow_value(tree, leaf, value_copy)) {
-                        free(value_copy);
-                        LOG_ERROR("Failed to read overflow value");
-                        return NULL;
-                    }
-                    return value_copy;
-                }
-                
-                // Copy inline value
-                memcpy(value_copy, leaf->data + leaf->key_len, leaf->value_len);
-                return value_copy;
-            }
-            return NULL;
-        }
-        
-        // Check compressed path
-        const uint8_t *node_bytes = (const uint8_t *)node;
-        uint8_t partial_len = node_bytes[2];
-        
-        if (partial_len > 0) {
-            LOG_INFO("Checking prefix: node at page=%lu has partial_len=%u, current depth=%zu", 
-                     current.page_id, partial_len, depth);
-            
-            int prefix_match = check_prefix(tree, current, node, key, key_len, depth);
-            
-            // Check inline portion (up to 10 bytes)
-            int expected_match = (partial_len < 10) ? partial_len : 10;
-            
-            LOG_INFO("Prefix check result: prefix_match=%d, expected_match=%d", 
-                     prefix_match, expected_match);
-            
-            if (prefix_match < expected_match) {
-                // Show what mismatched - use hex for clarity
-                char key_hex[64];
-                char node_hex[64];
-                int show_bytes = (expected_match < 10) ? expected_match : 10;
-                
-                for (int i = 0; i < show_bytes; i++) {
-                    if (depth + i < key_len) {
-                        snprintf(key_hex + i*3, 4, "%02x ", key[depth + i]);
-                    } else {
-                        snprintf(key_hex + i*3, 4, "?? ");
-                    }
-                    snprintf(node_hex + i*3, 4, "%02x ", node_bytes[4 + i]);
-                }
-                
-                LOG_INFO("PREFIX MISMATCH at depth=%zu (matched %d/%d bytes)", 
-                         depth, prefix_match, expected_match);
-                LOG_INFO("  Key bytes:  %s", key_hex);
-                LOG_INFO("  Node bytes: %s", node_hex);
-                
-                return NULL;  // Prefix mismatch in inline portion
-            }
-            
-            // For lazy expansion (partial_len > 10), verify full prefix via leaf
-            if (partial_len > 10) {
-                // Need to check remaining bytes - traverse to any leaf
-                // But we'll do this optimistically and verify at the leaf level
-                // The leaf comparison will catch any mismatch in bytes 10+
-            }
-            
-            depth += partial_len;  // Skip the full compressed path
-        }
-        
-        // Get next byte to search
-        // Fixed-size keys optimization: check exhaustion only when needed
-        uint8_t byte;
-        if (depth < key_len) {
-            byte = key[depth];
-            depth++;  // Move past the byte we just used for lookup
-        } else {
-            // Key exhausted, look for NULL byte child (leaf level)
-            byte = 0x00;
-        }
-        
-        current = find_child(tree, current, byte);
-        if (node_ref_is_null(current)) {
-            // Debug: child not found
-            char key_str[64];
-            snprintf(key_str, sizeof(key_str), "%.*s", (int)(key_len < 40 ? key_len : 40), key);
-            LOG_INFO("Child lookup failed: key='%s', depth=%zu, byte=0x%02x('%c')", 
-                     key_str, depth, byte, (byte >= 32 && byte < 127) ? byte : '?');
-        } else {
-            LOG_INFO("Child found, advancing to page=%lu offset=%u", 
-                     current.page_id, current.offset);
-        }
-    }
-    
-    LOG_INFO("Exited search loop, current is null, returning NULL");
-    return NULL;  // Not found
-}
-
-// Public API: Get with snapshot
-// Readers acquire rdlock to prevent torn reads from in-place parent updates.
-// Writer-preference rwlock ensures waiting writers are not starved by readers.
-const void *data_art_get_snapshot(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
-                                   size_t *value_len, data_art_snapshot_t *snapshot) {
-    pthread_rwlock_rdlock(&tree->write_lock);
-    const void *result;
-    if (snapshot) {
-        result = data_art_get_internal(tree, key, key_len, value_len,
-                                        snapshot->mvcc_snapshot, snapshot->txn_id);
-    } else {
-        result = data_art_get_internal(tree, key, key_len, value_len, NULL, 0);
-    }
-    pthread_rwlock_unlock(&tree->write_lock);
-    return result;
-}
-
-// Legacy API: Get without snapshot (reads latest committed)
-const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
-                         size_t *value_len) {
-    return data_art_get_snapshot(tree, key, key_len, value_len, NULL);
-}
-
-bool data_art_contains(data_art_tree_t *tree, const uint8_t *key, size_t key_len) {
-    size_t len;
-    return data_art_get(tree, key, key_len, &len) != NULL;
-}
-
-// ============================================================================
-// NOTE: Insert and Delete operations are implemented in separate files:
+// NOTE: Search, Insert and Delete operations are implemented in separate files:
+// - data_art_search.c (tree traversal, get, contains)
 // - data_art_insert.c (recursive insert with node growth)
 // - data_art_delete.c (recursive delete with node shrinking - TODO)
 // 
@@ -1166,13 +687,16 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
     if (!mvcc_commit_txn(tree->mvcc_manager, txn_id)) {
         LOG_ERROR("Failed to commit MVCC transaction %lu", txn_id);
     }
-    
+
+    // Publish final root for lock-free readers
+    data_art_publish_root(tree);
+
     // Clean up
     txn_buffer_destroy(buffer);
     ctx->txn_buffer = NULL;
     tree->txn_buffer = NULL;
     tree->current_txn_id = 0;
-    
+
     LOG_INFO("Committed transaction %lu for thread %p", txn_id, (void*)pthread_self());
     return true;
 }
@@ -1246,6 +770,10 @@ data_art_snapshot_t *data_art_begin_snapshot(data_art_tree_t *tree) {
         return NULL;
     }
     
+    // Capture committed root at snapshot creation time (lock-free)
+    snapshot->root_page_id = atomic_load_explicit(&tree->committed_root_page_id,
+                                                   memory_order_acquire);
+
     // Create MVCC snapshot
     snapshot->mvcc_snapshot = mvcc_snapshot_create(tree->mvcc_manager);
     if (!snapshot->mvcc_snapshot) {
@@ -1394,6 +922,9 @@ int64_t data_art_recover(data_art_tree_t *tree, uint64_t start_lsn) {
     
     LOG_INFO("Recovery complete: replayed %ld entries, tree size=%zu",
              entries, tree->size);
-    
+
+    // Publish recovered root for lock-free readers
+    data_art_publish_root(tree);
+
     return entries;
 }

@@ -195,11 +195,10 @@ TEST(test_wal_transactions) {
     ASSERT(wal != NULL, "WAL created");
     
     // Begin transaction
-    uint64_t txn_id = 0;
+    uint64_t txn_id = 1;
     uint64_t begin_lsn = 0;
-    bool success = wal_log_begin_txn(wal, &txn_id, &begin_lsn);
+    bool success = wal_log_begin_txn(wal, txn_id, &begin_lsn);
     ASSERT(success, "Begin transaction logged");
-    ASSERT(txn_id > 0, "Transaction ID assigned");
     ASSERT_EQ(begin_lsn, 1, "Begin LSN is 1");
     
     // Log operations within transaction
@@ -220,8 +219,8 @@ TEST(test_wal_transactions) {
     ASSERT_EQ(stats.commits, 1, "Commit count correct");
     
     // Test abort transaction
-    uint64_t abort_txn_id = 0;
-    success = wal_log_begin_txn(wal, &abort_txn_id, NULL);
+    uint64_t abort_txn_id = 2;
+    success = wal_log_begin_txn(wal, abort_txn_id, NULL);
     ASSERT(success, "Second transaction started");
     
     uint64_t abort_lsn = 0;
@@ -315,8 +314,8 @@ TEST(test_wal_fsync) {
     ASSERT(wal != NULL, "WAL created");
     
     // Log insert and commit (should fsync)
-    uint64_t txn_id = 0;
-    wal_log_begin_txn(wal, &txn_id, NULL);
+    uint64_t txn_id = 1;
+    wal_log_begin_txn(wal, txn_id, NULL);
     
     const uint8_t key[] = "sync_key";
     const uint8_t value[] = "sync_value";
@@ -507,8 +506,8 @@ TEST(test_wal_statistics) {
     ASSERT(wal != NULL, "WAL created");
     
     // Perform various operations
-    uint64_t txn_id;
-    wal_log_begin_txn(wal, &txn_id, NULL);
+    uint64_t txn_id = 1;
+    wal_log_begin_txn(wal, txn_id, NULL);
     
     const uint8_t key1[] = "stat_key_1";
     const uint8_t value1[] = "stat_value_1";

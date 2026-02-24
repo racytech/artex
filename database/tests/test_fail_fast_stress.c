@@ -37,16 +37,17 @@
 #include <sys/time.h>
 
 // Stress test configuration
+// Ethereum model: single writer (block executor), many readers (JSON-RPC)
 #define NUM_READER_THREADS 16
-#define NUM_WRITER_THREADS 6
-#define NUM_DELETER_THREADS 2
+#define NUM_WRITER_THREADS 1
+#define NUM_DELETER_THREADS 0
 #define NUM_LONG_SNAPSHOT_THREADS 2
 #define NUM_KEYS 10000
 #define NUM_HOT_KEYS 100  // Hot keys for contention testing
 #define TEST_DURATION_SECONDS 30  // Reduced for faster iteration
 #define STATS_INTERVAL_SECONDS 5
 #define ABORT_PROBABILITY 10  // 10% of transactions abort
-#define DELETE_PROBABILITY 30  // 30% of operations are deletes
+#define DELETE_PROBABILITY 30  // 30% of writer operations are deletes
 
 // Shared test state
 typedef struct {
@@ -60,6 +61,7 @@ typedef struct {
     uint64_t total_deletes;
     uint64_t total_aborts;
     uint64_t total_snapshots;
+    uint64_t null_reads;       // Key was deleted — valid result, not an error
     uint64_t read_errors;
     uint64_t write_errors;
     uint64_t delete_errors;
@@ -74,6 +76,10 @@ typedef struct {
     // Health checks
     bool deadlock_detected;
     bool memory_leak_detected;
+
+    // Per-key deletion tracking (writer updates after commit)
+    // Readers use this to distinguish expected NULL (deleted) from real errors.
+    _Atomic bool *key_deleted;  // [NUM_KEYS]
 } test_state_t;
 
 // Generate deterministic key from index
@@ -109,7 +115,7 @@ static data_art_tree_t *create_stress_tree(const char *db_path, const char *wal_
     
     // Aggressive buffer pool to force heavy eviction
     buffer_pool_config_t config = buffer_pool_default_config();
-    config.capacity = 100;  // Only 100 pages cached (aggressive thrashing)
+    config.capacity = 10000;  // CoW needs more pages (each write allocates new pages)
     buffer_pool_t *bp = buffer_pool_create(&config, pm);
     assert(bp != NULL);
     
@@ -159,10 +165,11 @@ static void *reader_thread(void *arg) {
     test_state_t *state = (test_state_t *)arg;
     unsigned int seed = (unsigned int)pthread_self();
     uint64_t local_reads = 0;
+    uint64_t local_null_reads = 0;
     uint64_t local_errors = 0;
     uint64_t local_snapshots = 0;
     uint64_t local_violations = 0;
-    
+
     while (!state->stop) {
         // Begin snapshot
         data_art_snapshot_t *snapshot = data_art_begin_snapshot(state->tree);
@@ -172,57 +179,89 @@ static void *reader_thread(void *arg) {
             continue;
         }
         local_snapshots++;
-        
+
         // Perform multiple reads within this snapshot
         int reads_in_snapshot = 20 + (rand_r(&seed) % 30);  // 20-50 reads per snapshot
-        char *first_value = NULL;
-        int first_key_index = -1;
-        
+
+        // Isolation check state: track first read of a key within this snapshot
+        // A second read of the same key must return the same result (value or NULL)
+        int tracked_key_index = -1;
+        char *tracked_value = NULL;     // NULL means the first read returned NULL
+        bool tracked_was_null = false;
+
         for (int i = 0; i < reads_in_snapshot && !state->stop; i++) {
             int key_index = rand_r(&seed) % NUM_KEYS;
             uint8_t key[20];
             generate_key(key, sizeof(key), key_index);
-            
+
             size_t read_len;
             const void *read_val = data_art_get_snapshot(state->tree, key, sizeof(key), &read_len, snapshot);
-            
+
             if (read_val) {
                 local_reads++;
-                
-                // Isolation check: same key within snapshot should return same value
-                if (key_index == first_key_index) {
-                    if (first_value && strcmp((const char *)read_val, first_value) != 0) {
-                        printf("✗ ISOLATION VIOLATION: Key %d changed within snapshot!\n", key_index);
-                        printf("  First read: %s\n", first_value);
-                        printf("  Second read: %s\n", (const char *)read_val);
+
+                // Isolation check: same key within snapshot must return same value
+                if (key_index == tracked_key_index) {
+                    if (tracked_was_null) {
+                        // First read returned NULL, now we got a value — violation
+                        fprintf(stderr, "ISOLATION VIOLATION: Key %d was NULL, now has value '%s'\n",
+                                key_index, (const char *)read_val);
+                        local_violations++;
+                    } else if (tracked_value && strcmp((const char *)read_val, tracked_value) != 0) {
+                        fprintf(stderr, "ISOLATION VIOLATION: Key %d changed within snapshot!\n", key_index);
+                        fprintf(stderr, "  First read: %s\n", tracked_value);
+                        fprintf(stderr, "  Second read: %s\n", (const char *)read_val);
                         local_violations++;
                     }
-                } else if (!first_value) {
-                    first_value = strdup((const char *)read_val);
-                    first_key_index = key_index;
+                } else if (tracked_key_index == -1) {
+                    tracked_key_index = key_index;
+                    tracked_value = strdup((const char *)read_val);
+                    tracked_was_null = false;
                 }
-                
+
                 free((void *)read_val);
             } else {
-                local_errors++;
+                // NULL result — check if the key was deleted by the writer
+                bool was_deleted = atomic_load_explicit(&state->key_deleted[key_index],
+                                                        memory_order_acquire);
+                if (was_deleted) {
+                    // Expected: key was deleted, NULL is correct
+                    local_null_reads++;
+                } else {
+                    // Key was never deleted — NULL is unexpected, real error
+                    local_errors++;
+                }
+
+                // Isolation check: same key within snapshot must stay NULL
+                if (key_index == tracked_key_index) {
+                    if (!tracked_was_null) {
+                        fprintf(stderr, "ISOLATION VIOLATION: Key %d had value '%s', now is NULL\n",
+                                key_index, tracked_value ? tracked_value : "(unknown)");
+                        local_violations++;
+                    }
+                } else if (tracked_key_index == -1) {
+                    tracked_key_index = key_index;
+                    tracked_was_null = true;
+                }
             }
         }
-        
-        free(first_value);
+
+        free(tracked_value);
         data_art_end_snapshot(state->tree, snapshot);
-        
+
         // Small delay to avoid spinning
         usleep(rand_r(&seed) % 500);
     }
-    
+
     // Update global stats
     pthread_mutex_lock(&state->stats_lock);
     state->total_reads += local_reads;
+    state->null_reads += local_null_reads;
     state->read_errors += local_errors;
     state->total_snapshots += local_snapshots;
     state->isolation_violations += local_violations;
     pthread_mutex_unlock(&state->stats_lock);
-    
+
     return NULL;
 }
 
@@ -236,7 +275,12 @@ static void *writer_thread(void *arg) {
     uint64_t local_errors = 0;
     uint64_t local_contentions = 0;
     int version = 1;
-    
+
+    // Batch tracking: record ops so we can update key_deleted after commit
+    int batch_keys[8];     // max 7 updates per txn + slack
+    bool batch_is_del[8];
+    int batch_count = 0;
+
     while (!state->stop) {
         uint64_t txn_id;
         if (!data_art_begin_txn(state->tree, &txn_id)) {
@@ -244,14 +288,15 @@ static void *writer_thread(void *arg) {
             usleep(1000);  // Back off
             continue;
         }
-        
+
         // Randomly abort 10% of transactions
         bool should_abort = (rand_r(&seed) % 100) < ABORT_PROBABILITY;
-        
+
         // Update 3-7 keys in this transaction
         int updates = 3 + (rand_r(&seed) % 5);
         bool success = true;
-        
+        batch_count = 0;
+
         for (int i = 0; i < updates && !state->stop; i++) {
             // 50% hot keys for contention, 50% random
             int key_index;
@@ -261,13 +306,13 @@ static void *writer_thread(void *arg) {
             } else {
                 key_index = NUM_HOT_KEYS + (rand_r(&seed) % (NUM_KEYS - NUM_HOT_KEYS));
             }
-            
+
             uint8_t key[20];
             generate_key(key, sizeof(key), key_index);
-            
+
             // 30% delete, 70% insert/update
             bool is_delete = (rand_r(&seed) % 100) < DELETE_PROBABILITY;
-            
+
             if (is_delete) {
                 if (!data_art_delete(state->tree, key, sizeof(key))) {
                     // Delete may fail if key doesn't exist (already deleted)
@@ -277,28 +322,39 @@ static void *writer_thread(void *arg) {
             } else {
                 char value[64];
                 generate_value(value, sizeof(value), key_index, version++);
-                
+
                 if (!data_art_insert(state->tree, key, sizeof(key), value, strlen(value) + 1)) {
                     success = false;
                     break;
                 }
                 local_writes++;
             }
+
+            // Track this op for post-commit key_deleted update
+            batch_keys[batch_count] = key_index;
+            batch_is_del[batch_count] = is_delete;
+            batch_count++;
         }
-        
+
         if (should_abort) {
-            // Deliberate abort to test rollback logic
+            // Deliberate abort to test rollback logic — don't update key_deleted
             data_art_abort_txn(state->tree);
             local_aborts++;
         } else if (success) {
             if (!data_art_commit_txn(state->tree)) {
                 local_errors++;
+            } else {
+                // Commit succeeded — publish key states for readers
+                for (int i = 0; i < batch_count; i++) {
+                    atomic_store_explicit(&state->key_deleted[batch_keys[i]],
+                                          batch_is_del[i], memory_order_release);
+                }
             }
         } else {
             data_art_abort_txn(state->tree);
             local_errors++;
         }
-        
+
         // Vary write rate
         usleep(rand_r(&seed) % 2000);
     }
@@ -428,10 +484,14 @@ void test_fail_fast_stress(void) {
     printf("  - %d seconds duration\n", TEST_DURATION_SECONDS);
     printf("  - Stats interval: %d seconds\n\n", STATS_INTERVAL_SECONDS);
     
-    data_art_tree_t *tree = create_stress_tree("test_stress_fail_fast.db", 
+    data_art_tree_t *tree = create_stress_tree("test_stress_fail_fast.db",
                                                 "test_stress_fail_fast_wal");
     initialize_data(tree);
-    
+
+    // All keys exist after initialization, none deleted
+    _Atomic bool *key_deleted = calloc(NUM_KEYS, sizeof(_Atomic bool));
+    assert(key_deleted != NULL);
+
     test_state_t state = {
         .tree = tree,
         .stop = false,
@@ -440,6 +500,7 @@ void test_fail_fast_stress(void) {
         .total_deletes = 0,
         .total_aborts = 0,
         .total_snapshots = 0,
+        .null_reads = 0,
         .read_errors = 0,
         .write_errors = 0,
         .delete_errors = 0,
@@ -447,6 +508,7 @@ void test_fail_fast_stress(void) {
         .hot_key_contentions = 0,
         .deadlock_detected = false,
         .memory_leak_detected = false,
+        .key_deleted = key_deleted,
         .snapshot_start_time = get_time_usec(),
         .last_reads = 0,
         .last_writes = 0
@@ -507,22 +569,24 @@ void test_fail_fast_stress(void) {
     printf("╔══════════════════════════════════════════════════════════╗\n");
     printf("║              FINAL RESULTS                               ║\n");
     printf("╚══════════════════════════════════════════════════════════╝\n");
+    uint64_t total_lookups = state.total_reads + state.null_reads;
     printf("\nOperations:\n");
-    printf("  Total reads:     %lu (%.0f ops/sec)\n", state.total_reads, state.total_reads / duration_sec);
+    printf("  Total reads:     %lu (%.0f ops/sec) — %lu returned value, %lu returned NULL (deleted key)\n",
+           total_lookups, total_lookups / duration_sec, state.total_reads, state.null_reads);
     printf("  Total writes:    %lu (%.0f ops/sec)\n", state.total_writes, state.total_writes / duration_sec);
     printf("  Total deletes:   %lu (%.0f ops/sec)\n", state.total_deletes, state.total_deletes / duration_sec);
     printf("  Total aborts:    %lu\n", state.total_aborts);
     printf("  Total snapshots: %lu\n", state.total_snapshots);
     printf("  Hot key ops:     %lu\n", state.hot_key_contentions);
-    printf("  Avg reads/snapshot: %.1f\n", (double)state.total_reads / state.total_snapshots);
-    
+    printf("  Avg reads/snapshot: %.1f\n", (double)total_lookups / (state.total_snapshots ? state.total_snapshots : 1));
+
     printf("\nErrors:\n");
     printf("  Read errors:  %lu (%.2f%%)\n", state.read_errors,
-           100.0 * state.read_errors / (state.total_reads + state.read_errors));
+           total_lookups ? 100.0 * state.read_errors / (total_lookups + state.read_errors) : 0.0);
     printf("  Write errors: %lu (%.2f%%)\n", state.write_errors,
-           100.0 * state.write_errors / (state.total_writes + state.write_errors));
+           100.0 * state.write_errors / (state.total_writes + state.write_errors + 1));
     printf("  Delete errors: %lu (%.2f%%)\n", state.delete_errors,
-           100.0 * state.delete_errors / (state.total_deletes + state.delete_errors));
+           100.0 * state.delete_errors / (state.total_deletes + state.delete_errors + 1));
     
     printf("\nMVCC Stats:\n");
     printf("  Active transactions: %lu\n", tree->mvcc_manager->txn_map.active_count);
@@ -533,13 +597,15 @@ void test_fail_fast_stress(void) {
     
     printf("\nCritical Checks:\n");
     printf("  Isolation violations: %lu %s\n", state.isolation_violations,
-           state.isolation_violations == 0 ? "✅" : "❌");
-    printf("  Deadlocks: %s\n", state.deadlock_detected ? "❌ DETECTED" : "✅ None");
-    printf("  Memory leaks: %s\n", state.memory_leak_detected ? "❌ DETECTED" : "✅ None");
+           state.isolation_violations == 0 ? "OK" : "FAIL");
+    printf("  Deadlocks: %s\n", state.deadlock_detected ? "FAIL DETECTED" : "OK None");
+    printf("  Memory leaks: %s\n", state.memory_leak_detected ? "FAIL DETECTED" : "OK None");
+    fflush(stdout);
     printf("  Hot key contention: %lu operations on %d hot keys\n", state.hot_key_contentions, NUM_HOT_KEYS);
     
     // Cleanup
     pthread_mutex_destroy(&state.stats_lock);
+    free(key_deleted);
     data_art_destroy(tree);
     
     // Verdict
@@ -549,11 +615,18 @@ void test_fail_fast_stress(void) {
         assert(false);
     }
     
-    double error_rate = 100.0 * (state.read_errors + state.write_errors + state.delete_errors) / 
-                        (state.total_reads + state.total_writes + state.total_deletes + 
-                         state.read_errors + state.write_errors + state.delete_errors);
+    uint64_t total_successful_ops = total_lookups + state.total_writes + state.total_deletes;
+    uint64_t total_errors = state.read_errors + state.write_errors + state.delete_errors;
+    double error_rate = total_successful_ops + total_errors > 0
+        ? 100.0 * total_errors / (total_successful_ops + total_errors)
+        : 0.0;
     if (error_rate > 1.0) {
-        printf("❌ FAILED: Error rate too high (%.2f%% > 1.0%%)\n", error_rate);
+        fprintf(stderr, "FAILED: Error rate too high (%.2f%% > 1.0%%)\n", error_rate);
+        fprintf(stderr, "  read_errors=%lu write_errors=%lu delete_errors=%lu\n",
+                state.read_errors, state.write_errors, state.delete_errors);
+        fprintf(stderr, "  total_lookups=%lu total_writes=%lu total_deletes=%lu\n",
+                total_lookups, state.total_writes, state.total_deletes);
+        fflush(stderr);
         assert(false);
     }
     

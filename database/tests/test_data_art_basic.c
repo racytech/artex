@@ -50,26 +50,40 @@ static void cleanup_test_file(void) {
     unlink(TEST_DB_FILE);
 }
 
+// Helper: create a 32-byte zero-padded key from a string
+static void make_key32(uint8_t key_out[32], const char *str) {
+    memset(key_out, 0, 32);
+    size_t len = strlen(str);
+    if (len > 32) len = 32;
+    memcpy(key_out, str, len);
+}
+
 // ============================================================================
 // Basic Tests
 // ============================================================================
 
 static void test_create_destroy(void) {
     TEST("create and destroy tree");
-    
+
     cleanup_test_file();
-    
+
     page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
     ASSERT(pm != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
+
+    buffer_pool_config_t bp_config = buffer_pool_default_config();
+    bp_config.capacity = 64;
+    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
+    ASSERT(bp != NULL);
+
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     ASSERT(tree != NULL);
     ASSERT(data_art_size(tree) == 0);
     ASSERT(data_art_is_empty(tree));
-    
+
     data_art_destroy(tree);
+    buffer_pool_destroy(bp);
     page_manager_destroy(pm);
-    
+
     cleanup_test_file();
     PASS();
 }
@@ -104,125 +118,155 @@ static void test_create_with_buffer_pool(void) {
 
 static void test_insert_single_small_value(void) {
     TEST("insert single small key-value");
-    
+
     cleanup_test_file();
-    
+
     page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
     ASSERT(pm != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
+
+    buffer_pool_config_t bp_config = buffer_pool_default_config();
+    bp_config.capacity = 64;
+    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
+    ASSERT(bp != NULL);
+
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     ASSERT(tree != NULL);
-    
-    const char *key = "hello";
+
+    uint8_t key[32];
+    make_key32(key, "hello");
     const char *value = "world";
-    
-    bool success = data_art_insert(tree, (const uint8_t *)key, strlen(key),
+
+    bool success = data_art_insert(tree, key, 32,
                                      value, strlen(value) + 1);
     ASSERT(success);
     ASSERT(data_art_size(tree) == 1);
     ASSERT(!data_art_is_empty(tree));
-    
+
     // Verify the value can be retrieved
     size_t value_len = 0;
-    const void *retrieved = data_art_get(tree, (const uint8_t *)key, strlen(key), &value_len);
+    const void *retrieved = data_art_get(tree, key, 32, &value_len);
     ASSERT(retrieved != NULL);
     ASSERT(value_len == strlen(value) + 1);
     ASSERT(strcmp((const char *)retrieved, value) == 0);
-    
+
     data_art_destroy(tree);
+    buffer_pool_destroy(bp);
     page_manager_destroy(pm);
-    
+
     cleanup_test_file();
     PASS();
 }
 
 static void test_insert_large_value_overflow(void) {
     TEST("insert large value requiring overflow pages");
-    
+
     cleanup_test_file();
-    
+
     page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
     ASSERT(pm != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
+
+    buffer_pool_config_t bp_config = buffer_pool_default_config();
+    bp_config.capacity = 64;
+    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
+    ASSERT(bp != NULL);
+
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     ASSERT(tree != NULL);
-    
-    const char *key = "bigkey";
-    
+
+    uint8_t key[32];
+    make_key32(key, "bigkey");
+
     // Create a large value (5000 bytes > MAX_INLINE_DATA)
     char *large_value = malloc(5000);
     ASSERT(large_value != NULL);
     memset(large_value, 'X', 4999);
     large_value[4999] = '\0';
-    
-    bool success = data_art_insert(tree, (const uint8_t *)key, strlen(key),
+
+    bool success = data_art_insert(tree, key, 32,
                                      large_value, 5000);
     ASSERT(success);
     ASSERT(data_art_size(tree) == 1);
     ASSERT(tree->overflow_pages_allocated > 0);
-    
+
     free(large_value);
     data_art_destroy(tree);
+    buffer_pool_destroy(bp);
     page_manager_destroy(pm);
-    
+
     cleanup_test_file();
     PASS();
 }
 
 static void test_get_nonexistent(void) {
     TEST("get nonexistent key returns NULL");
-    
+
     cleanup_test_file();
-    
+
     page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
     ASSERT(pm != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
+
+    buffer_pool_config_t bp_config = buffer_pool_default_config();
+    bp_config.capacity = 64;
+    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
+    ASSERT(bp != NULL);
+
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     ASSERT(tree != NULL);
-    
+
+    uint8_t key[32];
+    make_key32(key, "missing");
+
     size_t value_len = 0;
-    const void *result = data_art_get(tree, (const uint8_t *)"missing", 7, &value_len);
+    const void *result = data_art_get(tree, key, 32, &value_len);
     ASSERT(result == NULL);
-    ASSERT(!data_art_contains(tree, (const uint8_t *)"missing", 7));
-    
+    ASSERT(!data_art_contains(tree, key, 32));
+
     data_art_destroy(tree);
+    buffer_pool_destroy(bp);
     page_manager_destroy(pm);
-    
+
     cleanup_test_file();
     PASS();
 }
 
 static void test_statistics(void) {
     TEST("statistics tracking");
-    
+
     cleanup_test_file();
-    
+
     page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
     ASSERT(pm != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
+
+    buffer_pool_config_t bp_config = buffer_pool_default_config();
+    bp_config.capacity = 64;
+    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
+    ASSERT(bp != NULL);
+
+    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     ASSERT(tree != NULL);
-    
-    const char *key = "test";
+
+    uint8_t key[32];
+    make_key32(key, "test");
     const char *value = "value";
-    
-    data_art_insert(tree, (const uint8_t *)key, strlen(key),
+
+    data_art_insert(tree, key, 32,
                     value, strlen(value) + 1);
-    
+
     data_art_stats_t stats;
     data_art_get_stats(tree, &stats);
-    
+
     ASSERT(stats.num_entries == 1);
     ASSERT(stats.version == 1);
     ASSERT(stats.nodes_allocated > 0);
-    
+
     // Print stats for visual inspection
     printf("\n");
     data_art_print_stats(tree);
-    
+
     data_art_destroy(tree);
+    buffer_pool_destroy(bp);
     page_manager_destroy(pm);
-    
+
     cleanup_test_file();
     PASS();
 }
@@ -242,10 +286,11 @@ static void test_flush_and_persistence(void) {
     data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
     ASSERT(tree != NULL);
     
-    const char *key = "persist";
+    uint8_t key[32];
+    make_key32(key, "persist");
     const char *value = "data";
-    
-    data_art_insert(tree, (const uint8_t *)key, strlen(key),
+
+    data_art_insert(tree, key, 32,
                     value, strlen(value) + 1);
     
     bool flushed = data_art_flush(tree);
