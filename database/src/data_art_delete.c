@@ -60,14 +60,14 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref);//
 
 bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) {
     if (!tree || !key) {
-        db_set_last_error(DB_ERROR_INVALID_ARG);
+        DB_ERROR(DB_ERROR_INVALID_ARG, "tree or key is NULL");
         return false;
     }
 
     // Validate key size matches tree's configured size
     if (key_len != tree->key_size) {
-        db_set_last_error_msg(DB_ERROR_INVALID_ARG,
-            "data_art_delete: key size mismatch: expected %zu, got %zu", tree->key_size, key_len);
+        DB_ERROR(DB_ERROR_INVALID_ARG,
+            "key size mismatch: expected %zu, got %zu", tree->key_size, key_len);
         return false;
     }
 
@@ -77,7 +77,7 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
     }
 
     if (node_ref_is_null(tree->root)) {
-        db_set_last_error(DB_ERROR_NOT_FOUND);
+        DB_ERROR(DB_ERROR_NOT_FOUND, "empty tree");
         return false;  // Empty tree, nothing to delete
     }
     
@@ -94,7 +94,7 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
     if (auto_commit && tree->mvcc_manager) {
         if (!mvcc_begin_txn(tree->mvcc_manager, &auto_txn_id)) {
             pthread_mutex_unlock(&tree->write_lock);
-            db_set_last_error_msg(DB_ERROR_OUT_OF_MEMORY, "data_art_delete: failed to begin auto-commit txn");
+            DB_ERROR(DB_ERROR_OUT_OF_MEMORY, "failed to begin auto-commit txn");
             return false;
         }
         tree->current_txn_id = auto_txn_id;
@@ -129,7 +129,7 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
             mvcc_abort_txn(tree->mvcc_manager, auto_txn_id);
             tree->current_txn_id = 0;
         }
-        db_set_last_error(DB_ERROR_NOT_FOUND);
+        DB_ERROR(DB_ERROR_NOT_FOUND, "key not found");
     }
 
     pthread_mutex_unlock(&tree->write_lock);

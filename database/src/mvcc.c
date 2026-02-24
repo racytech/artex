@@ -457,19 +457,19 @@ void mvcc_manager_destroy(mvcc_manager_t *manager) {
 
 bool mvcc_begin_txn(mvcc_manager_t *manager, uint64_t *txn_id_out) {
     if (!manager || !txn_id_out) {
-        db_set_last_error(DB_ERROR_INVALID_ARG);
+        DB_ERROR(DB_ERROR_INVALID_ARG, "manager or txn_id_out is NULL");
         return false;
     }
-    
+
     // Allocate new transaction ID
     pthread_mutex_lock(&manager->txn_id_lock);
     uint64_t txn_id = manager->next_txn_id++;
     pthread_mutex_unlock(&manager->txn_id_lock);
-    
+
     // Create transaction entry
     txn_info_t *entry = malloc(sizeof(txn_info_t));
     if (!entry) {
-        db_set_last_error_msg(DB_ERROR_OUT_OF_MEMORY, "mvcc_begin_txn: failed to allocate txn_info_t");
+        DB_ERROR(DB_ERROR_OUT_OF_MEMORY, "failed to allocate txn_info_t");
         return false;
     }
     
@@ -489,7 +489,7 @@ bool mvcc_begin_txn(mvcc_manager_t *manager, uint64_t *txn_id_out) {
     if (!txn_map_insert(&manager->txn_map, entry)) {
         pthread_rwlock_unlock(&manager->txn_map.resize_lock);
         free(entry);
-        db_set_last_error_msg(DB_ERROR_INTERNAL, "mvcc_begin_txn: txn_map insert failed (txn_id=%lu)", txn_id);
+        DB_ERROR(DB_ERROR_INTERNAL, "txn_map insert failed (txn_id=%lu)", txn_id);
         return false;
     }
     
@@ -510,7 +510,7 @@ bool mvcc_begin_txn(mvcc_manager_t *manager, uint64_t *txn_id_out) {
 
 bool mvcc_commit_txn(mvcc_manager_t *manager, uint64_t txn_id) {
     if (!manager || txn_id == 0) {
-        db_set_last_error(DB_ERROR_INVALID_ARG);
+        DB_ERROR(DB_ERROR_INVALID_ARG, "manager is NULL or txn_id is 0");
         return false;
     }
 
@@ -520,7 +520,7 @@ bool mvcc_commit_txn(mvcc_manager_t *manager, uint64_t txn_id) {
 
     if (!entry) {
         pthread_rwlock_unlock(&manager->txn_map.resize_lock);
-        db_set_last_error_msg(DB_ERROR_TXN_NOT_FOUND, "mvcc_commit_txn: txn_id=%lu not found", txn_id);
+        DB_ERROR(DB_ERROR_TXN_NOT_FOUND, "txn_id=%lu not found", txn_id);
         return false;
     }
 
@@ -555,7 +555,7 @@ bool mvcc_commit_txn(mvcc_manager_t *manager, uint64_t txn_id) {
 
 bool mvcc_abort_txn(mvcc_manager_t *manager, uint64_t txn_id) {
     if (!manager || txn_id == 0) {
-        db_set_last_error(DB_ERROR_INVALID_ARG);
+        DB_ERROR(DB_ERROR_INVALID_ARG, "manager is NULL or txn_id is 0");
         return false;
     }
 
@@ -564,7 +564,7 @@ bool mvcc_abort_txn(mvcc_manager_t *manager, uint64_t txn_id) {
     pthread_rwlock_unlock(&manager->txn_map.resize_lock);
 
     if (!entry) {
-        db_set_last_error_msg(DB_ERROR_TXN_NOT_FOUND, "mvcc_abort_txn: txn_id=%lu not found", txn_id);
+        DB_ERROR(DB_ERROR_TXN_NOT_FOUND, "txn_id=%lu not found", txn_id);
         return false;
     }
     

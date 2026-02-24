@@ -16,16 +16,20 @@
    - `mvcc_expire_snapshots()` force-closes expired snapshots, called during periodic GC
    - Tests: basic expiration, selective (old vs new), disabled timeout, 100 snapshots bulk expire
 
-### 3. Fsync Retry Logic (1 day)
-   - Retry fsync failures 3x with exponential backoff
-   - Add health monitoring (db_health_t)
-   - Test: Inject ENOSPC, verify graceful degradation
+### 3. ~~Fsync Retry Logic~~ FIXED
+   - `fsync_with_retry()` in page_manager with 3x exponential backoff
+   - `db_health_t` state machine (OK → DEGRADED → FAILING)
+   - `page_manager_get_health()` API
+   - Test: health transitions on bad fd
 
 ### 4. ~~Error Handling & Return Codes~~ FIXED
    - Added `db_error.h` with 13-value `db_error_t` enum (superset of `page_result_t`)
-   - Thread-local `db_set_last_error_msg()` / `db_get_last_error()` API (512-byte message buffer)
-   - Instrumented: data_art insert/delete/commit/abort/flush, mvcc begin/commit/abort, wal log_insert/log_delete/fsync
-   - Non-breaking: all `bool` signatures unchanged, callers opt-in to detailed errors
+   - Thread-local error trace stack: `DB_ERROR(code, fmt, ...)` macro captures `__FILE__`, `__LINE__`, `__func__`
+   - 8-frame deep trace: frame[0] = root cause, frame[depth-1] = outermost caller
+   - `db_error_trace_print(FILE*)` for formatted diagnostics
+   - Instrumented 28 error sites across 6 files (insert/delete/commit/abort/flush, mvcc, wal)
+   - Non-breaking: all `bool` signatures unchanged, backward-compat `db_set_last_error()` preserved
+   - Tests: 10 tests (backward compat, single/multi-frame traces, overflow, print format, 16-thread isolation)
 
 ### 5. Crash Recovery Tests (1-2 days) 🔴 CRITICAL
    - Test: Kill process mid-write, verify data on restart

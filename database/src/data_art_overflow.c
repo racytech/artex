@@ -291,7 +291,7 @@ void data_art_release_version(data_art_tree_t *tree, uint64_t version) {
 
 bool data_art_flush(data_art_tree_t *tree) {
     if (!tree) {
-        db_set_last_error(DB_ERROR_INVALID_ARG);
+        DB_ERROR(DB_ERROR_INVALID_ARG, "tree is NULL");
         return false;
     }
 
@@ -302,7 +302,7 @@ bool data_art_flush(data_art_tree_t *tree) {
 
     // Flush all dirty pages in buffer pool
     if (!buffer_pool_flush_all(tree->buffer_pool)) {
-        db_set_last_error_msg(DB_ERROR_IO, "data_art_flush: buffer pool flush failed");
+        DB_ERROR(DB_ERROR_IO, "buffer pool flush failed");
         return false;
     }
     

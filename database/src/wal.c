@@ -556,12 +556,12 @@ bool wal_log_insert(wal_t *wal, uint64_t txn_id,
                     const uint8_t *value, uint32_t value_len,
                     uint64_t *lsn_out) {
     if (!wal || !key || !value || key_len == 0 || value_len == 0) {
-        db_set_last_error(DB_ERROR_INVALID_ARG);
+        DB_ERROR(DB_ERROR_INVALID_ARG, "invalid arguments");
         return false;
     }
-    
+
     pthread_rwlock_wrlock(&wal->lock);
-    
+
     // Create entry header
     wal_entry_header_t header;
     header.magic = WAL_MAGIC;
@@ -576,7 +576,7 @@ bool wal_log_insert(wal_t *wal, uint64_t txn_id,
     if (wal->segment_offset + wal->buffer_offset + total_entry_size > wal->config.segment_size) {
         if (!flush_write_buffer(wal) || !rotate_segment(wal)) {
             pthread_rwlock_unlock(&wal->lock);
-            db_set_last_error_msg(DB_ERROR_WAL_FULL, "wal_log_insert: segment rotation failed");
+            DB_ERROR(DB_ERROR_WAL_FULL, "segment rotation failed");
             return false;
         }
     }
@@ -586,7 +586,7 @@ bool wal_log_insert(wal_t *wal, uint64_t txn_id,
     uint8_t *payload = malloc(payload_size);
     if (!payload) {
         pthread_rwlock_unlock(&wal->lock);
-        db_set_last_error(DB_ERROR_OUT_OF_MEMORY);
+        DB_ERROR(DB_ERROR_OUT_OF_MEMORY, "failed to allocate payload (%zu bytes)", payload_size);
         return false;
     }
     
@@ -626,7 +626,7 @@ bool wal_log_delete(wal_t *wal, uint64_t txn_id,
                     const uint8_t *key, uint32_t key_len,
                     uint64_t *lsn_out) {
     if (!wal || !key || key_len == 0) {
-        db_set_last_error(DB_ERROR_INVALID_ARG);
+        DB_ERROR(DB_ERROR_INVALID_ARG, "invalid arguments");
         return false;
     }
 
@@ -646,7 +646,7 @@ bool wal_log_delete(wal_t *wal, uint64_t txn_id,
     if (wal->segment_offset + wal->buffer_offset + total_entry_size > wal->config.segment_size) {
         if (!flush_write_buffer(wal) || !rotate_segment(wal)) {
             pthread_rwlock_unlock(&wal->lock);
-            db_set_last_error_msg(DB_ERROR_WAL_FULL, "wal_log_delete: segment rotation failed");
+            DB_ERROR(DB_ERROR_WAL_FULL, "segment rotation failed");
             return false;
         }
     }
@@ -656,7 +656,7 @@ bool wal_log_delete(wal_t *wal, uint64_t txn_id,
     uint8_t *payload = malloc(payload_size);
     if (!payload) {
         pthread_rwlock_unlock(&wal->lock);
-        db_set_last_error(DB_ERROR_OUT_OF_MEMORY);
+        DB_ERROR(DB_ERROR_OUT_OF_MEMORY, "failed to allocate payload (%zu bytes)", payload_size);
         return false;
     }
     
@@ -919,7 +919,7 @@ bool wal_log_checkpoint(wal_t *wal,
 
 bool wal_fsync(wal_t *wal) {
     if (!wal) {
-        db_set_last_error(DB_ERROR_INVALID_ARG);
+        DB_ERROR(DB_ERROR_INVALID_ARG, "wal is NULL");
         return false;
     }
 
@@ -928,7 +928,7 @@ bool wal_fsync(wal_t *wal) {
     // Flush write buffer
     if (!flush_write_buffer(wal)) {
         pthread_rwlock_unlock(&wal->lock);
-        db_set_last_error_msg(DB_ERROR_IO, "wal_fsync: failed to flush write buffer");
+        DB_ERROR(DB_ERROR_IO, "failed to flush write buffer");
         return false;
     }
 
@@ -937,7 +937,7 @@ bool wal_fsync(wal_t *wal) {
     if (success) {
         wal->last_fsynced_lsn = wal->next_lsn - 1;
     } else {
-        db_set_last_error_msg(DB_ERROR_IO, "wal_fsync: fsync failed after retries");
+        DB_ERROR(DB_ERROR_IO, "fsync failed after retries");
     }
     
     pthread_rwlock_unlock(&wal->lock);

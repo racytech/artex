@@ -893,14 +893,14 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
 bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
                      const void *value, size_t value_len) {
     if (!tree || !key || !value) {
-        db_set_last_error(DB_ERROR_INVALID_ARG);
+        DB_ERROR(DB_ERROR_INVALID_ARG, "tree, key, or value is NULL");
         return false;
     }
 
     // Validate key size matches tree's configured size
     if (key_len != tree->key_size) {
-        db_set_last_error_msg(DB_ERROR_INVALID_ARG,
-            "data_art_insert: key size mismatch: expected %zu, got %zu", tree->key_size, key_len);
+        DB_ERROR(DB_ERROR_INVALID_ARG,
+            "key size mismatch: expected %zu, got %zu", tree->key_size, key_len);
         return false;
     }
     
@@ -922,7 +922,7 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
     if (auto_commit && tree->mvcc_manager) {
         if (!mvcc_begin_txn(tree->mvcc_manager, &auto_txn_id)) {
             pthread_mutex_unlock(&tree->write_lock);
-            db_set_last_error_msg(DB_ERROR_OUT_OF_MEMORY, "data_art_insert: failed to begin auto-commit txn");
+            DB_ERROR(DB_ERROR_OUT_OF_MEMORY, "failed to begin auto-commit txn");
             return false;
         }
         tree->current_txn_id = auto_txn_id;
@@ -968,7 +968,7 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
 
     pthread_mutex_unlock(&tree->write_lock);
     if (db_get_last_error() == DB_OK) {
-        db_set_last_error_msg(DB_ERROR_IO, "data_art_insert: recursive insert failed");
+        DB_ERROR(DB_ERROR_IO, "recursive insert failed");
     }
     return false;
 }
