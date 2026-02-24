@@ -381,6 +381,70 @@ void test_error_handling(void) {
 // Main
 // ============================================================================
 
+void test_page_corruption_detection(void) {
+    cleanup_test_db();
+
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+
+    // Allocate and write a valid page
+    uint64_t page_id = page_manager_alloc(pm, 0);
+    TEST_ASSERT(page_id != 0, "Page allocation should succeed");
+
+    page_t page;
+    page_init(&page, page_id, 1);
+    snprintf((char*)page.data, 100, "Valid page data for corruption test");
+    page_compute_checksum(&page);
+
+    page_result_t result = page_manager_write(pm, &page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Page write should succeed");
+    result = page_manager_sync(pm);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Sync should succeed");
+
+    // Verify the page reads back correctly before corruption
+    page_t read_page;
+    result = page_manager_read(pm, page_id, &read_page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Read before corruption should succeed");
+    TEST_ASSERT(page_verify_checksum(&read_page), "Checksum should be valid before corruption");
+
+    // Get the file location and corrupt the page data directly on disk
+    int fd;
+    uint64_t offset;
+    result = page_manager_get_file_location(pm, page_id, &fd, &offset);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Get file location should succeed");
+
+    // Corrupt bytes in the data area (after the header)
+    uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE};
+    ssize_t written = pwrite(fd, garbage, sizeof(garbage), offset + PAGE_HEADER_SIZE + 10);
+    TEST_ASSERT(written == sizeof(garbage), "Corruption write should succeed");
+    fsync(fd);
+
+    // Reading the corrupted page should detect checksum mismatch
+    page_t corrupted_page;
+    result = page_manager_read(pm, page_id, &corrupted_page);
+    TEST_ASSERT(result == PAGE_ERROR_CORRUPTION, "Read of corrupted page should return CORRUPTION");
+
+    // Verify the in-memory checksum function also detects it
+    // (manually read the raw bytes to test page_verify_checksum)
+    pread(fd, &corrupted_page, PAGE_SIZE, offset);
+    TEST_ASSERT(!page_verify_checksum(&corrupted_page), "Checksum verification should fail on corrupted page");
+
+    // Write a new valid page to the same ID — should succeed
+    page_init(&page, page_id, 2);
+    snprintf((char*)page.data, 100, "Repaired page data");
+    page_compute_checksum(&page);
+    result = page_manager_write(pm, &page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Writing repaired page should succeed");
+
+    // Read back the repaired page — should succeed
+    result = page_manager_read(pm, page_id, &read_page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Read of repaired page should succeed");
+    TEST_ASSERT(page_verify_checksum(&read_page), "Repaired page checksum should be valid");
+
+    page_manager_destroy(pm);
+    cleanup_test_db();
+}
+
 int main(void) {
     // Initialize logger
     log_init(LOG_LEVEL_INFO, stderr);
@@ -401,7 +465,8 @@ int main(void) {
     RUN_TEST(test_page_manager_sync);
     RUN_TEST(test_statistics);
     RUN_TEST(test_error_handling);
-    
+    RUN_TEST(test_page_corruption_detection);
+
     printf("\n");
     printf("========================================\n");
     printf("Results: %s%d passed%s, %s%d failed%s\n",
