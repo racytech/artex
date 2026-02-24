@@ -101,6 +101,7 @@ target_link_libraries(art_page_gc
 
 add_library(art_wal STATIC
     database/src/wal.c
+    database/src/db_error.c
     database/src/logger.c
 )
 
@@ -122,6 +123,7 @@ add_library(art_persistent STATIC
     database/src/data_art_node_ops.c
     database/src/txn_buffer.c
     database/src/mvcc.c
+    database/src/db_error.c
     database/src/logger.c
 )
 
@@ -339,6 +341,14 @@ add_executable(test_wal_recovery
 )
 target_link_libraries(test_wal_recovery art_wal pthread)
 add_test(NAME test_wal_recovery COMMAND test_wal_recovery)
+
+# Test: DB Error System
+add_executable(test_db_error
+    database/tests/test_db_error.c
+    database/src/db_error.c
+)
+target_link_libraries(test_db_error pthread)
+add_test(NAME test_db_error COMMAND test_db_error)
 
 # Test: Simple delete test
 add_executable(test_delete_simple

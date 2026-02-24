@@ -25,6 +25,7 @@
 #include "buffer_pool.h"
 #include "data_art.h"
 #include "txn_buffer.h"
+#include "db_error.h"
 #include "logger.h"
 
 #include <stdlib.h>
@@ -59,23 +60,24 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref);//
 
 bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) {
     if (!tree || !key) {
-        LOG_ERROR("Invalid parameters");
+        db_set_last_error(DB_ERROR_INVALID_ARG);
         return false;
     }
-    
+
     // Validate key size matches tree's configured size
     if (key_len != tree->key_size) {
-        LOG_ERROR("Key size mismatch: expected %zu bytes, got %zu bytes",
-                  tree->key_size, key_len);
+        db_set_last_error_msg(DB_ERROR_INVALID_ARG,
+            "data_art_delete: key size mismatch: expected %zu, got %zu", tree->key_size, key_len);
         return false;
     }
-    
+
     // If in transaction, buffer the operation instead of applying immediately
     if (tree->txn_buffer) {
         return txn_buffer_add_delete(tree->txn_buffer, key, key_len);
     }
-    
+
     if (node_ref_is_null(tree->root)) {
+        db_set_last_error(DB_ERROR_NOT_FOUND);
         return false;  // Empty tree, nothing to delete
     }
     
@@ -92,7 +94,7 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
     if (auto_commit && tree->mvcc_manager) {
         if (!mvcc_begin_txn(tree->mvcc_manager, &auto_txn_id)) {
             pthread_mutex_unlock(&tree->write_lock);
-            LOG_ERROR("Failed to begin auto-commit transaction");
+            db_set_last_error_msg(DB_ERROR_OUT_OF_MEMORY, "data_art_delete: failed to begin auto-commit txn");
             return false;
         }
         tree->current_txn_id = auto_txn_id;
@@ -122,11 +124,12 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
         // Publish new root for lock-free readers
         data_art_publish_root(tree);
     } else {
-        // Failed to delete - abort auto-commit transaction if we started one
+        // Key not found - abort auto-commit transaction if we started one
         if (auto_commit && tree->mvcc_manager) {
             mvcc_abort_txn(tree->mvcc_manager, auto_txn_id);
             tree->current_txn_id = 0;
         }
+        db_set_last_error(DB_ERROR_NOT_FOUND);
     }
 
     pthread_mutex_unlock(&tree->write_lock);

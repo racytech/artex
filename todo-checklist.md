@@ -21,11 +21,11 @@
    - Add health monitoring (db_health_t)
    - Test: Inject ENOSPC, verify graceful degradation
 
-### 4. Error Handling & Return Codes (1-2 days)
-   - Define db_error_t enum (replace bool/-1)
-   - Add get_last_error() API for detailed messages
-   - Distinguish: "disk full" vs "corruption" vs "I/O error"
-   - Mechanical but touches many files
+### 4. ~~Error Handling & Return Codes~~ FIXED
+   - Added `db_error.h` with 13-value `db_error_t` enum (superset of `page_result_t`)
+   - Thread-local `db_set_last_error_msg()` / `db_get_last_error()` API (512-byte message buffer)
+   - Instrumented: data_art insert/delete/commit/abort/flush, mvcc begin/commit/abort, wal log_insert/log_delete/fsync
+   - Non-breaking: all `bool` signatures unchanged, callers opt-in to detailed errors
 
 ### 5. Crash Recovery Tests (1-2 days) 🔴 CRITICAL
    - Test: Kill process mid-write, verify data on restart

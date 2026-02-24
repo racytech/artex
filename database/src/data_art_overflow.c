@@ -11,6 +11,7 @@
  */
 
 #include "data_art.h"
+#include "db_error.h"
 #include "logger.h"
 
 #include <stdlib.h>
@@ -290,18 +291,18 @@ void data_art_release_version(data_art_tree_t *tree, uint64_t version) {
 
 bool data_art_flush(data_art_tree_t *tree) {
     if (!tree) {
-        LOG_ERROR("Tree is NULL");
+        db_set_last_error(DB_ERROR_INVALID_ARG);
         return false;
     }
-    
+
     if (!tree->buffer_pool) {
         // No buffer pool, assume direct writes are already persistent
         return true;
     }
-    
+
     // Flush all dirty pages in buffer pool
     if (!buffer_pool_flush_all(tree->buffer_pool)) {
-        LOG_ERROR("Failed to flush buffer pool");
+        db_set_last_error_msg(DB_ERROR_IO, "data_art_flush: buffer pool flush failed");
         return false;
     }
     

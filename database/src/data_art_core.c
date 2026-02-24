@@ -14,6 +14,7 @@
 #include "txn_buffer.h"
 #include "mvcc.h"
 #include "page_gc.h"
+#include "db_error.h"
 #include "logger.h"
 
 #include <stdlib.h>
@@ -615,19 +616,19 @@ bool data_art_begin_txn(data_art_tree_t *tree, uint64_t *txn_id_out) {
 
 bool data_art_commit_txn(data_art_tree_t *tree) {
     if (!tree || !tree->wal) {
-        LOG_ERROR("Cannot commit transaction: WAL not enabled");
+        db_set_last_error_msg(DB_ERROR_INVALID_ARG, "data_art_commit_txn: WAL not enabled");
         return false;
     }
-    
+
     // Get thread-local transaction context
     thread_txn_context_t *ctx = get_txn_context();
     if (!ctx || !ctx->txn_buffer) {
-        LOG_ERROR("No active transaction to commit for this thread");
+        db_set_last_error_msg(DB_ERROR_TXN_NOT_FOUND, "data_art_commit_txn: no active transaction");
         return false;
     }
-    
+
     if (ctx->tree != tree) {
-        LOG_ERROR("Transaction belongs to different tree");
+        db_set_last_error_msg(DB_ERROR_TXN_CONFLICT, "data_art_commit_txn: transaction belongs to different tree");
         return false;
     }
     
@@ -661,8 +662,7 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
         tree->txn_buffer = buffer;
 
         if (!success) {
-            LOG_ERROR("Failed to apply operation %zu during commit", i);
-            // Cleanup and abort
+            db_set_last_error_msg(DB_ERROR_IO, "data_art_commit_txn: failed to apply operation %zu", i);
             txn_buffer_destroy(buffer);
             ctx->txn_buffer = NULL;
             tree->txn_buffer = NULL;
@@ -674,8 +674,7 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
     
     // Log commit to WAL
     if (!wal_log_commit_txn(tree->wal, txn_id, NULL)) {
-        LOG_ERROR("Failed to commit transaction %lu to WAL", txn_id);
-        // Operations already applied - durability failure
+        db_set_last_error_msg(DB_ERROR_IO, "data_art_commit_txn: WAL commit failed (txn_id=%lu)", txn_id);
         txn_buffer_destroy(buffer);
         ctx->txn_buffer = NULL;
         tree->txn_buffer = NULL;
@@ -703,19 +702,19 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
 
 bool data_art_abort_txn(data_art_tree_t *tree) {
     if (!tree || !tree->wal) {
-        LOG_ERROR("Cannot abort transaction: WAL not enabled");
+        db_set_last_error_msg(DB_ERROR_INVALID_ARG, "data_art_abort_txn: WAL not enabled");
         return false;
     }
-    
+
     // Get thread-local transaction context
     thread_txn_context_t *ctx = get_txn_context();
     if (!ctx || !ctx->txn_buffer) {
-        LOG_ERROR("No active transaction to abort for this thread");
+        db_set_last_error_msg(DB_ERROR_TXN_NOT_FOUND, "data_art_abort_txn: no active transaction");
         return false;
     }
-    
+
     if (ctx->tree != tree) {
-        LOG_ERROR("Transaction belongs to different tree");
+        db_set_last_error_msg(DB_ERROR_TXN_CONFLICT, "data_art_abort_txn: transaction belongs to different tree");
         return false;
     }
     
@@ -729,7 +728,7 @@ bool data_art_abort_txn(data_art_tree_t *tree) {
     
     // Log abort to WAL
     if (!wal_log_abort_txn(tree->wal, txn_id, NULL)) {
-        LOG_ERROR("Failed to abort transaction %lu", txn_id);
+        db_set_last_error_msg(DB_ERROR_IO, "data_art_abort_txn: WAL abort failed (txn_id=%lu)", txn_id);
         tree->current_txn_id = 0;
         return false;
     }
