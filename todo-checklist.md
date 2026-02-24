@@ -39,11 +39,12 @@
    - Bug fixed: `data_art_recover` deadlocked (WAL re-logging during replay) — now disables WAL+MVCC during replay
    - Bug fixed: `data_art_flush` false failure — `buffer_pool_flush_all` returns int, not bool
 
-### 6. Checkpointing Implementation (2-3 days) 🔴 CRITICAL
-   - Background checkpoint thread
-   - Test: Verify checkpoint reduces recovery time
-   - Test: Concurrent checkpoint + writes don't corrupt
-   - Prevents: Unbounded WAL growth
+### 6. ~~Checkpointing Implementation~~ FIXED
+   - `checkpoint_manager_t` with background pthread (`pthread_cond_timedwait` loop)
+   - Checkpoint sequence: `wal_should_checkpoint()` → `data_art_checkpoint()` → `wal_checkpoint_completed()` → `wal_truncate()`
+   - `checkpoint_manager_force()` for on-demand checkpoint with blocking wait
+   - Tests: start/stop lifecycle, force checkpoint, concurrent writes + checkpoint (1000 keys, 4 checkpoints), WAL truncation (4→2 segments)
+   - Result: WAL growth bounded, old segments automatically cleaned up
 
 ### 7. Iterator Support (3-4 days) — HARDEST
    - Implement persistent iterator with page pinning

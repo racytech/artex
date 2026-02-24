@@ -123,6 +123,7 @@ add_library(art_persistent STATIC
     database/src/data_art_node_ops.c
     database/src/txn_buffer.c
     database/src/mvcc.c
+    database/src/checkpoint_manager.c
     database/src/db_error.c
     database/src/logger.c
 )
@@ -356,6 +357,13 @@ add_executable(test_crash_recovery
 )
 target_link_libraries(test_crash_recovery art_persistent pthread)
 add_test(NAME test_crash_recovery COMMAND test_crash_recovery)
+
+# Test: Checkpoint Manager
+add_executable(test_checkpoint_manager
+    database/tests/test_checkpoint_manager.c
+)
+target_link_libraries(test_checkpoint_manager art_persistent pthread)
+add_test(NAME test_checkpoint_manager COMMAND test_checkpoint_manager)
 
 # Test: Simple delete test
 add_executable(test_delete_simple
