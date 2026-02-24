@@ -53,11 +53,75 @@
    - Overflow value reading supported via `data_art_read_overflow_value()`
    - Tests: empty tree, single key, sorted order (100 keys), large scale (10,000 keys), concurrent writes, overflow values
 
-### 8. Dead Code Cleanup
+### 8. Delete Replay Test (half day)
+   - Test: insert keys → delete some → crash → recover from WAL → verify deletions persisted
+   - Currently crash recovery tests only cover insert replay
+   - Validates `WAL_ENTRY_DELETE` replay path in `apply_wal_entry()`
+
+### 9. Transaction-Aware WAL Replay (1-2 days) 🔴 CRITICAL
+   - Currently replay applies ALL entries regardless of commit status
+   - If WAL has INSERT(txn1), INSERT(txn2), COMMIT(txn1), CRASH — txn2 entries should be rolled back
+   - Need: track active transactions during replay, skip entries from uncommitted txns
+   - Test: insert with txn1 (committed) + txn2 (uncommitted) → crash → recover → only txn1 entries present
+
+### 10. Metadata Persistence (2-3 days) 🔴 CRITICAL
+   - `page_manager_create()` always resets `next_page_id = 1` — no allocator state survives restart
+   - Persist to `$db_path/metadata.bin`: `next_page_id`, free list counts, `last_checkpoint_lsn`
+   - Write metadata atomically during checkpoint (after flush, before WAL truncate)
+   - Read on startup in `page_manager_create()` before WAL replay
+   - Enables incremental recovery from last checkpoint instead of full replay from LSN 0
+   - Test: insert keys → checkpoint → close → reopen → verify `next_page_id` restored, no page ID collisions
+
+### 11. Page Reuse (1-2 days) 🔴 CRITICAL
+   - `data_art_release_page()` is a no-op (data_art_core.c:322) — freed pages never returned to allocator
+   - `page_manager_alloc()` always increments `next_page_id` instead of reusing free list
+   - Database grows monotonically: delete 9,000 keys + insert 1,000 = 11,000 pages (should be ~1,000)
+   - Fix: make `release_page()` call `page_manager_free()` (epoch GC already ensures safety)
+   - Fix: `page_manager_alloc()` should check free lists first before allocating new page IDs
+   - Test: insert → delete → insert → verify page count stays bounded
+
+### 12. Iterator Seek / Range Queries (1-2 days)
+   - Add `data_art_iterator_seek(iter, key)` — position iterator at first key >= given key
+   - Enables efficient range scans: seek to start key, iterate until end key
+   - Required for Ethereum: scan all storage slots for a specific account prefix
+   - Builds on existing iterator DFS stack — just needs initial descent to target key
+
+### 13. Batch Insert (1-2 days)
+   - `data_art_insert_batch(tree, keys[], values[], count)` — atomic multi-key insert
+   - Wrap in single WAL transaction (BEGIN → N inserts → COMMIT) for durability
+   - Reduces fsync overhead: one fsync per batch instead of per-key
+   - Ethereum use case: block state updates (hundreds of key changes per block)
+
+### 14. Database Compaction (3-5 days)
+   - Rewrite live pages into contiguous files, discard dead pages
+   - Requires: iterate all live pages, copy to new file, swap atomically
+   - Header `db_compaction.h` exists as stub — needs full implementation
+   - Reclaims space from long-running databases with heavy delete workloads
+   - Could run as background thread similar to checkpoint_manager
+
+### 15. Torn Page Detection (1 day)
+   - Currently pages have CRC32 checksum — detects corruption but can't distinguish torn write from bit-flip
+   - Add page LSN or write counter to detect partial writes (half-written page after power loss)
+   - Double-write buffer approach: write page to temp location first, then to final location
+   - Low priority: WAL replay already recovers from most scenarios
+
+### 16. Online Backup / Snapshot Export (2-3 days)
+   - Export consistent snapshot of entire database to a directory
+   - Use existing snapshot isolation: capture committed root, iterate all keys, write to new files
+   - Enables point-in-time backups without stopping the database
+   - Could also support incremental backup (only pages changed since last backup)
+
+### 17. Prefix Iteration (1 day)
+   - `data_art_iterator_create_prefix(tree, prefix, prefix_len)` — iterate keys sharing a prefix
+   - ART naturally supports this: descend to prefix node, then iterate subtree
+   - Ethereum use case: enumerate all storage keys for a specific contract address
+   - Builds on iterator + seek — just adds early termination when prefix diverges
+
+### 18. Dead Code Cleanup
    - Remove `db_compaction.h` (entire unimplemented header)
-   - Remove 10 unused functions (data_art_cow_node, data_art_snapshot, data_art_load, etc.)
-   - Remove 4 dead static functions (shrink_node16_to_node4, shrink_node48_to_node16, etc.)
+   - Remove unused functions (data_art_cow_node, data_art_snapshot, data_art_load, etc.)
+   - Remove dead static functions in `data_art_node_ops.c` (shrink stubs already implemented in data_art_delete.c)
    - Remove debug printfs in `mem_art.c`, duplicate log lines in `wal.c`
    - Remove unused includes (`<stdio.h>` in search.c, `<assert.h>` in delete.c)
 
-Total: ~2 weeks to production-ready
+Total: ~2-3 weeks to production-ready (items 8-11 are critical path, 12-17 are nice-to-have)
