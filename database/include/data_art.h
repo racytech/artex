@@ -81,9 +81,10 @@ typedef enum {
 #define LEAF_FLAG_NONE     0x00
 #define LEAF_FLAG_OVERFLOW 0x01  // Has overflow pages for large value
 
-// Maximum inline data size (conservative to leave room for metadata)
-// Page size (4096) - page header (64) - leaf header (52 with MVCC + prev_version) = ~3980 bytes
-#define MAX_INLINE_DATA 3872  // Conservative limit, leaves ~108 bytes safety margin
+// Maximum inline data size — derived from PAGE_SIZE so it scales automatically.
+// Available = page data area - leaf header (56 bytes including struct padding)
+#define LEAF_HEADER_SIZE 56
+#define MAX_INLINE_DATA (PAGE_SIZE - PAGE_HEADER_SIZE - LEAF_HEADER_SIZE)
 
 /**
  * NODE_4: Up to 4 children
@@ -204,19 +205,22 @@ typedef struct {
 
 /**
  * Overflow page: Continuation storage for large values
- * 
+ *
  * When a value exceeds MAX_INLINE_DATA, the remainder is stored in a
- * linked list of overflow pages. Each page stores up to 4016 bytes.
- * 
- * Size: 4032 bytes (fits in page data area)
- * Layout: type(1) + pad(3) + next_page(8) + data_len(4) + data[4016]
+ * linked list of overflow pages. Each page fills the remaining page space.
+ *
+ * Overflow header: type(1) + pad(3) + next_page(8) + data_len(4) = 16 bytes
+ * Data area: PAGE_SIZE - PAGE_HEADER_SIZE - 16 bytes
  */
+#define OVERFLOW_HEADER_SIZE 16
+#define OVERFLOW_DATA_SIZE (PAGE_SIZE - PAGE_HEADER_SIZE - OVERFLOW_HEADER_SIZE)
+
 typedef struct {
     uint8_t type;               // DATA_NODE_OVERFLOW
     uint8_t padding[3];
     uint64_t next_page;         // Next overflow page ID (0 = last page)
-    uint32_t data_len;          // Valid bytes in data[] (0-4016)
-    uint8_t data[4016];         // Continuation data
+    uint32_t data_len;          // Valid bytes in data[]
+    uint8_t data[OVERFLOW_DATA_SIZE];  // Continuation data — fills remaining page space
 } __attribute__((packed)) data_art_overflow_t;
 
 // ============================================================================

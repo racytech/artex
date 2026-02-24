@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include <pthread.h>
 
-// Page size (fixed at 4KB)
+// Page size (4KB)
 #define PAGE_SIZE 4096
 
 // Max file size (512 MB per data file)

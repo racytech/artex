@@ -176,14 +176,15 @@ static void test_insert_large_value_overflow(void) {
     uint8_t key[32];
     make_key32(key, "bigkey");
 
-    // Create a large value (5000 bytes > MAX_INLINE_DATA)
-    char *large_value = malloc(5000);
+    // Create a large value that exceeds MAX_INLINE_DATA at any page size
+    size_t large_size = MAX_INLINE_DATA + 1000;
+    char *large_value = malloc(large_size);
     ASSERT(large_value != NULL);
-    memset(large_value, 'X', 4999);
-    large_value[4999] = '\0';
+    memset(large_value, 'X', large_size - 1);
+    large_value[large_size - 1] = '\0';
 
     bool success = data_art_insert(tree, key, 32,
-                                     large_value, 5000);
+                                     large_value, large_size);
     ASSERT(success);
     ASSERT(data_art_size(tree) == 1);
     ASSERT(tree->overflow_pages_allocated > 0);
