@@ -5,16 +5,16 @@
    - `mvcc_get_txn_state()` returns COMMITTED for removed entries (txn_id < next_txn_id)
    - Result: active_count stays bounded (~9 during stress test), retired count > 0
 
-### 1. Page Corruption Handling (1 day) — EASIEST
-   - Checksum verification already exists (`page_verify_checksum`)
-   - Fail-stop on checksum mismatch (already logs + returns error)
-   - Test: Corrupt page on disk, verify detection
-   - Mostly just writing a test for existing code
+### 1. ~~Page Corruption Handling~~ FIXED
+   - Checksum verification already existed (`page_verify_checksum`)
+   - Test added: corrupt page on disk via pwrite, verify `PAGE_ERROR_CORRUPTION` on read
+   - Test verifies repair path: write new valid page, read back succeeds
 
-### 2. Snapshot Timeout Enforcement (1 day)
-   - Add 5-minute timeout per snapshot
-   - Force-close expired snapshots
-   - Test: Create 100 snapshots, verify old ones auto-close
+### 2. ~~Snapshot Timeout Enforcement~~ FIXED
+   - Added `created_at` timestamp (CLOCK_MONOTONIC) to `mvcc_snapshot_t`
+   - Added `snapshot_timeout_ms` to manager (default 0 = disabled)
+   - `mvcc_expire_snapshots()` force-closes expired snapshots, called during periodic GC
+   - Tests: basic expiration, selective (old vs new), disabled timeout, 100 snapshots bulk expire
 
 ### 3. Fsync Retry Logic (1 day)
    - Retry fsync failures 3x with exponential backoff

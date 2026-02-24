@@ -540,6 +540,7 @@ bool mvcc_commit_txn(mvcc_manager_t *manager, uint64_t txn_id) {
         uint64_t min_safe_epoch = epoch_gc_compute_min_safe_epoch(manager);
         epoch_gc_reclaim(&manager->gc, min_safe_epoch);
         epoch_gc_advance(&manager->gc);
+        mvcc_expire_snapshots(manager);
     }
 
     return true;
@@ -662,8 +663,9 @@ mvcc_snapshot_t *mvcc_snapshot_create(mvcc_manager_t *manager) {
     // Store epoch in xmin field for GC tracking
     snapshot->xmin = current_epoch;
     
-    // Initialize reference count
+    // Initialize reference count and creation time
     snapshot->ref_count = 1;
+    clock_gettime(CLOCK_MONOTONIC, &snapshot->created_at);
     snapshot->next = NULL;
     
     // Add to snapshot list
@@ -714,6 +716,57 @@ void mvcc_snapshot_release(mvcc_manager_t *manager, mvcc_snapshot_t *snapshot) {
         uint64_t min_safe_epoch = epoch_gc_compute_min_safe_epoch(manager);
         epoch_gc_reclaim(&manager->gc, min_safe_epoch);
     }
+}
+
+void mvcc_set_snapshot_timeout(mvcc_manager_t *manager, uint64_t timeout_ms) {
+    if (!manager) return;
+    manager->snapshot_timeout_ms = timeout_ms;
+}
+
+size_t mvcc_expire_snapshots(mvcc_manager_t *manager) {
+    if (!manager || manager->snapshot_timeout_ms == 0) return 0;
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    uint64_t timeout_ms = manager->snapshot_timeout_ms;
+    size_t expired = 0;
+
+    pthread_rwlock_wrlock(&manager->snapshot_lock);
+
+    mvcc_snapshot_t **ptr = &manager->snapshots;
+    while (*ptr) {
+        mvcc_snapshot_t *snap = *ptr;
+
+        // Compute age in milliseconds
+        uint64_t age_ms = (uint64_t)(now.tv_sec - snap->created_at.tv_sec) * 1000
+                        + (uint64_t)(now.tv_nsec - snap->created_at.tv_nsec) / 1000000;
+
+        if (age_ms >= timeout_ms) {
+            // Unlink from list
+            *ptr = snap->next;
+            manager->snapshots_released++;
+            expired++;
+
+            LOG_WARN("Snapshot %lu expired (age=%lu ms, timeout=%lu ms)",
+                     snap->snapshot_id, age_ms, timeout_ms);
+
+            free(snap->active_txns);
+            free(snap);
+        } else {
+            ptr = &(*ptr)->next;
+        }
+    }
+
+    pthread_rwlock_unlock(&manager->snapshot_lock);
+
+    if (expired > 0) {
+        // Trigger GC after expiring snapshots
+        uint64_t min_safe_epoch = epoch_gc_compute_min_safe_epoch(manager);
+        epoch_gc_reclaim(&manager->gc, min_safe_epoch);
+    }
+
+    return expired;
 }
 
 bool mvcc_has_active_snapshots(mvcc_manager_t *manager) {

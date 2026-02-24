@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
+#include <time.h>
 
 // ANSI color codes
 #define COLOR_GREEN  "\033[0;32m"
@@ -313,6 +314,143 @@ static bool test_visibility_aborted_transaction(void) {
     return true;
 }
 
+static bool test_snapshot_timeout_basic(void) {
+    printf("🧪 Running: test_snapshot_timeout_basic\n");
+
+    mvcc_manager_t *manager = mvcc_manager_create();
+    TEST_ASSERT(manager != NULL, "Manager creation should succeed");
+
+    // Set a very short timeout (50ms)
+    mvcc_set_snapshot_timeout(manager, 50);
+
+    // Create a snapshot
+    mvcc_snapshot_t *snap = mvcc_snapshot_create(manager);
+    TEST_ASSERT(snap != NULL, "Snapshot creation should succeed");
+    TEST_ASSERT(mvcc_active_snapshot_count(manager) == 1, "Should have 1 active snapshot");
+
+    // Immediately expire — snapshot is fresh, should survive
+    size_t expired = mvcc_expire_snapshots(manager);
+    TEST_ASSERT(expired == 0, "Fresh snapshot should not expire");
+    TEST_ASSERT(mvcc_active_snapshot_count(manager) == 1, "Should still have 1 snapshot");
+
+    // Wait for timeout to elapse
+    struct timespec sleep_time = {0, 60 * 1000000}; // 60ms
+    nanosleep(&sleep_time, NULL);
+
+    // Now expire — should remove it
+    expired = mvcc_expire_snapshots(manager);
+    TEST_ASSERT(expired == 1, "Expired snapshot should be removed");
+    TEST_ASSERT(mvcc_active_snapshot_count(manager) == 0, "Should have 0 snapshots");
+
+    mvcc_manager_destroy(manager);
+
+    printf(COLOR_GREEN "   ✅ PASSED\n" COLOR_RESET);
+    return true;
+}
+
+static bool test_snapshot_timeout_selective(void) {
+    printf("🧪 Running: test_snapshot_timeout_selective\n");
+
+    mvcc_manager_t *manager = mvcc_manager_create();
+    TEST_ASSERT(manager != NULL, "Manager creation should succeed");
+
+    // Set 100ms timeout
+    mvcc_set_snapshot_timeout(manager, 100);
+
+    // Create first batch of snapshots
+    mvcc_snapshot_t *old_snaps[5];
+    for (int i = 0; i < 5; i++) {
+        old_snaps[i] = mvcc_snapshot_create(manager);
+        TEST_ASSERT(old_snaps[i] != NULL, "Snapshot creation should succeed");
+    }
+    TEST_ASSERT(mvcc_active_snapshot_count(manager) == 5, "Should have 5 snapshots");
+
+    // Wait for them to age past timeout
+    struct timespec sleep_time = {0, 120 * 1000000}; // 120ms
+    nanosleep(&sleep_time, NULL);
+
+    // Create fresh snapshots
+    mvcc_snapshot_t *new_snaps[3];
+    for (int i = 0; i < 3; i++) {
+        new_snaps[i] = mvcc_snapshot_create(manager);
+        TEST_ASSERT(new_snaps[i] != NULL, "Snapshot creation should succeed");
+    }
+    TEST_ASSERT(mvcc_active_snapshot_count(manager) == 8, "Should have 8 snapshots");
+
+    // Expire — should remove only the 5 old ones
+    size_t expired = mvcc_expire_snapshots(manager);
+    TEST_ASSERT(expired == 5, "Should expire exactly 5 old snapshots");
+    TEST_ASSERT(mvcc_active_snapshot_count(manager) == 3, "Should have 3 remaining");
+
+    // Clean up remaining snapshots
+    for (int i = 0; i < 3; i++) {
+        mvcc_snapshot_release(manager, new_snaps[i]);
+    }
+    TEST_ASSERT(mvcc_active_snapshot_count(manager) == 0, "Should have 0 snapshots");
+
+    mvcc_manager_destroy(manager);
+
+    printf(COLOR_GREEN "   ✅ PASSED\n" COLOR_RESET);
+    return true;
+}
+
+static bool test_snapshot_timeout_disabled(void) {
+    printf("🧪 Running: test_snapshot_timeout_disabled\n");
+
+    mvcc_manager_t *manager = mvcc_manager_create();
+    TEST_ASSERT(manager != NULL, "Manager creation should succeed");
+
+    // Default: no timeout (0)
+    mvcc_snapshot_t *snap = mvcc_snapshot_create(manager);
+    TEST_ASSERT(snap != NULL, "Snapshot creation should succeed");
+
+    // Wait a bit
+    struct timespec sleep_time = {0, 10 * 1000000}; // 10ms
+    nanosleep(&sleep_time, NULL);
+
+    // Expire should do nothing when timeout is 0
+    size_t expired = mvcc_expire_snapshots(manager);
+    TEST_ASSERT(expired == 0, "No snapshots should expire with timeout=0");
+    TEST_ASSERT(mvcc_active_snapshot_count(manager) == 1, "Snapshot should survive");
+
+    mvcc_snapshot_release(manager, snap);
+    mvcc_manager_destroy(manager);
+
+    printf(COLOR_GREEN "   ✅ PASSED\n" COLOR_RESET);
+    return true;
+}
+
+static bool test_snapshot_timeout_many(void) {
+    printf("🧪 Running: test_snapshot_timeout_many\n");
+
+    mvcc_manager_t *manager = mvcc_manager_create();
+    TEST_ASSERT(manager != NULL, "Manager creation should succeed");
+
+    // Set 30ms timeout
+    mvcc_set_snapshot_timeout(manager, 30);
+
+    // Create 100 snapshots
+    for (int i = 0; i < 100; i++) {
+        mvcc_snapshot_t *snap = mvcc_snapshot_create(manager);
+        TEST_ASSERT(snap != NULL, "Snapshot creation should succeed");
+    }
+    TEST_ASSERT(mvcc_active_snapshot_count(manager) == 100, "Should have 100 snapshots");
+
+    // Wait for timeout
+    struct timespec sleep_time = {0, 50 * 1000000}; // 50ms
+    nanosleep(&sleep_time, NULL);
+
+    // All 100 should expire
+    size_t expired = mvcc_expire_snapshots(manager);
+    TEST_ASSERT(expired == 100, "All 100 snapshots should expire");
+    TEST_ASSERT(mvcc_active_snapshot_count(manager) == 0, "Should have 0 snapshots");
+
+    mvcc_manager_destroy(manager);
+
+    printf(COLOR_GREEN "   ✅ PASSED\n" COLOR_RESET);
+    return true;
+}
+
 int main(void) {
     // Reduce log noise
     log_set_level(LOG_LEVEL_ERROR);
@@ -343,7 +481,11 @@ int main(void) {
     RUN_TEST(test_visibility_active_at_snapshot);
     RUN_TEST(test_visibility_deleted_version);
     RUN_TEST(test_visibility_aborted_transaction);
-    
+    RUN_TEST(test_snapshot_timeout_basic);
+    RUN_TEST(test_snapshot_timeout_selective);
+    RUN_TEST(test_snapshot_timeout_disabled);
+    RUN_TEST(test_snapshot_timeout_many);
+
     printf("========================================\n");
     printf(" Results: %d/%d tests passed\n", passed, total);
     printf("========================================\n\n");

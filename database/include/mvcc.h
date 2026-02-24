@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <time.h>
 
 // ============================================================================
 // Transaction State
@@ -76,7 +77,10 @@ typedef struct mvcc_snapshot {
     
     // Reference counting for garbage collection
     uint32_t ref_count;            // Number of references to this snapshot
-    
+
+    // Lifetime tracking
+    struct timespec created_at;    // When this snapshot was created (CLOCK_MONOTONIC)
+
     // Linked list for snapshot tracking
     struct mvcc_snapshot *next;
 } mvcc_snapshot_t;
@@ -139,7 +143,8 @@ typedef struct mvcc_manager {
     // Active snapshots
     mvcc_snapshot_t *snapshots;    // Linked list of active snapshots
     pthread_rwlock_t snapshot_lock; // RW lock for snapshot list
-    
+    uint64_t snapshot_timeout_ms;  // Max snapshot lifetime in ms (0 = no timeout)
+
     // Statistics
     uint64_t snapshots_created;
     uint64_t snapshots_released;
@@ -216,11 +221,30 @@ void mvcc_snapshot_acquire(mvcc_snapshot_t *snapshot);
 
 /**
  * Release snapshot (decrement ref count, free if zero)
- * 
+ *
  * @param manager MVCC manager
  * @param snapshot Snapshot to release
  */
 void mvcc_snapshot_release(mvcc_manager_t *manager, mvcc_snapshot_t *snapshot);
+
+/**
+ * Set snapshot timeout (max lifetime before force-expiration)
+ *
+ * @param manager MVCC manager
+ * @param timeout_ms Timeout in milliseconds (0 = no timeout, default)
+ */
+void mvcc_set_snapshot_timeout(mvcc_manager_t *manager, uint64_t timeout_ms);
+
+/**
+ * Expire snapshots that have exceeded the timeout
+ *
+ * Force-releases snapshots whose age exceeds snapshot_timeout_ms.
+ * Called automatically during periodic GC, or can be called manually.
+ *
+ * @param manager MVCC manager
+ * @return Number of snapshots expired
+ */
+size_t mvcc_expire_snapshots(mvcc_manager_t *manager);
 
 /**
  * Check if there are any active snapshots
