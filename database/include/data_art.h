@@ -631,6 +631,35 @@ bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out);
 int64_t data_art_recover(data_art_tree_t *tree, uint64_t start_lsn);
 
 // ============================================================================
+// Iterator Support
+// ============================================================================
+
+/**
+ * Persistent ART iterator — enumerates all keys in lexicographic order.
+ *
+ * Captures a snapshot of the committed root at creation time, providing
+ * a consistent view even under concurrent writes. Uses stack-based DFS.
+ *
+ * Usage:
+ *   data_art_iterator_t *it = data_art_iterator_create(tree);
+ *   while (data_art_iterator_next(it)) {
+ *       size_t klen, vlen;
+ *       const uint8_t *key = data_art_iterator_key(it, &klen);
+ *       const void *val = data_art_iterator_value(it, &vlen);
+ *       // use key, val ...
+ *   }
+ *   data_art_iterator_destroy(it);
+ */
+typedef struct data_art_iterator data_art_iterator_t;
+
+data_art_iterator_t *data_art_iterator_create(data_art_tree_t *tree);
+bool data_art_iterator_next(data_art_iterator_t *iter);
+const uint8_t *data_art_iterator_key(const data_art_iterator_t *iter, size_t *key_len);
+const void *data_art_iterator_value(const data_art_iterator_t *iter, size_t *value_len);
+bool data_art_iterator_done(const data_art_iterator_t *iter);
+void data_art_iterator_destroy(data_art_iterator_t *iter);
+
+// ============================================================================
 // Statistics & Debugging
 // ============================================================================
 

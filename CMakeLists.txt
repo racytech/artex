@@ -124,6 +124,7 @@ add_library(art_persistent STATIC
     database/src/txn_buffer.c
     database/src/mvcc.c
     database/src/checkpoint_manager.c
+    database/src/data_art_iterator.c
     database/src/db_error.c
     database/src/logger.c
 )
@@ -364,6 +365,13 @@ add_executable(test_checkpoint_manager
 )
 target_link_libraries(test_checkpoint_manager art_persistent pthread)
 add_test(NAME test_checkpoint_manager COMMAND test_checkpoint_manager)
+
+# Test: Persistent ART Iterator
+add_executable(test_data_art_iterator
+    database/tests/test_data_art_iterator.c
+)
+target_link_libraries(test_data_art_iterator art_persistent pthread)
+add_test(NAME test_data_art_iterator COMMAND test_data_art_iterator)
 
 # Test: Simple delete test
 add_executable(test_delete_simple

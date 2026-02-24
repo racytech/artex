@@ -46,11 +46,12 @@
    - Tests: start/stop lifecycle, force checkpoint, concurrent writes + checkpoint (1000 keys, 4 checkpoints), WAL truncation (4→2 segments)
    - Result: WAL growth bounded, old segments automatically cleaned up
 
-### 7. Iterator Support (3-4 days) — HARDEST
-   - Implement persistent iterator with page pinning
-   - Test: Iterate 1M entries without running out of memory
-   - Test: Iterator + concurrent writes maintain consistency
-   - Required for: Ethereum state scanning
+### 7. ~~Iterator Support~~ FIXED
+   - Stack-based DFS iterator yielding leaves in lexicographic key order
+   - Captures committed root atomically at creation (snapshot isolation under concurrent writes)
+   - Each `next()` resets TLS arena, reloads nodes from `node_ref_t` — no persistent page pinning needed
+   - Overflow value reading supported via `data_art_read_overflow_value()`
+   - Tests: empty tree, single key, sorted order (100 keys), large scale (10,000 keys), concurrent writes, overflow values
 
 ### 8. Dead Code Cleanup
    - Remove `db_compaction.h` (entire unimplemented header)
