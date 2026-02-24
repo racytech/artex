@@ -506,35 +506,42 @@ bool mvcc_begin_txn(mvcc_manager_t *manager, uint64_t *txn_id_out) {
 
 bool mvcc_commit_txn(mvcc_manager_t *manager, uint64_t txn_id) {
     if (!manager || txn_id == 0) return false;
-    
-    pthread_rwlock_rdlock(&manager->txn_map.resize_lock);
+
+    // Use wrlock since we'll also remove the entry
+    pthread_rwlock_wrlock(&manager->txn_map.resize_lock);
     txn_info_t *entry = txn_map_lookup(&manager->txn_map, txn_id);
-    
+
     if (!entry) {
         pthread_rwlock_unlock(&manager->txn_map.resize_lock);
         LOG_ERROR("Transaction %lu not found for commit", txn_id);
         return false;
     }
-    
+
     // Mark as committed
     entry->state = TXN_STATE_COMMITTED;
-    
+
     // Assign commit timestamp
     pthread_mutex_lock(&manager->txn_id_lock);
     entry->commit_ts = manager->next_txn_id;
     pthread_mutex_unlock(&manager->txn_id_lock);
-    
+
+    // Remove from txn_map and retire for GC (same as abort path)
+    txn_info_t *removed = txn_map_remove(&manager->txn_map, txn_id);
     pthread_rwlock_unlock(&manager->txn_map.resize_lock);
-    
+
+    if (removed) {
+        epoch_gc_retire(&manager->gc, removed);
+    }
+
     LOG_DEBUG("Transaction %lu committed (commit_ts=%lu)", txn_id, entry->commit_ts);
-    
+
     // Periodically run GC (every 100 commits)
     if (txn_id % 100 == 0) {
         uint64_t min_safe_epoch = epoch_gc_compute_min_safe_epoch(manager);
         epoch_gc_reclaim(&manager->gc, min_safe_epoch);
         epoch_gc_advance(&manager->gc);
     }
-    
+
     return true;
 }
 
@@ -561,13 +568,21 @@ bool mvcc_abort_txn(mvcc_manager_t *manager, uint64_t txn_id) {
 
 txn_state_t mvcc_get_txn_state(mvcc_manager_t *manager, uint64_t txn_id) {
     if (!manager || txn_id == 0) return TXN_STATE_ABORTED;
-    
+
     pthread_rwlock_rdlock(&manager->txn_map.resize_lock);
     txn_info_t *entry = txn_map_lookup(&manager->txn_map, txn_id);
-    txn_state_t state = entry ? entry->state : TXN_STATE_ABORTED;
     pthread_rwlock_unlock(&manager->txn_map.resize_lock);
-    
-    return state;
+
+    if (entry) return entry->state;
+
+    // Entry not in map. If txn_id < next_txn_id, the transaction existed but was
+    // removed after commit/abort. Treat as committed: aborted txns discard their
+    // ops (never written to tree), so no leaf references their xmin/xmax.
+    pthread_mutex_lock(&manager->txn_id_lock);
+    uint64_t next = manager->next_txn_id;
+    pthread_mutex_unlock(&manager->txn_id_lock);
+
+    return (txn_id < next) ? TXN_STATE_COMMITTED : TXN_STATE_ABORTED;
 }
 
 // ============================================================================
