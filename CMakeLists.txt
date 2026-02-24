@@ -350,6 +350,13 @@ add_executable(test_db_error
 target_link_libraries(test_db_error pthread)
 add_test(NAME test_db_error COMMAND test_db_error)
 
+# Test: Crash Recovery
+add_executable(test_crash_recovery
+    database/tests/test_crash_recovery.c
+)
+target_link_libraries(test_crash_recovery art_persistent pthread)
+add_test(NAME test_crash_recovery COMMAND test_crash_recovery)
+
 # Test: Simple delete test
 add_executable(test_delete_simple
     database/tests/test_delete_simple.c

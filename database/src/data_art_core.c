@@ -911,9 +911,21 @@ int64_t data_art_recover(data_art_tree_t *tree, uint64_t start_lsn) {
     // Replay WAL entries to rebuild tree state
     // start_lsn == 0 means replay from beginning
     uint64_t end_lsn = UINT64_MAX;  // Replay to end
-    
-    int64_t entries = wal_replay(tree->wal, start_lsn, end_lsn, tree, apply_wal_entry);
-    
+
+    // Temporarily disable WAL and MVCC during replay to prevent:
+    // - Re-logging replayed entries (insert/delete check tree->wal)
+    // - Unnecessary MVCC transaction overhead (insert/delete check tree->mvcc_manager)
+    wal_t *saved_wal = tree->wal;
+    mvcc_manager_t *saved_mvcc = tree->mvcc_manager;
+    tree->wal = NULL;
+    tree->mvcc_manager = NULL;
+
+    int64_t entries = wal_replay(saved_wal, start_lsn, end_lsn, tree, apply_wal_entry);
+
+    // Restore WAL and MVCC references
+    tree->wal = saved_wal;
+    tree->mvcc_manager = saved_mvcc;
+
     if (entries < 0) {
         LOG_ERROR("Recovery failed during WAL replay");
         return -1;

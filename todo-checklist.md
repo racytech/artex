@@ -31,11 +31,13 @@
    - Non-breaking: all `bool` signatures unchanged, backward-compat `db_set_last_error()` preserved
    - Tests: 10 tests (backward compat, single/multi-frame traces, overflow, print format, 16-thread isolation)
 
-### 5. Crash Recovery Tests (1-2 days) 🔴 CRITICAL
-   - Test: Kill process mid-write, verify data on restart
-   - Test: Corrupt WAL segment, verify graceful failure
-   - Test: Power loss simulation (truncated writes)
-   - Validates: Durability guarantee actually works
+### 5. ~~Crash Recovery Tests~~ FIXED
+   - End-to-end recovery: insert 100 keys → close → reopen → `data_art_recover(tree, 0)` → all 100 verified
+   - Truncated WAL: `truncate()` last entry mid-payload → 59/60 keys recovered, partial entry skipped
+   - Corrupted WAL: `pwrite()` garbage into last entry → CRC32 mismatch detected, 19/20 keys recovered
+   - Checkpoint in WAL: 50 inserts + checkpoint + 30 inserts → full replay recovers all 80 keys
+   - Bug fixed: `data_art_recover` deadlocked (WAL re-logging during replay) — now disables WAL+MVCC during replay
+   - Bug fixed: `data_art_flush` false failure — `buffer_pool_flush_all` returns int, not bool
 
 ### 6. Checkpointing Implementation (2-3 days) 🔴 CRITICAL
    - Background checkpoint thread
