@@ -445,6 +445,69 @@ void test_page_corruption_detection(void) {
     cleanup_test_db();
 }
 
+void test_fsync_retry_and_health(void) {
+    cleanup_test_db();
+
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+
+    // Verify default config
+    TEST_ASSERT(pm->fsync_retry_max == 3, "Default retry max should be 3");
+    TEST_ASSERT(pm->fsync_retry_delay_us == 100, "Default retry delay should be 100us");
+
+    // Health should start OK
+    db_health_t health;
+    page_manager_get_health(pm, &health);
+    TEST_ASSERT(health.state == DB_HEALTH_OK, "Initial health should be OK");
+    TEST_ASSERT(health.fsync_failures == 0, "Initial fsync failures should be 0");
+    TEST_ASSERT(health.fsync_retries == 0, "Initial fsync retries should be 0");
+
+    // Write some pages and sync — should succeed normally
+    for (int i = 0; i < 10; i++) {
+        uint64_t page_id = page_manager_alloc(pm, 0);
+        TEST_ASSERT(page_id != 0, "Page allocation should succeed");
+
+        page_t page;
+        page_init(&page, page_id, 1);
+        snprintf((char*)page.data, 100, "Test page %d", i);
+        page_compute_checksum(&page);
+        page_result_t result = page_manager_write(pm, &page);
+        TEST_ASSERT(result == PAGE_SUCCESS, "Page write should succeed");
+    }
+
+    page_result_t result = page_manager_sync(pm);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Sync should succeed");
+
+    // Verify health after successful sync
+    page_manager_get_health(pm, &health);
+    TEST_ASSERT(health.state == DB_HEALTH_OK, "Health should still be OK after successful sync");
+    TEST_ASSERT(health.total_fsync_calls > 0, "Should have recorded fsync calls");
+    TEST_ASSERT(health.fsync_failures == 0, "No failures on good sync");
+
+    // Test sync with invalid fd — forces fsync failure
+    // Save real fd, replace with -1
+    int saved_fd = pm->allocator->data_file_fds[0];
+    pm->allocator->data_file_fds[0] = -1;
+
+    result = page_manager_sync(pm);
+    TEST_ASSERT(result != PAGE_SUCCESS, "Sync with bad fd should fail");
+
+    page_manager_get_health(pm, &health);
+    TEST_ASSERT(health.state == DB_HEALTH_FAILING, "Health should be FAILING after fsync failure");
+    TEST_ASSERT(health.fsync_failures > 0, "Should record fsync failure");
+    TEST_ASSERT(health.last_error_errno != 0, "Should record errno from failure");
+
+    // Restore fd
+    pm->allocator->data_file_fds[0] = saved_fd;
+
+    // Sync should work again
+    result = page_manager_sync(pm);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Sync should succeed after restoring fd");
+
+    page_manager_destroy(pm);
+    cleanup_test_db();
+}
+
 int main(void) {
     // Initialize logger
     log_init(LOG_LEVEL_INFO, stderr);
@@ -466,6 +529,7 @@ int main(void) {
     RUN_TEST(test_statistics);
     RUN_TEST(test_error_handling);
     RUN_TEST(test_page_corruption_detection);
+    RUN_TEST(test_fsync_retry_and_health);
 
     printf("\n");
     printf("========================================\n");

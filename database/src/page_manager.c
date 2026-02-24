@@ -92,6 +92,9 @@ page_manager_t *page_manager_create(const char *db_path, bool read_only) {
     
     pm->read_only = read_only;
     pm->compression_enabled = false;  // Phase 1: no compression
+    pm->fsync_retry_max = 3;
+    pm->fsync_retry_delay_us = 100;
+    pm->health.state = DB_HEALTH_OK;
     
     // Create database directory if it doesn't exist
     if (!read_only) {
@@ -441,27 +444,75 @@ page_result_t page_manager_write(page_manager_t *pm, const page_t *page) {
     return PAGE_SUCCESS;
 }
 
+/**
+ * Fsync with retry and exponential backoff
+ */
+static page_result_t fsync_with_retry(page_manager_t *pm, int fd, const char *context) {
+    uint32_t retry_count = 0;
+    uint64_t delay_us = pm->fsync_retry_delay_us;
+
+    while (retry_count < pm->fsync_retry_max) {
+        if (fsync(fd) == 0) {
+            if (retry_count > 0) {
+                LOG_WARN("fsync succeeded after %u retries (%s)", retry_count, context);
+                pm->health.fsync_retries += retry_count;
+                if (pm->health.state == DB_HEALTH_OK) {
+                    pm->health.state = DB_HEALTH_DEGRADED;
+                }
+            }
+            pm->health.total_fsync_calls++;
+            return PAGE_SUCCESS;
+        }
+
+        if (errno == EINTR) {
+            continue;  // Signal interrupt — retry immediately
+        }
+
+        if (errno == EAGAIN || errno == EIO) {
+            LOG_WARN("fsync retry %u/%u: %s (%s)",
+                     retry_count + 1, pm->fsync_retry_max, strerror(errno), context);
+            usleep(delay_us);
+            delay_us *= 2;
+            retry_count++;
+            continue;
+        }
+
+        // ENOSPC or other unrecoverable error — no point retrying
+        break;
+    }
+
+    int saved_errno = errno;
+    LOG_CRITICAL("fsync failed after %u retries: %s (%s)",
+                 retry_count, strerror(saved_errno), context);
+    pm->health.fsync_failures++;
+    pm->health.last_error_errno = saved_errno;
+    pm->health.state = DB_HEALTH_FAILING;
+
+    return (saved_errno == ENOSPC) ? PAGE_ERROR_DISK_FULL : PAGE_ERROR_IO;
+}
+
 page_result_t page_manager_sync(page_manager_t *pm) {
     if (!pm || !pm->allocator) {
         return PAGE_ERROR_INVALID_ARG;
     }
-    
+
     if (pm->read_only) {
-        return PAGE_SUCCESS;  // Nothing to sync
+        return PAGE_SUCCESS;
     }
-    
+
     LOG_DEBUG("Syncing all data files");
-    
-    // Sync all data files
+
     for (uint32_t i = 0; i < pm->allocator->num_data_files; i++) {
-        if (fsync(pm->allocator->data_file_fds[i]) == -1) {
-            LOG_ERROR("Failed to sync data file %u: %s", i, strerror(errno));
-            return PAGE_ERROR_IO;
+        char ctx[32];
+        snprintf(ctx, sizeof(ctx), "data_file_%u", i);
+        page_result_t result = fsync_with_retry(pm, pm->allocator->data_file_fds[i], ctx);
+        if (result != PAGE_SUCCESS) {
+            return result;
         }
     }
-    
+
     LOG_INFO("All data files synced successfully");
-    
+
     return PAGE_SUCCESS;
 }
 
@@ -711,6 +762,11 @@ void page_manager_print_stats(page_manager_t *pm) {
     LOG_INFO("  Total size:    %lu bytes (%.2f MB)", stats.total_file_size,
              stats.total_file_size / (1024.0 * 1024.0));
     LOG_INFO("=============================================");
+}
+
+void page_manager_get_health(page_manager_t *pm, db_health_t *health_out) {
+    if (!pm || !health_out) return;
+    *health_out = pm->health;
 }
 
 // ============================================================================

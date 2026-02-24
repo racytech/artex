@@ -95,19 +95,39 @@ typedef struct {
     pthread_rwlock_t lock;             // Protects concurrent access
 } page_index_t;
 
+// Database health state
+typedef enum {
+    DB_HEALTH_OK       = 0,  // All systems normal
+    DB_HEALTH_DEGRADED = 1,  // Transient errors encountered (retries succeeded)
+    DB_HEALTH_FAILING  = 2,  // Persistent I/O errors (retries exhausted)
+} db_health_state_t;
+
+typedef struct {
+    db_health_state_t state;
+    uint64_t total_fsync_calls;
+    uint64_t fsync_retries;      // Total retries across all calls
+    uint64_t fsync_failures;     // Calls that failed after all retries
+    uint64_t last_error_errno;   // errno from last failure
+} db_health_t;
+
 // Page manager (coordinates allocation + I/O)
 typedef struct {
     char *db_path;              // Database directory path
     page_allocator_t *allocator;
     page_index_t *index;        // Page index with GC metadata
-    
+
     // File handles
     int metadata_fd;
-    
+
     // Configuration
     bool read_only;
     bool compression_enabled;
-    
+    uint32_t fsync_retry_max;        // Max fsync retries (default: 3)
+    uint32_t fsync_retry_delay_us;   // Initial backoff in microseconds (default: 100)
+
+    // Health monitoring
+    db_health_t health;
+
     // Statistics
     uint64_t pages_read;
     uint64_t pages_written;
@@ -303,10 +323,18 @@ void page_manager_get_stats(page_manager_t *pm, page_manager_stats_t *stats_out)
 
 /**
  * Print statistics (for debugging)
- * 
+ *
  * @param pm Page manager instance
  */
 void page_manager_print_stats(page_manager_t *pm);
+
+/**
+ * Get database health state
+ *
+ * @param pm Page manager instance
+ * @param health_out Output: health information
+ */
+void page_manager_get_health(page_manager_t *pm, db_health_t *health_out);
 
 // ============================================================================
 // Validation & Integrity
