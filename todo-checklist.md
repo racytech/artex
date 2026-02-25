@@ -149,64 +149,58 @@
    - Tests: 16 tests (171 assertions) — analyze, in-place moves, interleaved dead, journal recovery, persistence
    - Result: 26/26 tests pass
 
-### 19. Batch COW Optimization
-   - **Problem**: COW amplification — every single key update COWs ~32 nodes (leaf to root). N key updates = N × 32 page allocations, even though most updates share upper tree nodes.
-   - **Solution**: batch all mutations per block, walk tree once, COW each affected node at most once.
-   - Current TEMP FIX: commit path acquires/releases write_lock N times, publishes root N times, N separate COW paths.
-   - Dedicated batch path: sort mutations by key → single depth-first tree walk → COW shared ancestors once → publish root once.
+### 19. Batch COW Optimization + Group Commit
+   - **Problem**: COW amplification — every single key update COWs ~32 nodes (leaf to root). N key updates = N × 32 page allocations, even though most updates share upper tree nodes. Each commit also does its own fsync (~5ms).
+   - **Solution**: batch all mutations per block, walk tree once, COW each affected node at most once, single fsync.
+   - Current TEMP FIX: commit path acquires/releases write_lock N times, publishes root N times, N separate COW paths, N fsyncs.
+   - Dedicated batch path: sort mutations by key → single depth-first tree walk → COW shared ancestors once → publish root once → single fsync.
    - For Ethereum blocks (100-5000 state changes): top ~10 tree levels COW'd once instead of once per key.
    - Expected: 10-100x fewer page writes per block, single MVCC txn, single fsync.
    - This is the #1 performance bottleneck — more impactful than any other optimization.
 
-### 20. Write Batching / Group Commit
-   - Currently every `commit_txn` does its own fsync (~5ms each)
-   - Group commit: buffer multiple transactions, single fsync for the group
-   - Amortize disk latency across many commits (critical for high-throughput workloads)
-   - WAL already uses write buffer — extend with commit coalescing
-
-### 21. Bloom Filters for Negative Lookups
+### 20. Bloom Filters for Negative Lookups
    - Negative lookups (key not found) currently traverse tree to disk
    - Per-page or per-level bloom filter avoids I/O for keys that definitely don't exist
    - Important for Ethereum where misses are common (state trie probing)
    - Space-efficient: ~10 bits per key for <1% false positive rate
 
-### 22. Incremental Backup
+### 21. Incremental Backup
    - Current backup exports all keys every time
    - Delta backup: only keys/pages changed since last backup (tracked via LSN or write_counter)
    - Much faster for large databases with small daily changes
    - Could use WAL LSN watermark to identify changed pages
 
-### 23. Monitoring / Metrics Export
+### 22. Monitoring / Metrics Export
    - Basic stats exist (pages_read/written, bytes, cache hits) but no time-series
    - Add latency histograms for read/write/commit operations
    - Cache hit rate over sliding window
    - Export interface for Prometheus or similar monitoring systems
 
-### 24. File Pre-allocation
+### 23. File Pre-allocation
    - Data files currently grow on demand via pwrite
    - Pre-allocate with `fallocate()` to reduce filesystem fragmentation
    - Improves sequential write throughput and reduces metadata overhead
    - Allocate in chunks (e.g. 64MB) when file grows past current allocation
 
-### 25. State Pruning Policy
+### 24. State Pruning Policy
    - MVCC + page GC infrastructure exists but no policy layer
    - Prune state versions older than N snapshots/checkpoints
    - Ethereum-specific: keep only last N blocks of state, reclaim the rest
    - Ties into compaction: pruning marks pages dead, compaction reclaims space
 
-### 26. Merkle Proof Generation
+### 25. Merkle Proof Generation
    - If ART replaces Merkle Patricia Trie, need state root computation and inclusion/exclusion proofs
    - Compute hash of each node (bottom-up), root hash = state root
    - Proof = path from root to leaf with sibling hashes at each level
    - Could be a separate layer on top of the ART (hash-augmented nodes)
 
-### 27. Encryption at Rest
+### 26. Encryption at Rest
    - No data encryption on disk currently
    - Page-level encryption: encrypt before write, decrypt after read
    - Key management: master key + per-file or per-page derived keys
    - Transparent to buffer pool and upper layers
 
-### 28. CLI (Command-Line Interface)
+### 27. CLI (Command-Line Interface)
    - Combined admin + client tool for interacting with the database
    - **Key-value operations**: `get <key>`, `put <key> <value>`, `delete <key>`, `scan [prefix]`
    - **Transaction support**: `begin`, `commit`, `abort` for multi-key atomic updates
@@ -217,7 +211,7 @@
    - Read-only mode: `artdb --db /path/to/db --readonly`
    - Builds on all existing APIs: data_art, page_manager, buffer_pool, checkpoint_manager, db_backup
 
-### 29. Dead Code Cleanup
+### 28. Dead Code Cleanup
    - Remove unused functions (data_art_cow_node, data_art_snapshot, data_art_load, etc.)
    - Remove dead static functions in `data_art_node_ops.c` (shrink stubs already implemented in data_art_delete.c)
    - Remove debug printfs in `mem_art.c`, duplicate log lines in `wal.c`
