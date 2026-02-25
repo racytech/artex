@@ -21,6 +21,8 @@
 // Forward declarations - functions from data_art_core.c
 extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
 extern void data_art_reset_arena(void);
+extern void data_art_rdlock(data_art_tree_t *tree);
+extern void data_art_rdunlock(data_art_tree_t *tree);
 
 // Forward declaration - overflow value reader from data_art_overflow.c
 extern bool data_art_read_overflow_value(data_art_tree_t *tree,
@@ -395,22 +397,30 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
     return NULL;  // Not found
 }
 
-// Public API: Get with snapshot — LOCK-FREE
-// Full CoW ensures all pages on the committed root's path are immutable.
-// Readers load the committed root atomically and traverse without any lock.
+// Public API: Get with snapshot — zero-copy reads via operation-scoped rdlock.
+// Holds write_lock as rdlock to coordinate with in-place mutation writers.
+// Holds resize_lock as rdlock for direct mmap pointer access (zero-copy).
 const void *data_art_get_snapshot(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
                                    size_t *value_len, data_art_snapshot_t *snapshot) {
+    if (!tree) return NULL;
+
+    pthread_rwlock_rdlock(&tree->write_lock);
+    data_art_rdlock(tree);
+
     node_ref_t root;
+    const void *result;
     if (snapshot) {
-        // Use the root captured at snapshot creation time for consistent reads
         root = (node_ref_t){.page_id = snapshot->root_page_id, .offset = snapshot->root_offset};
-        return data_art_get_internal(tree, root, key, key_len, value_len,
-                                      snapshot->mvcc_snapshot, snapshot->txn_id);
+        result = data_art_get_internal(tree, root, key, key_len, value_len,
+                                        snapshot->mvcc_snapshot, snapshot->txn_id);
     } else {
-        // No snapshot: read latest committed root
         root = data_art_read_committed_root(tree);
-        return data_art_get_internal(tree, root, key, key_len, value_len, NULL, 0);
+        result = data_art_get_internal(tree, root, key, key_len, value_len, NULL, 0);
     }
+
+    data_art_rdunlock(tree);
+    pthread_rwlock_unlock(&tree->write_lock);
+    return result;
 }
 
 // Legacy API: Get without snapshot (reads latest committed)

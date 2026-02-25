@@ -182,7 +182,7 @@ static void test_statistics(void) {
     data_art_get_stats(tree, &stats);
 
     ASSERT(stats.num_entries == 1);
-    ASSERT(stats.version == 1);
+    ASSERT(stats.version == 2);  // version incremented once by auto-commit insert
     ASSERT(stats.nodes_allocated > 0);
 
     // Print stats for visual inspection

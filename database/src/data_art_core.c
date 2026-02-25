@@ -61,6 +61,26 @@ void data_art_reset_arena(void) {
 }
 
 // ============================================================================
+// Zero-Copy Read Support
+// ============================================================================
+//
+// When tls_rdlock_held is true, data_art_load_node() returns direct mmap
+// pointers instead of copying to the TLS arena.  The caller must hold
+// resize_lock as rdlock for the entire operation (via data_art_rdlock/rdunlock).
+
+static __thread bool tls_rdlock_held = false;
+
+void data_art_rdlock(data_art_tree_t *tree) {
+    pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
+    tls_rdlock_held = true;
+}
+
+void data_art_rdunlock(data_art_tree_t *tree) {
+    tls_rdlock_held = false;
+    pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+}
+
+// ============================================================================
 // Lock-Free Read Helpers
 // ============================================================================
 
@@ -471,7 +491,7 @@ static bool data_art_init_common(data_art_tree_t *tree, size_t key_size) {
     tree->current_txn_id = 0;
     tree->txn_buffer = NULL;
 
-    if (pthread_mutex_init(&tree->write_lock, NULL) != 0) {
+    if (pthread_rwlock_init(&tree->write_lock, NULL) != 0) {
         LOG_ERROR("Failed to initialize write_lock");
         return false;
     }
@@ -479,7 +499,7 @@ static bool data_art_init_common(data_art_tree_t *tree, size_t key_size) {
     tree->mvcc_manager = mvcc_manager_create();
     if (!tree->mvcc_manager) {
         LOG_ERROR("Failed to create MVCC manager");
-        pthread_mutex_destroy(&tree->write_lock);
+        pthread_rwlock_destroy(&tree->write_lock);
         return false;
     }
 
@@ -596,7 +616,7 @@ void data_art_destroy(data_art_tree_t *tree) {
     }
 
     // Destroy write lock
-    pthread_mutex_destroy(&tree->write_lock);
+    pthread_rwlock_destroy(&tree->write_lock);
 
     // Destroy MVCC manager
     if (tree->mvcc_manager) {
@@ -807,6 +827,13 @@ const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref) {
         return NULL;
     }
 
+    // Fast path: caller holds resize_lock — return direct mmap pointer (zero-copy)
+    if (tls_rdlock_held) {
+        page_t *page = mmap_storage_get_page(tree->mmap_storage, ref.page_id);
+        return page->data + ref.offset;
+    }
+
+    // Legacy path: lock, copy to arena, unlock
     pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
 
     page_t *page = mmap_storage_get_page(tree->mmap_storage, ref.page_id);
@@ -823,7 +850,6 @@ const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref) {
     memcpy(copy, src, node_size);
 
     pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
-    tree->cache_hits++;
     return copy;
 }
 
@@ -853,11 +879,45 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
 }
 
 // ============================================================================
+// In-Place Mutation Helpers
+// ============================================================================
+
+void *data_art_lock_node_mut(data_art_tree_t *tree, node_ref_t ref) {
+    pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
+    page_t *page = mmap_storage_get_page(tree->mmap_storage, ref.page_id);
+    return page->data + ref.offset;
+}
+
+void data_art_unlock_node_mut(data_art_tree_t *tree) {
+    pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+}
+
+bool data_art_write_partial(data_art_tree_t *tree, node_ref_t ref,
+                            size_t node_offset, const void *data, size_t len) {
+    if (!tree || !data || node_ref_is_null(ref)) return false;
+    pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
+    page_t *page = mmap_storage_get_page(tree->mmap_storage, ref.page_id);
+    memcpy(page->data + ref.offset + node_offset, data, len);
+    pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+    return true;
+}
+
+bool data_art_copy_node(data_art_tree_t *tree, node_ref_t dst, node_ref_t src, size_t size) {
+    if (!tree || node_ref_is_null(dst) || node_ref_is_null(src)) return false;
+    pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
+    page_t *src_page = mmap_storage_get_page(tree->mmap_storage, src.page_id);
+    page_t *dst_page = mmap_storage_get_page(tree->mmap_storage, dst.page_id);
+    memcpy(dst_page->data + dst.offset, src_page->data + src.offset, size);
+    pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+    return true;
+}
+
+// ============================================================================
 // NOTE: Search, Insert and Delete operations are implemented in separate files:
 // - data_art_search.c (tree traversal, get, contains)
 // - data_art_insert.c (recursive insert with node growth)
 // - data_art_delete.c (recursive delete with node shrinking - TODO)
-// 
+//
 // Node growth/shrinking operations are in:
 // - data_art_node_ops.c (add_child, remove_child, node transitions)
 // ============================================================================
@@ -945,7 +1005,7 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
     size_t num_ops = buffer->num_ops;
 
     // === OPTIMIZED BATCH COMMIT: single lock, single root publish ===
-    pthread_mutex_lock(&tree->write_lock);
+    pthread_rwlock_wrlock(&tree->write_lock);
 
     // Save rollback point in case any operation fails
     node_ref_t saved_root = tree->root;
@@ -972,7 +1032,7 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
             // Rollback: restore root and size
             tree->root = saved_root;
             tree->size = saved_size;
-            pthread_mutex_unlock(&tree->write_lock);
+            pthread_rwlock_unlock(&tree->write_lock);
 
             DB_ERROR(DB_ERROR_IO, "failed to apply operation %zu", i);
             txn_buffer_destroy(buffer);
@@ -992,7 +1052,7 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
     // Single root publication for the entire batch
     data_art_publish_root(tree);
 
-    pthread_mutex_unlock(&tree->write_lock);
+    pthread_rwlock_unlock(&tree->write_lock);
 
     // Clean up
     txn_buffer_destroy(buffer);
@@ -1067,11 +1127,14 @@ data_art_snapshot_t *data_art_begin_snapshot(data_art_tree_t *tree) {
         return NULL;
     }
     
-    // Capture committed root at snapshot creation time (lock-free)
+    // Capture committed root atomically, coordinating with in-place mutation writers.
+    // rdlock on write_lock ensures no writer is mid-mutation when we read the root.
+    pthread_rwlock_rdlock(&tree->write_lock);
     snapshot->root_page_id = atomic_load_explicit(&tree->committed_root_page_id,
                                                    memory_order_acquire);
     snapshot->root_offset = atomic_load_explicit(&tree->committed_root_offset,
                                                   memory_order_relaxed);
+    pthread_rwlock_unlock(&tree->write_lock);
 
     // Create MVCC snapshot
     snapshot->mvcc_snapshot = mvcc_snapshot_create(tree->mvcc_manager);

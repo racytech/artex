@@ -18,6 +18,11 @@ extern bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
                                   const void *node, size_t size);
 extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
 extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
+extern void *data_art_lock_node_mut(data_art_tree_t *tree, node_ref_t ref);
+extern void data_art_unlock_node_mut(data_art_tree_t *tree);
+extern bool data_art_write_partial(data_art_tree_t *tree, node_ref_t ref,
+                                    size_t node_offset, const void *data, size_t len);
+extern bool data_art_copy_node(data_art_tree_t *tree, node_ref_t dst, node_ref_t src, size_t size);
 
 // NODE48_EMPTY is defined in data_art.h
 
@@ -387,36 +392,33 @@ static node_ref_t add_child_node48(data_art_tree_t *tree, node_ref_t node_ref,
  */
 static node_ref_t add_child_node256(data_art_tree_t *tree, node_ref_t node_ref,
                                      const data_art_node256_t *n256, uint8_t byte, node_ref_t child_ref) {
-    data_art_node256_t new_n256 = *n256;
-    
-    // Check for duplicate key - this should never happen in normal operation
     if (n256->child_page_ids[byte] != 0) {
         LOG_ERROR("BUG: Attempted to add duplicate child byte=0x%02x to NODE_256 at page=%lu "
                  "(existing child at page=%lu)",
                  byte, node_ref.page_id, n256->child_page_ids[byte]);
         return NULL_NODE_REF;
     }
-    
-    // Direct assignment
-    if (new_n256.child_page_ids[byte] == 0) {
-        new_n256.num_children++;
-    }
-    
-    new_n256.child_page_ids[byte] = child_ref.page_id;
-    new_n256.child_offsets[byte] = child_ref.offset;
-    
-    // CoW: allocate new page (hint = old page for same-page COW), write there, release old
+
+    // Optimized CoW: copy whole node mmap-to-mmap, patch 13 bytes (num_children + child ref)
     node_ref_t new_ref = data_art_alloc_node_hint(tree, sizeof(data_art_node256_t), node_ref.page_id);
     if (node_ref_is_null(new_ref)) {
         LOG_ERROR("Failed to allocate new NODE_256 for CoW");
         return NULL_NODE_REF;
     }
-    if (!data_art_write_node(tree, new_ref, &new_n256, sizeof(new_n256))) {
-        LOG_ERROR("Failed to write NODE_256");
-        return NULL_NODE_REF;
-    }
-    data_art_release_page(tree, node_ref);
 
+    data_art_copy_node(tree, new_ref, node_ref, sizeof(data_art_node256_t));
+
+    uint8_t new_count = n256->num_children + 1;
+    data_art_write_partial(tree, new_ref, offsetof(data_art_node256_t, num_children),
+                           &new_count, sizeof(uint8_t));
+    data_art_write_partial(tree, new_ref,
+                           offsetof(data_art_node256_t, child_page_ids) + byte * sizeof(uint64_t),
+                           &child_ref.page_id, sizeof(uint64_t));
+    data_art_write_partial(tree, new_ref,
+                           offsetof(data_art_node256_t, child_offsets) + byte * sizeof(uint32_t),
+                           &child_ref.offset, sizeof(uint32_t));
+
+    data_art_release_page(tree, node_ref);
     return new_ref;
 }
 
@@ -433,12 +435,12 @@ node_ref_t data_art_add_child(data_art_tree_t *tree, node_ref_t node_ref,
     if (!node) {
         return NULL_NODE_REF;
     }
-    
+
     uint8_t type = *(const uint8_t *)node;
-    
+
     switch (type) {
         case DATA_NODE_4:
-            return add_child_node4(tree, node_ref, 
+            return add_child_node4(tree, node_ref,
                                    (const data_art_node4_t *)node, byte, child_ref);
         case DATA_NODE_16:
             return add_child_node16(tree, node_ref,
@@ -451,6 +453,115 @@ node_ref_t data_art_add_child(data_art_tree_t *tree, node_ref_t node_ref,
                                      (const data_art_node256_t *)node, byte, child_ref);
         default:
             LOG_ERROR("Invalid node type for add_child: %d", type);
+            return NULL_NODE_REF;
+    }
+}
+
+/**
+ * In-place add child — mutate node directly in mmap.
+ * Caller must hold write_lock as wrlock (exclusive).
+ * Returns same node_ref on success (no CoW propagation), or new ref if growth occurred.
+ */
+node_ref_t data_art_add_child_inplace(data_art_tree_t *tree, node_ref_t node_ref,
+                                       uint8_t byte, node_ref_t child_ref) {
+    // First load to determine type and check capacity
+    const void *node = data_art_load_node(tree, node_ref);
+    if (!node) return NULL_NODE_REF;
+
+    uint8_t type = *(const uint8_t *)node;
+
+    switch (type) {
+        case DATA_NODE_4: {
+            const data_art_node4_t *n4 = (const data_art_node4_t *)node;
+            if (n4->num_children >= 4) {
+                // Growth needed: fall back to CoW (alloc new NODE_16)
+                return add_child_node4(tree, node_ref, n4, byte, child_ref);
+            }
+            // In-place add to NODE_4
+            void *mut = data_art_lock_node_mut(tree, node_ref);
+            data_art_node4_t *m = (data_art_node4_t *)mut;
+            int pos = 0;
+            while (pos < m->num_children && m->keys[pos] < byte) pos++;
+            if (pos < m->num_children) {
+                memmove(&m->keys[pos + 1], &m->keys[pos], m->num_children - pos);
+                memmove(&m->child_page_ids[pos + 1], &m->child_page_ids[pos],
+                        (m->num_children - pos) * sizeof(uint64_t));
+                memmove(&m->child_offsets[pos + 1], &m->child_offsets[pos],
+                        (m->num_children - pos) * sizeof(uint32_t));
+            }
+            m->keys[pos] = byte;
+            m->child_page_ids[pos] = child_ref.page_id;
+            m->child_offsets[pos] = child_ref.offset;
+            m->num_children++;
+            data_art_unlock_node_mut(tree);
+            tree->inplace_mutations++;
+            return node_ref;
+        }
+        case DATA_NODE_16: {
+            const data_art_node16_t *n16 = (const data_art_node16_t *)node;
+            if (n16->num_children >= 16) {
+                return add_child_node16(tree, node_ref, n16, byte, child_ref);
+            }
+            void *mut = data_art_lock_node_mut(tree, node_ref);
+            data_art_node16_t *m = (data_art_node16_t *)mut;
+            int pos = 0;
+            while (pos < m->num_children && m->keys[pos] < byte) pos++;
+            if (pos < m->num_children) {
+                memmove(&m->keys[pos + 1], &m->keys[pos], m->num_children - pos);
+                memmove(&m->child_page_ids[pos + 1], &m->child_page_ids[pos],
+                        (m->num_children - pos) * sizeof(uint64_t));
+                memmove(&m->child_offsets[pos + 1], &m->child_offsets[pos],
+                        (m->num_children - pos) * sizeof(uint32_t));
+            }
+            m->keys[pos] = byte;
+            m->child_page_ids[pos] = child_ref.page_id;
+            m->child_offsets[pos] = child_ref.offset;
+            m->num_children++;
+            data_art_unlock_node_mut(tree);
+            tree->inplace_mutations++;
+            return node_ref;
+        }
+        case DATA_NODE_48: {
+            const data_art_node48_t *n48 = (const data_art_node48_t *)node;
+            if (n48->num_children >= 48) {
+                return add_child_node48(tree, node_ref, n48, byte, child_ref);
+            }
+            void *mut = data_art_lock_node_mut(tree, node_ref);
+            data_art_node48_t *m = (data_art_node48_t *)mut;
+            // Find free slot
+            uint8_t slot = 0;
+            for (; slot < 48; slot++) {
+                bool used = false;
+                for (int i = 0; i < 256; i++) {
+                    if (m->keys[i] == slot) { used = true; break; }
+                }
+                if (!used) break;
+            }
+            m->keys[byte] = slot;
+            m->child_page_ids[slot] = child_ref.page_id;
+            m->child_offsets[slot] = child_ref.offset;
+            m->num_children++;
+            data_art_unlock_node_mut(tree);
+            tree->inplace_mutations++;
+            return node_ref;
+        }
+        case DATA_NODE_256: {
+            const data_art_node256_t *n256 = (const data_art_node256_t *)node;
+            if (n256->child_page_ids[byte] != 0) {
+                LOG_ERROR("BUG: duplicate child byte=0x%02x in NODE_256 inplace", byte);
+                return NULL_NODE_REF;
+            }
+            void *mut = data_art_lock_node_mut(tree, node_ref);
+            data_art_node256_t *m = (data_art_node256_t *)mut;
+            m->child_page_ids[byte] = child_ref.page_id;
+            m->child_offsets[byte] = child_ref.offset;
+            m->num_children++;
+            data_art_unlock_node_mut(tree);
+            tree->inplace_mutations++;
+            return node_ref;
+        }
+        default:
+            LOG_ERROR("Invalid node type for add_child_inplace: %d", type);
             return NULL_NODE_REF;
     }
 }

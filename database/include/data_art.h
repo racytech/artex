@@ -303,7 +303,7 @@ typedef struct data_art_tree {
     struct txn_buffer *txn_buffer; // Buffer for pending operations (NULL if not in transaction)
     
     // Concurrency control
-    pthread_mutex_t write_lock;  // Serializes all write operations (one writer at a time)
+    pthread_rwlock_t write_lock;  // Writers: wrlock. Readers: rdlock (coordinates with in-place mutation).
 
     // Lock-free read support: readers load committed root atomically, no lock needed
     _Atomic uint64_t committed_root_page_id;
@@ -346,6 +346,7 @@ typedef struct data_art_tree {
     uint64_t slot_hint_misses;                       // Hint page full or wrong class
     uint64_t dedicated_pages_created;                // Fallback dedicated page allocs
     uint64_t pages_reused;                           // Pages recycled from reuse pool
+    uint64_t inplace_mutations;                      // In-place mutations (skipped CoW)
 } data_art_tree_t;
 
 // ============================================================================

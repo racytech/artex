@@ -19,6 +19,8 @@
 // Forward declarations from data_art_core.c
 extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
 extern void data_art_reset_arena(void);
+extern void data_art_rdlock(data_art_tree_t *tree);
+extern void data_art_rdunlock(data_art_tree_t *tree);
 
 // Forward declaration from data_art_overflow.c
 extern bool data_art_read_overflow_value(data_art_tree_t *tree,
@@ -191,7 +193,12 @@ data_art_iterator_t *data_art_iterator_create(data_art_tree_t *tree) {
 bool data_art_iterator_next(data_art_iterator_t *iter) {
     if (!iter || iter->done) return false;
 
-    // Reset TLS arena for this traversal step
+    // Hold write_lock rdlock to coordinate with in-place mutation writers,
+    // and resize_lock rdlock for zero-copy mmap reads.
+    pthread_rwlock_rdlock(&iter->tree->write_lock);
+    data_art_rdlock(iter->tree);
+
+    // Reset TLS arena (harmless when using zero-copy, needed for overflow fallback)
     data_art_reset_arena();
 
     // First call: push root onto stack
@@ -201,6 +208,8 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
         iter->stack[0].node_ref = iter->root;
         iter->stack[0].child_idx = 0;
     }
+
+    bool result = false;
 
     // DFS traversal to find next leaf
     while (iter->depth >= 0) {
@@ -212,7 +221,7 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
             LOG_ERROR("Iterator: failed to load node at page=%lu offset=%u",
                       frame->node_ref.page_id, frame->node_ref.offset);
             iter->done = true;
-            return false;
+            goto out;
         }
 
         uint8_t type = *(const uint8_t *)node;
@@ -229,7 +238,7 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
 
             if (!copy_leaf_data(iter, leaf)) {
                 iter->done = true;
-                return false;
+                goto out;
             }
 
             // Prefix check: stop if key no longer matches prefix
@@ -242,13 +251,14 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
                     iter->current_key = NULL;
                     iter->current_value = NULL;
                     iter->depth--;
-                    return false;
+                    goto out;
                 }
             }
 
             // Pop leaf from stack so next call continues with parent
             iter->depth--;
-            return true;
+            result = true;
+            goto out;
         }
 
         // Inner node: get next child (get_next_child_ref advances child_idx)
@@ -260,7 +270,7 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
             if (iter->depth >= ITER_MAX_DEPTH) {
                 LOG_ERROR("Iterator: stack overflow (depth >= %d)", ITER_MAX_DEPTH);
                 iter->done = true;
-                return false;
+                goto out;
             }
             iter->stack[iter->depth].node_ref = child_ref;
             iter->stack[iter->depth].child_idx = 0;
@@ -272,7 +282,11 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
 
     // Traversal complete
     iter->done = true;
-    return false;
+
+out:
+    data_art_rdunlock(iter->tree);
+    pthread_rwlock_unlock(&iter->tree->write_lock);
+    return result;
 }
 
 const uint8_t *data_art_iterator_key(const data_art_iterator_t *iter, size_t *key_len) {
@@ -439,12 +453,18 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
 
     size_t key_depth = 0;  // bytes of seek key consumed
 
+    // Hold write_lock rdlock + resize_lock for the descent phase
+    pthread_rwlock_rdlock(&iter->tree->write_lock);
+    data_art_rdlock(iter->tree);
+
     // Targeted descent: set up stack so next() finds first leaf >= key
     while (iter->depth >= 0) {
         iter_stack_frame_t *frame = &iter->stack[iter->depth];
         const void *node = data_art_load_node(iter->tree, frame->node_ref);
         if (!node) {
             iter->done = true;
+            data_art_rdunlock(iter->tree);
+            pthread_rwlock_unlock(&iter->tree->write_lock);
             return false;
         }
 
@@ -483,21 +503,16 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
 
         for (uint8_t i = 0; i < plen; i++) {
             if (key_depth >= key_len) {
-                // Seek key exhausted during prefix — everything in this
-                // subtree has a longer key, so it's all >= seek key.
-                // Set child_idx = 0 to let next() find leftmost leaf.
                 frame->child_idx = 0;
                 prefix_mismatch = true;
                 break;
             }
             if (key[key_depth] < partial[i]) {
-                // Seek key < node prefix: subtree is entirely >= seek key
                 frame->child_idx = 0;
                 prefix_mismatch = true;
                 break;
             }
             if (key[key_depth] > partial[i]) {
-                // Seek key > node prefix: subtree is entirely < seek key
                 iter->depth--;
                 prefix_mismatch = true;
                 break;
@@ -510,7 +525,6 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
 
         // Prefix matched fully. Find child for next key byte.
         if (key_depth >= key_len) {
-            // Seek key exhausted after prefix match: leftmost leaf is target
             frame->child_idx = 0;
             break;
         }
@@ -523,27 +537,26 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
                                          &frame->child_idx, &exact_child);
 
         if (node_ref_is_null(child)) {
-            // No child >= byte: pop, let parent advance
             iter->depth--;
             break;
         }
 
         if (exact_child) {
-            // Exact match: push child and continue descent
             iter->depth++;
             if (iter->depth >= ITER_MAX_DEPTH) {
                 iter->done = true;
+                data_art_rdunlock(iter->tree);
+                pthread_rwlock_unlock(&iter->tree->write_lock);
                 return false;
             }
             iter->stack[iter->depth].node_ref = child;
             iter->stack[iter->depth].child_idx = 0;
-            // Continue descent loop
         } else {
-            // Ceiling child (first child > byte): push it and stop descent.
-            // next() will find leftmost leaf in this ceiling subtree.
             iter->depth++;
             if (iter->depth >= ITER_MAX_DEPTH) {
                 iter->done = true;
+                data_art_rdunlock(iter->tree);
+                pthread_rwlock_unlock(&iter->tree->write_lock);
                 return false;
             }
             iter->stack[iter->depth].node_ref = child;
@@ -551,6 +564,10 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
             break;
         }
     }
+
+    // Release locks before calling next() which acquires its own
+    data_art_rdunlock(iter->tree);
+    pthread_rwlock_unlock(&iter->tree->write_lock);
 
     // Now advance to the first leaf >= target
     return data_art_iterator_next(iter);

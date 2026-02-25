@@ -11,6 +11,7 @@
  */
 
 #include "data_art.h"
+#include "mvcc.h"
 #include "txn_buffer.h"
 #include "db_error.h"
 #include "logger.h"
@@ -37,6 +38,19 @@ extern uint64_t data_art_write_overflow_value(data_art_tree_t *tree, const void 
 // Forward declarations (from data_art_node_ops.c)
 extern node_ref_t data_art_add_child(data_art_tree_t *tree, node_ref_t node_ref,
                                       uint8_t byte, node_ref_t child_ref);
+extern node_ref_t data_art_add_child_inplace(data_art_tree_t *tree, node_ref_t node_ref,
+                                              uint8_t byte, node_ref_t child_ref);
+
+// Forward declarations (from data_art_core.c) — in-place mutation & partial write helpers
+extern void *data_art_lock_node_mut(data_art_tree_t *tree, node_ref_t ref);
+extern void data_art_unlock_node_mut(data_art_tree_t *tree);
+extern bool data_art_write_partial(data_art_tree_t *tree, node_ref_t ref,
+                                    size_t node_offset, const void *data, size_t len);
+extern bool data_art_copy_node(data_art_tree_t *tree, node_ref_t dst, node_ref_t src, size_t size);
+
+// Thread-local flag: skip MVCC version chain machinery when no snapshots active.
+// Set by data_art_insert() / data_art_delete() before calling recursive functions.
+static __thread bool tls_skip_mvcc = false;
 
 // ============================================================================
 // Helper Functions
@@ -314,11 +328,76 @@ static node_ref_t alloc_leaf(data_art_tree_t *tree, const uint8_t *key, size_t k
  */
 static node_ref_t replace_child_in_node(data_art_tree_t *tree, node_ref_t node_ref,
                                          uint8_t byte, node_ref_t old_child_ref,
-                                         node_ref_t new_child_ref) {
+                                         node_ref_t new_child_ref, bool inplace) {
     if (node_ref_is_null(node_ref) || node_ref_equals(old_child_ref, new_child_ref)) {
         return node_ref;  // Nothing to do
     }
 
+    if (inplace) {
+        // In-place mutation: write only the child ref directly in mmap.
+        // Returns same node_ref — no CoW propagation upward.
+        void *mut = data_art_lock_node_mut(tree, node_ref);
+        uint8_t type = *(uint8_t *)mut;
+        bool found = false;
+
+        switch (type) {
+            case DATA_NODE_4: {
+                data_art_node4_t *m = (data_art_node4_t *)mut;
+                for (int i = 0; i < m->num_children; i++) {
+                    if (m->keys[i] == byte) {
+                        m->child_page_ids[i] = new_child_ref.page_id;
+                        m->child_offsets[i] = new_child_ref.offset;
+                        found = true;
+                        break;
+                    }
+                }
+                break;
+            }
+            case DATA_NODE_16: {
+                data_art_node16_t *m = (data_art_node16_t *)mut;
+                for (int i = 0; i < m->num_children; i++) {
+                    if (m->keys[i] == byte) {
+                        m->child_page_ids[i] = new_child_ref.page_id;
+                        m->child_offsets[i] = new_child_ref.offset;
+                        found = true;
+                        break;
+                    }
+                }
+                break;
+            }
+            case DATA_NODE_48: {
+                data_art_node48_t *m = (data_art_node48_t *)mut;
+                uint8_t idx = m->keys[byte];
+                if (idx != 255) {
+                    m->child_page_ids[idx] = new_child_ref.page_id;
+                    m->child_offsets[idx] = new_child_ref.offset;
+                    found = true;
+                }
+                break;
+            }
+            case DATA_NODE_256: {
+                data_art_node256_t *m = (data_art_node256_t *)mut;
+                if (m->child_page_ids[byte] != 0) {
+                    m->child_page_ids[byte] = new_child_ref.page_id;
+                    m->child_offsets[byte] = new_child_ref.offset;
+                    found = true;
+                }
+                break;
+            }
+        }
+        data_art_unlock_node_mut(tree);
+
+        if (!found) {
+            LOG_ERROR("[REPLACE_CHILD] inplace: byte=0x%02x not found in type=%u page=%lu",
+                     byte, type, node_ref.page_id);
+            return NULL_NODE_REF;
+        }
+        tree->inplace_mutations++;
+        return node_ref;  // Same ref — no propagation
+    }
+
+    // Optimized CoW path: alloc new slot, mmap-to-mmap copy, patch changed bytes.
+    // No malloc/free needed.
     const void *node = data_art_load_node(tree, node_ref);
     if (!node) {
         return NULL_NODE_REF;
@@ -327,23 +406,17 @@ static node_ref_t replace_child_in_node(data_art_tree_t *tree, node_ref_t node_r
     uint8_t type = *(const uint8_t *)node;
     size_t node_size = get_node_size(type);
 
-    // Create a copy of the node to modify
-    void *modified_node = malloc(node_size);
-    if (!modified_node) {
-        LOG_ERROR("Failed to allocate memory for node modification");
-        return NULL_NODE_REF;
-    }
-    memcpy(modified_node, node, node_size);
-
-    // Update the child reference based on node type
+    // Find the child index and compute byte offsets for the patch
+    size_t pid_off = 0, off_off = 0;
     bool found = false;
+
     switch (type) {
         case DATA_NODE_4: {
-            data_art_node4_t *n = (data_art_node4_t *)modified_node;
+            const data_art_node4_t *n = (const data_art_node4_t *)node;
             for (int i = 0; i < n->num_children; i++) {
                 if (n->keys[i] == byte) {
-                    n->child_page_ids[i] = new_child_ref.page_id;
-                    n->child_offsets[i] = new_child_ref.offset;
+                    pid_off = offsetof(data_art_node4_t, child_page_ids) + i * sizeof(uint64_t);
+                    off_off = offsetof(data_art_node4_t, child_offsets) + i * sizeof(uint32_t);
                     found = true;
                     break;
                 }
@@ -351,11 +424,11 @@ static node_ref_t replace_child_in_node(data_art_tree_t *tree, node_ref_t node_r
             break;
         }
         case DATA_NODE_16: {
-            data_art_node16_t *n = (data_art_node16_t *)modified_node;
+            const data_art_node16_t *n = (const data_art_node16_t *)node;
             for (int i = 0; i < n->num_children; i++) {
                 if (n->keys[i] == byte) {
-                    n->child_page_ids[i] = new_child_ref.page_id;
-                    n->child_offsets[i] = new_child_ref.offset;
+                    pid_off = offsetof(data_art_node16_t, child_page_ids) + i * sizeof(uint64_t);
+                    off_off = offsetof(data_art_node16_t, child_offsets) + i * sizeof(uint32_t);
                     found = true;
                     break;
                 }
@@ -363,26 +436,25 @@ static node_ref_t replace_child_in_node(data_art_tree_t *tree, node_ref_t node_r
             break;
         }
         case DATA_NODE_48: {
-            data_art_node48_t *n = (data_art_node48_t *)modified_node;
+            const data_art_node48_t *n = (const data_art_node48_t *)node;
             uint8_t idx = n->keys[byte];
             if (idx != 255) {
-                n->child_page_ids[idx] = new_child_ref.page_id;
-                n->child_offsets[idx] = new_child_ref.offset;
+                pid_off = offsetof(data_art_node48_t, child_page_ids) + idx * sizeof(uint64_t);
+                off_off = offsetof(data_art_node48_t, child_offsets) + idx * sizeof(uint32_t);
                 found = true;
             }
             break;
         }
         case DATA_NODE_256: {
-            data_art_node256_t *n = (data_art_node256_t *)modified_node;
+            const data_art_node256_t *n = (const data_art_node256_t *)node;
             if (n->child_page_ids[byte] != 0) {
-                n->child_page_ids[byte] = new_child_ref.page_id;
-                n->child_offsets[byte] = new_child_ref.offset;
+                pid_off = offsetof(data_art_node256_t, child_page_ids) + byte * sizeof(uint64_t);
+                off_off = offsetof(data_art_node256_t, child_offsets) + byte * sizeof(uint32_t);
                 found = true;
             }
             break;
         }
         default:
-            free(modified_node);
             LOG_ERROR("Invalid node type for child replacement: %d", type);
             return NULL_NODE_REF;
     }
@@ -390,25 +462,19 @@ static node_ref_t replace_child_in_node(data_art_tree_t *tree, node_ref_t node_r
     if (!found) {
         LOG_ERROR("[REPLACE_CHILD] FAILED: Child byte=0x%02x not found in node type=%u at page=%lu",
                  byte, type, node_ref.page_id);
-        free(modified_node);
         return NULL_NODE_REF;
     }
 
-    // CoW: allocate new page (hint = old page for same-page COW), write there, release old
+    // Allocate new slot, copy old node, patch the 12 changed bytes
     node_ref_t new_ref = data_art_alloc_node_hint(tree, node_size, node_ref.page_id);
     if (node_ref_is_null(new_ref)) {
         LOG_ERROR("[REPLACE_CHILD] FAILED: Could not allocate new page for CoW");
-        free(modified_node);
         return NULL_NODE_REF;
     }
 
-    bool success = data_art_write_node(tree, new_ref, modified_node, node_size);
-    free(modified_node);
-
-    if (!success) {
-        LOG_ERROR("[REPLACE_CHILD] FAILED: data_art_write_node failed for page=%lu", new_ref.page_id);
-        return NULL_NODE_REF;
-    }
+    data_art_copy_node(tree, new_ref, node_ref, node_size);
+    data_art_write_partial(tree, new_ref, pid_off, &new_child_ref.page_id, sizeof(uint64_t));
+    data_art_write_partial(tree, new_ref, off_off, &new_child_ref.offset, sizeof(uint32_t));
 
     data_art_release_page(tree, node_ref);
 
@@ -423,12 +489,14 @@ static node_ref_t replace_child_in_node(data_art_tree_t *tree, node_ref_t node_r
  * Returns new node reference (may be different if node grew)
  */
 static node_ref_t add_child_to_node(data_art_tree_t *tree, node_ref_t node_ref,
-                                     uint8_t byte, node_ref_t child_ref) {
+                                     uint8_t byte, node_ref_t child_ref, bool inplace) {
     if (node_ref_is_null(node_ref) || node_ref_is_null(child_ref)) {
         return node_ref;
     }
-    
-    // Use the implementation from data_art_node_ops.c
+
+    if (inplace) {
+        return data_art_add_child_inplace(tree, node_ref, byte, child_ref);
+    }
     return data_art_add_child(tree, node_ref, byte, child_ref);
 }
 
@@ -442,7 +510,7 @@ static node_ref_t add_child_to_node(data_art_tree_t *tree, node_ref_t node_ref,
 static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                                     const uint8_t *key, size_t key_len, size_t depth,
                                     const void *value, size_t value_len,
-                                    bool *inserted) {
+                                    bool *inserted, bool inplace) {
     // Debug: Print key being inserted
     if (depth == 0) {
         char key_str[256];
@@ -490,14 +558,23 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                 LOG_ERROR("Failed to allocate new leaf version");
                 return node_ref;
             }
-            
-            // Link new version to old version (version chain)
+
+            if (tls_skip_mvcc) {
+                // Fast path: no snapshots active, skip version chain & xmax marking.
+                // Release old leaf immediately since no snapshot can reference it.
+                data_art_release_page(tree, old_leaf_ref);
+                LOG_DEBUG("[UPDATE_LEAF] skip_mvcc: replaced leaf page=%lu -> page=%lu",
+                         old_leaf_ref.page_id, new_leaf_ref.page_id);
+                return new_leaf_ref;
+            }
+
+            // Full MVCC path: link new version to old version (version chain)
             data_art_leaf_t *new_leaf = (data_art_leaf_t *)data_art_load_node(tree, new_leaf_ref);
             if (!new_leaf) {
                 LOG_ERROR("Failed to load newly created leaf");
                 return node_ref;
             }
-            
+
             // Create a modifiable copy
             size_t new_leaf_size = sizeof(data_art_leaf_t) + new_leaf->inline_data_len;
             data_art_leaf_t *new_leaf_copy = malloc(new_leaf_size);
@@ -506,10 +583,10 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                 return node_ref;
             }
             memcpy(new_leaf_copy, new_leaf, new_leaf_size);
-            
+
             // Set version chain link
             new_leaf_copy->prev_version = old_leaf_ref;
-            
+
             // Write back the modified new leaf
             if (!data_art_write_node(tree, new_leaf_ref, new_leaf_copy, new_leaf_size)) {
                 LOG_ERROR("Failed to write version chain link");
@@ -517,10 +594,9 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                 return node_ref;
             }
             free(new_leaf_copy);
-            
+
             // Mark old version as superseded (set xmax) for MVCC version chains
             if (tree->mvcc_manager) {
-                // Logical update: mark old version as superseded
                 size_t old_leaf_size = sizeof(data_art_leaf_t) + leaf->inline_data_len;
                 data_art_leaf_t *old_leaf_copy = malloc(old_leaf_size);
                 if (old_leaf_copy) {
@@ -532,16 +608,13 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                              old_leaf_ref.page_id, tree->current_txn_id);
                 }
             } else {
-                // Physical update: free old leaf page (but keep it accessible via prev_version)
-                // NOTE: We don't free overflow pages here because old versions might still need them
-                // Garbage collection will handle this later
                 LOG_DEBUG("[UPDATE_LEAF] Physical update: old version (page=%lu) kept for version chain",
                          old_leaf_ref.page_id);
             }
-            
+
             LOG_DEBUG("[UPDATE_LEAF] Created new version at page=%lu (new value_len=%zu) -> prev_version=page=%lu",
                      new_leaf_ref.page_id, value_len, old_leaf_ref.page_id);
-            
+
             return new_leaf_ref;
         }
         
@@ -619,14 +692,14 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             return node_ref;
         }
         
-        // Add both leaves as children to the new node
-        new_node_ref = add_child_to_node(tree, new_node_ref, existing_byte, node_ref);
+        // Add both leaves as children to the new node (always CoW — fresh node)
+        new_node_ref = add_child_to_node(tree, new_node_ref, existing_byte, node_ref, false);
         if (node_ref_is_null(new_node_ref)) {
             LOG_ERROR("Failed to add existing leaf to new node");
             return node_ref;
         }
-        
-        new_node_ref = add_child_to_node(tree, new_node_ref, new_byte, new_leaf_ref);
+
+        new_node_ref = add_child_to_node(tree, new_node_ref, new_byte, new_leaf_ref, false);
         if (node_ref_is_null(new_node_ref)) {
             LOG_ERROR("Failed to add new leaf to new node");
             return node_ref;
@@ -794,8 +867,8 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             LOG_INFO("  Adding modified_node (page=%lu) as child with key=0x%02x to new_parent (page=%lu)", 
                      modified_node_ref.page_id, old_byte, new_parent_ref.page_id);
             
-            // Add modified old node as child
-            new_parent_ref = add_child_to_node(tree, new_parent_ref, old_byte, modified_node_ref);
+            // Add modified old node as child (always CoW — fresh parent node)
+            new_parent_ref = add_child_to_node(tree, new_parent_ref, old_byte, modified_node_ref, false);
             if (node_ref_is_null(new_parent_ref)) {
                 LOG_ERROR("Failed to add modified node to new parent");
                 return node_ref;
@@ -814,7 +887,7 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             LOG_INFO("  Creating new_leaf for key 149, will add as child with key=0x%02x ('%c')", 
                      new_byte, new_byte >= 32 && new_byte < 127 ? new_byte : '?');
             
-            new_parent_ref = add_child_to_node(tree, new_parent_ref, new_byte, new_leaf_ref);
+            new_parent_ref = add_child_to_node(tree, new_parent_ref, new_byte, new_leaf_ref, false);
             if (node_ref_is_null(new_parent_ref)) {
                 LOG_ERROR("Failed to add new leaf to new parent");
                 return new_parent_ref;
@@ -840,18 +913,20 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                  depth, child_ref.page_id, child_ref.offset);
         // Child exists - recurse
         node_ref_t new_child_ref = insert_recursive(tree, child_ref, key, key_len,
-                                                     depth + 1, value, value_len, inserted);
-        
-        // If child changed (due to split or growth), update parent's reference via CoW
+                                                     depth + 1, value, value_len,
+                                                     inserted, inplace);
+
+        // If child changed (due to split or growth), update parent's reference
         if (!node_ref_equals(new_child_ref, child_ref)) {
             LOG_DEBUG("  [UPDATE_PARENT] depth=%zu: child changed from page=%lu to page=%lu, updating parent at page=%lu",
                      depth, child_ref.page_id, new_child_ref.page_id, node_ref.page_id);
-            node_ref_t new_node_ref = replace_child_in_node(tree, node_ref, byte, child_ref, new_child_ref);
+            node_ref_t new_node_ref = replace_child_in_node(tree, node_ref, byte,
+                                                             child_ref, new_child_ref, inplace);
             if (node_ref_is_null(new_node_ref)) {
                 LOG_ERROR("  [UPDATE_PARENT] FAILED to update child reference in parent");
                 return node_ref;
             }
-            return new_node_ref;  // Propagate CoW upward
+            return new_node_ref;  // With inplace: same ref, no further propagation
         }
 
         return node_ref;
@@ -862,9 +937,8 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         node_ref_t leaf_ref = alloc_leaf(tree, key, key_len, value, value_len);
         if (!node_ref_is_null(leaf_ref)) {
             LOG_INFO("  depth=%zu: adding leaf at page=%u as child", depth, leaf_ref.page_id);
-            // Add leaf as child
-            node_ref_t new_node_ref = add_child_to_node(tree, node_ref, byte, leaf_ref);
-            LOG_INFO("  depth=%zu: after adding child, node ref: page=%u offset=%u", 
+            node_ref_t new_node_ref = add_child_to_node(tree, node_ref, byte, leaf_ref, inplace);
+            LOG_INFO("  depth=%zu: after adding child, node ref: page=%u offset=%u",
                      depth, new_node_ref.page_id, new_node_ref.offset);
             return new_node_ref;
         }
@@ -903,24 +977,38 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
     data_art_reset_arena();
 
     // Acquire write lock to serialize all write operations (one writer at a time)
-    pthread_mutex_lock(&tree->write_lock);
+    pthread_rwlock_wrlock(&tree->write_lock);
 
-    // Allocate unique transaction ID for auto-commit (even outside explicit transactions)
-    // This ensures every version has a unique xmin for MVCC visibility
+    // Auto-commit MVCC transaction setup
     uint64_t auto_txn_id = 0;
     bool auto_commit = (tree->current_txn_id == 0);
-    if (auto_commit && tree->mvcc_manager) {
-        if (!mvcc_begin_txn(tree->mvcc_manager, &auto_txn_id)) {
-            pthread_mutex_unlock(&tree->write_lock);
-            DB_ERROR(DB_ERROR_OUT_OF_MEMORY, "failed to begin auto-commit txn");
-            return false;
+    bool skip_mvcc = false;
+
+    if (auto_commit) {
+        if (tree->mvcc_manager &&
+            mvcc_has_active_snapshots(tree->mvcc_manager)) {
+            // Snapshots active: full MVCC required for visibility correctness
+            if (!mvcc_begin_txn(tree->mvcc_manager, &auto_txn_id)) {
+                pthread_rwlock_unlock(&tree->write_lock);
+                DB_ERROR(DB_ERROR_OUT_OF_MEMORY, "failed to begin auto-commit txn");
+                return false;
+            }
+            tree->current_txn_id = auto_txn_id;
+        } else {
+            // No snapshots (or no MVCC manager): skip full MVCC machinery,
+            // use monotonic version counter as xmin for the leaf.
+            skip_mvcc = true;
+            tree->version++;
+            tree->current_txn_id = tree->version;
         }
-        tree->current_txn_id = auto_txn_id;
     }
+
+    tls_skip_mvcc = skip_mvcc;
+    bool inplace = skip_mvcc;  // In-place mutation when no snapshots active
 
     bool inserted = false;
     node_ref_t new_root = insert_recursive(tree, tree->root, key, key_len, 0,
-                                            value, value_len, &inserted);
+                                            value, value_len, &inserted, inplace);
 
     if (!node_ref_is_null(new_root)) {
         tree->root = new_root;
@@ -929,26 +1017,26 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
             tree->size++;
         }
 
-        // Auto-commit the transaction if we started one
-        if (auto_commit && tree->mvcc_manager) {
+        // Commit MVCC transaction if we used the full machinery
+        if (auto_commit && !skip_mvcc && tree->mvcc_manager) {
             mvcc_commit_txn(tree->mvcc_manager, auto_txn_id);
-            tree->current_txn_id = 0;
         }
+        tree->current_txn_id = 0;
 
-        // Publish new root for lock-free readers
+        // Publish new root for readers
         data_art_publish_root(tree);
 
-        pthread_mutex_unlock(&tree->write_lock);
+        pthread_rwlock_unlock(&tree->write_lock);
         return true;
     }
 
     // Failed to insert - abort auto-commit transaction if we started one
-    if (auto_commit && tree->mvcc_manager) {
+    if (auto_commit && !skip_mvcc && tree->mvcc_manager) {
         mvcc_abort_txn(tree->mvcc_manager, auto_txn_id);
-        tree->current_txn_id = 0;
     }
+    tree->current_txn_id = 0;
 
-    pthread_mutex_unlock(&tree->write_lock);
+    pthread_rwlock_unlock(&tree->write_lock);
     if (db_get_last_error() == DB_OK) {
         DB_ERROR(DB_ERROR_IO, "recursive insert failed");
     }
@@ -971,9 +1059,11 @@ bool data_art_insert_internal(data_art_tree_t *tree, const uint8_t *key, size_t 
 
     data_art_reset_arena();
 
+    // Internal path is called from commit_txn under write_lock.
+    // Snapshots may be active during explicit transactions, so use CoW (no inplace).
     bool inserted = false;
     node_ref_t new_root = insert_recursive(tree, tree->root, key, key_len, 0,
-                                            value, value_len, &inserted);
+                                            value, value_len, &inserted, false);
     if (node_ref_is_null(new_root)) return false;
 
     tree->root = new_root;

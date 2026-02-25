@@ -23,6 +23,7 @@
  */
 
 #include "data_art.h"
+#include "mvcc.h"
 #include "txn_buffer.h"
 #include "db_error.h"
 #include "logger.h"
@@ -83,19 +84,29 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
     data_art_reset_arena();
 
     // Acquire write lock to serialize all write operations (one writer at a time)
-    pthread_mutex_lock(&tree->write_lock);
+    pthread_rwlock_wrlock(&tree->write_lock);
 
-    // Allocate unique transaction ID for auto-commit (even outside explicit transactions)
-    // This ensures every version has a unique xmax for MVCC visibility
+    // Auto-commit MVCC transaction setup
     uint64_t auto_txn_id = 0;
     bool auto_commit = (tree->current_txn_id == 0);
-    if (auto_commit && tree->mvcc_manager) {
-        if (!mvcc_begin_txn(tree->mvcc_manager, &auto_txn_id)) {
-            pthread_mutex_unlock(&tree->write_lock);
-            DB_ERROR(DB_ERROR_OUT_OF_MEMORY, "failed to begin auto-commit txn");
-            return false;
+    bool skip_mvcc = false;
+
+    if (auto_commit) {
+        if (tree->mvcc_manager &&
+            mvcc_has_active_snapshots(tree->mvcc_manager)) {
+            // Snapshots active: full MVCC required
+            if (!mvcc_begin_txn(tree->mvcc_manager, &auto_txn_id)) {
+                pthread_rwlock_unlock(&tree->write_lock);
+                DB_ERROR(DB_ERROR_OUT_OF_MEMORY, "failed to begin auto-commit txn");
+                return false;
+            }
+            tree->current_txn_id = auto_txn_id;
+        } else {
+            // No snapshots: skip full MVCC machinery
+            skip_mvcc = true;
+            tree->version++;
+            tree->current_txn_id = tree->version;
         }
-        tree->current_txn_id = auto_txn_id;
     }
 
     bool deleted = false;
@@ -105,24 +116,20 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
         tree->root = new_root;
         tree->size--;
 
-        // Auto-commit the transaction if we started one
-        if (auto_commit && tree->mvcc_manager) {
+        if (auto_commit && !skip_mvcc && tree->mvcc_manager) {
             mvcc_commit_txn(tree->mvcc_manager, auto_txn_id);
-            tree->current_txn_id = 0;
         }
 
-        // Publish new root for lock-free readers
         data_art_publish_root(tree);
     } else {
-        // Key not found - abort auto-commit transaction if we started one
-        if (auto_commit && tree->mvcc_manager) {
+        if (auto_commit && !skip_mvcc && tree->mvcc_manager) {
             mvcc_abort_txn(tree->mvcc_manager, auto_txn_id);
-            tree->current_txn_id = 0;
         }
         DB_ERROR(DB_ERROR_NOT_FOUND, "key not found");
     }
+    tree->current_txn_id = 0;
 
-    pthread_mutex_unlock(&tree->write_lock);
+    pthread_rwlock_unlock(&tree->write_lock);
     return deleted;
 }
 
