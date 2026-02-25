@@ -294,6 +294,22 @@ uint64_t mmap_storage_alloc_page(mmap_storage_t *ms) {
     return page_id;
 }
 
+void mmap_storage_ensure_capacity(mmap_storage_t *ms, uint64_t total_pages) {
+    if (!ms) return;
+
+    size_t required = total_pages * PAGE_SIZE;
+    if (required <= ms->mapped_size) return;
+
+    size_t new_size = ms->mapped_size;
+    while (new_size < required) new_size *= 2;
+
+    pthread_rwlock_wrlock(&ms->resize_lock);
+    if (new_size > ms->mapped_size) {
+        mmap_storage_grow(ms, new_size);
+    }
+    pthread_rwlock_unlock(&ms->resize_lock);
+}
+
 /* ========================================================================== */
 /* Persistence                                                                 */
 /* ========================================================================== */

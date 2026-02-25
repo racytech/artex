@@ -119,6 +119,12 @@ static inline page_t *mmap_storage_get_page(mmap_storage_t *ms, uint64_t page_id
  */
 uint64_t mmap_storage_alloc_page(mmap_storage_t *ms);
 
+/**
+ * Pre-grow the mapped region to hold at least total_pages pages.
+ * Prevents resize_lock wrlock contention during bulk operations.
+ */
+void mmap_storage_ensure_capacity(mmap_storage_t *ms, uint64_t total_pages);
+
 /* ========================================================================== */
 /* Persistence                                                                 */
 /* ========================================================================== */

@@ -899,10 +899,11 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
         return false;
     }
 
-    pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
+    bool need_lock = !tls_rdlock_held;
+    if (need_lock) pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
     page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
     memcpy(page->data + node_ref_offset(ref), node, size);
-    pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+    if (need_lock) pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
     return true;
 }
 
@@ -911,32 +912,34 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
 // ============================================================================
 
 void *data_art_lock_node_mut(data_art_tree_t *tree, node_ref_t ref) {
-    pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
+    if (!tls_rdlock_held) pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
     page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
     return page->data + node_ref_offset(ref);
 }
 
 void data_art_unlock_node_mut(data_art_tree_t *tree) {
-    pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+    if (!tls_rdlock_held) pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
 }
 
 bool data_art_write_partial(data_art_tree_t *tree, node_ref_t ref,
                             size_t node_offset, const void *data, size_t len) {
     if (!tree || !data || node_ref_is_null(ref)) return false;
-    pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
+    bool need_lock = !tls_rdlock_held;
+    if (need_lock) pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
     page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
     memcpy(page->data + node_ref_offset(ref) + node_offset, data, len);
-    pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+    if (need_lock) pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
     return true;
 }
 
 bool data_art_copy_node(data_art_tree_t *tree, node_ref_t dst, node_ref_t src, size_t size) {
     if (!tree || node_ref_is_null(dst) || node_ref_is_null(src)) return false;
-    pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
+    bool need_lock = !tls_rdlock_held;
+    if (need_lock) pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
     page_t *src_page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(src));
     page_t *dst_page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(dst));
     memcpy(dst_page->data + node_ref_offset(dst), src_page->data + node_ref_offset(src), size);
-    pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+    if (need_lock) pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
     return true;
 }
 
@@ -1038,6 +1041,13 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
     // Use in-place mutations when no snapshots need to see old tree versions
     bool inplace = !mvcc_has_active_snapshots(tree->mvcc_manager);
 
+    // Pre-grow mmap so no resize is needed during commit, then hold
+    // resize_lock for the entire loop — enables zero-copy reads and
+    // eliminates per-operation lock acquire/release overhead.
+    mmap_storage_ensure_capacity(tree->mmap_storage,
+                                 tree->mmap_storage->next_page_id + num_ops);
+    data_art_rdlock(tree);
+
     // Save rollback point in case any operation fails
     node_ref_t saved_root = tree->root;
     size_t saved_size = tree->size;
@@ -1063,6 +1073,7 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
             // Rollback: restore root and size
             tree->root = saved_root;
             tree->size = saved_size;
+            data_art_rdunlock(tree);
             pthread_rwlock_unlock(&tree->write_lock);
 
             DB_ERROR(DB_ERROR_IO, "failed to apply operation %zu", i);
@@ -1074,6 +1085,9 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
             return false;
         }
     }
+
+    // Release resize_lock before MVCC commit (no more node access needed)
+    data_art_rdunlock(tree);
 
     // Commit MVCC transaction
     if (!mvcc_commit_txn(tree->mvcc_manager, txn_id)) {

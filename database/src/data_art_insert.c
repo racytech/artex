@@ -50,6 +50,11 @@ extern bool data_art_copy_node(data_art_tree_t *tree, node_ref_t dst, node_ref_t
 // Set by data_art_insert() / data_art_delete() before calling recursive functions.
 static __thread bool tls_skip_mvcc = false;
 
+// Thread-local staging buffer for leaf construction (avoids malloc/free per insert).
+// Max leaf size = PAGE_SIZE - PAGE_HEADER_SIZE (overflow fills entire page).
+static __thread uint8_t tls_leaf_buf[PAGE_SIZE - PAGE_HEADER_SIZE]
+    __attribute__((aligned(8)));
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -135,12 +140,8 @@ static node_ref_t alloc_leaf(data_art_tree_t *tree, const uint8_t *key, size_t k
         return NULL_NODE_REF;
     }
 
-    // Create leaf structure
-    data_art_leaf_t *leaf = malloc(leaf_size);
-    if (!leaf) {
-        LOG_ERROR("Failed to allocate temporary leaf");
-        return NULL_NODE_REF;
-    }
+    // Use thread-local staging buffer (avoids malloc/free per insert)
+    data_art_leaf_t *leaf = (data_art_leaf_t *)tls_leaf_buf;
     memset(leaf, 0, leaf_size);
 
     leaf->type = DATA_NODE_LEAF;
@@ -168,7 +169,6 @@ static node_ref_t alloc_leaf(data_art_tree_t *tree, const uint8_t *key, size_t k
                                                               inline_value_size);
         if (overflow_pg == 0) {
             LOG_ERROR("Failed to write overflow value");
-            free(leaf);
             return NULL_NODE_REF;
         }
         memcpy(leaf->data, &overflow_pg, sizeof(overflow_pg));
@@ -186,11 +186,9 @@ static node_ref_t alloc_leaf(data_art_tree_t *tree, const uint8_t *key, size_t k
               node_ref_page_id(leaf_ref), node_ref_offset(leaf_ref), leaf->type, leaf->flags, leaf->value_len);
     if (!data_art_write_node(tree, leaf_ref, leaf, leaf_size)) {
         LOG_ERROR("Failed to write leaf node");
-        free(leaf);
         return NULL_NODE_REF;
     }
 
-    free(leaf);
     return leaf_ref;
 }
 
