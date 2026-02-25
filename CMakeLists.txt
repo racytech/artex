@@ -126,6 +126,7 @@ add_library(art_persistent STATIC
     database/src/checkpoint_manager.c
     database/src/data_art_iterator.c
     database/src/data_art_batch.c
+    database/src/db_backup.c
     database/src/db_error.c
     database/src/logger.c
 )
@@ -373,6 +374,13 @@ add_executable(test_data_art_iterator
 )
 target_link_libraries(test_data_art_iterator art_persistent pthread)
 add_test(NAME test_data_art_iterator COMMAND test_data_art_iterator)
+
+# Test: Database Backup (Export/Import)
+add_executable(test_db_backup
+    database/tests/test_db_backup.c
+)
+target_link_libraries(test_db_backup art_persistent pthread)
+add_test(NAME test_db_backup COMMAND test_db_backup)
 
 # Test: ART Determinism
 add_executable(test_determinism

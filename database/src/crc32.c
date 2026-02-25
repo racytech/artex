@@ -107,3 +107,38 @@ uint32_t compute_crc32(const uint8_t *data, size_t len) {
 #endif
     return compute_crc32_sw(data, len);
 }
+
+// Incremental CRC32-C API
+
+uint32_t compute_crc32_begin(void) {
+    return 0xFFFFFFFF;
+}
+
+uint32_t compute_crc32_update(uint32_t crc, const uint8_t *data, size_t len) {
+#ifdef __x86_64__
+    if (cpu_has_sse42()) {
+        while (len >= 8) {
+            uint64_t chunk;
+            memcpy(&chunk, data, 8);
+            crc = _mm_crc32_u64(crc, chunk);
+            data += 8;
+            len -= 8;
+        }
+        while (len > 0) {
+            crc = _mm_crc32_u8(crc, *data);
+            data++;
+            len--;
+        }
+        return crc;
+    }
+#endif
+    if (!crc32c_initialized) init_crc32_table();
+    for (size_t i = 0; i < len; i++) {
+        crc = (crc >> 8) ^ crc32c_table[(crc ^ data[i]) & 0xFF];
+    }
+    return crc;
+}
+
+uint32_t compute_crc32_finish(uint32_t crc) {
+    return ~crc;
+}

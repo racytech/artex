@@ -25,9 +25,22 @@ uint32_t compute_crc32(const uint8_t *data, size_t len);
 
 /**
  * Initialize CRC32 module (call once at startup)
- * 
+ *
  * Detects CPU capabilities and initializes lookup tables if needed.
  */
 void crc32_init(void);
+
+/**
+ * Incremental CRC32-C API for streaming computation.
+ *
+ * Usage:
+ *   uint32_t crc = compute_crc32_begin();
+ *   crc = compute_crc32_update(crc, chunk1, len1);
+ *   crc = compute_crc32_update(crc, chunk2, len2);
+ *   uint32_t final = compute_crc32_finish(crc);
+ */
+uint32_t compute_crc32_begin(void);
+uint32_t compute_crc32_update(uint32_t crc, const uint8_t *data, size_t len);
+uint32_t compute_crc32_finish(uint32_t crc);
 
 #endif // CRC32_H

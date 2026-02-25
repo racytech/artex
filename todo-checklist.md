@@ -115,11 +115,15 @@
    - Tests: simulated torn write (half-page pwrite), write counter increment verification (5 writes → counter=5)
    - Result: all 23/23 tests pass
 
-### 16. Online Backup / Snapshot Export (2-3 days)
-   - Export consistent snapshot of entire database to a directory
-   - Use existing snapshot isolation: capture committed root, iterate all keys, write to new files
-   - Enables point-in-time backups without stopping the database
-   - Could also support incremental backup (only pages changed since last backup)
+### 16. ~~Online Backup / Snapshot Export~~ FIXED
+   - Binary backup format: 32B header + sequential key-value entries + 16B footer with CRC32-C checksums
+   - `db_backup_export()` — creates iterator (snapshot isolation), writes all entries with running CRC
+   - `db_backup_import()` — validates header/footer/checksums, batch inserts in groups of 1000
+   - `db_backup_info()` — reads header metadata (entry_count, timestamp, key_size) without importing
+   - Added incremental CRC32-C API (`compute_crc32_begin/update/finish`) to crc32.h
+   - Flags field encodes key_size for import validation (bits 16-31)
+   - Tests: empty tree, single key, 1000 keys, 8KB overflow values, metadata, corrupted header/data, truncated file, invalid paths
+   - Result: 9/9 backup tests pass, 24/24 full suite
 
 ### 17. Database Compaction (3-5 days)
    - Rewrite live pages into contiguous files, discard dead pages
