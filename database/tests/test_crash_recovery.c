@@ -6,6 +6,7 @@
  *   2. Truncated WAL entry (simulated crash mid-write)
  *   3. Corrupted WAL entry (bit flip in payload)
  *   4. Checkpoint-based recovery
+ *   5. Delete replay (insert → delete → crash → recover → verify deletions persisted)
  */
 
 #include "data_art.h"
@@ -369,6 +370,63 @@ static void test_checkpoint_recovery(void) {
 }
 
 // ============================================================================
+// Test 5: Delete Replay Recovery
+// ============================================================================
+
+static void test_delete_replay_recovery(void) {
+    test_env_t env = {0};
+    make_paths(&env, "t5");
+    cleanup_paths(env.db_path, env.wal_path);
+    open_env(&env);
+
+    // Insert keys 0-49
+    printf("  Inserting 50 keys...\n");
+    insert_keys(&env, 0, 50);
+
+    // Delete keys 10-29 (20 deletions)
+    printf("  Deleting keys 10-29...\n");
+    for (int i = 10; i < 30; i++) {
+        uint8_t key[KEY_SIZE];
+        generate_key(key, i);
+        bool ok = data_art_delete(env.tree, key, KEY_SIZE);
+        ASSERT(ok, "delete existing key");
+    }
+
+    ASSERT(data_art_flush(env.tree), "flush");
+    ASSERT(wal_fsync(env.wal), "fsync");
+
+    // Simulate crash
+    printf("  Closing and reopening...\n");
+    close_env(&env);
+    open_env(&env);
+
+    // Recover
+    printf("  Recovering from WAL...\n");
+    int64_t recovered = data_art_recover(env.tree, 0);
+    ASSERT(recovered > 0, "recovery should succeed");
+    printf("  Recovered %ld entries (50 inserts + 20 deletes)\n", recovered);
+
+    // Keys 0-9 should exist
+    printf("  Verifying keys 0-9 present...\n");
+    verify_keys(&env, 0, 10);
+
+    // Keys 10-29 should NOT exist
+    printf("  Verifying keys 10-29 absent...\n");
+    for (int i = 10; i < 30; i++) {
+        verify_key_absent(&env, i);
+    }
+
+    // Keys 30-49 should exist
+    printf("  Verifying keys 30-49 present...\n");
+    verify_keys(&env, 30, 20);
+
+    ASSERT_EQ((long)data_art_size(env.tree), 30L, "tree size after delete recovery");
+
+    close_env(&env);
+    cleanup_paths(env.db_path, env.wal_path);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -392,6 +450,7 @@ int main(void) {
     RUN_TEST(test_truncated_wal_entry);
     RUN_TEST(test_corrupted_wal_entry);
     RUN_TEST(test_checkpoint_recovery);
+    RUN_TEST(test_delete_replay_recovery);
 
     printf("========================================\n");
     printf(" Results: %d/%d tests passed\n", tests_passed, test_count);
