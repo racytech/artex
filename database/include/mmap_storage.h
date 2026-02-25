@@ -18,7 +18,7 @@
 #ifndef MMAP_STORAGE_H
 #define MMAP_STORAGE_H
 
-#include "page_manager.h"  /* PAGE_SIZE, page_t */
+#include "page_types.h"  /* PAGE_SIZE, page_t */
 
 #include <stdint.h>
 #include <stddef.h>

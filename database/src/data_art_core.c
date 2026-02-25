@@ -293,7 +293,7 @@ static uint16_t slot_page_free_slot(page_t *page, uint32_t offset, const slot_cl
 
 /**
  * Initialize a new page as a slot page for the given class.
- * The page must be from buffer_pool_insert_new (zero-initialized, pinned).
+ * The page must be freshly allocated (zero-initialized by mmap).
  */
 static void slot_page_init(page_t *page, const slot_class_t *cls) {
     slot_page_header_t hdr = {

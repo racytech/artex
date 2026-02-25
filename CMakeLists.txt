@@ -13,30 +13,10 @@ set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG")
 # Find required packages
 find_package(PkgConfig REQUIRED)
 
-# Find compression libraries (optional for Phase 1, required for Phase 3)
-pkg_check_modules(LZ4 liblz4)
-pkg_check_modules(ZSTD libzstd)
-
-if(LZ4_FOUND)
-    message(STATUS "LZ4 found: ${LZ4_VERSION}")
-    add_definitions(-DHAVE_LZ4)
-else()
-    message(WARNING "LZ4 not found - compression disabled")
-endif()
-
-if(ZSTD_FOUND)
-    message(STATUS "ZSTD found: ${ZSTD_VERSION}")
-    add_definitions(-DHAVE_ZSTD)
-else()
-    message(WARNING "ZSTD not found - compression disabled")
-endif()
-
 # Include directories
 include_directories(
     ${CMAKE_SOURCE_DIR}/database/include
     ${CMAKE_SOURCE_DIR}/third_party
-    ${LZ4_INCLUDE_DIRS}
-    ${ZSTD_INCLUDE_DIRS}
 )
 
 #==============================================================================
@@ -48,85 +28,7 @@ add_library(art_crc32 STATIC
 )
 
 #==============================================================================
-# Database Library (Persistent ART - Page Manager)
-#==============================================================================
-
-add_library(art_page_manager STATIC
-    database/src/page_manager.c
-    database/src/logger.c
-)
-
-target_link_libraries(art_page_manager
-    art_crc32
-    ${LZ4_LIBRARIES}
-    ${ZSTD_LIBRARIES}
-)
-
-target_include_directories(art_page_manager PRIVATE
-    ${LZ4_INCLUDE_DIRS}
-    ${ZSTD_INCLUDE_DIRS}
-)
-
-#==============================================================================
-# Database Library (Buffer Pool - LRU Cache)
-#==============================================================================
-
-add_library(art_buffer_pool STATIC
-    database/src/buffer_pool.c
-    database/src/logger.c
-)
-
-target_link_libraries(art_buffer_pool
-    art_page_manager
-    pthread
-)
-
-#==============================================================================
-# Database Library (Page Garbage Collection)
-#==============================================================================
-
-add_library(art_page_gc STATIC
-    database/src/page_gc.c
-    database/src/logger.c
-)
-
-target_link_libraries(art_page_gc
-    art_page_manager
-    pthread
-)
-
-#==============================================================================
-# Database Library (Compaction)
-#==============================================================================
-
-add_library(art_compaction STATIC
-    database/src/db_compaction.c
-    database/src/logger.c
-)
-
-target_link_libraries(art_compaction
-    art_page_manager
-    art_page_gc
-    art_crc32
-)
-
-#==============================================================================
-# Database Library (Write-Ahead Log)
-#==============================================================================
-
-add_library(art_wal STATIC
-    database/src/wal.c
-    database/src/db_error.c
-    database/src/logger.c
-)
-
-target_link_libraries(art_wal
-    art_crc32
-    pthread
-)
-
-#==============================================================================
-# Database Library (Persistent ART - Disk-backed Tree)
+# Database Library (Persistent ART - mmap Backend)
 #==============================================================================
 
 add_library(art_persistent STATIC
@@ -162,7 +64,7 @@ add_library(art_database STATIC
 )
 
 #==============================================================================
-# Database Tests
+# Tests
 #==============================================================================
 
 enable_testing()
@@ -173,48 +75,6 @@ add_executable(test_mem_art
 )
 target_link_libraries(test_mem_art art_database)
 add_test(NAME test_mem_art COMMAND test_mem_art)
-
-# Test: Page Manager
-add_executable(test_page_manager
-    database/tests/test_page_manager.c
-)
-target_link_libraries(test_page_manager art_page_manager)
-add_test(NAME test_page_manager COMMAND test_page_manager)
-
-# Test: Page Manager Edge Cases
-add_executable(test_page_manager_edge_cases
-    database/tests/test_page_manager_edge_cases.c
-)
-target_link_libraries(test_page_manager_edge_cases art_page_manager art_page_gc)
-add_test(NAME test_page_manager_edge_cases COMMAND test_page_manager_edge_cases)
-
-# Test: Page Manager Compression
-add_executable(test_page_manager_compression
-    database/tests/test_page_manager_compression.c
-)
-target_link_libraries(test_page_manager_compression art_page_manager art_page_gc ${LZ4_LIBRARIES} ${ZSTD_LIBRARIES})
-add_test(NAME test_page_manager_compression COMMAND test_page_manager_compression)
-
-# Test: Compaction
-add_executable(test_compaction
-    database/tests/test_compaction.c
-)
-target_link_libraries(test_compaction art_compaction art_page_manager art_page_gc ${LZ4_LIBRARIES} ${ZSTD_LIBRARIES})
-add_test(NAME test_compaction COMMAND test_compaction)
-
-# Test: Buffer Pool
-add_executable(test_buffer_pool
-    database/tests/test_buffer_pool.c
-)
-target_link_libraries(test_buffer_pool art_buffer_pool)
-add_test(NAME test_buffer_pool COMMAND test_buffer_pool)
-
-# Test: Buffer Pool Edge Cases
-add_executable(test_buffer_pool_edge
-    database/tests/test_buffer_pool_edge.c
-)
-target_link_libraries(test_buffer_pool_edge art_buffer_pool pthread)
-add_test(NAME test_buffer_pool_edge COMMAND test_buffer_pool_edge)
 
 # Test: Persistent ART Basic
 add_executable(test_data_art_basic
@@ -235,24 +95,6 @@ add_executable(test_data_art_stress
     database/tests/test_data_art_stress.c
 )
 target_link_libraries(test_data_art_stress art_persistent pthread)
-
-# Benchmark: ART vs LMDB Comparison
-find_library(LMDB_LIB lmdb)
-find_path(LMDB_INCLUDE lmdb.h)
-
-add_executable(benchmark_comparison
-    database/tests/benchmark_comparison.c
-)
-
-if(LMDB_LIB AND LMDB_INCLUDE)
-    target_include_directories(benchmark_comparison PRIVATE ${LMDB_INCLUDE})
-    target_link_libraries(benchmark_comparison art_persistent ${LMDB_LIB} pthread)
-    target_compile_definitions(benchmark_comparison PRIVATE HAVE_LMDB=1)
-    message(STATUS "LMDB found — benchmark_comparison includes LMDB comparison")
-else()
-    target_link_libraries(benchmark_comparison art_persistent pthread)
-    message(STATUS "LMDB not found — benchmark_comparison runs ART-only")
-endif()
 
 # Test: Persistent ART Edge Cases
 add_executable(test_data_art_edge_cases
@@ -278,20 +120,20 @@ add_executable(test_data_art_full_stress
 )
 target_link_libraries(test_data_art_full_stress art_persistent pthread)
 
-# Test: Transaction-Based Stress Test (Atomic Multi-Key Updates)
+# Test: Transaction-Based Stress Test
 add_executable(test_data_art_txn_stress
     database/tests/test_data_art_txn_stress.c
 )
 target_link_libraries(test_data_art_txn_stress art_persistent pthread)
 
-# Test: Transaction Buffer (Atomic Multi-Key Updates)
+# Test: Transaction Buffer
 add_executable(test_txn_buffer
     database/tests/test_txn_buffer.c
 )
 target_link_libraries(test_txn_buffer art_persistent pthread)
 add_test(NAME test_txn_buffer COMMAND test_txn_buffer)
 
-# Test: MVCC (Multi-Version Concurrency Control)
+# Test: MVCC
 add_executable(test_mvcc
     database/tests/test_mvcc.c
 )
@@ -326,7 +168,7 @@ add_executable(test_fail_fast_stress
 target_link_libraries(test_fail_fast_stress art_persistent pthread)
 add_test(NAME test_fail_fast_stress COMMAND test_fail_fast_stress)
 
-# Test: Real-World Stress Test (Ethereum access pattern: 1 writer, 8 readers)
+# Test: Real-World Stress Test (Ethereum access pattern)
 add_executable(test_realworld_stress
     database/tests/test_realworld_stress.c
 )
@@ -351,50 +193,7 @@ add_executable(test_data_art_node_ops
 target_link_libraries(test_data_art_node_ops art_persistent pthread)
 add_test(NAME test_data_art_node_ops COMMAND test_data_art_node_ops)
 
-# Test: Page GC - Unit tests with mocks
-add_executable(test_page_gc_mock
-    database/tests/test_page_gc_mock.c
-)
-target_link_libraries(test_page_gc_mock art_page_gc pthread)
-add_test(NAME test_page_gc_mock COMMAND test_page_gc_mock)
-
-# Test: Page GC - Integration tests with real page_manager
-add_executable(test_page_gc_integration
-    database/tests/test_page_gc_integration.c
-)
-target_link_libraries(test_page_gc_integration art_page_gc art_page_manager pthread)
-add_test(NAME test_page_gc_integration COMMAND test_page_gc_integration)
-
-# Test: Write-Ahead Log
-add_executable(test_wal
-    database/tests/test_wal.c
-)
-target_link_libraries(test_wal art_wal pthread)
-add_test(NAME test_wal COMMAND test_wal)
-
-# Test: Write-Ahead Log Edge Cases
-add_executable(test_wal_edge_cases
-    database/tests/test_wal_edge_cases.c
-)
-target_link_libraries(test_wal_edge_cases art_wal pthread)
-add_test(NAME test_wal_edge_cases COMMAND test_wal_edge_cases)
-
-# Test: Write-Ahead Log Recovery Functions
-add_executable(test_wal_recovery
-    database/tests/test_wal_recovery.c
-)
-target_link_libraries(test_wal_recovery art_wal pthread)
-add_test(NAME test_wal_recovery COMMAND test_wal_recovery)
-
-# Test: DB Error System
-add_executable(test_db_error
-    database/tests/test_db_error.c
-    database/src/db_error.c
-)
-target_link_libraries(test_db_error pthread)
-add_test(NAME test_db_error COMMAND test_db_error)
-
-# Test: Crash Recovery
+# Test: Crash Recovery (mmap persistence)
 add_executable(test_crash_recovery
     database/tests/test_crash_recovery.c
 )
@@ -439,6 +238,24 @@ add_executable(test_delete_debug
 )
 target_link_libraries(test_delete_debug art_persistent pthread)
 
+# Benchmark: ART vs LMDB Comparison
+find_library(LMDB_LIB lmdb)
+find_path(LMDB_INCLUDE lmdb.h)
+
+add_executable(benchmark_comparison
+    database/tests/benchmark_comparison.c
+)
+
+if(LMDB_LIB AND LMDB_INCLUDE)
+    target_include_directories(benchmark_comparison PRIVATE ${LMDB_INCLUDE})
+    target_link_libraries(benchmark_comparison art_persistent ${LMDB_LIB} pthread)
+    target_compile_definitions(benchmark_comparison PRIVATE HAVE_LMDB=1)
+    message(STATUS "LMDB found — benchmark_comparison includes LMDB comparison")
+else()
+    target_link_libraries(benchmark_comparison art_persistent pthread)
+    message(STATUS "LMDB not found — benchmark_comparison runs ART-only")
+endif()
+
 # Benchmark: ART vs uthash
 add_executable(benchmark_art_vs_uthash
     benchmark_art_vs_uthash.c
@@ -456,19 +273,10 @@ message(STATUS "========================================")
 message(STATUS "Build type:        ${CMAKE_BUILD_TYPE}")
 message(STATUS "C Compiler:        ${CMAKE_C_COMPILER}")
 message(STATUS "C Flags:           ${CMAKE_C_FLAGS}")
-message(STATUS "Install prefix:    ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "")
-message(STATUS "Components:")
-message(STATUS "  - ART Database Library (in-memory)")
-message(STATUS "  - ART Page Manager (persistent)")
-message(STATUS "  - ART Buffer Pool (LRU cache)")
-message(STATUS "  - Compression: LZ4=${LZ4_FOUND}, ZSTD=${ZSTD_FOUND}")
-message(STATUS "")
-message(STATUS "Tests:")
-message(STATUS "  - test_mem_art (in-memory ART)")
-message(STATUS "  - test_page_manager (persistent page manager)")
-message(STATUS "  - test_page_manager_edge_cases (edge cases & stress tests)")
-message(STATUS "  - test_buffer_pool (buffer pool basic tests)")
-message(STATUS "  - test_buffer_pool_edge (buffer pool edge cases)")
+message(STATUS "Libraries:")
+message(STATUS "  - art_persistent (mmap-backed ART tree)")
+message(STATUS "  - art_database (in-memory ART tree)")
+message(STATUS "  - art_crc32 (CRC32 utility)")
 message(STATUS "========================================")
 message(STATUS "")
