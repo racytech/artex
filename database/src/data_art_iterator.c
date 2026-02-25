@@ -2,8 +2,9 @@
  * Persistent ART - Iterator (Sorted Key Enumeration)
  *
  * Stack-based depth-first traversal that yields leaves in lexicographic
- * key order. Each next() call resets the TLS arena and reloads nodes from
- * their page references, so no persistent page pinning is needed.
+ * key order. Locks are held for the entire scan lifetime (acquired on
+ * first next(), released on destroy or scan completion) enabling zero-copy
+ * mmap reads. Key/value buffers are pre-allocated and reused across calls.
  *
  * The iterator captures a snapshot of the committed root at creation time,
  * providing a consistent view even under concurrent writes.
@@ -45,12 +46,14 @@ struct data_art_iterator {
     int depth;
     bool started;
     bool done;
+    bool scanning;          // true while scan-lifetime locks are held
 
-    // Current leaf data (malloc'd, survives arena reset)
+    // Pre-allocated buffers (reused across next() calls)
     uint8_t *current_key;
     void    *current_value;
     size_t   current_key_len;
     size_t   current_value_len;
+    size_t   value_buf_cap;  // allocated capacity of current_value
 
     // Prefix filter (NULL = full iteration)
     uint8_t *prefix;
@@ -120,38 +123,26 @@ static node_ref_t get_next_child_ref(const void *node, int *child_idx) {
 // ============================================================================
 
 static bool copy_leaf_data(data_art_iterator_t *iter, const data_art_leaf_t *leaf) {
-    // Free previous data
-    free(iter->current_key);
-    free(iter->current_value);
-    iter->current_key = NULL;
-    iter->current_value = NULL;
-
-    // Copy key
+    // Copy key into pre-allocated buffer
     iter->current_key_len = iter->tree->key_size;
-    iter->current_key = malloc(iter->tree->key_size);
-    if (!iter->current_key) return false;
     memcpy(iter->current_key, leaf_key(leaf), iter->tree->key_size);
 
-    // Copy value
+    // Copy value (grow buffer if needed)
     iter->current_value_len = leaf->value_len;
     if (leaf->value_len == 0) {
-        iter->current_value = NULL;
         return true;
     }
 
-    iter->current_value = malloc(leaf->value_len);
-    if (!iter->current_value) {
-        free(iter->current_key);
-        iter->current_key = NULL;
-        return false;
+    if (leaf->value_len > iter->value_buf_cap) {
+        size_t new_cap = leaf->value_len;
+        void *new_buf = realloc(iter->current_value, new_cap);
+        if (!new_buf) return false;
+        iter->current_value = new_buf;
+        iter->value_buf_cap = new_cap;
     }
 
     if (leaf->flags & LEAF_FLAG_OVERFLOW) {
         if (!data_art_read_overflow_value(iter->tree, leaf, iter->current_value)) {
-            free(iter->current_key);
-            free(iter->current_value);
-            iter->current_key = NULL;
-            iter->current_value = NULL;
             return false;
         }
     } else {
@@ -179,19 +170,34 @@ data_art_iterator_t *data_art_iterator_create(data_art_tree_t *tree) {
     iter->depth = -1;
     iter->done = node_ref_is_null(iter->root);
 
+    // Pre-allocate key buffer (fixed size, reused across all next() calls)
+    iter->current_key = malloc(tree->key_size);
+    if (!iter->current_key) {
+        free(iter);
+        return NULL;
+    }
+
     return iter;
+}
+
+// Release scan-lifetime locks (called when scan ends or iterator destroyed)
+static void end_scan(data_art_iterator_t *iter) {
+    if (iter->scanning) {
+        iter->scanning = false;
+        data_art_rdunlock(iter->tree);
+        pthread_rwlock_unlock(&iter->tree->write_lock);
+    }
 }
 
 bool data_art_iterator_next(data_art_iterator_t *iter) {
     if (!iter || iter->done) return false;
 
-    // Hold write_lock rdlock to coordinate with in-place mutation writers,
-    // and resize_lock rdlock for zero-copy mmap reads.
-    pthread_rwlock_rdlock(&iter->tree->write_lock);
-    data_art_rdlock(iter->tree);
-
-    // Reset TLS arena (harmless when using zero-copy, needed for overflow fallback)
-    data_art_reset_arena();
+    // Acquire scan-lifetime locks on first call (held until destroy/done)
+    if (!iter->scanning) {
+        pthread_rwlock_rdlock(&iter->tree->write_lock);
+        data_art_rdlock(iter->tree);
+        iter->scanning = true;
+    }
 
     // First call: push root onto stack
     if (!iter->started) {
@@ -207,13 +213,14 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
     while (iter->depth >= 0) {
         iter_stack_frame_t *frame = &iter->stack[iter->depth];
 
-        // Load the node at current stack level
+        // Load the node at current stack level (zero-copy: direct mmap pointer)
         const void *node = data_art_load_node(iter->tree, frame->node_ref);
         if (!node) {
             LOG_ERROR("Iterator: failed to load node at page=%lu offset=%u",
                       node_ref_page_id(frame->node_ref), node_ref_offset(frame->node_ref));
             iter->done = true;
-            goto out;
+            end_scan(iter);
+            return false;
         }
 
         uint8_t type = *(const uint8_t *)node;
@@ -230,7 +237,8 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
 
             if (!copy_leaf_data(iter, leaf)) {
                 iter->done = true;
-                goto out;
+                end_scan(iter);
+                return false;
             }
 
             // Prefix check: stop if key no longer matches prefix
@@ -238,19 +246,15 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
                 if (iter->current_key_len < iter->prefix_len ||
                     memcmp(iter->current_key, iter->prefix, iter->prefix_len) != 0) {
                     iter->done = true;
-                    free(iter->current_key);
-                    free(iter->current_value);
-                    iter->current_key = NULL;
-                    iter->current_value = NULL;
                     iter->depth--;
-                    goto out;
+                    end_scan(iter);
+                    return false;
                 }
             }
 
             // Pop leaf from stack so next call continues with parent
             iter->depth--;
-            result = true;
-            goto out;
+            return true;
         }
 
         // Inner node: get next child (get_next_child_ref advances child_idx)
@@ -262,7 +266,8 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
             if (iter->depth >= ITER_MAX_DEPTH) {
                 LOG_ERROR("Iterator: stack overflow (depth >= %d)", ITER_MAX_DEPTH);
                 iter->done = true;
-                goto out;
+                end_scan(iter);
+                return false;
             }
             iter->stack[iter->depth].node_ref = child_ref;
             iter->stack[iter->depth].child_idx = 0;
@@ -274,11 +279,8 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
 
     // Traversal complete
     iter->done = true;
-
-out:
-    data_art_rdunlock(iter->tree);
-    pthread_rwlock_unlock(&iter->tree->write_lock);
-    return result;
+    end_scan(iter);
+    return false;
 }
 
 const uint8_t *data_art_iterator_key(const data_art_iterator_t *iter, size_t *key_len) {
@@ -300,6 +302,7 @@ bool data_art_iterator_done(const data_art_iterator_t *iter) {
 
 void data_art_iterator_destroy(data_art_iterator_t *iter) {
     if (!iter) return;
+    end_scan(iter);
     free(iter->current_key);
     free(iter->current_value);
     free(iter->prefix);
@@ -407,12 +410,7 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
                             const uint8_t *key, size_t key_len) {
     if (!iter || !key) return false;
 
-    // Reset iterator state
-    data_art_reset_arena();
-    free(iter->current_key);
-    free(iter->current_value);
-    iter->current_key = NULL;
-    iter->current_value = NULL;
+    // Reset iterator state (keep buffers allocated)
     iter->current_key_len = 0;
     iter->current_value_len = 0;
     iter->started = true;
@@ -431,9 +429,13 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
 
     size_t key_depth = 0;  // bytes of seek key consumed
 
-    // Hold write_lock rdlock + resize_lock for the descent phase
-    pthread_rwlock_rdlock(&iter->tree->write_lock);
-    data_art_rdlock(iter->tree);
+    // Acquire locks if not already held by scan
+    bool acquired_locks = false;
+    if (!iter->scanning) {
+        pthread_rwlock_rdlock(&iter->tree->write_lock);
+        data_art_rdlock(iter->tree);
+        acquired_locks = true;
+    }
 
     // Targeted descent: set up stack so next() finds first leaf >= key
     while (iter->depth >= 0) {
@@ -441,8 +443,10 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
         const void *node = data_art_load_node(iter->tree, frame->node_ref);
         if (!node) {
             iter->done = true;
-            data_art_rdunlock(iter->tree);
-            pthread_rwlock_unlock(&iter->tree->write_lock);
+            if (acquired_locks) {
+                data_art_rdunlock(iter->tree);
+                pthread_rwlock_unlock(&iter->tree->write_lock);
+            }
             return false;
         }
 
@@ -466,7 +470,6 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
 
             if (cmp >= 0) {
                 // leaf >= seek key: this is our target
-                // Leave it on the stack so next() yields it
                 break;
             } else {
                 // leaf < seek key: pop, let parent advance
@@ -497,8 +500,10 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
             iter->depth++;
             if (iter->depth >= ITER_MAX_DEPTH) {
                 iter->done = true;
-                data_art_rdunlock(iter->tree);
-                pthread_rwlock_unlock(&iter->tree->write_lock);
+                if (acquired_locks) {
+                    data_art_rdunlock(iter->tree);
+                    pthread_rwlock_unlock(&iter->tree->write_lock);
+                }
                 return false;
             }
             iter->stack[iter->depth].node_ref = child;
@@ -507,8 +512,10 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
             iter->depth++;
             if (iter->depth >= ITER_MAX_DEPTH) {
                 iter->done = true;
-                data_art_rdunlock(iter->tree);
-                pthread_rwlock_unlock(&iter->tree->write_lock);
+                if (acquired_locks) {
+                    data_art_rdunlock(iter->tree);
+                    pthread_rwlock_unlock(&iter->tree->write_lock);
+                }
                 return false;
             }
             iter->stack[iter->depth].node_ref = child;
@@ -517,9 +524,11 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
         }
     }
 
-    // Release locks before calling next() which acquires its own
-    data_art_rdunlock(iter->tree);
-    pthread_rwlock_unlock(&iter->tree->write_lock);
+    // Release locks if we acquired them — next() will re-acquire via scanning
+    if (acquired_locks) {
+        data_art_rdunlock(iter->tree);
+        pthread_rwlock_unlock(&iter->tree->write_lock);
+    }
 
     // Now advance to the first leaf >= target
     return data_art_iterator_next(iter);
