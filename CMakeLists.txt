@@ -96,6 +96,21 @@ target_link_libraries(art_page_gc
 )
 
 #==============================================================================
+# Database Library (Compaction)
+#==============================================================================
+
+add_library(art_compaction STATIC
+    database/src/db_compaction.c
+    database/src/logger.c
+)
+
+target_link_libraries(art_compaction
+    art_page_manager
+    art_page_gc
+    art_crc32
+)
+
+#==============================================================================
 # Database Library (Write-Ahead Log)
 #==============================================================================
 
@@ -180,6 +195,13 @@ add_executable(test_page_manager_compression
 )
 target_link_libraries(test_page_manager_compression art_page_manager art_page_gc ${LZ4_LIBRARIES} ${ZSTD_LIBRARIES})
 add_test(NAME test_page_manager_compression COMMAND test_page_manager_compression)
+
+# Test: Compaction
+add_executable(test_compaction
+    database/tests/test_compaction.c
+)
+target_link_libraries(test_compaction art_compaction art_page_manager art_page_gc ${LZ4_LIBRARIES} ${ZSTD_LIBRARIES})
+add_test(NAME test_compaction COMMAND test_compaction)
 
 # Test: Buffer Pool
 add_executable(test_buffer_pool

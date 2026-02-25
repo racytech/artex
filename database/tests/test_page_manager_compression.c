@@ -206,7 +206,8 @@ void test_mixed_compressed_uncompressed(void) {
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     TEST_ASSERT(pm != NULL, "Page manager created");
 
-    // Write 5 pages uncompressed
+    // Write 5 pages uncompressed (explicitly disable since default is LZ4)
+    page_manager_set_compression(pm, COMPRESSION_NONE);
     uint64_t pids[10];
     page_t pages[10];
     for (int i = 0; i < 5; i++) {

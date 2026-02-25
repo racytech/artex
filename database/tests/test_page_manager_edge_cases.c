@@ -128,8 +128,8 @@ void test_append_cursor_persistence(void) {
     // Record cursor position before close
     uint32_t file_idx_before = pm->allocator->current_file_idx;
     uint64_t file_offset_before = pm->allocator->current_file_offset;
-    TEST_ASSERT(file_offset_before == (uint64_t)num_pages * PAGE_SIZE,
-               "Cursor should be at num_pages * PAGE_SIZE");
+    TEST_ASSERT(file_offset_before > 0 && file_offset_before <= (uint64_t)num_pages * PAGE_SIZE,
+               "Cursor should be positive (may be compressed)");
 
     // Save metadata + index and destroy
     page_manager_save_metadata(pm, 0);
@@ -299,8 +299,8 @@ void test_page_rewrite_creates_dead_space(void) {
     TEST_ASSERT(result == PAGE_SUCCESS, "Should find rewrite location");
     TEST_ASSERT(offset2 != offset1, "Rewrite should append at new offset");
 
-    // Dead bytes should have increased by PAGE_SIZE (old location is dead)
-    TEST_ASSERT(pm->index->dead_bytes >= PAGE_SIZE,
+    // Dead bytes should have increased (old compressed page location is dead)
+    TEST_ASSERT(pm->index->dead_bytes > 0,
                "Dead bytes should account for old page location");
 
     // Read should return the new version
@@ -364,18 +364,25 @@ void test_multi_file_boundary(void) {
         TEST_ASSERT(result == PAGE_SUCCESS, "Write should succeed");
     }
 
-    // All pages should be in file 0
+    // All pages should be in file 0 with increasing offsets
+    uint64_t prev_offset = 0;
     for (int i = 0; i < num_pages; i++) {
         int fd;
         uint64_t offset;
         page_result_t result = page_manager_get_file_location(pm, page_ids[i], &fd, &offset);
         TEST_ASSERT(result == PAGE_SUCCESS, "Should find page in index");
-        TEST_ASSERT(offset == (uint64_t)i * PAGE_SIZE, "Page offset should match sequential append");
+        if (i == 0) {
+            TEST_ASSERT(offset == 0, "First page offset should be 0");
+        } else {
+            TEST_ASSERT(offset > prev_offset, "Page offset should match sequential append");
+        }
+        prev_offset = offset;
     }
 
-    // Verify cursor is at expected position
+    // Verify cursor is at expected position (compressed pages may be smaller)
     TEST_ASSERT(pm->allocator->current_file_idx == 0, "Should still be in file 0");
-    TEST_ASSERT(pm->allocator->current_file_offset == (uint64_t)num_pages * PAGE_SIZE,
+    TEST_ASSERT(pm->allocator->current_file_offset > 0 &&
+                pm->allocator->current_file_offset <= (uint64_t)num_pages * PAGE_SIZE,
                "Cursor should be at num_pages * PAGE_SIZE");
 
     // Verify non-existent page returns NOT_FOUND

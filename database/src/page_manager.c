@@ -1560,3 +1560,115 @@ static void reopen_existing_data_files(page_manager_t *pm) {
     free(indices);
     LOG_INFO("Reopened %zu existing data files", count);
 }
+
+// ============================================================================
+// Compaction Support
+// ============================================================================
+
+struct page_gc_metadata *page_manager_get_index_snapshot(page_manager_t *pm, size_t *count_out) {
+    if (!pm || !pm->index || !count_out) {
+        if (count_out) *count_out = 0;
+        return NULL;
+    }
+
+    page_index_t *index = pm->index;
+    pthread_rwlock_rdlock(&index->lock);
+
+    if (index->count == 0) {
+        *count_out = 0;
+        pthread_rwlock_unlock(&index->lock);
+        return NULL;
+    }
+
+    size_t size = index->count * sizeof(page_gc_metadata_t);
+    page_gc_metadata_t *snapshot = malloc(size);
+    if (!snapshot) {
+        LOG_ERROR("Failed to allocate index snapshot (%zu entries)", index->count);
+        *count_out = 0;
+        pthread_rwlock_unlock(&index->lock);
+        return NULL;
+    }
+
+    memcpy(snapshot, index->entries, size);
+    *count_out = index->count;
+
+    pthread_rwlock_unlock(&index->lock);
+    return (struct page_gc_metadata *)snapshot;
+}
+
+void page_manager_replace_index(page_manager_t *pm,
+                                struct page_gc_metadata *new_entries,
+                                size_t count,
+                                uint64_t total_file_size,
+                                uint64_t dead_bytes) {
+    if (!pm || !pm->index) return;
+
+    page_index_t *index = pm->index;
+    pthread_rwlock_wrlock(&index->lock);
+
+    free(index->entries);
+    index->entries = new_entries;
+    index->count = count;
+    index->capacity = count;
+    index->total_file_size = total_file_size;
+    index->dead_bytes = dead_bytes;
+
+    pthread_rwlock_unlock(&index->lock);
+
+    LOG_INFO("Replaced page index: %zu entries, total_size=%lu, dead=%lu",
+             count, total_file_size, dead_bytes);
+}
+
+void page_manager_reset_cursor(page_manager_t *pm, uint32_t file_idx, uint64_t file_offset) {
+    if (!pm || !pm->allocator) return;
+
+    pm->allocator->current_file_idx = file_idx;
+    pm->allocator->current_file_offset = file_offset;
+
+    LOG_INFO("Reset append cursor: file%u@%lu", file_idx, file_offset);
+}
+
+int page_manager_get_data_fd(page_manager_t *pm, uint32_t file_idx) {
+    if (!pm || !pm->allocator) return -1;
+    if (file_idx >= pm->allocator->num_data_files) return -1;
+    return pm->allocator->data_file_fds[file_idx];
+}
+
+void page_manager_replace_data_fd(page_manager_t *pm, uint32_t file_idx, int new_fd) {
+    if (!pm || !pm->allocator) return;
+    if (file_idx >= pm->allocator->num_data_files) return;
+
+    int old_fd = pm->allocator->data_file_fds[file_idx];
+    if (old_fd >= 0) {
+        close(old_fd);
+    }
+    pm->allocator->data_file_fds[file_idx] = new_fd;
+
+    LOG_INFO("Replaced data fd for file%u: old=%d, new=%d", file_idx, old_fd, new_fd);
+}
+
+void page_manager_update_page_offset(page_manager_t *pm, uint64_t page_id,
+                                     uint64_t new_offset) {
+    if (!pm || !pm->index) return;
+
+    page_index_t *index = pm->index;
+    pthread_rwlock_wrlock(&index->lock);
+
+    // Binary search for page_id (index is sorted by page_id)
+    page_gc_metadata_t *entries = (page_gc_metadata_t *)index->entries;
+    size_t lo = 0, hi = index->count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (entries[mid].page_id < page_id) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    if (lo < index->count && entries[lo].page_id == page_id) {
+        entries[lo].file_offset = new_offset;
+    }
+
+    pthread_rwlock_unlock(&index->lock);
+}

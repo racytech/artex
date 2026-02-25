@@ -472,4 +472,74 @@ bool page_manager_load_index(page_manager_t *pm);
  */
 void page_index_clear(page_manager_t *pm);
 
+// ============================================================================
+// Compaction Support
+// ============================================================================
+
+/**
+ * Get a snapshot copy of all page index entries.
+ * Caller must free() the returned array.
+ *
+ * @param pm Page manager instance
+ * @param count_out Number of entries in returned array
+ * @return Heap-allocated copy of index entries, or NULL if empty/error
+ */
+struct page_gc_metadata *page_manager_get_index_snapshot(page_manager_t *pm, size_t *count_out);
+
+/**
+ * Replace the entire page index with new entries.
+ * Takes ownership of new_entries (caller must not free).
+ *
+ * @param pm Page manager instance
+ * @param new_entries New entries array (heap-allocated, ownership transferred)
+ * @param count Number of entries
+ * @param total_file_size Sum of all live compressed sizes
+ * @param dead_bytes Dead bytes (typically 0 after compaction)
+ */
+void page_manager_replace_index(page_manager_t *pm,
+                                struct page_gc_metadata *new_entries,
+                                size_t count,
+                                uint64_t total_file_size,
+                                uint64_t dead_bytes);
+
+/**
+ * Reset the append cursor to a specific position.
+ * Used after compaction to point to end of compacted files.
+ *
+ * @param pm Page manager instance
+ * @param file_idx Data file index
+ * @param file_offset Byte offset within that file
+ */
+void page_manager_reset_cursor(page_manager_t *pm, uint32_t file_idx, uint64_t file_offset);
+
+/**
+ * Get file descriptor for a specific data file index.
+ *
+ * @param pm Page manager instance
+ * @param file_idx Data file index
+ * @return File descriptor, or -1 if invalid
+ */
+int page_manager_get_data_fd(page_manager_t *pm, uint32_t file_idx);
+
+/**
+ * Replace data file descriptor (close old, set new).
+ * Used during compaction atomic cutover.
+ *
+ * @param pm Page manager instance
+ * @param file_idx Data file index
+ * @param new_fd New file descriptor
+ */
+void page_manager_replace_data_fd(page_manager_t *pm, uint32_t file_idx, int new_fd);
+
+/**
+ * Update a single page's file_offset in the index.
+ * Used by compaction (in-place moves) and compaction recovery.
+ *
+ * @param pm Page manager instance
+ * @param page_id Page ID to update
+ * @param new_offset New file offset
+ */
+void page_manager_update_page_offset(page_manager_t *pm, uint64_t page_id,
+                                     uint64_t new_offset);
+
 #endif // PAGE_MANAGER_H
