@@ -896,8 +896,9 @@ bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out) {
         return false;
     }
 
-    // Persist allocator metadata atomically
+    // Persist allocator metadata and page index atomically
     page_manager_save_metadata(tree->page_manager, lsn);
+    page_manager_save_index(tree->page_manager);
 
     if (checkpoint_lsn_out) {
         *checkpoint_lsn_out = lsn;
@@ -1059,6 +1060,11 @@ int64_t data_art_recover(data_art_tree_t *tree, uint64_t start_lsn) {
     // Disable WAL and MVCC to prevent re-logging and unnecessary overhead
     tree->wal = NULL;
     tree->mvcc_manager = NULL;
+
+    // For full replay: clear page index — it will be rebuilt from WAL operations
+    if (start_lsn == 0 && tree->page_manager) {
+        page_index_clear(tree->page_manager);
+    }
 
     int64_t entries = wal_replay(saved_wal, start_lsn, end_lsn, &apply, apply_wal_entry_txn_aware);
 

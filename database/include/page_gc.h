@@ -49,7 +49,8 @@ extern "C" {
 typedef struct {
     // From COMPRESSION.md page_index_entry_t
     uint64_t page_id;
-    uint64_t file_offset;        // Physical location in data file
+    uint32_t file_idx;           // Which data file (pages_XXXXX.dat)
+    uint64_t file_offset;        // Physical byte offset in data file
     uint32_t compressed_size;    // Bytes on disk
     uint8_t compression_type;    // NONE, LZ4, ZSTD_5, ZSTD_19
     uint32_t checksum;

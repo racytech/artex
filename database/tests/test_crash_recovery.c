@@ -689,7 +689,7 @@ static void test_page_reuse_after_deletes(void) {
     uint64_t pid_after_insert = page_manager_get_next_page_id(env.pm);
     printf("  next_page_id after 200 inserts: %lu\n", pid_after_insert);
 
-    // Delete 150 keys (0-149) — pages should be freed to free list
+    // Delete 150 keys (0-149) — pages are marked dead (append-only)
     printf("  Deleting 150 keys...\n");
     for (int i = 0; i < 150; i++) {
         uint8_t key[KEY_SIZE];
@@ -702,7 +702,7 @@ static void test_page_reuse_after_deletes(void) {
     // Verify tree size is 50
     ASSERT_EQ((long)data_art_size(env.tree), 50L, "tree size after deletes");
 
-    // Insert 150 NEW keys (starting at 1000) — should reuse freed pages
+    // Insert 150 NEW keys (starting at 1000) — allocates fresh page IDs
     printf("  Inserting 150 new keys (should reuse freed pages)...\n");
     insert_keys(&env, 1000, 150);
     ASSERT(data_art_flush(env.tree), "flush after reinsert");
@@ -710,13 +710,12 @@ static void test_page_reuse_after_deletes(void) {
     uint64_t pid_after_reinsert = page_manager_get_next_page_id(env.pm);
     printf("  next_page_id after reinserting 150: %lu\n", pid_after_reinsert);
 
-    // If pages were reused, next_page_id should NOT have grown by 150
-    // Without reuse: pid_after_reinsert >= pid_after_insert + 150
-    // With reuse:    pid_after_reinsert < pid_after_insert + 150
-    printf("  Page reuse check: %lu < %lu + 150 = %lu\n",
-           pid_after_reinsert, pid_after_insert, pid_after_insert + 150);
-    ASSERT(pid_after_reinsert < pid_after_insert + 150,
-           "pages should be reused (next_page_id should not grow by 150)");
+    // In append-only mode, pages are NOT reused — freed pages become dead space.
+    // next_page_id should grow because new allocations always get fresh IDs.
+    printf("  Append-only check: pid_after_reinsert=%lu > pid_after_insert=%lu\n",
+           pid_after_reinsert, pid_after_insert);
+    ASSERT(pid_after_reinsert > pid_after_insert,
+           "next_page_id should grow (no reuse in append-only mode)");
 
     // Verify all 200 keys present (50 surviving + 150 new)
     printf("  Verifying 50 surviving keys (150-199)...\n");

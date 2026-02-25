@@ -6,6 +6,7 @@
  */
 
 #include "page_manager.h"
+#include "page_gc.h"
 #include "logger.h"
 
 #include <stdio.h>
@@ -105,30 +106,61 @@ void test_double_free(void) {
     cleanup_test_db();
 }
 
-void test_page_size_class_boundaries(void) {
-    // Test exact boundaries of size classes
-    TEST_ASSERT(page_get_size_class(0) == SIZE_CLASS_TINY, 
-               "Boundary: 0 bytes = TINY");
-    TEST_ASSERT(page_get_size_class(511) == SIZE_CLASS_TINY, 
-               "Boundary: 511 bytes = TINY");
-    TEST_ASSERT(page_get_size_class(512) == SIZE_CLASS_SMALL, 
-               "Boundary: 512 bytes = SMALL");
-    TEST_ASSERT(page_get_size_class(1023) == SIZE_CLASS_SMALL, 
-               "Boundary: 1023 bytes = SMALL");
-    TEST_ASSERT(page_get_size_class(1024) == SIZE_CLASS_MEDIUM, 
-               "Boundary: 1024 bytes = MEDIUM");
-    TEST_ASSERT(page_get_size_class(2047) == SIZE_CLASS_MEDIUM, 
-               "Boundary: 2047 bytes = MEDIUM");
-    TEST_ASSERT(page_get_size_class(2048) == SIZE_CLASS_LARGE, 
-               "Boundary: 2048 bytes = LARGE");
-    TEST_ASSERT(page_get_size_class(3071) == SIZE_CLASS_LARGE, 
-               "Boundary: 3071 bytes = LARGE");
-    TEST_ASSERT(page_get_size_class(3072) == SIZE_CLASS_HUGE, 
-               "Boundary: 3072 bytes = HUGE");
-    TEST_ASSERT(page_get_size_class(PAGE_SIZE - PAGE_HEADER_SIZE - 1) == SIZE_CLASS_HUGE,
-               "Boundary: Almost full = HUGE");
-    TEST_ASSERT(page_get_size_class(PAGE_SIZE - PAGE_HEADER_SIZE) == SIZE_CLASS_EMPTY,
-               "Boundary: Exactly full = EMPTY");
+void test_append_cursor_persistence(void) {
+    cleanup_test_db();
+
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+
+    // Write several pages to advance the append cursor
+    const int num_pages = 10;
+    uint64_t page_ids[10];
+    for (int i = 0; i < num_pages; i++) {
+        page_ids[i] = page_manager_alloc(pm, 0);
+        page_t page;
+        page_init(&page, page_ids[i], 1);
+        snprintf((char*)page.data, 100, "Cursor test %d", i);
+        page_compute_checksum(&page);
+        page_result_t result = page_manager_write(pm, &page);
+        TEST_ASSERT(result == PAGE_SUCCESS, "Write should succeed");
+    }
+
+    // Record cursor position before close
+    uint32_t file_idx_before = pm->allocator->current_file_idx;
+    uint64_t file_offset_before = pm->allocator->current_file_offset;
+    TEST_ASSERT(file_offset_before == (uint64_t)num_pages * PAGE_SIZE,
+               "Cursor should be at num_pages * PAGE_SIZE");
+
+    // Save metadata + index and destroy
+    page_manager_save_metadata(pm, 0);
+    page_manager_destroy(pm);
+
+    // Reopen and verify cursor restored
+    pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager reopen should succeed");
+    TEST_ASSERT(pm->allocator->current_file_idx == file_idx_before,
+               "Cursor file_idx should persist");
+    TEST_ASSERT(pm->allocator->current_file_offset == file_offset_before,
+               "Cursor file_offset should persist");
+
+    // Write one more page — should append at the saved cursor
+    uint64_t new_id = page_manager_alloc(pm, 0);
+    page_t page;
+    page_init(&page, new_id, 1);
+    strcpy((char*)page.data, "After reopen");
+    page_compute_checksum(&page);
+    page_result_t result = page_manager_write(pm, &page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Write after reopen should succeed");
+
+    // Verify the new page is readable
+    page_t read_page;
+    result = page_manager_read(pm, new_id, &read_page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Read after reopen write should succeed");
+    TEST_ASSERT(strcmp((char*)read_page.data, "After reopen") == 0,
+               "Data after reopen should match");
+
+    page_manager_destroy(pm);
+    cleanup_test_db();
 }
 
 void test_max_data_in_page(void) {
@@ -232,26 +264,52 @@ void test_checksum_corruption_detection(void) {
     cleanup_test_db();
 }
 
-void test_free_space_update_invalid_args(void) {
+void test_page_rewrite_creates_dead_space(void) {
     cleanup_test_db();
-    
+
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
-    
-    // Test NULL page manager
-    page_result_t result = page_manager_update_free_space(NULL, 1, 100);
-    TEST_ASSERT(result == PAGE_ERROR_INVALID_ARG, "NULL manager should fail");
-    
-    // Test page ID 0 - current implementation doesn't validate
-    result = page_manager_update_free_space(pm, 0, 100);
-    printf("  " ANSI_COLOR_YELLOW "ℹ" ANSI_COLOR_RESET " Update free space for page 0: %d (validation TBD)\n", result);
-    
-    // Test free_bytes > max possible
+
+    // Allocate and write a page
     uint64_t page_id = page_manager_alloc(pm, 0);
-    result = page_manager_update_free_space(pm, page_id, PAGE_SIZE);
-    // Should handle gracefully (may clamp or error)
-    printf("  " ANSI_COLOR_YELLOW "ℹ" ANSI_COLOR_RESET " Update with PAGE_SIZE result: %d\n", result);
-    
+    page_t page;
+    page_init(&page, page_id, 1);
+    strcpy((char*)page.data, "Version 1");
+    page_compute_checksum(&page);
+    page_result_t result = page_manager_write(pm, &page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "First write should succeed");
+
+    // Record location of first write
+    int fd1;
+    uint64_t offset1;
+    result = page_manager_get_file_location(pm, page_id, &fd1, &offset1);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Should find first write location");
+
+    // Rewrite same page_id (CoW creates new version at new location)
+    page_init(&page, page_id, 2);
+    strcpy((char*)page.data, "Version 2");
+    page_compute_checksum(&page);
+    result = page_manager_write(pm, &page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Rewrite should succeed");
+
+    // New location should be different (appended)
+    int fd2;
+    uint64_t offset2;
+    result = page_manager_get_file_location(pm, page_id, &fd2, &offset2);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Should find rewrite location");
+    TEST_ASSERT(offset2 != offset1, "Rewrite should append at new offset");
+
+    // Dead bytes should have increased by PAGE_SIZE (old location is dead)
+    TEST_ASSERT(pm->index->dead_bytes >= PAGE_SIZE,
+               "Dead bytes should account for old page location");
+
+    // Read should return the new version
+    page_t read_page;
+    result = page_manager_read(pm, page_id, &read_page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Read should return latest version");
+    TEST_ASSERT(strcmp((char*)read_page.data, "Version 2") == 0,
+               "Should read the rewritten data");
+
     page_manager_destroy(pm);
     cleanup_test_db();
 }
@@ -289,43 +347,43 @@ void test_read_with_null_output(void) {
 
 void test_multi_file_boundary(void) {
     cleanup_test_db();
-    
+
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
-    
-    // Calculate pages per file
-    const uint64_t pages_per_file = (512ULL * 1024 * 1024) / PAGE_SIZE; // 131072 pages
-    
-    printf("  " ANSI_COLOR_YELLOW "ℹ" ANSI_COLOR_RESET " Pages per file: %lu\n", pages_per_file);
-    
-    // Allocate page at boundary (last page of first file)
-    uint64_t page_id = pages_per_file;
-    
-    page_t page;
-    page_init(&page, page_id, 1);
-    strcpy((char*)page.data, "Boundary page");
-    page_compute_checksum(&page);
-    
-    // Get file location to verify
+
+    // Write a few pages and verify they all land in file 0
+    const int num_pages = 5;
+    uint64_t page_ids[5];
+    for (int i = 0; i < num_pages; i++) {
+        page_ids[i] = page_manager_alloc(pm, 0);
+        page_t page;
+        page_init(&page, page_ids[i], 1);
+        snprintf((char*)page.data, 100, "Multi-file test %d", i);
+        page_compute_checksum(&page);
+        page_result_t result = page_manager_write(pm, &page);
+        TEST_ASSERT(result == PAGE_SUCCESS, "Write should succeed");
+    }
+
+    // All pages should be in file 0
+    for (int i = 0; i < num_pages; i++) {
+        int fd;
+        uint64_t offset;
+        page_result_t result = page_manager_get_file_location(pm, page_ids[i], &fd, &offset);
+        TEST_ASSERT(result == PAGE_SUCCESS, "Should find page in index");
+        TEST_ASSERT(offset == (uint64_t)i * PAGE_SIZE, "Page offset should match sequential append");
+    }
+
+    // Verify cursor is at expected position
+    TEST_ASSERT(pm->allocator->current_file_idx == 0, "Should still be in file 0");
+    TEST_ASSERT(pm->allocator->current_file_offset == (uint64_t)num_pages * PAGE_SIZE,
+               "Cursor should be at num_pages * PAGE_SIZE");
+
+    // Verify non-existent page returns NOT_FOUND
     int fd;
     uint64_t offset;
-    page_result_t result = page_manager_get_file_location(pm, page_id, &fd, &offset);
-    TEST_ASSERT(result == PAGE_SUCCESS, "Should get file location for boundary page");
-    
-    printf("  " ANSI_COLOR_YELLOW "ℹ" ANSI_COLOR_RESET " Page %lu: fd=%d, offset=%lu\n", 
-           page_id, fd, offset);
-    
-    // Test page in second file - requires actual file creation
-    // Files are created on-demand during write, not during allocation
-    uint64_t page_id_file2 = pages_per_file + 1;
-    result = page_manager_get_file_location(pm, page_id_file2, &fd, &offset);
-    printf("  " ANSI_COLOR_YELLOW "ℹ" ANSI_COLOR_RESET " Second file lookup result: %d (files created on-demand during write)\n", result);
-    
-    if (result == PAGE_SUCCESS) {
-        printf("  " ANSI_COLOR_YELLOW "ℹ" ANSI_COLOR_RESET " Page %lu: fd=%d, offset=%lu\n", 
-               page_id_file2, fd, offset);
-    }
-    
+    page_result_t result = page_manager_get_file_location(pm, 99999, &fd, &offset);
+    TEST_ASSERT(result == PAGE_ERROR_NOT_FOUND, "Unwritten page should not be in index");
+
     page_manager_destroy(pm);
     cleanup_test_db();
 }
@@ -364,33 +422,39 @@ void test_many_allocations(void) {
 
 void test_many_free_and_realloc(void) {
     cleanup_test_db();
-    
+
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
-    
+
     const int num_pages = 500;
-    
+    uint64_t max_id = 0;
+
     // Allocate many pages
     for (int i = 0; i < num_pages; i++) {
-        page_manager_alloc(pm, 0);
+        uint64_t pid = page_manager_alloc(pm, 0);
+        if (pid > max_id) max_id = pid;
     }
-    
-    // Free half of them
-    for (int i = 1; i <= num_pages; i += 2) {
+
+    TEST_ASSERT(pm->allocator->total_pages == num_pages,
+               "Should have num_pages total");
+
+    // Free half of them (marks dead in append-only model)
+    for (uint64_t i = 1; i <= (uint64_t)num_pages; i += 2) {
         page_manager_free(pm, i);
     }
-    
-    TEST_ASSERT(pm->allocator->free_pages == num_pages / 2, 
-               "Should have half pages free");
-    
-    // Reallocate - should reuse freed pages
+
+    // In append-only model, freed pages are marked dead, not reused
+    // Allocating more pages should always return fresh IDs
     for (int i = 0; i < num_pages / 2; i++) {
         uint64_t page_id = page_manager_alloc(pm, 0);
-        TEST_ASSERT(page_id > 0, "Reallocation should succeed");
+        TEST_ASSERT(page_id > max_id, "New allocation should get fresh page_id (no reuse)");
+        max_id = page_id;
     }
-    
-    TEST_ASSERT(pm->allocator->free_pages == 0, "Should have no free pages after reuse");
-    
+
+    // Total pages should now be num_pages + num_pages/2
+    TEST_ASSERT(pm->allocator->total_pages == (uint64_t)(num_pages + num_pages / 2),
+               "Total pages should include original + new allocations");
+
     page_manager_destroy(pm);
     cleanup_test_db();
 }
@@ -409,8 +473,7 @@ void test_random_size_allocations(void) {
         uint64_t page_id = page_manager_alloc(pm, free_space);
         TEST_ASSERT(page_id > 0, "Random size allocation should succeed");
         
-        // Note: Newly allocated pages are not automatically added to free lists.
-        // The caller must call page_manager_update_free_space() after writing data.
+        // In append-only model, size_needed is unused for free list matching.
         // This test verifies allocation works with various size hints.
     }
     
@@ -418,44 +481,53 @@ void test_random_size_allocations(void) {
     cleanup_test_db();
 }
 
-void test_fragmentation_scenario(void) {
+void test_dead_page_statistics(void) {
     cleanup_test_db();
-    
+
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
-    
-    // Simulate fragmentation: alloc, free alternating pattern
+
+    // Allocate and write 20 pages
     uint64_t pages[20];
     for (int i = 0; i < 20; i++) {
         pages[i] = page_manager_alloc(pm, 0);
+        page_t page;
+        page_init(&page, pages[i], 1);
+        snprintf((char*)page.data, 100, "Dead stats page %d", i);
+        page_compute_checksum(&page);
+        page_manager_write(pm, &page);
     }
-    
-    // Free odd pages
+
+    // Free odd pages (marks them dead)
     for (int i = 1; i < 20; i += 2) {
         page_manager_free(pm, pages[i]);
     }
-    
-    TEST_ASSERT(pm->allocator->free_pages == 10, "Should have 10 free pages");
-    TEST_ASSERT(pm->allocator->allocated_pages == 10, "Should have 10 allocated pages");
-    
-    // Update free space on some pages to create fragmentation
+
+    // Check dead page statistics via page_gc
+    dead_page_stats_t stats;
+    page_gc_get_dead_stats(pm, &stats);
+
+    printf("  " ANSI_COLOR_YELLOW "ℹ" ANSI_COLOR_RESET " Total: %lu, Live: %lu, Dead: %lu\n",
+           stats.total_pages, stats.live_pages, stats.dead_pages);
+    printf("  " ANSI_COLOR_YELLOW "ℹ" ANSI_COLOR_RESET " Dead bytes: %lu, Fragmentation: %.1f%%\n",
+           stats.dead_bytes, stats.fragmentation_pct);
+
+    TEST_ASSERT(stats.dead_pages == 10, "Should have 10 dead pages");
+    TEST_ASSERT(stats.live_pages == 10, "Should have 10 live pages");
+    TEST_ASSERT(stats.total_pages == 20, "Should have 20 total pages");
+    TEST_ASSERT(stats.dead_bytes > 0, "Dead bytes should be non-zero");
+    TEST_ASSERT(stats.fragmentation_pct > 0.0, "Fragmentation should be non-zero");
+
+    // Verify dead pages are actually dead
+    for (int i = 1; i < 20; i += 2) {
+        TEST_ASSERT(page_gc_is_dead(pm, pages[i]), "Freed page should be dead");
+    }
+
+    // Verify live pages are not dead
     for (int i = 0; i < 20; i += 2) {
-        uint32_t free_space = (i * 100) % 3000;
-        page_manager_update_free_space(pm, pages[i], free_space);
+        TEST_ASSERT(!page_gc_is_dead(pm, pages[i]), "Non-freed page should be alive");
     }
-    
-    // Verify pages distributed across size classes
-    int non_empty_classes = 0;
-    for (int i = 0; i < SIZE_CLASS_COUNT; i++) {
-        if (pm->allocator->pages_per_class[i] > 0) {
-            non_empty_classes++;
-        }
-    }
-    
-    printf("  " ANSI_COLOR_YELLOW "ℹ" ANSI_COLOR_RESET " Pages distributed across %d size classes\n",
-           non_empty_classes);
-    TEST_ASSERT(non_empty_classes > 1, "Should have pages in multiple size classes");
-    
+
     page_manager_destroy(pm);
     cleanup_test_db();
 }
@@ -568,11 +640,11 @@ int main(void) {
     printf("\n=== Boundary & Edge Cases ===\n");
     RUN_TEST(test_page_id_boundaries);
     RUN_TEST(test_double_free);
-    RUN_TEST(test_page_size_class_boundaries);
+    RUN_TEST(test_append_cursor_persistence);
     RUN_TEST(test_max_data_in_page);
     RUN_TEST(test_empty_page_operations);
     RUN_TEST(test_checksum_corruption_detection);
-    RUN_TEST(test_free_space_update_invalid_args);
+    RUN_TEST(test_page_rewrite_creates_dead_space);
     RUN_TEST(test_write_with_null_page);
     RUN_TEST(test_read_with_null_output);
     
@@ -583,7 +655,7 @@ int main(void) {
     RUN_TEST(test_many_allocations);
     RUN_TEST(test_many_free_and_realloc);
     RUN_TEST(test_random_size_allocations);
-    RUN_TEST(test_fragmentation_scenario);
+    RUN_TEST(test_dead_page_statistics);
     
     printf("\n=== Persistence & Recovery ===\n");
     RUN_TEST(test_persistence_after_close);

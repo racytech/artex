@@ -51,41 +51,22 @@ typedef struct {
     uint8_t data[PAGE_SIZE - sizeof(page_header_t)];  // 4032 bytes
 } page_t;
 
-// Size classes for free list (based on available space)
-typedef enum {
-    SIZE_CLASS_TINY   = 0,  // 0-512 bytes free
-    SIZE_CLASS_SMALL  = 1,  // 512-1024 bytes free
-    SIZE_CLASS_MEDIUM = 2,  // 1024-2048 bytes free
-    SIZE_CLASS_LARGE  = 3,  // 2048-3072 bytes free
-    SIZE_CLASS_HUGE   = 4,  // 3072+ bytes free
-    SIZE_CLASS_EMPTY  = 5,  // Completely empty page
-    SIZE_CLASS_COUNT  = 6
-} size_class_t;
-
-// Free list node (tracks pages with free space)
-typedef struct free_list_node {
-    uint64_t page_id;
-    uint32_t free_bytes;
-    struct free_list_node *next;
-} free_list_node_t;
-
-// Page allocator (manages free lists)
+// Page allocator (append-only)
 typedef struct {
-    // Free lists per size class
-    free_list_node_t *free_lists[SIZE_CLASS_COUNT];
-    
     // Statistics
     uint64_t total_pages;
     uint64_t allocated_pages;
-    uint64_t free_pages;
-    uint64_t pages_per_class[SIZE_CLASS_COUNT];
-    
-    // Next page ID for new allocations
+
+    // Next page ID for new allocations (monotonically increasing)
     uint64_t next_page_id;
-    
+
     // Multi-file management
     uint32_t num_data_files;
     int *data_file_fds;  // Array of open file descriptors
+
+    // Append cursor (append-only storage)
+    uint32_t current_file_idx;     // Which file to append to
+    uint64_t current_file_offset;  // Next byte offset in current file
 } page_allocator_t;
 
 // Forward declaration - full definition in page_gc.h
@@ -187,25 +168,15 @@ void page_manager_destroy(page_manager_t *pm);
 uint64_t page_manager_alloc(page_manager_t *pm, size_t size_needed);
 
 /**
- * Free a page (add to free list)
- * 
+ * Free a page (mark as dead in append-only storage)
+ *
+ * Dead pages are not reused — space reclaimed by compaction.
+ *
  * @param pm Page manager instance
  * @param page_id Page ID to free
  * @return PAGE_SUCCESS on success, error code otherwise
  */
 page_result_t page_manager_free(page_manager_t *pm, uint64_t page_id);
-
-/**
- * Update free space for a page (when space consumed/freed)
- * 
- * @param pm Page manager instance
- * @param page_id Page ID
- * @param new_free_bytes New amount of free space
- * @return PAGE_SUCCESS on success, error code otherwise
- */
-page_result_t page_manager_update_free_space(page_manager_t *pm, 
-                                             uint64_t page_id,
-                                             uint32_t new_free_bytes);
 
 // ============================================================================
 // Page I/O (Uncompressed)
@@ -302,19 +273,19 @@ typedef struct {
     // Allocation statistics
     uint64_t total_pages;
     uint64_t allocated_pages;
-    uint64_t free_pages;
-    uint64_t pages_per_class[SIZE_CLASS_COUNT];
-    
+    uint64_t dead_pages;           // Pages marked dead (append-only)
+    uint64_t dead_bytes;           // Bytes consumed by dead pages
+
     // I/O statistics
     uint64_t pages_read;
     uint64_t pages_written;
     uint64_t bytes_read;
     uint64_t bytes_written;
-    
+
     // File statistics
     uint32_t num_data_files;
     uint64_t total_file_size;
-    
+
     // Performance metrics
     double avg_read_time_us;
     double avg_write_time_us;
@@ -365,14 +336,6 @@ void page_compute_checksum(page_t *page);
 // ============================================================================
 // Utility Functions
 // ============================================================================
-
-/**
- * Get size class for given free space
- * 
- * @param free_bytes Amount of free space in bytes
- * @return Size class
- */
-size_class_t page_get_size_class(uint32_t free_bytes);
 
 /**
  * Initialize a new page
@@ -469,5 +432,27 @@ bool page_manager_save_metadata(page_manager_t *pm, uint64_t checkpoint_lsn);
  * On failure, allocator state is left unchanged (defaults apply).
  */
 bool page_manager_load_metadata(page_manager_t *pm);
+
+// ============================================================================
+// Page Index Persistence (append-only storage)
+// ============================================================================
+
+/**
+ * Save page index to disk (pages.idx).
+ * Writes atomically via tmp + fsync + rename.
+ */
+bool page_manager_save_index(page_manager_t *pm);
+
+/**
+ * Load page index from disk (pages.idx).
+ * Returns true if index was loaded, false if file missing or invalid.
+ */
+bool page_manager_load_index(page_manager_t *pm);
+
+/**
+ * Clear all entries from the page index.
+ * Used during full WAL replay (start_lsn=0) to rebuild from scratch.
+ */
+void page_index_clear(page_manager_t *pm);
 
 #endif // PAGE_MANAGER_H

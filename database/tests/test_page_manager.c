@@ -97,31 +97,34 @@ void test_page_allocation(void) {
     cleanup_test_db();
 }
 
-void test_page_free_and_reuse(void) {
+void test_page_free_marks_dead(void) {
     cleanup_test_db();
-    
+
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
-    
-    // Allocate pages
+
+    // Allocate and write pages
     uint64_t page_id1 = page_manager_alloc(pm, 0);
     uint64_t page_id2 = page_manager_alloc(pm, 0);
     uint64_t page_id3 = page_manager_alloc(pm, 0);
-    
+    (void)page_id1; (void)page_id3;
+
+    page_t page;
+    page_init(&page, page_id2, 1);
+    page_manager_write(pm, &page);
+
     TEST_ASSERT(pm->allocator->allocated_pages == 3, "Should have 3 allocated pages");
-    TEST_ASSERT(pm->allocator->free_pages == 0, "Should have 0 free pages");
-    
-    // Free page 2
+
+    // Free page 2 — marks dead in append-only, does NOT reuse
     page_result_t result = page_manager_free(pm, page_id2);
     TEST_ASSERT(result == PAGE_SUCCESS, "Page free should succeed");
     TEST_ASSERT(pm->allocator->allocated_pages == 2, "Should have 2 allocated pages");
-    TEST_ASSERT(pm->allocator->free_pages == 1, "Should have 1 free page");
-    
-    // Allocate new page - should reuse freed page
+
+    // New alloc returns fresh page_id (no reuse)
     uint64_t page_id4 = page_manager_alloc(pm, 0);
-    TEST_ASSERT(page_id4 == page_id2, "Should reuse freed page 2");
-    TEST_ASSERT(pm->allocator->free_pages == 0, "Should have 0 free pages after reuse");
-    
+    TEST_ASSERT(page_id4 == 4, "New alloc should return fresh page_id 4, not reuse 2");
+    TEST_ASSERT(page_id4 != page_id2, "Should NOT reuse freed page in append-only mode");
+
     page_manager_destroy(pm);
     cleanup_test_db();
 }
@@ -246,53 +249,82 @@ void test_multiple_pages_io(void) {
     cleanup_test_db();
 }
 
-void test_size_class_calculation(void) {
-    TEST_ASSERT(page_get_size_class(0) == SIZE_CLASS_TINY, 
-               "0 bytes should be TINY");
-    TEST_ASSERT(page_get_size_class(100) == SIZE_CLASS_TINY, 
-               "100 bytes should be TINY");
-    TEST_ASSERT(page_get_size_class(512) == SIZE_CLASS_SMALL, 
-               "512 bytes should be SMALL");
-    TEST_ASSERT(page_get_size_class(1024) == SIZE_CLASS_MEDIUM, 
-               "1024 bytes should be MEDIUM");
-    TEST_ASSERT(page_get_size_class(2048) == SIZE_CLASS_LARGE, 
-               "2048 bytes should be LARGE");
-    TEST_ASSERT(page_get_size_class(3072) == SIZE_CLASS_HUGE, 
-               "3072 bytes should be HUGE");
-    TEST_ASSERT(page_get_size_class(PAGE_SIZE - PAGE_HEADER_SIZE) == SIZE_CLASS_EMPTY, 
-               "Full page should be EMPTY");
+void test_page_index_persistence(void) {
+    cleanup_test_db();
+
+    // Write 10 pages, destroy, recreate, verify all readable
+    {
+        page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+        TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+
+        for (int i = 0; i < 10; i++) {
+            uint64_t pid = page_manager_alloc(pm, 0);
+            page_t page;
+            page_init(&page, pid, i + 1);
+            snprintf((char*)page.data, 100, "Persist test page %d", i);
+            page_compute_checksum(&page);
+            page_manager_write(pm, &page);
+        }
+
+        // Save index explicitly (also happens in destroy)
+        page_manager_save_index(pm);
+        page_manager_save_metadata(pm, 0);
+        page_manager_destroy(pm);
+    }
+
+    // Reopen and verify
+    {
+        page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+        TEST_ASSERT(pm != NULL, "Page manager reopen should succeed");
+        TEST_ASSERT(pm->allocator->next_page_id == 11,
+                    "next_page_id should be restored to 11");
+
+        size_t idx_count = page_manager_get_num_pages(pm);
+        TEST_ASSERT(idx_count == 10, "Index should have 10 entries after reload");
+
+        // Read all pages back
+        int all_ok = 1;
+        for (int i = 0; i < 10; i++) {
+            page_t page;
+            page_result_t r = page_manager_read(pm, (uint64_t)(i + 1), &page);
+            if (r != PAGE_SUCCESS) { all_ok = 0; break; }
+            char expected[100];
+            snprintf(expected, 100, "Persist test page %d", i);
+            if (strcmp((char*)page.data, expected) != 0) { all_ok = 0; break; }
+        }
+        TEST_ASSERT(all_ok, "All 10 pages readable after restart");
+
+        page_manager_destroy(pm);
+    }
+
+    cleanup_test_db();
 }
 
-void test_free_space_tracking(void) {
+void test_dead_page_tracking(void) {
     cleanup_test_db();
-    
+
     page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
     TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
-    
-    // Allocate a page
-    uint64_t page_id = page_manager_alloc(pm, 0);
-    
-    // Update free space to SMALL class
-    page_result_t result = page_manager_update_free_space(pm, page_id, 600);
-    TEST_ASSERT(result == PAGE_SUCCESS, "Update free space should succeed");
-    TEST_ASSERT(pm->allocator->pages_per_class[SIZE_CLASS_SMALL] == 1,
-               "Should have 1 page in SMALL class");
-    
-    // Update to LARGE class
-    result = page_manager_update_free_space(pm, page_id, 2500);
-    TEST_ASSERT(result == PAGE_SUCCESS, "Update free space should succeed");
-    TEST_ASSERT(pm->allocator->pages_per_class[SIZE_CLASS_SMALL] == 0,
-               "Should have 0 pages in SMALL class");
-    TEST_ASSERT(pm->allocator->pages_per_class[SIZE_CLASS_LARGE] == 1,
-               "Should have 1 page in LARGE class");
-    
-    // Update to no free space
-    result = page_manager_update_free_space(pm, page_id, 0);
-    TEST_ASSERT(result == PAGE_SUCCESS, "Update free space should succeed");
-    TEST_ASSERT(pm->allocator->pages_per_class[SIZE_CLASS_LARGE] == 0,
-               "Should have 0 pages in LARGE class");
-    TEST_ASSERT(pm->allocator->free_pages == 0, "Should have no free pages");
-    
+
+    // Allocate and write pages
+    for (int i = 0; i < 5; i++) {
+        uint64_t pid = page_manager_alloc(pm, 0);
+        page_t page;
+        page_init(&page, pid, 1);
+        page_manager_write(pm, &page);
+    }
+
+    // Free pages 2 and 4 (mark as dead)
+    page_manager_free(pm, 2);
+    page_manager_free(pm, 4);
+
+    // Check stats
+    page_manager_stats_t stats;
+    page_manager_get_stats(pm, &stats);
+    TEST_ASSERT(stats.dead_pages == 2, "Should have 2 dead pages");
+    TEST_ASSERT(stats.dead_bytes == 2 * PAGE_SIZE, "Dead bytes = 2 * PAGE_SIZE");
+    TEST_ASSERT(stats.allocated_pages == 3, "Should have 3 allocated pages");
+
     page_manager_destroy(pm);
     cleanup_test_db();
 }
@@ -368,10 +400,10 @@ void test_error_handling(void) {
     result = page_manager_free(pm, 0);
     TEST_ASSERT(result == PAGE_ERROR_INVALID_ARG, "Cannot free page 0");
     
-    // Test read of non-existent page
+    // Test read of non-existent page (not in index)
     page_t page;
     result = page_manager_read(pm, 9999, &page);
-    TEST_ASSERT(result == PAGE_ERROR_IO, "Read of non-existent page should return IO error");
+    TEST_ASSERT(result == PAGE_ERROR_NOT_FOUND, "Read of non-existent page should return NOT_FOUND");
     
     page_manager_destroy(pm);
     cleanup_test_db();
@@ -628,12 +660,12 @@ int main(void) {
     
     RUN_TEST(test_page_manager_create_destroy);
     RUN_TEST(test_page_allocation);
-    RUN_TEST(test_page_free_and_reuse);
+    RUN_TEST(test_page_free_marks_dead);
     RUN_TEST(test_page_init_and_checksum);
     RUN_TEST(test_page_write_and_read);
     RUN_TEST(test_multiple_pages_io);
-    RUN_TEST(test_size_class_calculation);
-    RUN_TEST(test_free_space_tracking);
+    RUN_TEST(test_page_index_persistence);
+    RUN_TEST(test_dead_page_tracking);
     RUN_TEST(test_page_manager_sync);
     RUN_TEST(test_statistics);
     RUN_TEST(test_error_handling);

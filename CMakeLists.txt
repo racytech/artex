@@ -171,7 +171,7 @@ add_test(NAME test_page_manager COMMAND test_page_manager)
 add_executable(test_page_manager_edge_cases
     database/tests/test_page_manager_edge_cases.c
 )
-target_link_libraries(test_page_manager_edge_cases art_page_manager)
+target_link_libraries(test_page_manager_edge_cases art_page_manager art_page_gc)
 add_test(NAME test_page_manager_edge_cases COMMAND test_page_manager_edge_cases)
 
 # Test: Buffer Pool
