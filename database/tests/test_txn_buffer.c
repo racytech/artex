@@ -703,7 +703,7 @@ static bool test_optimized_commit_root_once()
     TEST_ASSERT(tree != NULL, "Failed to create tree");
 
     // Record root before commit
-    uint64_t root_before = atomic_load(&tree->committed_root_page_id);
+    uint64_t root_before = atomic_load(&tree->committed_root);
     TEST_ASSERT(root_before == 0, "Root should be 0 (empty tree)");
 
     // Begin txn, insert 50 keys
@@ -719,16 +719,16 @@ static bool test_optimized_commit_root_once()
     }
 
     // Root should still be 0 (buffered, not committed)
-    uint64_t root_during = atomic_load(&tree->committed_root_page_id);
+    uint64_t root_during = atomic_load(&tree->committed_root);
     TEST_ASSERT(root_during == 0, "Root should not change during buffering");
 
     // Commit
     TEST_ASSERT(data_art_commit_txn(tree), "Commit failed");
 
     // Root should now be non-zero (published once at end)
-    uint64_t root_after = atomic_load(&tree->committed_root_page_id);
+    uint64_t root_after = atomic_load(&tree->committed_root);
     TEST_ASSERT(root_after != 0, "Root should be published after commit");
-    TEST_ASSERT(root_after == tree->root.page_id,
+    TEST_ASSERT(root_after == tree->root,
                 "Published root should match tree root");
 
     data_art_destroy(tree);

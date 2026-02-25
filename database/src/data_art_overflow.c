@@ -32,15 +32,15 @@ bool data_art_read_overflow_value(data_art_tree_t *tree,
     
     if (!(leaf->flags & LEAF_FLAG_OVERFLOW)) {
         // No overflow, just copy inline data
-        const uint8_t *value_start = leaf->data + leaf->key_len;
+        const uint8_t *value_start = leaf->data + tree->key_size;
         size_t value_size = leaf->value_len;
         memcpy(value_out, value_start, value_size);
         return true;
     }
     
     // Copy inline portion first
-    const uint8_t *value_start = leaf->data + leaf->key_len;
-    size_t inline_value_size = leaf->inline_data_len - leaf->key_len;
+    const uint8_t *value_start = leaf->data + tree->key_size;
+    size_t inline_value_size = leaf->inline_data_len - tree->key_size;
     memcpy(value_out, value_start, inline_value_size);
     
     // Traverse overflow chain to get remainder
@@ -52,10 +52,10 @@ bool data_art_read_overflow_value(data_art_tree_t *tree,
         tree->overflow_chain_reads++;
         
         // Load overflow page
-        const data_art_overflow_t *overflow = 
-            (const data_art_overflow_t *)data_art_load_node(tree, 
-                (node_ref_t){.page_id = current_page, .offset = 0});
-        
+        const data_art_overflow_t *overflow =
+            (const data_art_overflow_t *)data_art_load_node(tree,
+                node_ref_make(current_page, 0));
+
         if (!overflow) {
             LOG_ERROR("Failed to load overflow page %lu", current_page);
             return false;
@@ -116,7 +116,7 @@ uint64_t data_art_write_overflow_value(data_art_tree_t *tree,
         tree->overflow_pages_allocated++;
         
         if (first_page == 0) {
-            first_page = ref.page_id;
+            first_page = node_ref_page_id(ref);
         }
         
         // Create overflow page structure
@@ -147,22 +147,22 @@ uint64_t data_art_write_overflow_value(data_art_tree_t *tree,
             // Update previous page's next_page pointer
             // CRITICAL: Load and COPY immediately before any other operations
             // that might call data_art_load_node and invalidate the pointer
-            const data_art_overflow_t *prev_overflow = 
+            const data_art_overflow_t *prev_overflow =
                 (const data_art_overflow_t *)data_art_load_node(tree,
-                    (node_ref_t){.page_id = prev_page, .offset = 0});
-            
+                    node_ref_make(prev_page, 0));
+
             if (prev_overflow) {
                 // IMPORTANT: Copy immediately to avoid stale pointer issues
                 data_art_overflow_t updated = *prev_overflow;
                 // Now safe to do other operations that might call data_art_load_node
-                updated.next_page = ref.page_id;
-                data_art_write_node(tree, 
-                    (node_ref_t){.page_id = prev_page, .offset = 0},
+                updated.next_page = node_ref_page_id(ref);
+                data_art_write_node(tree,
+                    node_ref_make(prev_page, 0),
                     &updated, sizeof(updated));
             }
         }
         
-        prev_page = ref.page_id;
+        prev_page = node_ref_page_id(ref);
         data_ptr += to_copy;
         remaining -= to_copy;
     }
@@ -180,9 +180,9 @@ size_t data_art_free_overflow_chain(data_art_tree_t *tree, uint64_t first_page) 
     
     while (current_page != 0) {
         // Load overflow page to get next pointer
-        const data_art_overflow_t *overflow = 
+        const data_art_overflow_t *overflow =
             (const data_art_overflow_t *)data_art_load_node(tree,
-                (node_ref_t){.page_id = current_page, .offset = 0});
+                node_ref_make(current_page, 0));
         
         if (!overflow) {
             LOG_ERROR("Failed to load overflow page %lu during free", current_page);
@@ -200,7 +200,7 @@ size_t data_art_free_overflow_chain(data_art_tree_t *tree, uint64_t first_page) 
         
         // Release current page using reference counting
         extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
-        data_art_release_page(tree, (node_ref_t){.page_id = current_page, .offset = 0});
+        data_art_release_page(tree, node_ref_make(current_page, 0));
         freed++;
         
         LOG_DEBUG("[FREE_OVERFLOW] Released overflow page %lu (next=%lu)", 

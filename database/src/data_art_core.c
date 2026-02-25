@@ -87,11 +87,7 @@ void data_art_rdunlock(data_art_tree_t *tree) {
 // Publish the current tree->root so lock-free readers can see it.
 // Called after auto-commit, commit_txn, or tree initialization.
 void data_art_publish_root(data_art_tree_t *tree) {
-    // Store offset first (readers read page_id first with acquire)
-    atomic_store_explicit(&tree->committed_root_offset,
-                          tree->root.offset, memory_order_relaxed);
-    atomic_store_explicit(&tree->committed_root_page_id,
-                          tree->root.page_id, memory_order_release);
+    atomic_store_explicit(&tree->committed_root, tree->root, memory_order_release);
 }
 
 // Thread-local transaction context
@@ -351,7 +347,7 @@ static node_ref_t slot_alloc(data_art_tree_t *tree, int class_idx) {
         uint32_t offset = slot_page_alloc_slot(page, cls);
         if (offset != 0) {
             tree->slot_allocs[class_idx]++;
-            return (node_ref_t){.page_id = cls->current_page_id, .offset = offset};
+            return node_ref_make(cls->current_page_id, offset);
         }
         cls->current_page_id = 0;
     }
@@ -380,7 +376,7 @@ static node_ref_t slot_alloc(data_art_tree_t *tree, int class_idx) {
     tree->slot_pages_created[class_idx]++;
     tree->slot_allocs[class_idx]++;
 
-    return (node_ref_t){.page_id = page_id, .offset = offset};
+    return node_ref_make(page_id, offset);
 }
 
 /**
@@ -401,7 +397,7 @@ static node_ref_t slot_alloc_hint(data_art_tree_t *tree, int class_idx, uint64_t
             if (offset != 0) {
                 tree->slot_hint_hits++;
                 tree->slot_allocs[class_idx]++;
-                return (node_ref_t){.page_id = hint_page_id, .offset = offset};
+                return node_ref_make(hint_page_id, offset);
             }
         }
     }
@@ -427,7 +423,7 @@ static node_ref_t alloc_dedicated_page(data_art_tree_t *tree) {
 
     tree->nodes_allocated++;
     tree->dedicated_pages_created++;
-    return (node_ref_t){.page_id = page_id, .offset = 0};
+    return node_ref_make(page_id, 0);
 }
 
 /**
@@ -436,7 +432,7 @@ static node_ref_t alloc_dedicated_page(data_art_tree_t *tree) {
 static void slot_free(data_art_tree_t *tree, uint64_t page_id, uint32_t offset) {
     if (offset == 0) {
         // Dedicated page — free whole page
-        data_art_release_page(tree, (node_ref_t){.page_id = page_id, .offset = 0});
+        data_art_release_page(tree, node_ref_make(page_id, 0));
         return;
     }
 
@@ -471,7 +467,7 @@ static void slot_free(data_art_tree_t *tree, uint64_t page_id, uint32_t offset) 
             cls->current_page_id = 0;
         }
         // Add to pending free list (whole page)
-        data_art_release_page(tree, (node_ref_t){.page_id = page_id, .offset = 0});
+        data_art_release_page(tree, node_ref_make(page_id, 0));
     }
 }
 
@@ -507,8 +503,7 @@ static bool data_art_init_common(data_art_tree_t *tree, size_t key_size) {
     tree->active_versions = NULL;
     tree->num_active_versions = 0;
 
-    atomic_store_explicit(&tree->committed_root_page_id, 0, memory_order_release);
-    atomic_store_explicit(&tree->committed_root_offset, 0, memory_order_release);
+    atomic_store_explicit(&tree->committed_root, NULL_NODE_REF, memory_order_release);
 
     slot_allocator_init(tree);
     return true;
@@ -598,15 +593,14 @@ data_art_tree_t *data_art_open(const char *path, size_t key_size) {
     }
 
     // Restore tree state from header
-    tree->root = (node_ref_t){.page_id = root_page_id, .offset = root_offset};
+    tree->root = node_ref_make(root_page_id, root_offset);
     tree->size = tree_size;
 
     // Publish committed root for lock-free readers
-    atomic_store_explicit(&tree->committed_root_page_id, root_page_id, memory_order_release);
-    atomic_store_explicit(&tree->committed_root_offset, root_offset, memory_order_release);
+    atomic_store_explicit(&tree->committed_root, tree->root, memory_order_release);
 
     LOG_INFO("Opened ART tree (key_size=%zu, size=%lu, root=%lu:%u, path=%s)",
-             key_size, tree_size, root_page_id, root_offset, path);
+             key_size, tree_size, node_ref_page_id(tree->root), node_ref_offset(tree->root), path);
     return tree;
 }
 
@@ -638,7 +632,7 @@ void data_art_destroy(data_art_tree_t *tree) {
 
     // Save header, then destroy storage
     mmap_storage_save_header(tree->mmap_storage,
-                             tree->root.page_id, tree->root.offset,
+                             node_ref_page_id(tree->root), node_ref_offset(tree->root),
                              tree->size, tree->key_size);
     free(tree->reuse_pool);
     mmap_storage_destroy(tree->mmap_storage);
@@ -790,8 +784,8 @@ void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref) {
     if (!tree || node_ref_is_null(old_ref)) return;
 
     // Slot-level free: non-zero offset means node is on a multi-node page
-    if (old_ref.offset != 0) {
-        slot_free(tree, old_ref.page_id, old_ref.offset);
+    if (node_ref_offset(old_ref) != 0) {
+        slot_free(tree, node_ref_page_id(old_ref), node_ref_offset(old_ref));
         return;
     }
 
@@ -807,7 +801,7 @@ void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref) {
         tree->pending_free_capacity = new_cap;
     }
 
-    tree->pending_free_pages[tree->pending_free_count++] = old_ref.page_id;
+    tree->pending_free_pages[tree->pending_free_count++] = node_ref_page_id(old_ref);
 
     // Opportunistically drain if safe
     try_drain_pending_frees(tree);
@@ -829,15 +823,15 @@ const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref) {
 
     // Fast path: caller holds resize_lock — return direct mmap pointer (zero-copy)
     if (tls_rdlock_held) {
-        page_t *page = mmap_storage_get_page(tree->mmap_storage, ref.page_id);
-        return page->data + ref.offset;
+        page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
+        return page->data + node_ref_offset(ref);
     }
 
     // Legacy path: lock, copy to arena, unlock
     pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
 
-    page_t *page = mmap_storage_get_page(tree->mmap_storage, ref.page_id);
-    const void *src = page->data + ref.offset;
+    page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
+    const void *src = page->data + node_ref_offset(ref);
     size_t node_size = data_art_node_size_from_data(src);
 
     void *copy = tls_arena_alloc(node_size);
@@ -872,8 +866,8 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
     }
 
     pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
-    page_t *page = mmap_storage_get_page(tree->mmap_storage, ref.page_id);
-    memcpy(page->data + ref.offset, node, size);
+    page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
+    memcpy(page->data + node_ref_offset(ref), node, size);
     pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
     return true;
 }
@@ -884,8 +878,8 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
 
 void *data_art_lock_node_mut(data_art_tree_t *tree, node_ref_t ref) {
     pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
-    page_t *page = mmap_storage_get_page(tree->mmap_storage, ref.page_id);
-    return page->data + ref.offset;
+    page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
+    return page->data + node_ref_offset(ref);
 }
 
 void data_art_unlock_node_mut(data_art_tree_t *tree) {
@@ -896,8 +890,8 @@ bool data_art_write_partial(data_art_tree_t *tree, node_ref_t ref,
                             size_t node_offset, const void *data, size_t len) {
     if (!tree || !data || node_ref_is_null(ref)) return false;
     pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
-    page_t *page = mmap_storage_get_page(tree->mmap_storage, ref.page_id);
-    memcpy(page->data + ref.offset + node_offset, data, len);
+    page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
+    memcpy(page->data + node_ref_offset(ref) + node_offset, data, len);
     pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
     return true;
 }
@@ -905,9 +899,9 @@ bool data_art_write_partial(data_art_tree_t *tree, node_ref_t ref,
 bool data_art_copy_node(data_art_tree_t *tree, node_ref_t dst, node_ref_t src, size_t size) {
     if (!tree || node_ref_is_null(dst) || node_ref_is_null(src)) return false;
     pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
-    page_t *src_page = mmap_storage_get_page(tree->mmap_storage, src.page_id);
-    page_t *dst_page = mmap_storage_get_page(tree->mmap_storage, dst.page_id);
-    memcpy(dst_page->data + dst.offset, src_page->data + src.offset, size);
+    page_t *src_page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(src));
+    page_t *dst_page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(dst));
+    memcpy(dst_page->data + node_ref_offset(dst), src_page->data + node_ref_offset(src), size);
     pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
     return true;
 }
@@ -1130,10 +1124,7 @@ data_art_snapshot_t *data_art_begin_snapshot(data_art_tree_t *tree) {
     // Capture committed root atomically, coordinating with in-place mutation writers.
     // rdlock on write_lock ensures no writer is mid-mutation when we read the root.
     pthread_rwlock_rdlock(&tree->write_lock);
-    snapshot->root_page_id = atomic_load_explicit(&tree->committed_root_page_id,
-                                                   memory_order_acquire);
-    snapshot->root_offset = atomic_load_explicit(&tree->committed_root_offset,
-                                                  memory_order_relaxed);
+    snapshot->root = atomic_load_explicit(&tree->committed_root, memory_order_acquire);
     pthread_rwlock_unlock(&tree->write_lock);
 
     // Create MVCC snapshot
@@ -1186,7 +1177,7 @@ bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out) {
 
     drain_pending_frees(tree);
     mmap_storage_save_header(tree->mmap_storage,
-                             tree->root.page_id, tree->root.offset,
+                             node_ref_page_id(tree->root), node_ref_offset(tree->root),
                              tree->size, tree->key_size);
     // Update next_page_id in header
     mmap_header_t *hdr = (mmap_header_t *)tree->mmap_storage->base;
@@ -1198,6 +1189,6 @@ bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out) {
     }
     if (checkpoint_lsn_out) *checkpoint_lsn_out = 0;
     LOG_INFO("Checkpoint (root=%lu:%u, size=%zu)",
-             tree->root.page_id, tree->root.offset, tree->size);
+             node_ref_page_id(tree->root), node_ref_offset(tree->root), tree->size);
     return true;
 }

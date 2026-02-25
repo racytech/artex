@@ -74,8 +74,7 @@ static node_ref_t get_next_child_ref(const void *node, int *child_idx) {
             if (*child_idx < n->num_children) {
                 int i = *child_idx;
                 *child_idx = i + 1;
-                return (node_ref_t){.page_id = n->child_page_ids[i],
-                                    .offset  = n->child_offsets[i]};
+                return n->children[i];
             }
             return NULL_NODE_REF;
         }
@@ -84,8 +83,7 @@ static node_ref_t get_next_child_ref(const void *node, int *child_idx) {
             if (*child_idx < n->num_children) {
                 int i = *child_idx;
                 *child_idx = i + 1;
-                return (node_ref_t){.page_id = n->child_page_ids[i],
-                                    .offset  = n->child_offsets[i]};
+                return n->children[i];
             }
             return NULL_NODE_REF;
         }
@@ -96,8 +94,7 @@ static node_ref_t get_next_child_ref(const void *node, int *child_idx) {
                 *child_idx = byte + 1;
                 uint8_t slot = n->keys[byte];
                 if (slot != NODE48_EMPTY) {
-                    return (node_ref_t){.page_id = n->child_page_ids[slot],
-                                        .offset  = n->child_offsets[slot]};
+                    return n->children[slot];
                 }
             }
             return NULL_NODE_REF;
@@ -107,9 +104,8 @@ static node_ref_t get_next_child_ref(const void *node, int *child_idx) {
             while (*child_idx < 256) {
                 int byte = *child_idx;
                 *child_idx = byte + 1;
-                if (n->child_page_ids[byte] != 0) {
-                    return (node_ref_t){.page_id = n->child_page_ids[byte],
-                                        .offset  = n->child_offsets[byte]};
+                if (n->children[byte] != 0) {
+                    return n->children[byte];
                 }
             }
             return NULL_NODE_REF;
@@ -131,10 +127,10 @@ static bool copy_leaf_data(data_art_iterator_t *iter, const data_art_leaf_t *lea
     iter->current_value = NULL;
 
     // Copy key
-    iter->current_key_len = leaf->key_len;
-    iter->current_key = malloc(leaf->key_len);
+    iter->current_key_len = iter->tree->key_size;
+    iter->current_key = malloc(iter->tree->key_size);
     if (!iter->current_key) return false;
-    memcpy(iter->current_key, leaf->data, leaf->key_len);
+    memcpy(iter->current_key, leaf->data, iter->tree->key_size);
 
     // Copy value
     iter->current_value_len = leaf->value_len;
@@ -159,7 +155,7 @@ static bool copy_leaf_data(data_art_iterator_t *iter, const data_art_leaf_t *lea
             return false;
         }
     } else {
-        memcpy(iter->current_value, leaf->data + leaf->key_len, leaf->value_len);
+        memcpy(iter->current_value, leaf->data + iter->tree->key_size, leaf->value_len);
     }
 
     return true;
@@ -178,11 +174,7 @@ data_art_iterator_t *data_art_iterator_create(data_art_tree_t *tree) {
     iter->tree = tree;
 
     // Capture committed root atomically for consistent snapshot
-    uint64_t root_page = atomic_load_explicit(&tree->committed_root_page_id,
-                                               memory_order_acquire);
-    uint32_t root_off = atomic_load_explicit(&tree->committed_root_offset,
-                                              memory_order_relaxed);
-    iter->root = (node_ref_t){.page_id = root_page, .offset = root_off};
+    iter->root = atomic_load_explicit(&tree->committed_root, memory_order_acquire);
 
     iter->depth = -1;
     iter->done = node_ref_is_null(iter->root);
@@ -219,7 +211,7 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
         const void *node = data_art_load_node(iter->tree, frame->node_ref);
         if (!node) {
             LOG_ERROR("Iterator: failed to load node at page=%lu offset=%u",
-                      frame->node_ref.page_id, frame->node_ref.offset);
+                      node_ref_page_id(frame->node_ref), node_ref_offset(frame->node_ref));
             iter->done = true;
             goto out;
         }
@@ -377,8 +369,7 @@ static node_ref_t find_child_ge(const void *node, uint8_t byte,
                 if (n->keys[i] >= byte) {
                     *exact = (n->keys[i] == byte);
                     *child_idx = i + 1;  // parent continues after this child
-                    return (node_ref_t){.page_id = n->child_page_ids[i],
-                                        .offset  = n->child_offsets[i]};
+                    return n->children[i];
                 }
             }
             return NULL_NODE_REF;
@@ -389,8 +380,7 @@ static node_ref_t find_child_ge(const void *node, uint8_t byte,
                 if (n->keys[i] >= byte) {
                     *exact = (n->keys[i] == byte);
                     *child_idx = i + 1;
-                    return (node_ref_t){.page_id = n->child_page_ids[i],
-                                        .offset  = n->child_offsets[i]};
+                    return n->children[i];
                 }
             }
             return NULL_NODE_REF;
@@ -402,8 +392,7 @@ static node_ref_t find_child_ge(const void *node, uint8_t byte,
                 if (slot != NODE48_EMPTY) {
                     *exact = (b == byte);
                     *child_idx = b + 1;  // continue scanning from next byte
-                    return (node_ref_t){.page_id = n->child_page_ids[slot],
-                                        .offset  = n->child_offsets[slot]};
+                    return n->children[slot];
                 }
             }
             return NULL_NODE_REF;
@@ -411,11 +400,10 @@ static node_ref_t find_child_ge(const void *node, uint8_t byte,
         case DATA_NODE_256: {
             const data_art_node256_t *n = (const data_art_node256_t *)node;
             for (int b = byte; b < 256; b++) {
-                if (n->child_page_ids[b] != 0) {
+                if (n->children[b] != 0) {
                     *exact = (b == byte);
                     *child_idx = b + 1;
-                    return (node_ref_t){.page_id = n->child_page_ids[b],
-                                        .offset  = n->child_offsets[b]};
+                    return n->children[b];
                 }
             }
             return NULL_NODE_REF;
@@ -481,9 +469,10 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
             }
 
             // Compare leaf key with seek key
-            size_t cmp_len = leaf->key_len < key_len ? leaf->key_len : key_len;
+            size_t leaf_key_len = iter->tree->key_size;
+            size_t cmp_len = leaf_key_len < key_len ? leaf_key_len : key_len;
             int cmp = memcmp(leaf->data, key, cmp_len);
-            if (cmp == 0) cmp = (int)leaf->key_len - (int)key_len;
+            if (cmp == 0) cmp = (int)leaf_key_len - (int)key_len;
 
             if (cmp >= 0) {
                 // leaf >= seek key: this is our target

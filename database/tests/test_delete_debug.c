@@ -60,11 +60,11 @@ int main(void) {
         snprintf(key, sizeof(key), "key_%03d", to_delete[i]);
 
         printf("  >>> Deleting key_%03d\n", to_delete[i]);
-        printf("      Tree root before delete: page=%lu\n", tree->root.page_id);
+        printf("      Tree root before delete: page=%lu\n", node_ref_page_id(tree->root));
 
         bool success = data_art_delete(tree, (uint8_t*)key, strlen(key));
         printf("      Delete result: %s\n", success ? "SUCCESS" : "FAILED");
-        printf("      Tree root after delete: page=%lu\n", tree->root.page_id);
+        printf("      Tree root after delete: page=%lu\n", node_ref_page_id(tree->root));
         printf("      Tree size after delete: %zu\n", data_art_size(tree));
         assert(success);
     }

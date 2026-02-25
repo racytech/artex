@@ -171,8 +171,8 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
     
     const void *node = data_art_load_node(tree, node_ref);
     if (!node) {
-        LOG_ERROR("Failed to load node at page=%lu, offset=%u", 
-                 node_ref.page_id, node_ref.offset);
+        LOG_ERROR("Failed to load node at page=%lu, offset=%u",
+                 node_ref_page_id(node_ref), node_ref_offset(node_ref));
         return node_ref;
     }
     
@@ -220,7 +220,7 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                 modified_leaf->xmax = tree->current_txn_id;
                 
                 // Write modified leaf back (CoW, hint = old page for same-page COW)
-                node_ref_t new_ref = data_art_alloc_node_hint(tree, leaf_size, node_ref.page_id);
+                node_ref_t new_ref = data_art_alloc_node_hint(tree, leaf_size, node_ref_page_id(node_ref));
                 if (node_ref_is_null(new_ref)) {
                     LOG_ERROR("Failed to allocate new leaf page");
                     free(modified_leaf);
@@ -349,8 +349,7 @@ static node_ref_t update_child(data_art_tree_t *tree, node_ref_t node_ref,
             data_art_node4_t *n4 = (data_art_node4_t *)new_node;
             for (int i = 0; i < n4->num_children; i++) {
                 if (n4->keys[i] == byte) {
-                    n4->child_page_ids[i] = new_child_ref.page_id;
-                    n4->child_offsets[i] = new_child_ref.offset;
+                    n4->children[i] = new_child_ref;
                     break;
                 }
             }
@@ -360,8 +359,7 @@ static node_ref_t update_child(data_art_tree_t *tree, node_ref_t node_ref,
             data_art_node16_t *n16 = (data_art_node16_t *)new_node;
             for (int i = 0; i < n16->num_children; i++) {
                 if (n16->keys[i] == byte) {
-                    n16->child_page_ids[i] = new_child_ref.page_id;
-                    n16->child_offsets[i] = new_child_ref.offset;
+                    n16->children[i] = new_child_ref;
                     break;
                 }
             }
@@ -371,15 +369,13 @@ static node_ref_t update_child(data_art_tree_t *tree, node_ref_t node_ref,
             data_art_node48_t *n48 = (data_art_node48_t *)new_node;
             int index = n48->keys[byte];
             if (index != 255) {  // 255 means empty slot
-                n48->child_page_ids[index] = new_child_ref.page_id;
-                n48->child_offsets[index] = new_child_ref.offset;
+                n48->children[index] = new_child_ref;
             }
             break;
         }
         case DATA_NODE_256: {
             data_art_node256_t *n256 = (data_art_node256_t *)new_node;
-            n256->child_page_ids[byte] = new_child_ref.page_id;
-            n256->child_offsets[byte] = new_child_ref.offset;
+            n256->children[byte] = new_child_ref;
             break;
         }
         default:
@@ -389,24 +385,24 @@ static node_ref_t update_child(data_art_tree_t *tree, node_ref_t node_ref,
     }
     
     // Allocate new page and write the node (hint = old page for same-page COW)
-    node_ref_t new_ref = data_art_alloc_node_hint(tree, node_size, node_ref.page_id);
+    node_ref_t new_ref = data_art_alloc_node_hint(tree, node_size, node_ref_page_id(node_ref));
     if (node_ref_is_null(new_ref)) {
         LOG_ERROR("Failed to allocate page for updated node");
         free(new_node);
         return node_ref;
     }
-    
+
     if (!data_art_write_node(tree, new_ref, new_node, node_size)) {
         LOG_ERROR("Failed to write updated node");
         free(new_node);
         return node_ref;
     }
-    
+
     free(new_node);
-    
+
     // Release old page - decrement ref count and mark dead if 0
     data_art_release_page(tree, node_ref);
-    
+
     return new_ref;
 }
 
@@ -465,12 +461,12 @@ static node_ref_t remove_child(data_art_tree_t *tree, node_ref_t node_ref,
         
         case DATA_NODE_256: {
             const data_art_node256_t *n256 = (const data_art_node256_t *)node;
-            
-            if (n256->child_page_ids[byte] == 0 && n256->child_offsets[byte] == 0) {
+
+            if (n256->children[byte] == 0) {
                 // Child doesn't exist
                 return node_ref;
             }
-            
+
             child_pos = byte;
             break;
         }
@@ -503,53 +499,47 @@ static node_ref_t remove_child(data_art_tree_t *tree, node_ref_t node_ref,
     switch (type) {
         case DATA_NODE_4: {
             data_art_node4_t *n4 = (data_art_node4_t *)new_node;
-            
+
             // Shift keys and children to fill the gap
             for (int i = child_pos; i < num_children - 1; i++) {
                 n4->keys[i] = n4->keys[i + 1];
-                n4->child_page_ids[i] = n4->child_page_ids[i + 1];
-                n4->child_offsets[i] = n4->child_offsets[i + 1];
+                n4->children[i] = n4->children[i + 1];
             }
-            
+
             // Clear the last slot
             n4->keys[num_children - 1] = 0;
-            n4->child_page_ids[num_children - 1] = 0;
-            n4->child_offsets[num_children - 1] = 0;
+            n4->children[num_children - 1] = 0;
             break;
         }
         
         case DATA_NODE_16: {
             data_art_node16_t *n16 = (data_art_node16_t *)new_node;
-            
+
             // Shift keys and children to fill the gap
             for (int i = child_pos; i < num_children - 1; i++) {
                 n16->keys[i] = n16->keys[i + 1];
-                n16->child_page_ids[i] = n16->child_page_ids[i + 1];
-                n16->child_offsets[i] = n16->child_offsets[i + 1];
+                n16->children[i] = n16->children[i + 1];
             }
-            
+
             // Clear the last slot
             n16->keys[num_children - 1] = 0;
-            n16->child_page_ids[num_children - 1] = 0;
-            n16->child_offsets[num_children - 1] = 0;
+            n16->children[num_children - 1] = 0;
             break;
         }
         
         case DATA_NODE_48: {
             data_art_node48_t *n48 = (data_art_node48_t *)new_node;
-            
+
             // Mark index slot as empty
             n48->keys[byte] = 0xFF;
-            
+
             // Shift children down to fill the gap
             for (int i = child_pos; i < num_children - 1; i++) {
-                n48->child_page_ids[i] = n48->child_page_ids[i + 1];
-                n48->child_offsets[i] = n48->child_offsets[i + 1];
+                n48->children[i] = n48->children[i + 1];
             }
-            
+
             // Clear the last slot
-            n48->child_page_ids[num_children - 1] = 0;
-            n48->child_offsets[num_children - 1] = 0;
+            n48->children[num_children - 1] = 0;
             
             // Update all index entries that pointed after the removed position
             for (int i = 0; i < 256; i++) {
@@ -562,33 +552,32 @@ static node_ref_t remove_child(data_art_tree_t *tree, node_ref_t node_ref,
         
         case DATA_NODE_256: {
             data_art_node256_t *n256 = (data_art_node256_t *)new_node;
-            
+
             // Simply zero out the child pointer
-            n256->child_page_ids[byte] = 0;
-            n256->child_offsets[byte] = 0;
+            n256->children[byte] = 0;
             break;
         }
     }
     
     // Allocate new page for modified node (hint = old page for same-page COW)
-    node_ref_t new_ref = data_art_alloc_node_hint(tree, node_size, node_ref.page_id);
+    node_ref_t new_ref = data_art_alloc_node_hint(tree, node_size, node_ref_page_id(node_ref));
     if (node_ref_is_null(new_ref)) {
         free(new_node);
         LOG_ERROR("Failed to allocate page for modified node");
         return node_ref;
     }
-    
+
     if (!data_art_write_node(tree, new_ref, new_node, node_size)) {
         free(new_node);
         LOG_ERROR("Failed to write modified node");
         return node_ref;
     }
-    
+
     free(new_node);
     *did_remove = true;
-    
+
     LOG_DEBUG("[REMOVE_CHILD] Created new node at page=%lu, releasing old page=%lu",
-              new_ref.page_id, node_ref.page_id);
+              node_ref_page_id(new_ref), node_ref_page_id(node_ref));
     
     // Release old page - decrement ref count and mark dead if 0
     data_art_release_page(tree, node_ref);
@@ -642,11 +631,8 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref) {
                 // If the child is a leaf, return it
                 // If the child is a node, we might be able to merge prefixes
                 const data_art_node4_t *n4 = (const data_art_node4_t *)node;
-                
-                node_ref_t child_ref = {
-                    .page_id = n4->child_page_ids[0],
-                    .offset = n4->child_offsets[0]
-                };
+
+                node_ref_t child_ref = n4->children[0];
                 
                 const void *child_node = data_art_load_node(tree, child_ref);
                 if (child_node) {
@@ -697,15 +683,14 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref) {
         // NODE_256 -> NODE_48
         const data_art_node256_t *old_n256 = (const data_art_node256_t *)node;
         data_art_node48_t *new_n48 = (data_art_node48_t *)new_node;
-        
+
         memset(new_n48->keys, 0xFF, 256);
-        
+
         int pos = 0;
         for (int i = 0; i < 256; i++) {
-            if (old_n256->child_page_ids[i] != 0) {
+            if (old_n256->children[i] != 0) {
                 new_n48->keys[i] = pos;
-                new_n48->child_page_ids[pos] = old_n256->child_page_ids[i];
-                new_n48->child_offsets[pos] = old_n256->child_offsets[i];
+                new_n48->children[pos] = old_n256->children[i];
                 pos++;
             }
         }
@@ -713,14 +698,13 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref) {
         // NODE_48 -> NODE_16
         const data_art_node48_t *old_n48 = (const data_art_node48_t *)node;
         data_art_node16_t *new_n16 = (data_art_node16_t *)new_node;
-        
+
         int pos = 0;
         for (int i = 0; i < 256; i++) {
             if (old_n48->keys[i] != 0xFF) {
                 uint8_t child_idx = old_n48->keys[i];
                 new_n16->keys[pos] = i;
-                new_n16->child_page_ids[pos] = old_n48->child_page_ids[child_idx];
-                new_n16->child_offsets[pos] = old_n48->child_offsets[child_idx];
+                new_n16->children[pos] = old_n48->children[child_idx];
                 pos++;
             }
         }
@@ -728,11 +712,10 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref) {
         // NODE_16 -> NODE_4
         const data_art_node16_t *old_n16 = (const data_art_node16_t *)node;
         data_art_node4_t *new_n4 = (data_art_node4_t *)new_node;
-        
+
         for (int i = 0; i < num_children; i++) {
             new_n4->keys[i] = old_n16->keys[i];
-            new_n4->child_page_ids[i] = old_n16->child_page_ids[i];
-            new_n4->child_offsets[i] = old_n16->child_offsets[i];
+            new_n4->children[i] = old_n16->children[i];
         }
     }
     

@@ -6,13 +6,13 @@
  * All keys must have the same length (e.g., Ethereum: 20 bytes for addresses, 32 bytes for storage keys).
  *
  * Disk-backed ART implementation with:
- * - Page references instead of pointers
+ * - Packed page references (page_id + offset in a single uint64_t)
  * - Copy-on-Write (CoW) for MVCC
  * - mmap-backed storage for persistence
  * - Serialized node structures for persistence
  *
  * Key differences from mem_art:
- * - Uses node_ref_t (page_id, offset) instead of pointers
+ * - Uses node_ref_t (packed uint64_t) instead of pointers
  * - All nodes serialized to fixed-size structures
  * - Backed by mmap_storage (memory-mapped file)
  * - Supports versioning via MVCC snapshots
@@ -34,28 +34,40 @@ typedef struct mvcc_manager mvcc_manager_t;
 typedef struct mvcc_snapshot mvcc_snapshot_t;
 
 // ============================================================================
-// Node Reference (Page-based addressing)
+// Node Reference (Packed Page-based addressing)
 // ============================================================================
 
 /**
- * Reference to a node stored on disk
- * 
- * Instead of memory pointers, we use (page_id, offset) pairs to reference
- * nodes. This allows persistence and enables buffer pool caching.
+ * Reference to a node stored on disk.
+ *
+ * Packed into a single uint64_t for compact storage in node child arrays:
+ *   bits [63:12] = page_id  (52 bits, supports up to 2^52 * 4KB = 16 EB)
+ *   bits [11:0]  = offset   (12 bits, 0-4095 within page data area)
+ *
+ * A ref of 0 represents NULL (page_id=0 is reserved for the file header).
  */
-typedef struct {
-    uint64_t page_id;    // Which page contains this node (0 = NULL)
-    uint32_t offset;     // Offset within page (0-4095)
-} node_ref_t;
+typedef uint64_t node_ref_t;
 
-#define NULL_NODE_REF ((node_ref_t){.page_id = 0, .offset = 0})
+#define NULL_NODE_REF ((node_ref_t)0)
+
+static inline node_ref_t node_ref_make(uint64_t page_id, uint32_t offset) {
+    return (page_id << 12) | (offset & 0xFFF);
+}
+
+static inline uint64_t node_ref_page_id(node_ref_t ref) {
+    return ref >> 12;
+}
+
+static inline uint32_t node_ref_offset(node_ref_t ref) {
+    return (uint32_t)(ref & 0xFFF);
+}
 
 static inline bool node_ref_is_null(node_ref_t ref) {
-    return ref.page_id == 0;
+    return ref == 0;
 }
 
 static inline bool node_ref_equals(node_ref_t a, node_ref_t b) {
-    return a.page_id == b.page_id && a.offset == b.offset;
+    return a == b;
 }
 
 // ============================================================================
@@ -134,17 +146,19 @@ typedef struct {
 #define LEAF_FLAG_NONE     0x00
 #define LEAF_FLAG_OVERFLOW 0x01  // Has overflow pages for large value
 
+// Leaf header size (bytes): type(1)+flags(1)+pad(2)+value_len(4)+overflow_page(8)+
+//   inline_data_len(4)+xmin(8)+xmax(8)+prev_version(8) = 44
+#define LEAF_HEADER_SIZE 44
+
 // Maximum inline data size — derived from PAGE_SIZE so it scales automatically.
-// Available = page data area - leaf header (56 bytes including struct padding)
-#define LEAF_HEADER_SIZE 56
 #define MAX_INLINE_DATA (PAGE_SIZE - PAGE_HEADER_SIZE - LEAF_HEADER_SIZE)
 
 /**
  * NODE_4: Up to 4 children
- * 
- * Size: 70 bytes (fixed)
+ *
+ * Size: 50 bytes (fixed)
  * Layout: type(1) + num_children(1) + partial_len(1) + pad(1) + partial(10) +
- *         keys(4) + child_page_ids(32) + child_offsets(16)
+ *         keys(4) + children(32)
  */
 typedef struct {
     uint8_t type;               // DATA_NODE_4
@@ -153,16 +167,15 @@ typedef struct {
     uint8_t padding1;           // Alignment
     uint8_t partial[10];        // Compressed path (max 10 bytes)
     uint8_t keys[4];            // Child keys
-    
-    // Children stored as page references
-    uint64_t child_page_ids[4];   // 32 bytes
-    uint32_t child_offsets[4];    // 16 bytes
+
+    // Children stored as packed page references (page_id << 12 | offset)
+    uint64_t children[4];       // 32 bytes
 } __attribute__((packed)) data_art_node4_t;
 
 /**
  * NODE_16: Up to 16 children
- * 
- * Size: 240 bytes (fixed)
+ *
+ * Size: 158 bytes (fixed)
  */
 typedef struct {
     uint8_t type;               // DATA_NODE_16
@@ -171,16 +184,14 @@ typedef struct {
     uint8_t padding1;
     uint8_t partial[10];
     uint8_t keys[16];
-    uint8_t padding2[2];        // Alignment
-    
-    uint64_t child_page_ids[16];  // 128 bytes
-    uint32_t child_offsets[16];   // 64 bytes
+
+    uint64_t children[16];      // 128 bytes
 } __attribute__((packed)) data_art_node16_t;
 
 /**
  * NODE_48: Up to 48 children (indexed)
- * 
- * Size: 658 bytes (fixed)
+ *
+ * Size: 654 bytes (fixed)
  * Uses index array: keys[byte_value] = child_slot (0-47, NODE48_EMPTY=empty)
  */
 #define NODE48_EMPTY 255
@@ -192,16 +203,14 @@ typedef struct {
     uint8_t padding1;
     uint8_t partial[10];
     uint8_t keys[256];          // Index: byte_value → child_slot
-    uint8_t padding2[2];
-    
-    uint64_t child_page_ids[48];  // 384 bytes
-    uint32_t child_offsets[48];   // 192 bytes
+
+    uint64_t children[48];      // 384 bytes
 } __attribute__((packed)) data_art_node48_t;
 
 /**
  * NODE_256: Up to 256 children (direct mapping)
- * 
- * Size: 3088 bytes (~75% of 4KB page)
+ *
+ * Size: 2062 bytes (~50% of 4KB page)
  * Direct array: children[byte_value] = child_ref
  */
 typedef struct {
@@ -210,51 +219,49 @@ typedef struct {
     uint8_t partial_len;
     uint8_t padding1;
     uint8_t partial[10];
-    uint8_t padding2[2];
-    
-    uint64_t child_page_ids[256];   // 2048 bytes
-    uint32_t child_offsets[256];    // 1024 bytes
+
+    uint64_t children[256];     // 2048 bytes
 } __attribute__((packed)) data_art_node256_t;
 
 /**
  * Leaf node: Stores key-value pair with MVCC versioning
- * 
- * For small values (key_len + value_len <= MAX_INLINE_DATA):
+ *
+ * Fixed-size keys: key_len is always tree->key_size, not stored in leaf.
+ *
+ * For small values (key_size + value_len <= MAX_INLINE_DATA):
  *   - Data stored inline in data[] array
  *   - overflow_page = 0
- * 
- * For large values (key_len + value_len > MAX_INLINE_DATA):
+ *
+ * For large values (key_size + value_len > MAX_INLINE_DATA):
  *   - Key stored inline in data[]
  *   - Value prefix stored inline (as much as fits)
  *   - Remaining value stored in overflow pages
  *   - overflow_page points to first overflow page
- * 
+ *
  * MVCC fields:
  *   - xmin: Transaction ID that created this version
  *   - xmax: Transaction ID that deleted/superseded this version (0 = current)
  *   - prev_version: Link to previous version of same key (for version chains)
- * 
+ *
  * Version chains:
  *   Tree always points to LATEST version. Each version links to older version.
  *   Example: Latest(xmin=3) -> Middle(xmin=2) -> Oldest(xmin=1) -> NULL
  *   Snapshots walk chain to find visible version based on xmin/xmax.
- * 
- * Size: 52 + inline_data_len (variable) [+12 bytes for prev_version]
- * Layout: type(1) + flags(1) + pad(2) + key_len(4) + value_len(4) +
- *         overflow_page(8) + inline_data_len(4) + xmin(8) + xmax(8) +
- *         prev_version(12) + data[...]
+ *
+ * Size: 44 + inline_data_len (variable)
+ * Layout: type(1) + flags(1) + pad(2) + value_len(4) + overflow_page(8) +
+ *         inline_data_len(4) + xmin(8) + xmax(8) + prev_version(8) + data[...]
  */
 typedef struct {
     uint8_t type;               // DATA_NODE_LEAF
     uint8_t flags;              // LEAF_FLAG_OVERFLOW if value spans pages
     uint8_t padding[2];
-    uint32_t key_len;           // Length of key
     uint32_t value_len;         // Total value length (may span overflow pages)
     uint64_t overflow_page;     // First overflow page ID (0 if none)
     uint32_t inline_data_len;   // Bytes stored inline in data[]
     uint64_t xmin;              // Transaction that created this version
     uint64_t xmax;              // Transaction that deleted/superseded this version (0 = current)
-    node_ref_t prev_version;    // Previous version of same key (NULL_NODE_REF = no older version)
+    node_ref_t prev_version;    // Previous version of same key (0 = no older version)
     uint8_t data[];             // key + value (or value prefix if overflow)
 } __attribute__((packed)) data_art_leaf_t;
 
@@ -284,34 +291,33 @@ typedef struct {
 
 /**
  * Persistent ART tree
- * 
+ *
  * Manages disk-backed adaptive radix tree with CoW and versioning.
  */
 typedef struct data_art_tree {
     // Storage backend
     mmap_storage_t *mmap_storage;
-    
+
     // Current tree state
     node_ref_t root;             // Root node reference
     uint64_t version;            // Current version number
     size_t size;                 // Number of key-value pairs
     size_t key_size;             // Fixed key size (20 or 32 bytes for Ethereum)
     size_t max_depth;            // Precomputed: key_size + 1 (for 0x00 terminator)
-    
+
     // Transaction support
     uint64_t current_txn_id;     // Active transaction ID (0 = no transaction)
     struct txn_buffer *txn_buffer; // Buffer for pending operations (NULL if not in transaction)
-    
+
     // Concurrency control
     pthread_rwlock_t write_lock;  // Writers: wrlock. Readers: rdlock (coordinates with in-place mutation).
 
     // Lock-free read support: readers load committed root atomically, no lock needed
-    _Atomic uint64_t committed_root_page_id;
-    _Atomic uint32_t committed_root_offset;
+    _Atomic uint64_t committed_root;  // packed node_ref_t
 
     // MVCC support
     mvcc_manager_t *mvcc_manager; // MVCC manager for snapshot isolation
-    
+
     // Versioning (CoW support)
     bool cow_enabled;            // Enable copy-on-write
     uint64_t *active_versions;   // Array of active version IDs
@@ -384,7 +390,7 @@ void data_art_destroy(data_art_tree_t *tree);
 
 /**
  * Insert or update a key-value pair
- * 
+ *
  * @param tree Tree instance
  * @param key Byte array key
  * @param key_len Length of key in bytes
@@ -397,7 +403,7 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
 
 /**
  * Retrieve value by key
- * 
+ *
  * @param tree Tree instance
  * @param key Byte array key
  * @param key_len Length of key
@@ -410,7 +416,7 @@ const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_l
 
 /**
  * Delete a key-value pair
- * 
+ *
  * @param tree Tree instance
  * @param key Byte array key
  * @param key_len Length of key
@@ -420,7 +426,7 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len);
 
 /**
  * Check if key exists
- * 
+ *
  * @param tree Tree instance
  * @param key Byte array key
  * @param key_len Length of key
@@ -430,7 +436,7 @@ bool data_art_contains(data_art_tree_t *tree, const uint8_t *key, size_t key_len
 
 /**
  * Get number of key-value pairs
- * 
+ *
  * @param tree Tree instance
  * @return Number of entries
  */
@@ -438,7 +444,7 @@ size_t data_art_size(const data_art_tree_t *tree);
 
 /**
  * Check if tree is empty
- * 
+ *
  * @param tree Tree instance
  * @return true if empty
  */
@@ -461,9 +467,9 @@ const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
 
 /**
  * Allocate space for a new node
- * 
+ *
  * Finds a page with sufficient free space and returns a node reference.
- * 
+ *
  * @param tree Tree instance
  * @param size Size of node in bytes
  * @return Node reference, or NULL_NODE_REF on failure
@@ -485,9 +491,9 @@ node_ref_t data_art_alloc_node_hint(data_art_tree_t *tree, size_t size, uint64_t
 
 /**
  * Write a node to disk
- * 
+ *
  * Serializes node and writes to the page referenced by ref.
- * 
+ *
  * @param tree Tree instance
  * @param ref Node reference
  * @param node Node data to write
@@ -516,25 +522,25 @@ bool data_art_delete_internal(data_art_tree_t *tree, const uint8_t *key, size_t 
 
 /**
  * Read a large value from overflow pages
- * 
+ *
  * Traverses the overflow page chain and reconstructs the full value.
  * Allocates memory for the complete value.
- * 
+ *
  * @param tree Tree instance
  * @param leaf Leaf node with overflow flag set
  * @param value_out Output buffer (allocated by caller, size >= leaf->value_len)
  * @return true on success, false on error
  */
-bool data_art_read_overflow_value(data_art_tree_t *tree, 
+bool data_art_read_overflow_value(data_art_tree_t *tree,
                                    const data_art_leaf_t *leaf,
                                    void *value_out);
 
 /**
  * Write a large value to overflow pages
- * 
+ *
  * Creates a chain of overflow pages to store value data that doesn't
  * fit inline in the leaf node.
- * 
+ *
  * @param tree Tree instance
  * @param value Value data to write
  * @param value_len Total value length
@@ -548,10 +554,10 @@ uint64_t data_art_write_overflow_value(data_art_tree_t *tree,
 
 /**
  * Free overflow page chain
- * 
+ *
  * Releases all overflow pages in the chain starting from first_page.
  * Called when deleting a leaf or updating a value.
- * 
+ *
  * @param tree Tree instance
  * @param first_page First overflow page ID
  * @return Number of pages freed
@@ -564,9 +570,9 @@ size_t data_art_free_overflow_chain(data_art_tree_t *tree, uint64_t first_page);
 
 /**
  * Flush all dirty pages to disk
- * 
+ *
  * Forces all modified pages to be written. Called during checkpoint.
- * 
+ *
  * @param tree Tree instance
  * @return true on success, false on failure
  */
@@ -575,7 +581,7 @@ bool data_art_flush(data_art_tree_t *tree);
 
 /**
  * Get current root reference (for persistence)
- * 
+ *
  * @param tree Tree instance
  * @return Root node reference
  */
@@ -587,7 +593,7 @@ node_ref_t data_art_get_root(const data_art_tree_t *tree);
 
 /**
  * Begin a new transaction
- * 
+ *
  * @param tree Tree instance
  * @param txn_id_out Output parameter for transaction ID
  * @return true on success
@@ -596,7 +602,7 @@ bool data_art_begin_txn(data_art_tree_t *tree, uint64_t *txn_id_out);
 
 /**
  * Commit the current transaction
- * 
+ *
  * @param tree Tree instance
  * @return true on success
  */
@@ -604,7 +610,7 @@ bool data_art_commit_txn(data_art_tree_t *tree);
 
 /**
  * Abort the current transaction
- * 
+ *
  * @param tree Tree instance
  * @return true on success
  */
@@ -666,17 +672,16 @@ bool data_art_batch(data_art_tree_t *tree,
 typedef struct data_art_snapshot {
     mvcc_snapshot_t *mvcc_snapshot;  // Underlying MVCC snapshot
     uint64_t txn_id;                 // Transaction ID for this snapshot
-    uint64_t root_page_id;           // Committed root at snapshot creation time
-    uint32_t root_offset;            // Root offset within page
+    node_ref_t root;                 // Committed root at snapshot creation time
 } data_art_snapshot_t;
 
 /**
  * Create a snapshot for consistent read operations
- * 
+ *
  * Returns a snapshot handle that captures the current transaction state.
  * Each thread should have its own snapshot for concurrent reads.
  * The handle must be freed with data_art_end_snapshot().
- * 
+ *
  * @param tree Tree instance
  * @return Snapshot handle, or NULL on failure
  */
@@ -684,9 +689,9 @@ data_art_snapshot_t *data_art_begin_snapshot(data_art_tree_t *tree);
 
 /**
  * Release a snapshot
- * 
+ *
  * Releases the snapshot and frees its resources.
- * 
+ *
  * @param tree Tree instance
  * @param snapshot Snapshot handle to release
  */
@@ -694,7 +699,7 @@ void data_art_end_snapshot(data_art_tree_t *tree, data_art_snapshot_t *snapshot)
 
 /**
  * Get value with snapshot isolation
- * 
+ *
  * @param tree Tree instance
  * @param key Key to search for
  * @param key_len Length of key
@@ -798,14 +803,14 @@ typedef struct {
     uint64_t cache_hits;
     uint64_t cache_misses;
     double cache_hit_rate;
-    
+
     // Node type distribution
     size_t num_node4;
     size_t num_node16;
     size_t num_node48;
     size_t num_node256;
     size_t num_leaves;
-    
+
     // Overflow statistics
     size_t num_leaves_with_overflow;  // Leaves using overflow pages
     uint64_t overflow_pages_allocated;  // Total overflow pages created
@@ -824,7 +829,7 @@ typedef struct {
 
 /**
  * Get tree statistics
- * 
+ *
  * @param tree Tree instance
  * @param stats Output statistics structure
  */
@@ -832,16 +837,16 @@ void data_art_get_stats(const data_art_tree_t *tree, data_art_stats_t *stats);
 
 /**
  * Print tree statistics (for debugging)
- * 
+ *
  * @param tree Tree instance
  */
 void data_art_print_stats(const data_art_tree_t *tree);
 
 /**
  * Verify tree integrity
- * 
+ *
  * Checks for corruption and invariant violations.
- * 
+ *
  * @param tree Tree instance
  * @return true if tree is valid, false if corrupted
  */

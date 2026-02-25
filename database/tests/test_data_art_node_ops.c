@@ -65,7 +65,6 @@ static node_ref_t create_dummy_leaf(data_art_tree_t *tree, uint8_t id) {
     memset(buf, 0, sizeof(buf));
     data_art_leaf_t *leaf = (data_art_leaf_t *)buf;
     leaf->type = DATA_NODE_LEAF;
-    leaf->key_len = 1;
     leaf->value_len = 1;
     leaf->inline_data_len = 2;
 
@@ -96,8 +95,7 @@ static bool verify_child_exists(data_art_tree_t *tree, node_ref_t node_ref,
             const data_art_node4_t *n = (const data_art_node4_t *)node;
             for (int i = 0; i < n->num_children; i++) {
                 if (n->keys[i] == byte) {
-                    child_ref.page_id = n->child_page_ids[i];
-                    child_ref.offset = n->child_offsets[i];
+                    child_ref = n->children[i];
                     break;
                 }
             }
@@ -107,8 +105,7 @@ static bool verify_child_exists(data_art_tree_t *tree, node_ref_t node_ref,
             const data_art_node16_t *n = (const data_art_node16_t *)node;
             for (int i = 0; i < n->num_children; i++) {
                 if (n->keys[i] == byte) {
-                    child_ref.page_id = n->child_page_ids[i];
-                    child_ref.offset = n->child_offsets[i];
+                    child_ref = n->children[i];
                     break;
                 }
             }
@@ -118,16 +115,14 @@ static bool verify_child_exists(data_art_tree_t *tree, node_ref_t node_ref,
             const data_art_node48_t *n = (const data_art_node48_t *)node;
             uint8_t idx = n->keys[byte];
             if (idx != 255) {
-                child_ref.page_id = n->child_page_ids[idx];
-                child_ref.offset = n->child_offsets[idx];
+                child_ref = n->children[idx];
             }
             break;
         }
         case DATA_NODE_256: {
             const data_art_node256_t *n = (const data_art_node256_t *)node;
-            if (n->child_page_ids[byte] != 0) {
-                child_ref.page_id = n->child_page_ids[byte];
-                child_ref.offset = n->child_offsets[byte];
+            if (n->children[byte] != 0) {
+                child_ref = n->children[byte];
             }
             break;
         }

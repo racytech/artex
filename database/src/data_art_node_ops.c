@@ -64,8 +64,7 @@ static node_ref_t grow_node4_to_node16(data_art_tree_t *tree, node_ref_t old_ref
     // Copy children (sorted)
     for (int i = 0; i < n4->num_children; i++) {
         n16.keys[i] = n4->keys[i];
-        n16.child_page_ids[i] = n4->child_page_ids[i];
-        n16.child_offsets[i] = n4->child_offsets[i];
+        n16.children[i] = n4->children[i];
     }
     
     // Write to disk
@@ -109,8 +108,7 @@ static node_ref_t grow_node16_to_node48(data_art_tree_t *tree, node_ref_t old_re
     for (int i = 0; i < n16->num_children; i++) {
         uint8_t byte = n16->keys[i];
         n48.keys[byte] = i;  // Index into child arrays
-        n48.child_page_ids[i] = n16->child_page_ids[i];
-        n48.child_offsets[i] = n16->child_offsets[i];
+        n48.children[i] = n16->children[i];
     }
     
     // Write to disk
@@ -151,8 +149,7 @@ static node_ref_t grow_node48_to_node256(data_art_tree_t *tree, node_ref_t old_r
     for (int i = 0; i < 256; i++) {
         uint8_t idx = n48->keys[i];
         if (idx != NODE48_EMPTY) {
-            n256.child_page_ids[i] = n48->child_page_ids[idx];
-            n256.child_offsets[i] = n48->child_offsets[idx];
+            n256.children[i] = n48->children[idx];
         }
     }
     
@@ -181,10 +178,10 @@ static node_ref_t add_child_node4(data_art_tree_t *tree, node_ref_t node_ref,
     // Check for duplicate key first
     for (int i = 0; i < n4->num_children; i++) {
         if (n4->keys[i] == byte) {
-            LOG_ERROR("BUG: Attempted to add duplicate child byte=0x%02x to NODE_4 at page=%lu (already has %u children)", 
-                     byte, node_ref.page_id, n4->num_children);
-            LOG_ERROR("  Existing child at index %d points to page=%lu", i, n4->child_page_ids[i]);
-            LOG_ERROR("  New child would point to page=%lu", child_ref.page_id);
+            LOG_ERROR("BUG: Attempted to add duplicate child byte=0x%02x to NODE_4 at page=%lu (already has %u children)",
+                     byte, node_ref_page_id(node_ref), n4->num_children);
+            LOG_ERROR("  Existing child at index %d points to page=%lu", i, node_ref_page_id(n4->children[i]));
+            LOG_ERROR("  New child would point to page=%lu", node_ref_page_id(child_ref));
             // Return error to prevent corruption
             return NULL_NODE_REF;
         }
@@ -218,22 +215,19 @@ static node_ref_t add_child_node4(data_art_tree_t *tree, node_ref_t node_ref,
     
     // Shift elements
     if (pos < new_n4.num_children) {
-        memmove(&new_n4.keys[pos + 1], &new_n4.keys[pos], 
+        memmove(&new_n4.keys[pos + 1], &new_n4.keys[pos],
                 new_n4.num_children - pos);
-        memmove(&new_n4.child_page_ids[pos + 1], &new_n4.child_page_ids[pos],
+        memmove(&new_n4.children[pos + 1], &new_n4.children[pos],
                 (new_n4.num_children - pos) * sizeof(uint64_t));
-        memmove(&new_n4.child_offsets[pos + 1], &new_n4.child_offsets[pos],
-                (new_n4.num_children - pos) * sizeof(uint32_t));
     }
-    
+
     // Insert
     new_n4.keys[pos] = byte;
-    new_n4.child_page_ids[pos] = child_ref.page_id;
-    new_n4.child_offsets[pos] = child_ref.offset;
+    new_n4.children[pos] = child_ref;
     new_n4.num_children++;
-    
+
     // CoW: allocate new page (hint = old page for same-page COW), write there, release old
-    node_ref_t new_ref = data_art_alloc_node_hint(tree, sizeof(data_art_node4_t), node_ref.page_id);
+    node_ref_t new_ref = data_art_alloc_node_hint(tree, sizeof(data_art_node4_t), node_ref_page_id(node_ref));
     if (node_ref_is_null(new_ref)) {
         LOG_ERROR("Failed to allocate new NODE_4 for CoW");
         return NULL_NODE_REF;
@@ -277,7 +271,7 @@ static node_ref_t add_child_node16(data_art_tree_t *tree, node_ref_t node_ref,
         if (n16->keys[i] == byte) {
             LOG_ERROR("BUG: Attempted to add duplicate child byte=0x%02x to NODE_16 at page=%lu "
                      "(num_children=%u)",
-                     byte, node_ref.page_id, n16->num_children);
+                     byte, node_ref_page_id(node_ref), n16->num_children);
             return NULL_NODE_REF;
         }
     }
@@ -290,22 +284,19 @@ static node_ref_t add_child_node16(data_art_tree_t *tree, node_ref_t node_ref,
     
     // Shift elements
     if (pos < new_n16.num_children) {
-        memmove(&new_n16.keys[pos + 1], &new_n16.keys[pos], 
+        memmove(&new_n16.keys[pos + 1], &new_n16.keys[pos],
                 new_n16.num_children - pos);
-        memmove(&new_n16.child_page_ids[pos + 1], &new_n16.child_page_ids[pos],
+        memmove(&new_n16.children[pos + 1], &new_n16.children[pos],
                 (new_n16.num_children - pos) * sizeof(uint64_t));
-        memmove(&new_n16.child_offsets[pos + 1], &new_n16.child_offsets[pos],
-                (new_n16.num_children - pos) * sizeof(uint32_t));
     }
-    
+
     // Insert
     new_n16.keys[pos] = byte;
-    new_n16.child_page_ids[pos] = child_ref.page_id;
-    new_n16.child_offsets[pos] = child_ref.offset;
+    new_n16.children[pos] = child_ref;
     new_n16.num_children++;
-    
+
     // CoW: allocate new page (hint = old page for same-page COW), write there, release old
-    node_ref_t new_ref = data_art_alloc_node_hint(tree, sizeof(data_art_node16_t), node_ref.page_id);
+    node_ref_t new_ref = data_art_alloc_node_hint(tree, sizeof(data_art_node16_t), node_ref_page_id(node_ref));
     if (node_ref_is_null(new_ref)) {
         LOG_ERROR("Failed to allocate new NODE_16 for CoW");
         return NULL_NODE_REF;
@@ -348,7 +339,7 @@ static node_ref_t add_child_node48(data_art_tree_t *tree, node_ref_t node_ref,
     if (n48->keys[byte] != 255) {
         LOG_ERROR("BUG: Attempted to add duplicate child byte=0x%02x to NODE_48 at page=%lu "
                  "(num_children=%u, slot=%u)",
-                 byte, node_ref.page_id, n48->num_children, n48->keys[byte]);
+                 byte, node_ref_page_id(node_ref), n48->num_children, n48->keys[byte]);
         return NULL_NODE_REF;
     }
     
@@ -368,12 +359,11 @@ static node_ref_t add_child_node48(data_art_tree_t *tree, node_ref_t node_ref,
     
     // Set index and child
     new_n48.keys[byte] = slot;
-    new_n48.child_page_ids[slot] = child_ref.page_id;
-    new_n48.child_offsets[slot] = child_ref.offset;
+    new_n48.children[slot] = child_ref;
     new_n48.num_children++;
-    
+
     // CoW: allocate new page (hint = old page for same-page COW), write there, release old
-    node_ref_t new_ref = data_art_alloc_node_hint(tree, sizeof(data_art_node48_t), node_ref.page_id);
+    node_ref_t new_ref = data_art_alloc_node_hint(tree, sizeof(data_art_node48_t), node_ref_page_id(node_ref));
     if (node_ref_is_null(new_ref)) {
         LOG_ERROR("Failed to allocate new NODE_48 for CoW");
         return NULL_NODE_REF;
@@ -392,15 +382,15 @@ static node_ref_t add_child_node48(data_art_tree_t *tree, node_ref_t node_ref,
  */
 static node_ref_t add_child_node256(data_art_tree_t *tree, node_ref_t node_ref,
                                      const data_art_node256_t *n256, uint8_t byte, node_ref_t child_ref) {
-    if (n256->child_page_ids[byte] != 0) {
+    if (n256->children[byte] != 0) {
         LOG_ERROR("BUG: Attempted to add duplicate child byte=0x%02x to NODE_256 at page=%lu "
                  "(existing child at page=%lu)",
-                 byte, node_ref.page_id, n256->child_page_ids[byte]);
+                 byte, node_ref_page_id(node_ref), node_ref_page_id(n256->children[byte]));
         return NULL_NODE_REF;
     }
 
-    // Optimized CoW: copy whole node mmap-to-mmap, patch 13 bytes (num_children + child ref)
-    node_ref_t new_ref = data_art_alloc_node_hint(tree, sizeof(data_art_node256_t), node_ref.page_id);
+    // Optimized CoW: copy whole node mmap-to-mmap, patch 9 bytes (num_children + child ref)
+    node_ref_t new_ref = data_art_alloc_node_hint(tree, sizeof(data_art_node256_t), node_ref_page_id(node_ref));
     if (node_ref_is_null(new_ref)) {
         LOG_ERROR("Failed to allocate new NODE_256 for CoW");
         return NULL_NODE_REF;
@@ -412,11 +402,8 @@ static node_ref_t add_child_node256(data_art_tree_t *tree, node_ref_t node_ref,
     data_art_write_partial(tree, new_ref, offsetof(data_art_node256_t, num_children),
                            &new_count, sizeof(uint8_t));
     data_art_write_partial(tree, new_ref,
-                           offsetof(data_art_node256_t, child_page_ids) + byte * sizeof(uint64_t),
-                           &child_ref.page_id, sizeof(uint64_t));
-    data_art_write_partial(tree, new_ref,
-                           offsetof(data_art_node256_t, child_offsets) + byte * sizeof(uint32_t),
-                           &child_ref.offset, sizeof(uint32_t));
+                           offsetof(data_art_node256_t, children) + byte * sizeof(uint64_t),
+                           &child_ref, sizeof(uint64_t));
 
     data_art_release_page(tree, node_ref);
     return new_ref;
@@ -484,14 +471,11 @@ node_ref_t data_art_add_child_inplace(data_art_tree_t *tree, node_ref_t node_ref
             while (pos < m->num_children && m->keys[pos] < byte) pos++;
             if (pos < m->num_children) {
                 memmove(&m->keys[pos + 1], &m->keys[pos], m->num_children - pos);
-                memmove(&m->child_page_ids[pos + 1], &m->child_page_ids[pos],
+                memmove(&m->children[pos + 1], &m->children[pos],
                         (m->num_children - pos) * sizeof(uint64_t));
-                memmove(&m->child_offsets[pos + 1], &m->child_offsets[pos],
-                        (m->num_children - pos) * sizeof(uint32_t));
             }
             m->keys[pos] = byte;
-            m->child_page_ids[pos] = child_ref.page_id;
-            m->child_offsets[pos] = child_ref.offset;
+            m->children[pos] = child_ref;
             m->num_children++;
             data_art_unlock_node_mut(tree);
             tree->inplace_mutations++;
@@ -508,14 +492,11 @@ node_ref_t data_art_add_child_inplace(data_art_tree_t *tree, node_ref_t node_ref
             while (pos < m->num_children && m->keys[pos] < byte) pos++;
             if (pos < m->num_children) {
                 memmove(&m->keys[pos + 1], &m->keys[pos], m->num_children - pos);
-                memmove(&m->child_page_ids[pos + 1], &m->child_page_ids[pos],
+                memmove(&m->children[pos + 1], &m->children[pos],
                         (m->num_children - pos) * sizeof(uint64_t));
-                memmove(&m->child_offsets[pos + 1], &m->child_offsets[pos],
-                        (m->num_children - pos) * sizeof(uint32_t));
             }
             m->keys[pos] = byte;
-            m->child_page_ids[pos] = child_ref.page_id;
-            m->child_offsets[pos] = child_ref.offset;
+            m->children[pos] = child_ref;
             m->num_children++;
             data_art_unlock_node_mut(tree);
             tree->inplace_mutations++;
@@ -538,8 +519,7 @@ node_ref_t data_art_add_child_inplace(data_art_tree_t *tree, node_ref_t node_ref
                 if (!used) break;
             }
             m->keys[byte] = slot;
-            m->child_page_ids[slot] = child_ref.page_id;
-            m->child_offsets[slot] = child_ref.offset;
+            m->children[slot] = child_ref;
             m->num_children++;
             data_art_unlock_node_mut(tree);
             tree->inplace_mutations++;
@@ -547,14 +527,13 @@ node_ref_t data_art_add_child_inplace(data_art_tree_t *tree, node_ref_t node_ref
         }
         case DATA_NODE_256: {
             const data_art_node256_t *n256 = (const data_art_node256_t *)node;
-            if (n256->child_page_ids[byte] != 0) {
+            if (n256->children[byte] != 0) {
                 LOG_ERROR("BUG: duplicate child byte=0x%02x in NODE_256 inplace", byte);
                 return NULL_NODE_REF;
             }
             void *mut = data_art_lock_node_mut(tree, node_ref);
             data_art_node256_t *m = (data_art_node256_t *)mut;
-            m->child_page_ids[byte] = child_ref.page_id;
-            m->child_offsets[byte] = child_ref.offset;
+            m->children[byte] = child_ref;
             m->num_children++;
             data_art_unlock_node_mut(tree);
             tree->inplace_mutations++;

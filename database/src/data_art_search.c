@@ -34,11 +34,7 @@ extern bool data_art_read_overflow_value(data_art_tree_t *tree,
 
 // Read the committed root atomically (no lock needed).
 static inline node_ref_t data_art_read_committed_root(data_art_tree_t *tree) {
-    uint64_t page_id = atomic_load_explicit(&tree->committed_root_page_id,
-                                             memory_order_acquire);
-    uint32_t offset = atomic_load_explicit(&tree->committed_root_offset,
-                                            memory_order_relaxed);
-    return (node_ref_t){.page_id = page_id, .offset = offset};
+    return atomic_load_explicit(&tree->committed_root, memory_order_acquire);
 }
 
 // ============================================================================
@@ -52,13 +48,13 @@ node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) 
     const void *node = data_art_load_node(tree, node_ref);
     if (!node) {
         LOG_INFO("find_child: failed to load node at page=%lu offset=%u",
-                 node_ref.page_id, node_ref.offset);
+                 node_ref_page_id(node_ref), node_ref_offset(node_ref));
         return NULL_NODE_REF;
     }
 
     uint8_t type = *(const uint8_t *)node;
     LOG_INFO("find_child: looking for byte=0x%02x in node type=%d at page=%lu",
-             byte, type, node_ref.page_id);
+             byte, type, node_ref_page_id(node_ref));
 
     switch (type) {
         case DATA_NODE_4: {
@@ -74,8 +70,7 @@ node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) 
 
             for (int i = 0; i < n->num_children; i++) {
                 if (n->keys[i] == byte) {
-                    return (node_ref_t){.page_id = n->child_page_ids[i],
-                                       .offset = n->child_offsets[i]};
+                    return n->children[i];
                 }
             }
             return NULL_NODE_REF;
@@ -94,8 +89,7 @@ node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) 
 
             for (int i = 0; i < n->num_children; i++) {
                 if (n->keys[i] == byte) {
-                    return (node_ref_t){.page_id = n->child_page_ids[i],
-                                       .offset = n->child_offsets[i]};
+                    return n->children[i];
                 }
             }
             return NULL_NODE_REF;
@@ -104,15 +98,12 @@ node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) 
             const data_art_node48_t *n = (const data_art_node48_t *)node;
             uint8_t idx = n->keys[byte];
             if (idx == 255) return NULL_NODE_REF;  // Empty slot
-            return (node_ref_t){.page_id = n->child_page_ids[idx],
-                               .offset = n->child_offsets[idx]};
+            return n->children[idx];
         }
         case DATA_NODE_256: {
             const data_art_node256_t *n = (const data_art_node256_t *)node;
-            uint64_t page_id = n->child_page_ids[byte];
-            if (page_id == 0) return NULL_NODE_REF;
-            return (node_ref_t){.page_id = page_id,
-                               .offset = n->child_offsets[byte]};
+            if (n->children[byte] == 0) return NULL_NODE_REF;
+            return n->children[byte];
         }
         default:
             return NULL_NODE_REF;
@@ -149,9 +140,6 @@ int check_prefix(data_art_tree_t *tree, node_ref_t node_ref,
  * Check if leaf matches key
  */
 bool leaf_matches(const data_art_leaf_t *leaf, const uint8_t *key, size_t key_len) {
-    if (leaf->key_len != key_len) {
-        return false;
-    }
     return memcmp(leaf->data, key, key_len) == 0;
 }
 
@@ -190,7 +178,7 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
         const void *node = data_art_load_node(tree, current);
         if (!node) {
             LOG_ERROR("Failed to load node at page=%lu, offset=%u",
-                     current.page_id, current.offset);
+                     node_ref_page_id(current), node_ref_offset(current));
             return NULL;
         }
 
@@ -199,8 +187,8 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
         // Check if leaf
         if (type == DATA_NODE_LEAF) {
             const data_art_leaf_t *leaf = (const data_art_leaf_t *)node;
-            LOG_DEBUG("Found LEAF at page=%lu: key_len=%u, value_len=%u, flags=0x%02x, xmin=%lu, xmax=%lu",
-                      current.page_id, leaf->key_len, leaf->value_len, leaf->flags, leaf->xmin, leaf->xmax);
+            LOG_DEBUG("Found LEAF at page=%lu: key_size=%zu, value_len=%u, flags=0x%02x, xmin=%lu, xmax=%lu",
+                      node_ref_page_id(current), tree->key_size, leaf->value_len, leaf->flags, leaf->xmin, leaf->xmax);
 
             // Walk version chain to find visible version
             node_ref_t version_ref = current;
@@ -208,7 +196,7 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
             int chain_length = 0;
             const int MAX_CHAIN_LENGTH = 1000;  // Prevent infinite loops
 
-            LOG_TRACE("Starting version chain walk from page=%lu offset=%u", version_ref.page_id, version_ref.offset);
+            LOG_TRACE("Starting version chain walk from page=%lu offset=%u", node_ref_page_id(version_ref), node_ref_offset(version_ref));
 
             // Start with the leaf we already loaded
             const data_art_leaf_t *candidate = leaf;
@@ -222,7 +210,7 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
                 }
 
                 LOG_TRACE("Checking version chain[%d]: page=%lu offset=%u xmin=%lu xmax=%lu",
-                         chain_length, version_ref.page_id, version_ref.offset, candidate->xmin, candidate->xmax);
+                         chain_length, node_ref_page_id(version_ref), node_ref_offset(version_ref), candidate->xmin, candidate->xmax);
 
                 // MVCC visibility check
                 bool visible = true;
@@ -273,8 +261,8 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
 
             // Debug: Verify the leaf structure makes sense
             if (leaf->value_len > 1024) {  // Suspiciously large
-                LOG_ERROR("CORRUPTION DETECTED: leaf at page=%lu offset=%u has suspiciously large value_len=%u, key_len=%u",
-                          current.page_id, current.offset, leaf->value_len, leaf->key_len);
+                LOG_ERROR("CORRUPTION DETECTED: leaf at page=%lu offset=%u has suspiciously large value_len=%u, key_size=%zu",
+                          node_ref_page_id(current), node_ref_offset(current), leaf->value_len, tree->key_size);
                 LOG_ERROR("Leaf dump: type=%u flags=0x%02x, overflow_page=%lu, inline_data_len=%u",
                           leaf->type, leaf->flags, leaf->overflow_page, leaf->inline_data_len);
                 // Dump raw bytes of entire leaf header
@@ -283,7 +271,7 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
                           raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
                           raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
                           raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23]);
-                LOG_ERROR("Field breakdown: type@0=%02x flags@1=%02x pad@2-3=%02x%02x | key_len@4-7=%02x%02x%02x%02x | value_len@8-11=%02x%02x%02x%02x | overflow@12-19=%02x%02x%02x%02x%02x%02x%02x%02x | inline_len@20-23=%02x%02x%02x%02x",
+                LOG_ERROR("Field breakdown: type@0=%02x flags@1=%02x pad@2-3=%02x%02x | value_len@4-7=%02x%02x%02x%02x | overflow@8-15=%02x%02x%02x%02x%02x%02x%02x%02x | inline_len@16-19=%02x%02x%02x%02x | xmin@20-23=%02x%02x%02x%02x",
                           raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
                           raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
                           raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23]);
@@ -314,7 +302,7 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
                 }
 
                 // Copy inline value
-                memcpy(value_copy, leaf->data + leaf->key_len, leaf->value_len);
+                memcpy(value_copy, leaf->data + tree->key_size, leaf->value_len);
                 return value_copy;
             }
             return NULL;
@@ -326,7 +314,7 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
 
         if (partial_len > 0) {
             LOG_INFO("Checking prefix: node at page=%lu has partial_len=%u, current depth=%zu",
-                     current.page_id, partial_len, depth);
+                     node_ref_page_id(current), partial_len, depth);
 
             int prefix_match = check_prefix(tree, current, node, key, key_len, depth);
 
@@ -389,7 +377,7 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
                      key_str, depth, byte, (byte >= 32 && byte < 127) ? byte : '?');
         } else {
             LOG_INFO("Child found, advancing to page=%lu offset=%u",
-                     current.page_id, current.offset);
+                     node_ref_page_id(current), node_ref_offset(current));
         }
     }
 
@@ -410,7 +398,7 @@ const void *data_art_get_snapshot(data_art_tree_t *tree, const uint8_t *key, siz
     node_ref_t root;
     const void *result;
     if (snapshot) {
-        root = (node_ref_t){.page_id = snapshot->root_page_id, .offset = snapshot->root_offset};
+        root = snapshot->root;
         result = data_art_get_internal(tree, root, key, key_len, value_len,
                                         snapshot->mvcc_snapshot, snapshot->txn_id);
     } else {
