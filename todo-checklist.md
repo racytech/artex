@@ -75,13 +75,12 @@
    - WAL checkpoint entry also restores `next_page_id` during replay (fallback if metadata.bin missing)
    - Tests: metadata survives restart (next_page_id=105 preserved), WAL-only fallback (deleted metadata.bin, restored from checkpoint entry)
 
-### 11. ~~Page Reuse~~ FIXED
-   - `data_art_release_page()` now calls `page_manager_free()` to return freed pages to allocator
-   - `page_manager_alloc()` already checked free lists first — just needed the feed from release_page
-   - Deferred free list for concurrency safety: pages queued in `pending_free_pages`, drained when no active MVCC snapshots (prevents isolation violations under concurrent reads)
-   - Checkpoint entry fix: full WAL replay (start_lsn=0) no longer overrides root/size from checkpoint — tree state is fully determined by replayed operations, checkpoint only updates `next_page_id`
-   - Test: insert 200 → delete 150 → insert 150 new → `next_page_id` grew by only 4 (207 vs 203), confirming ~146 pages reused
-   - Result: 23/23 tests pass, 0 isolation violations in concurrent stress tests
+### 11. ~~Page Reuse~~ SUPERSEDED by Append-Only
+   - Originally: free lists recycled page IDs, deferred free for MVCC safety
+   - **Now**: append-only storage — `page_manager_free()` marks pages dead (`PAGE_GC_FLAG_DEAD`), `page_manager_alloc()` always increments `next_page_id`. Space reclaimed by future compaction.
+   - Page index persisted as `pages.idx` (atomic save/load), metadata v2 persists append cursor
+   - `page_index_clear()` for full WAL replay recovery
+   - Result: 25/25 tests pass
 
 ### 12. ~~Iterator Seek / Range Queries~~ FIXED
    - `data_art_iterator_seek(iter, key, key_len)` positions iterator at first key >= target
@@ -125,12 +124,18 @@
    - Tests: empty tree, single key, 1000 keys, 8KB overflow values, metadata, corrupted header/data, truncated file, invalid paths
    - Result: 9/9 backup tests pass, 24/24 full suite
 
-### 17. Page Compression (LZ4/ZSTD)
-   - Stubs exist: `compression_type` in page header, `read_compressed`/`write_compressed` in page_manager
-   - LZ4 for hot pages (fast, ~2x ratio), ZSTD for cold pages (slower, ~4x ratio)
-   - Compression tier policy based on `last_access_time` in page header
-   - Transparent: compress on write, decompress on read, buffer pool sees uncompressed pages
-   - LZ4 and ZSTD already linked in CMakeLists.txt
+### 17. ~~Page Compression (LZ4/ZSTD)~~ FIXED
+   - Transparent compression in page_manager write/read paths — callers unchanged
+   - `page_compress()`/`page_decompress()` helpers with `#ifdef HAVE_LZ4`/`HAVE_ZSTD` guards
+   - `page_manager_write()` auto-compresses when enabled, skips if savings < 10%
+   - `page_manager_read()` auto-decompresses based on `compression_type` in page index
+   - `page_manager_set_compression(pm, type)` for runtime configuration
+   - `page_manager_write_compressed(pm, page, type)` for explicit tier selection
+   - `compression_type_t` enum: NONE=0, LZ4=1, ZSTD_5=2, ZSTD_19=3
+   - LZ4 enabled by default — patterned data: 98.4% savings (4096 → 64 bytes)
+   - Tests: 12 tests (84 assertions) — round-trip, skip logic, mixed reads, persistence, corruption detection
+   - Result: 25/25 tests pass
+   - **Future**: background compactor for tier promotion based on `last_access_time`
 
 ### 18. Batch Insert Optimization
    - Current TEMP FIX: commit path acquires/releases write_lock N times, publishes root N times
