@@ -629,6 +629,7 @@ void data_art_destroy(data_art_tree_t *tree) {
     // Drain any remaining pending frees (no readers at destroy time)
     drain_pending_frees(tree);
     free(tree->pending_free_pages);
+    free(tree->pending_slot_frees);
 
     // Save header, then destroy storage
     mmap_storage_save_header(tree->mmap_storage,
@@ -731,8 +732,18 @@ node_ref_t data_art_alloc_node_hint(data_art_tree_t *tree, size_t size, uint64_t
  *  - No active snapshots
  */
 static void drain_pending_frees(data_art_tree_t *tree) {
-    if (tree->pending_free_count == 0) return;
+    if (tree->pending_free_count == 0 && tree->pending_slot_free_count == 0) return;
+    if (tree->draining_pending) return;  // Prevent recursion
+    tree->draining_pending = true;
 
+    // Phase 1: Drain deferred slot frees (may generate whole-page frees)
+    for (size_t i = 0; i < tree->pending_slot_free_count; i++) {
+        slot_free(tree, tree->pending_slot_frees[i].page_id,
+                        tree->pending_slot_frees[i].offset);
+    }
+    tree->pending_slot_free_count = 0;
+
+    // Phase 2: Drain whole-page frees (may include pages emptied in phase 1)
     for (size_t i = 0; i < tree->pending_free_count; i++) {
         uint64_t page_id = tree->pending_free_pages[i];
 
@@ -752,6 +763,8 @@ static void drain_pending_frees(data_art_tree_t *tree) {
     LOG_DEBUG("Drained %zu pending frees to reuse pool (pool size=%zu)",
               tree->pending_free_count, tree->reuse_pool_count);
     tree->pending_free_count = 0;
+
+    tree->draining_pending = false;
 }
 
 /**
@@ -785,7 +798,30 @@ void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref) {
 
     // Slot-level free: non-zero offset means node is on a multi-node page
     if (node_ref_offset(old_ref) != 0) {
-        slot_free(tree, node_ref_page_id(old_ref), node_ref_offset(old_ref));
+        // Safe to free immediately if no MVCC or no active snapshots
+        if (!tree->mvcc_manager || !mvcc_has_active_snapshots(tree->mvcc_manager)) {
+            slot_free(tree, node_ref_page_id(old_ref), node_ref_offset(old_ref));
+        } else {
+            // Defer: snapshots may still reference this slot
+            if (tree->pending_slot_free_count >= tree->pending_slot_free_capacity) {
+                size_t new_cap = tree->pending_slot_free_capacity == 0 ? 64
+                               : tree->pending_slot_free_capacity * 2;
+                typeof(tree->pending_slot_frees) new_list =
+                    realloc(tree->pending_slot_frees,
+                            new_cap * sizeof(tree->pending_slot_frees[0]));
+                if (!new_list) {
+                    LOG_ERROR("Failed to grow pending slot free list");
+                    return;
+                }
+                tree->pending_slot_frees = new_list;
+                tree->pending_slot_free_capacity = new_cap;
+            }
+            tree->pending_slot_frees[tree->pending_slot_free_count].page_id =
+                node_ref_page_id(old_ref);
+            tree->pending_slot_frees[tree->pending_slot_free_count].offset =
+                node_ref_offset(old_ref);
+            tree->pending_slot_free_count++;
+        }
         return;
     }
 

@@ -318,6 +318,12 @@ typedef struct data_art_tree {
     size_t pending_free_count;        // Number of pages in pending list
     size_t pending_free_capacity;     // Capacity of pending list
 
+    // Deferred slot freeing (safe slot reuse under concurrent reads)
+    struct { uint64_t page_id; uint32_t offset; } *pending_slot_frees;
+    size_t pending_slot_free_count;
+    size_t pending_slot_free_capacity;
+    bool draining_pending;            // Guard against recursive drain
+
     // Slot allocator (multi-node-per-page)
     slot_class_t slot_classes[NUM_SLOT_CLASSES];
 
