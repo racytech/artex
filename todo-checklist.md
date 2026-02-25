@@ -137,66 +137,71 @@
    - Result: 25/25 tests pass
    - **Future**: background compactor for tier promotion based on `last_access_time`
 
-### 18. Batch Insert Optimization
+### 18. Database Compaction
+   - **Critical**: append-only storage has no free lists — compaction is the only way to reclaim dead space
+   - Dead bytes already tracked per-page in page index (`dead_bytes`, `PAGE_GC_FLAG_DEAD`)
+   - Compaction = rewrite live pages into new contiguous file, discard dead pages, update index
+   - Must handle variable-size pages (compressed pages range from ~50 to 4096 bytes)
+   - Algorithm: scan page index for file with high fragmentation → copy live pages → atomic swap (rename)
+   - Trigger: fragmentation ratio > 30% (`dead_bytes / total_file_size`)
+   - Background thread (same pattern as `checkpoint_manager`) or on-demand via API
+   - Preserves compression: live pages copied as-is (already compressed on disk)
+   - Header `db_compaction.h` exists as stub
+   - Ties into state pruning: pruning marks pages dead, compaction reclaims the space
+
+### 19. Batch Insert Optimization
    - Current TEMP FIX: commit path acquires/releases write_lock N times, publishes root N times
    - Dedicated batch path: hold lock once, apply all mutations to tree, publish root once
    - Single MVCC txn for entire batch instead of N auto-commit txns
    - Expected: 5-10x throughput improvement for large batches
 
-### 19. Write Batching / Group Commit
+### 20. Write Batching / Group Commit
    - Currently every `commit_txn` does its own fsync (~5ms each)
    - Group commit: buffer multiple transactions, single fsync for the group
    - Amortize disk latency across many commits (critical for high-throughput workloads)
    - WAL already uses write buffer — extend with commit coalescing
 
-### 20. Bloom Filters for Negative Lookups
+### 21. Bloom Filters for Negative Lookups
    - Negative lookups (key not found) currently traverse tree to disk
    - Per-page or per-level bloom filter avoids I/O for keys that definitely don't exist
    - Important for Ethereum where misses are common (state trie probing)
    - Space-efficient: ~10 bits per key for <1% false positive rate
 
-### 21. Incremental Backup
+### 22. Incremental Backup
    - Current backup exports all keys every time
    - Delta backup: only keys/pages changed since last backup (tracked via LSN or write_counter)
    - Much faster for large databases with small daily changes
    - Could use WAL LSN watermark to identify changed pages
 
-### 22. Monitoring / Metrics Export
+### 23. Monitoring / Metrics Export
    - Basic stats exist (pages_read/written, bytes, cache hits) but no time-series
    - Add latency histograms for read/write/commit operations
    - Cache hit rate over sliding window
    - Export interface for Prometheus or similar monitoring systems
 
-### 23. File Pre-allocation
+### 24. File Pre-allocation
    - Data files currently grow on demand via pwrite
    - Pre-allocate with `fallocate()` to reduce filesystem fragmentation
    - Improves sequential write throughput and reduces metadata overhead
    - Allocate in chunks (e.g. 64MB) when file grows past current allocation
 
-### 24. State Pruning Policy
+### 25. State Pruning Policy
    - MVCC + page GC infrastructure exists but no policy layer
    - Prune state versions older than N snapshots/checkpoints
    - Ethereum-specific: keep only last N blocks of state, reclaim the rest
    - Ties into compaction: pruning marks pages dead, compaction reclaims space
 
-### 25. Merkle Proof Generation
+### 26. Merkle Proof Generation
    - If ART replaces Merkle Patricia Trie, need state root computation and inclusion/exclusion proofs
    - Compute hash of each node (bottom-up), root hash = state root
    - Proof = path from root to leaf with sibling hashes at each level
    - Could be a separate layer on top of the ART (hash-augmented nodes)
 
-### 26. Encryption at Rest
+### 27. Encryption at Rest
    - No data encryption on disk currently
    - Page-level encryption: encrypt before write, decrypt after read
    - Key management: master key + per-file or per-page derived keys
    - Transparent to buffer pool and upper layers
-
-### 27. Database Compaction (3-5 days)
-   - Rewrite live pages into contiguous files, discard dead pages
-   - Requires: iterate all live pages, copy to new file, swap atomically
-   - Header `db_compaction.h` exists as stub — needs full implementation
-   - Reclaims space from long-running databases with heavy delete workloads
-   - Could run as background thread similar to checkpoint_manager
 
 ### 28. Dead Code Cleanup
    - Remove `db_compaction.h` (entire unimplemented header) if compaction not implemented
