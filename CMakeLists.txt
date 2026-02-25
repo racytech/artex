@@ -237,11 +237,23 @@ add_executable(test_data_art_stress
 )
 target_link_libraries(test_data_art_stress art_persistent pthread)
 
-# Benchmark: Persistent ART Performance
-add_executable(benchmark_data_art
-    database/tests/benchmark_data_art.c
+# Benchmark: ART vs LMDB Comparison
+find_library(LMDB_LIB lmdb)
+find_path(LMDB_INCLUDE lmdb.h)
+
+add_executable(benchmark_comparison
+    database/tests/benchmark_comparison.c
 )
-target_link_libraries(benchmark_data_art art_persistent pthread)
+
+if(LMDB_LIB AND LMDB_INCLUDE)
+    target_include_directories(benchmark_comparison PRIVATE ${LMDB_INCLUDE})
+    target_link_libraries(benchmark_comparison art_persistent ${LMDB_LIB} pthread)
+    target_compile_definitions(benchmark_comparison PRIVATE HAVE_LMDB=1)
+    message(STATUS "LMDB found — benchmark_comparison includes LMDB comparison")
+else()
+    target_link_libraries(benchmark_comparison art_persistent pthread)
+    message(STATUS "LMDB not found — benchmark_comparison runs ART-only")
+endif()
 
 # Test: Persistent ART Edge Cases
 add_executable(test_data_art_edge_cases
