@@ -35,8 +35,6 @@
 // These need to be made non-static in their respective files
 extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
 extern bool leaf_matches(const data_art_leaf_t *leaf, const uint8_t *key, size_t key_len);
-extern int check_prefix(data_art_tree_t *tree, node_ref_t node_ref, const void *node,
-                       const uint8_t *key, size_t key_len, size_t depth);
 extern node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte);
 extern size_t get_node_size(data_art_node_type_t node_type);
 extern node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size);
@@ -268,24 +266,7 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         return node_ref;
     }
     
-    // It's an inner node
-    // CRITICAL: Extract values BEFORE any recursive calls that might invalidate the temp buffer
-    const uint8_t *node_bytes = (const uint8_t *)node;
-    uint8_t partial_len = node_bytes[2];
-    
-    if (partial_len > 0) {
-        int prefix_match = check_prefix(tree, node_ref, node, key, key_len, depth);
-        
-        // Check inline portion (up to 10 bytes)
-        int expected_match = (partial_len < 10) ? partial_len : 10;
-        if (prefix_match < expected_match) {
-            // Prefix mismatch, key doesn't exist
-            return node_ref;
-        }
-        
-        // For lazy expansion, we'll verify at leaf level
-        depth += partial_len;
-    }
+    // Inner node — descend to child
     
     // Get next byte to search
     // Fixed-size keys: simplified byte extraction
@@ -627,27 +608,22 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref) {
             
         case DATA_NODE_4:
             if (num_children == 1) {
-                // Special case: collapse to single child
-                // If the child is a leaf, return it
-                // If the child is a node, we might be able to merge prefixes
+                // Can only collapse if the single child is a leaf.
+                // If it's an inner node, removing this Node4 would lose a key
+                // byte (the edge label at this depth). Without path compression,
+                // there is no prefix to absorb it.
                 const data_art_node4_t *n4 = (const data_art_node4_t *)node;
-
                 node_ref_t child_ref = n4->children[0];
-                
-                const void *child_node = data_art_load_node(tree, child_ref);
-                if (child_node) {
-                    uint8_t child_type = *(const uint8_t *)child_node;
-                    
-                    if (child_type == DATA_NODE_LEAF) {
-                        // Return the leaf directly
-                        return child_ref;
-                    } else {
-                        // Try to merge prefixes (path compression)
-                        // TODO: Implement prefix merging
-                        // For now, keep the NODE_4
-                        return node_ref;
-                    }
+                const void *child = data_art_load_node(tree, child_ref);
+                if (child && *(const uint8_t *)child == DATA_NODE_LEAF) {
+                    // NOTE: intentionally do NOT release the Node4 page here.
+                    // MVCC snapshots may still reference the old tree structure
+                    // that traverses through this Node4.  Releasing would let
+                    // slot_free reuse the slot, corrupting snapshot reads.
+                    // The orphaned Node4 will be cleaned up by future compaction/GC.
+                    return child_ref;
                 }
+                // Inner-node child: keep the Node4
             }
             break;
     }
@@ -669,14 +645,9 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref) {
     
     uint8_t *new_bytes = (uint8_t *)new_node;
     
-    // Copy header
+    // Copy header (type + num_children only, no partial fields)
     new_bytes[0] = new_type;
     new_bytes[1] = num_children;
-    new_bytes[2] = node_bytes[2];  // partial_len
-    new_bytes[3] = node_bytes[3];  // flags
-    
-    // Copy prefix
-    memcpy(new_bytes + 4, node_bytes + 4, 10);
     
     // Copy children based on conversion
     if (type == DATA_NODE_256 && new_type == DATA_NODE_48) {

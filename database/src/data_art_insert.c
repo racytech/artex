@@ -4,8 +4,6 @@
  * Complete implementation of recursive insert and delete with:
  * - Node growth (4→16→48→256)
  * - Node shrinking (256→48→16→4)
- * - Path compression handling
- * - Prefix splitting
  * 
  * This file extends data_art_core.c with the full ART algorithms.
  */
@@ -57,119 +55,11 @@ static __thread bool tls_skip_mvcc = false;
 // ============================================================================
 
 /**
- * Find any leaf descendant of a node (for lazy expansion prefix verification)
- * Recursively traverses down the first available child until reaching a leaf
- */
-static const data_art_leaf_t* find_any_leaf(data_art_tree_t *tree, node_ref_t node_ref) {
-    if (node_ref_is_null(node_ref)) {
-        return NULL;
-    }
-    
-    const void *node = data_art_load_node(tree, node_ref);
-    if (!node) {
-        return NULL;
-    }
-    
-    uint8_t type = *(const uint8_t *)node;
-    
-    // If it's a leaf, return it
-    if (type == DATA_NODE_LEAF) {
-        return (const data_art_leaf_t *)node;
-    }
-    
-    // Otherwise, recurse to first child
-    node_ref_t child_ref = NULL_NODE_REF;
-    
-    switch (type) {
-        case DATA_NODE_4: {
-            const data_art_node4_t *n = (const data_art_node4_t *)node;
-            if (n->num_children > 0) {
-                child_ref = n->children[0];
-            }
-            break;
-        }
-        case DATA_NODE_16: {
-            const data_art_node16_t *n = (const data_art_node16_t *)node;
-            if (n->num_children > 0) {
-                child_ref = n->children[0];
-            }
-            break;
-        }
-        case DATA_NODE_48: {
-            const data_art_node48_t *n = (const data_art_node48_t *)node;
-            // Find first non-empty slot
-            for (int i = 0; i < 256; i++) {
-                if (n->keys[i] != NODE48_EMPTY) {
-                    uint8_t idx = n->keys[i];
-                    child_ref = n->children[idx];
-                    break;
-                }
-            }
-            break;
-        }
-        case DATA_NODE_256: {
-            const data_art_node256_t *n = (const data_art_node256_t *)node;
-            // Find first non-null child
-            for (int i = 0; i < 256; i++) {
-                if (n->children[i] != 0) {
-                    child_ref = n->children[i];
-                    break;
-                }
-            }
-            break;
-        }
-    }
-    
-    return find_any_leaf(tree, child_ref);
-}
-
-/**
  * Check if leaf matches key
  */
 static bool leaf_matches_key(const data_art_leaf_t *leaf,
                               const uint8_t *key, size_t key_len) {
     return memcmp(leaf->data, key, key_len) == 0;
-}
-
-/**
- * Check prefix match (path compression) with lazy expansion support
- * Returns number of matching bytes
- */
-static int check_prefix_match(data_art_tree_t *tree, node_ref_t node_ref,
-                              const void *node, const uint8_t *key, 
-                              size_t key_len, size_t depth) {
-    const uint8_t *node_bytes = (const uint8_t *)node;
-    uint8_t partial_len = node_bytes[2];  // Offset of partial_len field
-    const uint8_t *partial = node_bytes + 4;  // Offset of partial array
-    
-    int max_cmp = (partial_len < 10) ? partial_len : 10;
-    
-    // Check inline portion first
-    // Fixed-size keys: depth + partial_len won't exceed key_len during normal traversal
-    for (int i = 0; i < max_cmp; i++) {
-        if (partial[i] != key[depth + i]) return i;
-    }
-    
-    // For lazy expansion (partial_len > 10):
-    // Find any leaf and verify the full prefix against it
-    if (partial_len > 10) {
-        // Fast-path: if remaining bytes would exceed key length, can't match
-        // This is rare for Ethereum keys but avoids expensive leaf lookup
-        if (depth + partial_len > key_len) {
-            return max_cmp;  // Mismatch beyond key boundary
-        }
-        
-        const data_art_leaf_t *leaf = find_any_leaf(tree, node_ref);
-        if (leaf) {
-            // Verify remaining bytes (from index 10 to partial_len)
-            // Fixed-size keys: both keys have same length, simplify comparison
-            for (int i = 10; i < partial_len; i++) {
-                if (leaf->data[depth + i] != key[depth + i]) return i;
-            }
-        }
-    }
-    
-    return partial_len;
 }
 
 /**
@@ -605,46 +495,24 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         const uint8_t *existing_key = leaf->data;
         size_t existing_key_len = tree->key_size;
         
-        uint8_t existing_key_copy[256];  // Temporary buffer for existing key
+        uint8_t existing_key_copy[256];
         if (existing_key_len > sizeof(existing_key_copy)) {
             LOG_ERROR("Existing key too long: %zu", existing_key_len);
             return node_ref;
         }
         memcpy(existing_key_copy, existing_key, existing_key_len);
         
-        // Calculate longest common prefix between the two keys
-        // IMPORTANT: Start comparison from current depth, not from 0!
-        size_t common_prefix_len = 0;
-        size_t max_compare_from_depth = (key_len - depth < existing_key_len - depth) ? 
-                                         (key_len - depth) : (existing_key_len - depth);
-        
-        while (common_prefix_len < max_compare_from_depth && 
-               existing_key_copy[depth + common_prefix_len] == key[depth + common_prefix_len]) {
-            common_prefix_len++;
+        // Find the first byte where keys diverge
+        size_t split_depth = depth;
+        while (split_depth < key_len && 
+               existing_key_copy[split_depth] == key[split_depth]) {
+            split_depth++;
         }
         
-        // Create new NODE_4 to hold both leaves
-        node_ref_t new_node_ref = data_art_alloc_node(tree, sizeof(data_art_node4_t));
-        if (node_ref_is_null(new_node_ref)) {
-            LOG_ERROR("Failed to allocate NODE_4 for leaf split");
-            return node_ref;
-        }
-        
-        data_art_node4_t new_node;
-        memset(&new_node, 0, sizeof(new_node));
-        new_node.type = DATA_NODE_4;
-        new_node.num_children = 0;
-        
-        // Set compressed path (up to 10 bytes)
-        size_t prefix_to_store = (common_prefix_len > 10) ? 10 : common_prefix_len;
-        new_node.partial_len = common_prefix_len;
-        if (prefix_to_store > 0) {
-            memcpy(new_node.partial, key + depth, prefix_to_store);
-        }
-        
-        // Write the new node
-        if (!data_art_write_node(tree, new_node_ref, &new_node, sizeof(new_node))) {
-            LOG_ERROR("Failed to write NODE_4");
+        // Sanity check: keys must diverge before end (duplicates caught above)
+        if (split_depth >= key_len) {
+            LOG_ERROR("BUG: Keys don't diverge (depth=%zu, split_depth=%zu)", 
+                     depth, split_depth);
             return node_ref;
         }
         
@@ -655,227 +523,68 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             return node_ref;
         }
         
-        // Determine the bytes where the keys differ
-        // Fixed-size keys: both keys have same length, split point must be valid
-        size_t split_pos = depth + common_prefix_len;
-        uint8_t existing_byte = (split_pos < existing_key_len) ? 
-                                 existing_key_copy[split_pos] : 0x00;
-        uint8_t new_byte = (split_pos < key_len) ? key[split_pos] : 0x00;
-        
-        // Sanity check: keys must differ at split point (duplicate keys caught earlier)
-        if (existing_byte == new_byte) {
-            LOG_ERROR("BUG: Keys don't differ at split point (depth=%zu, common_prefix=%zu)", 
-                     depth, common_prefix_len);
-            LOG_ERROR("  Both bytes are 0x%02x - duplicate key not caught by leaf_matches_key()", 
-                     existing_byte);
+        // Create innermost Node4 with 2 children at the divergence point
+        node_ref_t inner_ref = data_art_alloc_node(tree, sizeof(data_art_node4_t));
+        if (node_ref_is_null(inner_ref)) {
+            LOG_ERROR("Failed to allocate NODE_4 for leaf split");
             return node_ref;
         }
         
-        // Add both leaves as children to the new node (always CoW — fresh node)
-        new_node_ref = add_child_to_node(tree, new_node_ref, existing_byte, node_ref, false);
-        if (node_ref_is_null(new_node_ref)) {
+        data_art_node4_t inner;
+        memset(&inner, 0, sizeof(inner));
+        inner.type = DATA_NODE_4;
+        inner.num_children = 0;
+        
+        if (!data_art_write_node(tree, inner_ref, &inner, sizeof(inner))) {
+            LOG_ERROR("Failed to write NODE_4");
+            return node_ref;
+        }
+        
+        // Add both leaves as children (always CoW — fresh node)
+        uint8_t existing_byte = existing_key_copy[split_depth];
+        uint8_t new_byte = key[split_depth];
+        
+        inner_ref = add_child_to_node(tree, inner_ref, existing_byte, node_ref, false);
+        if (node_ref_is_null(inner_ref)) {
             LOG_ERROR("Failed to add existing leaf to new node");
             return node_ref;
         }
-
-        new_node_ref = add_child_to_node(tree, new_node_ref, new_byte, new_leaf_ref, false);
-        if (node_ref_is_null(new_node_ref)) {
+        
+        inner_ref = add_child_to_node(tree, inner_ref, new_byte, new_leaf_ref, false);
+        if (node_ref_is_null(inner_ref)) {
             LOG_ERROR("Failed to add new leaf to new node");
             return node_ref;
         }
         
-        return new_node_ref;
-    }
-    
-    // Check compressed path (prefix)
-    const uint8_t *node_bytes = (const uint8_t *)node;
-    uint8_t partial_len = node_bytes[2];
-    
-    LOG_INFO("  depth=%zu: checking prefix, partial_len=%u", depth, partial_len);
-    
-    if (partial_len > 0) {
-        // IMPORTANT: Make a copy of the node BEFORE calling check_prefix_match,
-        // because check_prefix_match may call find_any_leaf which overwrites temp_page
-        size_t node_size = get_node_size(type);
-        void *node_copy = malloc(node_size);
-        if (!node_copy) {
-            LOG_ERROR("Failed to allocate memory for node copy before prefix check");
-            return node_ref;
-        }
-        memcpy(node_copy, node, node_size);
-        
-        int prefix_match = check_prefix_match(tree, node_ref, node, key, key_len, depth);
-        
-        LOG_INFO("  depth=%zu: prefix_match=%d/%u", depth, prefix_match, partial_len);
-        
-        if (prefix_match < partial_len) {
-            // Prefix mismatch - need to split the node at the mismatch point
-            *inserted = true;
-            
-            LOG_INFO("  depth=%zu: PREFIX SPLIT needed at position %d", depth, prefix_match);
-            
-            // Create new NODE_4 to become the parent
-            node_ref_t new_parent_ref = data_art_alloc_node(tree, sizeof(data_art_node4_t));
-            if (node_ref_is_null(new_parent_ref)) {
-                free(node_copy);
-                LOG_ERROR("Failed to allocate NODE_4 for prefix split");
+        // Wrap with single-child Node4s for each shared prefix byte
+        // (iterating from split_depth-1 down to depth)
+        for (size_t d = split_depth; d > depth; d--) {
+            node_ref_t wrapper_ref = data_art_alloc_node(tree, sizeof(data_art_node4_t));
+            if (node_ref_is_null(wrapper_ref)) {
+                LOG_ERROR("Failed to allocate wrapper NODE_4");
                 return node_ref;
             }
             
-            data_art_node4_t new_parent;
-            memset(&new_parent, 0, sizeof(new_parent));
-            new_parent.type = DATA_NODE_4;
-            new_parent.num_children = 0;
-            new_parent.partial_len = prefix_match;  // Common portion
+            data_art_node4_t wrapper;
+            memset(&wrapper, 0, sizeof(wrapper));
+            wrapper.type = DATA_NODE_4;
+            wrapper.num_children = 0;
             
-            // Debug: show what the original partial prefix was
-            LOG_INFO("  Original partial prefix (%u bytes): '%.*s'", 
-                     partial_len, partial_len < 10 ? partial_len : 10, node_bytes + 4);
-            
-            // Copy prefix from the KEY, not from old node's partial array
-            // (old node's partial may only have first 10 bytes if partial_len > 10)
-            size_t prefix_to_store = (prefix_match > 10) ? 10 : prefix_match;
-            if (prefix_to_store > 0) {
-                memcpy(new_parent.partial, key + depth, prefix_to_store);
-                LOG_INFO("  New parent prefix (%zu bytes): '%.*s'", 
-                         prefix_to_store, (int)prefix_to_store, new_parent.partial);
-            }
-            
-            // Write new parent
-            if (!data_art_write_node(tree, new_parent_ref, &new_parent, sizeof(new_parent))) {
-                free(node_copy);
-                LOG_ERROR("Failed to write new parent node");
+            if (!data_art_write_node(tree, wrapper_ref, &wrapper, sizeof(wrapper))) {
+                LOG_ERROR("Failed to write wrapper NODE_4");
                 return node_ref;
             }
             
-            // Update old node's prefix (remove the common part)
-            // Use node_copy since the original 'node' pointer may be invalid
-            void *modified_node = malloc(node_size);
-            if (!modified_node) {
-                free(node_copy);
-                LOG_ERROR("Failed to allocate memory for node modification");
-                return node_ref;
-            }
-            memcpy(modified_node, node_copy, node_size);
-            free(node_copy);  // Done with node_copy
-            
-            // Log old node structure before modification
-            if (type == DATA_NODE_4) {
-                const data_art_node4_t *old_n4 = (const data_art_node4_t *)modified_node;
-                LOG_INFO("  OLD NODE_4 before modification: num_children=%u, partial_len=%u", 
-                         old_n4->num_children, old_n4->partial_len);
-                for (int i = 0; i < old_n4->num_children; i++) {
-                    LOG_INFO("    child[%d]: key=0x%02x, page=%lu, offset=%u",
-                             i, old_n4->keys[i], node_ref_page_id(old_n4->children[i]), node_ref_offset(old_n4->children[i]));
-                }
-            }
-            
-            // *** CRITICAL: Get the discriminating byte BEFORE modifying the node! ***
-            // Get the byte where the old node diverges
-            // For lazy expansion: if prefix_match >= 10, we need to get the byte from a leaf
-            // since the partial array only stores first 10 bytes
-            uint8_t old_byte;
-            if (prefix_match < 10 && partial_len <= 10) {
-                // Can read from original partial array (before we modify it)
-                const uint8_t *partial = node_bytes + 4;
-                old_byte = partial[prefix_match];
-                LOG_INFO("  Getting old_byte from original partial[%d] = 0x%02x ('%c')", 
-                         prefix_match, old_byte, old_byte >= 32 && old_byte < 127 ? old_byte : '?');
-            } else {
-                // Need to read from a leaf descendant (lazy expansion case)
-                const data_art_leaf_t *leaf = find_any_leaf(tree, node_ref);
-                if (leaf && depth + prefix_match < tree->key_size) {
-                    old_byte = leaf->data[depth + prefix_match];
-
-                    // Debug: show what leaf we got and what byte
-                    char leaf_key[256];
-                    size_t copy_len = tree->key_size < 255 ? tree->key_size : 255;
-                    memcpy(leaf_key, leaf->data, copy_len);
-                    leaf_key[copy_len] = '\0';
-                    LOG_INFO("  Getting old_byte from leaf key '%s' at position %zu = 0x%02x ('%c')",
-                             leaf_key, depth + prefix_match, old_byte,
-                             old_byte >= 32 && old_byte < 127 ? old_byte : '?');
-                } else {
-                    // Fallback: use NULL byte
-                    old_byte = 0x00;
-                    LOG_INFO("  Using fallback old_byte = 0x00");
-                }
-            }
-            
-            uint8_t *mod_bytes = (uint8_t *)modified_node;
-            uint8_t remaining_prefix_len = partial_len - prefix_match - 1;
-            mod_bytes[2] = remaining_prefix_len;  // Update partial_len
-            
-            LOG_INFO("  PREFIX SPLIT: partial_len %u -> new_parent %u, modified_node %u", 
-                     partial_len, prefix_match, remaining_prefix_len);
-            
-            // Reconstruct the remaining prefix from the OLD node's prefix
-            // After split: parent has [0..prefix_match-1], byte at prefix_match becomes discriminator,
-            // old node keeps [prefix_match+1..partial_len-1]
-            if (remaining_prefix_len > 0) {
-                size_t bytes_to_copy = (remaining_prefix_len > 10) ? 10 : remaining_prefix_len;
-                
-                // Copy from old node's prefix, NOT from the new key being inserted!
-                if (prefix_match + 1 < 10 && prefix_match + 1 + bytes_to_copy <= 10 && partial_len <= 10) {
-                    // Old node had non-lazy prefix, copy from partial array
-                    memmove(mod_bytes + 4, node_bytes + 4 + prefix_match + 1, bytes_to_copy);
-                } else {
-                    // Old node had lazy expansion - need to get bytes from a leaf in old subtree
-                    const data_art_leaf_t *leaf = find_any_leaf(tree, node_ref);
-                    if (leaf && depth + prefix_match + 1 + bytes_to_copy <= tree->key_size) {
-                        memcpy(mod_bytes + 4, leaf->data + depth + prefix_match + 1, bytes_to_copy);
-                    }
-                }
-            }
-            
-            // Allocate new page for modified old node (hint = old page for same-page COW)
-            node_ref_t modified_node_ref = data_art_alloc_node_hint(tree, node_size, node_ref_page_id(node_ref));
-            if (node_ref_is_null(modified_node_ref)) {
-                free(modified_node);
-                LOG_ERROR("Failed to allocate page for modified node");
+            wrapper_ref = add_child_to_node(tree, wrapper_ref, key[d - 1], inner_ref, false);
+            if (node_ref_is_null(wrapper_ref)) {
+                LOG_ERROR("Failed to add child to wrapper NODE_4");
                 return node_ref;
             }
             
-            if (!data_art_write_node(tree, modified_node_ref, modified_node, node_size)) {
-                free(modified_node);
-                LOG_ERROR("Failed to write modified node");
-                return node_ref;
-            }
-            free(modified_node);
-            
-            LOG_INFO("  Adding modified_node (page=%lu) as child with key=0x%02x to new_parent (page=%lu)",
-                     node_ref_page_id(modified_node_ref), old_byte, node_ref_page_id(new_parent_ref));
-            
-            // Add modified old node as child (always CoW — fresh parent node)
-            new_parent_ref = add_child_to_node(tree, new_parent_ref, old_byte, modified_node_ref, false);
-            if (node_ref_is_null(new_parent_ref)) {
-                LOG_ERROR("Failed to add modified node to new parent");
-                return node_ref;
-            }
-            
-            // Create leaf for new key and add it
-            node_ref_t new_leaf_ref = alloc_leaf(tree, key, key_len, value, value_len);
-            if (node_ref_is_null(new_leaf_ref)) {
-                LOG_ERROR("Failed to create new leaf");
-                return new_parent_ref;
-            }
-            
-            uint8_t new_byte = (depth + prefix_match < key_len) ? 
-                               key[depth + prefix_match] : 0x00;
-            
-            LOG_INFO("  Creating new_leaf for key 149, will add as child with key=0x%02x ('%c')", 
-                     new_byte, new_byte >= 32 && new_byte < 127 ? new_byte : '?');
-            
-            new_parent_ref = add_child_to_node(tree, new_parent_ref, new_byte, new_leaf_ref, false);
-            if (node_ref_is_null(new_parent_ref)) {
-                LOG_ERROR("Failed to add new leaf to new parent");
-                return new_parent_ref;
-            }
-            
-            return new_parent_ref;
+            inner_ref = wrapper_ref;
         }
         
-        depth += partial_len;
+        return inner_ref;
     }
     
     // Determine which byte to insert for

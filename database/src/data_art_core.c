@@ -218,7 +218,7 @@ static void slot_allocator_init(data_art_tree_t *tree) {
     for (int i = 0; i < NUM_SLOT_CLASSES; i++) {
         uint16_t aligned = (uint16_t)ALIGN8(classes[i].raw_size);
         uint16_t slots = (uint16_t)(SLOT_AREA_SIZE / aligned);
-        if (slots > 64) slots = 64;  // Bitmap is 8 bytes = 64 bits
+        if (slots > 128) slots = 128;  // Bitmap is 16 bytes = 128 bits
         if (slots == 0) slots = 1;
 
         tree->slot_classes[i].node_type = classes[i].type;

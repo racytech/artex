@@ -101,7 +101,7 @@ typedef enum {
 #define SLOT_CLASS_LEAF     4
 
 // Slot page header size (bytes, stored at start of page data area)
-#define SLOT_PAGE_HEADER_SIZE 16
+#define SLOT_PAGE_HEADER_SIZE 24
 
 // Usable slot area per page (after page header + slot header + tail marker)
 // = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_PAGE_HEADER_SIZE - 4 (tail marker)
@@ -114,10 +114,10 @@ typedef enum {
 #define ALIGN8(x) (((x) + 7) & ~7)
 
 /**
- * Slot page header — stored at page->data[0..15]
+ * Slot page header — stored at page->data[0..23]
  *
  * Tracks which slots are occupied via a bitmap.
- * Max 64 slots per page (8-byte bitmap).
+ * Max 128 slots per page (16-byte bitmap).
  */
 typedef struct {
     uint8_t  node_type;       // DATA_NODE_4..DATA_NODE_LEAF, or SLOT_PAGE_DEDICATED
@@ -125,7 +125,7 @@ typedef struct {
     uint16_t slot_size;       // Size of each slot in bytes (8-byte aligned)
     uint16_t slot_count;      // Total slots available in this page
     uint16_t used_count;      // Currently occupied slots
-    uint8_t  bitmap[8];       // Occupancy bitmap (bit N = slot N occupied)
+    uint8_t  bitmap[16];      // Occupancy bitmap (bit N = slot N occupied)
 } __attribute__((packed)) slot_page_header_t;
 
 /**
@@ -156,16 +156,15 @@ typedef struct {
 /**
  * NODE_4: Up to 4 children
  *
- * Size: 50 bytes (fixed)
- * Layout: type(1) + num_children(1) + partial_len(1) + pad(1) + partial(10) +
- *         keys(4) + children(32)
+ * Size: 38 bytes (fixed)
+ * Layout: type(1) + num_children(1) + keys(4) + children(32)
+ *
+ * No path compression — keys are fixed-size hashes with uniform distribution,
+ * so common prefixes are astronomically rare.
  */
 typedef struct {
     uint8_t type;               // DATA_NODE_4
     uint8_t num_children;       // 0-4
-    uint8_t partial_len;        // Length of compressed path
-    uint8_t padding1;           // Alignment
-    uint8_t partial[10];        // Compressed path (max 10 bytes)
     uint8_t keys[4];            // Child keys
 
     // Children stored as packed page references (page_id << 12 | offset)
@@ -175,14 +174,11 @@ typedef struct {
 /**
  * NODE_16: Up to 16 children
  *
- * Size: 158 bytes (fixed)
+ * Size: 146 bytes (fixed)
  */
 typedef struct {
     uint8_t type;               // DATA_NODE_16
     uint8_t num_children;       // 0-16
-    uint8_t partial_len;
-    uint8_t padding1;
-    uint8_t partial[10];
     uint8_t keys[16];
 
     uint64_t children[16];      // 128 bytes
@@ -191,7 +187,7 @@ typedef struct {
 /**
  * NODE_48: Up to 48 children (indexed)
  *
- * Size: 654 bytes (fixed)
+ * Size: 642 bytes (fixed)
  * Uses index array: keys[byte_value] = child_slot (0-47, NODE48_EMPTY=empty)
  */
 #define NODE48_EMPTY 255
@@ -199,9 +195,6 @@ typedef struct {
 typedef struct {
     uint8_t type;               // DATA_NODE_48
     uint8_t num_children;       // 0-48
-    uint8_t partial_len;
-    uint8_t padding1;
-    uint8_t partial[10];
     uint8_t keys[256];          // Index: byte_value → child_slot
 
     uint64_t children[48];      // 384 bytes
@@ -210,15 +203,12 @@ typedef struct {
 /**
  * NODE_256: Up to 256 children (direct mapping)
  *
- * Size: 2062 bytes (~50% of 4KB page)
+ * Size: 2050 bytes (~50% of 4KB page)
  * Direct array: children[byte_value] = child_ref
  */
 typedef struct {
     uint8_t type;               // DATA_NODE_256
     uint8_t num_children;       // 0-256
-    uint8_t partial_len;
-    uint8_t padding1;
-    uint8_t partial[10];
 
     uint64_t children[256];     // 2048 bytes
 } __attribute__((packed)) data_art_node256_t;

@@ -4,7 +4,7 @@
  * Implements tree lookup/search:
  * - data_art_get / data_art_get_snapshot (public API)
  * - data_art_contains
- * - Internal traversal: find_child, check_prefix, leaf_matches
+ * - Internal traversal: find_child, leaf_matches
  * - Version chain walk with MVCC visibility checks
  *
  * Search operations are fully lock-free. Readers load the committed root
@@ -110,31 +110,6 @@ node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) 
     }
 }
 
-/**
- * Check prefix match (path compression) with lazy expansion support
- * For search operations, we use optimistic matching for lazy expansion
- */
-int check_prefix(data_art_tree_t *tree, node_ref_t node_ref,
-                       const void *node, const uint8_t *key,
-                       size_t key_len, size_t depth) {
-    const uint8_t *node_bytes = (const uint8_t *)node;
-    uint8_t partial_len = node_bytes[2];  // Offset of partial_len field
-    const uint8_t *partial = node_bytes + 4;  // Offset of partial array
-
-    int max_cmp = (partial_len < 10) ? partial_len : 10;
-
-    // Check inline portion
-    for (int i = 0; i < max_cmp; i++) {
-        if (depth + i >= key_len) return i;
-        if (partial[i] != key[depth + i]) return i;
-    }
-
-    // For lazy expansion (partial_len > 10):
-    // We optimistically assume the remaining bytes match.
-    // The final leaf comparison will verify the full key.
-    // This avoids the cost of traversing to a leaf just for prefix verification.
-    return partial_len;
-}
 
 /**
  * Check if leaf matches key
@@ -306,55 +281,6 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
                 return value_copy;
             }
             return NULL;
-        }
-
-        // Check compressed path
-        const uint8_t *node_bytes = (const uint8_t *)node;
-        uint8_t partial_len = node_bytes[2];
-
-        if (partial_len > 0) {
-            LOG_INFO("Checking prefix: node at page=%lu has partial_len=%u, current depth=%zu",
-                     node_ref_page_id(current), partial_len, depth);
-
-            int prefix_match = check_prefix(tree, current, node, key, key_len, depth);
-
-            // Check inline portion (up to 10 bytes)
-            int expected_match = (partial_len < 10) ? partial_len : 10;
-
-            LOG_INFO("Prefix check result: prefix_match=%d, expected_match=%d",
-                     prefix_match, expected_match);
-
-            if (prefix_match < expected_match) {
-                // Show what mismatched - use hex for clarity
-                char key_hex[64];
-                char node_hex[64];
-                int show_bytes = (expected_match < 10) ? expected_match : 10;
-
-                for (int i = 0; i < show_bytes; i++) {
-                    if (depth + i < key_len) {
-                        snprintf(key_hex + i*3, 4, "%02x ", key[depth + i]);
-                    } else {
-                        snprintf(key_hex + i*3, 4, "?? ");
-                    }
-                    snprintf(node_hex + i*3, 4, "%02x ", node_bytes[4 + i]);
-                }
-
-                LOG_INFO("PREFIX MISMATCH at depth=%zu (matched %d/%d bytes)",
-                         depth, prefix_match, expected_match);
-                LOG_INFO("  Key bytes:  %s", key_hex);
-                LOG_INFO("  Node bytes: %s", node_hex);
-
-                return NULL;  // Prefix mismatch in inline portion
-            }
-
-            // For lazy expansion (partial_len > 10), verify full prefix via leaf
-            if (partial_len > 10) {
-                // Need to check remaining bytes - traverse to any leaf
-                // But we'll do this optimistically and verify at the leaf level
-                // The leaf comparison will catch any mismatch in bytes 10+
-            }
-
-            depth += partial_len;  // Skip the full compressed path
         }
 
         // Get next byte to search

@@ -345,16 +345,6 @@ data_art_iterator_t *data_art_iterator_create_prefix(
 // Seek: Position iterator at first key >= target
 // ============================================================================
 
-// All inner nodes share the same layout for the first 14 bytes:
-//   type(1) + num_children(1) + partial_len(1) + padding(1) + partial(10)
-// Use node4 as the generic accessor.
-static inline uint8_t node_partial_len(const void *node) {
-    return ((const data_art_node4_t *)node)->partial_len;
-}
-static inline const uint8_t *node_partial(const void *node) {
-    return ((const data_art_node4_t *)node)->partial;
-}
-
 // Find child with key >= byte. Sets *child_idx for get_next_child_ref() continuation.
 // Returns the child ref (NULL_NODE_REF if none), and sets *exact = true if key == byte.
 static node_ref_t find_child_ge(const void *node, uint8_t byte,
@@ -485,34 +475,7 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
             }
         }
 
-        // Inner node: compare partial prefix
-        uint8_t plen = node_partial_len(node);
-        const uint8_t *partial = node_partial(node);
-        bool prefix_mismatch = false;
-
-        for (uint8_t i = 0; i < plen; i++) {
-            if (key_depth >= key_len) {
-                frame->child_idx = 0;
-                prefix_mismatch = true;
-                break;
-            }
-            if (key[key_depth] < partial[i]) {
-                frame->child_idx = 0;
-                prefix_mismatch = true;
-                break;
-            }
-            if (key[key_depth] > partial[i]) {
-                iter->depth--;
-                prefix_mismatch = true;
-                break;
-            }
-            key_depth++;
-        }
-
-        if (prefix_mismatch)
-            break;
-
-        // Prefix matched fully. Find child for next key byte.
+        // Find child for next key byte.
         if (key_depth >= key_len) {
             frame->child_idx = 0;
             break;
