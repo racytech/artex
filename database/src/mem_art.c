@@ -177,21 +177,12 @@ const void *art_get(const art_tree_t *tree, const uint8_t *key, size_t key_len,
 
 bool art_delete(art_tree_t *tree, const uint8_t *key, size_t key_len) {
     if (!tree || !key || key_len == 0) return false;
-    
-    // Debug for 0x100b deletions
-    if (key_len == 20 && key[18] == 0x10 && key[19] == 0x0b) {
-        printf("DEBUG ART delete: Attempting to delete 0x100b from tree=%p\n", (void*)tree);
-    }
-    
+
     bool deleted = false;
     tree->root = delete_recursive(tree->root, key, key_len, 0, &deleted);
-    
+
     if (deleted) {
         tree->size--;
-        // Debug for 0x100b deletions
-        if (key_len == 20 && key[18] == 0x10 && key[19] == 0x0b) {
-            printf("DEBUG ART delete: Successfully DELETED 0x100b, tree size now=%zu\n", tree->size);
-        }
     }
     
     return deleted;

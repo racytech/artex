@@ -532,62 +532,6 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
 }
 
 // ============================================================================
-// Copy-on-Write (CoW) Support
-// ============================================================================
-
-node_ref_t data_art_cow_node(data_art_tree_t *tree, node_ref_t ref) {
-    if (!tree) {
-        LOG_ERROR("Tree is NULL");
-        return NULL_NODE_REF;
-    }
-    
-    if (node_ref_is_null(ref)) {
-        return NULL_NODE_REF;
-    }
-    
-    // Load the original node
-    const void *original = data_art_load_node(tree, ref);
-    if (!original) {
-        LOG_ERROR("Failed to load node for CoW");
-        return NULL_NODE_REF;
-    }
-    
-    // Determine node type and size
-    uint8_t type = *(const uint8_t *)original;
-    size_t size = 0;
-    
-    if (type == DATA_NODE_LEAF) {
-        // Leaf nodes have variable size
-        const data_art_leaf_t *leaf = (const data_art_leaf_t *)original;
-        size = sizeof(data_art_leaf_t) + leaf->inline_data_len;
-    } else {
-        size = get_node_size(type);
-        if (size == 0) {
-            LOG_ERROR("Failed to determine size for node type %d", type);
-            return NULL_NODE_REF;
-        }
-    }
-    
-    // Allocate new node
-    node_ref_t new_ref = data_art_alloc_node(tree, size);
-    if (node_ref_is_null(new_ref)) {
-        LOG_ERROR("Failed to allocate node for CoW copy");
-        return NULL_NODE_REF;
-    }
-    
-    // Copy data to new node
-    if (!data_art_write_node(tree, new_ref, original, size)) {
-        LOG_ERROR("Failed to write CoW copy");
-        // TODO: Free allocated node
-        return NULL_NODE_REF;
-    }
-    
-    tree->nodes_copied++;
-    
-    return new_ref;
-}
-
-// ============================================================================
 // NOTE: Search, Insert and Delete operations are implemented in separate files:
 // - data_art_search.c (tree traversal, get, contains)
 // - data_art_insert.c (recursive insert with node growth)

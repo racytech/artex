@@ -522,16 +522,6 @@ void page_manager_reset_cursor(page_manager_t *pm, uint32_t file_idx, uint64_t f
 int page_manager_get_data_fd(page_manager_t *pm, uint32_t file_idx);
 
 /**
- * Replace data file descriptor (close old, set new).
- * Used during compaction atomic cutover.
- *
- * @param pm Page manager instance
- * @param file_idx Data file index
- * @param new_fd New file descriptor
- */
-void page_manager_replace_data_fd(page_manager_t *pm, uint32_t file_idx, int new_fd);
-
-/**
  * Update a single page's file_offset in the index.
  * Used by compaction (in-place moves) and compaction recovery.
  *

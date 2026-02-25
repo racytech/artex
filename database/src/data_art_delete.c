@@ -30,7 +30,6 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 
 // Forward declarations - functions we need from data_art_core.c and other files
 // These need to be made non-static in their respective files

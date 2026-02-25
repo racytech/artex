@@ -1634,19 +1634,6 @@ int page_manager_get_data_fd(page_manager_t *pm, uint32_t file_idx) {
     return pm->allocator->data_file_fds[file_idx];
 }
 
-void page_manager_replace_data_fd(page_manager_t *pm, uint32_t file_idx, int new_fd) {
-    if (!pm || !pm->allocator) return;
-    if (file_idx >= pm->allocator->num_data_files) return;
-
-    int old_fd = pm->allocator->data_file_fds[file_idx];
-    if (old_fd >= 0) {
-        close(old_fd);
-    }
-    pm->allocator->data_file_fds[file_idx] = new_fd;
-
-    LOG_INFO("Replaced data fd for file%u: old=%d, new=%d", file_idx, old_fd, new_fd);
-}
-
 void page_manager_update_page_offset(page_manager_t *pm, uint64_t page_id,
                                      uint64_t new_offset) {
     if (!pm || !pm->index) return;

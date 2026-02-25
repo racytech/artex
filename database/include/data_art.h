@@ -410,18 +410,6 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
                          const void *node, size_t size);
 
 /**
- * Copy a node for CoW (Copy-on-Write)
- * 
- * Creates a new copy of the node at a different location.
- * Used for MVCC versioning.
- * 
- * @param tree Tree instance
- * @param ref Original node reference
- * @return New node reference, or NULL_NODE_REF on failure
- */
-node_ref_t data_art_cow_node(data_art_tree_t *tree, node_ref_t ref);
-
-/**
  * Internal insert — for optimized commit path (lock held, no auto-commit/publish)
  * Caller must hold write_lock, manage MVCC txn, WAL logging, and root publication.
  */
@@ -483,31 +471,6 @@ uint64_t data_art_write_overflow_value(data_art_tree_t *tree,
 size_t data_art_free_overflow_chain(data_art_tree_t *tree, uint64_t first_page);
 
 // ============================================================================
-// Versioning & Snapshots
-// ============================================================================
-
-/**
- * Create a snapshot of the current tree state
- * 
- * Returns the current version ID. This version will remain accessible
- * until explicitly released.
- * 
- * @param tree Tree instance
- * @return Version ID (snapshot handle)
- */
-uint64_t data_art_snapshot(data_art_tree_t *tree);
-
-/**
- * Release a snapshot version
- * 
- * Allows garbage collection of old versions.
- * 
- * @param tree Tree instance
- * @param version Version ID to release
- */
-void data_art_release_version(data_art_tree_t *tree, uint64_t version);
-
-// ============================================================================
 // Persistence & Recovery
 // ============================================================================
 
@@ -521,21 +484,6 @@ void data_art_release_version(data_art_tree_t *tree, uint64_t version);
  */
 bool data_art_flush(data_art_tree_t *tree);
 
-/**
- * Load tree from disk
- * 
- * Recovers tree state from persisted root reference.
- * 
- * @param page_manager Page manager
- * @param buffer_pool Buffer pool (optional)
- * @param key_size Fixed key size for the tree (20 or 32)
- * @param root_ref Root node reference from metadata
- * @return Tree instance, or NULL on failure
- */
-data_art_tree_t *data_art_load(page_manager_t *page_manager,
-                                 buffer_pool_t *buffer_pool,
-                                 size_t key_size,
-                                 node_ref_t root_ref);
 
 /**
  * Get current root reference (for persistence)

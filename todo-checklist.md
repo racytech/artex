@@ -149,15 +149,12 @@
    - Tests: 16 tests (171 assertions) — analyze, in-place moves, interleaved dead, journal recovery, persistence
    - Result: 26/26 tests pass
 
-### 19. ~~Batch COW Optimization + Group Commit~~ PHASE 1 DONE
-   - **Phase 1 (DONE)**: Optimized commit path — single lock, single root publish, single fsync
+### 19. ~~Batch COW Optimization + Group Commit~~ FIXED
+   - Optimized commit path — single lock, single root publish, single fsync
    - `data_art_insert_internal()` / `data_art_delete_internal()` bypass lock, auto-commit, WAL, root publish
    - `data_art_commit_txn()` rewritten: hold lock once → loop internal ops → WAL per-op → single fsync → single publish
    - Rollback on failure: saved root + size restored, MVCC txn aborted
    - Tests: 15/15 (1000-key batch, root-once, WAL recovery, mixed ops, consecutive txns)
-   - **Phase 2 (TODO)**: COW deduplication — sort mutations by key, single tree walk, COW shared ancestors once
-   - For random 32-byte keys: ~5% COW savings (paths diverge after 1-2 levels)
-   - For common-prefix keys (same contract storage): 10-100x fewer page writes
 
 ### 20. Bloom Filters for Negative Lookups
    - Negative lookups (key not found) currently traverse tree to disk
@@ -212,9 +209,11 @@
    - Read-only mode: `artdb --db /path/to/db --readonly`
    - Builds on all existing APIs: data_art, page_manager, buffer_pool, checkpoint_manager, db_backup
 
-### 28. Dead Code Cleanup
-   - Remove unused functions (data_art_cow_node, data_art_snapshot, data_art_load, etc.)
-   - Remove dead static functions in `data_art_node_ops.c` (shrink stubs already implemented in data_art_delete.c)
-   - Remove debug printfs in `mem_art.c`, duplicate log lines in `wal.c`
-   - Remove unused includes (`<stdio.h>` in search.c, `<assert.h>` in delete.c)
-   - Remove `page_manager_replace_data_fd()` (leftover from copy-based compaction, unused now)
+### 28. ~~Dead Code Cleanup~~ FIXED
+   - Removed unused functions: `data_art_cow_node`, `data_art_snapshot`, `data_art_release_version`, `data_art_load` (declarations + definitions)
+   - Removed dead static functions in `data_art_node_ops.c`: `shrink_node16_to_node4`, `shrink_node48_to_node16`, `shrink_node256_to_node48`
+   - Removed dead static functions: `remove_child_from_node` (data_art_insert.c), `find_any_leaf_for_prefix` (data_art_search.c)
+   - Removed debug printfs in `mem_art.c` (0x100b debug traces)
+   - Removed unused includes: `<stdio.h>` in search.c, `<assert.h>` in delete.c and node_ops.c
+   - Removed `page_manager_replace_data_fd()` (declaration + definition)
+   - Result: 26/26 tests pass, 3 compiler warnings eliminated

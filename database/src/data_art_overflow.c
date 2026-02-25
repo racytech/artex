@@ -216,76 +216,6 @@ size_t data_art_free_overflow_chain(data_art_tree_t *tree, uint64_t first_page) 
 }
 
 // ============================================================================
-// Versioning & Snapshots
-// ============================================================================
-
-uint64_t data_art_snapshot(data_art_tree_t *tree) {
-    if (!tree) {
-        LOG_ERROR("Tree is NULL");
-        return 0;
-    }
-    
-    // Enable CoW if not already enabled
-    if (!tree->cow_enabled) {
-        tree->cow_enabled = true;
-        LOG_INFO("Enabled copy-on-write for versioning");
-    }
-    
-    uint64_t snapshot_version = tree->version;
-    
-    // Add to active versions array
-    size_t new_size = tree->num_active_versions + 1;
-    uint64_t *new_array = realloc(tree->active_versions, 
-                                   new_size * sizeof(uint64_t));
-    if (!new_array) {
-        LOG_ERROR("Failed to allocate active versions array");
-        return 0;
-    }
-    
-    tree->active_versions = new_array;
-    tree->active_versions[tree->num_active_versions] = snapshot_version;
-    tree->num_active_versions = new_size;
-    
-    // Increment version for future modifications
-    tree->version++;
-    
-    LOG_INFO("Created snapshot version %lu", snapshot_version);
-    
-    return snapshot_version;
-}
-
-void data_art_release_version(data_art_tree_t *tree, uint64_t version) {
-    if (!tree || !tree->active_versions) {
-        return;
-    }
-    
-    // Find and remove version from active array
-    for (size_t i = 0; i < tree->num_active_versions; i++) {
-        if (tree->active_versions[i] == version) {
-            // Shift remaining versions down
-            memmove(&tree->active_versions[i], 
-                    &tree->active_versions[i + 1],
-                    (tree->num_active_versions - i - 1) * sizeof(uint64_t));
-            tree->num_active_versions--;
-            
-            LOG_INFO("Released snapshot version %lu", version);
-            
-            // If no active versions, disable CoW
-            if (tree->num_active_versions == 0) {
-                free(tree->active_versions);
-                tree->active_versions = NULL;
-                tree->cow_enabled = false;
-                LOG_INFO("Disabled copy-on-write (no active snapshots)");
-            }
-            
-            return;
-        }
-    }
-    
-    LOG_ERROR("Version %lu not found in active versions", version);
-}
-
-// ============================================================================
 // Persistence & Recovery
 // ============================================================================
 
@@ -306,38 +236,9 @@ bool data_art_flush(data_art_tree_t *tree) {
         DB_ERROR(DB_ERROR_IO, "buffer pool flush failed");
         return false;
     }
-    
+
     LOG_INFO("Flushed ART tree to disk");
     return true;
-}
-
-data_art_tree_t *data_art_load(page_manager_t *page_manager,
-                                 buffer_pool_t *buffer_pool,
-                                 size_t key_size,
-                                 node_ref_t root_ref) {
-    if (!page_manager) {
-        LOG_ERROR("page_manager cannot be NULL");
-        return NULL;
-    }
-    
-    data_art_tree_t *tree = data_art_create(page_manager, buffer_pool, NULL, key_size);
-    if (!tree) {
-        return NULL;
-    }
-    
-    tree->root = root_ref;
-
-    // Publish loaded root for lock-free readers
-    extern void data_art_publish_root(data_art_tree_t *tree);
-    data_art_publish_root(tree);
-
-    // TODO: Traverse tree to calculate size and statistics
-    // For now, assume metadata will be provided separately
-
-    LOG_INFO("Loaded ART tree from disk (root page=%lu, offset=%u)",
-             root_ref.page_id, root_ref.offset);
-
-    return tree;
 }
 
 node_ref_t data_art_get_root(const data_art_tree_t *tree) {

@@ -17,7 +17,6 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
 // Forward declarations - functions from data_art_core.c
 extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
@@ -114,76 +113,6 @@ node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) 
         default:
             return NULL_NODE_REF;
     }
-}
-
-/**
- * Find any leaf descendant of a node (for lazy expansion prefix verification)
- */
-static const data_art_leaf_t* find_any_leaf_for_prefix(data_art_tree_t *tree, node_ref_t node_ref) {
-    if (node_ref_is_null(node_ref)) {
-        return NULL;
-    }
-
-    const void *node = data_art_load_node(tree, node_ref);
-    if (!node) {
-        return NULL;
-    }
-
-    uint8_t type = *(const uint8_t *)node;
-
-    // If it's a leaf, return it
-    if (type == DATA_NODE_LEAF) {
-        return (const data_art_leaf_t *)node;
-    }
-
-    // Otherwise, recurse to first child
-    node_ref_t child_ref = NULL_NODE_REF;
-
-    switch (type) {
-        case DATA_NODE_4: {
-            const data_art_node4_t *n = (const data_art_node4_t *)node;
-            if (n->num_children > 0) {
-                child_ref = (node_ref_t){.page_id = n->child_page_ids[0],
-                                        .offset = n->child_offsets[0]};
-            }
-            break;
-        }
-        case DATA_NODE_16: {
-            const data_art_node16_t *n = (const data_art_node16_t *)node;
-            if (n->num_children > 0) {
-                child_ref = (node_ref_t){.page_id = n->child_page_ids[0],
-                                        .offset = n->child_offsets[0]};
-            }
-            break;
-        }
-        case DATA_NODE_48: {
-            const data_art_node48_t *n = (const data_art_node48_t *)node;
-            // Find first non-empty slot
-            for (int i = 0; i < 256; i++) {
-                if (n->keys[i] != NODE48_EMPTY) {
-                    uint8_t idx = n->keys[i];
-                    child_ref = (node_ref_t){.page_id = n->child_page_ids[idx],
-                                            .offset = n->child_offsets[idx]};
-                    break;
-                }
-            }
-            break;
-        }
-        case DATA_NODE_256: {
-            const data_art_node256_t *n = (const data_art_node256_t *)node;
-            // Find first non-null child
-            for (int i = 0; i < 256; i++) {
-                if (n->child_page_ids[i] != 0) {
-                    child_ref = (node_ref_t){.page_id = n->child_page_ids[i],
-                                            .offset = n->child_offsets[i]};
-                    break;
-                }
-            }
-            break;
-        }
-    }
-
-    return find_any_leaf_for_prefix(tree, child_ref);
 }
 
 /**

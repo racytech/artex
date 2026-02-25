@@ -432,16 +432,6 @@ static node_ref_t add_child_to_node(data_art_tree_t *tree, node_ref_t node_ref,
     return data_art_add_child(tree, node_ref, byte, child_ref);
 }
 
-/**
- * Remove child from node (with automatic shrinking)
- */
-static node_ref_t remove_child_from_node(data_art_tree_t *tree, node_ref_t node_ref,
-                                          uint8_t byte) {
-    // TODO: Implement node shrinking logic
-    LOG_ERROR("remove_child_from_node not yet implemented");
-    return node_ref;
-}
-
 // ============================================================================
 // Recursive Insert
 // ============================================================================
