@@ -537,17 +537,17 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             return node_ref;
         }
         
-        // Add both leaves as children (always CoW — fresh node)
+        // Add both leaves as children (fresh node — safe to mutate inplace)
         uint8_t existing_byte = existing_key_copy[split_depth];
         uint8_t new_byte = key[split_depth];
-        
-        inner_ref = add_child_to_node(tree, inner_ref, existing_byte, node_ref, false);
+
+        inner_ref = add_child_to_node(tree, inner_ref, existing_byte, node_ref, inplace);
         if (node_ref_is_null(inner_ref)) {
             LOG_ERROR("Failed to add existing leaf to new node");
             return node_ref;
         }
-        
-        inner_ref = add_child_to_node(tree, inner_ref, new_byte, new_leaf_ref, false);
+
+        inner_ref = add_child_to_node(tree, inner_ref, new_byte, new_leaf_ref, inplace);
         if (node_ref_is_null(inner_ref)) {
             LOG_ERROR("Failed to add new leaf to new node");
             return node_ref;
@@ -572,7 +572,7 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                 return node_ref;
             }
             
-            wrapper_ref = add_child_to_node(tree, wrapper_ref, key[d - 1], inner_ref, false);
+            wrapper_ref = add_child_to_node(tree, wrapper_ref, key[d - 1], inner_ref, inplace);
             if (node_ref_is_null(wrapper_ref)) {
                 LOG_ERROR("Failed to add child to wrapper NODE_4");
                 return node_ref;
