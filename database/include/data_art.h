@@ -520,7 +520,7 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
  * Caller must hold write_lock, manage MVCC txn, and root publication.
  */
 bool data_art_insert_internal(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
-                               const void *value, size_t value_len);
+                               const void *value, size_t value_len, bool inplace);
 
 /**
  * Internal delete — for optimized commit path (lock held, no auto-commit/publish)

@@ -740,17 +740,17 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
  * Caller is responsible for: write_lock, MVCC txn, WAL logging, root publish.
  */
 bool data_art_insert_internal(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
-                               const void *value, size_t value_len) {
+                               const void *value, size_t value_len, bool inplace) {
     if (!tree || !key || !value) return false;
     if (key_len != tree->key_size) return false;
 
     data_art_reset_arena();
 
-    // Internal path is called from commit_txn under write_lock.
-    // Snapshots may be active during explicit transactions, so use CoW (no inplace).
+    tls_skip_mvcc = inplace;
+
     bool inserted = false;
     node_ref_t new_root = insert_recursive(tree, tree->root, key, key_len, 0,
-                                            value, value_len, &inserted, false);
+                                            value, value_len, &inserted, inplace);
     if (node_ref_is_null(new_root)) return false;
 
     tree->root = new_root;

@@ -1035,6 +1035,9 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
     // === OPTIMIZED BATCH COMMIT: single lock, single root publish ===
     pthread_rwlock_wrlock(&tree->write_lock);
 
+    // Use in-place mutations when no snapshots need to see old tree versions
+    bool inplace = !mvcc_has_active_snapshots(tree->mvcc_manager);
+
     // Save rollback point in case any operation fails
     node_ref_t saved_root = tree->root;
     size_t saved_size = tree->size;
@@ -1046,7 +1049,7 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
 
         if (op->type == TXN_OP_INSERT) {
             success = data_art_insert_internal(tree, op->key, op->key_len,
-                                                op->value, op->value_len);
+                                                op->value, op->value_len, inplace);
         } else { // TXN_OP_DELETE
             success = data_art_delete_internal(tree, op->key, op->key_len);
             if (!success) {
