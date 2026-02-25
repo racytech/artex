@@ -281,6 +281,17 @@ void data_art_get_stats(const data_art_tree_t *tree, data_art_stats_t *stats) {
     stats->num_leaves = 0;
     stats->num_leaves_with_overflow = 0;
     stats->total_overflow_bytes = 0;
+
+    // Slot allocator statistics
+    for (int i = 0; i < NUM_SLOT_CLASSES; i++) {
+        stats->slot_pages_created[i] = tree->slot_pages_created[i];
+        stats->slot_allocs[i] = tree->slot_allocs[i];
+        stats->slot_frees[i] = tree->slot_frees[i];
+    }
+    stats->slot_hint_hits = tree->slot_hint_hits;
+    stats->slot_hint_misses = tree->slot_hint_misses;
+    stats->dedicated_pages_created = tree->dedicated_pages_created;
+    stats->pages_reused = tree->pages_reused;
 }
 
 void data_art_print_stats(const data_art_tree_t *tree) {

@@ -74,6 +74,61 @@ typedef enum {
 } data_art_node_type_t;
 
 // ============================================================================
+// Slot Page Infrastructure (Multi-Node-Per-Page)
+// ============================================================================
+
+/**
+ * Number of node size classes for slot allocation.
+ * One per node type: Node4, Node16, Node48, Node256, Leaf
+ */
+#define NUM_SLOT_CLASSES 5
+
+// Size class indices (match data_art_node_type_t values)
+#define SLOT_CLASS_NODE4    0
+#define SLOT_CLASS_NODE16   1
+#define SLOT_CLASS_NODE48   2
+#define SLOT_CLASS_NODE256  3
+#define SLOT_CLASS_LEAF     4
+
+// Slot page header size (bytes, stored at start of page data area)
+#define SLOT_PAGE_HEADER_SIZE 16
+
+// Usable slot area per page (after page header + slot header + tail marker)
+// = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_PAGE_HEADER_SIZE - 4 (tail marker)
+#define SLOT_AREA_SIZE (PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_PAGE_HEADER_SIZE - 4)
+
+// Dedicated page marker (node_type value for non-slotted pages)
+#define SLOT_PAGE_DEDICATED 0xFF
+
+// Align size up to 8-byte boundary
+#define ALIGN8(x) (((x) + 7) & ~7)
+
+/**
+ * Slot page header — stored at page->data[0..15]
+ *
+ * Tracks which slots are occupied via a bitmap.
+ * Max 64 slots per page (8-byte bitmap).
+ */
+typedef struct {
+    uint8_t  node_type;       // DATA_NODE_4..DATA_NODE_LEAF, or SLOT_PAGE_DEDICATED
+    uint8_t  reserved;
+    uint16_t slot_size;       // Size of each slot in bytes (8-byte aligned)
+    uint16_t slot_count;      // Total slots available in this page
+    uint16_t used_count;      // Currently occupied slots
+    uint8_t  bitmap[8];       // Occupancy bitmap (bit N = slot N occupied)
+} __attribute__((packed)) slot_page_header_t;
+
+/**
+ * Per-type allocator state — tracks "current page" for each size class
+ */
+typedef struct {
+    uint64_t current_page_id;   // Page currently accepting allocations (0 = none)
+    uint16_t slot_size;         // Aligned slot size for this class
+    uint16_t slots_per_page;    // Pre-computed max slots
+    uint8_t  node_type;         // DATA_NODE_4, DATA_NODE_16, etc.
+} slot_class_t;
+
+// ============================================================================
 // On-Disk Node Structures (Fixed Size, Packed)
 // ============================================================================
 
@@ -256,6 +311,7 @@ typedef struct data_art_tree {
 
     // Lock-free read support: readers load committed root atomically, no lock needed
     _Atomic uint64_t committed_root_page_id;
+    _Atomic uint32_t committed_root_offset;
 
     // MVCC support
     mvcc_manager_t *mvcc_manager; // MVCC manager for snapshot isolation
@@ -270,6 +326,14 @@ typedef struct data_art_tree {
     size_t pending_free_count;        // Number of pages in pending list
     size_t pending_free_capacity;     // Capacity of pending list
 
+    // Slot allocator (multi-node-per-page)
+    slot_class_t slot_classes[NUM_SLOT_CLASSES];
+
+    // Page reuse pool (recycled page IDs from drained pending frees)
+    uint64_t *reuse_pool;
+    size_t reuse_pool_count;
+    size_t reuse_pool_capacity;
+
     // Statistics
     uint64_t nodes_allocated;
     uint64_t nodes_copied;       // CoW copies
@@ -277,6 +341,15 @@ typedef struct data_art_tree {
     uint64_t cache_misses;
     uint64_t overflow_pages_allocated;  // Number of overflow pages created
     uint64_t overflow_chain_reads;      // Number of overflow chain traversals
+
+    // Slot allocator statistics
+    uint64_t slot_pages_created[NUM_SLOT_CLASSES];  // Pages created per class
+    uint64_t slot_allocs[NUM_SLOT_CLASSES];          // Slot allocations per class
+    uint64_t slot_frees[NUM_SLOT_CLASSES];           // Slot frees per class
+    uint64_t slot_hint_hits;                         // Hint page had a free slot
+    uint64_t slot_hint_misses;                       // Hint page full or wrong class
+    uint64_t dedicated_pages_created;                // Fallback dedicated page allocs
+    uint64_t pages_reused;                           // Pages recycled from reuse pool
 } data_art_tree_t;
 
 // ============================================================================
@@ -393,6 +466,19 @@ const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
  * @return Node reference, or NULL_NODE_REF on failure
  */
 node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size);
+
+/**
+ * Allocate space for a new node with a hint page for same-page COW.
+ *
+ * Tries to allocate on hint_page_id first (if it's the right class with
+ * free slots), falling back to normal allocation otherwise.
+ *
+ * @param tree Tree instance
+ * @param size Size of node in bytes
+ * @param hint_page_id Page to try first (0 = no hint, same as alloc_node)
+ * @return Node reference, or NULL_NODE_REF on failure
+ */
+node_ref_t data_art_alloc_node_hint(data_art_tree_t *tree, size_t size, uint64_t hint_page_id);
 
 /**
  * Write a node to disk
@@ -581,6 +667,7 @@ typedef struct data_art_snapshot {
     mvcc_snapshot_t *mvcc_snapshot;  // Underlying MVCC snapshot
     uint64_t txn_id;                 // Transaction ID for this snapshot
     uint64_t root_page_id;           // Committed root at snapshot creation time
+    uint32_t root_offset;            // Root offset within page
 } data_art_snapshot_t;
 
 /**
@@ -737,6 +824,15 @@ typedef struct {
     uint64_t overflow_pages_allocated;  // Total overflow pages created
     uint64_t overflow_chain_reads;      // Overflow chain traversals
     size_t total_overflow_bytes;        // Total bytes in overflow storage
+
+    // Slot allocator statistics
+    uint64_t slot_pages_created[NUM_SLOT_CLASSES];
+    uint64_t slot_allocs[NUM_SLOT_CLASSES];
+    uint64_t slot_frees[NUM_SLOT_CLASSES];
+    uint64_t slot_hint_hits;
+    uint64_t slot_hint_misses;
+    uint64_t dedicated_pages_created;
+    uint64_t pages_reused;
 } data_art_stats_t;
 
 /**

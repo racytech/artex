@@ -178,7 +178,9 @@ data_art_iterator_t *data_art_iterator_create(data_art_tree_t *tree) {
     // Capture committed root atomically for consistent snapshot
     uint64_t root_page = atomic_load_explicit(&tree->committed_root_page_id,
                                                memory_order_acquire);
-    iter->root = (node_ref_t){.page_id = root_page, .offset = 0};
+    uint32_t root_off = atomic_load_explicit(&tree->committed_root_offset,
+                                              memory_order_relaxed);
+    iter->root = (node_ref_t){.page_id = root_page, .offset = root_off};
 
     iter->depth = -1;
     iter->done = node_ref_is_null(iter->root);

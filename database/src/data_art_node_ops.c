@@ -227,8 +227,8 @@ static node_ref_t add_child_node4(data_art_tree_t *tree, node_ref_t node_ref,
     new_n4.child_offsets[pos] = child_ref.offset;
     new_n4.num_children++;
     
-    // CoW: allocate new page, write there, release old
-    node_ref_t new_ref = data_art_alloc_node(tree, sizeof(data_art_node4_t));
+    // CoW: allocate new page (hint = old page for same-page COW), write there, release old
+    node_ref_t new_ref = data_art_alloc_node_hint(tree, sizeof(data_art_node4_t), node_ref.page_id);
     if (node_ref_is_null(new_ref)) {
         LOG_ERROR("Failed to allocate new NODE_4 for CoW");
         return NULL_NODE_REF;
@@ -299,8 +299,8 @@ static node_ref_t add_child_node16(data_art_tree_t *tree, node_ref_t node_ref,
     new_n16.child_offsets[pos] = child_ref.offset;
     new_n16.num_children++;
     
-    // CoW: allocate new page, write there, release old
-    node_ref_t new_ref = data_art_alloc_node(tree, sizeof(data_art_node16_t));
+    // CoW: allocate new page (hint = old page for same-page COW), write there, release old
+    node_ref_t new_ref = data_art_alloc_node_hint(tree, sizeof(data_art_node16_t), node_ref.page_id);
     if (node_ref_is_null(new_ref)) {
         LOG_ERROR("Failed to allocate new NODE_16 for CoW");
         return NULL_NODE_REF;
@@ -367,8 +367,8 @@ static node_ref_t add_child_node48(data_art_tree_t *tree, node_ref_t node_ref,
     new_n48.child_offsets[slot] = child_ref.offset;
     new_n48.num_children++;
     
-    // CoW: allocate new page, write there, release old
-    node_ref_t new_ref = data_art_alloc_node(tree, sizeof(data_art_node48_t));
+    // CoW: allocate new page (hint = old page for same-page COW), write there, release old
+    node_ref_t new_ref = data_art_alloc_node_hint(tree, sizeof(data_art_node48_t), node_ref.page_id);
     if (node_ref_is_null(new_ref)) {
         LOG_ERROR("Failed to allocate new NODE_48 for CoW");
         return NULL_NODE_REF;
@@ -405,8 +405,8 @@ static node_ref_t add_child_node256(data_art_tree_t *tree, node_ref_t node_ref,
     new_n256.child_page_ids[byte] = child_ref.page_id;
     new_n256.child_offsets[byte] = child_ref.offset;
     
-    // CoW: allocate new page, write there, release old
-    node_ref_t new_ref = data_art_alloc_node(tree, sizeof(data_art_node256_t));
+    // CoW: allocate new page (hint = old page for same-page COW), write there, release old
+    node_ref_t new_ref = data_art_alloc_node_hint(tree, sizeof(data_art_node256_t), node_ref.page_id);
     if (node_ref_is_null(new_ref)) {
         LOG_ERROR("Failed to allocate new NODE_256 for CoW");
         return NULL_NODE_REF;

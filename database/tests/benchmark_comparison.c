@@ -633,6 +633,68 @@ static void bench_negative_lookup(int num_keys) {
     print_comparison("Negative Lookup", art_res, lmdb_res);
 }
 
+static const char *slot_class_name(int idx) {
+    static const char *names[] = {"Node4", "Node16", "Node48", "Node256", "Leaf"};
+    return (idx >= 0 && idx < NUM_SLOT_CLASSES) ? names[idx] : "?";
+}
+
+/**
+ * Slot utilization stats — shows how well multi-node-per-page packing works.
+ */
+static void bench_slot_stats(int num_keys) {
+    uint8_t key[KEY_SIZE], value[VALUE_SIZE];
+
+    printf("  %-28s\n", "Slot Allocator Stats");
+
+    art_ctx_t ctx = art_open();
+    if (!ctx.tree) { printf("    (failed)\n\n"); return; }
+
+    uint64_t txn_id;
+    data_art_begin_txn(ctx.tree, &txn_id);
+    for (int i = 0; i < num_keys; i++) {
+        make_key(i, key);
+        make_value(i, value);
+        data_art_insert(ctx.tree, key, KEY_SIZE, value, VALUE_SIZE);
+    }
+    data_art_commit_txn(ctx.tree);
+
+    data_art_stats_t stats;
+    data_art_get_stats(ctx.tree, &stats);
+
+    uint64_t total_slot_allocs = 0, total_slot_frees = 0, total_slot_pages = 0;
+    printf("    %-8s %8s %8s %8s %6s %8s\n",
+           "Class", "Pages", "Allocs", "Frees", "Slots", "Packing");
+    for (int i = 0; i < NUM_SLOT_CLASSES; i++) {
+        total_slot_allocs += stats.slot_allocs[i];
+        total_slot_frees += stats.slot_frees[i];
+        total_slot_pages += stats.slot_pages_created[i];
+        uint16_t spp = ctx.tree->slot_classes[i].slots_per_page;
+        double packing = (stats.slot_pages_created[i] > 0 && spp > 0) ?
+            (double)(stats.slot_allocs[i] - stats.slot_frees[i]) /
+            (stats.slot_pages_created[i] * spp) * 100.0 : 0;
+        printf("    %-8s %8lu %8lu %8lu %6u %7.1f%%\n",
+               slot_class_name(i),
+               stats.slot_pages_created[i],
+               stats.slot_allocs[i],
+               stats.slot_frees[i],
+               spp,
+               packing);
+    }
+    printf("    %-8s %8lu %8lu %8lu\n", "Total",
+           total_slot_pages, total_slot_allocs, total_slot_frees);
+    printf("    Dedicated pages:  %lu\n", stats.dedicated_pages_created);
+
+    uint64_t total_hints = stats.slot_hint_hits + stats.slot_hint_misses;
+    double hint_rate = total_hints > 0 ?
+        (double)stats.slot_hint_hits / total_hints * 100.0 : 0;
+    printf("    Hint hits/total:  %lu / %lu (%.1f%%)\n",
+           stats.slot_hint_hits, total_hints, hint_rate);
+    printf("    Pages reused:     %lu\n", stats.pages_reused);
+
+    art_close(&ctx);
+    printf("\n");
+}
+
 /**
  * Disk usage comparison.
  */
@@ -655,6 +717,7 @@ static void bench_disk_usage(int num_keys) {
         }
         data_art_commit_txn(ctx.tree);
         data_art_flush(ctx.tree);
+
         art_close(&ctx);
 
         uint64_t art_size = dir_size(ART_DB_PATH) + dir_size(ART_WAL_PATH);
@@ -736,6 +799,7 @@ int main(int argc, char **argv) {
     bench_range_scan(num_keys);
     bench_negative_lookup(num_keys);
     bench_disk_usage(num_keys);
+    bench_slot_stats(num_keys);
 
     printf("================================================================\n");
     printf("  Benchmark complete\n");

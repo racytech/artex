@@ -221,8 +221,8 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                 // Set xmax to mark as deleted
                 modified_leaf->xmax = tree->current_txn_id;
                 
-                // Write modified leaf back (CoW)
-                node_ref_t new_ref = data_art_alloc_node(tree, leaf_size);
+                // Write modified leaf back (CoW, hint = old page for same-page COW)
+                node_ref_t new_ref = data_art_alloc_node_hint(tree, leaf_size, node_ref.page_id);
                 if (node_ref_is_null(new_ref)) {
                     LOG_ERROR("Failed to allocate new leaf page");
                     free(modified_leaf);
@@ -390,8 +390,8 @@ static node_ref_t update_child(data_art_tree_t *tree, node_ref_t node_ref,
             return node_ref;
     }
     
-    // Allocate new page and write the node
-    node_ref_t new_ref = data_art_alloc_node(tree, node_size);
+    // Allocate new page and write the node (hint = old page for same-page COW)
+    node_ref_t new_ref = data_art_alloc_node_hint(tree, node_size, node_ref.page_id);
     if (node_ref_is_null(new_ref)) {
         LOG_ERROR("Failed to allocate page for updated node");
         free(new_node);
@@ -572,8 +572,8 @@ static node_ref_t remove_child(data_art_tree_t *tree, node_ref_t node_ref,
         }
     }
     
-    // Allocate new page for modified node
-    node_ref_t new_ref = data_art_alloc_node(tree, node_size);
+    // Allocate new page for modified node (hint = old page for same-page COW)
+    node_ref_t new_ref = data_art_alloc_node_hint(tree, node_size, node_ref.page_id);
     if (node_ref_is_null(new_ref)) {
         free(new_node);
         LOG_ERROR("Failed to allocate page for modified node");

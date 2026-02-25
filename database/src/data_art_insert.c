@@ -394,8 +394,8 @@ static node_ref_t replace_child_in_node(data_art_tree_t *tree, node_ref_t node_r
         return NULL_NODE_REF;
     }
 
-    // CoW: allocate new page, write there, release old
-    node_ref_t new_ref = data_art_alloc_node(tree, node_size);
+    // CoW: allocate new page (hint = old page for same-page COW), write there, release old
+    node_ref_t new_ref = data_art_alloc_node_hint(tree, node_size, node_ref.page_id);
     if (node_ref_is_null(new_ref)) {
         LOG_ERROR("[REPLACE_CHILD] FAILED: Could not allocate new page for CoW");
         free(modified_node);
@@ -776,8 +776,8 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                 }
             }
             
-            // Allocate new page for modified old node
-            node_ref_t modified_node_ref = data_art_alloc_node(tree, node_size);
+            // Allocate new page for modified old node (hint = old page for same-page COW)
+            node_ref_t modified_node_ref = data_art_alloc_node_hint(tree, node_size, node_ref.page_id);
             if (node_ref_is_null(modified_node_ref)) {
                 free(modified_node);
                 LOG_ERROR("Failed to allocate page for modified node");

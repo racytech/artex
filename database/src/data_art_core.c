@@ -24,6 +24,7 @@
 
 // Forward declarations
 static void drain_pending_frees(data_art_tree_t *tree);
+void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
 
 // ============================================================================
 // Thread-Local Arena for Safe Node Reads
@@ -67,6 +68,9 @@ void data_art_reset_arena(void) {
 // Publish the current tree->root so lock-free readers can see it.
 // Called after auto-commit, commit_txn, or tree initialization.
 void data_art_publish_root(data_art_tree_t *tree) {
+    // Store offset first (readers read page_id first with acquire)
+    atomic_store_explicit(&tree->committed_root_offset,
+                          tree->root.offset, memory_order_relaxed);
     atomic_store_explicit(&tree->committed_root_page_id,
                           tree->root.page_id, memory_order_release);
 }
@@ -145,6 +149,345 @@ static size_t data_art_node_size_from_data(const void *node_data) {
 }
 
 // ============================================================================
+// Slot Page Bitmap Helpers
+// ============================================================================
+
+/**
+ * Find first free (0) bit in bitmap, searching up to 'count' bits.
+ * Returns bit index, or -1 if all occupied.
+ */
+static int bitmap_find_free(const uint8_t *bitmap, int count) {
+    for (int byte_idx = 0; byte_idx < (count + 7) / 8; byte_idx++) {
+        uint8_t b = bitmap[byte_idx];
+        if (b == 0xFF) continue;  // All 8 bits set
+        for (int bit = 0; bit < 8; bit++) {
+            int idx = byte_idx * 8 + bit;
+            if (idx >= count) return -1;
+            if (!(b & (1u << bit))) return idx;
+        }
+    }
+    return -1;
+}
+
+static inline void bitmap_set(uint8_t *bitmap, int idx) {
+    bitmap[idx / 8] |= (1u << (idx % 8));
+}
+
+static inline void bitmap_clear(uint8_t *bitmap, int idx) {
+    bitmap[idx / 8] &= ~(1u << (idx % 8));
+}
+
+static inline bool bitmap_test(const uint8_t *bitmap, int idx) {
+    return (bitmap[idx / 8] & (1u << (idx % 8))) != 0;
+}
+
+// ============================================================================
+// Slot Allocator
+// ============================================================================
+
+/**
+ * Initialize slot class sizes based on node struct sizes and tree key_size.
+ */
+static void slot_allocator_init(data_art_tree_t *tree) {
+    // Default leaf inline size: key_size + 32 (typical Ethereum value)
+    size_t leaf_size = sizeof(data_art_leaf_t) + tree->key_size + 32;
+
+    struct { uint8_t type; size_t raw_size; } classes[] = {
+        { DATA_NODE_4,    sizeof(data_art_node4_t) },
+        { DATA_NODE_16,   sizeof(data_art_node16_t) },
+        { DATA_NODE_48,   sizeof(data_art_node48_t) },
+        { DATA_NODE_256,  sizeof(data_art_node256_t) },
+        { DATA_NODE_LEAF, leaf_size },
+    };
+
+    for (int i = 0; i < NUM_SLOT_CLASSES; i++) {
+        uint16_t aligned = (uint16_t)ALIGN8(classes[i].raw_size);
+        uint16_t slots = (uint16_t)(SLOT_AREA_SIZE / aligned);
+        if (slots > 64) slots = 64;  // Bitmap is 8 bytes = 64 bits
+        if (slots == 0) slots = 1;
+
+        tree->slot_classes[i].node_type = classes[i].type;
+        tree->slot_classes[i].slot_size = aligned;
+        tree->slot_classes[i].slots_per_page = slots;
+        tree->slot_classes[i].current_page_id = 0;
+
+        LOG_DEBUG("Slot class %d: type=%u raw_size=%zu slot_size=%u slots/page=%u",
+                  i, classes[i].type, classes[i].raw_size, aligned, slots);
+    }
+}
+
+/**
+ * Map a node size to a slot class index.
+ * Returns -1 if the size exceeds all slot classes (use dedicated page).
+ */
+static int size_to_slot_class(data_art_tree_t *tree, size_t size) {
+    int best = -1;
+    uint16_t best_size = UINT16_MAX;
+    for (int i = 0; i < NUM_SLOT_CLASSES; i++) {
+        // Skip single-slot classes — no benefit from multi-node-per-page
+        if (tree->slot_classes[i].slots_per_page < 2) continue;
+        if (size <= tree->slot_classes[i].slot_size &&
+            tree->slot_classes[i].slot_size < best_size) {
+            best = i;
+            best_size = tree->slot_classes[i].slot_size;
+        }
+    }
+    return best;
+}
+
+/**
+ * Read slot page header from a page in the buffer pool.
+ */
+static void slot_page_read_header(const page_t *page, slot_page_header_t *hdr) {
+    memcpy(hdr, page->data, sizeof(slot_page_header_t));
+}
+
+/**
+ * Write slot page header to a page in the buffer pool.
+ */
+static void slot_page_write_header(page_t *page, const slot_page_header_t *hdr) {
+    memcpy(page->data, hdr, sizeof(slot_page_header_t));
+}
+
+/**
+ * Allocate a slot on the given page. Returns offset within page->data, or 0 on failure.
+ * The page must be pinned and will be marked dirty.
+ */
+static uint32_t slot_page_alloc_slot(page_t *page, const slot_class_t *cls) {
+    slot_page_header_t hdr;
+    slot_page_read_header(page, &hdr);
+
+    if (hdr.used_count >= hdr.slot_count) {
+        return 0;  // Page full
+    }
+
+    int idx = bitmap_find_free(hdr.bitmap, hdr.slot_count);
+    if (idx < 0) return 0;
+
+    bitmap_set(hdr.bitmap, idx);
+    hdr.used_count++;
+    slot_page_write_header(page, &hdr);
+
+    return (uint32_t)(SLOT_PAGE_HEADER_SIZE + idx * cls->slot_size);
+}
+
+/**
+ * Free a slot on the given page. Returns new used_count.
+ * The page must be pinned and will be marked dirty.
+ */
+static uint16_t slot_page_free_slot(page_t *page, uint32_t offset, const slot_class_t *cls) {
+    slot_page_header_t hdr;
+    slot_page_read_header(page, &hdr);
+
+    int idx = (offset - SLOT_PAGE_HEADER_SIZE) / cls->slot_size;
+    if (idx < 0 || idx >= hdr.slot_count) {
+        LOG_ERROR("Invalid slot index %d (offset=%u, slot_size=%u)", idx, offset, cls->slot_size);
+        return hdr.used_count;
+    }
+
+    bitmap_clear(hdr.bitmap, idx);
+    if (hdr.used_count > 0) hdr.used_count--;
+    slot_page_write_header(page, &hdr);
+
+    return hdr.used_count;
+}
+
+/**
+ * Initialize a new page as a slot page for the given class.
+ * The page must be from buffer_pool_insert_new (zero-initialized, pinned).
+ */
+static void slot_page_init(page_t *page, const slot_class_t *cls) {
+    slot_page_header_t hdr = {
+        .node_type = cls->node_type,
+        .reserved = 0,
+        .slot_size = cls->slot_size,
+        .slot_count = cls->slots_per_page,
+        .used_count = 0,
+        .bitmap = {0},
+    };
+    slot_page_write_header(page, &hdr);
+}
+
+/**
+ * Pop a page ID from the reuse pool. Returns 0 if empty.
+ * Re-initializes ref count and clears stale flags on the page.
+ */
+static uint64_t reuse_pool_pop(data_art_tree_t *tree) {
+    if (tree->reuse_pool_count == 0) return 0;
+    uint64_t page_id = tree->reuse_pool[--tree->reuse_pool_count];
+    // Re-init ref count and clear dead/stale flags
+    page_gc_init_ref(tree->page_manager, page_id);
+    tree->pages_reused++;
+    return page_id;
+}
+
+/**
+ * Allocate a slot from the slot allocator for the given class.
+ * Returns a node_ref_t with {page_id, offset}, or NULL_NODE_REF on failure.
+ */
+static node_ref_t slot_alloc(data_art_tree_t *tree, int class_idx) {
+    slot_class_t *cls = &tree->slot_classes[class_idx];
+
+    // Try current page first
+    if (cls->current_page_id != 0) {
+        page_t *page = buffer_pool_get_pinned(tree->buffer_pool, cls->current_page_id);
+        if (page) {
+            uint32_t offset = slot_page_alloc_slot(page, cls);
+            if (offset != 0) {
+                buffer_pool_dirty_unpin(tree->buffer_pool, cls->current_page_id);
+                tree->slot_allocs[class_idx]++;
+                return (node_ref_t){.page_id = cls->current_page_id, .offset = offset};
+            }
+            // Page full — unpin and fall through to allocate new page
+            buffer_pool_unpin(tree->buffer_pool, cls->current_page_id);
+        }
+        cls->current_page_id = 0;
+    }
+
+    // Try reuse pool first, then allocate fresh
+    uint64_t page_id = reuse_pool_pop(tree);
+    if (page_id == 0) {
+        page_id = page_manager_alloc(tree->page_manager, PAGE_SIZE);
+        if (page_id == 0) {
+            LOG_ERROR("slot_alloc: page_manager_alloc failed");
+            return NULL_NODE_REF;
+        }
+        page_gc_init_ref(tree->page_manager, page_id);
+    }
+
+    // Insert into buffer pool as a fresh page
+    page_t *page = buffer_pool_insert_new(tree->buffer_pool, page_id);
+    if (!page) {
+        LOG_ERROR("slot_alloc: buffer_pool_insert_new failed for page %lu", page_id);
+        return NULL_NODE_REF;
+    }
+
+    // Initialize slot page header
+    slot_page_init(page, cls);
+
+    // Allocate first slot
+    uint32_t offset = slot_page_alloc_slot(page, cls);
+    buffer_pool_dirty_unpin(tree->buffer_pool, page_id);
+
+    cls->current_page_id = page_id;
+    tree->nodes_allocated++;
+    tree->slot_pages_created[class_idx]++;
+    tree->slot_allocs[class_idx]++;
+
+    return (node_ref_t){.page_id = page_id, .offset = offset};
+}
+
+/**
+ * Allocate a slot with a hint page — tries to reuse a slot on the hint page first.
+ * Used for same-page COW: when replacing a node, the old node's page often has a
+ * free slot (from a previous COW free). Allocating there keeps related nodes on the
+ * same page, improving cache locality and reducing page count.
+ */
+static node_ref_t slot_alloc_hint(data_art_tree_t *tree, int class_idx, uint64_t hint_page_id) {
+    slot_class_t *cls = &tree->slot_classes[class_idx];
+
+    // Try hint page first (if it's a valid slot page of the right class)
+    if (hint_page_id != 0 && hint_page_id != cls->current_page_id) {
+        page_t *page = buffer_pool_get_pinned(tree->buffer_pool, hint_page_id);
+        if (page) {
+            slot_page_header_t hdr;
+            slot_page_read_header(page, &hdr);
+            // Verify it's the right class and has free slots
+            if (hdr.node_type == cls->node_type && hdr.used_count < hdr.slot_count) {
+                uint32_t offset = slot_page_alloc_slot(page, cls);
+                if (offset != 0) {
+                    buffer_pool_dirty_unpin(tree->buffer_pool, hint_page_id);
+                    tree->slot_hint_hits++;
+                    tree->slot_allocs[class_idx]++;
+                    return (node_ref_t){.page_id = hint_page_id, .offset = offset};
+                }
+            }
+            buffer_pool_unpin(tree->buffer_pool, hint_page_id);
+        }
+    }
+
+    // Hint didn't work — fall through to normal allocation
+    tree->slot_hint_misses++;
+    return slot_alloc(tree, class_idx);
+}
+
+/**
+ * Allocate a node on a dedicated page (one node per page).
+ * Used for Node256, overflow pages, and oversized leaves.
+ */
+static node_ref_t alloc_dedicated_page(data_art_tree_t *tree, size_t size) {
+    // Try reuse pool first
+    uint64_t page_id = reuse_pool_pop(tree);
+    if (page_id == 0) {
+        // No reusable pages — allocate fresh
+        page_id = page_manager_alloc(tree->page_manager, size);
+        if (page_id == 0) {
+            LOG_ERROR("alloc_dedicated_page: page_manager_alloc failed");
+            return NULL_NODE_REF;
+        }
+        if (!page_gc_init_ref(tree->page_manager, page_id)) {
+            LOG_ERROR("alloc_dedicated_page: page_gc_init_ref failed for page %lu", page_id);
+            return NULL_NODE_REF;
+        }
+    }
+
+    tree->nodes_allocated++;
+    tree->dedicated_pages_created++;
+    return (node_ref_t){.page_id = page_id, .offset = 0};
+}
+
+/**
+ * Free a slot and potentially the entire page if it becomes empty.
+ */
+static void slot_free(data_art_tree_t *tree, uint64_t page_id, uint32_t offset) {
+    if (offset == 0) {
+        // Legacy/dedicated page — free whole page
+        data_art_release_page(tree, (node_ref_t){.page_id = page_id, .offset = 0});
+        return;
+    }
+
+    page_t *page = buffer_pool_get_pinned(tree->buffer_pool, page_id);
+    if (!page) {
+        LOG_ERROR("slot_free: failed to get page %lu", page_id);
+        return;
+    }
+
+    // Read header to determine class
+    slot_page_header_t hdr;
+    slot_page_read_header(page, &hdr);
+
+    // Find the matching class
+    slot_class_t *cls = NULL;
+    int class_idx = -1;
+    for (int i = 0; i < NUM_SLOT_CLASSES; i++) {
+        if (tree->slot_classes[i].node_type == hdr.node_type) {
+            cls = &tree->slot_classes[i];
+            class_idx = i;
+            break;
+        }
+    }
+
+    if (!cls) {
+        LOG_ERROR("slot_free: unknown node_type %u on page %lu", hdr.node_type, page_id);
+        buffer_pool_unpin(tree->buffer_pool, page_id);
+        return;
+    }
+
+    if (class_idx >= 0) tree->slot_frees[class_idx]++;
+    uint16_t remaining = slot_page_free_slot(page, offset, cls);
+    buffer_pool_dirty_unpin(tree->buffer_pool, page_id);
+
+    if (remaining == 0) {
+        // Page is empty — reset current_page_id if it matches
+        if (cls->current_page_id == page_id) {
+            cls->current_page_id = 0;
+        }
+        // Add to pending free list (whole page)
+        data_art_release_page(tree, (node_ref_t){.page_id = page_id, .offset = 0});
+    }
+}
+
+// ============================================================================
 // Tree Lifecycle
 // ============================================================================
 
@@ -209,8 +552,12 @@ data_art_tree_t *data_art_create(page_manager_t *page_manager,
     tree->overflow_pages_allocated = 0;
     tree->overflow_chain_reads = 0;
     
-    // Initialize committed root for lock-free readers (empty tree → page_id 0)
+    // Initialize committed root for lock-free readers (empty tree → page_id 0, offset 0)
     atomic_store_explicit(&tree->committed_root_page_id, 0, memory_order_release);
+    atomic_store_explicit(&tree->committed_root_offset, 0, memory_order_release);
+
+    // Initialize slot allocator for multi-node-per-page packing
+    slot_allocator_init(tree);
 
     LOG_INFO("Created persistent ART tree (key_size=%zu, max_depth=%zu, buffer_pool=%s, wal=%s)",
              key_size, tree->max_depth,
@@ -224,6 +571,7 @@ void data_art_destroy(data_art_tree_t *tree) {
     if (!tree) {
         return;
     }
+
     
     // Destroy write lock
     pthread_mutex_destroy(&tree->write_lock);
@@ -246,8 +594,14 @@ void data_art_destroy(data_art_tree_t *tree) {
     drain_pending_frees(tree);
     free(tree->pending_free_pages);
 
-    LOG_INFO("Destroyed ART tree (size=%zu, nodes=%lu)",
-             tree->size, tree->nodes_allocated);
+    // Drain reuse pool — mark pages as dead so compaction can reclaim them
+    for (size_t i = 0; i < tree->reuse_pool_count; i++) {
+        page_manager_free(tree->page_manager, tree->reuse_pool[i]);
+    }
+    free(tree->reuse_pool);
+
+    LOG_INFO("Destroyed ART tree (size=%zu, nodes=%lu, pages_reused=%lu)",
+             tree->size, tree->nodes_allocated, tree->pages_reused);
 
     free(tree);
 }
@@ -280,35 +634,60 @@ node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size) {
         LOG_ERROR("Tree is NULL");
         return NULL_NODE_REF;
     }
-    
-    // Page data size is PAGE_SIZE - PAGE_HEADER_SIZE
+
     size_t max_size = PAGE_SIZE - PAGE_HEADER_SIZE;
-    
     if (size == 0 || size > max_size) {
         LOG_ERROR("Invalid node size: %zu (max=%zu)", size, max_size);
         return NULL_NODE_REF;
     }
-    
-    // Allocate a new page for this node
-    uint64_t page_id = page_manager_alloc(tree->page_manager, size);
-    if (page_id == 0) {
-        LOG_ERROR("Failed to allocate page for node");
+
+    // Try slot allocation if buffer pool is available
+    if (tree->buffer_pool) {
+        int class_idx = size_to_slot_class(tree, size);
+        if (class_idx >= 0) {
+            return slot_alloc(tree, class_idx);
+        }
+    }
+
+    // Fallback: dedicated page (overflow, oversized, or no buffer pool)
+    return alloc_dedicated_page(tree, size);
+}
+
+/**
+ * Allocate space for a new node with a hint page for same-page COW.
+ *
+ * When COW'ing a node, pass the old node's page_id as hint.  The allocator
+ * tries the hint page first — if it's the right size class and has a free
+ * slot, the new copy lands on the same page as its siblings, improving
+ * cache locality and reducing total page count.
+ *
+ * Falls through to normal allocation if the hint page doesn't work.
+ */
+node_ref_t data_art_alloc_node_hint(data_art_tree_t *tree, size_t size, uint64_t hint_page_id) {
+    if (!tree) {
+        LOG_ERROR("Tree is NULL");
         return NULL_NODE_REF;
     }
-    
-    // Initialize reference count to 1 (caller holds initial reference)
-    if (!page_gc_init_ref(tree->page_manager, page_id)) {
-        LOG_ERROR("Failed to initialize ref count for page %lu", page_id);
-        // Note: page is allocated but orphaned - will be cleaned up during compaction
+
+    size_t max_size = PAGE_SIZE - PAGE_HEADER_SIZE;
+    if (size == 0 || size > max_size) {
+        LOG_ERROR("Invalid node size: %zu (max=%zu)", size, max_size);
         return NULL_NODE_REF;
     }
-    
-    tree->nodes_allocated++;
-    
-    // Node starts at offset 0 in the page
-    node_ref_t ref = {.page_id = page_id, .offset = 0};
-    
-    return ref;
+
+    // Try slot allocation with hint if buffer pool is available
+    if (tree->buffer_pool) {
+        int class_idx = size_to_slot_class(tree, size);
+        if (class_idx >= 0) {
+            if (hint_page_id != 0) {
+                return slot_alloc_hint(tree, class_idx, hint_page_id);
+            }
+            return slot_alloc(tree, class_idx);
+        }
+    }
+
+    // Fallback: dedicated page (overflow, oversized, or no buffer pool)
+    return alloc_dedicated_page(tree, size);
 }
 
 /**
@@ -322,9 +701,30 @@ static void drain_pending_frees(data_art_tree_t *tree) {
     if (tree->pending_free_count == 0) return;
 
     for (size_t i = 0; i < tree->pending_free_count; i++) {
-        page_manager_free(tree->page_manager, tree->pending_free_pages[i]);
+        uint64_t page_id = tree->pending_free_pages[i];
+
+        // Evict from buffer pool so reuse gets a fresh frame
+        if (tree->buffer_pool) {
+            buffer_pool_invalidate(tree->buffer_pool, page_id);
+        }
+
+        // Push to reuse pool instead of page_manager_free
+        if (tree->reuse_pool_count >= tree->reuse_pool_capacity) {
+            size_t new_cap = tree->reuse_pool_capacity == 0 ? 64 : tree->reuse_pool_capacity * 2;
+            uint64_t *new_pool = realloc(tree->reuse_pool, new_cap * sizeof(uint64_t));
+            if (!new_pool) {
+                // Fallback: free to page manager (loses reuse opportunity)
+                page_manager_free(tree->page_manager, page_id);
+                continue;
+            }
+            tree->reuse_pool = new_pool;
+            tree->reuse_pool_capacity = new_cap;
+        }
+        tree->reuse_pool[tree->reuse_pool_count++] = page_id;
     }
-    LOG_DEBUG("Drained %zu pending page frees", tree->pending_free_count);
+
+    LOG_DEBUG("Drained %zu pending frees to reuse pool (pool size=%zu)",
+              tree->pending_free_count, tree->reuse_pool_count);
     tree->pending_free_count = 0;
 }
 
@@ -357,7 +757,13 @@ static void try_drain_pending_frees(data_art_tree_t *tree) {
 void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref) {
     if (!tree || node_ref_is_null(old_ref)) return;
 
-    // Grow pending list if needed
+    // Slot-level free: non-zero offset means node is on a multi-node page
+    if (old_ref.offset != 0 && tree->buffer_pool) {
+        slot_free(tree, old_ref.page_id, old_ref.offset);
+        return;
+    }
+
+    // Whole-page free (dedicated pages or legacy offset=0 pages)
     if (tree->pending_free_count >= tree->pending_free_capacity) {
         size_t new_cap = tree->pending_free_capacity == 0 ? 64 : tree->pending_free_capacity * 2;
         uint64_t *new_list = realloc(tree->pending_free_pages, new_cap * sizeof(uint64_t));
@@ -733,6 +1139,8 @@ data_art_snapshot_t *data_art_begin_snapshot(data_art_tree_t *tree) {
     // Capture committed root at snapshot creation time (lock-free)
     snapshot->root_page_id = atomic_load_explicit(&tree->committed_root_page_id,
                                                    memory_order_acquire);
+    snapshot->root_offset = atomic_load_explicit(&tree->committed_root_offset,
+                                                  memory_order_relaxed);
 
     // Create MVCC snapshot
     snapshot->mvcc_snapshot = mvcc_snapshot_create(tree->mvcc_manager);

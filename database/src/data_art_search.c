@@ -34,7 +34,9 @@ extern bool data_art_read_overflow_value(data_art_tree_t *tree,
 static inline node_ref_t data_art_read_committed_root(data_art_tree_t *tree) {
     uint64_t page_id = atomic_load_explicit(&tree->committed_root_page_id,
                                              memory_order_acquire);
-    return (node_ref_t){.page_id = page_id, .offset = 0};
+    uint32_t offset = atomic_load_explicit(&tree->committed_root_offset,
+                                            memory_order_relaxed);
+    return (node_ref_t){.page_id = page_id, .offset = offset};
 }
 
 // ============================================================================
@@ -401,7 +403,7 @@ const void *data_art_get_snapshot(data_art_tree_t *tree, const uint8_t *key, siz
     node_ref_t root;
     if (snapshot) {
         // Use the root captured at snapshot creation time for consistent reads
-        root = (node_ref_t){.page_id = snapshot->root_page_id, .offset = 0};
+        root = (node_ref_t){.page_id = snapshot->root_page_id, .offset = snapshot->root_offset};
         return data_art_get_internal(tree, root, key, key_len, value_len,
                                       snapshot->mvcc_snapshot, snapshot->txn_id);
     } else {
