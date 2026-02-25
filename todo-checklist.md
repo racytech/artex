@@ -203,7 +203,18 @@
    - Key management: master key + per-file or per-page derived keys
    - Transparent to buffer pool and upper layers
 
-### 28. Dead Code Cleanup
+### 28. CLI (Command-Line Interface)
+   - Combined admin + client tool for interacting with the database
+   - **Key-value operations**: `get <key>`, `put <key> <value>`, `delete <key>`, `scan [prefix]`
+   - **Transaction support**: `begin`, `commit`, `abort` for multi-key atomic updates
+   - **Admin commands**: `stats` (page manager, buffer pool, MVCC), `compact` (trigger compaction), `checkpoint` (force checkpoint), `backup <path>` / `restore <path>`
+   - **Inspection**: `info` (database metadata, compression ratio, dead bytes), `pages [page_id]` (page index details), `health` (fsync health state)
+   - **Interactive REPL mode** + single-command mode (`artdb get mykey`)
+   - Opens database from a path argument: `artdb --db /path/to/db`
+   - Read-only mode: `artdb --db /path/to/db --readonly`
+   - Builds on all existing APIs: data_art, page_manager, buffer_pool, checkpoint_manager, db_backup
+
+### 29. Dead Code Cleanup
    - Remove `db_compaction.h` (entire unimplemented header) if compaction not implemented
    - Remove unused functions (data_art_cow_node, data_art_snapshot, data_art_load, etc.)
    - Remove dead static functions in `data_art_node_ops.c` (shrink stubs already implemented in data_art_delete.c)
