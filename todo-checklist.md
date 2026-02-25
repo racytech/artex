@@ -125,15 +125,76 @@
    - Tests: empty tree, single key, 1000 keys, 8KB overflow values, metadata, corrupted header/data, truncated file, invalid paths
    - Result: 9/9 backup tests pass, 24/24 full suite
 
-### 17. Database Compaction (3-5 days)
+### 17. Page Compression (LZ4/ZSTD)
+   - Stubs exist: `compression_type` in page header, `read_compressed`/`write_compressed` in page_manager
+   - LZ4 for hot pages (fast, ~2x ratio), ZSTD for cold pages (slower, ~4x ratio)
+   - Compression tier policy based on `last_access_time` in page header
+   - Transparent: compress on write, decompress on read, buffer pool sees uncompressed pages
+   - LZ4 and ZSTD already linked in CMakeLists.txt
+
+### 18. Batch Insert Optimization
+   - Current TEMP FIX: commit path acquires/releases write_lock N times, publishes root N times
+   - Dedicated batch path: hold lock once, apply all mutations to tree, publish root once
+   - Single MVCC txn for entire batch instead of N auto-commit txns
+   - Expected: 5-10x throughput improvement for large batches
+
+### 19. Write Batching / Group Commit
+   - Currently every `commit_txn` does its own fsync (~5ms each)
+   - Group commit: buffer multiple transactions, single fsync for the group
+   - Amortize disk latency across many commits (critical for high-throughput workloads)
+   - WAL already uses write buffer — extend with commit coalescing
+
+### 20. Bloom Filters for Negative Lookups
+   - Negative lookups (key not found) currently traverse tree to disk
+   - Per-page or per-level bloom filter avoids I/O for keys that definitely don't exist
+   - Important for Ethereum where misses are common (state trie probing)
+   - Space-efficient: ~10 bits per key for <1% false positive rate
+
+### 21. Incremental Backup
+   - Current backup exports all keys every time
+   - Delta backup: only keys/pages changed since last backup (tracked via LSN or write_counter)
+   - Much faster for large databases with small daily changes
+   - Could use WAL LSN watermark to identify changed pages
+
+### 22. Monitoring / Metrics Export
+   - Basic stats exist (pages_read/written, bytes, cache hits) but no time-series
+   - Add latency histograms for read/write/commit operations
+   - Cache hit rate over sliding window
+   - Export interface for Prometheus or similar monitoring systems
+
+### 23. File Pre-allocation
+   - Data files currently grow on demand via pwrite
+   - Pre-allocate with `fallocate()` to reduce filesystem fragmentation
+   - Improves sequential write throughput and reduces metadata overhead
+   - Allocate in chunks (e.g. 64MB) when file grows past current allocation
+
+### 24. State Pruning Policy
+   - MVCC + page GC infrastructure exists but no policy layer
+   - Prune state versions older than N snapshots/checkpoints
+   - Ethereum-specific: keep only last N blocks of state, reclaim the rest
+   - Ties into compaction: pruning marks pages dead, compaction reclaims space
+
+### 25. Merkle Proof Generation
+   - If ART replaces Merkle Patricia Trie, need state root computation and inclusion/exclusion proofs
+   - Compute hash of each node (bottom-up), root hash = state root
+   - Proof = path from root to leaf with sibling hashes at each level
+   - Could be a separate layer on top of the ART (hash-augmented nodes)
+
+### 26. Encryption at Rest
+   - No data encryption on disk currently
+   - Page-level encryption: encrypt before write, decrypt after read
+   - Key management: master key + per-file or per-page derived keys
+   - Transparent to buffer pool and upper layers
+
+### 27. Database Compaction (3-5 days)
    - Rewrite live pages into contiguous files, discard dead pages
    - Requires: iterate all live pages, copy to new file, swap atomically
    - Header `db_compaction.h` exists as stub — needs full implementation
    - Reclaims space from long-running databases with heavy delete workloads
    - Could run as background thread similar to checkpoint_manager
 
-### 18. Dead Code Cleanup
-   - Remove `db_compaction.h` (entire unimplemented header)
+### 28. Dead Code Cleanup
+   - Remove `db_compaction.h` (entire unimplemented header) if compaction not implemented
    - Remove unused functions (data_art_cow_node, data_art_snapshot, data_art_load, etc.)
    - Remove dead static functions in `data_art_node_ops.c` (shrink stubs already implemented in data_art_delete.c)
    - Remove debug printfs in `mem_art.c`, duplicate log lines in `wal.c`
