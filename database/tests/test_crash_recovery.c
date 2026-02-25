@@ -11,6 +11,7 @@
  *   7. Mixed committed + uncommitted transactions
  *   8. Metadata persistence (next_page_id survives restart via metadata.bin)
  *   9. Recovery without metadata.bin (WAL checkpoint entry restores next_page_id)
+ *  10. Page reuse after deletes (freed pages returned to allocator and reused)
  */
 
 #include "data_art.h"
@@ -671,6 +672,72 @@ static void test_recovery_without_metadata_file(void) {
 }
 
 // ============================================================================
+// Test 10: Page Reuse After Deletes
+// ============================================================================
+
+static void test_page_reuse_after_deletes(void) {
+    test_env_t env = {0};
+    make_paths(&env, "t10");
+    cleanup_paths(env.db_path, env.wal_path);
+    open_env(&env);
+
+    // Insert 200 keys
+    printf("  Inserting 200 keys...\n");
+    insert_keys(&env, 0, 200);
+    ASSERT(data_art_flush(env.tree), "flush after insert");
+
+    uint64_t pid_after_insert = page_manager_get_next_page_id(env.pm);
+    printf("  next_page_id after 200 inserts: %lu\n", pid_after_insert);
+
+    // Delete 150 keys (0-149) — pages should be freed to free list
+    printf("  Deleting 150 keys...\n");
+    for (int i = 0; i < 150; i++) {
+        uint8_t key[KEY_SIZE];
+        generate_key(key, i);
+        bool ok = data_art_delete(env.tree, key, KEY_SIZE);
+        ASSERT(ok, "delete key");
+    }
+    ASSERT(data_art_flush(env.tree), "flush after delete");
+
+    // Verify tree size is 50
+    ASSERT_EQ((long)data_art_size(env.tree), 50L, "tree size after deletes");
+
+    // Insert 150 NEW keys (starting at 1000) — should reuse freed pages
+    printf("  Inserting 150 new keys (should reuse freed pages)...\n");
+    insert_keys(&env, 1000, 150);
+    ASSERT(data_art_flush(env.tree), "flush after reinsert");
+
+    uint64_t pid_after_reinsert = page_manager_get_next_page_id(env.pm);
+    printf("  next_page_id after reinserting 150: %lu\n", pid_after_reinsert);
+
+    // If pages were reused, next_page_id should NOT have grown by 150
+    // Without reuse: pid_after_reinsert >= pid_after_insert + 150
+    // With reuse:    pid_after_reinsert < pid_after_insert + 150
+    printf("  Page reuse check: %lu < %lu + 150 = %lu\n",
+           pid_after_reinsert, pid_after_insert, pid_after_insert + 150);
+    ASSERT(pid_after_reinsert < pid_after_insert + 150,
+           "pages should be reused (next_page_id should not grow by 150)");
+
+    // Verify all 200 keys present (50 surviving + 150 new)
+    printf("  Verifying 50 surviving keys (150-199)...\n");
+    verify_keys(&env, 150, 50);
+
+    printf("  Verifying 150 new keys (1000-1149)...\n");
+    verify_keys(&env, 1000, 150);
+
+    // Deleted keys should be absent
+    printf("  Verifying deleted keys (0-149) absent...\n");
+    for (int i = 0; i < 150; i++) {
+        verify_key_absent(&env, i);
+    }
+
+    ASSERT_EQ((long)data_art_size(env.tree), 200L, "final tree size");
+
+    close_env(&env);
+    cleanup_paths(env.db_path, env.wal_path);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -699,6 +766,7 @@ int main(void) {
     RUN_TEST(test_mixed_committed_uncommitted);
     RUN_TEST(test_metadata_persistence);
     RUN_TEST(test_recovery_without_metadata_file);
+    RUN_TEST(test_page_reuse_after_deletes);
 
     printf("========================================\n");
     printf(" Results: %d/%d tests passed\n", tests_passed, test_count);

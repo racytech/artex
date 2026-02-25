@@ -22,6 +22,9 @@
 #include <assert.h>
 #include <pthread.h>
 
+// Forward declarations
+static void drain_pending_frees(data_art_tree_t *tree);
+
 // ============================================================================
 // Thread-Local Arena for Safe Node Reads
 // ============================================================================
@@ -238,10 +241,14 @@ void data_art_destroy(data_art_tree_t *tree) {
     
     // Note: We do NOT delete pages from disk - they persist
     // Use data_art_drop() if you want to remove all data
-    
-    LOG_INFO("Destroyed ART tree (size=%zu, nodes=%lu)", 
+
+    // Drain any remaining pending frees (no readers at destroy time)
+    drain_pending_frees(tree);
+    free(tree->pending_free_pages);
+
+    LOG_INFO("Destroyed ART tree (size=%zu, nodes=%lu)",
              tree->size, tree->nodes_allocated);
-    
+
     free(tree);
 }
 
@@ -305,22 +312,67 @@ node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size) {
 }
 
 /**
+ * Drain the deferred free list — actually free pages to the allocator.
+ *
+ * Safe to call when no concurrent readers can reference these pages:
+ *  - No MVCC manager (single-threaded / recovery)
+ *  - No active snapshots
+ */
+static void drain_pending_frees(data_art_tree_t *tree) {
+    if (tree->pending_free_count == 0) return;
+
+    for (size_t i = 0; i < tree->pending_free_count; i++) {
+        page_manager_free(tree->page_manager, tree->pending_free_pages[i]);
+    }
+    LOG_DEBUG("Drained %zu pending page frees", tree->pending_free_count);
+    tree->pending_free_count = 0;
+}
+
+/**
+ * Try to drain pending frees if it's safe (no active readers).
+ */
+static void try_drain_pending_frees(data_art_tree_t *tree) {
+    // No MVCC manager → single-threaded or recovery, always safe
+    if (!tree->mvcc_manager) {
+        drain_pending_frees(tree);
+        return;
+    }
+    // MVCC present but no active snapshots → safe to drain
+    if (!mvcc_has_active_snapshots(tree->mvcc_manager)) {
+        drain_pending_frees(tree);
+    }
+}
+
+/**
  * Release reference to an old page
- * 
+ *
  * Called when a page is no longer referenced by the tree (e.g., after
- * copy-on-write creates a new version). Decrements ref count and invalidates
- * buffer pool entry if ref count reaches 0.
- * 
+ * copy-on-write creates a new version). Adds the page to a deferred free
+ * list. Pages are actually returned to the allocator when it's safe
+ * (no concurrent readers can reference them).
+ *
  * @param tree ART tree
  * @param old_ref Reference to old page
  */
 void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref) {
-    // With lock-free reads, snapshots may still be traversing old pages.
-    // Releasing/invalidating pages here would cause readers to see corrupted data.
-    // Old pages are left alive; epoch-based GC will reclaim them when no snapshot
-    // can reference them.
-    (void)tree;
-    (void)old_ref;
+    if (!tree || node_ref_is_null(old_ref)) return;
+
+    // Grow pending list if needed
+    if (tree->pending_free_count >= tree->pending_free_capacity) {
+        size_t new_cap = tree->pending_free_capacity == 0 ? 64 : tree->pending_free_capacity * 2;
+        uint64_t *new_list = realloc(tree->pending_free_pages, new_cap * sizeof(uint64_t));
+        if (!new_list) {
+            LOG_ERROR("Failed to grow pending free list");
+            return;
+        }
+        tree->pending_free_pages = new_list;
+        tree->pending_free_capacity = new_cap;
+    }
+
+    tree->pending_free_pages[tree->pending_free_count++] = old_ref.page_id;
+
+    // Opportunistically drain if safe
+    try_drain_pending_frees(tree);
 }
 
 // ============================================================================
@@ -821,12 +873,16 @@ bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out) {
         return false;
     }
     
+    // Drain deferred page frees before checkpointing
+    // Safe because checkpoint is called under write lock and represents a quiesce point
+    drain_pending_frees(tree);
+
     // Flush all dirty pages to disk
     if (!data_art_flush(tree)) {
         LOG_ERROR("Failed to flush tree pages during checkpoint");
         return false;
     }
-    
+
     // Log checkpoint with current tree state
     uint64_t next_pid = page_manager_get_next_page_id(tree->page_manager);
     uint64_t lsn;
@@ -894,6 +950,7 @@ typedef struct {
     uint64_t *uncommitted;
     size_t uncommitted_count;
     int64_t skipped;
+    bool full_replay;  // true when start_lsn == 0 (full from-scratch rebuild)
 } txn_apply_ctx_t;
 
 static bool is_uncommitted_txn(uint64_t txn_id, const txn_apply_ctx_t *ctx) {
@@ -924,14 +981,19 @@ static bool apply_wal_entry_txn_aware(void *context, const wal_entry_header_t *h
 
         case WAL_ENTRY_CHECKPOINT: {
             const wal_checkpoint_payload_t *ckpt = (const wal_checkpoint_payload_t *)payload;
-            ctx->tree->root.page_id = ckpt->root_page_id;
-            ctx->tree->root.offset = ckpt->root_offset;
-            ctx->tree->size = ckpt->tree_size;
-            // Restore page allocator state from checkpoint
+            if (!ctx->full_replay) {
+                // Incremental recovery: restore root/size from checkpoint
+                ctx->tree->root.page_id = ckpt->root_page_id;
+                ctx->tree->root.offset = ckpt->root_offset;
+                ctx->tree->size = ckpt->tree_size;
+            }
+            // Always restore allocator state — ensures next_page_id doesn't regress
             if (ckpt->next_page_id > 0)
                 page_manager_set_next_page_id(ctx->tree->page_manager, ckpt->next_page_id);
-            LOG_INFO("Restored checkpoint: root=%lu:%u, size=%zu, next_page_id=%lu",
-                     ckpt->root_page_id, ckpt->root_offset, ctx->tree->size, ckpt->next_page_id);
+            LOG_INFO("Checkpoint entry: root=%lu:%u, size=%zu, next_page_id=%lu%s",
+                     ckpt->root_page_id, ckpt->root_offset, (size_t)ckpt->tree_size,
+                     ckpt->next_page_id,
+                     ctx->full_replay ? " (root/size skipped — full replay)" : "");
             break;
         }
 
@@ -990,7 +1052,8 @@ int64_t data_art_recover(data_art_tree_t *tree, uint64_t start_lsn) {
         .tree = tree,
         .uncommitted = uncommitted,
         .uncommitted_count = uncommitted_count,
-        .skipped = 0
+        .skipped = 0,
+        .full_replay = (start_lsn == 0)
     };
 
     // Disable WAL and MVCC to prevent re-logging and unnecessary overhead

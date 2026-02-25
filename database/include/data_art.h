@@ -264,7 +264,12 @@ typedef struct data_art_tree {
     bool cow_enabled;            // Enable copy-on-write
     uint64_t *active_versions;   // Array of active version IDs
     size_t num_active_versions;
-    
+
+    // Deferred page freeing (safe page reuse under concurrent reads)
+    uint64_t *pending_free_pages;     // Pages waiting to be freed
+    size_t pending_free_count;        // Number of pages in pending list
+    size_t pending_free_capacity;     // Capacity of pending list
+
     // Statistics
     uint64_t nodes_allocated;
     uint64_t nodes_copied;       // CoW copies

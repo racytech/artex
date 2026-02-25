@@ -75,13 +75,13 @@
    - WAL checkpoint entry also restores `next_page_id` during replay (fallback if metadata.bin missing)
    - Tests: metadata survives restart (next_page_id=105 preserved), WAL-only fallback (deleted metadata.bin, restored from checkpoint entry)
 
-### 11. Page Reuse (1-2 days) 🔴 CRITICAL
-   - `data_art_release_page()` is a no-op (data_art_core.c:322) — freed pages never returned to allocator
-   - `page_manager_alloc()` always increments `next_page_id` instead of reusing free list
-   - Database grows monotonically: delete 9,000 keys + insert 1,000 = 11,000 pages (should be ~1,000)
-   - Fix: make `release_page()` call `page_manager_free()` (epoch GC already ensures safety)
-   - Fix: `page_manager_alloc()` should check free lists first before allocating new page IDs
-   - Test: insert → delete → insert → verify page count stays bounded
+### 11. ~~Page Reuse~~ FIXED
+   - `data_art_release_page()` now calls `page_manager_free()` to return freed pages to allocator
+   - `page_manager_alloc()` already checked free lists first — just needed the feed from release_page
+   - Deferred free list for concurrency safety: pages queued in `pending_free_pages`, drained when no active MVCC snapshots (prevents isolation violations under concurrent reads)
+   - Checkpoint entry fix: full WAL replay (start_lsn=0) no longer overrides root/size from checkpoint — tree state is fully determined by replayed operations, checkpoint only updates `next_page_id`
+   - Test: insert 200 → delete 150 → insert 150 new → `next_page_id` grew by only 4 (207 vs 203), confirming ~146 pages reused
+   - Result: 23/23 tests pass, 0 isolation violations in concurrent stress tests
 
 ### 12. Iterator Seek / Range Queries (1-2 days)
    - Add `data_art_iterator_seek(iter, key)` — position iterator at first key >= given key
