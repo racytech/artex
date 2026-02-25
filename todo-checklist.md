@@ -149,11 +149,14 @@
    - Tests: 16 tests (171 assertions) — analyze, in-place moves, interleaved dead, journal recovery, persistence
    - Result: 26/26 tests pass
 
-### 19. Batch Insert Optimization
-   - Current TEMP FIX: commit path acquires/releases write_lock N times, publishes root N times
-   - Dedicated batch path: hold lock once, apply all mutations to tree, publish root once
-   - Single MVCC txn for entire batch instead of N auto-commit txns
-   - Expected: 5-10x throughput improvement for large batches
+### 19. Batch COW Optimization
+   - **Problem**: COW amplification — every single key update COWs ~32 nodes (leaf to root). N key updates = N × 32 page allocations, even though most updates share upper tree nodes.
+   - **Solution**: batch all mutations per block, walk tree once, COW each affected node at most once.
+   - Current TEMP FIX: commit path acquires/releases write_lock N times, publishes root N times, N separate COW paths.
+   - Dedicated batch path: sort mutations by key → single depth-first tree walk → COW shared ancestors once → publish root once.
+   - For Ethereum blocks (100-5000 state changes): top ~10 tree levels COW'd once instead of once per key.
+   - Expected: 10-100x fewer page writes per block, single MVCC txn, single fsync.
+   - This is the #1 performance bottleneck — more impactful than any other optimization.
 
 ### 20. Write Batching / Group Commit
    - Currently every `commit_txn` does its own fsync (~5ms each)
