@@ -734,6 +734,20 @@ void data_art_iterator_destroy(data_art_iterator_t *iter);
 bool data_art_iterator_seek(data_art_iterator_t *iter,
                             const uint8_t *key, size_t key_len);
 
+/**
+ * Create a prefix iterator — iterates only keys starting with the given prefix.
+ *
+ * Uses seek to jump to the first matching key, then stops when prefix diverges.
+ * If prefix is NULL or prefix_len is 0, behaves like data_art_iterator_create().
+ *
+ * @param tree Tree instance
+ * @param prefix Prefix bytes to match
+ * @param prefix_len Length of prefix
+ * @return Iterator, or NULL on failure
+ */
+data_art_iterator_t *data_art_iterator_create_prefix(
+    data_art_tree_t *tree, const uint8_t *prefix, size_t prefix_len);
+
 // ============================================================================
 // Statistics & Debugging
 // ============================================================================

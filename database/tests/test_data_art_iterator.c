@@ -673,6 +673,165 @@ static void test_seek_empty_tree(void) {
 }
 
 // ============================================================================
+// Test 12: Prefix iteration — basic
+// ============================================================================
+
+static void test_prefix_basic(void) {
+    test_env_t env;
+    make_paths(&env, "prefix_basic");
+    cleanup_paths(env.db_path, env.wal_path);
+    open_env(&env);
+
+    // Insert keys with three different prefixes: "aaa_", "bbb_", "ccc_"
+    const char *prefixes[] = {"aaa_", "bbb_", "ccc_"};
+    int per_prefix = 10;
+
+    for (int p = 0; p < 3; p++) {
+        for (int i = 0; i < per_prefix; i++) {
+            uint8_t key[KEY_SIZE];
+            memset(key, 0, KEY_SIZE);
+            snprintf((char *)key, KEY_SIZE, "%s%04d", prefixes[p], i);
+            uint8_t val[8];
+            snprintf((char *)val, 8, "v%d", p * per_prefix + i);
+            ASSERT(data_art_insert(env.tree, key, KEY_SIZE, val, strlen((char *)val) + 1),
+                   "insert failed");
+        }
+    }
+    ASSERT_EQ(data_art_size(env.tree), 30, "should have 30 keys");
+
+    // Iterate with prefix "bbb_" — should get exactly 10 keys
+    uint8_t prefix[KEY_SIZE];
+    memset(prefix, 0, KEY_SIZE);
+    memcpy(prefix, "bbb_", 4);
+
+    data_art_iterator_t *iter = data_art_iterator_create_prefix(env.tree, prefix, 4);
+    ASSERT(iter != NULL, "create_prefix returned NULL");
+
+    int count = 0;
+    do {
+        if (data_art_iterator_done(iter)) break;
+        size_t klen;
+        const uint8_t *k = data_art_iterator_key(iter, &klen);
+        ASSERT(k != NULL, "key is NULL");
+        ASSERT(memcmp(k, "bbb_", 4) == 0, "key doesn't start with bbb_");
+        count++;
+    } while (data_art_iterator_next(iter));
+
+    ASSERT_EQ(count, per_prefix, "prefix should yield exactly 10 keys");
+
+    data_art_iterator_destroy(iter);
+    close_env(&env);
+    cleanup_paths(env.db_path, env.wal_path);
+}
+
+// ============================================================================
+// Test 13: Prefix iteration — no match
+// ============================================================================
+
+static void test_prefix_no_match(void) {
+    test_env_t env;
+    make_paths(&env, "prefix_nomatch");
+    cleanup_paths(env.db_path, env.wal_path);
+    open_env(&env);
+
+    // Insert keys with prefix "aaa_"
+    for (int i = 0; i < 20; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "aaa_%04d", i);
+        uint8_t val[4] = {1, 2, 3, 4};
+        ASSERT(data_art_insert(env.tree, key, KEY_SIZE, val, 4), "insert failed");
+    }
+
+    // Iterate with prefix "zzz_" — no match
+    uint8_t prefix[KEY_SIZE];
+    memset(prefix, 0, KEY_SIZE);
+    memcpy(prefix, "zzz_", 4);
+
+    data_art_iterator_t *iter = data_art_iterator_create_prefix(env.tree, prefix, 4);
+    ASSERT(iter != NULL, "create_prefix returned NULL");
+    ASSERT(data_art_iterator_done(iter), "should be done immediately (no match)");
+
+    data_art_iterator_destroy(iter);
+    close_env(&env);
+    cleanup_paths(env.db_path, env.wal_path);
+}
+
+// ============================================================================
+// Test 14: Prefix iteration — all keys match
+// ============================================================================
+
+static void test_prefix_all_match(void) {
+    test_env_t env;
+    make_paths(&env, "prefix_all");
+    cleanup_paths(env.db_path, env.wal_path);
+    open_env(&env);
+
+    // Insert 50 keys all starting with "common_"
+    for (int i = 0; i < 50; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "common_%04d", i);
+        uint8_t val[4] = {0};
+        ASSERT(data_art_insert(env.tree, key, KEY_SIZE, val, 4), "insert failed");
+    }
+
+    // Iterate with prefix "common_" — all 50 should match
+    uint8_t prefix[KEY_SIZE];
+    memset(prefix, 0, KEY_SIZE);
+    memcpy(prefix, "common_", 7);
+
+    data_art_iterator_t *iter = data_art_iterator_create_prefix(env.tree, prefix, 7);
+    ASSERT(iter != NULL, "create_prefix returned NULL");
+
+    int count = 0;
+    do {
+        if (data_art_iterator_done(iter)) break;
+        count++;
+    } while (data_art_iterator_next(iter));
+
+    ASSERT_EQ(count, 50, "all 50 keys should match prefix");
+
+    data_art_iterator_destroy(iter);
+    close_env(&env);
+    cleanup_paths(env.db_path, env.wal_path);
+}
+
+// ============================================================================
+// Test 15: Prefix iteration — empty prefix (full iteration)
+// ============================================================================
+
+static void test_prefix_empty(void) {
+    test_env_t env;
+    make_paths(&env, "prefix_empty");
+    cleanup_paths(env.db_path, env.wal_path);
+    open_env(&env);
+
+    for (int i = 0; i < 30; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "key_%04d", i);
+        uint8_t val[4] = {0};
+        ASSERT(data_art_insert(env.tree, key, KEY_SIZE, val, 4), "insert failed");
+    }
+
+    // prefix_len = 0 should behave like full iteration
+    data_art_iterator_t *iter = data_art_iterator_create_prefix(env.tree, NULL, 0);
+    ASSERT(iter != NULL, "create_prefix with NULL prefix returned NULL");
+
+    int count = 0;
+    while (data_art_iterator_next(iter)) {
+        count++;
+    }
+
+    ASSERT_EQ(count, 30, "empty prefix should return all 30 keys");
+
+    data_art_iterator_destroy(iter);
+    close_env(&env);
+    cleanup_paths(env.db_path, env.wal_path);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -703,6 +862,10 @@ int main(void) {
     RUN_TEST(test_seek_boundaries);
     RUN_TEST(test_range_scan);
     RUN_TEST(test_seek_empty_tree);
+    RUN_TEST(test_prefix_basic);
+    RUN_TEST(test_prefix_no_match);
+    RUN_TEST(test_prefix_all_match);
+    RUN_TEST(test_prefix_empty);
 
     printf("========================================\n");
     printf(" Results: %d/%d tests passed\n", tests_passed, test_count);

@@ -99,12 +99,12 @@
    - Result: 10/10 txn_buffer tests pass, 23/23 full suite
    - **Needs optimization**: commit path acquires/releases write_lock N times (once per op), publishes root N times, allocates N auto-commit MVCC txns. A dedicated batch path should hold the lock once, apply all mutations, and publish root once.
 
-### 14. Database Compaction (3-5 days)
-   - Rewrite live pages into contiguous files, discard dead pages
-   - Requires: iterate all live pages, copy to new file, swap atomically
-   - Header `db_compaction.h` exists as stub — needs full implementation
-   - Reclaims space from long-running databases with heavy delete workloads
-   - Could run as background thread similar to checkpoint_manager
+### 14. ~~Prefix Iteration~~ FIXED
+   - `data_art_iterator_create_prefix(tree, prefix, prefix_len)` — iterate keys sharing a prefix
+   - Seeks to first key >= prefix, then stops when prefix diverges in `next()`
+   - NULL/empty prefix falls back to full iteration
+   - Tests: basic (3 prefixes, verify only target prefix returned), no match, all match, empty prefix
+   - Result: 15/15 iterator tests pass, 23/23 full suite
 
 ### 15. Torn Page Detection (1 day)
    - Currently pages have CRC32 checksum — detects corruption but can't distinguish torn write from bit-flip
@@ -118,11 +118,12 @@
    - Enables point-in-time backups without stopping the database
    - Could also support incremental backup (only pages changed since last backup)
 
-### 17. Prefix Iteration (1 day)
-   - `data_art_iterator_create_prefix(tree, prefix, prefix_len)` — iterate keys sharing a prefix
-   - ART naturally supports this: descend to prefix node, then iterate subtree
-   - Ethereum use case: enumerate all storage keys for a specific contract address
-   - Builds on iterator + seek — just adds early termination when prefix diverges
+### 17. Database Compaction (3-5 days)
+   - Rewrite live pages into contiguous files, discard dead pages
+   - Requires: iterate all live pages, copy to new file, swap atomically
+   - Header `db_compaction.h` exists as stub — needs full implementation
+   - Reclaims space from long-running databases with heavy delete workloads
+   - Could run as background thread similar to checkpoint_manager
 
 ### 18. Dead Code Cleanup
    - Remove `db_compaction.h` (entire unimplemented header)
@@ -130,5 +131,3 @@
    - Remove dead static functions in `data_art_node_ops.c` (shrink stubs already implemented in data_art_delete.c)
    - Remove debug printfs in `mem_art.c`, duplicate log lines in `wal.c`
    - Remove unused includes (`<stdio.h>` in search.c, `<assert.h>` in delete.c)
-
-Total: ~2-3 weeks to production-ready (items 8-11 are critical path, 12-17 are nice-to-have)

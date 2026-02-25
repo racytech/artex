@@ -49,6 +49,10 @@ struct data_art_iterator {
     void    *current_value;
     size_t   current_key_len;
     size_t   current_value_len;
+
+    // Prefix filter (NULL = full iteration)
+    uint8_t *prefix;
+    size_t   prefix_len;
 };
 
 // ============================================================================
@@ -226,6 +230,20 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
                 return false;
             }
 
+            // Prefix check: stop if key no longer matches prefix
+            if (iter->prefix) {
+                if (iter->current_key_len < iter->prefix_len ||
+                    memcmp(iter->current_key, iter->prefix, iter->prefix_len) != 0) {
+                    iter->done = true;
+                    free(iter->current_key);
+                    free(iter->current_value);
+                    iter->current_key = NULL;
+                    iter->current_value = NULL;
+                    iter->depth--;
+                    return false;
+                }
+            }
+
             // Pop leaf from stack so next call continues with parent
             iter->depth--;
             return true;
@@ -276,7 +294,43 @@ void data_art_iterator_destroy(data_art_iterator_t *iter) {
     if (!iter) return;
     free(iter->current_key);
     free(iter->current_value);
+    free(iter->prefix);
     free(iter);
+}
+
+// ============================================================================
+// Prefix Iteration
+// ============================================================================
+
+data_art_iterator_t *data_art_iterator_create_prefix(
+        data_art_tree_t *tree, const uint8_t *prefix, size_t prefix_len) {
+    if (!tree || !prefix || prefix_len == 0) {
+        // No prefix = full iteration
+        return data_art_iterator_create(tree);
+    }
+
+    data_art_iterator_t *iter = data_art_iterator_create(tree);
+    if (!iter) return NULL;
+
+    // Store prefix for boundary checking in next()
+    iter->prefix = malloc(prefix_len);
+    if (!iter->prefix) {
+        data_art_iterator_destroy(iter);
+        return NULL;
+    }
+    memcpy(iter->prefix, prefix, prefix_len);
+    iter->prefix_len = prefix_len;
+
+    // Seek to first key >= prefix
+    if (!data_art_iterator_seek(iter, prefix, prefix_len)) {
+        // No key >= prefix exists
+        iter->done = true;
+        return iter;
+    }
+
+    // Seek succeeded — the prefix check in next() already validated the match
+    // (seek calls next() internally, which runs the prefix filter)
+    return iter;
 }
 
 // ============================================================================
