@@ -683,37 +683,51 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
         DB_ERROR(DB_ERROR_TXN_CONFLICT, "transaction belongs to different tree");
         return false;
     }
-    
+
     uint64_t txn_id = ctx->txn_id;
     txn_buffer_t *buffer = ctx->txn_buffer;
-    
-    // Apply all buffered operations to the tree
-    for (size_t i = 0; i < buffer->num_ops; i++) {
+    size_t num_ops = buffer->num_ops;
+
+    // === OPTIMIZED BATCH COMMIT: single lock, single root publish, single fsync ===
+    pthread_mutex_lock(&tree->write_lock);
+
+    // Save rollback point in case any operation fails
+    node_ref_t saved_root = tree->root;
+    size_t saved_size = tree->size;
+
+    // Apply all buffered operations using internal functions (no per-op lock/publish)
+    for (size_t i = 0; i < num_ops; i++) {
         txn_operation_t *op = &buffer->operations[i];
-        
-        // Temporarily clear txn_buffer to prevent recursive buffering
-        ctx->txn_buffer = NULL;
-        tree->txn_buffer = NULL;
-        
         bool success;
+
         if (op->type == TXN_OP_INSERT) {
-            success = data_art_insert(tree, op->key, op->key_len,
-                                     op->value, op->value_len);
+            success = data_art_insert_internal(tree, op->key, op->key_len,
+                                                op->value, op->value_len);
+            if (success) {
+                if (!wal_log_insert(tree->wal, txn_id, op->key, op->key_len,
+                                    op->value, op->value_len, NULL)) {
+                    LOG_ERROR("Failed to log insert to WAL");
+                }
+            }
         } else { // TXN_OP_DELETE
-            // Delete may return false if key was already deleted by a
-            // concurrent transaction — this is expected, not an error.
-            success = data_art_delete(tree, op->key, op->key_len);
-            if (!success) {
-                LOG_DEBUG("Delete for key not found during commit (concurrent delete) — skipping");
+            success = data_art_delete_internal(tree, op->key, op->key_len);
+            if (success) {
+                if (!wal_log_delete(tree->wal, txn_id, op->key, op->key_len, NULL)) {
+                    LOG_ERROR("Failed to log delete to WAL");
+                }
+            } else {
+                // Delete not found — not an error in batch context
+                LOG_DEBUG("Delete for key not found during commit — skipping");
                 success = true;
             }
         }
 
-        // Restore buffer
-        ctx->txn_buffer = buffer;
-        tree->txn_buffer = buffer;
-
         if (!success) {
+            // Rollback: restore root and size
+            tree->root = saved_root;
+            tree->size = saved_size;
+            pthread_mutex_unlock(&tree->write_lock);
+
             DB_ERROR(DB_ERROR_IO, "failed to apply operation %zu", i);
             txn_buffer_destroy(buffer);
             ctx->txn_buffer = NULL;
@@ -723,9 +737,14 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
             return false;
         }
     }
-    
-    // Log commit to WAL
+
+    // WAL commit marker + single fsync
     if (!wal_log_commit_txn(tree->wal, txn_id, NULL)) {
+        // Rollback on WAL failure
+        tree->root = saved_root;
+        tree->size = saved_size;
+        pthread_mutex_unlock(&tree->write_lock);
+
         DB_ERROR(DB_ERROR_IO, "WAL commit failed (txn_id=%lu)", txn_id);
         txn_buffer_destroy(buffer);
         ctx->txn_buffer = NULL;
@@ -733,14 +752,16 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
         tree->current_txn_id = 0;
         return false;
     }
-    
+
     // Commit MVCC transaction
     if (!mvcc_commit_txn(tree->mvcc_manager, txn_id)) {
         LOG_ERROR("Failed to commit MVCC transaction %lu", txn_id);
     }
 
-    // Publish final root for lock-free readers
+    // Single root publication for the entire batch
     data_art_publish_root(tree);
+
+    pthread_mutex_unlock(&tree->write_lock);
 
     // Clean up
     txn_buffer_destroy(buffer);
@@ -748,7 +769,8 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
     tree->txn_buffer = NULL;
     tree->current_txn_id = 0;
 
-    LOG_INFO("Committed transaction %lu for thread %p", txn_id, (void*)pthread_self());
+    LOG_INFO("Committed transaction %lu (%zu ops) for thread %p",
+             txn_id, num_ops, (void*)pthread_self());
     return true;
 }
 

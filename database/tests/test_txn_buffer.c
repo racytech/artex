@@ -738,6 +738,361 @@ static bool test_batch_empty()
 }
 
 // ============================================================================
+// Test 11: Optimized Commit — 1000 Keys (No Deadlock)
+// ============================================================================
+
+static bool test_optimized_commit_1000_keys()
+{
+    PRINT_TEST_HEADER("test_optimized_commit_1000_keys");
+
+    cleanup_test_files();
+
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Failed to create page manager");
+
+    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 128}, pm);
+    TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
+
+    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 4 * 1024 * 1024});
+    TEST_ASSERT(wal != NULL, "Failed to create WAL");
+
+    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    TEST_ASSERT(tree != NULL, "Failed to create tree");
+
+    // Begin explicit transaction and buffer 1000 keys
+    uint64_t txn_id;
+    TEST_ASSERT(data_art_begin_txn(tree, &txn_id), "Failed to begin txn");
+
+    for (int i = 0; i < 1000; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "opt_key_%06d", i);
+        char value[32];
+        snprintf(value, sizeof(value), "val_%06d", i);
+
+        TEST_ASSERT(data_art_insert(tree, key, KEY_SIZE, value, strlen(value) + 1),
+                    "Failed to buffer insert");
+    }
+
+    // Nothing committed yet
+    TEST_ASSERT(data_art_size(tree) == 0, "Tree should be empty before commit");
+
+    // Commit — this is where the optimized path runs.
+    // If internal functions tried to re-acquire write_lock, this would deadlock.
+    TEST_ASSERT(data_art_commit_txn(tree), "Commit of 1000 keys failed (possible deadlock)");
+
+    TEST_ASSERT(data_art_size(tree) == 1000, "Tree should have 1000 keys");
+
+    // Spot-check a few keys
+    for (int i = 0; i < 1000; i += 100) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "opt_key_%06d", i);
+        size_t vlen;
+        const void *val = data_art_get(tree, key, KEY_SIZE, &vlen);
+        TEST_ASSERT(val != NULL, "Key not found after optimized commit");
+
+        char expected[32];
+        snprintf(expected, sizeof(expected), "val_%06d", i);
+        TEST_ASSERT(memcmp(val, expected, strlen(expected) + 1) == 0, "Value mismatch");
+    }
+
+    data_art_destroy(tree);
+    buffer_pool_destroy(bp);
+    wal_close(wal);
+    page_manager_destroy(pm);
+    cleanup_test_files();
+
+    printf("   ✅ PASSED\n");
+    return true;
+}
+
+// ============================================================================
+// Test 12: Optimized Commit — Root Published Once
+// ============================================================================
+
+static bool test_optimized_commit_root_once()
+{
+    PRINT_TEST_HEADER("test_optimized_commit_root_once");
+
+    cleanup_test_files();
+
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Failed to create page manager");
+
+    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
+    TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
+
+    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
+    TEST_ASSERT(wal != NULL, "Failed to create WAL");
+
+    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    TEST_ASSERT(tree != NULL, "Failed to create tree");
+
+    // Record root before commit
+    uint64_t root_before = atomic_load(&tree->committed_root_page_id);
+    TEST_ASSERT(root_before == 0, "Root should be 0 (empty tree)");
+
+    // Begin txn, insert 50 keys
+    uint64_t txn_id;
+    TEST_ASSERT(data_art_begin_txn(tree, &txn_id), "Failed to begin txn");
+
+    for (int i = 0; i < 50; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "root_test_%04d", i);
+        TEST_ASSERT(data_art_insert(tree, key, KEY_SIZE, "val", 4),
+                    "Failed to buffer insert");
+    }
+
+    // Root should still be 0 (buffered, not committed)
+    uint64_t root_during = atomic_load(&tree->committed_root_page_id);
+    TEST_ASSERT(root_during == 0, "Root should not change during buffering");
+
+    // Commit
+    TEST_ASSERT(data_art_commit_txn(tree), "Commit failed");
+
+    // Root should now be non-zero (published once at end)
+    uint64_t root_after = atomic_load(&tree->committed_root_page_id);
+    TEST_ASSERT(root_after != 0, "Root should be published after commit");
+    TEST_ASSERT(root_after == tree->root.page_id,
+                "Published root should match tree root");
+
+    data_art_destroy(tree);
+    buffer_pool_destroy(bp);
+    wal_close(wal);
+    page_manager_destroy(pm);
+    cleanup_test_files();
+
+    printf("   ✅ PASSED\n");
+    return true;
+}
+
+// ============================================================================
+// Test 13: Optimized Commit — WAL Recovery After Explicit Txn
+// ============================================================================
+
+static bool test_optimized_commit_wal_recovery()
+{
+    PRINT_TEST_HEADER("test_optimized_commit_wal_recovery");
+
+    cleanup_test_files();
+
+    // Phase 1: insert 200 keys via explicit txn, close without checkpoint
+    {
+        page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+        buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
+        wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 4 * 1024 * 1024});
+        data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+
+        uint64_t txn_id;
+        TEST_ASSERT(data_art_begin_txn(tree, &txn_id), "Failed to begin txn");
+
+        for (int i = 0; i < 200; i++) {
+            uint8_t key[KEY_SIZE];
+            memset(key, 0, KEY_SIZE);
+            snprintf((char *)key, KEY_SIZE, "wal_recov_%05d", i);
+            char value[32];
+            snprintf(value, sizeof(value), "v_%05d", i);
+            TEST_ASSERT(data_art_insert(tree, key, KEY_SIZE, value, strlen(value) + 1),
+                        "Failed to buffer insert");
+        }
+
+        TEST_ASSERT(data_art_commit_txn(tree), "Commit failed");
+        TEST_ASSERT(data_art_size(tree) == 200, "Should have 200 keys");
+
+        data_art_destroy(tree);
+        buffer_pool_destroy(bp);
+        wal_close(wal);
+        page_manager_destroy(pm);
+    }
+
+    // Phase 2: reopen, recover from WAL, verify all keys
+    {
+        page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+        buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
+        wal_t *wal = wal_open(TEST_WAL_PATH, NULL);
+        data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+
+        int64_t recovered = data_art_recover(tree, 0);
+        TEST_ASSERT(recovered >= 0, "Recovery failed");
+
+        TEST_ASSERT(data_art_size(tree) == 200, "Recovered tree should have 200 keys");
+
+        // Verify all keys and values
+        for (int i = 0; i < 200; i++) {
+            uint8_t key[KEY_SIZE];
+            memset(key, 0, KEY_SIZE);
+            snprintf((char *)key, KEY_SIZE, "wal_recov_%05d", i);
+            size_t vlen;
+            const void *val = data_art_get(tree, key, KEY_SIZE, &vlen);
+            TEST_ASSERT(val != NULL, "Recovered key not found");
+
+            char expected[32];
+            snprintf(expected, sizeof(expected), "v_%05d", i);
+            TEST_ASSERT(memcmp(val, expected, strlen(expected) + 1) == 0,
+                        "Recovered value mismatch");
+        }
+
+        data_art_destroy(tree);
+        buffer_pool_destroy(bp);
+        wal_close(wal);
+        page_manager_destroy(pm);
+    }
+
+    cleanup_test_files();
+
+    printf("   ✅ PASSED\n");
+    return true;
+}
+
+// ============================================================================
+// Test 14: Optimized Commit — Mixed Insert+Delete via Explicit Txn
+// ============================================================================
+
+static bool test_optimized_commit_mixed()
+{
+    PRINT_TEST_HEADER("test_optimized_commit_mixed");
+
+    cleanup_test_files();
+
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
+    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
+    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+
+    // Pre-insert 50 keys (auto-commit)
+    for (int i = 0; i < 50; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "mixed_%05d", i);
+        char val[32];
+        snprintf(val, sizeof(val), "old_%05d", i);
+        TEST_ASSERT(data_art_insert(tree, key, KEY_SIZE, val, strlen(val) + 1),
+                    "Pre-insert failed");
+    }
+    TEST_ASSERT(data_art_size(tree) == 50, "Should have 50 keys");
+
+    // Begin explicit txn: delete keys 10-29 (20 deletes) + insert keys 50-79 (30 inserts)
+    uint64_t txn_id;
+    TEST_ASSERT(data_art_begin_txn(tree, &txn_id), "Failed to begin txn");
+
+    for (int i = 10; i < 30; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "mixed_%05d", i);
+        TEST_ASSERT(data_art_delete(tree, key, KEY_SIZE), "Failed to buffer delete");
+    }
+
+    for (int i = 50; i < 80; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "mixed_%05d", i);
+        char val[32];
+        snprintf(val, sizeof(val), "new_%05d", i);
+        TEST_ASSERT(data_art_insert(tree, key, KEY_SIZE, val, strlen(val) + 1),
+                    "Failed to buffer insert");
+    }
+
+    // Tree should still show 50 keys (changes buffered)
+    TEST_ASSERT(data_art_size(tree) == 50, "Size should not change during buffering");
+
+    // Commit
+    TEST_ASSERT(data_art_commit_txn(tree), "Mixed commit failed");
+
+    // Verify: 50 - 20 + 30 = 60 keys
+    TEST_ASSERT(data_art_size(tree) == 60, "Should have 60 keys after mixed commit");
+
+    // Keys 0-9: present (original)
+    for (int i = 0; i < 10; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "mixed_%05d", i);
+        TEST_ASSERT(data_art_contains(tree, key, KEY_SIZE), "Key 0-9 should exist");
+    }
+
+    // Keys 10-29: deleted
+    for (int i = 10; i < 30; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "mixed_%05d", i);
+        TEST_ASSERT(!data_art_contains(tree, key, KEY_SIZE), "Key 10-29 should be deleted");
+    }
+
+    // Keys 30-79: present (30-49 original, 50-79 new)
+    for (int i = 30; i < 80; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "mixed_%05d", i);
+        TEST_ASSERT(data_art_contains(tree, key, KEY_SIZE), "Key 30-79 should exist");
+    }
+
+    data_art_destroy(tree);
+    buffer_pool_destroy(bp);
+    wal_close(wal);
+    page_manager_destroy(pm);
+    cleanup_test_files();
+
+    printf("   ✅ PASSED\n");
+    return true;
+}
+
+// ============================================================================
+// Test 15: Optimized Commit — Consecutive Transactions
+// ============================================================================
+
+static bool test_optimized_commit_consecutive_txns()
+{
+    PRINT_TEST_HEADER("test_optimized_commit_consecutive_txns");
+
+    cleanup_test_files();
+
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 128}, pm);
+    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 4 * 1024 * 1024});
+    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+
+    // Run 10 consecutive transactions, each inserting 50 keys
+    for (int t = 0; t < 10; t++) {
+        uint64_t txn_id;
+        TEST_ASSERT(data_art_begin_txn(tree, &txn_id), "Failed to begin txn");
+
+        for (int i = 0; i < 50; i++) {
+            uint8_t key[KEY_SIZE];
+            memset(key, 0, KEY_SIZE);
+            snprintf((char *)key, KEY_SIZE, "consec_%02d_%04d", t, i);
+            char val[32];
+            snprintf(val, sizeof(val), "v_%02d_%04d", t, i);
+            TEST_ASSERT(data_art_insert(tree, key, KEY_SIZE, val, strlen(val) + 1),
+                        "Failed to buffer insert");
+        }
+
+        TEST_ASSERT(data_art_commit_txn(tree), "Commit failed");
+        TEST_ASSERT(data_art_size(tree) == (size_t)(50 * (t + 1)),
+                    "Size mismatch after commit");
+    }
+
+    TEST_ASSERT(data_art_size(tree) == 500, "Final tree should have 500 keys");
+
+    // Spot-check keys from different transactions
+    for (int t = 0; t < 10; t++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "consec_%02d_%04d", t, 25);
+        TEST_ASSERT(data_art_contains(tree, key, KEY_SIZE), "Key from txn should exist");
+    }
+
+    data_art_destroy(tree);
+    buffer_pool_destroy(bp);
+    wal_close(wal);
+    page_manager_destroy(pm);
+    cleanup_test_files();
+
+    printf("   ✅ PASSED\n");
+    return true;
+}
+
+// ============================================================================
 // Main Test Runner
 // ============================================================================
 
@@ -775,6 +1130,11 @@ int main()
     RUN_TEST(test_batch_mixed_ops);
     RUN_TEST(test_batch_wal_recovery);
     RUN_TEST(test_batch_empty);
+    RUN_TEST(test_optimized_commit_1000_keys);
+    RUN_TEST(test_optimized_commit_root_once);
+    RUN_TEST(test_optimized_commit_wal_recovery);
+    RUN_TEST(test_optimized_commit_mixed);
+    RUN_TEST(test_optimized_commit_consecutive_txns);
 
     printf("\n");
     printf("========================================\n");

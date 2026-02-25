@@ -149,14 +149,15 @@
    - Tests: 16 tests (171 assertions) — analyze, in-place moves, interleaved dead, journal recovery, persistence
    - Result: 26/26 tests pass
 
-### 19. Batch COW Optimization + Group Commit
-   - **Problem**: COW amplification — every single key update COWs ~32 nodes (leaf to root). N key updates = N × 32 page allocations, even though most updates share upper tree nodes. Each commit also does its own fsync (~5ms).
-   - **Solution**: batch all mutations per block, walk tree once, COW each affected node at most once, single fsync.
-   - Current TEMP FIX: commit path acquires/releases write_lock N times, publishes root N times, N separate COW paths, N fsyncs.
-   - Dedicated batch path: sort mutations by key → single depth-first tree walk → COW shared ancestors once → publish root once → single fsync.
-   - For Ethereum blocks (100-5000 state changes): top ~10 tree levels COW'd once instead of once per key.
-   - Expected: 10-100x fewer page writes per block, single MVCC txn, single fsync.
-   - This is the #1 performance bottleneck — more impactful than any other optimization.
+### 19. ~~Batch COW Optimization + Group Commit~~ PHASE 1 DONE
+   - **Phase 1 (DONE)**: Optimized commit path — single lock, single root publish, single fsync
+   - `data_art_insert_internal()` / `data_art_delete_internal()` bypass lock, auto-commit, WAL, root publish
+   - `data_art_commit_txn()` rewritten: hold lock once → loop internal ops → WAL per-op → single fsync → single publish
+   - Rollback on failure: saved root + size restored, MVCC txn aborted
+   - Tests: 15/15 (1000-key batch, root-once, WAL recovery, mixed ops, consecutive txns)
+   - **Phase 2 (TODO)**: COW deduplication — sort mutations by key, single tree walk, COW shared ancestors once
+   - For random 32-byte keys: ~5% COW savings (paths diverge after 1-2 levels)
+   - For common-prefix keys (same contract storage): 10-100x fewer page writes
 
 ### 20. Bloom Filters for Negative Lookups
    - Negative lookups (key not found) currently traverse tree to disk

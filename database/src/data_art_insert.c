@@ -972,3 +972,29 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
     }
     return false;
 }
+
+// ============================================================================
+// Internal Insert (for optimized commit path)
+// ============================================================================
+
+/**
+ * Internal insert — called from commit path with write_lock already held.
+ * No locking, no auto-commit MVCC, no WAL logging, no root publication.
+ * Caller is responsible for: write_lock, MVCC txn, WAL logging, root publish.
+ */
+bool data_art_insert_internal(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
+                               const void *value, size_t value_len) {
+    if (!tree || !key || !value) return false;
+    if (key_len != tree->key_size) return false;
+
+    data_art_reset_arena();
+
+    bool inserted = false;
+    node_ref_t new_root = insert_recursive(tree, tree->root, key, key_len, 0,
+                                            value, value_len, &inserted);
+    if (node_ref_is_null(new_root)) return false;
+
+    tree->root = new_root;
+    if (inserted) tree->size++;
+    return true;
+}

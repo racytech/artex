@@ -137,6 +137,33 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
 }
 
 // ============================================================================
+// Internal Delete (for optimized commit path)
+// ============================================================================
+
+/**
+ * Internal delete — called from commit path with write_lock already held.
+ * No locking, no auto-commit MVCC, no WAL logging, no root publication.
+ * Caller is responsible for: write_lock, MVCC txn, WAL logging, root publish.
+ * Returns true if key was deleted, false if not found.
+ */
+bool data_art_delete_internal(data_art_tree_t *tree, const uint8_t *key, size_t key_len) {
+    if (!tree || !key) return false;
+    if (key_len != tree->key_size) return false;
+    if (node_ref_is_null(tree->root)) return false;
+
+    data_art_reset_arena();
+
+    bool deleted = false;
+    node_ref_t new_root = delete_recursive(tree, tree->root, key, key_len, 0, &deleted);
+
+    if (deleted) {
+        tree->root = new_root;
+        tree->size--;
+    }
+    return deleted;
+}
+
+// ============================================================================
 // Recursive Delete
 // ============================================================================
 

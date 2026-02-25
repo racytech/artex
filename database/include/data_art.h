@@ -421,6 +421,19 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
  */
 node_ref_t data_art_cow_node(data_art_tree_t *tree, node_ref_t ref);
 
+/**
+ * Internal insert — for optimized commit path (lock held, no auto-commit/publish)
+ * Caller must hold write_lock, manage MVCC txn, WAL logging, and root publication.
+ */
+bool data_art_insert_internal(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
+                               const void *value, size_t value_len);
+
+/**
+ * Internal delete — for optimized commit path (lock held, no auto-commit/publish)
+ * Returns true if key was deleted, false if not found.
+ */
+bool data_art_delete_internal(data_art_tree_t *tree, const uint8_t *key, size_t key_len);
+
 // ============================================================================
 // Overflow Page Operations
 // ============================================================================
