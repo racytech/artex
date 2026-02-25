@@ -83,11 +83,12 @@
    - Test: insert 200 → delete 150 → insert 150 new → `next_page_id` grew by only 4 (207 vs 203), confirming ~146 pages reused
    - Result: 23/23 tests pass, 0 isolation violations in concurrent stress tests
 
-### 12. Iterator Seek / Range Queries (1-2 days)
-   - Add `data_art_iterator_seek(iter, key)` — position iterator at first key >= given key
-   - Enables efficient range scans: seek to start key, iterate until end key
-   - Required for Ethereum: scan all storage slots for a specific account prefix
-   - Builds on existing iterator DFS stack — just needs initial descent to target key
+### 12. ~~Iterator Seek / Range Queries~~ FIXED
+   - `data_art_iterator_seek(iter, key, key_len)` positions iterator at first key >= target
+   - Targeted descent from root: compares partial prefixes and finds ceiling children at each level
+   - `find_child_ge()` helper handles all 4 node types (Node4/16: linear scan, Node48/256: byte scan)
+   - Tests: exact match, between-keys, before-all/past-all boundaries, range scan (300 keys from sorted[100..399]), empty tree
+   - Result: 11/11 iterator tests pass, 23/23 full suite
 
 ### 13. Batch Insert (1-2 days)
    - `data_art_insert_batch(tree, keys[], values[], count)` — atomic multi-key insert

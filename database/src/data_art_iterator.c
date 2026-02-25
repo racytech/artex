@@ -278,3 +278,224 @@ void data_art_iterator_destroy(data_art_iterator_t *iter) {
     free(iter->current_value);
     free(iter);
 }
+
+// ============================================================================
+// Seek: Position iterator at first key >= target
+// ============================================================================
+
+// All inner nodes share the same layout for the first 14 bytes:
+//   type(1) + num_children(1) + partial_len(1) + padding(1) + partial(10)
+// Use node4 as the generic accessor.
+static inline uint8_t node_partial_len(const void *node) {
+    return ((const data_art_node4_t *)node)->partial_len;
+}
+static inline const uint8_t *node_partial(const void *node) {
+    return ((const data_art_node4_t *)node)->partial;
+}
+
+// Find child with key >= byte. Sets *child_idx for get_next_child_ref() continuation.
+// Returns the child ref (NULL_NODE_REF if none), and sets *exact = true if key == byte.
+static node_ref_t find_child_ge(const void *node, uint8_t byte,
+                                int *child_idx, bool *exact) {
+    uint8_t type = *(const uint8_t *)node;
+    *exact = false;
+
+    switch (type) {
+        case DATA_NODE_4: {
+            const data_art_node4_t *n = (const data_art_node4_t *)node;
+            for (int i = 0; i < n->num_children; i++) {
+                if (n->keys[i] >= byte) {
+                    *exact = (n->keys[i] == byte);
+                    *child_idx = i + 1;  // parent continues after this child
+                    return (node_ref_t){.page_id = n->child_page_ids[i],
+                                        .offset  = n->child_offsets[i]};
+                }
+            }
+            return NULL_NODE_REF;
+        }
+        case DATA_NODE_16: {
+            const data_art_node16_t *n = (const data_art_node16_t *)node;
+            for (int i = 0; i < n->num_children; i++) {
+                if (n->keys[i] >= byte) {
+                    *exact = (n->keys[i] == byte);
+                    *child_idx = i + 1;
+                    return (node_ref_t){.page_id = n->child_page_ids[i],
+                                        .offset  = n->child_offsets[i]};
+                }
+            }
+            return NULL_NODE_REF;
+        }
+        case DATA_NODE_48: {
+            const data_art_node48_t *n = (const data_art_node48_t *)node;
+            for (int b = byte; b < 256; b++) {
+                uint8_t slot = n->keys[b];
+                if (slot != NODE48_EMPTY) {
+                    *exact = (b == byte);
+                    *child_idx = b + 1;  // continue scanning from next byte
+                    return (node_ref_t){.page_id = n->child_page_ids[slot],
+                                        .offset  = n->child_offsets[slot]};
+                }
+            }
+            return NULL_NODE_REF;
+        }
+        case DATA_NODE_256: {
+            const data_art_node256_t *n = (const data_art_node256_t *)node;
+            for (int b = byte; b < 256; b++) {
+                if (n->child_page_ids[b] != 0) {
+                    *exact = (b == byte);
+                    *child_idx = b + 1;
+                    return (node_ref_t){.page_id = n->child_page_ids[b],
+                                        .offset  = n->child_offsets[b]};
+                }
+            }
+            return NULL_NODE_REF;
+        }
+        default:
+            return NULL_NODE_REF;
+    }
+}
+
+bool data_art_iterator_seek(data_art_iterator_t *iter,
+                            const uint8_t *key, size_t key_len) {
+    if (!iter || !key) return false;
+
+    // Reset iterator state
+    data_art_reset_arena();
+    free(iter->current_key);
+    free(iter->current_value);
+    iter->current_key = NULL;
+    iter->current_value = NULL;
+    iter->current_key_len = 0;
+    iter->current_value_len = 0;
+    iter->started = true;
+    iter->done = false;
+    iter->depth = -1;
+
+    if (node_ref_is_null(iter->root)) {
+        iter->done = true;
+        return false;
+    }
+
+    // Push root
+    iter->depth = 0;
+    iter->stack[0].node_ref = iter->root;
+    iter->stack[0].child_idx = 0;
+
+    size_t key_depth = 0;  // bytes of seek key consumed
+
+    // Targeted descent: set up stack so next() finds first leaf >= key
+    while (iter->depth >= 0) {
+        iter_stack_frame_t *frame = &iter->stack[iter->depth];
+        const void *node = data_art_load_node(iter->tree, frame->node_ref);
+        if (!node) {
+            iter->done = true;
+            return false;
+        }
+
+        uint8_t type = *(const uint8_t *)node;
+
+        // Leaf: compare with seek key
+        if (type == DATA_NODE_LEAF) {
+            const data_art_leaf_t *leaf = (const data_art_leaf_t *)node;
+
+            // Skip deleted leaves
+            if (leaf->xmax != 0) {
+                iter->depth--;
+                break;  // let next() find the next valid leaf
+            }
+
+            // Compare leaf key with seek key
+            size_t cmp_len = leaf->key_len < key_len ? leaf->key_len : key_len;
+            int cmp = memcmp(leaf->data, key, cmp_len);
+            if (cmp == 0) cmp = (int)leaf->key_len - (int)key_len;
+
+            if (cmp >= 0) {
+                // leaf >= seek key: this is our target
+                // Leave it on the stack so next() yields it
+                break;
+            } else {
+                // leaf < seek key: pop, let parent advance
+                iter->depth--;
+                break;
+            }
+        }
+
+        // Inner node: compare partial prefix
+        uint8_t plen = node_partial_len(node);
+        const uint8_t *partial = node_partial(node);
+        bool prefix_mismatch = false;
+
+        for (uint8_t i = 0; i < plen; i++) {
+            if (key_depth >= key_len) {
+                // Seek key exhausted during prefix — everything in this
+                // subtree has a longer key, so it's all >= seek key.
+                // Set child_idx = 0 to let next() find leftmost leaf.
+                frame->child_idx = 0;
+                prefix_mismatch = true;
+                break;
+            }
+            if (key[key_depth] < partial[i]) {
+                // Seek key < node prefix: subtree is entirely >= seek key
+                frame->child_idx = 0;
+                prefix_mismatch = true;
+                break;
+            }
+            if (key[key_depth] > partial[i]) {
+                // Seek key > node prefix: subtree is entirely < seek key
+                iter->depth--;
+                prefix_mismatch = true;
+                break;
+            }
+            key_depth++;
+        }
+
+        if (prefix_mismatch)
+            break;
+
+        // Prefix matched fully. Find child for next key byte.
+        if (key_depth >= key_len) {
+            // Seek key exhausted after prefix match: leftmost leaf is target
+            frame->child_idx = 0;
+            break;
+        }
+
+        uint8_t byte = key[key_depth];
+        key_depth++;
+
+        bool exact_child;
+        node_ref_t child = find_child_ge(node, byte,
+                                         &frame->child_idx, &exact_child);
+
+        if (node_ref_is_null(child)) {
+            // No child >= byte: pop, let parent advance
+            iter->depth--;
+            break;
+        }
+
+        if (exact_child) {
+            // Exact match: push child and continue descent
+            iter->depth++;
+            if (iter->depth >= ITER_MAX_DEPTH) {
+                iter->done = true;
+                return false;
+            }
+            iter->stack[iter->depth].node_ref = child;
+            iter->stack[iter->depth].child_idx = 0;
+            // Continue descent loop
+        } else {
+            // Ceiling child (first child > byte): push it and stop descent.
+            // next() will find leftmost leaf in this ceiling subtree.
+            iter->depth++;
+            if (iter->depth >= ITER_MAX_DEPTH) {
+                iter->done = true;
+                return false;
+            }
+            iter->stack[iter->depth].node_ref = child;
+            iter->stack[iter->depth].child_idx = 0;
+            break;
+        }
+    }
+
+    // Now advance to the first leaf >= target
+    return data_art_iterator_next(iter);
+}

@@ -664,6 +664,26 @@ const void *data_art_iterator_value(const data_art_iterator_t *iter, size_t *val
 bool data_art_iterator_done(const data_art_iterator_t *iter);
 void data_art_iterator_destroy(data_art_iterator_t *iter);
 
+/**
+ * Seek to the first key >= target key.
+ *
+ * Repositions the iterator so the next key/value accessors return the first
+ * entry whose key is >= the given key. Enables efficient range scans:
+ *
+ *   data_art_iterator_seek(it, start_key, key_len);
+ *   while (!data_art_iterator_done(it)) {
+ *       // process key/value ...
+ *       data_art_iterator_next(it);
+ *   }
+ *
+ * @param iter Iterator instance
+ * @param key Target key to seek to
+ * @param key_len Length of the target key
+ * @return true if positioned at a valid entry, false if no key >= target
+ */
+bool data_art_iterator_seek(data_art_iterator_t *iter,
+                            const uint8_t *key, size_t key_len);
+
 // ============================================================================
 // Statistics & Debugging
 // ============================================================================
