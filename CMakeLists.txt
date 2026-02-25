@@ -136,6 +136,7 @@ add_library(art_persistent STATIC
     database/src/data_art_insert.c
     database/src/data_art_delete.c
     database/src/data_art_node_ops.c
+    database/src/mmap_storage.c
     database/src/txn_buffer.c
     database/src/mvcc.c
     database/src/checkpoint_manager.c

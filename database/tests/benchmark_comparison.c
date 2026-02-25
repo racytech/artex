@@ -10,6 +10,7 @@
  */
 
 #include "data_art.h"
+#include "mmap_storage.h"
 #include "page_manager.h"
 #include "buffer_pool.h"
 #include "wal.h"
@@ -32,6 +33,8 @@
 #define VALUE_SIZE 32
 #define ART_DB_PATH "/tmp/bench_art.db"
 #define ART_WAL_PATH "/tmp/bench_art_wal"
+#define ART_MMAP_DIR "/tmp/bench_art_mmap"
+#define ART_MMAP_FILE "/tmp/bench_art_mmap/art_mmap.dat"
 #define LMDB_PATH "/tmp/bench_lmdb"
 
 // ============================================================================
@@ -84,6 +87,7 @@ static void cleanup_path(const char *path) {
 static void cleanup_all(void) {
     cleanup_path(ART_DB_PATH);
     cleanup_path(ART_WAL_PATH);
+    cleanup_path(ART_MMAP_DIR);
     cleanup_path(LMDB_PATH);
     sync();
     usleep(10000);
@@ -200,6 +204,25 @@ static void art_close(art_ctx_t *ctx) {
     if (ctx->wal) wal_close(ctx->wal);
     if (ctx->pm) page_manager_destroy(ctx->pm);
     memset(ctx, 0, sizeof(*ctx));
+}
+
+// ============================================================================
+// mmap ART helpers
+// ============================================================================
+
+static data_art_tree_t *mmap_art_open(void) {
+    cleanup_path(ART_MMAP_DIR);
+    mkdir(ART_MMAP_DIR, 0755);
+
+    data_art_tree_t *tree = data_art_create_mmap(ART_MMAP_FILE, KEY_SIZE);
+    if (!tree) {
+        fprintf(stderr, "ART(mmap): data_art_create_mmap failed\n");
+    }
+    return tree;
+}
+
+static void mmap_art_close(data_art_tree_t *tree) {
+    if (tree) data_art_destroy(tree);
 }
 
 // ============================================================================
@@ -768,6 +791,131 @@ static void bench_disk_usage(int num_keys) {
 }
 
 // ============================================================================
+// mmap ART Benchmarks
+// ============================================================================
+
+static void bench_mmap_perkey_insert(int num_keys) {
+    bench_result_t mmap_res = {0};
+    uint8_t key[KEY_SIZE], value[VALUE_SIZE];
+
+    data_art_tree_t *tree = mmap_art_open();
+    if (!tree) { printf("  mmap Per-Key Insert: (failed)\n\n"); return; }
+
+    uint64_t start = get_time_us();
+    for (int i = 0; i < num_keys; i++) {
+        make_key(i, key);
+        make_value(i, value);
+        data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
+    }
+    mmap_res.elapsed_us = get_time_us() - start;
+    mmap_res.num_ops = num_keys;
+
+    printf("  %-28s\n", "mmap Per-Key Insert");
+    print_result("mmap:", mmap_res);
+    printf("\n");
+
+    mmap_art_close(tree);
+}
+
+static void bench_mmap_bulk_insert(int num_keys) {
+    bench_result_t mmap_res = {0};
+    uint8_t key[KEY_SIZE], value[VALUE_SIZE];
+
+    data_art_tree_t *tree = mmap_art_open();
+    if (!tree) { printf("  mmap Bulk Insert: (failed)\n\n"); return; }
+
+    uint64_t txn_id;
+    data_art_begin_txn(tree, &txn_id);
+
+    uint64_t start = get_time_us();
+    for (int i = 0; i < num_keys; i++) {
+        make_key(i, key);
+        make_value(i, value);
+        data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
+    }
+    data_art_commit_txn(tree);
+    mmap_res.elapsed_us = get_time_us() - start;
+    mmap_res.num_ops = num_keys;
+
+    printf("  %-28s\n", "mmap Bulk Random Insert");
+    print_result("mmap:", mmap_res);
+    printf("\n");
+
+    mmap_art_close(tree);
+}
+
+static void bench_mmap_random_lookup(int num_keys) {
+    bench_result_t mmap_res = {0};
+    uint8_t key[KEY_SIZE], value[VALUE_SIZE];
+
+    data_art_tree_t *tree = mmap_art_open();
+    if (!tree) { printf("  mmap Random Lookup: (failed)\n\n"); return; }
+
+    // Setup (not timed)
+    uint64_t txn_id;
+    data_art_begin_txn(tree, &txn_id);
+    for (int i = 0; i < num_keys; i++) {
+        make_key(i, key);
+        make_value(i, value);
+        data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
+    }
+    data_art_commit_txn(tree);
+
+    // Timed: lookup
+    uint64_t start = get_time_us();
+    int found = 0;
+    for (int i = 0; i < num_keys; i++) {
+        make_key(num_keys - 1 - i, key);
+        size_t vlen;
+        const void *val = data_art_get(tree, key, KEY_SIZE, &vlen);
+        if (val) found++;
+    }
+    mmap_res.elapsed_us = get_time_us() - start;
+    mmap_res.num_ops = num_keys;
+
+    printf("  %-28s\n", "mmap Random Lookup");
+    print_result("mmap:", mmap_res);
+    if (found != num_keys) printf("    WARNING: found %d/%d\n", found, num_keys);
+    printf("\n");
+
+    mmap_art_close(tree);
+}
+
+static void bench_mmap_disk_usage(int num_keys) {
+    uint8_t key[KEY_SIZE], value[VALUE_SIZE];
+
+    data_art_tree_t *tree = mmap_art_open();
+    if (!tree) { printf("  mmap Disk: (failed)\n\n"); return; }
+
+    uint64_t txn_id;
+    data_art_begin_txn(tree, &txn_id);
+    for (int i = 0; i < num_keys; i++) {
+        make_key(i, key);
+        make_value(i, value);
+        data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
+    }
+    data_art_commit_txn(tree);
+    data_art_flush(tree);
+
+    // Get actual used size: next_page_id * PAGE_SIZE
+    uint64_t mmap_used = tree->mmap_storage->next_page_id * PAGE_SIZE;
+    char size_str[64];
+    format_size(mmap_used, size_str, sizeof(size_str));
+    printf("  %-28s\n", "mmap Disk Usage");
+    printf("    mmap:   %s  (%lu bytes/key, %lu pages used)\n", size_str,
+           num_keys > 0 ? mmap_used / num_keys : 0,
+           tree->mmap_storage->next_page_id);
+
+    data_art_stats_t stats;
+    data_art_get_stats(tree, &stats);
+    printf("    Pages reused:     %lu\n", stats.pages_reused);
+    printf("    Dedicated pages:  %lu\n", stats.dedicated_pages_created);
+
+    mmap_art_close(tree);
+    printf("\n");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -800,6 +948,12 @@ int main(int argc, char **argv) {
     bench_negative_lookup(num_keys);
     bench_disk_usage(num_keys);
     bench_slot_stats(num_keys);
+
+    printf("--- mmap ART ---\n\n");
+    bench_mmap_bulk_insert(num_keys);
+    bench_mmap_perkey_insert(num_keys);
+    bench_mmap_random_lookup(num_keys);
+    bench_mmap_disk_usage(num_keys);
 
     printf("================================================================\n");
     printf("  Benchmark complete\n");

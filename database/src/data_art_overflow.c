@@ -11,6 +11,7 @@
  */
 
 #include "data_art.h"
+#include "mmap_storage.h"
 #include "db_error.h"
 #include "logger.h"
 
@@ -223,6 +224,11 @@ bool data_art_flush(data_art_tree_t *tree) {
     if (!tree) {
         DB_ERROR(DB_ERROR_INVALID_ARG, "tree is NULL");
         return false;
+    }
+
+    if (tree->mmap_storage) {
+        // mmap path: msync
+        return mmap_storage_sync(tree->mmap_storage);
     }
 
     if (!tree->buffer_pool) {

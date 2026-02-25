@@ -11,11 +11,14 @@
  */
 
 #include "data_art.h"
+#include "mmap_storage.h"
 #include "txn_buffer.h"
 #include "mvcc.h"
 #include "page_gc.h"
 #include "db_error.h"
 #include "logger.h"
+
+#define USES_MMAP(tree) ((tree)->mmap_storage != NULL)
 
 #include <stdlib.h>
 #include <string.h>
@@ -315,8 +318,10 @@ static void slot_page_init(page_t *page, const slot_class_t *cls) {
 static uint64_t reuse_pool_pop(data_art_tree_t *tree) {
     if (tree->reuse_pool_count == 0) return 0;
     uint64_t page_id = tree->reuse_pool[--tree->reuse_pool_count];
-    // Re-init ref count and clear dead/stale flags
-    page_gc_init_ref(tree->page_manager, page_id);
+    // Re-init ref count and clear dead/stale flags (page_manager mode only)
+    if (!USES_MMAP(tree)) {
+        page_gc_init_ref(tree->page_manager, page_id);
+    }
     tree->pages_reused++;
     return page_id;
 }
@@ -328,6 +333,47 @@ static uint64_t reuse_pool_pop(data_art_tree_t *tree) {
 static node_ref_t slot_alloc(data_art_tree_t *tree, int class_idx) {
     slot_class_t *cls = &tree->slot_classes[class_idx];
 
+    if (USES_MMAP(tree)) {
+        // ---- mmap path ----
+        // Try current page first
+        if (cls->current_page_id != 0) {
+            page_t *page = mmap_storage_get_page(tree->mmap_storage, cls->current_page_id);
+            uint32_t offset = slot_page_alloc_slot(page, cls);
+            if (offset != 0) {
+                tree->slot_allocs[class_idx]++;
+                return (node_ref_t){.page_id = cls->current_page_id, .offset = offset};
+            }
+            cls->current_page_id = 0;
+        }
+
+        // Try reuse pool first, then allocate fresh
+        uint64_t page_id = reuse_pool_pop(tree);
+        if (page_id == 0) {
+            page_id = mmap_storage_alloc_page(tree->mmap_storage);
+            if (page_id == 0) {
+                LOG_ERROR("slot_alloc(mmap): alloc_page failed");
+                return NULL_NODE_REF;
+            }
+        } else {
+            // Reused page — zero the data area for clean state
+            page_t *page = mmap_storage_get_page(tree->mmap_storage, page_id);
+            memset(page->data, 0, sizeof(page->data));
+        }
+
+        page_t *page = mmap_storage_get_page(tree->mmap_storage, page_id);
+        slot_page_init(page, cls);
+
+        uint32_t offset = slot_page_alloc_slot(page, cls);
+
+        cls->current_page_id = page_id;
+        tree->nodes_allocated++;
+        tree->slot_pages_created[class_idx]++;
+        tree->slot_allocs[class_idx]++;
+
+        return (node_ref_t){.page_id = page_id, .offset = offset};
+    }
+
+    // ---- buffer_pool path ----
     // Try current page first
     if (cls->current_page_id != 0) {
         page_t *page = buffer_pool_get_pinned(tree->buffer_pool, cls->current_page_id);
@@ -386,6 +432,26 @@ static node_ref_t slot_alloc(data_art_tree_t *tree, int class_idx) {
 static node_ref_t slot_alloc_hint(data_art_tree_t *tree, int class_idx, uint64_t hint_page_id) {
     slot_class_t *cls = &tree->slot_classes[class_idx];
 
+    if (USES_MMAP(tree)) {
+        // ---- mmap path ----
+        if (hint_page_id != 0 && hint_page_id != cls->current_page_id) {
+            page_t *page = mmap_storage_get_page(tree->mmap_storage, hint_page_id);
+            slot_page_header_t hdr;
+            slot_page_read_header(page, &hdr);
+            if (hdr.node_type == cls->node_type && hdr.used_count < hdr.slot_count) {
+                uint32_t offset = slot_page_alloc_slot(page, cls);
+                if (offset != 0) {
+                    tree->slot_hint_hits++;
+                    tree->slot_allocs[class_idx]++;
+                    return (node_ref_t){.page_id = hint_page_id, .offset = offset};
+                }
+            }
+        }
+        tree->slot_hint_misses++;
+        return slot_alloc(tree, class_idx);
+    }
+
+    // ---- buffer_pool path ----
     // Try hint page first (if it's a valid slot page of the right class)
     if (hint_page_id != 0 && hint_page_id != cls->current_page_id) {
         page_t *page = buffer_pool_get_pinned(tree->buffer_pool, hint_page_id);
@@ -416,18 +482,28 @@ static node_ref_t slot_alloc_hint(data_art_tree_t *tree, int class_idx, uint64_t
  * Used for Node256, overflow pages, and oversized leaves.
  */
 static node_ref_t alloc_dedicated_page(data_art_tree_t *tree, size_t size) {
+    (void)size;  /* mmap always allocates full pages */
+
     // Try reuse pool first
     uint64_t page_id = reuse_pool_pop(tree);
     if (page_id == 0) {
-        // No reusable pages — allocate fresh
-        page_id = page_manager_alloc(tree->page_manager, size);
-        if (page_id == 0) {
-            LOG_ERROR("alloc_dedicated_page: page_manager_alloc failed");
-            return NULL_NODE_REF;
-        }
-        if (!page_gc_init_ref(tree->page_manager, page_id)) {
-            LOG_ERROR("alloc_dedicated_page: page_gc_init_ref failed for page %lu", page_id);
-            return NULL_NODE_REF;
+        if (USES_MMAP(tree)) {
+            page_id = mmap_storage_alloc_page(tree->mmap_storage);
+            if (page_id == 0) {
+                LOG_ERROR("alloc_dedicated_page(mmap): alloc_page failed");
+                return NULL_NODE_REF;
+            }
+        } else {
+            // No reusable pages — allocate fresh from page_manager
+            page_id = page_manager_alloc(tree->page_manager, size);
+            if (page_id == 0) {
+                LOG_ERROR("alloc_dedicated_page: page_manager_alloc failed");
+                return NULL_NODE_REF;
+            }
+            if (!page_gc_init_ref(tree->page_manager, page_id)) {
+                LOG_ERROR("alloc_dedicated_page: page_gc_init_ref failed for page %lu", page_id);
+                return NULL_NODE_REF;
+            }
         }
     }
 
@@ -446,10 +522,15 @@ static void slot_free(data_art_tree_t *tree, uint64_t page_id, uint32_t offset) 
         return;
     }
 
-    page_t *page = buffer_pool_get_pinned(tree->buffer_pool, page_id);
-    if (!page) {
-        LOG_ERROR("slot_free: failed to get page %lu", page_id);
-        return;
+    page_t *page;
+    if (USES_MMAP(tree)) {
+        page = mmap_storage_get_page(tree->mmap_storage, page_id);
+    } else {
+        page = buffer_pool_get_pinned(tree->buffer_pool, page_id);
+        if (!page) {
+            LOG_ERROR("slot_free: failed to get page %lu", page_id);
+            return;
+        }
     }
 
     // Read header to determine class
@@ -469,13 +550,16 @@ static void slot_free(data_art_tree_t *tree, uint64_t page_id, uint32_t offset) 
 
     if (!cls) {
         LOG_ERROR("slot_free: unknown node_type %u on page %lu", hdr.node_type, page_id);
-        buffer_pool_unpin(tree->buffer_pool, page_id);
+        if (!USES_MMAP(tree)) buffer_pool_unpin(tree->buffer_pool, page_id);
         return;
     }
 
     if (class_idx >= 0) tree->slot_frees[class_idx]++;
     uint16_t remaining = slot_page_free_slot(page, offset, cls);
-    buffer_pool_dirty_unpin(tree->buffer_pool, page_id);
+
+    if (!USES_MMAP(tree)) {
+        buffer_pool_dirty_unpin(tree->buffer_pool, page_id);
+    }
 
     if (remaining == 0) {
         // Page is empty — reset current_page_id if it matches
@@ -491,6 +575,41 @@ static void slot_free(data_art_tree_t *tree, uint64_t page_id, uint32_t offset) 
 // Tree Lifecycle
 // ============================================================================
 
+/**
+ * Common initialization shared by all create paths (page_manager and mmap).
+ */
+static bool data_art_init_common(data_art_tree_t *tree, size_t key_size) {
+    tree->root = NULL_NODE_REF;
+    tree->version = 1;
+    tree->size = 0;
+    tree->key_size = key_size;
+    tree->max_depth = key_size + 1;
+    tree->current_txn_id = 0;
+    tree->txn_buffer = NULL;
+
+    if (pthread_mutex_init(&tree->write_lock, NULL) != 0) {
+        LOG_ERROR("Failed to initialize write_lock");
+        return false;
+    }
+
+    tree->mvcc_manager = mvcc_manager_create();
+    if (!tree->mvcc_manager) {
+        LOG_ERROR("Failed to create MVCC manager");
+        pthread_mutex_destroy(&tree->write_lock);
+        return false;
+    }
+
+    tree->cow_enabled = false;
+    tree->active_versions = NULL;
+    tree->num_active_versions = 0;
+
+    atomic_store_explicit(&tree->committed_root_page_id, 0, memory_order_release);
+    atomic_store_explicit(&tree->committed_root_offset, 0, memory_order_release);
+
+    slot_allocator_init(tree);
+    return true;
+}
+
 data_art_tree_t *data_art_create(page_manager_t *page_manager,
                                    buffer_pool_t *buffer_pool,
                                    wal_t *wal,
@@ -499,65 +618,27 @@ data_art_tree_t *data_art_create(page_manager_t *page_manager,
         LOG_ERROR("page_manager cannot be NULL");
         return NULL;
     }
-    
-    // Validate key_size for Ethereum (20-byte addresses, 32-byte hashes)
+
     if (key_size != 20 && key_size != 32) {
         LOG_ERROR("Invalid key_size: %zu (must be 20 or 32 for Ethereum)", key_size);
         return NULL;
     }
-    
+
     data_art_tree_t *tree = calloc(1, sizeof(data_art_tree_t));
     if (!tree) {
         LOG_ERROR("Failed to allocate tree structure");
         return NULL;
     }
-    
+
     tree->page_manager = page_manager;
     tree->buffer_pool = buffer_pool;
     tree->wal = wal;
-    tree->root = NULL_NODE_REF;
-    tree->version = 1;
-    tree->size = 0;
-    tree->key_size = key_size;
-    tree->max_depth = key_size + 1;  // +1 for 0x00 terminator at leaf level
-    tree->current_txn_id = 0;        // No active transaction
-    tree->txn_buffer = NULL;         // No transaction buffer initially
-    
-    // Initialize write lock (mutex). Readers are lock-free via atomic committed root,
-    // so only writers need serialization.
-    if (pthread_mutex_init(&tree->write_lock, NULL) != 0) {
-        LOG_ERROR("Failed to initialize write_lock");
-        free(tree);
-        return NULL;
-    }
-    
-    // Initialize MVCC manager
-    tree->mvcc_manager = mvcc_manager_create();
-    if (!tree->mvcc_manager) {
-        LOG_ERROR("Failed to create MVCC manager");
-        pthread_mutex_destroy(&tree->write_lock);
-        free(tree);
-        return NULL;
-    }
-    
-    tree->cow_enabled = false;
-    tree->active_versions = NULL;
-    tree->num_active_versions = 0;
-    
-    // Initialize statistics
-    tree->nodes_allocated = 0;
-    tree->nodes_copied = 0;
-    tree->cache_hits = 0;
-    tree->cache_misses = 0;
-    tree->overflow_pages_allocated = 0;
-    tree->overflow_chain_reads = 0;
-    
-    // Initialize committed root for lock-free readers (empty tree → page_id 0, offset 0)
-    atomic_store_explicit(&tree->committed_root_page_id, 0, memory_order_release);
-    atomic_store_explicit(&tree->committed_root_offset, 0, memory_order_release);
+    tree->mmap_storage = NULL;
 
-    // Initialize slot allocator for multi-node-per-page packing
-    slot_allocator_init(tree);
+    if (!data_art_init_common(tree, key_size)) {
+        free(tree);
+        return NULL;
+    }
 
     LOG_INFO("Created persistent ART tree (key_size=%zu, max_depth=%zu, buffer_pool=%s, wal=%s)",
              key_size, tree->max_depth,
@@ -567,26 +648,127 @@ data_art_tree_t *data_art_create(page_manager_t *page_manager,
     return tree;
 }
 
+data_art_tree_t *data_art_create_mmap(const char *path, size_t key_size) {
+    if (!path) {
+        LOG_ERROR("path cannot be NULL");
+        return NULL;
+    }
+
+    if (key_size != 20 && key_size != 32) {
+        LOG_ERROR("Invalid key_size: %zu (must be 20 or 32)", key_size);
+        return NULL;
+    }
+
+    mmap_storage_t *ms = mmap_storage_create(path, MMAP_DEFAULT_INITIAL_PAGES);
+    if (!ms) {
+        LOG_ERROR("Failed to create mmap storage at %s", path);
+        return NULL;
+    }
+
+    data_art_tree_t *tree = calloc(1, sizeof(data_art_tree_t));
+    if (!tree) {
+        mmap_storage_destroy(ms);
+        return NULL;
+    }
+
+    tree->mmap_storage = ms;
+    tree->page_manager = NULL;
+    tree->buffer_pool = NULL;
+    tree->wal = NULL;
+
+    if (!data_art_init_common(tree, key_size)) {
+        mmap_storage_destroy(ms);
+        free(tree);
+        return NULL;
+    }
+
+    // Save key_size to header for reopen
+    mmap_storage_save_header(ms, 0, 0, 0, key_size);
+
+    LOG_INFO("Created mmap ART tree (key_size=%zu, path=%s)", key_size, path);
+    return tree;
+}
+
+data_art_tree_t *data_art_open_mmap(const char *path, size_t key_size) {
+    if (!path) {
+        LOG_ERROR("path cannot be NULL");
+        return NULL;
+    }
+
+    mmap_storage_t *ms = mmap_storage_open(path);
+    if (!ms) {
+        LOG_ERROR("Failed to open mmap storage at %s", path);
+        return NULL;
+    }
+
+    // Load header
+    uint64_t root_page_id;
+    uint32_t root_offset;
+    uint64_t tree_size, stored_key_size;
+
+    if (!mmap_storage_load_header(ms, &root_page_id, &root_offset,
+                                   &tree_size, &stored_key_size)) {
+        LOG_ERROR("Failed to load mmap header from %s", path);
+        mmap_storage_destroy(ms);
+        return NULL;
+    }
+
+    if (stored_key_size != key_size) {
+        LOG_ERROR("Key size mismatch: file has %lu, requested %zu",
+                  stored_key_size, key_size);
+        mmap_storage_destroy(ms);
+        return NULL;
+    }
+
+    data_art_tree_t *tree = calloc(1, sizeof(data_art_tree_t));
+    if (!tree) {
+        mmap_storage_destroy(ms);
+        return NULL;
+    }
+
+    tree->mmap_storage = ms;
+    tree->page_manager = NULL;
+    tree->buffer_pool = NULL;
+    tree->wal = NULL;
+
+    if (!data_art_init_common(tree, key_size)) {
+        mmap_storage_destroy(ms);
+        free(tree);
+        return NULL;
+    }
+
+    // Restore tree state from header
+    tree->root = (node_ref_t){.page_id = root_page_id, .offset = root_offset};
+    tree->size = tree_size;
+
+    // Publish committed root for lock-free readers
+    atomic_store_explicit(&tree->committed_root_page_id, root_page_id, memory_order_release);
+    atomic_store_explicit(&tree->committed_root_offset, root_offset, memory_order_release);
+
+    LOG_INFO("Opened mmap ART tree (key_size=%zu, size=%lu, root=%lu:%u, path=%s)",
+             key_size, tree_size, root_page_id, root_offset, path);
+    return tree;
+}
+
 void data_art_destroy(data_art_tree_t *tree) {
     if (!tree) {
         return;
     }
 
-    
     // Destroy write lock
     pthread_mutex_destroy(&tree->write_lock);
-    
+
     // Destroy MVCC manager
     if (tree->mvcc_manager) {
         mvcc_manager_destroy(tree->mvcc_manager);
         tree->mvcc_manager = NULL;
     }
-    
+
     // Free active versions array if allocated
     if (tree->active_versions) {
         free(tree->active_versions);
     }
-    
+
     // Note: We do NOT delete pages from disk - they persist
     // Use data_art_drop() if you want to remove all data
 
@@ -594,11 +776,21 @@ void data_art_destroy(data_art_tree_t *tree) {
     drain_pending_frees(tree);
     free(tree->pending_free_pages);
 
-    // Drain reuse pool — mark pages as dead so compaction can reclaim them
-    for (size_t i = 0; i < tree->reuse_pool_count; i++) {
-        page_manager_free(tree->page_manager, tree->reuse_pool[i]);
+    if (USES_MMAP(tree)) {
+        // mmap path: save header, then destroy storage
+        mmap_storage_save_header(tree->mmap_storage,
+                                 tree->root.page_id, tree->root.offset,
+                                 tree->size, tree->key_size);
+        // Reuse pool pages are simply available in the file — no need to mark dead
+        free(tree->reuse_pool);
+        mmap_storage_destroy(tree->mmap_storage);
+    } else {
+        // page_manager path: drain reuse pool to mark dead for compaction
+        for (size_t i = 0; i < tree->reuse_pool_count; i++) {
+            page_manager_free(tree->page_manager, tree->reuse_pool[i]);
+        }
+        free(tree->reuse_pool);
     }
-    free(tree->reuse_pool);
 
     LOG_INFO("Destroyed ART tree (size=%zu, nodes=%lu, pages_reused=%lu)",
              tree->size, tree->nodes_allocated, tree->pages_reused);
@@ -641,8 +833,8 @@ node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size) {
         return NULL_NODE_REF;
     }
 
-    // Try slot allocation if buffer pool is available
-    if (tree->buffer_pool) {
+    // Try slot allocation if buffer pool or mmap is available
+    if (tree->buffer_pool || USES_MMAP(tree)) {
         int class_idx = size_to_slot_class(tree, size);
         if (class_idx >= 0) {
             return slot_alloc(tree, class_idx);
@@ -675,8 +867,8 @@ node_ref_t data_art_alloc_node_hint(data_art_tree_t *tree, size_t size, uint64_t
         return NULL_NODE_REF;
     }
 
-    // Try slot allocation with hint if buffer pool is available
-    if (tree->buffer_pool) {
+    // Try slot allocation with hint if buffer pool or mmap is available
+    if (tree->buffer_pool || USES_MMAP(tree)) {
         int class_idx = size_to_slot_class(tree, size);
         if (class_idx >= 0) {
             if (hint_page_id != 0) {
@@ -703,8 +895,8 @@ static void drain_pending_frees(data_art_tree_t *tree) {
     for (size_t i = 0; i < tree->pending_free_count; i++) {
         uint64_t page_id = tree->pending_free_pages[i];
 
-        // Evict from buffer pool so reuse gets a fresh frame
-        if (tree->buffer_pool) {
+        // Evict from buffer pool so reuse gets a fresh frame (page_manager mode only)
+        if (!USES_MMAP(tree) && tree->buffer_pool) {
             buffer_pool_invalidate(tree->buffer_pool, page_id);
         }
 
@@ -714,7 +906,9 @@ static void drain_pending_frees(data_art_tree_t *tree) {
             uint64_t *new_pool = realloc(tree->reuse_pool, new_cap * sizeof(uint64_t));
             if (!new_pool) {
                 // Fallback: free to page manager (loses reuse opportunity)
-                page_manager_free(tree->page_manager, page_id);
+                if (!USES_MMAP(tree)) {
+                    page_manager_free(tree->page_manager, page_id);
+                }
                 continue;
             }
             tree->reuse_pool = new_pool;
@@ -758,7 +952,7 @@ void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref) {
     if (!tree || node_ref_is_null(old_ref)) return;
 
     // Slot-level free: non-zero offset means node is on a multi-node page
-    if (old_ref.offset != 0 && tree->buffer_pool) {
+    if (old_ref.offset != 0 && (tree->buffer_pool || USES_MMAP(tree))) {
         slot_free(tree, old_ref.page_id, old_ref.offset);
         return;
     }
@@ -790,18 +984,39 @@ const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref) {
         LOG_ERROR("Tree is NULL");
         return NULL;
     }
-    
+
     if (node_ref_is_null(ref)) {
         return NULL;
     }
-    
-    // Buffer pool is required for correct operation
-    // The old temp_pages fallback had corruption issues with deep recursion
+
+    if (USES_MMAP(tree)) {
+        // ---- mmap path ----
+        pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
+
+        page_t *page = mmap_storage_get_page(tree->mmap_storage, ref.page_id);
+        const void *src = page->data + ref.offset;
+        size_t node_size = data_art_node_size_from_data(src);
+
+        void *copy = tls_arena_alloc(node_size);
+        if (!copy) {
+            LOG_ERROR("TLS arena exhausted (%zu bytes used, need %zu more)",
+                      tls_arena_offset, node_size);
+            pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+            return NULL;
+        }
+        memcpy(copy, src, node_size);
+
+        pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+        tree->cache_hits++;
+        return copy;
+    }
+
+    // ---- buffer_pool path ----
     if (!tree->buffer_pool) {
         LOG_ERROR("Buffer pool is required but not configured");
         return NULL;
     }
-    
+
     // Pin the page so it can't be evicted while we copy
     page_t *page = buffer_pool_get_pinned(tree->buffer_pool, ref.page_id);
     if (!page) {
@@ -837,21 +1052,30 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
         LOG_ERROR("Invalid parameters: tree=%p, node=%p", (void*)tree, node);
         return false;
     }
-    
+
     if (node_ref_is_null(ref)) {
         LOG_ERROR("Cannot write to NULL node reference");
         return false;
     }
-    
-    // Buffer pool is required
-    if (!tree->buffer_pool) {
-        LOG_ERROR("Buffer pool is required but not configured");
-        return false;
-    }
-    
+
     size_t max_size = PAGE_SIZE - PAGE_HEADER_SIZE;
     if (size > max_size) {
         LOG_ERROR("Node size %zu exceeds page capacity %zu", size, max_size);
+        return false;
+    }
+
+    if (USES_MMAP(tree)) {
+        // ---- mmap path ----
+        pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
+        page_t *page = mmap_storage_get_page(tree->mmap_storage, ref.page_id);
+        memcpy(page->data + ref.offset, node, size);
+        pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+        return true;
+    }
+
+    // ---- buffer_pool path ----
+    if (!tree->buffer_pool) {
+        LOG_ERROR("Buffer pool is required but not configured");
         return false;
     }
     
@@ -1185,11 +1409,37 @@ void data_art_end_snapshot(data_art_tree_t *tree, data_art_snapshot_t *snapshot)
 // ============================================================================
 
 bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out) {
-    if (!tree || !tree->wal) {
+    if (!tree) {
+        LOG_ERROR("Cannot checkpoint: tree is NULL");
+        return false;
+    }
+
+    if (USES_MMAP(tree)) {
+        // ---- mmap path: save header + msync ----
+        drain_pending_frees(tree);
+        mmap_storage_save_header(tree->mmap_storage,
+                                 tree->root.page_id, tree->root.offset,
+                                 tree->size, tree->key_size);
+        // Update next_page_id in header
+        mmap_header_t *hdr = (mmap_header_t *)tree->mmap_storage->base;
+        hdr->next_page_id = tree->mmap_storage->next_page_id;
+
+        if (!mmap_storage_sync(tree->mmap_storage)) {
+            LOG_ERROR("mmap checkpoint: msync failed");
+            return false;
+        }
+        if (checkpoint_lsn_out) *checkpoint_lsn_out = 0;
+        LOG_INFO("mmap checkpoint (root=%lu:%u, size=%zu)",
+                 tree->root.page_id, tree->root.offset, tree->size);
+        return true;
+    }
+
+    // ---- page_manager + WAL path ----
+    if (!tree->wal) {
         LOG_ERROR("Cannot checkpoint: WAL not enabled");
         return false;
     }
-    
+
     // Drain deferred page frees before checkpointing
     // Safe because checkpoint is called under write lock and represents a quiesce point
     drain_pending_frees(tree);

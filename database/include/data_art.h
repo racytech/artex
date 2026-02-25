@@ -34,6 +34,7 @@
 typedef struct txn_buffer txn_buffer_t;
 typedef struct mvcc_manager mvcc_manager_t;
 typedef struct mvcc_snapshot mvcc_snapshot_t;
+typedef struct mmap_storage mmap_storage_t;
 
 // ============================================================================
 // Node Reference (Page-based addressing)
@@ -294,6 +295,7 @@ typedef struct data_art_tree {
     page_manager_t *page_manager;
     buffer_pool_t *buffer_pool;
     wal_t *wal;                  // Write-ahead log for durability
+    mmap_storage_t *mmap_storage; // mmap backend (NULL = use page_manager+buffer_pool)
     
     // Current tree state
     node_ref_t root;             // Root node reference
@@ -371,10 +373,31 @@ data_art_tree_t *data_art_create(page_manager_t *page_manager,
                                    size_t key_size);
 
 /**
+ * Create a new persistent ART tree backed by mmap storage.
+ *
+ * Uses a memory-mapped file instead of page_manager + buffer_pool.
+ * No WAL — durability via msync.
+ *
+ * @param path      File path for the mmap data file
+ * @param key_size  Fixed size for all keys (20 or 32)
+ * @return Tree instance, or NULL on failure
+ */
+data_art_tree_t *data_art_create_mmap(const char *path, size_t key_size);
+
+/**
+ * Open an existing mmap-backed ART tree.
+ *
+ * @param path      Path to existing mmap data file
+ * @param key_size  Fixed key size (must match the file)
+ * @return Tree instance, or NULL on failure
+ */
+data_art_tree_t *data_art_open_mmap(const char *path, size_t key_size);
+
+/**
  * Destroy tree and free resources
- * 
+ *
  * Does NOT delete data from disk. Use data_art_drop() to remove all data.
- * 
+ *
  * @param tree Tree to destroy
  */
 void data_art_destroy(data_art_tree_t *tree);
