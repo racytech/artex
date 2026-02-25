@@ -137,17 +137,17 @@
    - Result: 25/25 tests pass
    - **Future**: background compactor for tier promotion based on `last_access_time`
 
-### 18. Database Compaction
-   - **Critical**: append-only storage has no free lists — compaction is the only way to reclaim dead space
-   - Dead bytes already tracked per-page in page index (`dead_bytes`, `PAGE_GC_FLAG_DEAD`)
-   - Compaction = rewrite live pages into new contiguous file, discard dead pages, update index
-   - Must handle variable-size pages (compressed pages range from ~50 to 4096 bytes)
-   - Algorithm: scan page index for file with high fragmentation → copy live pages → atomic swap (rename)
-   - Trigger: fragmentation ratio > 30% (`dead_bytes / total_file_size`)
-   - Background thread (same pattern as `checkpoint_manager`) or on-demand via API
-   - Preserves compression: live pages copied as-is (already compressed on disk)
-   - Header `db_compaction.h` exists as stub
-   - Ties into state pruning: pruning marks pages dead, compaction reclaims the space
+### 18. ~~Database Compaction~~ FIXED
+   - In-place defragmentation: moves live pages forward within each data file, ftruncate() to reclaim space
+   - No temporary files or extra disk space needed (critical for 100GB-1TB+ Ethereum state)
+   - Pages only move to lower offsets (write cursor always behind read cursor)
+   - Crash-safe via compaction journal (`compaction.journal`): records move plan, idempotent replay on recovery
+   - `db_compaction_recover()` handles all crash states (mid-move, post-truncate, post-index-save)
+   - Compressed pages copied as raw bytes (no decompress/recompress)
+   - Dead-at-end optimization: no moves needed when dead pages are only at file tail (just truncate)
+   - `db_compaction_analyze()` for read-only fragmentation analysis, `db_compaction_is_recommended()` (>30%)
+   - Tests: 16 tests (171 assertions) — analyze, in-place moves, interleaved dead, journal recovery, persistence
+   - Result: 26/26 tests pass
 
 ### 19. Batch Insert Optimization
    - Current TEMP FIX: commit path acquires/releases write_lock N times, publishes root N times
@@ -215,8 +215,8 @@
    - Builds on all existing APIs: data_art, page_manager, buffer_pool, checkpoint_manager, db_backup
 
 ### 29. Dead Code Cleanup
-   - Remove `db_compaction.h` (entire unimplemented header) if compaction not implemented
    - Remove unused functions (data_art_cow_node, data_art_snapshot, data_art_load, etc.)
    - Remove dead static functions in `data_art_node_ops.c` (shrink stubs already implemented in data_art_delete.c)
    - Remove debug printfs in `mem_art.c`, duplicate log lines in `wal.c`
    - Remove unused includes (`<stdio.h>` in search.c, `<assert.h>` in delete.c)
+   - Remove `page_manager_replace_data_fd()` (leftover from copy-based compaction, unused now)
