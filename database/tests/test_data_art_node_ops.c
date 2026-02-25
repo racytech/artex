@@ -60,20 +60,20 @@ static node_ref_t create_dummy_leaf(data_art_tree_t *tree, uint8_t id) {
         return NULL_NODE_REF;
     }
 
-    data_art_leaf_t leaf;
-    memset(&leaf, 0, sizeof(leaf));
-    leaf.type = DATA_NODE_LEAF;
-    leaf.key_len = 1;
-    leaf.value_len = 1;
-    leaf.inline_data_len = 2;
+    // Allocate full leaf_size on the stack (struct + flexible array data)
+    char buf[sizeof(data_art_leaf_t) + 10];
+    memset(buf, 0, sizeof(buf));
+    data_art_leaf_t *leaf = (data_art_leaf_t *)buf;
+    leaf->type = DATA_NODE_LEAF;
+    leaf->key_len = 1;
+    leaf->value_len = 1;
+    leaf->inline_data_len = 2;
 
     // Write unique identifier
-    char data[10];
-    data[0] = id;  // key
-    data[1] = id;  // value
-    memcpy(leaf.data, data, 2);
+    leaf->data[0] = id;  // key
+    leaf->data[1] = id;  // value
 
-    if (!data_art_write_node(tree, ref, &leaf, leaf_size)) {
+    if (!data_art_write_node(tree, ref, leaf, leaf_size)) {
         return NULL_NODE_REF;
     }
 
