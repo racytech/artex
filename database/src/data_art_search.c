@@ -115,7 +115,7 @@ node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) 
  * Check if leaf matches key
  */
 bool leaf_matches(const data_art_leaf_t *leaf, const uint8_t *key, size_t key_len) {
-    return memcmp(leaf->data, key, key_len) == 0;
+    return memcmp(leaf_key(leaf), key, key_len) == 0;
 }
 
 // ============================================================================
@@ -238,18 +238,8 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
             if (leaf->value_len > 1024) {  // Suspiciously large
                 LOG_ERROR("CORRUPTION DETECTED: leaf at page=%lu offset=%u has suspiciously large value_len=%u, key_size=%zu",
                           node_ref_page_id(current), node_ref_offset(current), leaf->value_len, tree->key_size);
-                LOG_ERROR("Leaf dump: type=%u flags=0x%02x, overflow_page=%lu, inline_data_len=%u",
-                          leaf->type, leaf->flags, leaf->overflow_page, leaf->inline_data_len);
-                // Dump raw bytes of entire leaf header
-                const uint8_t *raw = (const uint8_t *)leaf;
-                LOG_ERROR("Raw bytes [0-23]: %02x %02x %02x %02x | %02x %02x %02x %02x | %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x",
-                          raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-                          raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
-                          raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23]);
-                LOG_ERROR("Field breakdown: type@0=%02x flags@1=%02x pad@2-3=%02x%02x | value_len@4-7=%02x%02x%02x%02x | overflow@8-15=%02x%02x%02x%02x%02x%02x%02x%02x | inline_len@16-19=%02x%02x%02x%02x | xmin@20-23=%02x%02x%02x%02x",
-                          raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-                          raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
-                          raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23]);
+                LOG_ERROR("Leaf dump: type=%u flags=0x%02x, overflow_page=%lu",
+                          leaf->type, leaf->flags, leaf_overflow_page(leaf));
             }
 
             if (leaf_matches(leaf, key, key_len)) {
@@ -277,7 +267,7 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
                 }
 
                 // Copy inline value
-                memcpy(value_copy, leaf->data + tree->key_size, leaf->value_len);
+                memcpy(value_copy, leaf_key(leaf) + tree->key_size, leaf->value_len);
                 return value_copy;
             }
             return NULL;

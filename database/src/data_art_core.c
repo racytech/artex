@@ -145,7 +145,7 @@ size_t get_node_size(data_art_node_type_t type) {
  * Get the size of a node by inspecting its in-memory data.
  * Unlike get_node_size(), this handles variable-size leaves.
  */
-static size_t data_art_node_size_from_data(const void *node_data) {
+static size_t data_art_node_size_from_data(const void *node_data, size_t key_size) {
     uint8_t type = *(const uint8_t *)node_data;
     switch (type) {
         case DATA_NODE_4:      return sizeof(data_art_node4_t);
@@ -153,10 +153,8 @@ static size_t data_art_node_size_from_data(const void *node_data) {
         case DATA_NODE_48:     return sizeof(data_art_node48_t);
         case DATA_NODE_256:    return sizeof(data_art_node256_t);
         case DATA_NODE_OVERFLOW: return sizeof(data_art_overflow_t);
-        case DATA_NODE_LEAF: {
-            const data_art_leaf_t *leaf = (const data_art_leaf_t *)node_data;
-            return sizeof(data_art_leaf_t) + leaf->inline_data_len;
-        }
+        case DATA_NODE_LEAF:
+            return leaf_total_size((const data_art_leaf_t *)node_data, key_size);
         default:
             LOG_ERROR("Unknown node type %u in data_art_node_size_from_data", type);
             return PAGE_SIZE - PAGE_HEADER_SIZE;  // safe fallback: copy max possible
@@ -868,7 +866,7 @@ const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref) {
 
     page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
     const void *src = page->data + node_ref_offset(ref);
-    size_t node_size = data_art_node_size_from_data(src);
+    size_t node_size = data_art_node_size_from_data(src, tree->key_size);
 
     void *copy = tls_arena_alloc(node_size);
     if (!copy) {

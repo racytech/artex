@@ -130,7 +130,7 @@ static bool copy_leaf_data(data_art_iterator_t *iter, const data_art_leaf_t *lea
     iter->current_key_len = iter->tree->key_size;
     iter->current_key = malloc(iter->tree->key_size);
     if (!iter->current_key) return false;
-    memcpy(iter->current_key, leaf->data, iter->tree->key_size);
+    memcpy(iter->current_key, leaf_key(leaf), iter->tree->key_size);
 
     // Copy value
     iter->current_value_len = leaf->value_len;
@@ -155,7 +155,7 @@ static bool copy_leaf_data(data_art_iterator_t *iter, const data_art_leaf_t *lea
             return false;
         }
     } else {
-        memcpy(iter->current_value, leaf->data + iter->tree->key_size, leaf->value_len);
+        memcpy(iter->current_value, leaf_key(leaf) + iter->tree->key_size, leaf->value_len);
     }
 
     return true;
@@ -461,7 +461,7 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
             // Compare leaf key with seek key
             size_t leaf_key_len = iter->tree->key_size;
             size_t cmp_len = leaf_key_len < key_len ? leaf_key_len : key_len;
-            int cmp = memcmp(leaf->data, key, cmp_len);
+            int cmp = memcmp(leaf_key(leaf), key, cmp_len);
             if (cmp == 0) cmp = (int)leaf_key_len - (int)key_len;
 
             if (cmp >= 0) {

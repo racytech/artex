@@ -66,7 +66,6 @@ static node_ref_t create_dummy_leaf(data_art_tree_t *tree, uint8_t id) {
     data_art_leaf_t *leaf = (data_art_leaf_t *)buf;
     leaf->type = DATA_NODE_LEAF;
     leaf->value_len = 1;
-    leaf->inline_data_len = 2;
 
     // Write unique identifier
     leaf->data[0] = id;  // key

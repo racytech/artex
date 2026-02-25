@@ -59,7 +59,7 @@ static __thread bool tls_skip_mvcc = false;
  */
 static bool leaf_matches_key(const data_art_leaf_t *leaf,
                               const uint8_t *key, size_t key_len) {
-    return memcmp(leaf->data, key, key_len) == 0;
+    return memcmp(leaf_key(leaf), key, key_len) == 0;
 }
 
 /**
@@ -120,77 +120,76 @@ static node_ref_t alloc_leaf(data_art_tree_t *tree, const uint8_t *key, size_t k
     // Calculate leaf size
     size_t total_data = key_len + value_len;
     bool needs_overflow = total_data > MAX_INLINE_DATA;
-    
-    size_t inline_data_len = needs_overflow ? 
-        (key_len + (MAX_INLINE_DATA - key_len)) : total_data;
-    
-    size_t leaf_size = sizeof(data_art_leaf_t) + inline_data_len;
-    
+
+    size_t leaf_size;
+    if (needs_overflow) {
+        leaf_size = PAGE_SIZE - PAGE_HEADER_SIZE;  // overflow fills entire page
+    } else {
+        leaf_size = sizeof(data_art_leaf_t) + key_len + value_len;
+    }
+
     // Allocate leaf node
     node_ref_t leaf_ref = data_art_alloc_node(tree, leaf_size);
     if (node_ref_is_null(leaf_ref)) {
         LOG_ERROR("Failed to allocate leaf node");
         return NULL_NODE_REF;
     }
-    
+
     // Create leaf structure
     data_art_leaf_t *leaf = malloc(leaf_size);
     if (!leaf) {
         LOG_ERROR("Failed to allocate temporary leaf");
         return NULL_NODE_REF;
     }
-    
+    memset(leaf, 0, leaf_size);
+
     leaf->type = DATA_NODE_LEAF;
     leaf->flags = needs_overflow ? LEAF_FLAG_OVERFLOW : LEAF_FLAG_NONE;
     leaf->value_len = value_len;
-    leaf->overflow_page = 0;
-    leaf->inline_data_len = inline_data_len;
-    
+
     // Set MVCC version fields
     leaf->xmin = tree->current_txn_id > 0 ? tree->current_txn_id : 1;
     leaf->xmax = 0;  // Not deleted
     leaf->prev_version = NULL_NODE_REF;  // No older version (new insert)
-    
-    // Copy key
-    memcpy(leaf->data, key, key_len);
-    LOG_DEBUG("[ALLOC_LEAF] Copied key: %zu bytes at offset 0", key_len);
-    
-    // Copy value (inline portion)
+
+    // Copy key + value into data[]
     if (needs_overflow) {
-        size_t inline_value_size = inline_data_len - key_len;
-        memcpy(leaf->data + key_len, value, inline_value_size);
-        LOG_DEBUG("[ALLOC_LEAF] Copied inline value: %zu bytes at offset %zu (overflow mode)", inline_value_size, key_len);
-        
+        // data[] = [overflow_page_id:8B][key][value_prefix]
+        // overflow_page_id written after chain creation below
+        memcpy(leaf->data + 8, key, key_len);
+
+        size_t inline_value_size = leaf_size - sizeof(data_art_leaf_t) - 8 - key_len;
+        memcpy(leaf->data + 8 + key_len, value, inline_value_size);
+        LOG_DEBUG("[ALLOC_LEAF] Overflow mode: key at offset 8, inline value %zu bytes", inline_value_size);
+
         // Write overflow pages
-        uint64_t overflow_page = data_art_write_overflow_value(tree, value, 
-                                                                 value_len, 
-                                                                 inline_value_size);
-        if (overflow_page == 0) {
+        uint64_t overflow_pg = data_art_write_overflow_value(tree, value,
+                                                              value_len,
+                                                              inline_value_size);
+        if (overflow_pg == 0) {
             LOG_ERROR("Failed to write overflow value");
             free(leaf);
             return NULL_NODE_REF;
         }
-        leaf->overflow_page = overflow_page;
+        memcpy(leaf->data, &overflow_pg, sizeof(overflow_pg));
     } else {
+        // data[] = [key][value]
+        memcpy(leaf->data, key, key_len);
         memcpy(leaf->data + key_len, value, value_len);
-        LOG_DEBUG("[ALLOC_LEAF] Copied full value: %zu bytes at offset %zu (inline mode)", value_len, key_len);
+        LOG_DEBUG("[ALLOC_LEAF] Inline mode: key + value = %zu bytes", key_len + value_len);
     }
-    
+
     // Write leaf to disk
     LOG_TRACE("Writing leaf: page=%lu, value_len=%u, leaf_size=%zu",
               node_ref_page_id(leaf_ref), leaf->value_len, leaf_size);
-    LOG_DEBUG("[WRITE_LEAF] BEFORE write: page=%lu offset=%u | type=%u flags=0x%02x value_len=%u overflow_page=%lu inline_data_len=%u",
-              node_ref_page_id(leaf_ref), node_ref_offset(leaf_ref), leaf->type, leaf->flags, leaf->value_len, leaf->overflow_page, leaf->inline_data_len);
+    LOG_DEBUG("[WRITE_LEAF] page=%lu offset=%u | type=%u flags=0x%02x value_len=%u",
+              node_ref_page_id(leaf_ref), node_ref_offset(leaf_ref), leaf->type, leaf->flags, leaf->value_len);
     if (!data_art_write_node(tree, leaf_ref, leaf, leaf_size)) {
         LOG_ERROR("Failed to write leaf node");
         free(leaf);
         return NULL_NODE_REF;
     }
-    LOG_DEBUG("[WRITE_LEAF] AFTER write: page=%lu offset=%u | value_len=%u (should be unchanged)",
-              node_ref_page_id(leaf_ref), node_ref_offset(leaf_ref), leaf->value_len);
-    LOG_TRACE("Leaf written successfully: page=%lu, value_len=%u",
-              node_ref_page_id(leaf_ref), leaf->value_len);
-    
+
     free(leaf);
     return leaf_ref;
 }
@@ -417,7 +416,7 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                      node_ref_page_id(node_ref), leaf->value_len, leaf->xmin, leaf->xmax);
             
             // Save old leaf information
-            uint64_t old_overflow_page = leaf->overflow_page;
+            uint64_t old_overflow_pg = leaf_overflow_page(leaf);
             bool had_overflow = (leaf->flags & LEAF_FLAG_OVERFLOW) != 0;
             node_ref_t old_leaf_ref = node_ref;
             
@@ -445,7 +444,7 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             }
 
             // Create a modifiable copy
-            size_t new_leaf_size = sizeof(data_art_leaf_t) + new_leaf->inline_data_len;
+            size_t new_leaf_size = leaf_total_size(new_leaf, tree->key_size);
             data_art_leaf_t *new_leaf_copy = malloc(new_leaf_size);
             if (!new_leaf_copy) {
                 LOG_ERROR("Failed to allocate memory for leaf copy");
@@ -466,7 +465,7 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
 
             // Mark old version as superseded (set xmax) for MVCC version chains
             if (tree->mvcc_manager) {
-                size_t old_leaf_size = sizeof(data_art_leaf_t) + leaf->inline_data_len;
+                size_t old_leaf_size = leaf_total_size(leaf, tree->key_size);
                 data_art_leaf_t *old_leaf_copy = malloc(old_leaf_size);
                 if (old_leaf_copy) {
                     memcpy(old_leaf_copy, leaf, old_leaf_size);
@@ -492,7 +491,7 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         
         // IMPORTANT: Copy the existing key data NOW before any other operations
         // because data_art_load_node may use a static buffer that gets overwritten
-        const uint8_t *existing_key = leaf->data;
+        const uint8_t *existing_key = leaf_key(leaf);
         size_t existing_key_len = tree->key_size;
         
         uint8_t existing_key_copy[256];

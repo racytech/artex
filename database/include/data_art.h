@@ -146,9 +146,8 @@ typedef struct {
 #define LEAF_FLAG_NONE     0x00
 #define LEAF_FLAG_OVERFLOW 0x01  // Has overflow pages for large value
 
-// Leaf header size (bytes): type(1)+flags(1)+pad(2)+value_len(4)+overflow_page(8)+
-//   inline_data_len(4)+xmin(8)+xmax(8)+prev_version(8) = 44
-#define LEAF_HEADER_SIZE 44
+// Leaf header size (bytes): type(1)+flags(1)+value_len(4)+xmin(8)+xmax(8)+prev_version(8) = 30
+#define LEAF_HEADER_SIZE 30
 
 // Maximum inline data size — derived from PAGE_SIZE so it scales automatically.
 #define MAX_INLINE_DATA (PAGE_SIZE - PAGE_HEADER_SIZE - LEAF_HEADER_SIZE)
@@ -245,15 +244,32 @@ typedef struct {
 typedef struct {
     uint8_t type;               // DATA_NODE_LEAF
     uint8_t flags;              // LEAF_FLAG_OVERFLOW if value spans pages
-    uint8_t padding[2];
     uint32_t value_len;         // Total value length (may span overflow pages)
-    uint64_t overflow_page;     // First overflow page ID (0 if none)
-    uint32_t inline_data_len;   // Bytes stored inline in data[]
     uint64_t xmin;              // Transaction that created this version
     uint64_t xmax;              // Transaction that deleted/superseded this version (0 = current)
     node_ref_t prev_version;    // Previous version of same key (0 = no older version)
-    uint8_t data[];             // key + value (or value prefix if overflow)
+    uint8_t data[];             // Non-overflow: [key][value]
+                                // Overflow: [overflow_page_id:8B][key][value_prefix]
 } __attribute__((packed)) data_art_leaf_t;
+
+// Leaf accessor helpers — encapsulate overflow_page-in-data[] layout
+static inline const uint8_t *leaf_key(const data_art_leaf_t *leaf) {
+    return leaf->data + ((leaf->flags & LEAF_FLAG_OVERFLOW) ? 8 : 0);
+}
+static inline uint8_t *leaf_key_mut(data_art_leaf_t *leaf) {
+    return leaf->data + ((leaf->flags & LEAF_FLAG_OVERFLOW) ? 8 : 0);
+}
+static inline uint64_t leaf_overflow_page(const data_art_leaf_t *leaf) {
+    if (!(leaf->flags & LEAF_FLAG_OVERFLOW)) return 0;
+    uint64_t pg;
+    memcpy(&pg, leaf->data, sizeof(pg));
+    return pg;
+}
+static inline size_t leaf_total_size(const data_art_leaf_t *leaf, size_t key_size) {
+    if (leaf->flags & LEAF_FLAG_OVERFLOW)
+        return PAGE_SIZE - PAGE_HEADER_SIZE;  // overflow leaf fills entire page
+    return sizeof(data_art_leaf_t) + key_size + leaf->value_len;
+}
 
 /**
  * Overflow page: Continuation storage for large values

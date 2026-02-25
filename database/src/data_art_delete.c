@@ -204,7 +204,7 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             
             if (should_do_logical_delete) {
                 // Create modified copy of leaf with xmax set
-                size_t leaf_size = sizeof(data_art_leaf_t) + leaf->inline_data_len;
+                size_t leaf_size = leaf_total_size(leaf, tree->key_size);
                 data_art_leaf_t *modified_leaf = malloc(leaf_size);
                 if (!modified_leaf) {
                     LOG_ERROR("Failed to allocate modified leaf");
@@ -248,11 +248,11 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             *deleted = true;
             
             // Free overflow pages if this leaf has any
-            if ((leaf->flags & LEAF_FLAG_OVERFLOW) && leaf->overflow_page != 0) {
-                LOG_DEBUG("[DELETE_LEAF] Freeing overflow chain starting at page=%lu",
-                         leaf->overflow_page);
+            if (leaf->flags & LEAF_FLAG_OVERFLOW) {
+                uint64_t ofp = leaf_overflow_page(leaf);
+                LOG_DEBUG("[DELETE_LEAF] Freeing overflow chain starting at page=%lu", ofp);
                 extern size_t data_art_free_overflow_chain(data_art_tree_t *tree, uint64_t first_overflow_page);
-                data_art_free_overflow_chain(tree, leaf->overflow_page);
+                data_art_free_overflow_chain(tree, ofp);
             }
             
             // Free the leaf page itself

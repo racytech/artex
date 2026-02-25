@@ -32,21 +32,20 @@ bool data_art_read_overflow_value(data_art_tree_t *tree,
     
     if (!(leaf->flags & LEAF_FLAG_OVERFLOW)) {
         // No overflow, just copy inline data
-        const uint8_t *value_start = leaf->data + tree->key_size;
-        size_t value_size = leaf->value_len;
-        memcpy(value_out, value_start, value_size);
+        const uint8_t *value_start = leaf_key(leaf) + tree->key_size;
+        memcpy(value_out, value_start, leaf->value_len);
         return true;
     }
-    
+
     // Copy inline portion first
-    const uint8_t *value_start = leaf->data + tree->key_size;
-    size_t inline_value_size = leaf->inline_data_len - tree->key_size;
+    const uint8_t *value_start = leaf_key(leaf) + tree->key_size;
+    size_t inline_value_size = (PAGE_SIZE - PAGE_HEADER_SIZE) - sizeof(data_art_leaf_t) - 8 - tree->key_size;
     memcpy(value_out, value_start, inline_value_size);
-    
+
     // Traverse overflow chain to get remainder
     uint8_t *out_ptr = (uint8_t *)value_out + inline_value_size;
     size_t remaining = leaf->value_len - inline_value_size;
-    uint64_t current_page = leaf->overflow_page;
+    uint64_t current_page = leaf_overflow_page(leaf);
     
     while (current_page != 0 && remaining > 0) {
         tree->overflow_chain_reads++;
