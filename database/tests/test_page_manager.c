@@ -372,7 +372,8 @@ void test_statistics(void) {
     TEST_ASSERT(stats.total_pages == 5, "Total pages should be 5");
     TEST_ASSERT(stats.allocated_pages == 5, "Allocated pages should be 5");
     TEST_ASSERT(stats.pages_written == 5, "Pages written should be 5");
-    TEST_ASSERT(stats.bytes_written == 5 * PAGE_SIZE, "Bytes written should match");
+    TEST_ASSERT(stats.bytes_written > 0 && stats.bytes_written <= 5 * PAGE_SIZE,
+                "Bytes written should be positive (may be compressed)");
     TEST_ASSERT(stats.num_data_files == 1, "Should have 1 data file");
     
     // Print statistics (visual verification)

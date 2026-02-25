@@ -21,10 +21,22 @@
 #include <time.h>
 #include <stddef.h>
 
+#ifdef HAVE_LZ4
+#include <lz4.h>
+#endif
+
+#ifdef HAVE_ZSTD
+#include <zstd.h>
+#endif
+
+// Skip compression if savings < 10%
+#define COMPRESSION_MIN_SAVINGS_RATIO 0.9
+
 // Forward declaration for page index management
 static void page_index_insert_or_update(page_manager_t *pm, uint64_t page_id,
                                         uint32_t file_idx, uint64_t file_offset,
-                                        uint32_t compressed_size);
+                                        uint32_t compressed_size,
+                                        uint8_t compression_type);
 
 // Metadata file format (written atomically during checkpoint)
 #define METADATA_MAGIC   0x4D455441  // "META"
@@ -91,7 +103,8 @@ page_manager_t *page_manager_create(const char *db_path, bool read_only) {
     }
 
     pm->read_only = read_only;
-    pm->compression_enabled = false;
+    pm->compression_enabled = true;
+    pm->default_compression_type = COMPRESSION_LZ4;
     pm->fsync_retry_max = 3;
     pm->fsync_retry_delay_us = 100;
     pm->health.state = DB_HEALTH_OK;
@@ -252,7 +265,8 @@ uint64_t page_manager_alloc(page_manager_t *pm, size_t size_needed) {
     // a zero-initialized page for sentinel entries (not yet written to disk).
     // The actual disk location is set when page_manager_write() is called.
     page_index_insert_or_update(pm, page_id,
-                                UINT32_MAX, UINT64_MAX, PAGE_SIZE);
+                                UINT32_MAX, UINT64_MAX, PAGE_SIZE,
+                                COMPRESSION_NONE);
 
     return page_id;
 }
@@ -281,6 +295,69 @@ page_result_t page_manager_free(page_manager_t *pm, uint64_t page_id) {
     }
 
     return PAGE_SUCCESS;
+}
+
+// ============================================================================
+// Compression Helpers
+// ============================================================================
+
+/**
+ * Compress page data.
+ * Returns compressed size, or 0 on failure / unsupported type.
+ */
+static size_t page_compress(const uint8_t *src, size_t src_size,
+                            uint8_t *dst, size_t dst_capacity,
+                            uint8_t compression_type) {
+    switch (compression_type) {
+#ifdef HAVE_LZ4
+        case COMPRESSION_LZ4: {
+            int result = LZ4_compress_default(
+                (const char *)src, (char *)dst,
+                (int)src_size, (int)dst_capacity);
+            return (result > 0) ? (size_t)result : 0;
+        }
+#endif
+#ifdef HAVE_ZSTD
+        case COMPRESSION_ZSTD_5: {
+            size_t result = ZSTD_compress(dst, dst_capacity, src, src_size, 5);
+            return ZSTD_isError(result) ? 0 : result;
+        }
+        case COMPRESSION_ZSTD_19: {
+            size_t result = ZSTD_compress(dst, dst_capacity, src, src_size, 19);
+            return ZSTD_isError(result) ? 0 : result;
+        }
+#endif
+        default:
+            return 0;
+    }
+}
+
+/**
+ * Decompress page data.
+ * Returns decompressed size (should equal PAGE_SIZE), or 0 on failure.
+ */
+static size_t page_decompress(const uint8_t *src, size_t src_size,
+                              uint8_t *dst, size_t dst_capacity,
+                              uint8_t compression_type) {
+    switch (compression_type) {
+#ifdef HAVE_LZ4
+        case COMPRESSION_LZ4: {
+            int result = LZ4_decompress_safe(
+                (const char *)src, (char *)dst,
+                (int)src_size, (int)dst_capacity);
+            return (result > 0) ? (size_t)result : 0;
+        }
+#endif
+#ifdef HAVE_ZSTD
+        case COMPRESSION_ZSTD_5:
+        case COMPRESSION_ZSTD_19: {
+            size_t result = ZSTD_decompress(dst, dst_capacity, src, src_size);
+            return ZSTD_isError(result) ? 0 : result;
+        }
+#endif
+        default:
+            return 0;
+    }
 }
 
 // ============================================================================
@@ -336,29 +413,75 @@ page_result_t page_manager_read(page_manager_t *pm, uint64_t page_id,
         return result;
     }
 
-    // Read page from disk
-    ssize_t bytes_read = pread(fd, page_out, PAGE_SIZE, offset);
-    if (bytes_read == -1) {
-        if (errno == ENOSPC) {
-            LOG_ERROR("Disk full reading page %lu", page_id);
-            return PAGE_ERROR_DISK_FULL;
-        }
-        LOG_ERROR("Failed to read page %lu: %s", page_id, strerror(errno));
-        return PAGE_ERROR_IO;
+    // Get compression info from index metadata
+    uint32_t read_size = PAGE_SIZE;
+    uint8_t comp_type = COMPRESSION_NONE;
+    if (meta) {
+        read_size = meta->compressed_size;
+        comp_type = meta->compression_type;
     }
 
-    if (bytes_read != PAGE_SIZE) {
-        if (bytes_read == 0) {
-            LOG_DEBUG("Page %lu not yet written to disk (0 bytes read)", page_id);
-        } else {
-            LOG_ERROR("Short read for page %lu: got %zd bytes, expected %d",
-                     page_id, bytes_read, PAGE_SIZE);
+    if (comp_type == COMPRESSION_NONE) {
+        // Uncompressed: read directly into page_out
+        ssize_t bytes_read = pread(fd, page_out, PAGE_SIZE, offset);
+        if (bytes_read == -1) {
+            if (errno == ENOSPC) {
+                LOG_ERROR("Disk full reading page %lu", page_id);
+                return PAGE_ERROR_DISK_FULL;
+            }
+            LOG_ERROR("Failed to read page %lu: %s", page_id, strerror(errno));
+            return PAGE_ERROR_IO;
         }
-        memset(page_out, 0, sizeof(*page_out));
-        return PAGE_ERROR_IO;
+
+        if (bytes_read != PAGE_SIZE) {
+            if (bytes_read == 0) {
+                LOG_DEBUG("Page %lu not yet written to disk (0 bytes read)", page_id);
+            } else {
+                LOG_ERROR("Short read for page %lu: got %zd bytes, expected %d",
+                         page_id, bytes_read, PAGE_SIZE);
+            }
+            memset(page_out, 0, sizeof(*page_out));
+            return PAGE_ERROR_IO;
+        }
+    } else {
+        // Compressed: read into temp buffer, then decompress
+        if (read_size > PAGE_SIZE) {
+            LOG_ERROR("Page %lu compressed_size %u exceeds PAGE_SIZE", page_id, read_size);
+            return PAGE_ERROR_CORRUPTION;
+        }
+
+        uint8_t compressed_buf[PAGE_SIZE];
+        ssize_t bytes_read = pread(fd, compressed_buf, read_size, offset);
+        if (bytes_read == -1) {
+            if (errno == ENOSPC) {
+                LOG_ERROR("Disk full reading page %lu", page_id);
+                return PAGE_ERROR_DISK_FULL;
+            }
+            LOG_ERROR("Failed to read compressed page %lu: %s", page_id, strerror(errno));
+            return PAGE_ERROR_IO;
+        }
+
+        if ((uint32_t)bytes_read != read_size) {
+            LOG_ERROR("Short read for compressed page %lu: got %zd, expected %u",
+                     page_id, bytes_read, read_size);
+            memset(page_out, 0, sizeof(*page_out));
+            return PAGE_ERROR_IO;
+        }
+
+        size_t decompressed_size = page_decompress(
+            compressed_buf, read_size,
+            (uint8_t *)page_out, PAGE_SIZE,
+            comp_type);
+
+        if (decompressed_size != PAGE_SIZE) {
+            LOG_CRITICAL("Decompression failed for page %lu: got %zu bytes, expected %d "
+                         "(compression_type=%u, compressed_size=%u)",
+                         page_id, decompressed_size, PAGE_SIZE, comp_type, read_size);
+            return PAGE_ERROR_CORRUPTION;
+        }
     }
 
-    // Verify checksum
+    // Verify checksum (on decompressed data)
     if (!page_verify_checksum(page_out)) {
         uint32_t tail_counter;
         memcpy(&tail_counter, (uint8_t *)page_out + PAGE_TAIL_MARKER_OFFSET,
@@ -385,9 +508,9 @@ page_result_t page_manager_read(page_manager_t *pm, uint64_t page_id,
     }
 
     pm->pages_read++;
-    pm->bytes_read += PAGE_SIZE;
+    pm->bytes_read += read_size;
 
-    LOG_TRACE("Read page %lu successfully", page_id);
+    LOG_TRACE("Read page %lu successfully (comp=%u, size=%u)", page_id, comp_type, read_size);
 
     return PAGE_SUCCESS;
 }
@@ -410,11 +533,36 @@ page_result_t page_manager_write(page_manager_t *pm, page_t *page) {
     memcpy((uint8_t *)page + PAGE_TAIL_MARKER_OFFSET, &counter, sizeof(counter));
     page_compute_checksum(page);
 
+    // Compression: try to compress if enabled
+    uint8_t *write_buf = (uint8_t *)page;
+    uint32_t write_size = PAGE_SIZE;
+    uint8_t comp_type = COMPRESSION_NONE;
+    uint8_t compressed_buf[PAGE_SIZE];
+
+    if (pm->compression_enabled && pm->default_compression_type != COMPRESSION_NONE) {
+        size_t compressed_size = page_compress(
+            (const uint8_t *)page, PAGE_SIZE,
+            compressed_buf, PAGE_SIZE,
+            pm->default_compression_type);
+
+        if (compressed_size > 0 &&
+            compressed_size < (size_t)(PAGE_SIZE * COMPRESSION_MIN_SAVINGS_RATIO)) {
+            write_buf = compressed_buf;
+            write_size = (uint32_t)compressed_size;
+            comp_type = pm->default_compression_type;
+        }
+    }
+
+    // Update page header compression metadata (in-memory)
+    page->header.compression_type = comp_type;
+    page->header.compressed_size = write_size;
+    page->header.uncompressed_size = PAGE_SIZE;
+
     // Check if current file has room; if not, create new file
     uint32_t file_idx = pm->allocator->current_file_idx;
     uint64_t byte_offset = pm->allocator->current_file_offset;
 
-    if (byte_offset + PAGE_SIZE > MAX_FILE_SIZE) {
+    if (byte_offset + write_size > MAX_FILE_SIZE) {
         if (page_manager_create_data_file(pm) != PAGE_SUCCESS) {
             LOG_ERROR("Failed to create new data file for append");
             return PAGE_ERROR_IO;
@@ -434,7 +582,7 @@ page_result_t page_manager_write(page_manager_t *pm, page_t *page) {
     int fd = pm->allocator->data_file_fds[file_idx];
 
     // Append page at cursor position
-    ssize_t bytes_written = pwrite(fd, page, PAGE_SIZE, byte_offset);
+    ssize_t bytes_written = pwrite(fd, write_buf, write_size, byte_offset);
     if (bytes_written == -1) {
         if (errno == ENOSPC) {
             LOG_ERROR("Disk full writing page %lu", page_id);
@@ -444,22 +592,24 @@ page_result_t page_manager_write(page_manager_t *pm, page_t *page) {
         return PAGE_ERROR_IO;
     }
 
-    if (bytes_written != PAGE_SIZE) {
-        LOG_ERROR("Short write for page %lu: wrote %zd bytes, expected %d",
-                 page_id, bytes_written, PAGE_SIZE);
+    if ((uint32_t)bytes_written != write_size) {
+        LOG_ERROR("Short write for page %lu: wrote %zd bytes, expected %u",
+                 page_id, bytes_written, write_size);
         return PAGE_ERROR_IO;
     }
 
     // Advance append cursor
-    pm->allocator->current_file_offset += PAGE_SIZE;
+    pm->allocator->current_file_offset += write_size;
 
     pm->pages_written++;
-    pm->bytes_written += PAGE_SIZE;
+    pm->bytes_written += write_size;
 
     // Update page index: map page_id → (file_idx, byte_offset)
-    page_index_insert_or_update(pm, page_id, file_idx, byte_offset, PAGE_SIZE);
+    page_index_insert_or_update(pm, page_id, file_idx, byte_offset, write_size,
+                                comp_type);
 
-    LOG_TRACE("Wrote page %lu at file%u@%lu (append-only)", page_id, file_idx, byte_offset);
+    LOG_TRACE("Wrote page %lu at file%u@%lu (size=%u, comp=%u)",
+              page_id, file_idx, byte_offset, write_size, comp_type);
 
     return PAGE_SUCCESS;
 }
@@ -630,7 +780,8 @@ void page_compute_checksum(page_t *page) {
 // Helper: Insert or update page in index (maintains sorted order by page_id)
 static void page_index_insert_or_update(page_manager_t *pm, uint64_t page_id,
                                         uint32_t file_idx, uint64_t file_offset,
-                                        uint32_t compressed_size) {
+                                        uint32_t compressed_size,
+                                        uint8_t compression_type) {
     if (!pm || !pm->index) return;
 
     page_index_t *index = pm->index;
@@ -651,6 +802,7 @@ static void page_index_insert_or_update(page_manager_t *pm, uint64_t page_id,
             entries[mid].file_idx = file_idx;
             entries[mid].file_offset = file_offset;
             entries[mid].compressed_size = compressed_size;
+            entries[mid].compression_type = compression_type;
             entries[mid].version++;
             if (file_idx != UINT32_MAX) {
                 index->total_file_size += compressed_size;
@@ -692,7 +844,7 @@ static void page_index_insert_or_update(page_manager_t *pm, uint64_t page_id,
     entries[left].file_idx = file_idx;
     entries[left].file_offset = file_offset;
     entries[left].compressed_size = compressed_size;
-    entries[left].compression_type = 0;
+    entries[left].compression_type = compression_type;
     entries[left].version = 1;
     entries[left].ref_count = 0;  // Will be initialized by page_gc_init_ref
     entries[left].flags = 0;
@@ -785,15 +937,48 @@ void page_manager_get_health(page_manager_t *pm, db_health_t *health_out) {
 
 page_result_t page_manager_read_compressed(page_manager_t *pm, uint64_t page_id,
                                            page_t *page_out) {
-    LOG_WARN("Compressed read not yet implemented, falling back to uncompressed");
+    // Read path auto-detects compression from index metadata
     return page_manager_read(pm, page_id, page_out);
 }
 
 page_result_t page_manager_write_compressed(page_manager_t *pm, page_t *page,
                                             uint8_t compression_type) {
-    (void)compression_type;
-    LOG_WARN("Compressed write not yet implemented, falling back to uncompressed");
-    return page_manager_write(pm, page);
+    if (!pm || !page) {
+        return PAGE_ERROR_INVALID_ARG;
+    }
+
+    // Temporarily override compression settings
+    bool saved_enabled = pm->compression_enabled;
+    uint8_t saved_type = pm->default_compression_type;
+
+    if (compression_type == COMPRESSION_NONE) {
+        pm->compression_enabled = false;
+    } else {
+        pm->compression_enabled = true;
+        pm->default_compression_type = compression_type;
+    }
+
+    page_result_t result = page_manager_write(pm, page);
+
+    pm->compression_enabled = saved_enabled;
+    pm->default_compression_type = saved_type;
+
+    return result;
+}
+
+void page_manager_set_compression(page_manager_t *pm, uint8_t compression_type) {
+    if (!pm) return;
+
+    if (compression_type == COMPRESSION_NONE) {
+        pm->compression_enabled = false;
+        pm->default_compression_type = COMPRESSION_NONE;
+    } else {
+        pm->compression_enabled = true;
+        pm->default_compression_type = compression_type;
+    }
+
+    LOG_INFO("Compression set: enabled=%d, type=%u",
+             pm->compression_enabled, pm->default_compression_type);
 }
 
 // ============================================================================

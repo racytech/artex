@@ -109,6 +109,7 @@ typedef struct {
     // Configuration
     bool read_only;
     bool compression_enabled;
+    uint8_t default_compression_type;  // COMPRESSION_NONE, LZ4, ZSTD_5, ZSTD_19
     uint32_t fsync_retry_max;        // Max fsync retries (default: 3)
     uint32_t fsync_retry_delay_us;   // Initial backoff in microseconds (default: 100)
 
@@ -121,6 +122,14 @@ typedef struct {
     uint64_t bytes_read;
     uint64_t bytes_written;
 } page_manager_t;
+
+// Compression types
+typedef enum {
+    COMPRESSION_NONE    = 0,
+    COMPRESSION_LZ4     = 1,
+    COMPRESSION_ZSTD_5  = 2,
+    COMPRESSION_ZSTD_19 = 3,
+} compression_type_t;
 
 // Result codes
 typedef enum {
@@ -238,6 +247,14 @@ page_result_t page_manager_read_compressed(page_manager_t *pm,
 page_result_t page_manager_write_compressed(page_manager_t *pm,
                                             page_t *page,
                                             uint8_t compression_type);
+
+/**
+ * Enable/disable page compression
+ *
+ * @param pm Page manager instance
+ * @param compression_type Compression algorithm (COMPRESSION_NONE to disable)
+ */
+void page_manager_set_compression(page_manager_t *pm, uint8_t compression_type);
 
 // ============================================================================
 // Multi-File Management

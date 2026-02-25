@@ -174,6 +174,13 @@ add_executable(test_page_manager_edge_cases
 target_link_libraries(test_page_manager_edge_cases art_page_manager art_page_gc)
 add_test(NAME test_page_manager_edge_cases COMMAND test_page_manager_edge_cases)
 
+# Test: Page Manager Compression
+add_executable(test_page_manager_compression
+    database/tests/test_page_manager_compression.c
+)
+target_link_libraries(test_page_manager_compression art_page_manager art_page_gc ${LZ4_LIBRARIES} ${ZSTD_LIBRARIES})
+add_test(NAME test_page_manager_compression COMMAND test_page_manager_compression)
+
 # Test: Buffer Pool
 add_executable(test_buffer_pool
     database/tests/test_buffer_pool.c
