@@ -1,14 +1,12 @@
 /**
  * Checkpoint Manager - Background Checkpointing for Persistent ART
  *
- * Background thread that periodically runs the checkpoint sequence:
- *   wal_should_checkpoint() → data_art_checkpoint() →
- *   wal_checkpoint_completed() → wal_truncate()
+ * Background thread that periodically calls data_art_checkpoint()
+ * which saves the mmap header and syncs to disk.
  */
 
 #include "checkpoint_manager.h"
 #include "data_art.h"
-#include "wal.h"
 #include "logger.h"
 
 #include <stdlib.h>
@@ -45,16 +43,11 @@ static bool do_checkpoint(checkpoint_manager_t *mgr) {
         return false;
     }
 
-    wal_checkpoint_completed(mgr->tree->wal, checkpoint_lsn);
-    uint32_t truncated = wal_truncate(mgr->tree->wal, checkpoint_lsn);
-
     pthread_mutex_lock(&mgr->lock);
     mgr->checkpoints_completed++;
-    mgr->segments_truncated += truncated;
     pthread_mutex_unlock(&mgr->lock);
 
-    LOG_INFO("Checkpoint completed (LSN=%lu, truncated=%u segments)",
-             checkpoint_lsn, truncated);
+    LOG_INFO("Checkpoint completed");
     return true;
 }
 
@@ -84,7 +77,8 @@ static void *checkpoint_thread_fn(void *arg) {
 
         // Check if checkpoint is needed (or forced)
         uint32_t trigger = 0;
-        bool should = force || wal_should_checkpoint(mgr->tree->wal, &trigger);
+        bool should = force;
+        (void)trigger;
 
         if (should) {
             do_checkpoint(mgr);
@@ -109,8 +103,8 @@ checkpoint_manager_config_t checkpoint_manager_default_config(void) {
 
 checkpoint_manager_t *checkpoint_manager_create(data_art_tree_t *tree,
                                                 const checkpoint_manager_config_t *config) {
-    if (!tree || !tree->wal) {
-        LOG_ERROR("checkpoint_manager_create: tree or WAL is NULL");
+    if (!tree) {
+        LOG_ERROR("checkpoint_manager_create: tree is NULL");
         return NULL;
     }
 

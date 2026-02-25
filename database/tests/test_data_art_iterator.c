@@ -16,9 +16,6 @@
  */
 
 #include "data_art.h"
-#include "page_manager.h"
-#include "buffer_pool.h"
-#include "wal.h"
 #include "logger.h"
 
 #include <stdio.h>
@@ -62,54 +59,39 @@ static int tests_passed = 0;
 // ============================================================================
 
 #define KEY_SIZE 32
-#define BASE_DB_PATH  "/tmp/test_iter_db"
-#define BASE_WAL_PATH "/tmp/test_iter_wal"
+#define BASE_DIR "/tmp/test_iter"
 
 typedef struct {
-    page_manager_t  *pm;
-    buffer_pool_t   *bp;
-    wal_t           *wal;
     data_art_tree_t *tree;
-    char db_path[256];
-    char wal_path[256];
+    char dir_path[256];
 } test_env_t;
 
-static void cleanup_paths(const char *db_path, const char *wal_path) {
+static void cleanup_dir(const char *dir_path) {
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s %s", db_path, wal_path);
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir_path);
     system(cmd);
     sync();
     usleep(10000);
 }
 
 static void make_paths(test_env_t *env, const char *suffix) {
-    snprintf(env->db_path, sizeof(env->db_path), "%s_%s", BASE_DB_PATH, suffix);
-    snprintf(env->wal_path, sizeof(env->wal_path), "%s_%s", BASE_WAL_PATH, suffix);
+    snprintf(env->dir_path, sizeof(env->dir_path), "%s_%s", BASE_DIR, suffix);
 }
 
 static void open_env(test_env_t *env) {
-    env->pm = page_manager_create(env->db_path, false);
-    ASSERT(env->pm != NULL, "page_manager_create");
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s", env->dir_path);
+    system(cmd);
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 1024;
-    env->bp = buffer_pool_create(&bp_config, env->pm);
-    ASSERT(env->bp != NULL, "buffer_pool_create");
+    char art_path[512];
+    snprintf(art_path, sizeof(art_path), "%s/art.dat", env->dir_path);
 
-    wal_config_t wal_config = wal_default_config();
-    wal_config.segment_size = 8 * 1024 * 1024;
-    env->wal = wal_open(env->wal_path, &wal_config);
-    ASSERT(env->wal != NULL, "wal_open");
-
-    env->tree = data_art_create(env->pm, env->bp, env->wal, KEY_SIZE);
+    env->tree = data_art_create(art_path, KEY_SIZE);
     ASSERT(env->tree != NULL, "data_art_create");
 }
 
 static void close_env(test_env_t *env) {
     if (env->tree) { data_art_destroy(env->tree); env->tree = NULL; }
-    if (env->wal)  { wal_close(env->wal);         env->wal = NULL; }
-    if (env->bp)   { buffer_pool_destroy(env->bp); env->bp = NULL; }
-    if (env->pm)   { page_manager_destroy(env->pm); env->pm = NULL; }
 }
 
 static void generate_key(uint8_t *key, int index) {
@@ -148,7 +130,7 @@ static void insert_keys(test_env_t *env, int start, int count) {
 static void test_empty_tree(void) {
     test_env_t env = {0};
     make_paths(&env, "t1");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
     data_art_iterator_t *iter = data_art_iterator_create(env.tree);
@@ -161,7 +143,7 @@ static void test_empty_tree(void) {
 
     data_art_iterator_destroy(iter);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -171,7 +153,7 @@ static void test_empty_tree(void) {
 static void test_single_key(void) {
     test_env_t env = {0};
     make_paths(&env, "t2");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
     uint8_t key[KEY_SIZE];
@@ -202,7 +184,7 @@ static void test_single_key(void) {
 
     data_art_iterator_destroy(iter);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -212,7 +194,7 @@ static void test_single_key(void) {
 static void test_sorted_order(void) {
     test_env_t env = {0};
     make_paths(&env, "t3");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
     int n = 100;
@@ -253,7 +235,7 @@ static void test_sorted_order(void) {
 
     data_art_iterator_destroy(iter);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -263,7 +245,7 @@ static void test_sorted_order(void) {
 static void test_large_scale(void) {
     test_env_t env = {0};
     make_paths(&env, "t4");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
     int n = 10000;
@@ -301,7 +283,7 @@ static void test_large_scale(void) {
 
     data_art_iterator_destroy(iter);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -331,7 +313,7 @@ static void *writer_thread_fn(void *arg) {
 static void test_concurrent_writes(void) {
     test_env_t env = {0};
     make_paths(&env, "t5");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
     int initial_count = 200;
@@ -355,7 +337,7 @@ static void test_concurrent_writes(void) {
     pthread_t writer;
     pthread_create(&writer, NULL, writer_thread_fn, &args);
 
-    // Iterate — should see exactly the initial keys (snapshot isolation)
+    // Iterate -- should see exactly the initial keys (snapshot isolation)
     int count = 0;
     while (data_art_iterator_next(iter)) {
         count++;
@@ -368,7 +350,7 @@ static void test_concurrent_writes(void) {
 
     data_art_iterator_destroy(iter);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -378,12 +360,10 @@ static void test_concurrent_writes(void) {
 static void test_overflow_values(void) {
     test_env_t env = {0};
     make_paths(&env, "t6");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
     // Create a large value that will trigger overflow pages
-    // MAX_INLINE_DATA = PAGE_SIZE - PAGE_HEADER_SIZE - LEAF_HEADER_SIZE
-    // For 4KB pages, this is roughly ~4000 bytes. Use 8KB to be safe.
     size_t large_value_len = 8192;
     char *large_value = malloc(large_value_len);
     ASSERT(large_value != NULL, "malloc large value");
@@ -413,8 +393,6 @@ static void test_overflow_values(void) {
         ASSERT(val != NULL, "value not NULL");
         ASSERT_EQ(vlen, large_value_len, "overflow value length");
 
-        // Verify content (we can't easily map back to index from sorted order,
-        // but we can verify the length is correct and data is non-zero)
         const uint8_t *bytes = (const uint8_t *)val;
         bool has_nonzero = false;
         for (size_t j = 0; j < vlen; j++) {
@@ -431,7 +409,7 @@ static void test_overflow_values(void) {
     data_art_iterator_destroy(iter);
     free(large_value);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -441,10 +419,9 @@ static void test_overflow_values(void) {
 static void test_seek_exact_match(void) {
     test_env_t env = {0};
     make_paths(&env, "t7");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
-    // Insert keys 0-99
     printf("  Inserting 100 keys...\n");
     insert_keys(&env, 0, 100);
     ASSERT(data_art_flush(env.tree), "flush");
@@ -452,7 +429,6 @@ static void test_seek_exact_match(void) {
     data_art_iterator_t *iter = data_art_iterator_create(env.tree);
     ASSERT(iter != NULL, "iterator_create");
 
-    // Seek to key 50 — should find exact match
     uint8_t seek_key[KEY_SIZE];
     generate_key(seek_key, 50);
     printf("  Seeking to key 50...\n");
@@ -465,18 +441,16 @@ static void test_seek_exact_match(void) {
     ASSERT_EQ((long)klen, (long)KEY_SIZE, "key length");
     ASSERT(memcmp(k, seek_key, KEY_SIZE) == 0, "should be exactly key 50");
 
-    // Continue iterating — next key should be key 51 (or the next in sorted order)
     bool has_next = data_art_iterator_next(iter);
     ASSERT(has_next, "should have more keys after 50");
 
-    // Count remaining keys (including the one we just got)
     int count = 1;
     while (data_art_iterator_next(iter)) count++;
     printf("  Keys after seek to 50: 1 (seek result) + 1 (next) + %d (remaining)\n", count);
 
     data_art_iterator_destroy(iter);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -486,10 +460,9 @@ static void test_seek_exact_match(void) {
 static void test_seek_between_keys(void) {
     test_env_t env = {0};
     make_paths(&env, "t8");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
-    // Insert only even-indexed keys: 0, 2, 4, 6, ..., 198
     printf("  Inserting 100 even-indexed keys...\n");
     for (int i = 0; i < 100; i++) {
         uint8_t key[KEY_SIZE];
@@ -503,17 +476,12 @@ static void test_seek_between_keys(void) {
 
     data_art_iterator_t *iter = data_art_iterator_create(env.tree);
 
-    // Seek to key 3 (doesn't exist) — should land on the first key >= 3
     uint8_t seek_key[KEY_SIZE];
     generate_key(seek_key, 3);
     printf("  Seeking to key 3 (not present, should find next)...\n");
     bool found = data_art_iterator_seek(iter, seek_key, KEY_SIZE);
     ASSERT(found, "seek should find a key >= 3");
 
-    // The result should be key 4 (the next even key after 3 in sorted order)
-    // But since generate_key uses hash-based suffix, the sorted order is
-    // determined by the full 32-byte key, not just the index.
-    // What we CAN verify: the returned key >= seek_key (key 3)
     size_t klen;
     const uint8_t *k = data_art_iterator_key(iter, &klen);
     ASSERT(k != NULL, "key should not be NULL");
@@ -523,7 +491,7 @@ static void test_seek_between_keys(void) {
 
     data_art_iterator_destroy(iter);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -533,15 +501,13 @@ static void test_seek_between_keys(void) {
 static void test_seek_boundaries(void) {
     test_env_t env = {0};
     make_paths(&env, "t9");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
-    // Insert keys 100-199
     printf("  Inserting keys 100-199...\n");
     insert_keys(&env, 100, 100);
     ASSERT(data_art_flush(env.tree), "flush");
 
-    // Find the actual first and last keys in sorted order
     data_art_iterator_t *full = data_art_iterator_create(env.tree);
     ASSERT(data_art_iterator_next(full), "tree not empty");
     size_t first_klen;
@@ -550,7 +516,6 @@ static void test_seek_boundaries(void) {
     memcpy(saved_first, first_key, KEY_SIZE);
     data_art_iterator_destroy(full);
 
-    // Seek before all keys: use all-zeros key
     printf("  Seeking to all-zeros key (before all)...\n");
     data_art_iterator_t *iter1 = data_art_iterator_create(env.tree);
     uint8_t zero_key[KEY_SIZE];
@@ -564,7 +529,6 @@ static void test_seek_boundaries(void) {
     printf("  Found first key in tree\n");
     data_art_iterator_destroy(iter1);
 
-    // Seek past all keys: use all-0xFF key
     printf("  Seeking to all-0xFF key (past all)...\n");
     data_art_iterator_t *iter2 = data_art_iterator_create(env.tree);
     uint8_t max_key[KEY_SIZE];
@@ -576,7 +540,7 @@ static void test_seek_boundaries(void) {
     data_art_iterator_destroy(iter2);
 
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -586,15 +550,13 @@ static void test_seek_boundaries(void) {
 static void test_range_scan(void) {
     test_env_t env = {0};
     make_paths(&env, "t10");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
-    // Insert 500 keys (0-499)
     printf("  Inserting 500 keys...\n");
     insert_keys(&env, 0, 500);
     ASSERT(data_art_flush(env.tree), "flush");
 
-    // First: collect all keys in sorted order to identify range boundaries
     data_art_iterator_t *full = data_art_iterator_create(env.tree);
     uint8_t sorted_keys[500][KEY_SIZE];
     int total = 0;
@@ -608,7 +570,6 @@ static void test_range_scan(void) {
     ASSERT_EQ(total, 500, "all keys iterated");
     data_art_iterator_destroy(full);
 
-    // Seek to key at index 100 (in sorted order), iterate to key at index 399
     uint8_t start_key[KEY_SIZE], end_key[KEY_SIZE];
     memcpy(start_key, sorted_keys[100], KEY_SIZE);
     memcpy(end_key, sorted_keys[399], KEY_SIZE);
@@ -627,10 +588,8 @@ static void test_range_scan(void) {
         const uint8_t *k = data_art_iterator_key(iter, &klen);
         ASSERT(k != NULL, "key in range");
 
-        // Stop when past end key
         if (memcmp(k, end_key, KEY_SIZE) > 0) break;
 
-        // Verify sorted order
         if (!first) {
             ASSERT(memcmp(k, prev_key, KEY_SIZE) > 0, "keys should be in sorted order");
         }
@@ -644,7 +603,7 @@ static void test_range_scan(void) {
 
     data_art_iterator_destroy(iter);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -654,7 +613,7 @@ static void test_range_scan(void) {
 static void test_seek_empty_tree(void) {
     test_env_t env = {0};
     make_paths(&env, "t11");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
     data_art_iterator_t *iter = data_art_iterator_create(env.tree);
@@ -669,20 +628,19 @@ static void test_seek_empty_tree(void) {
 
     data_art_iterator_destroy(iter);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
-// Test 12: Prefix iteration — basic
+// Test 12: Prefix iteration -- basic
 // ============================================================================
 
 static void test_prefix_basic(void) {
     test_env_t env;
     make_paths(&env, "prefix_basic");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
-    // Insert keys with three different prefixes: "aaa_", "bbb_", "ccc_"
     const char *prefixes[] = {"aaa_", "bbb_", "ccc_"};
     int per_prefix = 10;
 
@@ -699,7 +657,6 @@ static void test_prefix_basic(void) {
     }
     ASSERT_EQ(data_art_size(env.tree), 30, "should have 30 keys");
 
-    // Iterate with prefix "bbb_" — should get exactly 10 keys
     uint8_t prefix[KEY_SIZE];
     memset(prefix, 0, KEY_SIZE);
     memcpy(prefix, "bbb_", 4);
@@ -721,20 +678,19 @@ static void test_prefix_basic(void) {
 
     data_art_iterator_destroy(iter);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
-// Test 13: Prefix iteration — no match
+// Test 13: Prefix iteration -- no match
 // ============================================================================
 
 static void test_prefix_no_match(void) {
     test_env_t env;
     make_paths(&env, "prefix_nomatch");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
-    // Insert keys with prefix "aaa_"
     for (int i = 0; i < 20; i++) {
         uint8_t key[KEY_SIZE];
         memset(key, 0, KEY_SIZE);
@@ -743,7 +699,6 @@ static void test_prefix_no_match(void) {
         ASSERT(data_art_insert(env.tree, key, KEY_SIZE, val, 4), "insert failed");
     }
 
-    // Iterate with prefix "zzz_" — no match
     uint8_t prefix[KEY_SIZE];
     memset(prefix, 0, KEY_SIZE);
     memcpy(prefix, "zzz_", 4);
@@ -754,20 +709,19 @@ static void test_prefix_no_match(void) {
 
     data_art_iterator_destroy(iter);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
-// Test 14: Prefix iteration — all keys match
+// Test 14: Prefix iteration -- all keys match
 // ============================================================================
 
 static void test_prefix_all_match(void) {
     test_env_t env;
     make_paths(&env, "prefix_all");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
-    // Insert 50 keys all starting with "common_"
     for (int i = 0; i < 50; i++) {
         uint8_t key[KEY_SIZE];
         memset(key, 0, KEY_SIZE);
@@ -776,7 +730,6 @@ static void test_prefix_all_match(void) {
         ASSERT(data_art_insert(env.tree, key, KEY_SIZE, val, 4), "insert failed");
     }
 
-    // Iterate with prefix "common_" — all 50 should match
     uint8_t prefix[KEY_SIZE];
     memset(prefix, 0, KEY_SIZE);
     memcpy(prefix, "common_", 7);
@@ -794,17 +747,17 @@ static void test_prefix_all_match(void) {
 
     data_art_iterator_destroy(iter);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
-// Test 15: Prefix iteration — empty prefix (full iteration)
+// Test 15: Prefix iteration -- empty prefix (full iteration)
 // ============================================================================
 
 static void test_prefix_empty(void) {
     test_env_t env;
     make_paths(&env, "prefix_empty");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
     for (int i = 0; i < 30; i++) {
@@ -815,7 +768,6 @@ static void test_prefix_empty(void) {
         ASSERT(data_art_insert(env.tree, key, KEY_SIZE, val, 4), "insert failed");
     }
 
-    // prefix_len = 0 should behave like full iteration
     data_art_iterator_t *iter = data_art_iterator_create_prefix(env.tree, NULL, 0);
     ASSERT(iter != NULL, "create_prefix with NULL prefix returned NULL");
 
@@ -828,7 +780,7 @@ static void test_prefix_empty(void) {
 
     data_art_iterator_destroy(iter);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================

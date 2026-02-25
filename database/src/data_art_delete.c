@@ -22,7 +22,6 @@
  * than necessary. Insert and search operations are fully optimized.
  */
 
-#include "buffer_pool.h"
 #include "data_art.h"
 #include "txn_buffer.h"
 #include "db_error.h"
@@ -105,14 +104,6 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
     if (deleted) {
         tree->root = new_root;
         tree->size--;
-
-        // Log to WAL for durability (if WAL is enabled)
-        if (tree->wal) {
-            uint64_t txn_id = tree->current_txn_id;
-            if (!wal_log_delete(tree->wal, txn_id, key, key_len, NULL)) {
-                LOG_ERROR("Failed to log delete to WAL");
-            }
-        }
 
         // Auto-commit the transaction if we started one
         if (auto_commit && tree->mvcc_manager) {

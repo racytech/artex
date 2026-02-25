@@ -15,9 +15,6 @@
 
 #include "db_backup.h"
 #include "data_art.h"
-#include "page_manager.h"
-#include "buffer_pool.h"
-#include "wal.h"
 #include "logger.h"
 
 #include <stdio.h>
@@ -62,22 +59,17 @@ static int tests_passed = 0;
 // ============================================================================
 
 #define KEY_SIZE 32
-#define BASE_DB_PATH     "/tmp/test_backup_db"
-#define BASE_WAL_PATH    "/tmp/test_backup_wal"
+#define BASE_DIR         "/tmp/test_backup"
 #define BACKUP_FILE_PATH "/tmp/test_backup_export.artb"
 
 typedef struct {
-    page_manager_t  *pm;
-    buffer_pool_t   *bp;
-    wal_t           *wal;
     data_art_tree_t *tree;
-    char db_path[256];
-    char wal_path[256];
+    char dir_path[256];
 } test_env_t;
 
-static void cleanup_paths(const char *db_path, const char *wal_path) {
+static void cleanup_dir(const char *dir_path) {
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s %s", db_path, wal_path);
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir_path);
     system(cmd);
     sync();
     usleep(10000);
@@ -88,43 +80,31 @@ static void cleanup_backup(void) {
 }
 
 static void make_paths(test_env_t *env, const char *suffix) {
-    snprintf(env->db_path, sizeof(env->db_path), "%s_%s", BASE_DB_PATH, suffix);
-    snprintf(env->wal_path, sizeof(env->wal_path), "%s_%s", BASE_WAL_PATH, suffix);
+    snprintf(env->dir_path, sizeof(env->dir_path), "%s_%s", BASE_DIR, suffix);
 }
 
 static void open_env(test_env_t *env) {
-    env->pm = page_manager_create(env->db_path, false);
-    ASSERT(env->pm != NULL, "page_manager_create");
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s", env->dir_path);
+    system(cmd);
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 2048;
-    env->bp = buffer_pool_create(&bp_config, env->pm);
-    ASSERT(env->bp != NULL, "buffer_pool_create");
+    char art_path[512];
+    snprintf(art_path, sizeof(art_path), "%s/art.dat", env->dir_path);
 
-    wal_config_t wal_config = wal_default_config();
-    wal_config.segment_size = 8 * 1024 * 1024;
-    env->wal = wal_open(env->wal_path, &wal_config);
-    ASSERT(env->wal != NULL, "wal_open");
-
-    env->tree = data_art_create(env->pm, env->bp, env->wal, KEY_SIZE);
+    env->tree = data_art_create(art_path, KEY_SIZE);
     ASSERT(env->tree != NULL, "data_art_create");
 }
 
 static void close_env(test_env_t *env) {
     if (env->tree) { data_art_destroy(env->tree); env->tree = NULL; }
-    if (env->wal)  { wal_close(env->wal);         env->wal = NULL; }
-    if (env->bp)   { buffer_pool_destroy(env->bp); env->bp = NULL; }
-    if (env->pm)   { page_manager_destroy(env->pm); env->pm = NULL; }
 }
 
 static void generate_key(uint8_t *key, int index) {
     memset(key, 0, KEY_SIZE);
-    // Big-endian index in first 4 bytes for sorted order
     key[0] = (uint8_t)((index >> 24) & 0xFF);
     key[1] = (uint8_t)((index >> 16) & 0xFF);
     key[2] = (uint8_t)((index >> 8) & 0xFF);
     key[3] = (uint8_t)(index & 0xFF);
-    // Pseudo-random fill for remaining bytes
     uint32_t state = (uint32_t)index * 2654435761u;
     for (int i = 4; i < KEY_SIZE; i++) {
         state = state * 1103515245 + 12345;
@@ -158,15 +138,13 @@ static void test_export_empty_tree(void) {
 
     test_env_t src = {0};
     make_paths(&src, "empty_src");
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
     cleanup_backup();
     open_env(&src);
 
-    // Export empty tree
     bool ok = db_backup_export(src.tree, BACKUP_FILE_PATH);
     ASSERT(ok, "export empty tree");
 
-    // Check backup info
     db_backup_info_t info;
     ok = db_backup_info(BACKUP_FILE_PATH, &info);
     ASSERT(ok, "backup info");
@@ -174,10 +152,9 @@ static void test_export_empty_tree(void) {
     ASSERT_EQ(info.key_size, KEY_SIZE, "key_size should match");
     ASSERT_EQ(info.version, DB_BACKUP_VERSION, "version should match");
 
-    // Import into fresh tree
     test_env_t dst = {0};
     make_paths(&dst, "empty_dst");
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     open_env(&dst);
 
     ok = db_backup_import(dst.tree, BACKUP_FILE_PATH);
@@ -185,9 +162,9 @@ static void test_export_empty_tree(void) {
     ASSERT_EQ(data_art_size(dst.tree), 0, "imported tree should be empty");
 
     close_env(&dst);
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     close_env(&src);
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
     cleanup_backup();
 
     printf(COLOR_GREEN "  PASSED\n" COLOR_RESET);
@@ -200,32 +177,28 @@ static void test_round_trip_single(void) {
 
     test_env_t src = {0};
     make_paths(&src, "single_src");
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
     cleanup_backup();
     open_env(&src);
 
-    // Insert one key
     uint8_t key[KEY_SIZE];
     generate_key(key, 42);
     const char *value = "hello_world";
     bool ok = data_art_insert(src.tree, key, KEY_SIZE, value, strlen(value));
     ASSERT(ok, "insert single key");
 
-    // Export
     ok = db_backup_export(src.tree, BACKUP_FILE_PATH);
     ASSERT(ok, "export single key");
 
-    // Import into fresh tree
     test_env_t dst = {0};
     make_paths(&dst, "single_dst");
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     open_env(&dst);
 
     ok = db_backup_import(dst.tree, BACKUP_FILE_PATH);
     ASSERT(ok, "import single key");
     ASSERT_EQ(data_art_size(dst.tree), 1, "imported tree should have 1 key");
 
-    // Verify key and value
     size_t found_len = 0;
     const void *found = data_art_get(dst.tree, key, KEY_SIZE, &found_len);
     ASSERT(found != NULL, "key should exist in imported tree");
@@ -233,9 +206,9 @@ static void test_round_trip_single(void) {
     ASSERT(memcmp(found, value, found_len) == 0, "value content should match");
 
     close_env(&dst);
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     close_env(&src);
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
     cleanup_backup();
 
     printf(COLOR_GREEN "  PASSED\n" COLOR_RESET);
@@ -248,28 +221,25 @@ static void test_round_trip_1000(void) {
 
     test_env_t src = {0};
     make_paths(&src, "1k_src");
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
     cleanup_backup();
     open_env(&src);
 
     insert_keys(&src, 0, 1000);
     ASSERT_EQ(data_art_size(src.tree), 1000, "source should have 1000 keys");
 
-    // Export
     bool ok = db_backup_export(src.tree, BACKUP_FILE_PATH);
     ASSERT(ok, "export 1000 keys");
 
-    // Import into fresh tree
     test_env_t dst = {0};
     make_paths(&dst, "1k_dst");
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     open_env(&dst);
 
     ok = db_backup_import(dst.tree, BACKUP_FILE_PATH);
     ASSERT(ok, "import 1000 keys");
     ASSERT_EQ(data_art_size(dst.tree), 1000, "imported tree should have 1000 keys");
 
-    // Verify all keys present with correct values
     for (int i = 0; i < 1000; i++) {
         uint8_t key[KEY_SIZE];
         char expected_val[64];
@@ -284,9 +254,9 @@ static void test_round_trip_1000(void) {
     }
 
     close_env(&dst);
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     close_env(&src);
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
     cleanup_backup();
 
     printf(COLOR_GREEN "  PASSED\n" COLOR_RESET);
@@ -299,11 +269,10 @@ static void test_round_trip_overflow(void) {
 
     test_env_t src = {0};
     make_paths(&src, "overflow_src");
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
     cleanup_backup();
     open_env(&src);
 
-    // Insert 10 keys with 8KB values (triggers overflow pages)
     const size_t big_val_len = 8 * 1024;
     char *big_val = malloc(big_val_len);
     ASSERT(big_val != NULL, "malloc big value");
@@ -311,28 +280,24 @@ static void test_round_trip_overflow(void) {
     for (int i = 0; i < 10; i++) {
         uint8_t key[KEY_SIZE];
         generate_key(key, i);
-        // Fill value with unique pattern per key
         memset(big_val, (uint8_t)(i + 'A'), big_val_len);
         bool ok = data_art_insert(src.tree, key, KEY_SIZE, big_val, big_val_len);
         ASSERT(ok, "insert overflow key");
     }
     ASSERT_EQ(data_art_size(src.tree), 10, "source should have 10 keys");
 
-    // Export
     bool ok = db_backup_export(src.tree, BACKUP_FILE_PATH);
     ASSERT(ok, "export overflow keys");
 
-    // Import
     test_env_t dst = {0};
     make_paths(&dst, "overflow_dst");
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     open_env(&dst);
 
     ok = db_backup_import(dst.tree, BACKUP_FILE_PATH);
     ASSERT(ok, "import overflow keys");
     ASSERT_EQ(data_art_size(dst.tree), 10, "imported tree should have 10 keys");
 
-    // Verify all values
     for (int i = 0; i < 10; i++) {
         uint8_t key[KEY_SIZE];
         generate_key(key, i);
@@ -347,9 +312,9 @@ static void test_round_trip_overflow(void) {
 
     free(big_val);
     close_env(&dst);
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     close_env(&src);
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
     cleanup_backup();
 
     printf(COLOR_GREEN "  PASSED\n" COLOR_RESET);
@@ -362,7 +327,7 @@ static void test_backup_info(void) {
 
     test_env_t src = {0};
     make_paths(&src, "info_src");
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
     cleanup_backup();
     open_env(&src);
 
@@ -383,7 +348,7 @@ static void test_backup_info(void) {
            "timestamp should be recent");
 
     close_env(&src);
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
     cleanup_backup();
 
     printf(COLOR_GREEN "  PASSED\n" COLOR_RESET);
@@ -396,7 +361,7 @@ static void test_corrupted_header(void) {
 
     test_env_t src = {0};
     make_paths(&src, "corrhdr_src");
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
     cleanup_backup();
     open_env(&src);
 
@@ -404,31 +369,28 @@ static void test_corrupted_header(void) {
     bool ok = db_backup_export(src.tree, BACKUP_FILE_PATH);
     ASSERT(ok, "export for corruption test");
     close_env(&src);
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
 
-    // Corrupt the magic bytes
     FILE *fp = fopen(BACKUP_FILE_PATH, "r+b");
     ASSERT(fp != NULL, "open backup for corruption");
     uint32_t bad_magic = 0xDEADBEEF;
     fwrite(&bad_magic, 4, 1, fp);
     fclose(fp);
 
-    // Import should fail
     test_env_t dst = {0};
     make_paths(&dst, "corrhdr_dst");
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     open_env(&dst);
 
     ok = db_backup_import(dst.tree, BACKUP_FILE_PATH);
     ASSERT(!ok, "import corrupted header should fail");
 
-    // Info should also fail
     db_backup_info_t info;
     ok = db_backup_info(BACKUP_FILE_PATH, &info);
     ASSERT(!ok, "info on corrupted header should fail");
 
     close_env(&dst);
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     cleanup_backup();
 
     printf(COLOR_GREEN "  PASSED\n" COLOR_RESET);
@@ -441,7 +403,7 @@ static void test_corrupted_data(void) {
 
     test_env_t src = {0};
     make_paths(&src, "corrdata_src");
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
     cleanup_backup();
     open_env(&src);
 
@@ -449,9 +411,8 @@ static void test_corrupted_data(void) {
     bool ok = db_backup_export(src.tree, BACKUP_FILE_PATH);
     ASSERT(ok, "export for data corruption test");
     close_env(&src);
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
 
-    // Corrupt a byte in the middle of entry data (after the 32-byte header)
     FILE *fp = fopen(BACKUP_FILE_PATH, "r+b");
     ASSERT(fp != NULL, "open backup for data corruption");
     fseek(fp, sizeof(db_backup_header_t) + 50, SEEK_SET);
@@ -459,17 +420,16 @@ static void test_corrupted_data(void) {
     fwrite(&bad_byte, 1, 1, fp);
     fclose(fp);
 
-    // Import should fail (data CRC mismatch)
     test_env_t dst = {0};
     make_paths(&dst, "corrdata_dst");
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     open_env(&dst);
 
     ok = db_backup_import(dst.tree, BACKUP_FILE_PATH);
     ASSERT(!ok, "import with corrupted data should fail");
 
     close_env(&dst);
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     cleanup_backup();
 
     printf(COLOR_GREEN "  PASSED\n" COLOR_RESET);
@@ -482,7 +442,7 @@ static void test_truncated_file(void) {
 
     test_env_t src = {0};
     make_paths(&src, "trunc_src");
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
     cleanup_backup();
     open_env(&src);
 
@@ -490,24 +450,22 @@ static void test_truncated_file(void) {
     bool ok = db_backup_export(src.tree, BACKUP_FILE_PATH);
     ASSERT(ok, "export for truncation test");
     close_env(&src);
-    cleanup_paths(src.db_path, src.wal_path);
+    cleanup_dir(src.dir_path);
 
-    // Truncate the file in the middle
     struct stat st;
     stat(BACKUP_FILE_PATH, &st);
     truncate(BACKUP_FILE_PATH, st.st_size / 2);
 
-    // Import should fail gracefully
     test_env_t dst = {0};
     make_paths(&dst, "trunc_dst");
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     open_env(&dst);
 
     ok = db_backup_import(dst.tree, BACKUP_FILE_PATH);
     ASSERT(!ok, "import truncated file should fail");
 
     close_env(&dst);
-    cleanup_paths(dst.db_path, dst.wal_path);
+    cleanup_dir(dst.dir_path);
     cleanup_backup();
 
     printf(COLOR_GREEN "  PASSED\n" COLOR_RESET);
@@ -520,23 +478,19 @@ static void test_invalid_paths(void) {
 
     test_env_t env = {0};
     make_paths(&env, "invalid_src");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
-    // Export to nonexistent directory
     bool ok = db_backup_export(env.tree, "/nonexistent/dir/backup.artb");
     ASSERT(!ok, "export to invalid path should fail");
 
-    // Import from nonexistent file
     ok = db_backup_import(env.tree, "/nonexistent/backup.artb");
     ASSERT(!ok, "import from nonexistent file should fail");
 
-    // Info on nonexistent file
     db_backup_info_t info;
     ok = db_backup_info("/nonexistent/backup.artb", &info);
     ASSERT(!ok, "info on nonexistent file should fail");
 
-    // NULL arguments
     ok = db_backup_export(NULL, BACKUP_FILE_PATH);
     ASSERT(!ok, "export with NULL tree should fail");
     ok = db_backup_export(env.tree, NULL);
@@ -547,7 +501,7 @@ static void test_invalid_paths(void) {
     ASSERT(!ok, "info with NULL path should fail");
 
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 
     printf(COLOR_GREEN "  PASSED\n" COLOR_RESET);
     tests_passed++;

@@ -5,7 +5,6 @@
  */
 
 #include "data_art.h"
-#include "buffer_pool.h"
 #include "logger.h"
 
 #include <stdio.h>
@@ -15,18 +14,9 @@
 #include <sys/stat.h>
 #include <time.h>
 
-#define TEST_DB_PATH "/tmp/test_data_art_growth.db"
-
 // Test counter
 static int tests_run = 0;
 static int tests_passed = 0;
-
-// Remove test database directory
-static void cleanup_test_db(void) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", TEST_DB_PATH);
-    system(cmd);
-}
 
 // Test result macro
 #define TEST(name) \
@@ -34,7 +24,6 @@ static void cleanup_test_db(void) {
         printf("TEST: %s ... ", name); \
         fflush(stdout); \
         tests_run++; \
-        cleanup_test_db(); \
     } while (0)
 
 #define PASS() \
@@ -63,15 +52,9 @@ static void make_key32(uint8_t key_out[32], const char *str) {
 static bool test_node4_to_node16_growth(void) {
     TEST("NODE_4 grows to NODE_16 after 4 children");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    assert(pm != NULL);
+    system("rm -rf /tmp/test_growth_4to16 && mkdir -p /tmp/test_growth_4to16");
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 64;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    assert(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_growth_4to16/art.dat", 32);
     assert(tree != NULL);
 
     // Insert 5 keys (should trigger NODE_4 -> NODE_16)
@@ -88,8 +71,6 @@ static bool test_node4_to_node16_growth(void) {
 
         if (!data_art_insert(tree, key, 32, value, strlen(value))) {
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("failed to insert key");
         }
     }
@@ -103,8 +84,6 @@ static bool test_node4_to_node16_growth(void) {
         void *retrieved = data_art_get(tree, key, 32, &value_len);
         if (!retrieved) {
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("failed to retrieve key");
         }
 
@@ -114,8 +93,6 @@ static bool test_node4_to_node16_growth(void) {
         if (value_len != strlen(expected) || memcmp(retrieved, expected, value_len) != 0) {
             free(retrieved);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("retrieved value doesn't match");
         }
 
@@ -124,14 +101,10 @@ static bool test_node4_to_node16_growth(void) {
 
     if (data_art_size(tree) != 5) {
         data_art_destroy(tree);
-        buffer_pool_destroy(bp);
-        page_manager_destroy(pm);
         FAIL("incorrect tree size");
     }
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
     PASS();
     return true;
@@ -143,15 +116,9 @@ static bool test_node4_to_node16_growth(void) {
 static bool test_node16_to_node48_growth(void) {
     TEST("NODE_16 grows to NODE_48 after 16 children");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    assert(pm != NULL);
+    system("rm -rf /tmp/test_growth_16to48 && mkdir -p /tmp/test_growth_16to48");
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 64;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    assert(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_growth_16to48/art.dat", 32);
     assert(tree != NULL);
 
     // Insert 17 keys with common prefix (all 32 bytes, zero-padded)
@@ -165,8 +132,6 @@ static bool test_node16_to_node48_growth(void) {
 
         if (!data_art_insert(tree, key, 32, value, strlen(value))) {
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("failed to insert key");
         }
     }
@@ -181,8 +146,6 @@ static bool test_node16_to_node48_growth(void) {
         void *retrieved = data_art_get(tree, key, 32, &value_len);
         if (!retrieved) {
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("failed to retrieve key");
         }
         free(retrieved);
@@ -190,14 +153,10 @@ static bool test_node16_to_node48_growth(void) {
 
     if (data_art_size(tree) != 17) {
         data_art_destroy(tree);
-        buffer_pool_destroy(bp);
-        page_manager_destroy(pm);
         FAIL("incorrect tree size");
     }
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
     PASS();
     return true;
@@ -209,15 +168,9 @@ static bool test_node16_to_node48_growth(void) {
 static bool test_node48_to_node256_growth(void) {
     TEST("NODE_48 grows to NODE_256 after 48 children");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    assert(pm != NULL);
+    system("rm -rf /tmp/test_growth_48to256 && mkdir -p /tmp/test_growth_48to256");
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 256;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    assert(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_growth_48to256/art.dat", 32);
     assert(tree != NULL);
 
     // Insert 49 keys (all 32 bytes, zero-padded)
@@ -231,8 +184,6 @@ static bool test_node48_to_node256_growth(void) {
 
         if (!data_art_insert(tree, key, 32, value, strlen(value))) {
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("failed to insert key");
         }
     }
@@ -247,8 +198,6 @@ static bool test_node48_to_node256_growth(void) {
         void *retrieved = data_art_get(tree, key, 32, &value_len);
         if (!retrieved) {
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("failed to retrieve key");
         }
         free(retrieved);
@@ -256,14 +205,10 @@ static bool test_node48_to_node256_growth(void) {
 
     if (data_art_size(tree) != 49) {
         data_art_destroy(tree);
-        buffer_pool_destroy(bp);
-        page_manager_destroy(pm);
         FAIL("incorrect tree size");
     }
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
     PASS();
     return true;
@@ -275,15 +220,9 @@ static bool test_node48_to_node256_growth(void) {
 static bool test_bulk_insert(void) {
     TEST("bulk insert 100 keys");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    assert(pm != NULL);
+    system("rm -rf /tmp/test_growth_bulk && mkdir -p /tmp/test_growth_bulk");
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 256;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    assert(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_growth_bulk/art.dat", 32);
     assert(tree != NULL);
 
     const int NUM_KEYS = 100;
@@ -298,8 +237,6 @@ static bool test_bulk_insert(void) {
 
         if (!data_art_insert(tree, key, 32, value, strlen(value))) {
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("failed to insert key");
         }
     }
@@ -318,8 +255,6 @@ static bool test_bulk_insert(void) {
         if (!retrieved) {
             fprintf(stderr, "FAILED TO RETRIEVE KEY: bulk_key_%04d (index %d)\n", i, i);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("failed to retrieve key");
         }
 
@@ -327,8 +262,6 @@ static bool test_bulk_insert(void) {
             memcmp(retrieved, expected_value, value_len) != 0) {
             free(retrieved);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("value mismatch");
         }
 
@@ -337,8 +270,6 @@ static bool test_bulk_insert(void) {
 
     if (data_art_size(tree) != NUM_KEYS) {
         data_art_destroy(tree);
-        buffer_pool_destroy(bp);
-        page_manager_destroy(pm);
         FAIL("incorrect tree size");
     }
 
@@ -346,8 +277,6 @@ static bool test_bulk_insert(void) {
     data_art_print_stats(tree);
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
     PASS();
     return true;
@@ -359,15 +288,9 @@ static bool test_bulk_insert(void) {
 static bool test_random_keys(void) {
     TEST("random 32-byte keys");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    assert(pm != NULL);
+    system("rm -rf /tmp/test_growth_random && mkdir -p /tmp/test_growth_random");
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 1024;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    assert(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_growth_random/art.dat", 32);
     assert(tree != NULL);
 
     const int NUM_KEYS = 500;
@@ -430,8 +353,6 @@ static bool test_random_keys(void) {
     free(value_lens);
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
     PASS();
     return true;
@@ -444,8 +365,6 @@ cleanup_fail:
     free(values);
     free(value_lens);
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
     FAIL("random key test failed");
 }
 
@@ -456,15 +375,9 @@ cleanup_fail:
 static bool test_long_prefix_keys(void) {
     TEST("long shared prefix keys (lazy expansion)");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    assert(pm != NULL);
+    system("rm -rf /tmp/test_growth_longpfx && mkdir -p /tmp/test_growth_longpfx");
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 256;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    assert(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_growth_longpfx/art.dat", 32);
     assert(tree != NULL);
 
     const int NUM_KEYS = 100;
@@ -482,8 +395,6 @@ static bool test_long_prefix_keys(void) {
         if (!data_art_insert(tree, keys[i], 32, values[i], strlen(values[i]))) {
             fprintf(stderr, "Failed to insert key %d\n", i);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("insertion failed");
         }
     }
@@ -496,8 +407,6 @@ static bool test_long_prefix_keys(void) {
         if (!retrieved) {
             fprintf(stderr, "Failed to retrieve key %d\n", i);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("retrieval failed");
         }
 
@@ -506,8 +415,6 @@ static bool test_long_prefix_keys(void) {
             fprintf(stderr, "Value mismatch for key %d\n", i);
             free(retrieved);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("value mismatch");
         }
 
@@ -515,8 +422,6 @@ static bool test_long_prefix_keys(void) {
     }
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
     PASS();
     return true;
@@ -528,15 +433,9 @@ static bool test_long_prefix_keys(void) {
 static bool test_single_byte_keys(void) {
     TEST("single byte varying keys (padded to 32)");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    assert(pm != NULL);
+    system("rm -rf /tmp/test_growth_singlebyte && mkdir -p /tmp/test_growth_singlebyte");
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 512;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    assert(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_growth_singlebyte/art.dat", 32);
     assert(tree != NULL);
 
     // Insert 256 keys: first byte varies 0..255, rest zero-padded to 32
@@ -551,8 +450,6 @@ static bool test_single_byte_keys(void) {
         if (!data_art_insert(tree, key, 32, value, strlen(value))) {
             fprintf(stderr, "Failed to insert key 0x%02x\n", i);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("insertion failed");
         }
     }
@@ -572,8 +469,6 @@ static bool test_single_byte_keys(void) {
         if (!retrieved) {
             fprintf(stderr, "Failed to retrieve key 0x%02x\n", i);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("retrieval failed");
         }
 
@@ -581,8 +476,6 @@ static bool test_single_byte_keys(void) {
             memcmp(retrieved, expected_value, value_len) != 0) {
             free(retrieved);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("value mismatch");
         }
 
@@ -591,14 +484,10 @@ static bool test_single_byte_keys(void) {
 
     if (data_art_size(tree) != 256) {
         data_art_destroy(tree);
-        buffer_pool_destroy(bp);
-        page_manager_destroy(pm);
         FAIL("tree size mismatch");
     }
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
     PASS();
     return true;
@@ -610,15 +499,9 @@ static bool test_single_byte_keys(void) {
 static bool test_late_divergence_keys(void) {
     TEST("keys with late divergence (byte 31)");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    assert(pm != NULL);
+    system("rm -rf /tmp/test_growth_latediverge && mkdir -p /tmp/test_growth_latediverge");
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 256;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    assert(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_growth_latediverge/art.dat", 32);
     assert(tree != NULL);
 
     const int NUM_KEYS = 50;
@@ -635,8 +518,6 @@ static bool test_late_divergence_keys(void) {
         if (!data_art_insert(tree, keys[i], 32, value, strlen(value))) {
             fprintf(stderr, "Failed to insert key %d\n", i);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("insertion failed");
         }
     }
@@ -650,8 +531,6 @@ static bool test_late_divergence_keys(void) {
             fprintf(stderr, "Failed to retrieve key %d (last byte=0x%02x)\n",
                     i, keys[i][31]);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("retrieval failed");
         }
 
@@ -659,8 +538,6 @@ static bool test_late_divergence_keys(void) {
     }
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
     PASS();
     return true;
@@ -672,15 +549,9 @@ static bool test_late_divergence_keys(void) {
 static bool test_empty_and_short_keys(void) {
     TEST("short content keys padded to 32 bytes");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    assert(pm != NULL);
+    system("rm -rf /tmp/test_growth_shortkeys && mkdir -p /tmp/test_growth_shortkeys");
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 64;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    assert(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_growth_shortkeys/art.dat", 32);
     assert(tree != NULL);
 
     // Test with varying-content 32-byte keys:
@@ -697,8 +568,6 @@ static bool test_empty_and_short_keys(void) {
         if (!data_art_insert(tree, key, 32, value, strlen(value))) {
             fprintf(stderr, "Failed to insert key with %d X bytes\n", len);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("insertion failed");
         }
     }
@@ -718,8 +587,6 @@ static bool test_empty_and_short_keys(void) {
         if (!retrieved) {
             fprintf(stderr, "Failed to retrieve key with %d X bytes\n", len);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("retrieval failed");
         }
 
@@ -727,8 +594,6 @@ static bool test_empty_and_short_keys(void) {
             memcmp(retrieved, expected, value_len) != 0) {
             free(retrieved);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("value mismatch");
         }
 
@@ -736,8 +601,6 @@ static bool test_empty_and_short_keys(void) {
     }
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
     PASS();
     return true;
@@ -749,15 +612,9 @@ static bool test_empty_and_short_keys(void) {
 static bool test_stress_2k_keys(void) {
     TEST("stress test - 2K random 32-byte keys");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    assert(pm != NULL);
+    system("rm -rf /tmp/test_growth_stress2k && mkdir -p /tmp/test_growth_stress2k");
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 4096;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    assert(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_growth_stress2k/art.dat", 32);
     assert(tree != NULL);
 
     const int NUM_KEYS = 2000;
@@ -780,8 +637,6 @@ static bool test_stress_2k_keys(void) {
             fprintf(stderr, "\n  Failed to insert key %d\n", i);
             free(keys);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("insertion failed");
         }
 
@@ -807,8 +662,6 @@ static bool test_stress_2k_keys(void) {
             fprintf(stderr, "\n  Failed to retrieve key %d\n", i);
             free(keys);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("retrieval failed");
         }
 
@@ -818,8 +671,6 @@ static bool test_stress_2k_keys(void) {
             free(retrieved);
             free(keys);
             data_art_destroy(tree);
-            buffer_pool_destroy(bp);
-            page_manager_destroy(pm);
             FAIL("value mismatch");
         }
 
@@ -831,8 +682,6 @@ static bool test_stress_2k_keys(void) {
 
     free(keys);
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
     PASS();
     return true;
@@ -864,8 +713,6 @@ int main(void) {
     printf("========================================\n");
     printf("Test Results: %d/%d passed\n", tests_passed, tests_run);
     printf("========================================\n");
-
-    cleanup_test_db();
 
     return (tests_passed == tests_run) ? 0 : 1;
 }

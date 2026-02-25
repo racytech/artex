@@ -148,10 +148,8 @@ add_library(art_persistent STATIC
 )
 
 target_link_libraries(art_persistent
-    art_page_manager
-    art_buffer_pool
-    art_page_gc
-    art_wal
+    art_crc32
+    pthread
 )
 
 #==============================================================================

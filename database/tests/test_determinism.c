@@ -6,9 +6,6 @@
  */
 
 #include "data_art.h"
-#include "page_manager.h"
-#include "buffer_pool.h"
-#include "wal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,45 +38,32 @@ static int tests_passed = 0;
 #define KEY_SIZE 32
 
 typedef struct {
-    page_manager_t  *pm;
-    buffer_pool_t   *bp;
-    wal_t           *wal;
     data_art_tree_t *tree;
-    char db_path[256];
-    char wal_path[256];
+    char dir_path[256];
 } test_env_t;
 
-static void cleanup_paths(const char *db_path, const char *wal_path) {
+static void cleanup_dir(const char *dir_path) {
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s %s", db_path, wal_path);
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir_path);
     system(cmd);
     sync();
     usleep(10000);
 }
 
 static void open_env(test_env_t *env) {
-    env->pm = page_manager_create(env->db_path, false);
-    ASSERT(env->pm != NULL, "page_manager_create");
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s", env->dir_path);
+    system(cmd);
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 1024;
-    env->bp = buffer_pool_create(&bp_config, env->pm);
-    ASSERT(env->bp != NULL, "buffer_pool_create");
+    char art_path[512];
+    snprintf(art_path, sizeof(art_path), "%s/art.dat", env->dir_path);
 
-    wal_config_t wal_config = wal_default_config();
-    wal_config.segment_size = 8 * 1024 * 1024;
-    env->wal = wal_open(env->wal_path, &wal_config);
-    ASSERT(env->wal != NULL, "wal_open");
-
-    env->tree = data_art_create(env->pm, env->bp, env->wal, KEY_SIZE);
+    env->tree = data_art_create(art_path, KEY_SIZE);
     ASSERT(env->tree != NULL, "data_art_create");
 }
 
 static void close_env(test_env_t *env) {
     if (env->tree) { data_art_destroy(env->tree); env->tree = NULL; }
-    if (env->wal)  { wal_close(env->wal);         env->wal = NULL; }
-    if (env->bp)   { buffer_pool_destroy(env->bp); env->bp = NULL; }
-    if (env->pm)   { page_manager_destroy(env->pm); env->pm = NULL; }
 }
 
 // Generate a deterministic key from index (same as iterator test)
@@ -108,11 +92,11 @@ static void shuffle(int *arr, int n, uint32_t seed) {
 }
 
 // ============================================================================
-// Test: Same keys, different insertion orders → identical iteration
+// Test: Same keys, different insertion orders -> identical iteration
 // ============================================================================
 
 static void test_determinism(void) {
-    printf("\n[Test] Determinism: same keys in different order → same tree\n");
+    printf("\n[Test] Determinism: same keys in different order -> same tree\n");
 
     const int N = 500;
     const char *value = "determinism_test_value!!";
@@ -141,11 +125,8 @@ static void test_determinism(void) {
 
     for (int t = 0; t < 3; t++) {
         test_env_t env = {0};
-        char suffix[64];
-        snprintf(suffix, sizeof(suffix), "det_%s", labels[t]);
-        snprintf(env.db_path, sizeof(env.db_path), "/tmp/test_det_db_%s", labels[t]);
-        snprintf(env.wal_path, sizeof(env.wal_path), "/tmp/test_det_wal_%s", labels[t]);
-        cleanup_paths(env.db_path, env.wal_path);
+        snprintf(env.dir_path, sizeof(env.dir_path), "/tmp/test_det_%s", labels[t]);
+        cleanup_dir(env.dir_path);
         open_env(&env);
 
         // Insert in this order
@@ -180,7 +161,7 @@ static void test_determinism(void) {
         printf("  Tree %d (%s): iterated %d keys\n", t, labels[t], count);
 
         close_env(&env);
-        cleanup_paths(env.db_path, env.wal_path);
+        cleanup_dir(env.dir_path);
     }
 
     // Verify all three trees produced identical iteration
@@ -219,12 +200,12 @@ static void test_determinism(void) {
 }
 
 // ============================================================================
-// Test: Determinism with deletes — insert same keys, delete same subset,
-//       different order → identical remaining keys
+// Test: Determinism with deletes -- insert same keys, delete same subset,
+//       different order -> identical remaining keys
 // ============================================================================
 
 static void test_determinism_with_deletes(void) {
-    printf("\n[Test] Determinism with deletes: same ops, different order → same tree\n");
+    printf("\n[Test] Determinism with deletes: same ops, different order -> same tree\n");
 
     const int N = 300;
     const int DELETE_COUNT = 100;  // delete keys 0..99
@@ -262,9 +243,8 @@ static void test_determinism_with_deletes(void) {
 
     for (int t = 0; t < 2; t++) {
         test_env_t env = {0};
-        snprintf(env.db_path, sizeof(env.db_path), "/tmp/test_det_del_db_%s", labels[t]);
-        snprintf(env.wal_path, sizeof(env.wal_path), "/tmp/test_det_del_wal_%s", labels[t]);
-        cleanup_paths(env.db_path, env.wal_path);
+        snprintf(env.dir_path, sizeof(env.dir_path), "/tmp/test_det_del_%s", labels[t]);
+        cleanup_dir(env.dir_path);
         open_env(&env);
 
         // Insert all N keys
@@ -310,7 +290,7 @@ static void test_determinism_with_deletes(void) {
                t, labels[t], count, expect);
 
         close_env(&env);
-        cleanup_paths(env.db_path, env.wal_path);
+        cleanup_dir(env.dir_path);
     }
 
     // Verify identical

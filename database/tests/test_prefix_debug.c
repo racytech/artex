@@ -3,18 +3,18 @@
 #include <string.h>
 #include <stdint.h>
 #include "data_art.h"
-#include "page_manager.h"
+
+#define TEST_DIR "/tmp/test_prefix_debug"
+#define TEST_ART_PATH TEST_DIR "/art.dat"
 
 static void generate_prefix_key(uint8_t *key, size_t max_len, const char *prefix, uint64_t num) {
     snprintf((char *)key, max_len, "%s_%020lu", prefix, num);
 }
 
 int main() {
-    const char *db_path = "/tmp/test_prefix.db";
-    remove(db_path);
-    
-    page_manager_t *pm = page_manager_create(db_path, false);
-    data_art_tree_t *tree = data_art_create(pm, NULL, NULL, 32);
+    system("rm -rf " TEST_DIR " && mkdir -p " TEST_DIR);
+
+    data_art_tree_t *tree = data_art_create(TEST_ART_PATH, 32);
     
     // Insert just a few keys
     for (int p = 0; p < 2; p++) {
@@ -62,8 +62,7 @@ int main() {
     }
     
     data_art_destroy(tree);
-    page_manager_destroy(pm);
-    remove(db_path);
-    
+    system("rm -rf " TEST_DIR);
+
     return 0;
 }

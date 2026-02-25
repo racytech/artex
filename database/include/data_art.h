@@ -1,29 +1,27 @@
 /*
  * Persistent Adaptive Radix Tree (data_art)
- * 
+ *
  * DESIGNED FOR FIXED-SIZE KEYS (e.g., 20-byte addresses, 32-byte hashes)
  * This implementation does NOT support variable-length keys or prefix relationships.
  * All keys must have the same length (e.g., Ethereum: 20 bytes for addresses, 32 bytes for storage keys).
- * 
+ *
  * Disk-backed ART implementation with:
  * - Page references instead of pointers
  * - Copy-on-Write (CoW) for MVCC
- * - Buffer pool integration for caching
+ * - mmap-backed storage for persistence
  * - Serialized node structures for persistence
- * 
+ *
  * Key differences from mem_art:
  * - Uses node_ref_t (page_id, offset) instead of pointers
  * - All nodes serialized to fixed-size structures
- * - Integrated with page_manager and buffer_pool
- * - Supports versioning and crash recovery
+ * - Backed by mmap_storage (memory-mapped file)
+ * - Supports versioning via MVCC snapshots
  */
 
 #ifndef DATA_ART_H
 #define DATA_ART_H
 
-#include "page_manager.h"
-#include "buffer_pool.h"
-#include "wal.h"
+#include "mmap_storage.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -34,7 +32,6 @@
 typedef struct txn_buffer txn_buffer_t;
 typedef struct mvcc_manager mvcc_manager_t;
 typedef struct mvcc_snapshot mvcc_snapshot_t;
-typedef struct mmap_storage mmap_storage_t;
 
 // ============================================================================
 // Node Reference (Page-based addressing)
@@ -292,10 +289,7 @@ typedef struct {
  */
 typedef struct data_art_tree {
     // Storage backend
-    page_manager_t *page_manager;
-    buffer_pool_t *buffer_pool;
-    wal_t *wal;                  // Write-ahead log for durability
-    mmap_storage_t *mmap_storage; // mmap backend (NULL = use page_manager+buffer_pool)
+    mmap_storage_t *mmap_storage;
     
     // Current tree state
     node_ref_t root;             // Root node reference
@@ -359,30 +353,15 @@ typedef struct data_art_tree {
 // ============================================================================
 
 /**
- * Create a new persistent ART tree with fixed-size keys
- * 
- * @param page_manager Page manager for disk I/O
- * @param buffer_pool Buffer pool for caching (optional, can be NULL)
- * @param wal Write-ahead log for durability (optional, can be NULL)
- * @param key_size Fixed size for all keys (must be 20 or 32 for Ethereum)
- * @return Tree instance, or NULL on failure
- */
-data_art_tree_t *data_art_create(page_manager_t *page_manager,
-                                   buffer_pool_t *buffer_pool,
-                                   wal_t *wal,
-                                   size_t key_size);
-
-/**
  * Create a new persistent ART tree backed by mmap storage.
  *
- * Uses a memory-mapped file instead of page_manager + buffer_pool.
- * No WAL — durability via msync.
+ * Uses a memory-mapped file for persistence. Durability via msync.
  *
  * @param path      File path for the mmap data file
  * @param key_size  Fixed size for all keys (20 or 32)
  * @return Tree instance, or NULL on failure
  */
-data_art_tree_t *data_art_create_mmap(const char *path, size_t key_size);
+data_art_tree_t *data_art_create(const char *path, size_t key_size);
 
 /**
  * Open an existing mmap-backed ART tree.
@@ -391,7 +370,7 @@ data_art_tree_t *data_art_create_mmap(const char *path, size_t key_size);
  * @param key_size  Fixed key size (must match the file)
  * @return Tree instance, or NULL on failure
  */
-data_art_tree_t *data_art_open_mmap(const char *path, size_t key_size);
+data_art_tree_t *data_art_open(const char *path, size_t key_size);
 
 /**
  * Destroy tree and free resources
@@ -470,12 +449,12 @@ bool data_art_is_empty(const data_art_tree_t *tree);
 
 /**
  * Load a node from disk into memory
- * 
- * Uses buffer pool if available, otherwise direct page manager access.
- * 
+ *
+ * Reads from mmap and copies to thread-local arena for safety.
+ *
  * @param tree Tree instance
  * @param ref Node reference
- * @return Pointer to node in memory (cached), NULL on error
+ * @return Pointer to node in memory (TLS arena copy), NULL on error
  */
 const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
 
@@ -507,7 +486,6 @@ node_ref_t data_art_alloc_node_hint(data_art_tree_t *tree, size_t size, uint64_t
  * Write a node to disk
  * 
  * Serializes node and writes to the page referenced by ref.
- * Marks page as dirty in buffer pool.
  * 
  * @param tree Tree instance
  * @param ref Node reference
@@ -520,7 +498,7 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
 
 /**
  * Internal insert — for optimized commit path (lock held, no auto-commit/publish)
- * Caller must hold write_lock, manage MVCC txn, WAL logging, and root publication.
+ * Caller must hold write_lock, manage MVCC txn, and root publication.
  */
 bool data_art_insert_internal(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
                                const void *value, size_t value_len);
@@ -649,10 +627,8 @@ typedef struct {
 /**
  * Atomic batch insert — inserts multiple key-value pairs in a single transaction.
  *
- * Wraps all inserts in BEGIN -> N inserts -> COMMIT with a single fsync.
+ * Wraps all inserts in BEGIN -> N inserts -> COMMIT atomically.
  * If any insert fails, the entire batch is aborted (no partial application).
- *
- * Requires WAL to be enabled (returns false without WAL).
  *
  * @param tree Tree instance
  * @param keys Array of key pointers
@@ -734,27 +710,14 @@ const void *data_art_get_snapshot(data_art_tree_t *tree, const uint8_t *key, siz
 
 /**
  * Create a checkpoint of the current tree state
- * 
- * Flushes all dirty pages and logs checkpoint to WAL, enabling
- * truncation of old WAL segments.
- * 
+ *
+ * Saves tree header and syncs mmap to disk.
+ *
  * @param tree Tree instance
- * @param checkpoint_lsn_out Output parameter for checkpoint LSN (optional)
+ * @param checkpoint_lsn_out Output parameter (unused, set to 0)
  * @return true on success
  */
 bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out);
-
-/**
- * Recover tree state from WAL after crash
- * 
- * Replays WAL entries from last checkpoint to rebuild tree state.
- * Should be called after data_art_create() on startup.
- * 
- * @param tree Tree instance
- * @param start_lsn LSN to start recovery from (0 = from beginning)
- * @return Number of entries recovered, or -1 on error
- */
-int64_t data_art_recover(data_art_tree_t *tree, uint64_t start_lsn);
 
 // ============================================================================
 // Iterator Support

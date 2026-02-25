@@ -927,14 +927,6 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
 
         if (inserted) {
             tree->size++;
-
-            // Log to WAL for durability (if WAL is enabled)
-            if (tree->wal) {
-                uint64_t txn_id = tree->current_txn_id;  // 0 if no active transaction
-                if (!wal_log_insert(tree->wal, txn_id, key, key_len, value, value_len, NULL)) {
-                    LOG_ERROR("Failed to log insert to WAL");
-                }
-            }
         }
 
         // Auto-commit the transaction if we started one

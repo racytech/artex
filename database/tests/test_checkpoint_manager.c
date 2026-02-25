@@ -5,14 +5,11 @@
  *   1. Start and stop (basic lifecycle)
  *   2. Force checkpoint
  *   3. Concurrent writes + checkpoint
- *   4. WAL truncation after checkpoint
+ *   4. Multiple checkpoints with data verification
  */
 
 #include "checkpoint_manager.h"
 #include "data_art.h"
-#include "page_manager.h"
-#include "buffer_pool.h"
-#include "wal.h"
 #include "logger.h"
 
 #include <stdio.h>
@@ -21,8 +18,6 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <sys/stat.h>
-#include <dirent.h>
 
 // ============================================================================
 // Test Framework
@@ -58,58 +53,39 @@ static int tests_passed = 0;
 // ============================================================================
 
 #define KEY_SIZE 32
-#define BASE_DB_PATH  "/tmp/test_ckpt_mgr_db"
-#define BASE_WAL_PATH "/tmp/test_ckpt_mgr_wal"
+#define BASE_DIR "/tmp/test_ckpt_mgr"
 
 typedef struct {
-    page_manager_t  *pm;
-    buffer_pool_t   *bp;
-    wal_t           *wal;
     data_art_tree_t *tree;
-    char db_path[256];
-    char wal_path[256];
+    char dir_path[256];
 } test_env_t;
 
-static void cleanup_paths(const char *db_path, const char *wal_path) {
+static void cleanup_dir(const char *dir_path) {
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s %s", db_path, wal_path);
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir_path);
     system(cmd);
     sync();
     usleep(10000);
 }
 
 static void make_paths(test_env_t *env, const char *suffix) {
-    snprintf(env->db_path, sizeof(env->db_path), "%s_%s", BASE_DB_PATH, suffix);
-    snprintf(env->wal_path, sizeof(env->wal_path), "%s_%s", BASE_WAL_PATH, suffix);
-}
-
-static void open_env_ex(test_env_t *env, uint64_t segment_size) {
-    env->pm = page_manager_create(env->db_path, false);
-    ASSERT(env->pm != NULL, "page_manager_create");
-
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 256;
-    env->bp = buffer_pool_create(&bp_config, env->pm);
-    ASSERT(env->bp != NULL, "buffer_pool_create");
-
-    wal_config_t wal_config = wal_default_config();
-    wal_config.segment_size = segment_size;
-    env->wal = wal_open(env->wal_path, &wal_config);
-    ASSERT(env->wal != NULL, "wal_open");
-
-    env->tree = data_art_create(env->pm, env->bp, env->wal, KEY_SIZE);
-    ASSERT(env->tree != NULL, "data_art_create");
+    snprintf(env->dir_path, sizeof(env->dir_path), "%s_%s", BASE_DIR, suffix);
 }
 
 static void open_env(test_env_t *env) {
-    open_env_ex(env, 8 * 1024 * 1024);  // 8MB default
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s", env->dir_path);
+    system(cmd);
+
+    char art_path[512];
+    snprintf(art_path, sizeof(art_path), "%s/art.dat", env->dir_path);
+
+    env->tree = data_art_create(art_path, KEY_SIZE);
+    ASSERT(env->tree != NULL, "data_art_create");
 }
 
 static void close_env(test_env_t *env) {
     if (env->tree) { data_art_destroy(env->tree); env->tree = NULL; }
-    if (env->wal)  { wal_close(env->wal);         env->wal = NULL; }
-    if (env->bp)   { buffer_pool_destroy(env->bp); env->bp = NULL; }
-    if (env->pm)   { page_manager_destroy(env->pm); env->pm = NULL; }
 }
 
 static void generate_key(uint8_t *key, int index) {
@@ -156,20 +132,6 @@ static void verify_keys(test_env_t *env, int start, int count) {
     }
 }
 
-static int count_wal_segments(const char *wal_dir) {
-    DIR *dir = opendir(wal_dir);
-    if (!dir) return 0;
-    int count = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strstr(entry->d_name, "wal_") && strstr(entry->d_name, ".log")) {
-            count++;
-        }
-    }
-    closedir(dir);
-    return count;
-}
-
 // ============================================================================
 // Test 1: Start and Stop (basic lifecycle)
 // ============================================================================
@@ -177,7 +139,7 @@ static int count_wal_segments(const char *wal_dir) {
 static void test_start_stop(void) {
     test_env_t env = {0};
     make_paths(&env, "t1");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
     checkpoint_manager_config_t config = checkpoint_manager_default_config();
@@ -203,7 +165,7 @@ static void test_start_stop(void) {
 
     checkpoint_manager_destroy(mgr);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -213,16 +175,14 @@ static void test_start_stop(void) {
 static void test_force_checkpoint(void) {
     test_env_t env = {0};
     make_paths(&env, "t2");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
     printf("  Inserting 100 keys...\n");
     insert_keys(&env, 0, 100);
-    ASSERT(data_art_flush(env.tree), "flush");
-    ASSERT(wal_fsync(env.wal), "fsync");
 
     checkpoint_manager_config_t config = checkpoint_manager_default_config();
-    config.check_interval_ms = 5000;  // High interval — force will bypass
+    config.check_interval_ms = 5000;  // High interval -- force will bypass
     checkpoint_manager_t *mgr = checkpoint_manager_create(env.tree, &config);
     ASSERT(mgr != NULL, "create");
     ASSERT(checkpoint_manager_start(mgr), "start");
@@ -241,7 +201,7 @@ static void test_force_checkpoint(void) {
     checkpoint_manager_stop(mgr);
     checkpoint_manager_destroy(mgr);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -271,7 +231,7 @@ static void *writer_thread_fn(void *arg) {
 static void test_concurrent_writes_checkpoint(void) {
     test_env_t env = {0};
     make_paths(&env, "t3");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
     open_env(&env);
 
     checkpoint_manager_config_t config = checkpoint_manager_default_config();
@@ -302,9 +262,7 @@ static void test_concurrent_writes_checkpoint(void) {
 
     pthread_join(writer, NULL);
 
-    // Final flush + force checkpoint
-    ASSERT(data_art_flush(env.tree), "final flush");
-    ASSERT(wal_fsync(env.wal), "final fsync");
+    // Final force checkpoint
     checkpoint_manager_force(mgr);
 
     uint64_t completed = 0;
@@ -319,50 +277,43 @@ static void test_concurrent_writes_checkpoint(void) {
     checkpoint_manager_stop(mgr);
     checkpoint_manager_destroy(mgr);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
-// Test 4: WAL Truncation After Checkpoint
+// Test 4: Multiple Checkpoints with Data Verification
 // ============================================================================
 
-static void test_wal_truncation(void) {
+static void test_multiple_checkpoints(void) {
     test_env_t env = {0};
     make_paths(&env, "t4");
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
+    open_env(&env);
 
-    // Use tiny 64KB segments to force multiple segment files
-    open_env_ex(&env, 64 * 1024);
+    printf("  Inserting 2000 keys with periodic checkpoints...\n");
 
-    printf("  Inserting 2000 keys (small WAL segments to force rotation)...\n");
-    insert_keys(&env, 0, 2000);
-    ASSERT(data_art_flush(env.tree), "flush");
-    ASSERT(wal_fsync(env.wal), "fsync");
-
-    int segments_before = count_wal_segments(env.wal_path);
-    printf("  WAL segments before checkpoint: %d\n", segments_before);
-
-    // Force checkpoint + truncation
     checkpoint_manager_t *mgr = checkpoint_manager_create(env.tree, NULL);
     ASSERT(mgr != NULL, "create");
 
-    printf("  Running checkpoint (no background thread, direct force)...\n");
-    ASSERT(checkpoint_manager_force(mgr), "force");
+    // Insert in batches with checkpoints between
+    for (int batch = 0; batch < 4; batch++) {
+        insert_keys(&env, batch * 500, 500);
+        printf("  Forcing checkpoint after batch %d (keys %d-%d)...\n",
+               batch, batch * 500, batch * 500 + 499);
+        ASSERT(checkpoint_manager_force(mgr), "force");
+    }
 
     uint64_t completed = 0, truncated = 0;
     checkpoint_manager_get_stats(mgr, &completed, &truncated);
     printf("  Checkpoints: %lu, segments truncated: %lu\n", completed, truncated);
-    ASSERT_EQ(completed, 1, "should have 1 checkpoint");
-
-    int segments_after = count_wal_segments(env.wal_path);
-    printf("  WAL segments after checkpoint: %d\n", segments_after);
+    ASSERT_EQ(completed, 4, "should have 4 checkpoints");
 
     // Verify data still accessible
     verify_keys(&env, 0, 2000);
 
     checkpoint_manager_destroy(mgr);
     close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -388,7 +339,7 @@ int main(void) {
     RUN_TEST(test_start_stop);
     RUN_TEST(test_force_checkpoint);
     RUN_TEST(test_concurrent_writes_checkpoint);
-    RUN_TEST(test_wal_truncation);
+    RUN_TEST(test_multiple_checkpoints);
 
     printf("========================================\n");
     printf(" Results: %d/%d tests passed\n", tests_passed, test_count);

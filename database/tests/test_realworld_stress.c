@@ -22,9 +22,6 @@
 
 #include "../include/data_art.h"
 #include "../include/logger.h"
-#include "../include/page_manager.h"
-#include "../include/buffer_pool.h"
-#include "../include/wal.h"
 #include "../include/mvcc.h"
 
 #include <stdio.h>
@@ -55,8 +52,7 @@
 #define READS_PER_SNAP_MAX   50
 #define PREPOPULATE_COUNT    (NUM_KEYS / 2)
 
-#define TEST_DB_PATH   "test_realworld_stress.db"
-#define TEST_WAL_PATH  "test_realworld_stress_wal"
+#define TEST_DIR   "/tmp/test_realworld_stress"
 
 // ============================================================================
 // Shared State
@@ -130,24 +126,9 @@ static uint64_t get_time_usec(void) {
 // ============================================================================
 
 static data_art_tree_t *create_stress_tree(void) {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s %s", TEST_DB_PATH, TEST_WAL_PATH);
-    system(cmd);
+    system("rm -rf " TEST_DIR " && mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    assert(pm != NULL);
-
-    buffer_pool_config_t config = buffer_pool_default_config();
-    config.capacity = 10000;
-    buffer_pool_t *bp = buffer_pool_create(&config, pm);
-    assert(bp != NULL);
-
-    wal_config_t wal_config = wal_default_config();
-    wal_config.segment_size = 4 * 1024 * 1024;
-    wal_t *wal = wal_open(TEST_WAL_PATH, &wal_config);
-    assert(wal != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
     assert(tree != NULL);
     assert(tree->mvcc_manager != NULL);
 
@@ -465,7 +446,7 @@ int main(int argc, char *argv[]) {
     _Atomic bool *key_deleted = calloc(NUM_KEYS, sizeof(_Atomic bool));
     assert(key_deleted != NULL);
 
-    // Keys beyond PREPOPULATE_COUNT don't exist yet — NULL is expected
+    // Keys beyond PREPOPULATE_COUNT don't exist yet -- NULL is expected
     for (int i = PREPOPULATE_COUNT; i < NUM_KEYS; i++)
         atomic_store(&key_deleted[i], true);
 
@@ -525,7 +506,7 @@ int main(int argc, char *argv[]) {
     printf("===============================================================\n");
     printf("  Duration: %.1fs  |  Seed: %u\n", duration_sec, base_seed);
     printf("\n");
-    printf("  Reads:     %" PRIu64 " (%.0f/s) — %" PRIu64 " value, %" PRIu64 " null (deleted)\n",
+    printf("  Reads:     %" PRIu64 " (%.0f/s) -- %" PRIu64 " value, %" PRIu64 " null (deleted)\n",
            total_lookups, total_lookups / duration_sec, state.total_reads, state.null_reads);
     printf("  Writes:    %" PRIu64 " (%.0f/s)\n",
            state.total_writes, state.total_writes / duration_sec);
@@ -572,7 +553,7 @@ int main(int argc, char *argv[]) {
     pthread_mutex_destroy(&state.stats_lock);
     free(key_deleted);
     data_art_destroy(tree);
-    system("rm -rf " TEST_DB_PATH " " TEST_WAL_PATH);
+    system("rm -rf " TEST_DIR);
 
     // Assertions
     if (state.isolation_violations > 0) {

@@ -11,7 +11,6 @@
  */
 
 #include "data_art.h"
-#include "mmap_storage.h"
 #include "db_error.h"
 #include "logger.h"
 
@@ -226,25 +225,7 @@ bool data_art_flush(data_art_tree_t *tree) {
         return false;
     }
 
-    if (tree->mmap_storage) {
-        // mmap path: msync
-        return mmap_storage_sync(tree->mmap_storage);
-    }
-
-    if (!tree->buffer_pool) {
-        // No buffer pool, assume direct writes are already persistent
-        return true;
-    }
-
-    // Flush all dirty pages in buffer pool
-    // buffer_pool_flush_all returns count of flushed frames (>= 0) or -1 on error
-    if (buffer_pool_flush_all(tree->buffer_pool) < 0) {
-        DB_ERROR(DB_ERROR_IO, "buffer pool flush failed");
-        return false;
-    }
-
-    LOG_INFO("Flushed ART tree to disk");
-    return true;
+    return mmap_storage_sync(tree->mmap_storage);
 }
 
 node_ref_t data_art_get_root(const data_art_tree_t *tree) {

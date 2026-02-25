@@ -1,12 +1,10 @@
 /*
  * Basic tests for persistent ART (data_art)
- * 
+ *
  * Tests the core functionality of the disk-backed adaptive radix tree.
  */
 
 #include "data_art.h"
-#include "page_manager.h"
-#include "buffer_pool.h"
 #include "logger.h"
 
 #include <stdio.h>
@@ -14,8 +12,6 @@
 #include <string.h>
 #include <assert.h>
 #include <unistd.h>
-
-#define TEST_DB_FILE "/tmp/test_data_art.db"
 
 // Test counter
 static int tests_run = 0;
@@ -46,10 +42,6 @@ static int tests_passed = 0;
 // Test Helpers
 // ============================================================================
 
-static void cleanup_test_file(void) {
-    unlink(TEST_DB_FILE);
-}
-
 // Helper: create a 32-byte zero-padded key from a string
 static void make_key32(uint8_t key_out[32], const char *str) {
     memset(key_out, 0, 32);
@@ -65,71 +57,37 @@ static void make_key32(uint8_t key_out[32], const char *str) {
 static void test_create_destroy(void) {
     TEST("create and destroy tree");
 
-    cleanup_test_file();
+    system("rm -rf /tmp/test_basic_create && mkdir -p /tmp/test_basic_create");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
-    ASSERT(pm != NULL);
-
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 64;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    ASSERT(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_basic_create/art.dat", 32);
     ASSERT(tree != NULL);
     ASSERT(data_art_size(tree) == 0);
     ASSERT(data_art_is_empty(tree));
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
-    cleanup_test_file();
     PASS();
 }
 
-static void test_create_with_buffer_pool(void) {
-    TEST("create tree with buffer pool");
-    
-    cleanup_test_file();
-    
-    page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
-    ASSERT(pm != NULL);
-    
-    buffer_pool_config_t config = {
-        .capacity = 16,
-        .enable_statistics = true
-    };
-    
-    buffer_pool_t *bp = buffer_pool_create(&config, pm);
-    ASSERT(bp != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+static void test_create_with_defaults(void) {
+    TEST("create tree with mmap defaults");
+
+    system("rm -rf /tmp/test_basic_defaults && mkdir -p /tmp/test_basic_defaults");
+
+    data_art_tree_t *tree = data_art_create("/tmp/test_basic_defaults/art.dat", 32);
     ASSERT(tree != NULL);
-    ASSERT(tree->buffer_pool == bp);
-    
+
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
-    
-    cleanup_test_file();
+
     PASS();
 }
 
 static void test_insert_single_small_value(void) {
     TEST("insert single small key-value");
 
-    cleanup_test_file();
+    system("rm -rf /tmp/test_basic_insert && mkdir -p /tmp/test_basic_insert");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
-    ASSERT(pm != NULL);
-
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 64;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    ASSERT(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_basic_insert/art.dat", 32);
     ASSERT(tree != NULL);
 
     uint8_t key[32];
@@ -150,27 +108,16 @@ static void test_insert_single_small_value(void) {
     ASSERT(strcmp((const char *)retrieved, value) == 0);
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
-    cleanup_test_file();
     PASS();
 }
 
 static void test_insert_large_value_overflow(void) {
     TEST("insert large value requiring overflow pages");
 
-    cleanup_test_file();
+    system("rm -rf /tmp/test_basic_overflow && mkdir -p /tmp/test_basic_overflow");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
-    ASSERT(pm != NULL);
-
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 64;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    ASSERT(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_basic_overflow/art.dat", 32);
     ASSERT(tree != NULL);
 
     uint8_t key[32];
@@ -191,27 +138,16 @@ static void test_insert_large_value_overflow(void) {
 
     free(large_value);
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
-    cleanup_test_file();
     PASS();
 }
 
 static void test_get_nonexistent(void) {
     TEST("get nonexistent key returns NULL");
 
-    cleanup_test_file();
+    system("rm -rf /tmp/test_basic_nokey && mkdir -p /tmp/test_basic_nokey");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
-    ASSERT(pm != NULL);
-
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 64;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    ASSERT(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_basic_nokey/art.dat", 32);
     ASSERT(tree != NULL);
 
     uint8_t key[32];
@@ -223,27 +159,16 @@ static void test_get_nonexistent(void) {
     ASSERT(!data_art_contains(tree, key, 32));
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
-    cleanup_test_file();
     PASS();
 }
 
 static void test_statistics(void) {
     TEST("statistics tracking");
 
-    cleanup_test_file();
+    system("rm -rf /tmp/test_basic_stats && mkdir -p /tmp/test_basic_stats");
 
-    page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
-    ASSERT(pm != NULL);
-
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 64;
-    buffer_pool_t *bp = buffer_pool_create(&bp_config, pm);
-    ASSERT(bp != NULL);
-
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+    data_art_tree_t *tree = data_art_create("/tmp/test_basic_stats/art.dat", 32);
     ASSERT(tree != NULL);
 
     uint8_t key[32];
@@ -265,47 +190,34 @@ static void test_statistics(void) {
     data_art_print_stats(tree);
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
 
-    cleanup_test_file();
     PASS();
 }
 
 static void test_flush_and_persistence(void) {
     TEST("flush tree to disk");
-    
-    cleanup_test_file();
-    
-    page_manager_t *pm = page_manager_create(TEST_DB_FILE, false);
-    ASSERT(pm != NULL);
-    
-    buffer_pool_config_t config = {.capacity = 16, .enable_statistics = true};
-    buffer_pool_t *bp = buffer_pool_create(&config, pm);
-    ASSERT(bp != NULL);
-    
-    data_art_tree_t *tree = data_art_create(pm, bp, NULL, 32);
+
+    system("rm -rf /tmp/test_basic_flush && mkdir -p /tmp/test_basic_flush");
+
+    data_art_tree_t *tree = data_art_create("/tmp/test_basic_flush/art.dat", 32);
     ASSERT(tree != NULL);
-    
+
     uint8_t key[32];
     make_key32(key, "persist");
     const char *value = "data";
 
     data_art_insert(tree, key, 32,
                     value, strlen(value) + 1);
-    
+
     bool flushed = data_art_flush(tree);
     ASSERT(flushed);
-    
+
     // Get root for later recovery
     node_ref_t root = data_art_get_root(tree);
     ASSERT(!node_ref_is_null(root));
-    
+
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    page_manager_destroy(pm);
-    
-    cleanup_test_file();
+
     PASS();
 }
 
@@ -318,21 +230,21 @@ int main(void) {
     printf("========================================\n");
     printf("Persistent ART (data_art) Basic Tests\n");
     printf("========================================\n\n");
-    
+
     // Basic functionality
     test_create_destroy();
-    test_create_with_buffer_pool();
+    test_create_with_defaults();
     test_insert_single_small_value();
     test_insert_large_value_overflow();
     test_get_nonexistent();
     test_statistics();
     test_flush_and_persistence();
-    
+
     // Summary
     printf("\n");
     printf("========================================\n");
     printf("Test Results: %d/%d passed\n", tests_passed, tests_run);
     printf("========================================\n\n");
-    
+
     return (tests_passed == tests_run) ? 0 : 1;
 }

@@ -1,23 +1,20 @@
 /**
- * Crash Recovery Test Suite for Persistent ART
+ * Persistence Test Suite for mmap-backed ART
  *
- * Proves durability and crash resilience by testing:
- *   1. End-to-end recovery (insert -> close -> reopen -> recover -> verify)
- *   2. Truncated WAL entry (simulated crash mid-write)
- *   3. Corrupted WAL entry (bit flip in payload)
- *   4. Checkpoint-based recovery
- *   5. Delete replay (insert → delete → crash → recover → verify deletions persisted)
- *   6. Uncommitted transaction skipped during recovery
- *   7. Mixed committed + uncommitted transactions
- *   8. Metadata persistence (next_page_id survives restart via metadata.bin)
- *   9. Recovery without metadata.bin (WAL checkpoint entry restores next_page_id)
- *  10. Page reuse after deletes (freed pages returned to allocator and reused)
+ * Proves durability by testing:
+ *   1. End-to-end persistence (insert -> destroy -> open -> verify)
+ *   2. Large dataset persistence (1000 keys)
+ *   3. Checkpoint persistence (checkpoint -> destroy -> open -> verify)
+ *   4. Delete persistence (insert -> delete -> destroy -> open -> verify deletions)
+ *   5. Mixed insert+delete persistence
+ *   6. Transaction commit persistence
+ *   7. Transaction abort not persisted
+ *   8. Multiple reopen cycles
+ *   9. Persistence with overflow values
+ *  10. Page growth after deletes and reinserts
  */
 
 #include "data_art.h"
-#include "page_manager.h"
-#include "buffer_pool.h"
-#include "wal.h"
 #include "logger.h"
 
 #include <stdio.h>
@@ -26,7 +23,6 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 
 // ============================================================================
 // Test Framework
@@ -86,54 +82,43 @@ static size_t generate_value(char *buf, size_t max_len, int index) {
 // Test Environment
 // ============================================================================
 
-#define BASE_DB_PATH  "/tmp/test_crash_recovery_db"
-#define BASE_WAL_PATH "/tmp/test_crash_recovery_wal"
+#define BASE_DIR "/tmp/test_persistence"
 
 typedef struct {
-    page_manager_t  *pm;
-    buffer_pool_t   *bp;
-    wal_t           *wal;
     data_art_tree_t *tree;
-    char db_path[256];
-    char wal_path[256];
+    char dir_path[256];
+    char art_path[512];
 } test_env_t;
 
-static void cleanup_paths(const char *db_path, const char *wal_path) {
+static void cleanup_dir(const char *dir_path) {
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s %s", db_path, wal_path);
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir_path);
     system(cmd);
     sync();
     usleep(10000);
 }
 
 static void make_paths(test_env_t *env, const char *suffix) {
-    snprintf(env->db_path, sizeof(env->db_path), "%s_%s", BASE_DB_PATH, suffix);
-    snprintf(env->wal_path, sizeof(env->wal_path), "%s_%s", BASE_WAL_PATH, suffix);
+    snprintf(env->dir_path, sizeof(env->dir_path), "%s_%s", BASE_DIR, suffix);
+    snprintf(env->art_path, sizeof(env->art_path), "%s/art.dat", env->dir_path);
 }
 
-static void open_env(test_env_t *env) {
-    env->pm = page_manager_create(env->db_path, false);
-    ASSERT(env->pm != NULL, "page_manager_create");
+static void create_tree(test_env_t *env) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s", env->dir_path);
+    system(cmd);
 
-    buffer_pool_config_t bp_config = buffer_pool_default_config();
-    bp_config.capacity = 256;
-    env->bp = buffer_pool_create(&bp_config, env->pm);
-    ASSERT(env->bp != NULL, "buffer_pool_create");
-
-    wal_config_t wal_config = wal_default_config();
-    wal_config.segment_size = 8 * 1024 * 1024;  // 8MB
-    env->wal = wal_open(env->wal_path, &wal_config);
-    ASSERT(env->wal != NULL, "wal_open");
-
-    env->tree = data_art_create(env->pm, env->bp, env->wal, KEY_SIZE);
+    env->tree = data_art_create(env->art_path, KEY_SIZE);
     ASSERT(env->tree != NULL, "data_art_create");
 }
 
-static void close_env(test_env_t *env) {
+static void open_tree(test_env_t *env) {
+    env->tree = data_art_open(env->art_path, KEY_SIZE);
+    ASSERT(env->tree != NULL, "data_art_open");
+}
+
+static void close_tree(test_env_t *env) {
     if (env->tree) { data_art_destroy(env->tree); env->tree = NULL; }
-    if (env->wal)  { wal_close(env->wal);         env->wal = NULL; }
-    if (env->bp)   { buffer_pool_destroy(env->bp); env->bp = NULL; }
-    if (env->pm)   { page_manager_destroy(env->pm); env->pm = NULL; }
 }
 
 static void insert_keys(test_env_t *env, int start, int count) {
@@ -158,7 +143,7 @@ static void verify_keys(test_env_t *env, int start, int count) {
         const void *got = data_art_get(env->tree, key, KEY_SIZE, &got_len);
         if (!got) {
             char msg[128];
-            snprintf(msg, sizeof(msg), "Key %d not found after recovery", start + i);
+            snprintf(msg, sizeof(msg), "Key %d not found after reopen", start + i);
             ASSERT(false, msg);
         }
         ASSERT_EQ((long)got_len, (long)expected_len, "value length mismatch");
@@ -180,209 +165,103 @@ static void verify_key_absent(test_env_t *env, int index) {
     }
 }
 
-static off_t get_file_size(const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) return -1;
-    return st.st_size;
-}
-
-static void find_wal_segment(const char *wal_dir, char *out, size_t out_size) {
-    snprintf(out, out_size, "%s/wal_000000.log", wal_dir);
-}
-
 // ============================================================================
-// Test 1: End-to-End Recovery
+// Test 1: End-to-End Persistence
 // ============================================================================
 
-static void test_end_to_end_recovery(void) {
+static void test_end_to_end_persistence(void) {
     printf("  Inserting 100 keys...\n");
     test_env_t env = {0};
     make_paths(&env, "t1");
-    cleanup_paths(env.db_path, env.wal_path);
-    open_env(&env);
+    cleanup_dir(env.dir_path);
+    create_tree(&env);
 
     insert_keys(&env, 0, 100);
-    ASSERT(data_art_flush(env.tree), "flush");
-    ASSERT(wal_fsync(env.wal), "fsync");
+    ASSERT_EQ((long)data_art_size(env.tree), 100L, "tree size before close");
 
     printf("  Closing and reopening...\n");
-    close_env(&env);
-    open_env(&env);
-
-    printf("  Recovering from WAL...\n");
-    int64_t recovered = data_art_recover(env.tree, 0);
-    ASSERT(recovered > 0, "data_art_recover should succeed");
-    printf("  Recovered %ld entries\n", recovered);
+    close_tree(&env);
+    open_tree(&env);
 
     printf("  Verifying all 100 keys...\n");
     verify_keys(&env, 0, 100);
     verify_key_absent(&env, 100);
-    ASSERT_EQ((long)data_art_size(env.tree), 100L, "tree size");
+    ASSERT_EQ((long)data_art_size(env.tree), 100L, "tree size after reopen");
 
-    close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
-// Test 2: Truncated WAL Entry
+// Test 2: Large Dataset Persistence (1000 keys)
 // ============================================================================
 
-static void test_truncated_wal_entry(void) {
+static void test_large_dataset_persistence(void) {
     test_env_t env = {0};
     make_paths(&env, "t2");
-    cleanup_paths(env.db_path, env.wal_path);
-    open_env(&env);
+    cleanup_dir(env.dir_path);
+    create_tree(&env);
 
-    printf("  Inserting 60 keys...\n");
-    insert_keys(&env, 0, 60);
-    ASSERT(data_art_flush(env.tree), "flush");
-    ASSERT(wal_fsync(env.wal), "fsync");
+    printf("  Inserting 1000 keys...\n");
+    insert_keys(&env, 0, 1000);
+    ASSERT_EQ((long)data_art_size(env.tree), 1000L, "tree size");
 
-    close_env(&env);
+    printf("  Closing and reopening...\n");
+    close_tree(&env);
+    open_tree(&env);
 
-    // Truncate the last entry in half
-    char seg_path[512];
-    find_wal_segment(env.wal_path, seg_path, sizeof(seg_path));
-    off_t file_size = get_file_size(seg_path);
-    ASSERT(file_size > 0, "WAL segment exists");
+    printf("  Verifying all 1000 keys...\n");
+    verify_keys(&env, 0, 1000);
+    ASSERT_EQ((long)data_art_size(env.tree), 1000L, "tree size after reopen");
 
-    off_t truncated_size = file_size - 50;
-    printf("  Truncating WAL from %ld to %ld bytes (cutting last entry)...\n",
-           (long)file_size, (long)truncated_size);
-    int ret = truncate(seg_path, truncated_size);
-    ASSERT(ret == 0, "truncate WAL segment");
-
-    // Reopen and recover
-    open_env(&env);
-    printf("  Recovering from truncated WAL...\n");
-    int64_t recovered = data_art_recover(env.tree, 0);
-    ASSERT(recovered >= 0, "recovery should not report error for truncation");
-    printf("  Recovered %ld entries\n", recovered);
-
-    // The last entry (index 59) was truncated, so 59 keys should be present
-    printf("  Verifying 59 keys present, key 59 absent...\n");
-    verify_keys(&env, 0, 59);
-    verify_key_absent(&env, 59);
-
-    close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
-// Test 3: Corrupted WAL Entry
+// Test 3: Checkpoint Persistence
 // ============================================================================
 
-static void test_corrupted_wal_entry(void) {
+static void test_checkpoint_persistence(void) {
     test_env_t env = {0};
     make_paths(&env, "t3");
-    cleanup_paths(env.db_path, env.wal_path);
-    open_env(&env);
-
-    printf("  Inserting 20 keys...\n");
-    insert_keys(&env, 0, 20);
-    ASSERT(data_art_flush(env.tree), "flush");
-    ASSERT(wal_fsync(env.wal), "fsync");
-
-    close_env(&env);
-
-    // Corrupt the last entry's payload
-    char seg_path[512];
-    find_wal_segment(env.wal_path, seg_path, sizeof(seg_path));
-    off_t file_size = get_file_size(seg_path);
-    ASSERT(file_size > 0, "WAL segment exists");
-
-    // Corrupt 4 bytes near the end (within the last entry's payload)
-    off_t corruption_offset = file_size - 20;
-    printf("  Corrupting 4 bytes at offset %ld (file size %ld)...\n",
-           (long)corruption_offset, (long)file_size);
-    int fd = open(seg_path, O_WRONLY);
-    ASSERT(fd >= 0, "open WAL segment for corruption");
-    uint8_t garbage[4] = {0xDE, 0xAD, 0xBE, 0xEF};
-    ssize_t written = pwrite(fd, garbage, sizeof(garbage), corruption_offset);
-    ASSERT(written == sizeof(garbage), "pwrite corruption bytes");
-    close(fd);
-
-    // Reopen and recover — should return -1 due to CRC mismatch
-    open_env(&env);
-    printf("  Recovering from corrupted WAL...\n");
-    int64_t recovered = data_art_recover(env.tree, 0);
-    printf("  Recovery returned %ld (expected -1 due to corruption)\n", recovered);
-    ASSERT_EQ(recovered, -1L, "recovery should report error for corruption");
-
-    // But the 19 entries before the corrupted one were still applied
-    printf("  Verifying 19 keys present, key 19 absent...\n");
-    verify_keys(&env, 0, 19);
-    verify_key_absent(&env, 19);
-
-    // Validate segment should also report errors
-    uint32_t errors = 0;
-    bool valid = wal_validate_segment(env.wal, 0, &errors);
-    ASSERT(!valid, "segment should be invalid");
-    ASSERT(errors > 0, "errors should be reported");
-    printf("  wal_validate_segment: valid=%d, errors=%u\n", valid, errors);
-
-    close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
-}
-
-// ============================================================================
-// Test 4: Recovery with Checkpoint in WAL
-// ============================================================================
-
-static void test_checkpoint_recovery(void) {
-    test_env_t env = {0};
-    make_paths(&env, "t4");
-    cleanup_paths(env.db_path, env.wal_path);
-    open_env(&env);
+    cleanup_dir(env.dir_path);
+    create_tree(&env);
 
     printf("  Inserting 50 keys...\n");
     insert_keys(&env, 0, 50);
-    ASSERT(data_art_flush(env.tree), "flush before checkpoint");
-    ASSERT(wal_fsync(env.wal), "fsync before checkpoint");
 
     printf("  Creating checkpoint...\n");
     uint64_t checkpoint_lsn = 0;
     bool ok = data_art_checkpoint(env.tree, &checkpoint_lsn);
     ASSERT(ok, "data_art_checkpoint");
-    ASSERT(checkpoint_lsn > 0, "checkpoint LSN assigned");
     printf("  Checkpoint at LSN %lu\n", checkpoint_lsn);
 
     printf("  Inserting 30 more keys...\n");
     insert_keys(&env, 50, 30);
-    ASSERT(data_art_flush(env.tree), "flush after more inserts");
-    ASSERT(wal_fsync(env.wal), "fsync after more inserts");
 
-    close_env(&env);
+    printf("  Closing and reopening...\n");
+    close_tree(&env);
+    open_tree(&env);
 
-    // Reopen and recover from scratch (LSN 0) — replays all 50 inserts,
-    // the checkpoint entry (sets root/size), then 30 more inserts.
-    // This validates that WAL replay handles checkpoint entries correctly
-    // when rebuilding the full tree from scratch.
-    open_env(&env);
-    printf("  Recovering from WAL (full replay with checkpoint in middle)...\n");
-    int64_t recovered = data_art_recover(env.tree, 0);
-    ASSERT(recovered > 0, "data_art_recover should succeed");
-    printf("  Recovered %ld entries (50 inserts + 1 checkpoint + 30 inserts)\n", recovered);
-    ASSERT_EQ(recovered, 81L, "should replay 50 + 1 checkpoint + 30 entries");
-
-    // All 80 keys should be present
+    // All 80 keys should be present (mmap persists everything)
     printf("  Verifying all 80 keys...\n");
     verify_keys(&env, 0, 80);
-    ASSERT_EQ((long)data_art_size(env.tree), 80L, "tree size after recovery");
+    ASSERT_EQ((long)data_art_size(env.tree), 80L, "tree size after reopen");
 
-    close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
-// Test 5: Delete Replay Recovery
+// Test 4: Delete Persistence
 // ============================================================================
 
-static void test_delete_replay_recovery(void) {
+static void test_delete_persistence(void) {
     test_env_t env = {0};
-    make_paths(&env, "t5");
-    cleanup_paths(env.db_path, env.wal_path);
-    open_env(&env);
+    make_paths(&env, "t4");
+    cleanup_dir(env.dir_path);
+    create_tree(&env);
 
     // Insert keys 0-49
     printf("  Inserting 50 keys...\n");
@@ -397,19 +276,12 @@ static void test_delete_replay_recovery(void) {
         ASSERT(ok, "delete existing key");
     }
 
-    ASSERT(data_art_flush(env.tree), "flush");
-    ASSERT(wal_fsync(env.wal), "fsync");
+    ASSERT_EQ((long)data_art_size(env.tree), 30L, "tree size after deletes");
 
-    // Simulate crash
+    // Close and reopen
     printf("  Closing and reopening...\n");
-    close_env(&env);
-    open_env(&env);
-
-    // Recover
-    printf("  Recovering from WAL...\n");
-    int64_t recovered = data_art_recover(env.tree, 0);
-    ASSERT(recovered > 0, "recovery should succeed");
-    printf("  Recovered %ld entries (50 inserts + 20 deletes)\n", recovered);
+    close_tree(&env);
+    open_tree(&env);
 
     // Keys 0-9 should exist
     printf("  Verifying keys 0-9 present...\n");
@@ -425,89 +297,30 @@ static void test_delete_replay_recovery(void) {
     printf("  Verifying keys 30-49 present...\n");
     verify_keys(&env, 30, 20);
 
-    ASSERT_EQ((long)data_art_size(env.tree), 30L, "tree size after delete recovery");
+    ASSERT_EQ((long)data_art_size(env.tree), 30L, "tree size after reopen");
 
-    close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
-// Test 6: Uncommitted Transaction Skipped During Recovery
+// Test 5: Mixed Insert + Delete Persistence
 // ============================================================================
 
-static void test_uncommitted_txn_skipped(void) {
+static void test_mixed_persistence(void) {
     test_env_t env = {0};
-    make_paths(&env, "t6");
-    cleanup_paths(env.db_path, env.wal_path);
-    open_env(&env);
-
-    // Insert 20 keys normally (auto-commit, no BEGIN/COMMIT in WAL)
-    printf("  Inserting 20 auto-committed keys...\n");
-    insert_keys(&env, 0, 20);
-
-    // Simulate incomplete transaction: write WAL entries directly
-    // BEGIN_TXN for fake txn, then 10 INSERTs, but NO COMMIT
-    uint64_t fake_txn_id = 9999;
-    printf("  Writing uncommitted txn (id=%lu) with 10 inserts to WAL...\n", fake_txn_id);
-    ASSERT(wal_log_begin_txn(env.wal, fake_txn_id, NULL), "wal_log_begin_txn");
-
-    for (int i = 0; i < 10; i++) {
-        uint8_t key[KEY_SIZE];
-        char value[VALUE_MAX_LEN];
-        generate_key(key, 1000 + i);
-        size_t vlen = generate_value(value, sizeof(value), 1000 + i);
-        ASSERT(wal_log_insert(env.wal, fake_txn_id, key, KEY_SIZE,
-                              (const uint8_t *)value, (uint32_t)vlen, NULL),
-               "wal_log_insert for uncommitted txn");
-    }
-    // Intentionally NO wal_log_commit_txn — simulating crash mid-commit
-
-    ASSERT(data_art_flush(env.tree), "flush");
-    ASSERT(wal_fsync(env.wal), "fsync");
-
-    printf("  Closing and reopening...\n");
-    close_env(&env);
-    open_env(&env);
-
-    printf("  Recovering from WAL (should skip uncommitted txn)...\n");
-    int64_t recovered = data_art_recover(env.tree, 0);
-    ASSERT(recovered > 0, "recovery should succeed");
-    printf("  Recovered %ld entries\n", recovered);
-
-    // 20 auto-committed keys should exist
-    printf("  Verifying 20 auto-committed keys present...\n");
-    verify_keys(&env, 0, 20);
-
-    // 10 uncommitted keys should NOT exist
-    printf("  Verifying 10 uncommitted keys absent...\n");
-    for (int i = 0; i < 10; i++) {
-        verify_key_absent(&env, 1000 + i);
-    }
-
-    ASSERT_EQ((long)data_art_size(env.tree), 20L, "tree size (uncommitted excluded)");
-
-    close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
-}
-
-// ============================================================================
-// Test 7: Mixed Committed + Uncommitted Transactions
-// ============================================================================
-
-static void test_mixed_committed_uncommitted(void) {
-    test_env_t env = {0};
-    make_paths(&env, "t7");
-    cleanup_paths(env.db_path, env.wal_path);
-    open_env(&env);
+    make_paths(&env, "t5");
+    cleanup_dir(env.dir_path);
+    create_tree(&env);
 
     // Insert 10 keys via auto-commit
-    printf("  Inserting 10 auto-committed keys...\n");
+    printf("  Inserting 10 keys...\n");
     insert_keys(&env, 0, 10);
 
-    // Begin explicit txn1, insert 5 keys, commit
+    // Begin explicit txn, insert 5 more keys, commit
     printf("  Committing explicit txn with 5 keys...\n");
-    uint64_t txn_id1;
-    ASSERT(data_art_begin_txn(env.tree, &txn_id1), "begin_txn");
+    uint64_t txn_id;
+    ASSERT(data_art_begin_txn(env.tree, &txn_id), "begin_txn");
     for (int i = 0; i < 5; i++) {
         uint8_t key[KEY_SIZE];
         char value[VALUE_MAX_LEN];
@@ -517,32 +330,11 @@ static void test_mixed_committed_uncommitted(void) {
     }
     ASSERT(data_art_commit_txn(env.tree), "commit_txn");
 
-    // Write uncommitted txn2 directly to WAL (simulating crash mid-commit)
-    uint64_t fake_txn_id = 8888;
-    printf("  Writing uncommitted txn (id=%lu) with 5 inserts to WAL...\n", fake_txn_id);
-    ASSERT(wal_log_begin_txn(env.wal, fake_txn_id, NULL), "wal_log_begin_txn");
-    for (int i = 0; i < 5; i++) {
-        uint8_t key[KEY_SIZE];
-        char value[VALUE_MAX_LEN];
-        generate_key(key, 2000 + i);
-        size_t vlen = generate_value(value, sizeof(value), 2000 + i);
-        ASSERT(wal_log_insert(env.wal, fake_txn_id, key, KEY_SIZE,
-                              (const uint8_t *)value, (uint32_t)vlen, NULL),
-               "wal_log_insert for uncommitted txn");
-    }
-    // NO commit for fake_txn_id
-
-    ASSERT(data_art_flush(env.tree), "flush");
-    ASSERT(wal_fsync(env.wal), "fsync");
+    ASSERT_EQ((long)data_art_size(env.tree), 15L, "tree size (10 auto + 5 committed)");
 
     printf("  Closing and reopening...\n");
-    close_env(&env);
-    open_env(&env);
-
-    printf("  Recovering from WAL...\n");
-    int64_t recovered = data_art_recover(env.tree, 0);
-    ASSERT(recovered > 0, "recovery should succeed");
-    printf("  Recovered %ld entries\n", recovered);
+    close_tree(&env);
+    open_tree(&env);
 
     // 10 auto-committed keys should exist
     printf("  Verifying 10 auto-committed keys present...\n");
@@ -552,144 +344,203 @@ static void test_mixed_committed_uncommitted(void) {
     printf("  Verifying 5 committed txn keys present...\n");
     verify_keys(&env, 100, 5);
 
-    // 5 uncommitted keys should NOT exist
-    printf("  Verifying 5 uncommitted keys absent...\n");
-    for (int i = 0; i < 5; i++) {
-        verify_key_absent(&env, 2000 + i);
-    }
+    ASSERT_EQ((long)data_art_size(env.tree), 15L, "tree size after reopen");
 
-    ASSERT_EQ((long)data_art_size(env.tree), 15L, "tree size (15 = 10 auto + 5 committed)");
-
-    close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
-// Test 8: Metadata Persistence Across Restart
+// Test 6: Transaction Commit Persistence
 // ============================================================================
 
-static void test_metadata_persistence(void) {
+static void test_txn_commit_persistence(void) {
+    test_env_t env = {0};
+    make_paths(&env, "t6");
+    cleanup_dir(env.dir_path);
+    create_tree(&env);
+
+    // Insert via explicit transaction
+    printf("  Inserting 50 keys via explicit txn...\n");
+    uint64_t txn_id;
+    ASSERT(data_art_begin_txn(env.tree, &txn_id), "begin_txn");
+    for (int i = 0; i < 50; i++) {
+        uint8_t key[KEY_SIZE];
+        char value[VALUE_MAX_LEN];
+        generate_key(key, i);
+        size_t vlen = generate_value(value, sizeof(value), i);
+        ASSERT(data_art_insert(env.tree, key, KEY_SIZE, value, vlen), "txn insert");
+    }
+    ASSERT(data_art_commit_txn(env.tree), "commit_txn");
+    ASSERT_EQ((long)data_art_size(env.tree), 50L, "tree size after commit");
+
+    printf("  Closing and reopening...\n");
+    close_tree(&env);
+    open_tree(&env);
+
+    printf("  Verifying all 50 keys...\n");
+    verify_keys(&env, 0, 50);
+    ASSERT_EQ((long)data_art_size(env.tree), 50L, "tree size after reopen");
+
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
+}
+
+// ============================================================================
+// Test 7: Transaction Abort Not Persisted
+// ============================================================================
+
+static void test_txn_abort_not_persisted(void) {
+    test_env_t env = {0};
+    make_paths(&env, "t7");
+    cleanup_dir(env.dir_path);
+    create_tree(&env);
+
+    // Insert 20 keys normally
+    printf("  Inserting 20 auto-committed keys...\n");
+    insert_keys(&env, 0, 20);
+
+    // Begin txn with 10 more keys, then ABORT
+    printf("  Inserting 10 keys in txn, then aborting...\n");
+    uint64_t txn_id;
+    ASSERT(data_art_begin_txn(env.tree, &txn_id), "begin_txn");
+    for (int i = 0; i < 10; i++) {
+        uint8_t key[KEY_SIZE];
+        char value[VALUE_MAX_LEN];
+        generate_key(key, 1000 + i);
+        size_t vlen = generate_value(value, sizeof(value), 1000 + i);
+        ASSERT(data_art_insert(env.tree, key, KEY_SIZE, value, vlen), "txn insert");
+    }
+    ASSERT(data_art_abort_txn(env.tree), "abort_txn");
+
+    // Only 20 keys should exist (aborted txn not applied)
+    ASSERT_EQ((long)data_art_size(env.tree), 20L, "tree size after abort");
+
+    printf("  Closing and reopening...\n");
+    close_tree(&env);
+    open_tree(&env);
+
+    // 20 auto-committed keys should exist
+    printf("  Verifying 20 auto-committed keys present...\n");
+    verify_keys(&env, 0, 20);
+
+    // 10 aborted keys should NOT exist
+    printf("  Verifying 10 aborted keys absent...\n");
+    for (int i = 0; i < 10; i++) {
+        verify_key_absent(&env, 1000 + i);
+    }
+
+    ASSERT_EQ((long)data_art_size(env.tree), 20L, "tree size after reopen");
+
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
+}
+
+// ============================================================================
+// Test 8: Multiple Reopen Cycles
+// ============================================================================
+
+static void test_multiple_reopen_cycles(void) {
     test_env_t env = {0};
     make_paths(&env, "t8");
-    cleanup_paths(env.db_path, env.wal_path);
-    open_env(&env);
+    cleanup_dir(env.dir_path);
+    create_tree(&env);
 
     // Insert 50 keys
     printf("  Inserting 50 keys...\n");
     insert_keys(&env, 0, 50);
 
-    // Checkpoint (writes metadata.bin + WAL checkpoint entry)
+    // Checkpoint
     printf("  Checkpointing...\n");
     uint64_t ckpt_lsn;
     ASSERT(data_art_checkpoint(env.tree, &ckpt_lsn), "checkpoint");
 
-    // Record next_page_id before close
-    uint64_t saved_next_pid = page_manager_get_next_page_id(env.pm);
-    printf("  next_page_id before close: %lu\n", saved_next_pid);
-    ASSERT(saved_next_pid > 1, "next_page_id should advance after 50 inserts");
-
     // Close and reopen
-    printf("  Closing and reopening...\n");
-    close_env(&env);
-    open_env(&env);
+    printf("  Cycle 1: close and reopen...\n");
+    close_tree(&env);
+    open_tree(&env);
 
-    // Verify next_page_id restored from metadata.bin
-    uint64_t restored_next_pid = page_manager_get_next_page_id(env.pm);
-    printf("  next_page_id after reopen: %lu\n", restored_next_pid);
-    ASSERT_EQ((long)restored_next_pid, (long)saved_next_pid,
-              "next_page_id should survive restart");
-
-    // Recover from WAL
-    printf("  Recovering from WAL...\n");
-    int64_t recovered = data_art_recover(env.tree, 0);
-    ASSERT(recovered > 0, "recovery should succeed");
-
-    // Insert 50 more keys (should not collide with existing pages)
+    // Insert 50 more keys
     printf("  Inserting 50 more keys...\n");
     insert_keys(&env, 50, 50);
+
+    // Close and reopen again
+    printf("  Cycle 2: close and reopen...\n");
+    close_tree(&env);
+    open_tree(&env);
 
     // Verify all 100 keys present
     printf("  Verifying all 100 keys...\n");
     verify_keys(&env, 0, 100);
     ASSERT_EQ((long)data_art_size(env.tree), 100L, "tree size");
 
-    close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
-// Test 9: Recovery Without metadata.bin (WAL-only fallback)
+// Test 9: Persistence with Overflow Values
 // ============================================================================
 
-static void test_recovery_without_metadata_file(void) {
+static void test_overflow_value_persistence(void) {
     test_env_t env = {0};
     make_paths(&env, "t9");
-    cleanup_paths(env.db_path, env.wal_path);
-    open_env(&env);
+    cleanup_dir(env.dir_path);
+    create_tree(&env);
 
-    // Insert 30 keys and checkpoint
-    printf("  Inserting 30 keys and checkpointing...\n");
-    insert_keys(&env, 0, 30);
-    uint64_t ckpt_lsn;
-    ASSERT(data_art_checkpoint(env.tree, &ckpt_lsn), "checkpoint");
+    // Insert 10 keys with 8KB values (triggers overflow pages)
+    const size_t big_val_len = 8 * 1024;
+    char *big_val = malloc(big_val_len);
+    ASSERT(big_val != NULL, "malloc big value");
 
-    uint64_t saved_next_pid = page_manager_get_next_page_id(env.pm);
-    printf("  next_page_id before close: %lu\n", saved_next_pid);
+    printf("  Inserting 10 keys with 8KB values...\n");
+    for (int i = 0; i < 10; i++) {
+        uint8_t key[KEY_SIZE];
+        generate_key(key, i);
+        memset(big_val, (uint8_t)(i + 'A'), big_val_len);
+        bool ok = data_art_insert(env.tree, key, KEY_SIZE, big_val, big_val_len);
+        ASSERT(ok, "insert overflow key");
+    }
 
-    close_env(&env);
+    printf("  Closing and reopening...\n");
+    close_tree(&env);
+    open_tree(&env);
 
-    // Delete metadata.bin to simulate missing file
-    char meta_path[512];
-    snprintf(meta_path, sizeof(meta_path), "%s/metadata.bin", env.db_path);
-    printf("  Deleting %s...\n", meta_path);
-    unlink(meta_path);
+    printf("  Verifying 10 overflow keys...\n");
+    for (int i = 0; i < 10; i++) {
+        uint8_t key[KEY_SIZE];
+        generate_key(key, i);
+        memset(big_val, (uint8_t)(i + 'A'), big_val_len);
 
-    // Reopen — metadata.bin missing, next_page_id starts at 1
-    open_env(&env);
-    uint64_t pre_recovery_pid = page_manager_get_next_page_id(env.pm);
-    printf("  next_page_id after reopen (no metadata): %lu\n", pre_recovery_pid);
+        size_t found_len = 0;
+        const void *found = data_art_get(env.tree, key, KEY_SIZE, &found_len);
+        ASSERT(found != NULL, "overflow key should exist");
+        ASSERT_EQ((long)found_len, (long)big_val_len, "overflow value length");
+        ASSERT(memcmp(found, big_val, big_val_len) == 0, "overflow value content");
+        free((void *)found);
+    }
+    ASSERT_EQ((long)data_art_size(env.tree), 10L, "tree size");
 
-    // Recover from WAL — checkpoint entry should restore next_page_id
-    printf("  Recovering from WAL (checkpoint entry should restore next_page_id)...\n");
-    int64_t recovered = data_art_recover(env.tree, 0);
-    ASSERT(recovered > 0, "recovery should succeed");
-
-    uint64_t post_recovery_pid = page_manager_get_next_page_id(env.pm);
-    printf("  next_page_id after recovery: %lu\n", post_recovery_pid);
-    ASSERT_EQ((long)post_recovery_pid, (long)saved_next_pid,
-              "next_page_id should be restored from WAL checkpoint entry");
-
-    // Insert more keys — should not collide
-    printf("  Inserting 20 more keys...\n");
-    insert_keys(&env, 30, 20);
-
-    printf("  Verifying all 50 keys...\n");
-    verify_keys(&env, 0, 50);
-    ASSERT_EQ((long)data_art_size(env.tree), 50L, "tree size");
-
-    close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    free(big_val);
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
-// Test 10: Page Reuse After Deletes
+// Test 10: Page Growth After Deletes and Reinserts
 // ============================================================================
 
-static void test_page_reuse_after_deletes(void) {
+static void test_page_growth_after_deletes(void) {
     test_env_t env = {0};
     make_paths(&env, "t10");
-    cleanup_paths(env.db_path, env.wal_path);
-    open_env(&env);
+    cleanup_dir(env.dir_path);
+    create_tree(&env);
 
     // Insert 200 keys
     printf("  Inserting 200 keys...\n");
     insert_keys(&env, 0, 200);
-    ASSERT(data_art_flush(env.tree), "flush after insert");
 
-    uint64_t pid_after_insert = page_manager_get_next_page_id(env.pm);
-    printf("  next_page_id after 200 inserts: %lu\n", pid_after_insert);
-
-    // Delete 150 keys (0-149) — pages are marked dead (append-only)
+    // Delete 150 keys (0-149)
     printf("  Deleting 150 keys...\n");
     for (int i = 0; i < 150; i++) {
         uint8_t key[KEY_SIZE];
@@ -697,25 +548,18 @@ static void test_page_reuse_after_deletes(void) {
         bool ok = data_art_delete(env.tree, key, KEY_SIZE);
         ASSERT(ok, "delete key");
     }
-    ASSERT(data_art_flush(env.tree), "flush after delete");
 
     // Verify tree size is 50
     ASSERT_EQ((long)data_art_size(env.tree), 50L, "tree size after deletes");
 
-    // Insert 150 NEW keys (starting at 1000) — allocates fresh page IDs
-    printf("  Inserting 150 new keys (should reuse freed pages)...\n");
+    // Insert 150 NEW keys (starting at 1000)
+    printf("  Inserting 150 new keys...\n");
     insert_keys(&env, 1000, 150);
-    ASSERT(data_art_flush(env.tree), "flush after reinsert");
 
-    uint64_t pid_after_reinsert = page_manager_get_next_page_id(env.pm);
-    printf("  next_page_id after reinserting 150: %lu\n", pid_after_reinsert);
-
-    // In append-only mode, pages are NOT reused — freed pages become dead space.
-    // next_page_id should grow because new allocations always get fresh IDs.
-    printf("  Append-only check: pid_after_reinsert=%lu > pid_after_insert=%lu\n",
-           pid_after_reinsert, pid_after_insert);
-    ASSERT(pid_after_reinsert > pid_after_insert,
-           "next_page_id should grow (no reuse in append-only mode)");
+    // Close and reopen
+    printf("  Closing and reopening...\n");
+    close_tree(&env);
+    open_tree(&env);
 
     // Verify all 200 keys present (50 surviving + 150 new)
     printf("  Verifying 50 surviving keys (150-199)...\n");
@@ -732,8 +576,8 @@ static void test_page_reuse_after_deletes(void) {
 
     ASSERT_EQ((long)data_art_size(env.tree), 200L, "final tree size");
 
-    close_env(&env);
-    cleanup_paths(env.db_path, env.wal_path);
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
 }
 
 // ============================================================================
@@ -745,7 +589,7 @@ int main(void) {
 
     printf("\n");
     printf("========================================\n");
-    printf(" Crash Recovery Test Suite\n");
+    printf(" Persistence Test Suite\n");
     printf("========================================\n\n");
 
     #define RUN_TEST(fn) do { \
@@ -756,16 +600,16 @@ int main(void) {
         printf(COLOR_GREEN "  PASSED\n\n" COLOR_RESET); \
     } while(0)
 
-    RUN_TEST(test_end_to_end_recovery);
-    RUN_TEST(test_truncated_wal_entry);
-    RUN_TEST(test_corrupted_wal_entry);
-    RUN_TEST(test_checkpoint_recovery);
-    RUN_TEST(test_delete_replay_recovery);
-    RUN_TEST(test_uncommitted_txn_skipped);
-    RUN_TEST(test_mixed_committed_uncommitted);
-    RUN_TEST(test_metadata_persistence);
-    RUN_TEST(test_recovery_without_metadata_file);
-    RUN_TEST(test_page_reuse_after_deletes);
+    RUN_TEST(test_end_to_end_persistence);
+    RUN_TEST(test_large_dataset_persistence);
+    RUN_TEST(test_checkpoint_persistence);
+    RUN_TEST(test_delete_persistence);
+    RUN_TEST(test_mixed_persistence);
+    RUN_TEST(test_txn_commit_persistence);
+    RUN_TEST(test_txn_abort_not_persisted);
+    RUN_TEST(test_multiple_reopen_cycles);
+    RUN_TEST(test_overflow_value_persistence);
+    RUN_TEST(test_page_growth_after_deletes);
 
     printf("========================================\n");
     printf(" Results: %d/%d tests passed\n", tests_passed, test_count);

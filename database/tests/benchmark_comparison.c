@@ -10,10 +10,6 @@
  */
 
 #include "data_art.h"
-#include "mmap_storage.h"
-#include "page_manager.h"
-#include "buffer_pool.h"
-#include "wal.h"
 #include "logger.h"
 
 #ifdef HAVE_LMDB
@@ -31,10 +27,8 @@
 
 #define KEY_SIZE 32
 #define VALUE_SIZE 32
-#define ART_DB_PATH "/tmp/bench_art.db"
-#define ART_WAL_PATH "/tmp/bench_art_wal"
-#define ART_MMAP_DIR "/tmp/bench_art_mmap"
-#define ART_MMAP_FILE "/tmp/bench_art_mmap/art_mmap.dat"
+#define ART_DIR "/tmp/bench_art_mmap"
+#define ART_FILE "/tmp/bench_art_mmap/art.dat"
 #define LMDB_PATH "/tmp/bench_lmdb"
 
 // ============================================================================
@@ -85,9 +79,7 @@ static void cleanup_path(const char *path) {
 }
 
 static void cleanup_all(void) {
-    cleanup_path(ART_DB_PATH);
-    cleanup_path(ART_WAL_PATH);
-    cleanup_path(ART_MMAP_DIR);
+    cleanup_path(ART_DIR);
     cleanup_path(LMDB_PATH);
     sync();
     usleep(10000);
@@ -167,61 +159,18 @@ static void print_comparison(const char *name, bench_result_t art,
 // ART helpers
 // ============================================================================
 
-typedef struct {
-    page_manager_t *pm;
-    buffer_pool_t *bp;
-    wal_t *wal;
-    data_art_tree_t *tree;
-} art_ctx_t;
+static data_art_tree_t *art_open(void) {
+    cleanup_path(ART_DIR);
+    mkdir(ART_DIR, 0755);
 
-static art_ctx_t art_open(void) {
-    art_ctx_t ctx = {0};
-    cleanup_path(ART_DB_PATH);
-    cleanup_path(ART_WAL_PATH);
-    sync();
-    usleep(5000);
-
-    ctx.pm = page_manager_create(ART_DB_PATH, false);
-    if (!ctx.pm) { fprintf(stderr, "ART: page_manager_create failed\n"); return ctx; }
-
-    // Disable compression — LZ4 wastes CPU on small random-data nodes
-    page_manager_set_compression(ctx.pm, COMPRESSION_NONE);
-
-    ctx.bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 65536}, ctx.pm);
-    if (!ctx.bp) { fprintf(stderr, "ART: buffer_pool_create failed\n"); return ctx; }
-
-    ctx.wal = wal_open(ART_WAL_PATH, &(wal_config_t){.segment_size = 8 * 1024 * 1024});
-    if (!ctx.wal) { fprintf(stderr, "ART: wal_open failed\n"); return ctx; }
-
-    ctx.tree = data_art_create(ctx.pm, ctx.bp, ctx.wal, KEY_SIZE);
-    if (!ctx.tree) { fprintf(stderr, "ART: data_art_create failed\n"); }
-    return ctx;
-}
-
-static void art_close(art_ctx_t *ctx) {
-    if (ctx->tree) data_art_destroy(ctx->tree);
-    if (ctx->bp) buffer_pool_destroy(ctx->bp);
-    if (ctx->wal) wal_close(ctx->wal);
-    if (ctx->pm) page_manager_destroy(ctx->pm);
-    memset(ctx, 0, sizeof(*ctx));
-}
-
-// ============================================================================
-// mmap ART helpers
-// ============================================================================
-
-static data_art_tree_t *mmap_art_open(void) {
-    cleanup_path(ART_MMAP_DIR);
-    mkdir(ART_MMAP_DIR, 0755);
-
-    data_art_tree_t *tree = data_art_create_mmap(ART_MMAP_FILE, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(ART_FILE, KEY_SIZE);
     if (!tree) {
-        fprintf(stderr, "ART(mmap): data_art_create_mmap failed\n");
+        fprintf(stderr, "ART: data_art_create failed\n");
     }
     return tree;
 }
 
-static void mmap_art_close(data_art_tree_t *tree) {
+static void art_close(data_art_tree_t *tree) {
     if (tree) data_art_destroy(tree);
 }
 
@@ -282,22 +231,22 @@ static void bench_bulk_insert_sequential(int num_keys) {
 
     // --- ART: single txn ---
     {
-        art_ctx_t ctx = art_open();
-        if (!ctx.tree) return;
+        data_art_tree_t *tree = art_open();
+        if (!tree) return;
 
         uint64_t txn_id;
-        data_art_begin_txn(ctx.tree, &txn_id);
+        data_art_begin_txn(tree, &txn_id);
 
         uint64_t start = get_time_us();
         for (int i = 0; i < num_keys; i++) {
             make_sequential_key(i, key);
             make_value(i, value);
-            data_art_insert(ctx.tree, key, KEY_SIZE, value, VALUE_SIZE);
+            data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
         }
-        data_art_commit_txn(ctx.tree);
+        data_art_commit_txn(tree);
         art_res.elapsed_us = get_time_us() - start;
         art_res.num_ops = num_keys;
-        art_close(&ctx);
+        art_close(tree);
     }
 
     // --- LMDB: single txn ---
@@ -333,22 +282,22 @@ static void bench_bulk_insert_random(int num_keys) {
 
     // --- ART: single txn ---
     {
-        art_ctx_t ctx = art_open();
-        if (!ctx.tree) return;
+        data_art_tree_t *tree = art_open();
+        if (!tree) return;
 
         uint64_t txn_id;
-        data_art_begin_txn(ctx.tree, &txn_id);
+        data_art_begin_txn(tree, &txn_id);
 
         uint64_t start = get_time_us();
         for (int i = 0; i < num_keys; i++) {
             make_key(i, key);
             make_value(i, value);
-            data_art_insert(ctx.tree, key, KEY_SIZE, value, VALUE_SIZE);
+            data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
         }
-        data_art_commit_txn(ctx.tree);
+        data_art_commit_txn(tree);
         art_res.elapsed_us = get_time_us() - start;
         art_res.num_ops = num_keys;
-        art_close(&ctx);
+        art_close(tree);
     }
 
     // --- LMDB: single txn ---
@@ -388,18 +337,18 @@ static void bench_perkey_insert(int num_keys) {
 
     // --- ART: auto-commit per key ---
     {
-        art_ctx_t ctx = art_open();
-        if (!ctx.tree) return;
+        data_art_tree_t *tree = art_open();
+        if (!tree) return;
 
         uint64_t start = get_time_us();
         for (int i = 0; i < num_keys; i++) {
             make_key(i, key);
             make_value(i, value);
-            data_art_insert(ctx.tree, key, KEY_SIZE, value, VALUE_SIZE);
+            data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
         }
         art_res.elapsed_us = get_time_us() - start;
         art_res.num_ops = num_keys;
-        art_close(&ctx);
+        art_close(tree);
     }
 
     // --- LMDB: one txn per key ---
@@ -439,25 +388,25 @@ static void bench_random_lookup(int num_keys) {
 
     // --- ART ---
     {
-        art_ctx_t ctx = art_open();
-        if (!ctx.tree) return;
+        data_art_tree_t *tree = art_open();
+        if (!tree) return;
 
         // Setup (not timed): bulk insert
         uint64_t txn_id;
-        data_art_begin_txn(ctx.tree, &txn_id);
+        data_art_begin_txn(tree, &txn_id);
         for (int i = 0; i < num_keys; i++) {
             make_key(i, key);
             make_value(i, value);
-            data_art_insert(ctx.tree, key, KEY_SIZE, value, VALUE_SIZE);
+            data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
         }
-        data_art_commit_txn(ctx.tree);
+        data_art_commit_txn(tree);
 
         // Timed: lookup in reverse order
         uint64_t start = get_time_us();
         for (int i = 0; i < num_keys; i++) {
             make_key(num_keys - 1 - i, key);
             size_t vlen;
-            const void *val = data_art_get(ctx.tree, key, KEY_SIZE, &vlen);
+            const void *val = data_art_get(tree, key, KEY_SIZE, &vlen);
             if (!val) {
                 fprintf(stderr, "ART: lookup miss at %d\n", num_keys - 1 - i);
                 break;
@@ -465,7 +414,7 @@ static void bench_random_lookup(int num_keys) {
         }
         art_res.elapsed_us = get_time_us() - start;
         art_res.num_ops = num_keys;
-        art_close(&ctx);
+        art_close(tree);
     }
 
     // --- LMDB ---
@@ -514,22 +463,22 @@ static void bench_range_scan(int num_keys) {
 
     // --- ART ---
     {
-        art_ctx_t ctx = art_open();
-        if (!ctx.tree) return;
+        data_art_tree_t *tree = art_open();
+        if (!tree) return;
 
         // Setup
         uint64_t txn_id;
-        data_art_begin_txn(ctx.tree, &txn_id);
+        data_art_begin_txn(tree, &txn_id);
         for (int i = 0; i < num_keys; i++) {
             make_key(i, key);
             make_value(i, value);
-            data_art_insert(ctx.tree, key, KEY_SIZE, value, VALUE_SIZE);
+            data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
         }
-        data_art_commit_txn(ctx.tree);
+        data_art_commit_txn(tree);
 
         // Timed: full scan
         uint64_t start = get_time_us();
-        data_art_iterator_t *iter = data_art_iterator_create(ctx.tree);
+        data_art_iterator_t *iter = data_art_iterator_create(tree);
         int count = 0;
         while (data_art_iterator_next(iter)) {
             size_t klen, vlen;
@@ -540,7 +489,7 @@ static void bench_range_scan(int num_keys) {
         data_art_iterator_destroy(iter);
         art_res.elapsed_us = get_time_us() - start;
         art_res.num_ops = count;
-        art_close(&ctx);
+        art_close(tree);
     }
 
     // --- LMDB ---
@@ -594,29 +543,29 @@ static void bench_negative_lookup(int num_keys) {
 
     // --- ART ---
     {
-        art_ctx_t ctx = art_open();
-        if (!ctx.tree) return;
+        data_art_tree_t *tree = art_open();
+        if (!tree) return;
 
         // Setup
         uint64_t txn_id;
-        data_art_begin_txn(ctx.tree, &txn_id);
+        data_art_begin_txn(tree, &txn_id);
         for (int i = 0; i < num_keys; i++) {
             make_key(i, key);
             make_value(i, value);
-            data_art_insert(ctx.tree, key, KEY_SIZE, value, VALUE_SIZE);
+            data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
         }
-        data_art_commit_txn(ctx.tree);
+        data_art_commit_txn(tree);
 
         // Timed: lookup keys that don't exist
         uint64_t start = get_time_us();
         for (int i = 0; i < num_keys; i++) {
             make_key(num_keys + i, key);
             size_t vlen;
-            data_art_get(ctx.tree, key, KEY_SIZE, &vlen);
+            data_art_get(tree, key, KEY_SIZE, &vlen);
         }
         art_res.elapsed_us = get_time_us() - start;
         art_res.num_ops = num_keys;
-        art_close(&ctx);
+        art_close(tree);
     }
 
     // --- LMDB ---
@@ -669,20 +618,20 @@ static void bench_slot_stats(int num_keys) {
 
     printf("  %-28s\n", "Slot Allocator Stats");
 
-    art_ctx_t ctx = art_open();
-    if (!ctx.tree) { printf("    (failed)\n\n"); return; }
+    data_art_tree_t *tree = art_open();
+    if (!tree) { printf("    (failed)\n\n"); return; }
 
     uint64_t txn_id;
-    data_art_begin_txn(ctx.tree, &txn_id);
+    data_art_begin_txn(tree, &txn_id);
     for (int i = 0; i < num_keys; i++) {
         make_key(i, key);
         make_value(i, value);
-        data_art_insert(ctx.tree, key, KEY_SIZE, value, VALUE_SIZE);
+        data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
     }
-    data_art_commit_txn(ctx.tree);
+    data_art_commit_txn(tree);
 
     data_art_stats_t stats;
-    data_art_get_stats(ctx.tree, &stats);
+    data_art_get_stats(tree, &stats);
 
     uint64_t total_slot_allocs = 0, total_slot_frees = 0, total_slot_pages = 0;
     printf("    %-8s %8s %8s %8s %6s %8s\n",
@@ -691,7 +640,7 @@ static void bench_slot_stats(int num_keys) {
         total_slot_allocs += stats.slot_allocs[i];
         total_slot_frees += stats.slot_frees[i];
         total_slot_pages += stats.slot_pages_created[i];
-        uint16_t spp = ctx.tree->slot_classes[i].slots_per_page;
+        uint16_t spp = tree->slot_classes[i].slots_per_page;
         double packing = (stats.slot_pages_created[i] > 0 && spp > 0) ?
             (double)(stats.slot_allocs[i] - stats.slot_frees[i]) /
             (stats.slot_pages_created[i] * spp) * 100.0 : 0;
@@ -714,7 +663,7 @@ static void bench_slot_stats(int num_keys) {
            stats.slot_hint_hits, total_hints, hint_rate);
     printf("    Pages reused:     %lu\n", stats.pages_reused);
 
-    art_close(&ctx);
+    art_close(tree);
     printf("\n");
 }
 
@@ -728,26 +677,28 @@ static void bench_disk_usage(int num_keys) {
 
     // --- ART ---
     {
-        art_ctx_t ctx = art_open();
-        if (!ctx.tree) { printf("    ART:   (failed)\n"); return; }
+        data_art_tree_t *tree = art_open();
+        if (!tree) { printf("    ART:   (failed)\n"); return; }
 
         uint64_t txn_id;
-        data_art_begin_txn(ctx.tree, &txn_id);
+        data_art_begin_txn(tree, &txn_id);
         for (int i = 0; i < num_keys; i++) {
             make_key(i, key);
             make_value(i, value);
-            data_art_insert(ctx.tree, key, KEY_SIZE, value, VALUE_SIZE);
+            data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
         }
-        data_art_commit_txn(ctx.tree);
-        data_art_flush(ctx.tree);
+        data_art_commit_txn(tree);
+        data_art_flush(tree);
 
-        art_close(&ctx);
-
-        uint64_t art_size = dir_size(ART_DB_PATH) + dir_size(ART_WAL_PATH);
+        // Get actual used size: next_page_id * PAGE_SIZE
+        uint64_t art_size = tree->mmap_storage->next_page_id * PAGE_SIZE;
         char size_str[64];
         format_size(art_size, size_str, sizeof(size_str));
-        printf("    ART:    %s  (%lu bytes/key)\n", size_str,
-               num_keys > 0 ? art_size / num_keys : 0);
+        printf("    ART:    %s  (%lu bytes/key, %lu pages)\n", size_str,
+               num_keys > 0 ? art_size / num_keys : 0,
+               tree->mmap_storage->next_page_id);
+
+        art_close(tree);
     }
 
     // --- LMDB ---
@@ -773,7 +724,6 @@ static void bench_disk_usage(int num_keys) {
         MDB_stat mstat;
         mdb_env_info(ctx.env, &info);
         mdb_env_stat(ctx.env, &mstat);
-        // Actual size on disk = last used page * page size
         uint64_t lmdb_size = (uint64_t)info.me_last_pgno * (uint64_t)mstat.ms_psize;
 
         lmdb_close(&ctx);
@@ -787,131 +737,6 @@ static void bench_disk_usage(int num_keys) {
     printf("    LMDB:   (not available)\n");
 #endif
 
-    printf("\n");
-}
-
-// ============================================================================
-// mmap ART Benchmarks
-// ============================================================================
-
-static void bench_mmap_perkey_insert(int num_keys) {
-    bench_result_t mmap_res = {0};
-    uint8_t key[KEY_SIZE], value[VALUE_SIZE];
-
-    data_art_tree_t *tree = mmap_art_open();
-    if (!tree) { printf("  mmap Per-Key Insert: (failed)\n\n"); return; }
-
-    uint64_t start = get_time_us();
-    for (int i = 0; i < num_keys; i++) {
-        make_key(i, key);
-        make_value(i, value);
-        data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
-    }
-    mmap_res.elapsed_us = get_time_us() - start;
-    mmap_res.num_ops = num_keys;
-
-    printf("  %-28s\n", "mmap Per-Key Insert");
-    print_result("mmap:", mmap_res);
-    printf("\n");
-
-    mmap_art_close(tree);
-}
-
-static void bench_mmap_bulk_insert(int num_keys) {
-    bench_result_t mmap_res = {0};
-    uint8_t key[KEY_SIZE], value[VALUE_SIZE];
-
-    data_art_tree_t *tree = mmap_art_open();
-    if (!tree) { printf("  mmap Bulk Insert: (failed)\n\n"); return; }
-
-    uint64_t txn_id;
-    data_art_begin_txn(tree, &txn_id);
-
-    uint64_t start = get_time_us();
-    for (int i = 0; i < num_keys; i++) {
-        make_key(i, key);
-        make_value(i, value);
-        data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
-    }
-    data_art_commit_txn(tree);
-    mmap_res.elapsed_us = get_time_us() - start;
-    mmap_res.num_ops = num_keys;
-
-    printf("  %-28s\n", "mmap Bulk Random Insert");
-    print_result("mmap:", mmap_res);
-    printf("\n");
-
-    mmap_art_close(tree);
-}
-
-static void bench_mmap_random_lookup(int num_keys) {
-    bench_result_t mmap_res = {0};
-    uint8_t key[KEY_SIZE], value[VALUE_SIZE];
-
-    data_art_tree_t *tree = mmap_art_open();
-    if (!tree) { printf("  mmap Random Lookup: (failed)\n\n"); return; }
-
-    // Setup (not timed)
-    uint64_t txn_id;
-    data_art_begin_txn(tree, &txn_id);
-    for (int i = 0; i < num_keys; i++) {
-        make_key(i, key);
-        make_value(i, value);
-        data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
-    }
-    data_art_commit_txn(tree);
-
-    // Timed: lookup
-    uint64_t start = get_time_us();
-    int found = 0;
-    for (int i = 0; i < num_keys; i++) {
-        make_key(num_keys - 1 - i, key);
-        size_t vlen;
-        const void *val = data_art_get(tree, key, KEY_SIZE, &vlen);
-        if (val) found++;
-    }
-    mmap_res.elapsed_us = get_time_us() - start;
-    mmap_res.num_ops = num_keys;
-
-    printf("  %-28s\n", "mmap Random Lookup");
-    print_result("mmap:", mmap_res);
-    if (found != num_keys) printf("    WARNING: found %d/%d\n", found, num_keys);
-    printf("\n");
-
-    mmap_art_close(tree);
-}
-
-static void bench_mmap_disk_usage(int num_keys) {
-    uint8_t key[KEY_SIZE], value[VALUE_SIZE];
-
-    data_art_tree_t *tree = mmap_art_open();
-    if (!tree) { printf("  mmap Disk: (failed)\n\n"); return; }
-
-    uint64_t txn_id;
-    data_art_begin_txn(tree, &txn_id);
-    for (int i = 0; i < num_keys; i++) {
-        make_key(i, key);
-        make_value(i, value);
-        data_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE);
-    }
-    data_art_commit_txn(tree);
-    data_art_flush(tree);
-
-    // Get actual used size: next_page_id * PAGE_SIZE
-    uint64_t mmap_used = tree->mmap_storage->next_page_id * PAGE_SIZE;
-    char size_str[64];
-    format_size(mmap_used, size_str, sizeof(size_str));
-    printf("  %-28s\n", "mmap Disk Usage");
-    printf("    mmap:   %s  (%lu bytes/key, %lu pages used)\n", size_str,
-           num_keys > 0 ? mmap_used / num_keys : 0,
-           tree->mmap_storage->next_page_id);
-
-    data_art_stats_t stats;
-    data_art_get_stats(tree, &stats);
-    printf("    Pages reused:     %lu\n", stats.pages_reused);
-    printf("    Dedicated pages:  %lu\n", stats.dedicated_pages_created);
-
-    mmap_art_close(tree);
     printf("\n");
 }
 
@@ -930,14 +755,14 @@ int main(int argc, char **argv) {
 
     printf("\n");
     printf("================================================================\n");
-    printf("  ART Database Benchmark");
+    printf("  ART Database Benchmark (mmap backend)");
 #ifdef HAVE_LMDB
-    printf(" — Comparison with LMDB");
+    printf(" — vs LMDB");
 #endif
     printf("\n");
     printf("  Keys: %d bytes | Values: %d bytes | Count: %d\n",
            KEY_SIZE, VALUE_SIZE, num_keys);
-    printf("  Both: no fsync (ART: WAL nosync, LMDB: MDB_NOSYNC)\n");
+    printf("  Both: no fsync (ART: mmap, LMDB: MDB_NOSYNC)\n");
     printf("================================================================\n\n");
 
     bench_bulk_insert_sequential(num_keys);
@@ -948,12 +773,6 @@ int main(int argc, char **argv) {
     bench_negative_lookup(num_keys);
     bench_disk_usage(num_keys);
     bench_slot_stats(num_keys);
-
-    printf("--- mmap ART ---\n\n");
-    bench_mmap_bulk_insert(num_keys);
-    bench_mmap_perkey_insert(num_keys);
-    bench_mmap_random_lookup(num_keys);
-    bench_mmap_disk_usage(num_keys);
 
     printf("================================================================\n");
     printf("  Benchmark complete\n");

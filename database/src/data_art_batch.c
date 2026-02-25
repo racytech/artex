@@ -12,8 +12,8 @@ bool data_art_insert_batch(data_art_tree_t *tree,
                            const uint8_t **keys, const size_t *key_lens,
                            const void **values, const size_t *value_lens,
                            size_t count) {
-    if (!tree || !tree->wal) {
-        DB_ERROR(DB_ERROR_INVALID_ARG, "tree is NULL or WAL not enabled");
+    if (!tree) {
+        DB_ERROR(DB_ERROR_INVALID_ARG, "tree is NULL");
         return false;
     }
     if (count == 0) {
@@ -48,8 +48,8 @@ bool data_art_insert_batch(data_art_tree_t *tree,
 
 bool data_art_batch(data_art_tree_t *tree,
                     const data_art_batch_op_t *ops, size_t count) {
-    if (!tree || !tree->wal) {
-        DB_ERROR(DB_ERROR_INVALID_ARG, "tree is NULL or WAL not enabled");
+    if (!tree) {
+        DB_ERROR(DB_ERROR_INVALID_ARG, "tree is NULL");
         return false;
     }
     if (count == 0) {

@@ -7,9 +7,6 @@
 
 #include "data_art.h"
 #include "txn_buffer.h"
-#include "page_manager.h"
-#include "buffer_pool.h"
-#include "wal.h"
 #include "logger.h"
 
 #include <stdio.h>
@@ -18,8 +15,7 @@
 #include <unistd.h>
 #include <assert.h>
 
-#define TEST_DB_PATH "test_txn_buffer.db"
-#define TEST_WAL_PATH "test_txn_buffer_wal"
+#define TEST_DIR "/tmp/test_txn_buffer"
 #define KEY_SIZE 32
 
 // Test helper macros
@@ -28,20 +24,18 @@
     {                                                                              \
         if (!(cond))                                                               \
         {                                                                          \
-            fprintf(stderr, "❌ FAILED: %s\n   %s:%d\n", msg, __FILE__, __LINE__); \
+            fprintf(stderr, "FAILED: %s\n   %s:%d\n", msg, __FILE__, __LINE__); \
             return false;                                                          \
         }                                                                          \
     } while (0)
 
 #define PRINT_TEST_HEADER(name) \
-    printf("\n🧪 Running: %s\n", name)
+    printf("\nRunning: %s\n", name)
 
 // Test helper functions
-static void cleanup_test_files()
+static void cleanup_test_dir()
 {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s %s", TEST_DB_PATH, TEST_WAL_PATH);
-    system(cmd);
+    system("rm -rf " TEST_DIR);
     sync();
     usleep(10000);
 }
@@ -54,18 +48,10 @@ static bool test_basic_commit()
 {
     PRINT_TEST_HEADER("test_basic_commit");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    TEST_ASSERT(pm != NULL, "Failed to create page manager");
-
-    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 16}, pm);
-    TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
-
-    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024}); // 1MB segments
-    TEST_ASSERT(wal != NULL, "Failed to create WAL");
-
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
     TEST_ASSERT(tree != NULL, "Failed to create tree");
 
     // Begin transaction
@@ -109,12 +95,9 @@ static bool test_basic_commit()
 
     // Cleanup
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    wal_close(wal);
-    page_manager_destroy(pm);
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
@@ -126,12 +109,10 @@ static bool test_abort_rollback()
 {
     PRINT_TEST_HEADER("test_abort_rollback");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 16}, pm);
-    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
 
     // Insert some initial data (no transaction)
     uint8_t existing_key[KEY_SIZE] = "existing";
@@ -175,12 +156,9 @@ static bool test_abort_rollback()
 
     // Cleanup
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    wal_close(wal);
-    page_manager_destroy(pm);
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
@@ -192,12 +170,10 @@ static bool test_mixed_operations()
 {
     PRINT_TEST_HEADER("test_mixed_operations");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 16}, pm);
-    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
 
     // Insert initial data
     uint8_t key1[KEY_SIZE] = "key1";
@@ -234,12 +210,9 @@ static bool test_mixed_operations()
 
     // Cleanup
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    wal_close(wal);
-    page_manager_destroy(pm);
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
@@ -251,12 +224,10 @@ static bool test_large_transaction()
 {
     PRINT_TEST_HEADER("test_large_transaction");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
-    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
 
     uint64_t txn_id;
     TEST_ASSERT(data_art_begin_txn(tree, &txn_id), "Failed to begin transaction");
@@ -295,12 +266,9 @@ static bool test_large_transaction()
 
     // Cleanup
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    wal_close(wal);
-    page_manager_destroy(pm);
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
@@ -312,12 +280,10 @@ static bool test_nested_transaction_rejection()
 {
     PRINT_TEST_HEADER("test_nested_transaction_rejection");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 16}, pm);
-    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
 
     uint64_t txn_id1, txn_id2;
 
@@ -343,12 +309,9 @@ static bool test_nested_transaction_rejection()
 
     // Cleanup
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    wal_close(wal);
-    page_manager_destroy(pm);
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
@@ -360,18 +323,10 @@ static bool test_batch_insert_basic()
 {
     PRINT_TEST_HEADER("test_batch_insert_basic");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    TEST_ASSERT(pm != NULL, "Failed to create page manager");
-
-    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
-    TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
-
-    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
-    TEST_ASSERT(wal != NULL, "Failed to create WAL");
-
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
     TEST_ASSERT(tree != NULL, "Failed to create tree");
 
     // Prepare 100 keys
@@ -408,12 +363,9 @@ static bool test_batch_insert_basic()
     TEST_ASSERT(tree->size == (size_t)COUNT, "Tree size should be 100");
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    wal_close(wal);
-    page_manager_destroy(pm);
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
@@ -425,21 +377,13 @@ static bool test_batch_insert_atomicity()
 {
     PRINT_TEST_HEADER("test_batch_insert_atomicity");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    TEST_ASSERT(pm != NULL, "Failed to create page manager");
-
-    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
-    TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
-
-    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
-    TEST_ASSERT(wal != NULL, "Failed to create WAL");
-
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
     TEST_ASSERT(tree != NULL, "Failed to create tree");
 
-    // Prepare 51 keys — last one has NULL value (should fail)
+    // Prepare 51 keys -- last one has NULL value (should fail)
     const int COUNT = 51;
     uint8_t key_data[COUNT][KEY_SIZE];
     uint8_t value_data[COUNT][32];
@@ -466,7 +410,7 @@ static bool test_batch_insert_atomicity()
     bool result = data_art_insert_batch(tree, keys, key_lens, values, value_lens, COUNT);
     TEST_ASSERT(!result, "Batch with NULL value should fail");
 
-    // Tree should be empty — all operations rolled back
+    // Tree should be empty -- all operations rolled back
     TEST_ASSERT(tree->size == 0, "Tree should be empty after failed batch");
 
     // Verify no keys are present
@@ -477,12 +421,9 @@ static bool test_batch_insert_atomicity()
     }
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    wal_close(wal);
-    page_manager_destroy(pm);
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
@@ -494,18 +435,10 @@ static bool test_batch_mixed_ops()
 {
     PRINT_TEST_HEADER("test_batch_mixed_ops");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    TEST_ASSERT(pm != NULL, "Failed to create page manager");
-
-    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
-    TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
-
-    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
-    TEST_ASSERT(wal != NULL, "Failed to create WAL");
-
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
     TEST_ASSERT(tree != NULL, "Failed to create tree");
 
     // Insert 50 keys individually first
@@ -586,37 +519,26 @@ static bool test_batch_mixed_ops()
     }
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    wal_close(wal);
-    page_manager_destroy(pm);
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
 // ============================================================================
-// Test 9: Batch Insert WAL Recovery
+// Test 9: Batch Insert Persistence (mmap)
 // ============================================================================
 
-static bool test_batch_wal_recovery()
+static bool test_batch_persistence()
 {
-    PRINT_TEST_HEADER("test_batch_wal_recovery");
+    PRINT_TEST_HEADER("test_batch_persistence");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
     // Phase 1: batch insert 100 keys, then close
     {
-        page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-        TEST_ASSERT(pm != NULL, "Failed to create page manager");
-
-        buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
-        TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
-
-        wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
-        TEST_ASSERT(wal != NULL, "Failed to create WAL");
-
-        data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+        data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
         TEST_ASSERT(tree != NULL, "Failed to create tree");
 
         const int COUNT = 100;
@@ -641,29 +563,13 @@ static bool test_batch_wal_recovery()
                     "Batch insert failed");
         TEST_ASSERT(tree->size == (size_t)COUNT, "Tree should have 100 keys");
 
-        // Close without checkpoint — recovery must replay from WAL
         data_art_destroy(tree);
-        buffer_pool_destroy(bp);
-        wal_close(wal);
-        page_manager_destroy(pm);
     }
 
-    // Phase 2: reopen and recover from WAL
+    // Phase 2: reopen and verify all keys persisted via mmap
     {
-        page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-        TEST_ASSERT(pm != NULL, "Failed to reopen page manager");
-
-        buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
-        TEST_ASSERT(bp != NULL, "Failed to reopen buffer pool");
-
-        wal_t *wal = wal_open(TEST_WAL_PATH, NULL);
-        TEST_ASSERT(wal != NULL, "Failed to reopen WAL");
-
-        data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
-        TEST_ASSERT(tree != NULL, "Failed to recreate tree");
-
-        int64_t recovered = data_art_recover(tree, 0);
-        TEST_ASSERT(recovered >= 0, "Recovery failed");
+        data_art_tree_t *tree = data_art_open(TEST_DIR "/art.dat", KEY_SIZE);
+        TEST_ASSERT(tree != NULL, "Failed to reopen tree");
 
         // Verify all 100 keys recovered
         const int COUNT = 100;
@@ -684,14 +590,11 @@ static bool test_batch_wal_recovery()
         TEST_ASSERT(tree->size == (size_t)COUNT, "Recovered tree should have 100 keys");
 
         data_art_destroy(tree);
-        buffer_pool_destroy(bp);
-        wal_close(wal);
-        page_manager_destroy(pm);
     }
 
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
@@ -703,18 +606,10 @@ static bool test_batch_empty()
 {
     PRINT_TEST_HEADER("test_batch_empty");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    TEST_ASSERT(pm != NULL, "Failed to create page manager");
-
-    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 16}, pm);
-    TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
-
-    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
-    TEST_ASSERT(wal != NULL, "Failed to create WAL");
-
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
     TEST_ASSERT(tree != NULL, "Failed to create tree");
 
     // Empty insert batch
@@ -728,35 +623,24 @@ static bool test_batch_empty()
     TEST_ASSERT(tree->size == 0, "Tree should still be empty");
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    wal_close(wal);
-    page_manager_destroy(pm);
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
 // ============================================================================
-// Test 11: Optimized Commit — 1000 Keys (No Deadlock)
+// Test 11: Optimized Commit -- 1000 Keys (No Deadlock)
 // ============================================================================
 
 static bool test_optimized_commit_1000_keys()
 {
     PRINT_TEST_HEADER("test_optimized_commit_1000_keys");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    TEST_ASSERT(pm != NULL, "Failed to create page manager");
-
-    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 128}, pm);
-    TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
-
-    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 4 * 1024 * 1024});
-    TEST_ASSERT(wal != NULL, "Failed to create WAL");
-
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
     TEST_ASSERT(tree != NULL, "Failed to create tree");
 
     // Begin explicit transaction and buffer 1000 keys
@@ -777,7 +661,7 @@ static bool test_optimized_commit_1000_keys()
     // Nothing committed yet
     TEST_ASSERT(data_art_size(tree) == 0, "Tree should be empty before commit");
 
-    // Commit — this is where the optimized path runs.
+    // Commit -- this is where the optimized path runs.
     // If internal functions tried to re-acquire write_lock, this would deadlock.
     TEST_ASSERT(data_art_commit_txn(tree), "Commit of 1000 keys failed (possible deadlock)");
 
@@ -798,35 +682,24 @@ static bool test_optimized_commit_1000_keys()
     }
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    wal_close(wal);
-    page_manager_destroy(pm);
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
 // ============================================================================
-// Test 12: Optimized Commit — Root Published Once
+// Test 12: Optimized Commit -- Root Published Once
 // ============================================================================
 
 static bool test_optimized_commit_root_once()
 {
     PRINT_TEST_HEADER("test_optimized_commit_root_once");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    TEST_ASSERT(pm != NULL, "Failed to create page manager");
-
-    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
-    TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
-
-    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
-    TEST_ASSERT(wal != NULL, "Failed to create WAL");
-
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
     TEST_ASSERT(tree != NULL, "Failed to create tree");
 
     // Record root before commit
@@ -859,31 +732,26 @@ static bool test_optimized_commit_root_once()
                 "Published root should match tree root");
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    wal_close(wal);
-    page_manager_destroy(pm);
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
 // ============================================================================
-// Test 13: Optimized Commit — WAL Recovery After Explicit Txn
+// Test 13: Optimized Commit -- Persistence After Explicit Txn
 // ============================================================================
 
-static bool test_optimized_commit_wal_recovery()
+static bool test_optimized_commit_persistence()
 {
-    PRINT_TEST_HEADER("test_optimized_commit_wal_recovery");
+    PRINT_TEST_HEADER("test_optimized_commit_persistence");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    // Phase 1: insert 200 keys via explicit txn, close without checkpoint
+    // Phase 1: insert 200 keys via explicit txn, close
     {
-        page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-        buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
-        wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 4 * 1024 * 1024});
-        data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+        data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
 
         uint64_t txn_id;
         TEST_ASSERT(data_art_begin_txn(tree, &txn_id), "Failed to begin txn");
@@ -902,22 +770,14 @@ static bool test_optimized_commit_wal_recovery()
         TEST_ASSERT(data_art_size(tree) == 200, "Should have 200 keys");
 
         data_art_destroy(tree);
-        buffer_pool_destroy(bp);
-        wal_close(wal);
-        page_manager_destroy(pm);
     }
 
-    // Phase 2: reopen, recover from WAL, verify all keys
+    // Phase 2: reopen and verify all keys persisted via mmap
     {
-        page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-        buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
-        wal_t *wal = wal_open(TEST_WAL_PATH, NULL);
-        data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+        data_art_tree_t *tree = data_art_open(TEST_DIR "/art.dat", KEY_SIZE);
+        TEST_ASSERT(tree != NULL, "Failed to reopen tree");
 
-        int64_t recovered = data_art_recover(tree, 0);
-        TEST_ASSERT(recovered >= 0, "Recovery failed");
-
-        TEST_ASSERT(data_art_size(tree) == 200, "Recovered tree should have 200 keys");
+        TEST_ASSERT(data_art_size(tree) == 200, "Reopened tree should have 200 keys");
 
         // Verify all keys and values
         for (int i = 0; i < 200; i++) {
@@ -935,31 +795,26 @@ static bool test_optimized_commit_wal_recovery()
         }
 
         data_art_destroy(tree);
-        buffer_pool_destroy(bp);
-        wal_close(wal);
-        page_manager_destroy(pm);
     }
 
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
 // ============================================================================
-// Test 14: Optimized Commit — Mixed Insert+Delete via Explicit Txn
+// Test 14: Optimized Commit -- Mixed Insert+Delete via Explicit Txn
 // ============================================================================
 
 static bool test_optimized_commit_mixed()
 {
     PRINT_TEST_HEADER("test_optimized_commit_mixed");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
-    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
 
     // Pre-insert 50 keys (auto-commit)
     for (int i = 0; i < 50; i++) {
@@ -1028,29 +883,24 @@ static bool test_optimized_commit_mixed()
     }
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    wal_close(wal);
-    page_manager_destroy(pm);
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
 // ============================================================================
-// Test 15: Optimized Commit — Consecutive Transactions
+// Test 15: Optimized Commit -- Consecutive Transactions
 // ============================================================================
 
 static bool test_optimized_commit_consecutive_txns()
 {
     PRINT_TEST_HEADER("test_optimized_commit_consecutive_txns");
 
-    cleanup_test_files();
+    cleanup_test_dir();
+    system("mkdir -p " TEST_DIR);
 
-    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
-    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 128}, pm);
-    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 4 * 1024 * 1024});
-    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    data_art_tree_t *tree = data_art_create(TEST_DIR "/art.dat", KEY_SIZE);
 
     // Run 10 consecutive transactions, each inserting 50 keys
     for (int t = 0; t < 10; t++) {
@@ -1083,12 +933,9 @@ static bool test_optimized_commit_consecutive_txns()
     }
 
     data_art_destroy(tree);
-    buffer_pool_destroy(bp);
-    wal_close(wal);
-    page_manager_destroy(pm);
-    cleanup_test_files();
+    cleanup_test_dir();
 
-    printf("   ✅ PASSED\n");
+    printf("   PASSED\n");
     return true;
 }
 
@@ -1116,7 +963,7 @@ int main()
         }                                             \
         else                                          \
         {                                             \
-            printf("   ❌ FAILED: %s\n", #test_func); \
+            printf("   FAILED: %s\n", #test_func);   \
         }                                             \
     } while (0)
 
@@ -1128,11 +975,11 @@ int main()
     RUN_TEST(test_batch_insert_basic);
     RUN_TEST(test_batch_insert_atomicity);
     RUN_TEST(test_batch_mixed_ops);
-    RUN_TEST(test_batch_wal_recovery);
+    RUN_TEST(test_batch_persistence);
     RUN_TEST(test_batch_empty);
     RUN_TEST(test_optimized_commit_1000_keys);
     RUN_TEST(test_optimized_commit_root_once);
-    RUN_TEST(test_optimized_commit_wal_recovery);
+    RUN_TEST(test_optimized_commit_persistence);
     RUN_TEST(test_optimized_commit_mixed);
     RUN_TEST(test_optimized_commit_consecutive_txns);
 
