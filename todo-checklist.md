@@ -59,11 +59,12 @@
    - 70 entries replayed (50 inserts + 20 deletes), tree size = 30, deleted keys confirmed absent
    - Validates `WAL_ENTRY_DELETE` replay path in `apply_wal_entry()`
 
-### 9. Transaction-Aware WAL Replay (1-2 days) 🔴 CRITICAL
-   - Currently replay applies ALL entries regardless of commit status
-   - If WAL has INSERT(txn1), INSERT(txn2), COMMIT(txn1), CRASH — txn2 entries should be rolled back
-   - Need: track active transactions during replay, skip entries from uncommitted txns
-   - Test: insert with txn1 (committed) + txn2 (uncommitted) → crash → recover → only txn1 entries present
+### 9. ~~Transaction-Aware WAL Replay~~ FIXED
+   - Two-pass recovery: scan WAL for BEGIN/COMMIT markers, compute uncommitted set, then replay skipping their entries
+   - Auto-commit operations (no BEGIN_TXN in WAL) always applied; explicit txns without COMMIT_TXN are skipped
+   - Handles corruption gracefully: scan proceeds with whatever markers collected before error
+   - Tests: uncommitted txn skipped (20 auto-commit present, 10 uncommitted absent), mixed committed + uncommitted (15 present, 5 absent)
+   - All 23/23 tests pass, 7/7 crash recovery tests pass
 
 ### 10. Metadata Persistence (2-3 days) 🔴 CRITICAL
    - `page_manager_create()` always resets `next_page_id = 1` — no allocator state survives restart

@@ -7,6 +7,8 @@
  *   3. Corrupted WAL entry (bit flip in payload)
  *   4. Checkpoint-based recovery
  *   5. Delete replay (insert → delete → crash → recover → verify deletions persisted)
+ *   6. Uncommitted transaction skipped during recovery
+ *   7. Mixed committed + uncommitted transactions
  */
 
 #include "data_art.h"
@@ -427,6 +429,139 @@ static void test_delete_replay_recovery(void) {
 }
 
 // ============================================================================
+// Test 6: Uncommitted Transaction Skipped During Recovery
+// ============================================================================
+
+static void test_uncommitted_txn_skipped(void) {
+    test_env_t env = {0};
+    make_paths(&env, "t6");
+    cleanup_paths(env.db_path, env.wal_path);
+    open_env(&env);
+
+    // Insert 20 keys normally (auto-commit, no BEGIN/COMMIT in WAL)
+    printf("  Inserting 20 auto-committed keys...\n");
+    insert_keys(&env, 0, 20);
+
+    // Simulate incomplete transaction: write WAL entries directly
+    // BEGIN_TXN for fake txn, then 10 INSERTs, but NO COMMIT
+    uint64_t fake_txn_id = 9999;
+    printf("  Writing uncommitted txn (id=%lu) with 10 inserts to WAL...\n", fake_txn_id);
+    ASSERT(wal_log_begin_txn(env.wal, fake_txn_id, NULL), "wal_log_begin_txn");
+
+    for (int i = 0; i < 10; i++) {
+        uint8_t key[KEY_SIZE];
+        char value[VALUE_MAX_LEN];
+        generate_key(key, 1000 + i);
+        size_t vlen = generate_value(value, sizeof(value), 1000 + i);
+        ASSERT(wal_log_insert(env.wal, fake_txn_id, key, KEY_SIZE,
+                              (const uint8_t *)value, (uint32_t)vlen, NULL),
+               "wal_log_insert for uncommitted txn");
+    }
+    // Intentionally NO wal_log_commit_txn — simulating crash mid-commit
+
+    ASSERT(data_art_flush(env.tree), "flush");
+    ASSERT(wal_fsync(env.wal), "fsync");
+
+    printf("  Closing and reopening...\n");
+    close_env(&env);
+    open_env(&env);
+
+    printf("  Recovering from WAL (should skip uncommitted txn)...\n");
+    int64_t recovered = data_art_recover(env.tree, 0);
+    ASSERT(recovered > 0, "recovery should succeed");
+    printf("  Recovered %ld entries\n", recovered);
+
+    // 20 auto-committed keys should exist
+    printf("  Verifying 20 auto-committed keys present...\n");
+    verify_keys(&env, 0, 20);
+
+    // 10 uncommitted keys should NOT exist
+    printf("  Verifying 10 uncommitted keys absent...\n");
+    for (int i = 0; i < 10; i++) {
+        verify_key_absent(&env, 1000 + i);
+    }
+
+    ASSERT_EQ((long)data_art_size(env.tree), 20L, "tree size (uncommitted excluded)");
+
+    close_env(&env);
+    cleanup_paths(env.db_path, env.wal_path);
+}
+
+// ============================================================================
+// Test 7: Mixed Committed + Uncommitted Transactions
+// ============================================================================
+
+static void test_mixed_committed_uncommitted(void) {
+    test_env_t env = {0};
+    make_paths(&env, "t7");
+    cleanup_paths(env.db_path, env.wal_path);
+    open_env(&env);
+
+    // Insert 10 keys via auto-commit
+    printf("  Inserting 10 auto-committed keys...\n");
+    insert_keys(&env, 0, 10);
+
+    // Begin explicit txn1, insert 5 keys, commit
+    printf("  Committing explicit txn with 5 keys...\n");
+    uint64_t txn_id1;
+    ASSERT(data_art_begin_txn(env.tree, &txn_id1), "begin_txn");
+    for (int i = 0; i < 5; i++) {
+        uint8_t key[KEY_SIZE];
+        char value[VALUE_MAX_LEN];
+        generate_key(key, 100 + i);
+        size_t vlen = generate_value(value, sizeof(value), 100 + i);
+        ASSERT(data_art_insert(env.tree, key, KEY_SIZE, value, vlen), "txn insert");
+    }
+    ASSERT(data_art_commit_txn(env.tree), "commit_txn");
+
+    // Write uncommitted txn2 directly to WAL (simulating crash mid-commit)
+    uint64_t fake_txn_id = 8888;
+    printf("  Writing uncommitted txn (id=%lu) with 5 inserts to WAL...\n", fake_txn_id);
+    ASSERT(wal_log_begin_txn(env.wal, fake_txn_id, NULL), "wal_log_begin_txn");
+    for (int i = 0; i < 5; i++) {
+        uint8_t key[KEY_SIZE];
+        char value[VALUE_MAX_LEN];
+        generate_key(key, 2000 + i);
+        size_t vlen = generate_value(value, sizeof(value), 2000 + i);
+        ASSERT(wal_log_insert(env.wal, fake_txn_id, key, KEY_SIZE,
+                              (const uint8_t *)value, (uint32_t)vlen, NULL),
+               "wal_log_insert for uncommitted txn");
+    }
+    // NO commit for fake_txn_id
+
+    ASSERT(data_art_flush(env.tree), "flush");
+    ASSERT(wal_fsync(env.wal), "fsync");
+
+    printf("  Closing and reopening...\n");
+    close_env(&env);
+    open_env(&env);
+
+    printf("  Recovering from WAL...\n");
+    int64_t recovered = data_art_recover(env.tree, 0);
+    ASSERT(recovered > 0, "recovery should succeed");
+    printf("  Recovered %ld entries\n", recovered);
+
+    // 10 auto-committed keys should exist
+    printf("  Verifying 10 auto-committed keys present...\n");
+    verify_keys(&env, 0, 10);
+
+    // 5 committed txn keys should exist
+    printf("  Verifying 5 committed txn keys present...\n");
+    verify_keys(&env, 100, 5);
+
+    // 5 uncommitted keys should NOT exist
+    printf("  Verifying 5 uncommitted keys absent...\n");
+    for (int i = 0; i < 5; i++) {
+        verify_key_absent(&env, 2000 + i);
+    }
+
+    ASSERT_EQ((long)data_art_size(env.tree), 15L, "tree size (15 = 10 auto + 5 committed)");
+
+    close_env(&env);
+    cleanup_paths(env.db_path, env.wal_path);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -451,6 +586,8 @@ int main(void) {
     RUN_TEST(test_corrupted_wal_entry);
     RUN_TEST(test_checkpoint_recovery);
     RUN_TEST(test_delete_replay_recovery);
+    RUN_TEST(test_uncommitted_txn_skipped);
+    RUN_TEST(test_mixed_committed_uncommitted);
 
     printf("========================================\n");
     printf(" Results: %d/%d tests passed\n", tests_passed, test_count);

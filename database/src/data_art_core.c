@@ -849,55 +849,97 @@ bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out) {
     return true;
 }
 
-// Callback for WAL replay
-static bool apply_wal_entry(void *context, const wal_entry_header_t *header, const void *payload) {
-    data_art_tree_t *tree = (data_art_tree_t *)context;
-    
+// ============================================================================
+// Transaction-Aware WAL Replay
+//
+// Two-pass recovery:
+//   Pass 1: Scan WAL for BEGIN_TXN/COMMIT_TXN markers to identify uncommitted txns
+//   Pass 2: Replay entries, skipping INSERT/DELETE from uncommitted transactions
+//
+// Auto-commit operations (no BEGIN_TXN in WAL) are always applied.
+// ============================================================================
+
+// Dynamic array append for txn_id tracking
+static void txn_id_append(uint64_t **arr, size_t *count, size_t *cap, uint64_t id) {
+    if (*count >= *cap) {
+        *cap = (*cap == 0) ? 16 : *cap * 2;
+        *arr = realloc(*arr, *cap * sizeof(uint64_t));
+    }
+    (*arr)[(*count)++] = id;
+}
+
+// Pass 1 context: collect BEGIN and COMMIT txn_ids
+typedef struct {
+    uint64_t *begun;        size_t begun_count, begun_cap;
+    uint64_t *committed;    size_t committed_count, committed_cap;
+} txn_scan_ctx_t;
+
+static bool scan_txn_markers(void *ctx, const wal_entry_header_t *header, const void *payload) {
+    (void)payload;
+    txn_scan_ctx_t *scan = (txn_scan_ctx_t *)ctx;
+    if (header->entry_type == WAL_ENTRY_BEGIN_TXN)
+        txn_id_append(&scan->begun, &scan->begun_count, &scan->begun_cap, header->txn_id);
+    else if (header->entry_type == WAL_ENTRY_COMMIT_TXN)
+        txn_id_append(&scan->committed, &scan->committed_count, &scan->committed_cap, header->txn_id);
+    return true;
+}
+
+// Pass 2 context: apply entries, skipping uncommitted transactions
+typedef struct {
+    data_art_tree_t *tree;
+    uint64_t *uncommitted;
+    size_t uncommitted_count;
+    int64_t skipped;
+} txn_apply_ctx_t;
+
+static bool is_uncommitted_txn(uint64_t txn_id, const txn_apply_ctx_t *ctx) {
+    for (size_t i = 0; i < ctx->uncommitted_count; i++)
+        if (ctx->uncommitted[i] == txn_id) return true;
+    return false;
+}
+
+static bool apply_wal_entry_txn_aware(void *context, const wal_entry_header_t *header, const void *payload) {
+    txn_apply_ctx_t *ctx = (txn_apply_ctx_t *)context;
+
     switch (header->entry_type) {
         case WAL_ENTRY_INSERT: {
+            if (is_uncommitted_txn(header->txn_id, ctx)) { ctx->skipped++; break; }
             const wal_insert_payload_t *insert = (const wal_insert_payload_t *)payload;
             const uint8_t *key = insert->data;
             const uint8_t *value = insert->data + insert->key_len;
-            
-            // Note: insert may fail if key already exists - that's ok during replay
-            data_art_insert(tree, key, insert->key_len, value, insert->value_len);
+            data_art_insert(ctx->tree, key, insert->key_len, value, insert->value_len);
             break;
         }
-        
+
         case WAL_ENTRY_DELETE: {
+            if (is_uncommitted_txn(header->txn_id, ctx)) { ctx->skipped++; break; }
             const wal_delete_payload_t *del = (const wal_delete_payload_t *)payload;
-            const uint8_t *key = del->key;
-            
-            // Note: delete may fail if key doesn't exist - that's ok during replay
-            data_art_delete(tree, key, del->key_len);
+            data_art_delete(ctx->tree, del->key, del->key_len);
             break;
         }
-        
+
+        case WAL_ENTRY_CHECKPOINT: {
+            const wal_checkpoint_payload_t *ckpt = (const wal_checkpoint_payload_t *)payload;
+            ctx->tree->root.page_id = ckpt->root_page_id;
+            ctx->tree->root.offset = ckpt->root_offset;
+            ctx->tree->size = ckpt->tree_size;
+            LOG_INFO("Restored checkpoint: root=%lu:%u, size=%zu",
+                     ckpt->root_page_id, ckpt->root_offset, ctx->tree->size);
+            break;
+        }
+
         case WAL_ENTRY_BEGIN_TXN:
         case WAL_ENTRY_COMMIT_TXN:
         case WAL_ENTRY_ABORT_TXN:
-            // Transaction markers - already handled by WAL replay logic
+        case WAL_ENTRY_NOOP:
             break;
-            
-        case WAL_ENTRY_CHECKPOINT: {
-            const wal_checkpoint_payload_t *ckpt = (const wal_checkpoint_payload_t *)payload;
-            
-            // Restore tree state from checkpoint
-            tree->root.page_id = ckpt->root_page_id;
-            tree->root.offset = ckpt->root_offset;
-            tree->size = ckpt->tree_size;
-            
-            LOG_INFO("Restored checkpoint: root=%lu:%u, size=%zu",
-                     tree->root.page_id, tree->root.offset, tree->size);
-            break;
-        }
-        
+
         default:
             LOG_WARN("Unknown WAL entry type: %u", header->entry_type);
             break;
     }
-    
-    return true;  // Continue replay
+
+    return true;
 }
 
 int64_t data_art_recover(data_art_tree_t *tree, uint64_t start_lsn) {
@@ -905,34 +947,62 @@ int64_t data_art_recover(data_art_tree_t *tree, uint64_t start_lsn) {
         LOG_ERROR("Cannot recover: WAL not enabled");
         return -1;
     }
-    
-    LOG_INFO("Starting recovery from LSN %lu", start_lsn);
-    
-    // Replay WAL entries to rebuild tree state
-    // start_lsn == 0 means replay from beginning
-    uint64_t end_lsn = UINT64_MAX;  // Replay to end
 
-    // Temporarily disable WAL and MVCC during replay to prevent:
-    // - Re-logging replayed entries (insert/delete check tree->wal)
-    // - Unnecessary MVCC transaction overhead (insert/delete check tree->mvcc_manager)
+    LOG_INFO("Starting recovery from LSN %lu", start_lsn);
+
     wal_t *saved_wal = tree->wal;
     mvcc_manager_t *saved_mvcc = tree->mvcc_manager;
+    uint64_t end_lsn = UINT64_MAX;
+
+    // Pass 1: Scan WAL for transaction markers
+    // Note: scan may return -1 on corruption, but we proceed with whatever
+    // markers were collected. Txns with BEGIN but no COMMIT (due to corruption
+    // truncating the WAL) are correctly treated as uncommitted.
+    txn_scan_ctx_t scan = {0};
+    wal_replay(saved_wal, start_lsn, end_lsn, &scan, scan_txn_markers);
+
+    // Build uncommitted set = begun txns that never committed
+    uint64_t *uncommitted = NULL;
+    size_t uncommitted_count = 0, uncommitted_cap = 0;
+    for (size_t i = 0; i < scan.begun_count; i++) {
+        bool found_commit = false;
+        for (size_t j = 0; j < scan.committed_count; j++) {
+            if (scan.begun[i] == scan.committed[j]) { found_commit = true; break; }
+        }
+        if (!found_commit)
+            txn_id_append(&uncommitted, &uncommitted_count, &uncommitted_cap, scan.begun[i]);
+    }
+    free(scan.begun);
+    free(scan.committed);
+
+    if (uncommitted_count > 0)
+        LOG_WARN("Recovery: %zu uncommitted transactions will be skipped", uncommitted_count);
+
+    // Pass 2: Apply entries with transaction awareness
+    txn_apply_ctx_t apply = {
+        .tree = tree,
+        .uncommitted = uncommitted,
+        .uncommitted_count = uncommitted_count,
+        .skipped = 0
+    };
+
+    // Disable WAL and MVCC to prevent re-logging and unnecessary overhead
     tree->wal = NULL;
     tree->mvcc_manager = NULL;
 
-    int64_t entries = wal_replay(saved_wal, start_lsn, end_lsn, tree, apply_wal_entry);
+    int64_t entries = wal_replay(saved_wal, start_lsn, end_lsn, &apply, apply_wal_entry_txn_aware);
 
-    // Restore WAL and MVCC references
     tree->wal = saved_wal;
     tree->mvcc_manager = saved_mvcc;
+    free(uncommitted);
 
     if (entries < 0) {
         LOG_ERROR("Recovery failed during WAL replay");
         return -1;
     }
-    
-    LOG_INFO("Recovery complete: replayed %ld entries, tree size=%zu",
-             entries, tree->size);
+
+    LOG_INFO("Recovery complete: %ld entries replayed, %ld skipped from %zu uncommitted txns, tree size=%zu",
+             entries, apply.skipped, uncommitted_count, tree->size);
 
     // Publish recovered root for lock-free readers
     data_art_publish_root(tree);
