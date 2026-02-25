@@ -16,6 +16,12 @@
 // Page header (64 bytes at start of each page)
 #define PAGE_HEADER_SIZE 64
 
+// Torn page detection: last 4 bytes of page mirror the write counter
+#define PAGE_TAIL_MARKER_OFFSET (PAGE_SIZE - sizeof(uint32_t))  // byte 4092
+
+// Usable data area per page (excludes header and tail marker)
+#define PAGE_DATA_SIZE (PAGE_SIZE - PAGE_HEADER_SIZE - sizeof(uint32_t))  // 4028 bytes
+
 typedef struct {
     uint64_t page_id;              // Unique page ID
     uint64_t version;              // MVCC version this page was created in
@@ -32,7 +38,7 @@ typedef struct {
     
     // Integrity & versioning
     uint32_t checksum;             // CRC32 of page data
-    uint32_t flags;                // Various flags (reserved)
+    uint32_t write_counter;        // Torn page detection (mirrored at page tail)
     uint64_t prev_version;         // Previous version page_id (for CoW chain)
     uint64_t last_access_time;     // Timestamp for compression tier policy
     
@@ -144,6 +150,7 @@ typedef enum {
     PAGE_ERROR_CORRUPTION = -4,
     PAGE_ERROR_INVALID_ARG = -5,
     PAGE_ERROR_OUT_OF_MEMORY = -6,
+    PAGE_ERROR_TORN_WRITE = -7,
 } page_result_t;
 
 // ============================================================================
@@ -223,7 +230,7 @@ page_result_t page_manager_read(page_manager_t *pm,
  * @param page Page to write (page_id must be set in header)
  * @return PAGE_SUCCESS on success, error code otherwise
  */
-page_result_t page_manager_write(page_manager_t *pm, const page_t *page);
+page_result_t page_manager_write(page_manager_t *pm, page_t *page);
 
 /**
  * Sync all pending writes to disk
@@ -258,7 +265,7 @@ page_result_t page_manager_read_compressed(page_manager_t *pm,
  * @return PAGE_SUCCESS on success, error code otherwise
  */
 page_result_t page_manager_write_compressed(page_manager_t *pm,
-                                            const page_t *page,
+                                            page_t *page,
                                             uint8_t compression_type);
 
 // ============================================================================

@@ -61,7 +61,7 @@ static uint64_t alloc_and_write_page(page_manager_t *pm, uint8_t fill_byte) {
     page_t page;
     memset(&page, 0, sizeof(page_t));
     page.header.page_id = page_id;
-    page.header.flags = 0;
+    page.header.write_counter = 0;
     memset(page.data, fill_byte, sizeof(page.data));
     
     // Compute checksum
@@ -343,25 +343,25 @@ void test_dirty_page_persistence(void) {
         
         uint64_t page_id = alloc_and_write_page(pm, 0x00);
         
-        // Write pattern to page
+        // Write pattern to usable data area (last 4 bytes reserved for torn page tail marker)
         page_t *page = buffer_pool_get(bp, page_id);
-        for (int i = 0; i < (int)sizeof(page->data); i++) {
+        for (int i = 0; i < (int)PAGE_DATA_SIZE; i++) {
             page->data[i] = (uint8_t)(i % 256);
         }
         buffer_pool_mark_dirty(bp, page_id);
-        
+
         // Flush
         buffer_pool_flush_page(bp, page_id);
-        
+
         // Evict page
         buffer_pool_evict(bp, page_id);
-        
+
         // Load again and verify pattern
         page = buffer_pool_get(bp, page_id);
         ASSERT(page != NULL, "Page reloaded");
-        
+
         bool pattern_correct = true;
-        for (int i = 0; i < (int)sizeof(page->data); i++) {
+        for (int i = 0; i < (int)PAGE_DATA_SIZE; i++) {
             if (page->data[i] != (uint8_t)(i % 256)) {
                 pattern_correct = false;
                 break;

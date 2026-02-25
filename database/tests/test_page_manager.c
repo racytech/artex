@@ -508,6 +508,115 @@ void test_fsync_retry_and_health(void) {
     cleanup_test_db();
 }
 
+void test_torn_write_detection(void) {
+    cleanup_test_db();
+
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+
+    // Allocate and write a valid page
+    uint64_t page_id = page_manager_alloc(pm, 0);
+    TEST_ASSERT(page_id != 0, "Page allocation should succeed");
+
+    page_t page;
+    page_init(&page, page_id, 1);
+    snprintf((char*)page.data, 100, "Valid page data for torn write test");
+    page_compute_checksum(&page);
+
+    page_result_t result = page_manager_write(pm, &page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Page write should succeed");
+    result = page_manager_sync(pm);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Sync should succeed");
+
+    // Verify it reads back fine
+    page_t read_page;
+    result = page_manager_read(pm, page_id, &read_page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Read should succeed after normal write");
+
+    // Simulate torn write: overwrite only the first half of the page on disk
+    // This changes the header (including write_counter) but leaves the old tail
+    int fd;
+    uint64_t offset;
+    result = page_manager_get_file_location(pm, page_id, &fd, &offset);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Get file location should succeed");
+
+    // Create a "new version" of the page with different data + incremented counter
+    page_t torn_page;
+    memcpy(&torn_page, &page, PAGE_SIZE);
+    snprintf((char*)torn_page.data, 100, "Torn page data - ONLY FIRST HALF WRITTEN");
+    torn_page.header.write_counter++;
+    // Don't update tail marker — simulates torn write
+    page_compute_checksum(&torn_page);
+
+    // Write only the first half (header + start of data, but NOT the tail)
+    ssize_t written = pwrite(fd, &torn_page, PAGE_SIZE / 2, offset);
+    TEST_ASSERT(written == PAGE_SIZE / 2, "Partial write should succeed");
+    fsync(fd);
+
+    // Read should detect torn write or corruption
+    page_t corrupted_page;
+    result = page_manager_read(pm, page_id, &corrupted_page);
+    TEST_ASSERT(result == PAGE_ERROR_TORN_WRITE || result == PAGE_ERROR_CORRUPTION,
+                "Read of torn page should detect error");
+
+    // Write a valid page to repair
+    page_init(&page, page_id, 2);
+    snprintf((char*)page.data, 100, "Repaired after torn write");
+    page_compute_checksum(&page);
+    result = page_manager_write(pm, &page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Writing repaired page should succeed");
+
+    // Read back should succeed
+    result = page_manager_read(pm, page_id, &read_page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Read of repaired page should succeed");
+
+    page_manager_destroy(pm);
+    cleanup_test_db();
+}
+
+void test_write_counter_increments(void) {
+    cleanup_test_db();
+
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Page manager creation should succeed");
+
+    uint64_t page_id = page_manager_alloc(pm, 0);
+    TEST_ASSERT(page_id != 0, "Page allocation should succeed");
+
+    page_t page;
+    page_init(&page, page_id, 1);
+    TEST_ASSERT(page.header.write_counter == 0, "Initial write counter should be 0");
+
+    // Write the page 5 times
+    for (int i = 0; i < 5; i++) {
+        snprintf((char*)page.data, 100, "Write iteration %d", i);
+        page_compute_checksum(&page);
+        page_result_t result = page_manager_write(pm, &page);
+        TEST_ASSERT(result == PAGE_SUCCESS, "Page write should succeed");
+    }
+
+    // write_counter should be 5 (incremented by each write)
+    TEST_ASSERT(page.header.write_counter == 5,
+                "Write counter should be 5 after 5 writes");
+
+    // Sync and read back
+    page_manager_sync(pm);
+    page_t read_page;
+    page_result_t result = page_manager_read(pm, page_id, &read_page);
+    TEST_ASSERT(result == PAGE_SUCCESS, "Read should succeed");
+    TEST_ASSERT(read_page.header.write_counter == 5,
+                "Read-back write counter should be 5");
+
+    // Verify tail marker matches
+    uint32_t tail_counter;
+    memcpy(&tail_counter, (uint8_t *)&read_page + PAGE_TAIL_MARKER_OFFSET,
+           sizeof(tail_counter));
+    TEST_ASSERT(tail_counter == 5, "Tail marker should match header counter");
+
+    page_manager_destroy(pm);
+    cleanup_test_db();
+}
+
 int main(void) {
     // Initialize logger
     log_init(LOG_LEVEL_INFO, stderr);
@@ -530,6 +639,8 @@ int main(void) {
     RUN_TEST(test_error_handling);
     RUN_TEST(test_page_corruption_detection);
     RUN_TEST(test_fsync_retry_and_health);
+    RUN_TEST(test_torn_write_detection);
+    RUN_TEST(test_write_counter_increments);
 
     printf("\n");
     printf("========================================\n");

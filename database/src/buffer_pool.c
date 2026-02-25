@@ -236,7 +236,7 @@ static buffer_frame_t *load_page(buffer_pool_t *bp, uint64_t page_id) {
         frame->page.header.compression_type = 0;
         frame->page.header.compressed_size = 0;
         frame->page.header.uncompressed_size = PAGE_SIZE;
-        frame->page.header.flags = 0;
+        frame->page.header.write_counter = 0;
         frame->is_dirty = true;  // Mark dirty so it gets written on flush
         bp->stats.total_loads++;
         return frame;

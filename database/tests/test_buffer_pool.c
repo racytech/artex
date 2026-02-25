@@ -61,7 +61,7 @@ static uint64_t alloc_and_write_page(page_manager_t *pm, uint8_t fill_byte) {
     page_t page;
     memset(&page, 0, sizeof(page_t));
     page.header.page_id = page_id;
-    page.header.flags = 0;
+    page.header.write_counter = 0;
     memset(page.data, fill_byte, sizeof(page.data));
     
     // Compute checksum

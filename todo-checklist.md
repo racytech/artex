@@ -106,11 +106,14 @@
    - Tests: basic (3 prefixes, verify only target prefix returned), no match, all match, empty prefix
    - Result: 15/15 iterator tests pass, 23/23 full suite
 
-### 15. Torn Page Detection (1 day)
-   - Currently pages have CRC32 checksum — detects corruption but can't distinguish torn write from bit-flip
-   - Add page LSN or write counter to detect partial writes (half-written page after power loss)
-   - Double-write buffer approach: write page to temp location first, then to final location
-   - Low priority: WAL replay already recovers from most scenarios
+### 15. ~~Torn Page Detection~~ FIXED
+   - Repurposed unused `flags` field as `write_counter` in `page_header_t` (no header size change)
+   - Write counter incremented on every `page_manager_write()`, mirrored at page tail (last 4 bytes, `PAGE_TAIL_MARKER_OFFSET`)
+   - On read: CRC fails → check header counter vs tail counter → `PAGE_ERROR_TORN_WRITE` if mismatch, `PAGE_ERROR_CORRUPTION` if match
+   - Also catches edge case: CRC passes but counters mismatch (torn boundary at exact CRC-neutral point)
+   - `PAGE_DATA_SIZE` constant (4028 bytes) documents usable data area excluding tail marker
+   - Tests: simulated torn write (half-page pwrite), write counter increment verification (5 writes → counter=5)
+   - Result: all 23/23 tests pass
 
 ### 16. Online Backup / Snapshot Export (2-3 days)
    - Export consistent snapshot of entire database to a directory

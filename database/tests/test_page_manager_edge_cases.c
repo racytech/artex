@@ -141,23 +141,23 @@ void test_max_data_in_page(void) {
     page_t page;
     page_init(&page, page_id, 1);
     
-    // Fill entire data area with pattern
-    const size_t data_size = PAGE_SIZE - PAGE_HEADER_SIZE;
+    // Fill usable data area with pattern (last 4 bytes reserved for torn page tail marker)
+    const size_t data_size = PAGE_DATA_SIZE;
     for (size_t i = 0; i < data_size; i++) {
         page.data[i] = (uint8_t)(i & 0xFF);
     }
     page.header.free_offset = PAGE_HEADER_SIZE + data_size;
     page_compute_checksum(&page);
-    
+
     // Write and read back
     page_result_t result = page_manager_write(pm, &page);
     TEST_ASSERT(result == PAGE_SUCCESS, "Should write page with max data");
-    
+
     page_t read_page;
     result = page_manager_read(pm, page_id, &read_page);
     TEST_ASSERT(result == PAGE_SUCCESS, "Should read page with max data");
-    
-    // Verify data integrity
+
+    // Verify data integrity (only usable area, tail marker reserved)
     bool data_matches = true;
     for (size_t i = 0; i < data_size; i++) {
         if (read_page.data[i] != (uint8_t)(i & 0xFF)) {

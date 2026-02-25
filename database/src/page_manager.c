@@ -409,10 +409,31 @@ page_result_t page_manager_read(page_manager_t *pm, uint64_t page_id,
     
     // Verify checksum
     if (!page_verify_checksum(page_out)) {
+        // Check if this is a torn write (header counter != tail counter)
+        uint32_t tail_counter;
+        memcpy(&tail_counter, (uint8_t *)page_out + PAGE_TAIL_MARKER_OFFSET,
+               sizeof(tail_counter));
+        if (page_out->header.write_counter != tail_counter) {
+            LOG_CRITICAL("Torn write detected for page %lu "
+                         "(header_counter=%u, tail_counter=%u)",
+                         page_id, page_out->header.write_counter, tail_counter);
+            return PAGE_ERROR_TORN_WRITE;
+        }
         LOG_CRITICAL("Checksum mismatch for page %lu", page_id);
         return PAGE_ERROR_CORRUPTION;
     }
-    
+
+    // Verify torn page detection (CRC passed but counters mismatch)
+    uint32_t tail_counter;
+    memcpy(&tail_counter, (uint8_t *)page_out + PAGE_TAIL_MARKER_OFFSET,
+           sizeof(tail_counter));
+    if (page_out->header.write_counter != tail_counter) {
+        LOG_CRITICAL("Torn write detected for page %lu "
+                     "(header_counter=%u, tail_counter=%u, CRC OK)",
+                     page_id, page_out->header.write_counter, tail_counter);
+        return PAGE_ERROR_TORN_WRITE;
+    }
+
     pm->pages_read++;
     pm->bytes_read += PAGE_SIZE;
     
@@ -421,25 +442,31 @@ page_result_t page_manager_read(page_manager_t *pm, uint64_t page_id,
     return PAGE_SUCCESS;
 }
 
-page_result_t page_manager_write(page_manager_t *pm, const page_t *page) {
+page_result_t page_manager_write(page_manager_t *pm, page_t *page) {
     if (!pm || !page) {
         return PAGE_ERROR_INVALID_ARG;
     }
-    
+
     if (pm->read_only) {
         LOG_ERROR("Cannot write in read-only mode");
         return PAGE_ERROR_INVALID_ARG;
     }
-    
+
     uint64_t page_id = page->header.page_id;
-    
+
     int fd;
     uint64_t offset;
     page_result_t result = page_manager_get_file_location(pm, page_id, &fd, &offset);
     if (result != PAGE_SUCCESS) {
         return result;
     }
-    
+
+    // Stamp torn page detection markers (header + tail must match)
+    page->header.write_counter++;
+    uint32_t counter = page->header.write_counter;
+    memcpy((uint8_t *)page + PAGE_TAIL_MARKER_OFFSET, &counter, sizeof(counter));
+    page_compute_checksum(page);
+
     // Write page to disk
     ssize_t bytes_written = pwrite(fd, page, PAGE_SIZE, offset);
     if (bytes_written == -1) {
@@ -627,7 +654,7 @@ void page_init(page_t *page, uint64_t page_id, uint64_t version) {
     page->header.compression_type = 0;  // No compression
     page->header.compressed_size = 0;
     page->header.uncompressed_size = PAGE_SIZE;
-    page->header.flags = 0;
+    page->header.write_counter = 0;
     page->header.prev_version = 0;
     page->header.last_access_time = time(NULL);
     
@@ -805,7 +832,7 @@ page_result_t page_manager_read_compressed(page_manager_t *pm, uint64_t page_id,
     return page_manager_read(pm, page_id, page_out);
 }
 
-page_result_t page_manager_write_compressed(page_manager_t *pm, const page_t *page,
+page_result_t page_manager_write_compressed(page_manager_t *pm, page_t *page,
                                             uint8_t compression_type) {
     // Phase 3: Implement compression
     (void)compression_type;
