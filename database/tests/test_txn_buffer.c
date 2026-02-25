@@ -39,15 +39,11 @@
 // Test helper functions
 static void cleanup_test_files()
 {
-    unlink(TEST_DB_PATH);
-    unlink(TEST_WAL_PATH);
-    // Clean up WAL segments
-    char seg_path[512];
-    for (int i = 0; i < 10; i++)
-    {
-        snprintf(seg_path, sizeof(seg_path), "%s.%04d", TEST_WAL_PATH, i);
-        unlink(seg_path);
-    }
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s %s", TEST_DB_PATH, TEST_WAL_PATH);
+    system(cmd);
+    sync();
+    usleep(10000);
 }
 
 // ============================================================================
@@ -357,6 +353,391 @@ static bool test_nested_transaction_rejection()
 }
 
 // ============================================================================
+// Test 6: Batch Insert Basic
+// ============================================================================
+
+static bool test_batch_insert_basic()
+{
+    PRINT_TEST_HEADER("test_batch_insert_basic");
+
+    cleanup_test_files();
+
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Failed to create page manager");
+
+    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
+    TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
+
+    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
+    TEST_ASSERT(wal != NULL, "Failed to create WAL");
+
+    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    TEST_ASSERT(tree != NULL, "Failed to create tree");
+
+    // Prepare 100 keys
+    const int COUNT = 100;
+    uint8_t key_data[COUNT][KEY_SIZE];
+    uint8_t value_data[COUNT][32];
+    const uint8_t *keys[COUNT];
+    size_t key_lens[COUNT];
+    const void *values[COUNT];
+    size_t value_lens[COUNT];
+
+    for (int i = 0; i < COUNT; i++) {
+        memset(key_data[i], 0, KEY_SIZE);
+        snprintf((char *)key_data[i], KEY_SIZE, "batch_key_%04d", i);
+        snprintf((char *)value_data[i], 32, "val_%04d", i);
+        keys[i] = key_data[i];
+        key_lens[i] = KEY_SIZE;
+        values[i] = value_data[i];
+        value_lens[i] = strlen((char *)value_data[i]) + 1;
+    }
+
+    // Batch insert
+    TEST_ASSERT(data_art_insert_batch(tree, keys, key_lens, values, value_lens, COUNT),
+                "Batch insert failed");
+
+    // Verify all 100 keys present
+    for (int i = 0; i < COUNT; i++) {
+        size_t vlen;
+        const void *val = data_art_get(tree, key_data[i], KEY_SIZE, &vlen);
+        TEST_ASSERT(val != NULL, "Key not found after batch insert");
+        TEST_ASSERT(memcmp(val, value_data[i], vlen) == 0, "Value mismatch");
+    }
+
+    TEST_ASSERT(tree->size == (size_t)COUNT, "Tree size should be 100");
+
+    data_art_destroy(tree);
+    buffer_pool_destroy(bp);
+    wal_close(wal);
+    page_manager_destroy(pm);
+    cleanup_test_files();
+
+    printf("   ✅ PASSED\n");
+    return true;
+}
+
+// ============================================================================
+// Test 7: Batch Insert Atomicity (Failure Rolls Back)
+// ============================================================================
+
+static bool test_batch_insert_atomicity()
+{
+    PRINT_TEST_HEADER("test_batch_insert_atomicity");
+
+    cleanup_test_files();
+
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Failed to create page manager");
+
+    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
+    TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
+
+    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
+    TEST_ASSERT(wal != NULL, "Failed to create WAL");
+
+    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    TEST_ASSERT(tree != NULL, "Failed to create tree");
+
+    // Prepare 51 keys — last one has NULL value (should fail)
+    const int COUNT = 51;
+    uint8_t key_data[COUNT][KEY_SIZE];
+    uint8_t value_data[COUNT][32];
+    const uint8_t *keys[COUNT];
+    size_t key_lens[COUNT];
+    const void *values[COUNT];
+    size_t value_lens[COUNT];
+
+    for (int i = 0; i < COUNT; i++) {
+        memset(key_data[i], 0, KEY_SIZE);
+        snprintf((char *)key_data[i], KEY_SIZE, "atom_key_%04d", i);
+        snprintf((char *)value_data[i], 32, "val_%04d", i);
+        keys[i] = key_data[i];
+        key_lens[i] = KEY_SIZE;
+        values[i] = value_data[i];
+        value_lens[i] = strlen((char *)value_data[i]) + 1;
+    }
+
+    // Make the last entry invalid (NULL value)
+    values[COUNT - 1] = NULL;
+    value_lens[COUNT - 1] = 0;
+
+    // Batch should fail
+    bool result = data_art_insert_batch(tree, keys, key_lens, values, value_lens, COUNT);
+    TEST_ASSERT(!result, "Batch with NULL value should fail");
+
+    // Tree should be empty — all operations rolled back
+    TEST_ASSERT(tree->size == 0, "Tree should be empty after failed batch");
+
+    // Verify no keys are present
+    for (int i = 0; i < COUNT - 1; i++) {
+        size_t vlen;
+        const void *val = data_art_get(tree, key_data[i], KEY_SIZE, &vlen);
+        TEST_ASSERT(val == NULL, "Key should not exist after rollback");
+    }
+
+    data_art_destroy(tree);
+    buffer_pool_destroy(bp);
+    wal_close(wal);
+    page_manager_destroy(pm);
+    cleanup_test_files();
+
+    printf("   ✅ PASSED\n");
+    return true;
+}
+
+// ============================================================================
+// Test 8: Batch Mixed Operations (Insert + Delete)
+// ============================================================================
+
+static bool test_batch_mixed_ops()
+{
+    PRINT_TEST_HEADER("test_batch_mixed_ops");
+
+    cleanup_test_files();
+
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Failed to create page manager");
+
+    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
+    TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
+
+    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
+    TEST_ASSERT(wal != NULL, "Failed to create WAL");
+
+    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    TEST_ASSERT(tree != NULL, "Failed to create tree");
+
+    // Insert 50 keys individually first
+    for (int i = 0; i < 50; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "mixed_key_%04d", i);
+        char val[32];
+        snprintf(val, 32, "old_val_%04d", i);
+        TEST_ASSERT(data_art_insert(tree, key, KEY_SIZE, val, strlen(val) + 1),
+                    "Pre-insert failed");
+    }
+    TEST_ASSERT(tree->size == 50, "Should have 50 keys after pre-insert");
+
+    // Build batch: delete keys 10-29 (20 deletes) + insert keys 50-79 (30 inserts)
+    const int NUM_OPS = 50;
+    data_art_batch_op_t ops[NUM_OPS];
+    uint8_t op_keys[NUM_OPS][KEY_SIZE];
+
+    // 20 deletes (keys 10-29)
+    for (int i = 0; i < 20; i++) {
+        memset(op_keys[i], 0, KEY_SIZE);
+        snprintf((char *)op_keys[i], KEY_SIZE, "mixed_key_%04d", i + 10);
+        ops[i].type = BATCH_OP_DELETE;
+        ops[i].key = op_keys[i];
+        ops[i].key_len = KEY_SIZE;
+        ops[i].value = NULL;
+        ops[i].value_len = 0;
+    }
+
+    // 30 inserts (keys 50-79)
+    uint8_t new_values[30][32];
+    for (int i = 0; i < 30; i++) {
+        memset(op_keys[20 + i], 0, KEY_SIZE);
+        snprintf((char *)op_keys[20 + i], KEY_SIZE, "mixed_key_%04d", i + 50);
+        snprintf((char *)new_values[i], 32, "new_val_%04d", i + 50);
+        ops[20 + i].type = BATCH_OP_INSERT;
+        ops[20 + i].key = op_keys[20 + i];
+        ops[20 + i].key_len = KEY_SIZE;
+        ops[20 + i].value = new_values[i];
+        ops[20 + i].value_len = strlen((char *)new_values[i]) + 1;
+    }
+
+    // Execute batch
+    TEST_ASSERT(data_art_batch(tree, ops, NUM_OPS), "Mixed batch failed");
+
+    // Verify: 50 - 20 + 30 = 60 keys
+    TEST_ASSERT(tree->size == 60, "Tree should have 60 keys");
+
+    // Keys 0-9 should exist (original, not deleted)
+    for (int i = 0; i < 10; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "mixed_key_%04d", i);
+        size_t vlen;
+        TEST_ASSERT(data_art_get(tree, key, KEY_SIZE, &vlen) != NULL,
+                    "Key 0-9 should still exist");
+    }
+
+    // Keys 10-29 should NOT exist (deleted)
+    for (int i = 10; i < 30; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "mixed_key_%04d", i);
+        size_t vlen;
+        TEST_ASSERT(data_art_get(tree, key, KEY_SIZE, &vlen) == NULL,
+                    "Deleted key should not exist");
+    }
+
+    // Keys 30-79 should exist (30-49 original, 50-79 new)
+    for (int i = 30; i < 80; i++) {
+        uint8_t key[KEY_SIZE];
+        memset(key, 0, KEY_SIZE);
+        snprintf((char *)key, KEY_SIZE, "mixed_key_%04d", i);
+        size_t vlen;
+        TEST_ASSERT(data_art_get(tree, key, KEY_SIZE, &vlen) != NULL,
+                    "Key 30-79 should exist");
+    }
+
+    data_art_destroy(tree);
+    buffer_pool_destroy(bp);
+    wal_close(wal);
+    page_manager_destroy(pm);
+    cleanup_test_files();
+
+    printf("   ✅ PASSED\n");
+    return true;
+}
+
+// ============================================================================
+// Test 9: Batch Insert WAL Recovery
+// ============================================================================
+
+static bool test_batch_wal_recovery()
+{
+    PRINT_TEST_HEADER("test_batch_wal_recovery");
+
+    cleanup_test_files();
+
+    // Phase 1: batch insert 100 keys, then close
+    {
+        page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+        TEST_ASSERT(pm != NULL, "Failed to create page manager");
+
+        buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
+        TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
+
+        wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
+        TEST_ASSERT(wal != NULL, "Failed to create WAL");
+
+        data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+        TEST_ASSERT(tree != NULL, "Failed to create tree");
+
+        const int COUNT = 100;
+        uint8_t key_data[COUNT][KEY_SIZE];
+        uint8_t value_data[COUNT][32];
+        const uint8_t *keys[COUNT];
+        size_t key_lens[COUNT];
+        const void *values[COUNT];
+        size_t value_lens[COUNT];
+
+        for (int i = 0; i < COUNT; i++) {
+            memset(key_data[i], 0, KEY_SIZE);
+            snprintf((char *)key_data[i], KEY_SIZE, "recov_key_%04d", i);
+            snprintf((char *)value_data[i], 32, "recov_val_%04d", i);
+            keys[i] = key_data[i];
+            key_lens[i] = KEY_SIZE;
+            values[i] = value_data[i];
+            value_lens[i] = strlen((char *)value_data[i]) + 1;
+        }
+
+        TEST_ASSERT(data_art_insert_batch(tree, keys, key_lens, values, value_lens, COUNT),
+                    "Batch insert failed");
+        TEST_ASSERT(tree->size == (size_t)COUNT, "Tree should have 100 keys");
+
+        // Close without checkpoint — recovery must replay from WAL
+        data_art_destroy(tree);
+        buffer_pool_destroy(bp);
+        wal_close(wal);
+        page_manager_destroy(pm);
+    }
+
+    // Phase 2: reopen and recover from WAL
+    {
+        page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+        TEST_ASSERT(pm != NULL, "Failed to reopen page manager");
+
+        buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 64}, pm);
+        TEST_ASSERT(bp != NULL, "Failed to reopen buffer pool");
+
+        wal_t *wal = wal_open(TEST_WAL_PATH, NULL);
+        TEST_ASSERT(wal != NULL, "Failed to reopen WAL");
+
+        data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+        TEST_ASSERT(tree != NULL, "Failed to recreate tree");
+
+        int64_t recovered = data_art_recover(tree, 0);
+        TEST_ASSERT(recovered >= 0, "Recovery failed");
+
+        // Verify all 100 keys recovered
+        const int COUNT = 100;
+        for (int i = 0; i < COUNT; i++) {
+            uint8_t key[KEY_SIZE];
+            memset(key, 0, KEY_SIZE);
+            snprintf((char *)key, KEY_SIZE, "recov_key_%04d", i);
+            size_t vlen;
+            const void *val = data_art_get(tree, key, KEY_SIZE, &vlen);
+            TEST_ASSERT(val != NULL, "Recovered key not found");
+
+            char expected[32];
+            snprintf(expected, 32, "recov_val_%04d", i);
+            TEST_ASSERT(memcmp(val, expected, strlen(expected) + 1) == 0,
+                        "Recovered value mismatch");
+        }
+
+        TEST_ASSERT(tree->size == (size_t)COUNT, "Recovered tree should have 100 keys");
+
+        data_art_destroy(tree);
+        buffer_pool_destroy(bp);
+        wal_close(wal);
+        page_manager_destroy(pm);
+    }
+
+    cleanup_test_files();
+
+    printf("   ✅ PASSED\n");
+    return true;
+}
+
+// ============================================================================
+// Test 10: Empty Batch (No-op)
+// ============================================================================
+
+static bool test_batch_empty()
+{
+    PRINT_TEST_HEADER("test_batch_empty");
+
+    cleanup_test_files();
+
+    page_manager_t *pm = page_manager_create(TEST_DB_PATH, false);
+    TEST_ASSERT(pm != NULL, "Failed to create page manager");
+
+    buffer_pool_t *bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 16}, pm);
+    TEST_ASSERT(bp != NULL, "Failed to create buffer pool");
+
+    wal_t *wal = wal_open(TEST_WAL_PATH, &(wal_config_t){.segment_size = 1024 * 1024});
+    TEST_ASSERT(wal != NULL, "Failed to create WAL");
+
+    data_art_tree_t *tree = data_art_create(pm, bp, wal, KEY_SIZE);
+    TEST_ASSERT(tree != NULL, "Failed to create tree");
+
+    // Empty insert batch
+    TEST_ASSERT(data_art_insert_batch(tree, NULL, NULL, NULL, NULL, 0),
+                "Empty insert batch should succeed");
+    TEST_ASSERT(tree->size == 0, "Tree should be empty");
+
+    // Empty mixed batch
+    TEST_ASSERT(data_art_batch(tree, NULL, 0),
+                "Empty mixed batch should succeed");
+    TEST_ASSERT(tree->size == 0, "Tree should still be empty");
+
+    data_art_destroy(tree);
+    buffer_pool_destroy(bp);
+    wal_close(wal);
+    page_manager_destroy(pm);
+    cleanup_test_files();
+
+    printf("   ✅ PASSED\n");
+    return true;
+}
+
+// ============================================================================
 // Main Test Runner
 // ============================================================================
 
@@ -389,6 +770,11 @@ int main()
     RUN_TEST(test_mixed_operations);
     RUN_TEST(test_large_transaction);
     RUN_TEST(test_nested_transaction_rejection);
+    RUN_TEST(test_batch_insert_basic);
+    RUN_TEST(test_batch_insert_atomicity);
+    RUN_TEST(test_batch_mixed_ops);
+    RUN_TEST(test_batch_wal_recovery);
+    RUN_TEST(test_batch_empty);
 
     printf("\n");
     printf("========================================\n");

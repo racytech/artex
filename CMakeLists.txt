@@ -125,6 +125,7 @@ add_library(art_persistent STATIC
     database/src/mvcc.c
     database/src/checkpoint_manager.c
     database/src/data_art_iterator.c
+    database/src/data_art_batch.c
     database/src/db_error.c
     database/src/logger.c
 )

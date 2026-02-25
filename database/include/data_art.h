@@ -562,6 +562,56 @@ bool data_art_commit_txn(data_art_tree_t *tree);
 bool data_art_abort_txn(data_art_tree_t *tree);
 
 // ============================================================================
+// Batch Operations
+// ============================================================================
+
+/**
+ * Batch operation type for mixed insert/delete batches
+ */
+typedef struct {
+    enum { BATCH_OP_INSERT, BATCH_OP_DELETE } type;
+    const uint8_t *key;
+    size_t key_len;
+    const void *value;      // NULL for delete
+    size_t value_len;       // 0 for delete
+} data_art_batch_op_t;
+
+/**
+ * Atomic batch insert — inserts multiple key-value pairs in a single transaction.
+ *
+ * Wraps all inserts in BEGIN -> N inserts -> COMMIT with a single fsync.
+ * If any insert fails, the entire batch is aborted (no partial application).
+ *
+ * Requires WAL to be enabled (returns false without WAL).
+ *
+ * @param tree Tree instance
+ * @param keys Array of key pointers
+ * @param key_lens Array of key lengths (must all equal tree->key_size)
+ * @param values Array of value pointers
+ * @param value_lens Array of value lengths
+ * @param count Number of entries to insert
+ * @return true if all inserts committed, false on failure (batch aborted)
+ */
+bool data_art_insert_batch(data_art_tree_t *tree,
+                           const uint8_t **keys, const size_t *key_lens,
+                           const void **values, const size_t *value_lens,
+                           size_t count);
+
+/**
+ * Atomic batch of mixed insert/delete operations.
+ *
+ * Same transactional semantics as insert_batch but supports both
+ * inserts and deletes in a single atomic batch.
+ *
+ * @param tree Tree instance
+ * @param ops Array of batch operations
+ * @param count Number of operations
+ * @return true if all operations committed, false on failure (batch aborted)
+ */
+bool data_art_batch(data_art_tree_t *tree,
+                    const data_art_batch_op_t *ops, size_t count);
+
+// ============================================================================
 // MVCC Snapshot Support
 // ============================================================================
 

@@ -90,11 +90,14 @@
    - Tests: exact match, between-keys, before-all/past-all boundaries, range scan (300 keys from sorted[100..399]), empty tree
    - Result: 11/11 iterator tests pass, 23/23 full suite
 
-### 13. Batch Insert (1-2 days)
-   - `data_art_insert_batch(tree, keys[], values[], count)` — atomic multi-key insert
-   - Wrap in single WAL transaction (BEGIN → N inserts → COMMIT) for durability
-   - Reduces fsync overhead: one fsync per batch instead of per-key
-   - Ethereum use case: block state updates (hundreds of key changes per block)
+### 13. ~~Batch Insert~~ TEMP FIX
+   - `data_art_insert_batch(tree, keys[], key_lens[], values[], value_lens[], count)` — atomic multi-key insert
+   - `data_art_batch(tree, ops[], count)` — mixed insert+delete batch via `data_art_batch_op_t`
+   - Both wrap existing txn API: `begin_txn` → buffer ops → `commit_txn` (single fsync)
+   - Atomicity: any failure aborts entire batch (no partial application)
+   - Tests: basic 100-key batch, atomicity rollback, mixed insert+delete (50-20+30=60), WAL recovery, empty batch
+   - Result: 10/10 txn_buffer tests pass, 23/23 full suite
+   - **Needs optimization**: commit path acquires/releases write_lock N times (once per op), publishes root N times, allocates N auto-commit MVCC txns. A dedicated batch path should hold the lock once, apply all mutations, and publish root once.
 
 ### 14. Database Compaction (3-5 days)
    - Rewrite live pages into contiguous files, discard dead pages
