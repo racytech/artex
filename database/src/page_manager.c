@@ -16,11 +16,28 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <time.h>
 
 // Forward declaration for page index management
 static void page_index_insert_or_update(page_manager_t *pm, uint64_t page_id,
                                         uint32_t compressed_size);
+
+// Metadata file format (written atomically during checkpoint)
+#define METADATA_MAGIC   0x4D455441  // "META"
+#define METADATA_VERSION 1
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t next_page_id;
+    uint64_t last_checkpoint_lsn;
+    uint32_t checksum;
+    uint32_t padding;
+} __attribute__((packed)) db_metadata_t;
+
+// Reopen existing data files found in db_path
+static void reopen_existing_data_files(page_manager_t *pm);
 
 // ============================================================================
 // Free List Management
@@ -146,8 +163,16 @@ page_manager_t *page_manager_create(const char *db_path, bool read_only) {
     pm->index->total_file_size = 0;
     pm->index->dead_bytes = 0;
     
-    // Create first data file
-    if (!read_only) {
+    // Try to reopen existing data files first
+    reopen_existing_data_files(pm);
+
+    // Load persisted metadata (next_page_id, etc.)
+    if (page_manager_load_metadata(pm)) {
+        LOG_INFO("Loaded metadata: next_page_id=%lu", pm->allocator->next_page_id);
+    }
+
+    // Create first data file if none exist
+    if (pm->allocator->num_data_files == 0 && !read_only) {
         if (page_manager_create_data_file(pm) != PAGE_SUCCESS) {
             LOG_ERROR("Failed to create initial data file");
             free(pm->allocator);
@@ -156,7 +181,7 @@ page_manager_t *page_manager_create(const char *db_path, bool read_only) {
             return NULL;
         }
     }
-    
+
     LOG_INFO("Page manager created successfully");
     return pm;
 }
@@ -878,9 +903,195 @@ void page_manager_update_dead_stats(page_manager_t *pm, uint32_t dead_bytes) {
     if (!pm || !pm->index) {
         return;
     }
-    
+
     page_index_t *index = pm->index;
     pthread_rwlock_wrlock(&index->lock);
     index->dead_bytes += dead_bytes;
     pthread_rwlock_unlock(&index->lock);
+}
+
+// ============================================================================
+// Metadata Persistence
+// ============================================================================
+
+uint64_t page_manager_get_next_page_id(page_manager_t *pm) {
+    if (!pm || !pm->allocator) return 0;
+    return pm->allocator->next_page_id;
+}
+
+void page_manager_set_next_page_id(page_manager_t *pm, uint64_t next_id) {
+    if (!pm || !pm->allocator) return;
+    // Only increase — never set to a value lower than current
+    if (next_id > pm->allocator->next_page_id) {
+        pm->allocator->next_page_id = next_id;
+        LOG_INFO("Set next_page_id to %lu", next_id);
+    }
+}
+
+bool page_manager_save_metadata(page_manager_t *pm, uint64_t checkpoint_lsn) {
+    if (!pm || !pm->allocator || !pm->db_path) return false;
+
+    db_metadata_t meta = {0};
+    meta.magic = METADATA_MAGIC;
+    meta.version = METADATA_VERSION;
+    meta.next_page_id = pm->allocator->next_page_id;
+    meta.last_checkpoint_lsn = checkpoint_lsn;
+    meta.checksum = compute_crc32((const uint8_t *)&meta,
+                                   offsetof(db_metadata_t, checksum));
+
+    // Write to tmp file, fsync, rename (atomic on POSIX)
+    char tmp_path[512], final_path[512];
+    snprintf(final_path, sizeof(final_path), "%s/metadata.bin", pm->db_path);
+    snprintf(tmp_path, sizeof(tmp_path), "%s/metadata.bin.tmp", pm->db_path);
+
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        LOG_ERROR("Failed to open %s: %s", tmp_path, strerror(errno));
+        return false;
+    }
+
+    ssize_t written = write(fd, &meta, sizeof(meta));
+    if (written != sizeof(meta)) {
+        LOG_ERROR("Failed to write metadata: %s", strerror(errno));
+        close(fd);
+        unlink(tmp_path);
+        return false;
+    }
+
+    if (fsync(fd) != 0) {
+        LOG_ERROR("Failed to fsync metadata: %s", strerror(errno));
+        close(fd);
+        unlink(tmp_path);
+        return false;
+    }
+    close(fd);
+
+    if (rename(tmp_path, final_path) != 0) {
+        LOG_ERROR("Failed to rename metadata: %s", strerror(errno));
+        unlink(tmp_path);
+        return false;
+    }
+
+    LOG_INFO("Saved metadata: next_page_id=%lu, checkpoint_lsn=%lu",
+             meta.next_page_id, meta.last_checkpoint_lsn);
+    return true;
+}
+
+bool page_manager_load_metadata(page_manager_t *pm) {
+    if (!pm || !pm->allocator || !pm->db_path) return false;
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/metadata.bin", pm->db_path);
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        // File doesn't exist on first run — not an error
+        return false;
+    }
+
+    db_metadata_t meta;
+    ssize_t bytes_read = read(fd, &meta, sizeof(meta));
+    close(fd);
+
+    if (bytes_read != sizeof(meta)) {
+        LOG_WARN("Metadata file truncated (%zd bytes)", bytes_read);
+        return false;
+    }
+
+    if (meta.magic != METADATA_MAGIC) {
+        LOG_WARN("Metadata file has bad magic: 0x%08X", meta.magic);
+        return false;
+    }
+
+    if (meta.version != METADATA_VERSION) {
+        LOG_WARN("Metadata file version mismatch: %u (expected %u)",
+                 meta.version, METADATA_VERSION);
+        return false;
+    }
+
+    uint32_t expected_crc = compute_crc32((const uint8_t *)&meta,
+                                           offsetof(db_metadata_t, checksum));
+    if (meta.checksum != expected_crc) {
+        LOG_WARN("Metadata file checksum mismatch");
+        return false;
+    }
+
+    page_manager_set_next_page_id(pm, meta.next_page_id);
+    return true;
+}
+
+// ============================================================================
+// Reopen Existing Data Files
+// ============================================================================
+
+static int cmp_uint32(const void *a, const void *b) {
+    uint32_t va = *(const uint32_t *)a;
+    uint32_t vb = *(const uint32_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+static void reopen_existing_data_files(page_manager_t *pm) {
+    DIR *dir = opendir(pm->db_path);
+    if (!dir) return;
+
+    // Collect file indices
+    uint32_t *indices = NULL;
+    size_t count = 0, cap = 0;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        uint32_t idx;
+        if (sscanf(entry->d_name, "pages_%05u.dat", &idx) == 1) {
+            if (count >= cap) {
+                cap = (cap == 0) ? 8 : cap * 2;
+                indices = realloc(indices, cap * sizeof(uint32_t));
+            }
+            indices[count++] = idx;
+        }
+    }
+    closedir(dir);
+
+    if (count == 0) {
+        free(indices);
+        return;
+    }
+
+    // Sort indices so files are opened in order
+    qsort(indices, count, sizeof(uint32_t), cmp_uint32);
+
+    // Open each file
+    for (size_t i = 0; i < count; i++) {
+        char filename[512];
+        snprintf(filename, sizeof(filename), "%s/pages_%05u.dat",
+                 pm->db_path, indices[i]);
+
+        int flags = pm->read_only ? O_RDONLY : (O_RDWR | O_SYNC);
+        int fd = open(filename, flags);
+        if (fd < 0) {
+            LOG_WARN("Failed to reopen %s: %s", filename, strerror(errno));
+            continue;
+        }
+
+        // Expand fd array to fit this index
+        uint32_t needed = indices[i] + 1;
+        if (needed > pm->allocator->num_data_files) {
+            int *new_fds = realloc(pm->allocator->data_file_fds,
+                                    needed * sizeof(int));
+            if (!new_fds) {
+                close(fd);
+                continue;
+            }
+            // Initialize any gaps to -1
+            for (uint32_t g = pm->allocator->num_data_files; g < needed; g++)
+                new_fds[g] = -1;
+            pm->allocator->data_file_fds = new_fds;
+            pm->allocator->num_data_files = needed;
+        }
+
+        pm->allocator->data_file_fds[indices[i]] = fd;
+        LOG_INFO("Reopened data file: index=%u, fd=%d", indices[i], fd);
+    }
+
+    free(indices);
+    LOG_INFO("Reopened %zu existing data files", count);
 }

@@ -433,4 +433,34 @@ uint64_t page_manager_get_total_file_size(page_manager_t *pm);
  */
 void page_manager_update_dead_stats(page_manager_t *pm, uint32_t dead_bytes);
 
+// ============================================================================
+// Metadata Persistence
+// ============================================================================
+
+/**
+ * Get the next page ID that will be allocated.
+ */
+uint64_t page_manager_get_next_page_id(page_manager_t *pm);
+
+/**
+ * Set the next page ID (used during recovery).
+ * Only increases — never sets to a value lower than current.
+ */
+void page_manager_set_next_page_id(page_manager_t *pm, uint64_t next_id);
+
+/**
+ * Save allocator metadata to disk (metadata.bin).
+ * Writes atomically via tmp + rename.
+ *
+ * @param checkpoint_lsn LSN of the checkpoint being saved
+ */
+bool page_manager_save_metadata(page_manager_t *pm, uint64_t checkpoint_lsn);
+
+/**
+ * Load allocator metadata from disk (metadata.bin).
+ * Returns true if metadata was loaded, false if file missing or invalid.
+ * On failure, allocator state is left unchanged (defaults apply).
+ */
+bool page_manager_load_metadata(page_manager_t *pm);
+
 #endif // PAGE_MANAGER_H

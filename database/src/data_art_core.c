@@ -828,24 +828,28 @@ bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out) {
     }
     
     // Log checkpoint with current tree state
+    uint64_t next_pid = page_manager_get_next_page_id(tree->page_manager);
     uint64_t lsn;
-    if (!wal_log_checkpoint(tree->wal, 
+    if (!wal_log_checkpoint(tree->wal,
                            tree->root.page_id,
                            tree->root.offset,
                            tree->size,
-                           tree->nodes_allocated,  // Use nodes allocated as proxy
+                           next_pid,
                            &lsn)) {
         LOG_ERROR("Failed to log checkpoint to WAL");
         return false;
     }
-    
+
+    // Persist allocator metadata atomically
+    page_manager_save_metadata(tree->page_manager, lsn);
+
     if (checkpoint_lsn_out) {
         *checkpoint_lsn_out = lsn;
     }
-    
-    LOG_INFO("Created checkpoint at LSN %lu (root=%lu:%u, size=%zu)",
-             lsn, tree->root.page_id, tree->root.offset, tree->size);
-    
+
+    LOG_INFO("Created checkpoint at LSN %lu (root=%lu:%u, size=%zu, next_page_id=%lu)",
+             lsn, tree->root.page_id, tree->root.offset, tree->size, next_pid);
+
     return true;
 }
 
@@ -923,8 +927,11 @@ static bool apply_wal_entry_txn_aware(void *context, const wal_entry_header_t *h
             ctx->tree->root.page_id = ckpt->root_page_id;
             ctx->tree->root.offset = ckpt->root_offset;
             ctx->tree->size = ckpt->tree_size;
-            LOG_INFO("Restored checkpoint: root=%lu:%u, size=%zu",
-                     ckpt->root_page_id, ckpt->root_offset, ctx->tree->size);
+            // Restore page allocator state from checkpoint
+            if (ckpt->next_page_id > 0)
+                page_manager_set_next_page_id(ctx->tree->page_manager, ckpt->next_page_id);
+            LOG_INFO("Restored checkpoint: root=%lu:%u, size=%zu, next_page_id=%lu",
+                     ckpt->root_page_id, ckpt->root_offset, ctx->tree->size, ckpt->next_page_id);
             break;
         }
 

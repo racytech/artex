@@ -66,13 +66,14 @@
    - Tests: uncommitted txn skipped (20 auto-commit present, 10 uncommitted absent), mixed committed + uncommitted (15 present, 5 absent)
    - All 23/23 tests pass, 7/7 crash recovery tests pass
 
-### 10. Metadata Persistence (2-3 days) 🔴 CRITICAL
-   - `page_manager_create()` always resets `next_page_id = 1` — no allocator state survives restart
-   - Persist to `$db_path/metadata.bin`: `next_page_id`, free list counts, `last_checkpoint_lsn`
-   - Write metadata atomically during checkpoint (after flush, before WAL truncate)
-   - Read on startup in `page_manager_create()` before WAL replay
-   - Enables incremental recovery from last checkpoint instead of full replay from LSN 0
-   - Test: insert keys → checkpoint → close → reopen → verify `next_page_id` restored, no page ID collisions
+### 10. ~~Metadata Persistence~~ FIXED
+   - `metadata.bin` written atomically (tmp + fsync + rename) during checkpoint
+   - Format: magic + version + next_page_id + last_checkpoint_lsn + CRC32 checksum (32 bytes)
+   - `page_manager_create()` loads metadata.bin on startup, restores `next_page_id`
+   - Existing data files (pages_XXXXX.dat) reopened automatically on startup via directory scan
+   - Fixed bug: `data_art_checkpoint()` was passing `nodes_allocated` (wrong) instead of actual `next_page_id`
+   - WAL checkpoint entry also restores `next_page_id` during replay (fallback if metadata.bin missing)
+   - Tests: metadata survives restart (next_page_id=105 preserved), WAL-only fallback (deleted metadata.bin, restored from checkpoint entry)
 
 ### 11. Page Reuse (1-2 days) 🔴 CRITICAL
    - `data_art_release_page()` is a no-op (data_art_core.c:322) — freed pages never returned to allocator

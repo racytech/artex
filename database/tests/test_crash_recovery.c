@@ -9,6 +9,8 @@
  *   5. Delete replay (insert → delete → crash → recover → verify deletions persisted)
  *   6. Uncommitted transaction skipped during recovery
  *   7. Mixed committed + uncommitted transactions
+ *   8. Metadata persistence (next_page_id survives restart via metadata.bin)
+ *   9. Recovery without metadata.bin (WAL checkpoint entry restores next_page_id)
  */
 
 #include "data_art.h"
@@ -562,6 +564,113 @@ static void test_mixed_committed_uncommitted(void) {
 }
 
 // ============================================================================
+// Test 8: Metadata Persistence Across Restart
+// ============================================================================
+
+static void test_metadata_persistence(void) {
+    test_env_t env = {0};
+    make_paths(&env, "t8");
+    cleanup_paths(env.db_path, env.wal_path);
+    open_env(&env);
+
+    // Insert 50 keys
+    printf("  Inserting 50 keys...\n");
+    insert_keys(&env, 0, 50);
+
+    // Checkpoint (writes metadata.bin + WAL checkpoint entry)
+    printf("  Checkpointing...\n");
+    uint64_t ckpt_lsn;
+    ASSERT(data_art_checkpoint(env.tree, &ckpt_lsn), "checkpoint");
+
+    // Record next_page_id before close
+    uint64_t saved_next_pid = page_manager_get_next_page_id(env.pm);
+    printf("  next_page_id before close: %lu\n", saved_next_pid);
+    ASSERT(saved_next_pid > 50, "next_page_id should be > 50 after 50 inserts");
+
+    // Close and reopen
+    printf("  Closing and reopening...\n");
+    close_env(&env);
+    open_env(&env);
+
+    // Verify next_page_id restored from metadata.bin
+    uint64_t restored_next_pid = page_manager_get_next_page_id(env.pm);
+    printf("  next_page_id after reopen: %lu\n", restored_next_pid);
+    ASSERT_EQ((long)restored_next_pid, (long)saved_next_pid,
+              "next_page_id should survive restart");
+
+    // Recover from WAL
+    printf("  Recovering from WAL...\n");
+    int64_t recovered = data_art_recover(env.tree, 0);
+    ASSERT(recovered > 0, "recovery should succeed");
+
+    // Insert 50 more keys (should not collide with existing pages)
+    printf("  Inserting 50 more keys...\n");
+    insert_keys(&env, 50, 50);
+
+    // Verify all 100 keys present
+    printf("  Verifying all 100 keys...\n");
+    verify_keys(&env, 0, 100);
+    ASSERT_EQ((long)data_art_size(env.tree), 100L, "tree size");
+
+    close_env(&env);
+    cleanup_paths(env.db_path, env.wal_path);
+}
+
+// ============================================================================
+// Test 9: Recovery Without metadata.bin (WAL-only fallback)
+// ============================================================================
+
+static void test_recovery_without_metadata_file(void) {
+    test_env_t env = {0};
+    make_paths(&env, "t9");
+    cleanup_paths(env.db_path, env.wal_path);
+    open_env(&env);
+
+    // Insert 30 keys and checkpoint
+    printf("  Inserting 30 keys and checkpointing...\n");
+    insert_keys(&env, 0, 30);
+    uint64_t ckpt_lsn;
+    ASSERT(data_art_checkpoint(env.tree, &ckpt_lsn), "checkpoint");
+
+    uint64_t saved_next_pid = page_manager_get_next_page_id(env.pm);
+    printf("  next_page_id before close: %lu\n", saved_next_pid);
+
+    close_env(&env);
+
+    // Delete metadata.bin to simulate missing file
+    char meta_path[512];
+    snprintf(meta_path, sizeof(meta_path), "%s/metadata.bin", env.db_path);
+    printf("  Deleting %s...\n", meta_path);
+    unlink(meta_path);
+
+    // Reopen — metadata.bin missing, next_page_id starts at 1
+    open_env(&env);
+    uint64_t pre_recovery_pid = page_manager_get_next_page_id(env.pm);
+    printf("  next_page_id after reopen (no metadata): %lu\n", pre_recovery_pid);
+
+    // Recover from WAL — checkpoint entry should restore next_page_id
+    printf("  Recovering from WAL (checkpoint entry should restore next_page_id)...\n");
+    int64_t recovered = data_art_recover(env.tree, 0);
+    ASSERT(recovered > 0, "recovery should succeed");
+
+    uint64_t post_recovery_pid = page_manager_get_next_page_id(env.pm);
+    printf("  next_page_id after recovery: %lu\n", post_recovery_pid);
+    ASSERT_EQ((long)post_recovery_pid, (long)saved_next_pid,
+              "next_page_id should be restored from WAL checkpoint entry");
+
+    // Insert more keys — should not collide
+    printf("  Inserting 20 more keys...\n");
+    insert_keys(&env, 30, 20);
+
+    printf("  Verifying all 50 keys...\n");
+    verify_keys(&env, 0, 50);
+    ASSERT_EQ((long)data_art_size(env.tree), 50L, "tree size");
+
+    close_env(&env);
+    cleanup_paths(env.db_path, env.wal_path);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -588,6 +697,8 @@ int main(void) {
     RUN_TEST(test_delete_replay_recovery);
     RUN_TEST(test_uncommitted_txn_skipped);
     RUN_TEST(test_mixed_committed_uncommitted);
+    RUN_TEST(test_metadata_persistence);
+    RUN_TEST(test_recovery_without_metadata_file);
 
     printf("========================================\n");
     printf(" Results: %d/%d tests passed\n", tests_passed, test_count);
