@@ -116,10 +116,10 @@ static bool flush_frame(buffer_pool_t *bp, buffer_frame_t *frame) {
     
     // Set page_id in header before writing
     frame->page.header.page_id = frame->page_id;
-    
-    // Compute checksum for modified data
-    page_compute_checksum(&frame->page);
-    
+
+    // No checksum here — page_manager_write() computes it
+    // (after stamping write_counter for torn-write detection)
+
     page_result_t result = page_manager_write(bp->page_manager, &frame->page);
     if (result != PAGE_SUCCESS) {
         LOG_ERROR("Failed to flush page %lu to disk", frame->page_id);
@@ -187,12 +187,14 @@ static bool evict_lru_frame(buffer_pool_t *bp) {
  * Allocate and initialize a new frame
  */
 static buffer_frame_t *create_frame(uint64_t page_id) {
-    buffer_frame_t *frame = calloc(1, sizeof(buffer_frame_t));
+    // malloc instead of calloc — avoid zeroing 4KB page data
+    // (load_page overwrites it from disk; insert_new zeroes explicitly)
+    buffer_frame_t *frame = malloc(sizeof(buffer_frame_t));
     if (!frame) {
         LOG_ERROR("Failed to allocate buffer frame");
         return NULL;
     }
-    
+
     frame->page_id = page_id;
     frame->is_dirty = false;
     frame->pin_count = 0;
@@ -200,7 +202,7 @@ static buffer_frame_t *create_frame(uint64_t page_id) {
     frame->load_time = frame->last_access_time;
     frame->lru_prev = NULL;
     frame->lru_next = NULL;
-    
+
     return frame;
 }
 
@@ -461,6 +463,64 @@ page_t *buffer_pool_get_pinned(buffer_pool_t *bp, uint64_t page_id) {
     return &frame->page;
 }
 
+page_t *buffer_pool_insert_new(buffer_pool_t *bp, uint64_t page_id) {
+    if (!bp) return NULL;
+
+    pthread_rwlock_wrlock(&bp->lock);
+
+    // Defensive: check if already in cache
+    buffer_frame_t *frame = find_frame(bp, page_id);
+    if (frame) {
+        lru_touch(bp, frame);
+        if (frame->pin_count == 0) bp->stats.num_pinned++;
+        frame->pin_count++;
+        bp->stats.pins++;
+        pthread_rwlock_unlock(&bp->lock);
+        return &frame->page;
+    }
+
+    // Evict if full
+    size_t current_size = HASH_COUNT(bp->frames_hash);
+    if (current_size >= bp->config.capacity) {
+        if (!evict_lru_frame(bp)) {
+            pthread_rwlock_unlock(&bp->lock);
+            return NULL;
+        }
+    }
+
+    // Create fresh frame — NO disk I/O
+    frame = create_frame(page_id);
+    if (!frame) {
+        pthread_rwlock_unlock(&bp->lock);
+        return NULL;
+    }
+
+    // Zero page data for new allocation (create_frame uses malloc, not calloc)
+    memset(&frame->page, 0, sizeof(page_t));
+
+    // Initialize page header for new allocation
+    frame->page.header.page_id = page_id;
+    frame->page.header.free_offset = PAGE_HEADER_SIZE;
+    frame->page.header.uncompressed_size = PAGE_SIZE;
+
+    // Mark dirty — will be flushed on eviction or checkpoint
+    frame->is_dirty = true;
+
+    // Add to cache + LRU
+    add_frame(bp, frame);
+    lru_add_head(bp, frame);
+
+    // Pin before returning
+    frame->pin_count = 1;
+    bp->stats.num_pinned++;
+    bp->stats.pins++;
+    bp->stats.num_dirty++;
+    bp->stats.num_frames = HASH_COUNT(bp->frames_hash);
+
+    pthread_rwlock_unlock(&bp->lock);
+    return &frame->page;
+}
+
 bool buffer_pool_pin(buffer_pool_t *bp, uint64_t page_id) {
     if (!bp) {
         return false;
@@ -527,6 +587,38 @@ bool buffer_pool_mark_dirty(buffer_pool_t *bp, uint64_t page_id) {
         bp->stats.num_dirty++;
     }
     
+    pthread_rwlock_unlock(&bp->lock);
+    return true;
+}
+
+bool buffer_pool_dirty_unpin(buffer_pool_t *bp, uint64_t page_id) {
+    if (!bp) {
+        return false;
+    }
+
+    pthread_rwlock_wrlock(&bp->lock);
+
+    buffer_frame_t *frame = find_frame(bp, page_id);
+    if (!frame) {
+        pthread_rwlock_unlock(&bp->lock);
+        return false;
+    }
+
+    // Mark dirty
+    if (!frame->is_dirty) {
+        frame->is_dirty = true;
+        bp->stats.num_dirty++;
+    }
+
+    // Unpin
+    if (frame->pin_count > 0) {
+        frame->pin_count--;
+        bp->stats.unpins++;
+        if (frame->pin_count == 0 && bp->stats.num_pinned > 0) {
+            bp->stats.num_pinned--;
+        }
+    }
+
     pthread_rwlock_unlock(&bp->lock);
     return true;
 }

@@ -702,11 +702,8 @@ page_result_t page_manager_create_data_file(page_manager_t *pm) {
 
     LOG_INFO("Creating data file: %s", filename);
 
-    // Open file
+    // Open file (no O_SYNC — WAL handles durability, pages flush on checkpoint)
     int flags = O_RDWR | O_CREAT;
-    if (!pm->read_only) {
-        flags |= O_SYNC;  // Write-through for durability
-    }
 
     int fd = open(filename, flags, 0644);
     if (fd == -1) {
@@ -1530,7 +1527,7 @@ static void reopen_existing_data_files(page_manager_t *pm) {
         snprintf(filename, sizeof(filename), "%s/pages_%05u.dat",
                  pm->db_path, indices[i]);
 
-        int flags = pm->read_only ? O_RDONLY : (O_RDWR | O_SYNC);
+        int flags = pm->read_only ? O_RDONLY : O_RDWR;
         int fd = open(filename, flags);
         if (fd < 0) {
             LOG_WARN("Failed to reopen %s: %s", filename, strerror(errno));

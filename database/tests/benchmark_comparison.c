@@ -183,7 +183,7 @@ static art_ctx_t art_open(void) {
     // Disable compression — LZ4 wastes CPU on small random-data nodes
     page_manager_set_compression(ctx.pm, COMPRESSION_NONE);
 
-    ctx.bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 1024}, ctx.pm);
+    ctx.bp = buffer_pool_create(&(buffer_pool_config_t){.capacity = 65536}, ctx.pm);
     if (!ctx.bp) { fprintf(stderr, "ART: buffer_pool_create failed\n"); return ctx; }
 
     ctx.wal = wal_open(ART_WAL_PATH, &(wal_config_t){.segment_size = 8 * 1024 * 1024});

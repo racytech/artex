@@ -449,85 +449,28 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
         return false;
     }
     
-    // Try to get page from buffer pool (and pin it atomically)
+    // Get page from buffer pool — either existing (cache hit) or new allocation
     page_t *page = buffer_pool_get_pinned(tree->buffer_pool, ref.page_id);
-    bool page_is_temp = false;
-    page_t *temp_page_allocated = NULL;
-    
+
     if (!page) {
-        // Page doesn't exist in buffer pool yet - might be a new page
-        // Allocate temporary page on heap for writing, then reload into buffer pool
-        temp_page_allocated = malloc(sizeof(page_t));
-        if (!temp_page_allocated) {
-            LOG_ERROR("Failed to allocate temporary page");
+        // Page not in buffer pool — insert a fresh frame directly.
+        // No disk I/O: the page was just allocated, WAL handles durability.
+        page = buffer_pool_insert_new(tree->buffer_pool, ref.page_id);
+        if (!page) {
+            LOG_ERROR("Failed to insert new page %lu into buffer pool", ref.page_id);
             return false;
         }
-        
-        memset(temp_page_allocated, 0, sizeof(*temp_page_allocated));
-        
-        // Try to read existing page data
-        page_result_t result = page_manager_read(tree->page_manager, ref.page_id, temp_page_allocated);
-        if (result != PAGE_SUCCESS) {
-            // Page doesn't exist yet - already zeroed
-            temp_page_allocated->header.page_id = ref.page_id;
-            LOG_TRACE("Page %lu doesn't exist yet, using zero-initialized page", ref.page_id);
-        } else {
-            LOG_TRACE("Successfully read existing page %lu from disk", ref.page_id);
-        }
-        page = temp_page_allocated;
-        page_is_temp = true;
     }
-    
+
     // Copy node data to page at offset
-    LOG_DEBUG("[WRITE_NODE] Copying %zu bytes to page=%lu offset=%u", size, ref.page_id, ref.offset);
     memcpy(page->data + ref.offset, node, size);
-    
-    // Debug: Log what we're about to write
-    uint8_t node_type = *(const uint8_t *)node;
-    if (node_type == 0) {  // DATA_NODE_LEAF
-        const data_art_leaf_t *debug_leaf = (const data_art_leaf_t *)node;
-        LOG_TRACE("About to write leaf to page=%lu: key_len=%u, value_len=%u, size=%zu",
-                  ref.page_id, debug_leaf->key_len, debug_leaf->value_len, size);
-        LOG_DEBUG("[WRITE_NODE] Leaf in page buffer: type=%u flags=0x%02x key_len=%u value_len=%u",
-                  debug_leaf->type, debug_leaf->flags, debug_leaf->key_len, debug_leaf->value_len);
-    }
-    
-    // Compute checksum before writing
-    page_compute_checksum(page);
-    
-    if (!page_is_temp) {
-        // Page is in buffer pool - mark as dirty for later flush
-        buffer_pool_mark_dirty(tree->buffer_pool, ref.page_id);
-        
-        // Unpin the page now that we're done modifying it
-        buffer_pool_unpin(tree->buffer_pool, ref.page_id);
-    } else {
-        // Temp page for new allocation - write directly and reload into buffer pool
-        LOG_DEBUG("[WRITE_NODE] Writing new page=%lu to disk", ref.page_id);
-        page_result_t result = page_manager_write(tree->page_manager, page);
-        if (result != PAGE_SUCCESS) {
-            LOG_ERROR("Failed to write page %lu", ref.page_id);
-            if (temp_page_allocated) {
-                free(temp_page_allocated);
-            }
-            return false;
-        }
-        LOG_DEBUG("[WRITE_NODE] Page %lu written to disk successfully", ref.page_id);
-        
-        // Reload into buffer pool cache for subsequent reads
-        buffer_pool_reload(tree->buffer_pool, ref.page_id);
-        LOG_DEBUG("[WRITE_NODE] Reloaded page %lu into buffer pool cache", ref.page_id);
-        
-        // Sync to ensure data is persisted
-        page_manager_sync(tree->page_manager);
-        LOG_DEBUG("[WRITE_NODE] Page %lu synced to disk", ref.page_id);
-    }
-    
-    // Free temporary page if allocated
-    if (temp_page_allocated) {
-        free(temp_page_allocated);
-    }
-    
+
+    // No checksum here — page_manager_write() computes it at flush time
+    // (after stamping write_counter for torn-write detection)
+
+    // Mark dirty and unpin (single hash lookup + lock)
+    buffer_pool_dirty_unpin(tree->buffer_pool, ref.page_id);
+
     return true;
 }
 

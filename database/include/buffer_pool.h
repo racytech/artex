@@ -195,14 +195,26 @@ bool buffer_pool_unpin(buffer_pool_t *bp, uint64_t page_id);
 
 /**
  * Mark a page as dirty (modified)
- * 
+ *
  * Dirty pages are flushed to disk during checkpoint or eviction.
- * 
+ *
  * @param bp Buffer pool
  * @param page_id Page ID to mark dirty
  * @return true on success, false if page not in cache
  */
 bool buffer_pool_mark_dirty(buffer_pool_t *bp, uint64_t page_id);
+
+/**
+ * Mark a page dirty and unpin it in a single operation
+ *
+ * Combines buffer_pool_mark_dirty() and buffer_pool_unpin() with a single
+ * hash lookup and lock acquisition. Use after modifying a pinned page.
+ *
+ * @param bp Buffer pool
+ * @param page_id Page ID to mark dirty and unpin
+ * @return true on success, false if page not in cache
+ */
+bool buffer_pool_dirty_unpin(buffer_pool_t *bp, uint64_t page_id);
 
 /**
  * Flush a specific page to disk
@@ -274,6 +286,23 @@ int buffer_pool_clear(buffer_pool_t *bp);
  * @return true on success (or if page not in cache), false on error
  */
 bool buffer_pool_invalidate(buffer_pool_t *bp, uint64_t page_id);
+
+/**
+ * Insert a new page directly into the buffer pool (no disk I/O)
+ *
+ * Creates a fresh zero-initialized frame for a newly allocated page.
+ * The page is marked dirty and pinned (pin_count=1).
+ * Caller must call buffer_pool_unpin() when done.
+ *
+ * Use this for pages that were just allocated via page_manager_alloc()
+ * and don't exist on disk yet. Avoids the pwrite+reload overhead.
+ * The dirty page will be flushed to disk during eviction or checkpoint.
+ *
+ * @param bp Buffer pool
+ * @param page_id Page ID of newly allocated page
+ * @return Pointer to page in cache (pinned), or NULL on error
+ */
+page_t *buffer_pool_insert_new(buffer_pool_t *bp, uint64_t page_id);
 
 /**
  * Reload a page from disk after external write
