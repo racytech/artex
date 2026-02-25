@@ -1057,11 +1057,13 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
         txn_operation_t *op = &buffer->operations[i];
         bool success;
 
+        uint8_t *key = buffer->arena + op->key_off;
         if (op->type == TXN_OP_INSERT) {
-            success = data_art_insert_internal(tree, op->key, op->key_len,
-                                                op->value, op->value_len, inplace);
+            void *value = buffer->arena + op->value_off;
+            success = data_art_insert_internal(tree, key, op->key_len,
+                                                value, op->value_len, inplace);
         } else { // TXN_OP_DELETE
-            success = data_art_delete_internal(tree, op->key, op->key_len);
+            success = data_art_delete_internal(tree, key, op->key_len);
             if (!success) {
                 // Delete not found — not an error in batch context
                 LOG_DEBUG("Delete for key not found during commit — skipping");

@@ -25,20 +25,21 @@ typedef enum {
 } txn_op_type_t;
 
 /**
- * Single buffered operation
+ * Single buffered operation — key/value stored as offsets into arena
  */
 typedef struct {
     txn_op_type_t type;
-    uint8_t *key;
+    size_t key_off;       // offset into arena
     size_t key_len;
-    uint8_t *value;      // NULL for delete operations
-    size_t value_len;    // 0 for delete operations
+    size_t value_off;     // offset into arena (unused for delete)
+    size_t value_len;     // 0 for delete operations
 } txn_operation_t;
 
 /**
  * Transaction buffer
- * 
+ *
  * Stores all pending operations for an active transaction.
+ * Key/value data lives in a flat arena (bump-allocated, freed in bulk).
  * Operations are applied to the tree only on commit.
  */
 typedef struct txn_buffer {
@@ -46,6 +47,9 @@ typedef struct txn_buffer {
     size_t num_ops;               // Number of operations
     size_t capacity;              // Allocated capacity
     uint64_t txn_id;              // Associated transaction ID
+    uint8_t *arena;               // Flat buffer for key/value data
+    size_t   arena_used;          // Bump pointer
+    size_t   arena_cap;           // Allocated arena size
 } txn_buffer_t;
 
 // ============================================================================
