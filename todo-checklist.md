@@ -53,9 +53,10 @@
    - Overflow value reading supported via `data_art_read_overflow_value()`
    - Tests: empty tree, single key, sorted order (100 keys), large scale (10,000 keys), concurrent writes, overflow values
 
-### 8. Delete Replay Test (half day)
-   - Test: insert keys → delete some → crash → recover from WAL → verify deletions persisted
-   - Currently crash recovery tests only cover insert replay
+### 8. ~~Delete Replay Test~~ FIXED
+   - Added test_delete_replay_recovery to test_crash_recovery.c
+   - Insert 50 keys → delete keys 10-29 → close → reopen → recover from WAL → verify
+   - 70 entries replayed (50 inserts + 20 deletes), tree size = 30, deleted keys confirmed absent
    - Validates `WAL_ENTRY_DELETE` replay path in `apply_wal_entry()`
 
 ### 9. Transaction-Aware WAL Replay (1-2 days) 🔴 CRITICAL
