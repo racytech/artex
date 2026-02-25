@@ -337,20 +337,16 @@ static node_ref_t add_child_node48(data_art_tree_t *tree, node_ref_t node_ref,
         return NULL_NODE_REF;
     }
     
-    // Find empty slot
-    int slot = 0;
-    while (slot < 48) {
-        bool used = false;
-        for (int i = 0; i < 256; i++) {
-            if (new_n48.keys[i] == slot) {
-                used = true;
-                break;
-            }
+    // Find empty slot via bitmask (single pass over keys[] instead of O(48×256))
+    uint64_t used_mask = 0;
+    for (int i = 0; i < 256; i++) {
+        if (new_n48.keys[i] != NODE48_EMPTY) {
+            used_mask |= (1ULL << new_n48.keys[i]);
         }
-        if (!used) break;
-        slot++;
     }
-    
+    uint64_t free_mask = ~used_mask & ((1ULL << 48) - 1);
+    int slot = __builtin_ctzll(free_mask);
+
     // Set index and child
     new_n48.keys[byte] = slot;
     new_n48.children[slot] = child_ref;
@@ -503,15 +499,15 @@ node_ref_t data_art_add_child_inplace(data_art_tree_t *tree, node_ref_t node_ref
             }
             void *mut = data_art_lock_node_mut(tree, node_ref);
             data_art_node48_t *m = (data_art_node48_t *)mut;
-            // Find free slot
-            uint8_t slot = 0;
-            for (; slot < 48; slot++) {
-                bool used = false;
-                for (int i = 0; i < 256; i++) {
-                    if (m->keys[i] == slot) { used = true; break; }
+            // Find free slot via bitmask
+            uint64_t used_mask = 0;
+            for (int i = 0; i < 256; i++) {
+                if (m->keys[i] != NODE48_EMPTY) {
+                    used_mask |= (1ULL << m->keys[i]);
                 }
-                if (!used) break;
             }
+            uint64_t free_mask = ~used_mask & ((1ULL << 48) - 1);
+            uint8_t slot = (uint8_t)__builtin_ctzll(free_mask);
             m->keys[byte] = slot;
             m->children[slot] = child_ref;
             m->num_children++;

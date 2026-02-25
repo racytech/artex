@@ -427,6 +427,20 @@ const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_l
                          size_t *value_len);
 
 /**
+ * Get value into caller-supplied buffer (zero allocation).
+ *
+ * @param tree Tree instance
+ * @param key Byte array key
+ * @param key_len Length of key
+ * @param value_buf Buffer to copy value into
+ * @param buf_size Size of value_buf
+ * @param value_len Output: actual value length (can be NULL)
+ * @return true if found, false otherwise
+ */
+bool data_art_get_into(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
+                       void *value_buf, size_t buf_size, size_t *value_len);
+
+/**
  * Delete a key-value pair
  *
  * @param tree Tree instance

@@ -401,13 +401,12 @@ static void bench_random_lookup(int num_keys) {
         }
         data_art_commit_txn(tree);
 
-        // Timed: lookup in reverse order
+        // Timed: lookup in reverse order (zero-alloc path)
         uint64_t start = get_time_us();
         for (int i = 0; i < num_keys; i++) {
             make_key(num_keys - 1 - i, key);
             size_t vlen;
-            const void *val = data_art_get(tree, key, KEY_SIZE, &vlen);
-            if (!val) {
+            if (!data_art_get_into(tree, key, KEY_SIZE, value, VALUE_SIZE, &vlen)) {
                 fprintf(stderr, "ART: lookup miss at %d\n", num_keys - 1 - i);
                 break;
             }
@@ -556,12 +555,12 @@ static void bench_negative_lookup(int num_keys) {
         }
         data_art_commit_txn(tree);
 
-        // Timed: lookup keys that don't exist
+        // Timed: lookup keys that don't exist (zero-alloc path)
         uint64_t start = get_time_us();
         for (int i = 0; i < num_keys; i++) {
             make_key(num_keys + i, key);
             size_t vlen;
-            data_art_get(tree, key, KEY_SIZE, &vlen);
+            data_art_get_into(tree, key, KEY_SIZE, value, VALUE_SIZE, &vlen);
         }
         art_res.elapsed_us = get_time_us() - start;
         art_res.num_ops = num_keys;

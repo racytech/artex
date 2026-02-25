@@ -122,10 +122,12 @@ bool leaf_matches(const data_art_leaf_t *leaf, const uint8_t *key, size_t key_le
 // Core Operations - Search
 // ============================================================================
 
-// Internal get with snapshot support
+// Internal get with snapshot support.
+// If out_buf != NULL, copies value into it (no malloc). Otherwise, malloc's a buffer.
 static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
                          const uint8_t *key, size_t key_len,
-                         size_t *value_len, mvcc_snapshot_t *snapshot, uint64_t snapshot_txn_id) {
+                         size_t *value_len, mvcc_snapshot_t *snapshot, uint64_t snapshot_txn_id,
+                         void *out_buf, size_t out_buf_size) {
     if (!tree || !key) {
         LOG_ERROR("Invalid parameters");
         return NULL;
@@ -248,18 +250,26 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
                 }
                 LOG_TRACE("Leaf matches! Returning value_len=%u", leaf->value_len);
 
-                // Allocate buffer for value (caller must free)
-                void *value_copy = malloc(leaf->value_len);
-                if (!value_copy) {
-                    LOG_ERROR("Failed to allocate memory for value");
-                    return NULL;
+                // Copy value into caller's buffer or malloc'd buffer
+                void *value_copy;
+                if (out_buf) {
+                    if (leaf->value_len > out_buf_size) {
+                        LOG_ERROR("Value too large for buffer: %u > %zu", leaf->value_len, out_buf_size);
+                        return NULL;
+                    }
+                    value_copy = out_buf;
+                } else {
+                    value_copy = malloc(leaf->value_len);
+                    if (!value_copy) {
+                        LOG_ERROR("Failed to allocate memory for value");
+                        return NULL;
+                    }
                 }
 
                 // Handle overflow if needed
                 if (leaf->flags & LEAF_FLAG_OVERFLOW) {
-                    // Read full value from overflow chain
                     if (!data_art_read_overflow_value(tree, leaf, value_copy)) {
-                        free(value_copy);
+                        if (!out_buf) free(value_copy);
                         LOG_ERROR("Failed to read overflow value");
                         return NULL;
                     }
@@ -316,10 +326,12 @@ const void *data_art_get_snapshot(data_art_tree_t *tree, const uint8_t *key, siz
     if (snapshot) {
         root = snapshot->root;
         result = data_art_get_internal(tree, root, key, key_len, value_len,
-                                        snapshot->mvcc_snapshot, snapshot->txn_id);
+                                        snapshot->mvcc_snapshot, snapshot->txn_id,
+                                        NULL, 0);
     } else {
         root = data_art_read_committed_root(tree);
-        result = data_art_get_internal(tree, root, key, key_len, value_len, NULL, 0);
+        result = data_art_get_internal(tree, root, key, key_len, value_len,
+                                        NULL, 0, NULL, 0);
     }
 
     data_art_rdunlock(tree);
@@ -331,6 +343,23 @@ const void *data_art_get_snapshot(data_art_tree_t *tree, const uint8_t *key, siz
 const void *data_art_get(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
                          size_t *value_len) {
     return data_art_get_snapshot(tree, key, key_len, value_len, NULL);
+}
+
+// Zero-alloc get: copies value into caller-supplied buffer (no malloc)
+bool data_art_get_into(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
+                       void *value_buf, size_t buf_size, size_t *value_len) {
+    if (!tree) return false;
+
+    pthread_rwlock_rdlock(&tree->write_lock);
+    data_art_rdlock(tree);
+
+    node_ref_t root = data_art_read_committed_root(tree);
+    const void *result = data_art_get_internal(tree, root, key, key_len, value_len,
+                                                NULL, 0, value_buf, buf_size);
+
+    data_art_rdunlock(tree);
+    pthread_rwlock_unlock(&tree->write_lock);
+    return result != NULL;
 }
 
 bool data_art_contains(data_art_tree_t *tree, const uint8_t *key, size_t key_len) {
