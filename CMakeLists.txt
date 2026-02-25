@@ -373,6 +373,12 @@ add_executable(test_data_art_iterator
 target_link_libraries(test_data_art_iterator art_persistent pthread)
 add_test(NAME test_data_art_iterator COMMAND test_data_art_iterator)
 
+# Test: ART Determinism
+add_executable(test_determinism
+    database/tests/test_determinism.c
+)
+target_link_libraries(test_determinism art_persistent pthread)
+
 # Test: Simple delete test
 add_executable(test_delete_simple
     database/tests/test_delete_simple.c
