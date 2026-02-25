@@ -47,27 +47,16 @@ static inline node_ref_t data_art_read_committed_root(data_art_tree_t *tree) {
 node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) {
     const void *node = data_art_load_node(tree, node_ref);
     if (!node) {
-        LOG_INFO("find_child: failed to load node at page=%lu offset=%u",
-                 node_ref_page_id(node_ref), node_ref_offset(node_ref));
+        LOG_ERROR("find_child: failed to load node at page=%lu offset=%u",
+                  node_ref_page_id(node_ref), node_ref_offset(node_ref));
         return NULL_NODE_REF;
     }
 
     uint8_t type = *(const uint8_t *)node;
-    LOG_INFO("find_child: looking for byte=0x%02x in node type=%d at page=%lu",
-             byte, type, node_ref_page_id(node_ref));
 
     switch (type) {
         case DATA_NODE_4: {
             const data_art_node4_t *n = (const data_art_node4_t *)node;
-            // Debug: log available keys
-            char keys_str[32] = {0};
-            for (int i = 0; i < n->num_children && i < 4; i++) {
-                char temp[8];
-                snprintf(temp, sizeof(temp), "0x%02x ", n->keys[i]);
-                strcat(keys_str, temp);
-            }
-            LOG_INFO("find_child NODE_4: looking for 0x%02x, available keys: %s", byte, keys_str);
-
             for (int i = 0; i < n->num_children; i++) {
                 if (n->keys[i] == byte) {
                     return n->children[i];
@@ -77,16 +66,6 @@ node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) 
         }
         case DATA_NODE_16: {
             const data_art_node16_t *n = (const data_art_node16_t *)node;
-            // Debug: log available keys
-            char keys_str[128] = {0};
-            for (int i = 0; i < n->num_children && i < 16; i++) {
-                char temp[8];
-                snprintf(temp, sizeof(temp), "0x%02x ", n->keys[i]);
-                strcat(keys_str, temp);
-            }
-            LOG_INFO("find_child NODE_16: looking for 0x%02x, num_children=%d, available keys: %s",
-                     byte, n->num_children, keys_str);
-
             for (int i = 0; i < n->num_children; i++) {
                 if (n->keys[i] == byte) {
                     return n->children[i];
@@ -97,7 +76,7 @@ node_ref_t find_child(data_art_tree_t *tree, node_ref_t node_ref, uint8_t byte) 
         case DATA_NODE_48: {
             const data_art_node48_t *n = (const data_art_node48_t *)node;
             uint8_t idx = n->keys[byte];
-            if (idx == 255) return NULL_NODE_REF;  // Empty slot
+            if (idx == 255) return NULL_NODE_REF;
             return n->children[idx];
         }
         case DATA_NODE_256: {
@@ -238,9 +217,9 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
 
             // Debug: Verify the leaf structure makes sense
             if (leaf->value_len > 1024) {  // Suspiciously large
-                LOG_ERROR("CORRUPTION DETECTED: leaf at page=%lu offset=%u has suspiciously large value_len=%u, key_size=%zu",
+                LOG_DEBUG("CORRUPTION DETECTED: leaf at page=%lu offset=%u has suspiciously large value_len=%u, key_size=%zu",
                           node_ref_page_id(current), node_ref_offset(current), leaf->value_len, tree->key_size);
-                LOG_ERROR("Leaf dump: type=%u flags=0x%02x, overflow_page=%lu",
+                LOG_DEBUG("Leaf dump: type=%u flags=0x%02x, overflow_page=%lu",
                           leaf->type, leaf->flags, leaf_overflow_page(leaf));
             }
 
@@ -295,19 +274,8 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
         }
 
         current = find_child(tree, current, byte);
-        if (node_ref_is_null(current)) {
-            // Debug: child not found
-            char key_str[64];
-            snprintf(key_str, sizeof(key_str), "%.*s", (int)(key_len < 40 ? key_len : 40), key);
-            LOG_INFO("Child lookup failed: key='%s', depth=%zu, byte=0x%02x('%c')",
-                     key_str, depth, byte, (byte >= 32 && byte < 127) ? byte : '?');
-        } else {
-            LOG_INFO("Child found, advancing to page=%lu offset=%u",
-                     node_ref_page_id(current), node_ref_offset(current));
-        }
     }
 
-    LOG_INFO("Exited search loop, current is null, returning NULL");
     return NULL;  // Not found
 }
 

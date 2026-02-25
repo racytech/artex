@@ -377,19 +377,9 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                                     const uint8_t *key, size_t key_len, size_t depth,
                                     const void *value, size_t value_len,
                                     bool *inserted, bool inplace) {
-    // Debug: Print key being inserted
-    if (depth == 0) {
-        char key_str[256];
-        size_t copy_len = key_len < 255 ? key_len : 255;
-        memcpy(key_str, key, copy_len);
-        key_str[copy_len] = '\0';
-        LOG_INFO("=== INSERTING KEY: %s (len=%zu) ===", key_str, key_len);
-    }
-    
     // Base case: create new leaf
     if (node_ref_is_null(node_ref)) {
         *inserted = true;
-        LOG_INFO("  depth=%zu: Creating new leaf", depth);
         return alloc_leaf(tree, key, key_len, value, value_len);
     }
     
@@ -400,8 +390,8 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
     }
     
     uint8_t type = *(const uint8_t *)node;
-    LOG_INFO("  depth=%zu: node_type=%u at page=%lu offset=%u",
-             depth, type, node_ref_page_id(node_ref), node_ref_offset(node_ref));
+    LOG_DEBUG("  depth=%zu: node_type=%u at page=%lu offset=%u",
+              depth, type, node_ref_page_id(node_ref), node_ref_offset(node_ref));
     
     // If it's a leaf, check for match or split
     if (type == DATA_NODE_LEAF) {
@@ -494,7 +484,7 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         
         uint8_t existing_key_copy[256];
         if (existing_key_len > sizeof(existing_key_copy)) {
-            LOG_ERROR("Existing key too long: %zu", existing_key_len);
+            LOG_DEBUG("Existing key too long: %zu", existing_key_len);
             return node_ref;
         }
         memcpy(existing_key_copy, existing_key, existing_key_len);
@@ -508,7 +498,7 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         
         // Sanity check: keys must diverge before end (duplicates caught above)
         if (split_depth >= key_len) {
-            LOG_ERROR("BUG: Keys don't diverge (depth=%zu, split_depth=%zu)", 
+            LOG_DEBUG("BUG: Keys don't diverge (depth=%zu, split_depth=%zu)",
                      depth, split_depth);
             return node_ref;
         }
@@ -588,13 +578,13 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
     // Fixed-size keys: simplified byte extraction
     uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
     
-    LOG_INFO("  depth=%zu: looking for child with byte=0x%02x", depth, byte);
+    LOG_DEBUG("  depth=%zu: looking for child with byte=0x%02x", depth, byte);
     
     // Find child for this byte
     node_ref_t child_ref = find_child_ref(tree, node_ref, byte);
     
     if (!node_ref_is_null(child_ref)) {
-        LOG_INFO("  depth=%zu: child found at page=%lu offset=%u, recursing...",
+        LOG_DEBUG("  depth=%zu: child found at page=%lu offset=%u, recursing...",
                  depth, node_ref_page_id(child_ref), node_ref_offset(child_ref));
         // Child exists - recurse
         node_ref_t new_child_ref = insert_recursive(tree, child_ref, key, key_len,
@@ -617,13 +607,13 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         return node_ref;
     } else {
         // No child - add new leaf here
-        LOG_INFO("  depth=%zu: no child found, creating new leaf for byte=0x%02x", depth, byte);
+        LOG_DEBUG("  depth=%zu: no child found, creating new leaf for byte=0x%02x", depth, byte);
         *inserted = true;
         node_ref_t leaf_ref = alloc_leaf(tree, key, key_len, value, value_len);
         if (!node_ref_is_null(leaf_ref)) {
-            LOG_INFO("  depth=%zu: adding leaf at page=%lu as child", depth, node_ref_page_id(leaf_ref));
+            LOG_DEBUG("  depth=%zu: adding leaf at page=%lu as child", depth, node_ref_page_id(leaf_ref));
             node_ref_t new_node_ref = add_child_to_node(tree, node_ref, byte, leaf_ref, inplace);
-            LOG_INFO("  depth=%zu: after adding child, node ref: page=%lu offset=%u",
+            LOG_DEBUG("  depth=%zu: after adding child, node ref: page=%lu offset=%u",
                      depth, node_ref_page_id(new_node_ref), node_ref_offset(new_node_ref));
             return new_node_ref;
         }
