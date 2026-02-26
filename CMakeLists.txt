@@ -250,6 +250,13 @@ add_executable(test_delete_debug
 )
 target_link_libraries(test_delete_debug art_persistent pthread)
 
+# Test: Deadlock detection (lock ordering)
+add_executable(test_deadlock
+    database/tests/test_deadlock.c
+)
+target_link_libraries(test_deadlock art_persistent pthread)
+add_test(NAME test_deadlock COMMAND test_deadlock)
+
 # Benchmark: ART vs LMDB Comparison
 find_library(LMDB_LIB lmdb)
 find_path(LMDB_INCLUDE lmdb.h)
