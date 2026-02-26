@@ -204,6 +204,7 @@ static void test_round_trip_single(void) {
     ASSERT(found != NULL, "key should exist in imported tree");
     ASSERT_EQ(found_len, strlen(value), "value length should match");
     ASSERT(memcmp(found, value, found_len) == 0, "value content should match");
+    free((void *)found);
 
     close_env(&dst);
     cleanup_dir(dst.dir_path);
@@ -251,6 +252,7 @@ static void test_round_trip_1000(void) {
         ASSERT(found != NULL, "key should exist");
         ASSERT_EQ(found_len, expected_len, "value length should match");
         ASSERT(memcmp(found, expected_val, found_len) == 0, "value should match");
+        free((void *)found);
     }
 
     close_env(&dst);
@@ -308,6 +310,7 @@ static void test_round_trip_overflow(void) {
         ASSERT(found != NULL, "overflow key should exist");
         ASSERT_EQ(found_len, big_val_len, "overflow value length should match");
         ASSERT(memcmp(found, big_val, big_val_len) == 0, "overflow value should match");
+        free((void *)found);
     }
 
     free(big_val);

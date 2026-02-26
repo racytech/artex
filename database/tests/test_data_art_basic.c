@@ -106,6 +106,7 @@ static void test_insert_single_small_value(void) {
     ASSERT(retrieved != NULL);
     ASSERT(value_len == strlen(value) + 1);
     ASSERT(strcmp((const char *)retrieved, value) == 0);
+    free((void *)retrieved);
 
     data_art_destroy(tree);
 

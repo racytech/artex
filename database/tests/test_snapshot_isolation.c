@@ -69,6 +69,7 @@ void test_snapshot_isolation_basic(void) {
     assert(read_len == sizeof(value1));
     assert(memcmp(read_val, value1, read_len) == 0);
     printf("Snapshot sees key1 = %s\n", (char*)read_val);
+    free((void *)read_val);
 
     // Now insert more data in a new transaction
     uint64_t txn2;
@@ -92,6 +93,7 @@ void test_snapshot_isolation_basic(void) {
     assert(read_len == sizeof(value1));
     assert(memcmp(read_val, value1, read_len) == 0);
     printf("Snapshot still sees key1 = %s\n", (char*)read_val);
+    free((void *)read_val);
 
     // Snapshot should NOT see key3 (inserted after snapshot)
     const void *result = data_art_get_snapshot(tree, key3, sizeof(key3), &read_len, snapshot1);
@@ -109,12 +111,14 @@ void test_snapshot_isolation_basic(void) {
     read_val = data_art_get(tree, key1, sizeof(key1), &read_len);
     assert(read_val != NULL);
     printf("After snapshot: key1 still visible\n");
+    free((void *)read_val);
 
     read_val = data_art_get(tree, key3, sizeof(key3), &read_len);
     assert(read_val != NULL);
     assert(read_len == sizeof(value3));
     assert(memcmp(read_val, value3, read_len) == 0);
     printf("After snapshot: key3 = %s (visible)\n", (char*)read_val);
+    free((void *)read_val);
 
     destroy_test_tree(tree, dir);
 
@@ -148,6 +152,7 @@ void test_snapshot_isolation_deletes(void) {
     const void *read_val = data_art_get_snapshot(tree, key1, sizeof(key1), &read_len, snapshot1);
     assert(read_val != NULL);
     printf("Snapshot sees key = %s\n", (char*)read_val);
+    free((void *)read_val);
 
     // Delete the key in a new transaction
     uint64_t txn2;
@@ -161,6 +166,7 @@ void test_snapshot_isolation_deletes(void) {
     assert(read_val != NULL);
     assert(memcmp(read_val, value1, read_len) == 0);
     printf("Snapshot still sees key = %s (delete not visible)\n", (char*)read_val);
+    free((void *)read_val);
 
     // End snapshot
     data_art_end_snapshot(tree, snapshot1);
@@ -216,6 +222,7 @@ void test_multiple_snapshots(void) {
     assert(read_val != NULL);
     assert(memcmp(read_val, v1, read_len) == 0);
     printf("Snapshot1 sees: %s\n", (char*)read_val);
+    free((void *)read_val);
 
     // End snapshot1 and start snapshot2
     data_art_end_snapshot(tree, snapshot1);
@@ -228,6 +235,7 @@ void test_multiple_snapshots(void) {
     assert(read_val != NULL);
     assert(memcmp(read_val, v2, read_len) == 0);
     printf("Snapshot2 sees: %s\n", (char*)read_val);
+    free((void *)read_val);
 
     // Update to v3
     uint64_t txn3;
@@ -243,6 +251,7 @@ void test_multiple_snapshots(void) {
     assert(read_val != NULL);
     assert(memcmp(read_val, v2, read_len) == 0);
     printf("Snapshot2 still sees: %s (isolated from v3)\n", (char*)read_val);
+    free((void *)read_val);
 
     data_art_end_snapshot(tree, snapshot2);
 
@@ -251,6 +260,7 @@ void test_multiple_snapshots(void) {
     assert(read_val != NULL);
     assert(memcmp(read_val, v3, read_len) == 0);
     printf("Current view sees: %s\n", (char*)read_val);
+    free((void *)read_val);
 
     destroy_test_tree(tree, dir);
 
