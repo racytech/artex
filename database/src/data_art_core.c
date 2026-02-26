@@ -1039,12 +1039,12 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
     // Use in-place mutations when no snapshots need to see old tree versions
     bool inplace = !mvcc_has_active_snapshots(tree->mvcc_manager);
 
-    // Pre-grow mmap so no resize is needed during commit, then hold
-    // resize_lock for the entire loop — enables zero-copy reads and
-    // eliminates per-operation lock acquire/release overhead.
+    // Hint: pre-grow mmap to reduce resize frequency during commit.
+    // We do NOT hold resize_lock for the loop — alloc_page may need
+    // wrlock(resize_lock) to grow, which would self-deadlock against rdlock.
+    // Per-operation locking (TLS arena copies) handles resize safety.
     mmap_storage_ensure_capacity(tree->mmap_storage,
-                                 tree->mmap_storage->next_page_id + num_ops);
-    data_art_rdlock(tree);
+                                 tree->mmap_storage->next_page_id + num_ops * 4);
 
     // Save rollback point in case any operation fails
     node_ref_t saved_root = tree->root;
@@ -1073,7 +1073,6 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
             // Rollback: restore root and size
             tree->root = saved_root;
             tree->size = saved_size;
-            data_art_rdunlock(tree);
             pthread_rwlock_unlock(&tree->write_lock);
 
             DB_ERROR(DB_ERROR_IO, "failed to apply operation %zu", i);
@@ -1084,9 +1083,6 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
             return false;
         }
     }
-
-    // Release resize_lock before MVCC commit (no more node access needed)
-    data_art_rdunlock(tree);
 
     // Commit MVCC transaction
     if (!mvcc_commit_txn(tree->mvcc_manager, txn_id)) {
