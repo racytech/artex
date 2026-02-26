@@ -503,6 +503,9 @@ int main(int argc, char *argv[]) {
             break;
         }
 
+        // Hint kernel to start flushing dirty pages in the background
+        data_art_start_writeback(tree);
+
         // Advance watermark
         keys_so_far += (uint64_t)this_block;
         atomic_store_explicit(&g_committed_key_count, keys_so_far,
@@ -543,7 +546,7 @@ int main(int argc, char *argv[]) {
                 total_reads += reader_ctxs[i].reads_verified;
 
             printf("  block %8" PRIu64 " | %7.1fM / %.0fM keys | "
-                   "%.0f K/s (avg %.0f K/s) | DB %.2f GB | "
+                   "%.0f Kkeys/s (avg %.0f Kkeys/s) | DB %.2f GB | "
                    "reads %" PRIu64 " | ckpt %" PRIu64
                    " (last %.0fms, max %.0fms, avg %.0fms)\n",
                    block_num,
@@ -635,8 +638,8 @@ writer_done:
     printf("  ============================================\n");
     printf("  keys:        %" PRIu64 " (%.0fM)\n", target_keys, target_keys / 1e6);
     printf("  DB size:     %.2f GB\n", db_gb);
-    printf("  wall time:   %s (%.0f keys/sec)\n", elapsed_str,
-           (double)target_keys / wall_secs);
+    printf("  wall time:   %s (%.0f Kkeys/sec)\n", elapsed_str,
+           (double)target_keys / wall_secs / 1000.0);
     printf("  reads:       %" PRIu64 " (%" PRIu64 " verified)\n",
            total_reads, total_verified);
     printf("  blocks:      %" PRIu64 "\n", block_num);
