@@ -15,6 +15,8 @@
  */
 
 #include "data_art.h"
+#include "mmap_storage.h"
+#include "crc32.h"
 #include "logger.h"
 
 #include <stdio.h>
@@ -22,6 +24,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 
 // ============================================================================
@@ -581,6 +584,279 @@ static void test_page_growth_after_deletes(void) {
 }
 
 // ============================================================================
+// Test 11: Shadow Header — Slot Rotation
+// ============================================================================
+
+static void test_shadow_header_slot_rotation(void) {
+    test_env_t env = {0};
+    make_paths(&env, "t11");
+    cleanup_dir(env.dir_path);
+    create_tree(&env);
+
+    // Insert some keys and checkpoint
+    printf("  Inserting 20 keys, checkpoint 1...\n");
+    insert_keys(&env, 0, 20);
+    ASSERT(data_art_checkpoint(env.tree, NULL), "checkpoint 1");
+
+    // Read header to check slot state
+    mmap_header_page_t *hp = (mmap_header_page_t *)env.tree->mmap_storage->base;
+    int active1 = env.tree->mmap_storage->active_slot;
+    uint32_t ckpt_num1 = hp->slots[active1].checkpoint_num;
+    printf("  After checkpoint 1: active_slot=%d, checkpoint_num=%u\n", active1, ckpt_num1);
+    ASSERT(ckpt_num1 >= 1, "checkpoint_num should be >= 1");
+
+    // Insert more and checkpoint again
+    printf("  Inserting 10 more keys, checkpoint 2...\n");
+    insert_keys(&env, 20, 10);
+    ASSERT(data_art_checkpoint(env.tree, NULL), "checkpoint 2");
+
+    int active2 = env.tree->mmap_storage->active_slot;
+    uint32_t ckpt_num2 = hp->slots[active2].checkpoint_num;
+    printf("  After checkpoint 2: active_slot=%d, checkpoint_num=%u\n", active2, ckpt_num2);
+
+    // Slots should alternate
+    ASSERT(active2 != active1, "active slot should alternate after checkpoint");
+    ASSERT(ckpt_num2 == ckpt_num1 + 1, "checkpoint_num should increment by 1");
+
+    // Both slots should have valid CRC
+    uint32_t crc0 = compute_crc32((const uint8_t *)&hp->slots[0], 56);
+    uint32_t crc1 = compute_crc32((const uint8_t *)&hp->slots[1], 56);
+    ASSERT(hp->slots[0].checksum == crc0, "slot 0 CRC should be valid");
+    ASSERT(hp->slots[1].checksum == crc1, "slot 1 CRC should be valid");
+
+    // Close and reopen — should recover from the higher checkpoint_num slot
+    printf("  Closing and reopening...\n");
+    close_tree(&env);
+    open_tree(&env);
+
+    printf("  Verifying all 30 keys...\n");
+    verify_keys(&env, 0, 30);
+    ASSERT_EQ((long)data_art_size(env.tree), 30L, "tree size after reopen");
+
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
+}
+
+// ============================================================================
+// Test 12: Shadow Header — Corrupt Active Slot Recovery
+// ============================================================================
+
+static void test_shadow_header_corrupt_active(void) {
+    test_env_t env = {0};
+    make_paths(&env, "t12");
+    cleanup_dir(env.dir_path);
+    create_tree(&env);
+
+    // Insert keys, checkpoint twice so both slots are valid
+    printf("  Inserting 50 keys...\n");
+    insert_keys(&env, 0, 50);
+    ASSERT(data_art_checkpoint(env.tree, NULL), "checkpoint 1");
+    ASSERT(data_art_checkpoint(env.tree, NULL), "checkpoint 2");
+
+    int active = env.tree->mmap_storage->active_slot;
+    printf("  Active slot: %d\n", active);
+
+    // Get the file path and close the tree
+    char path_copy[512];
+    strncpy(path_copy, env.art_path, sizeof(path_copy));
+    close_tree(&env);
+
+    // Corrupt the active slot's checksum via pwrite
+    printf("  Corrupting active slot %d checksum...\n", active);
+    int fd = open(path_copy, O_RDWR);
+    ASSERT(fd >= 0, "open for corruption");
+
+    // Checksum is at offset 56 within the slot (each slot is 64 bytes)
+    off_t corrupt_offset = (off_t)(active * 64 + 56);
+    uint32_t garbage = 0xDEADBEEF;
+    ssize_t written = pwrite(fd, &garbage, sizeof(garbage), corrupt_offset);
+    ASSERT(written == sizeof(garbage), "pwrite corruption");
+    fsync(fd);
+    close(fd);
+
+    // Reopen — should recover from the OTHER (non-corrupt) slot
+    printf("  Reopening (should recover from slot %d)...\n", 1 - active);
+    open_tree(&env);
+
+    // The recovered slot is the previous checkpoint (checkpoint 1),
+    // which also has 50 keys since we inserted before both checkpoints
+    printf("  Verifying keys after corrupt-slot recovery...\n");
+    verify_keys(&env, 0, 50);
+    ASSERT_EQ((long)data_art_size(env.tree), 50L, "tree size from fallback slot");
+
+    // Active slot should now be the non-corrupt one
+    ASSERT(env.tree->mmap_storage->active_slot == 1 - active,
+           "should have picked the non-corrupt slot");
+
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
+}
+
+// ============================================================================
+// Test 13: Shadow Header — Both Slots Corrupt
+// ============================================================================
+
+static void test_shadow_header_both_corrupt(void) {
+    test_env_t env = {0};
+    make_paths(&env, "t13");
+    cleanup_dir(env.dir_path);
+
+    // Create and populate
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s", env.dir_path);
+    system(cmd);
+
+    data_art_tree_t *tree = data_art_create(env.art_path, KEY_SIZE);
+    ASSERT(tree != NULL, "create tree");
+    data_art_destroy(tree);
+
+    // Corrupt BOTH slots' checksums
+    printf("  Corrupting both slot checksums...\n");
+    int fd = open(env.art_path, O_RDWR);
+    ASSERT(fd >= 0, "open for corruption");
+
+    uint32_t garbage = 0xDEADBEEF;
+    pwrite(fd, &garbage, sizeof(garbage), 56);       // slot 0 checksum
+    pwrite(fd, &garbage, sizeof(garbage), 64 + 56);  // slot 1 checksum
+    fsync(fd);
+    close(fd);
+
+    // Reopen should FAIL — both slots corrupt
+    printf("  Reopening (should fail)...\n");
+    data_art_tree_t *bad_tree = data_art_open(env.art_path, KEY_SIZE);
+    ASSERT(bad_tree == NULL, "open should fail with both slots corrupt");
+
+    cleanup_dir(env.dir_path);
+}
+
+// ============================================================================
+// Test 14: Shadow Header — v1 to v2 Migration
+// ============================================================================
+
+static void test_shadow_header_v1_migration(void) {
+    test_env_t env = {0};
+    make_paths(&env, "t14");
+    cleanup_dir(env.dir_path);
+
+    char cmd_buf[512];
+    snprintf(cmd_buf, sizeof(cmd_buf), "mkdir -p %s", env.dir_path);
+    system(cmd_buf);
+
+    // Create a file with a v1 header manually
+    printf("  Creating v1 format file...\n");
+    size_t file_size = 16384 * PAGE_SIZE;
+    int fd = open(env.art_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ASSERT(fd >= 0, "create v1 file");
+    ASSERT(ftruncate(fd, (off_t)file_size) == 0, "ftruncate v1 file");
+
+    // Write a v1 header (56 bytes of metadata + padding)
+    mmap_header_v1_t v1 = {0};
+    v1.magic = MMAP_MAGIC;
+    v1.version = 1;  // v1 format
+    v1.page_size = PAGE_SIZE;
+    v1.next_page_id = 1;
+    v1.root_page_id = 0;
+    v1.root_offset = 0;
+    v1.padding = 0;
+    v1.tree_size = 0;
+    v1.key_size = KEY_SIZE;
+    pwrite(fd, &v1, sizeof(v1), 0);
+    fsync(fd);
+    close(fd);
+
+    // Open with new code — should auto-migrate v1 → v2
+    printf("  Opening v1 file (should auto-migrate to v2)...\n");
+    open_tree(&env);
+
+    // Verify migration: header should now be v2 with valid CRC
+    mmap_header_page_t *hp = (mmap_header_page_t *)env.tree->mmap_storage->base;
+    ASSERT(hp->slots[0].version == MMAP_FORMAT_VERSION, "slot 0 version should be 2");
+    ASSERT(hp->slots[1].version == MMAP_FORMAT_VERSION, "slot 1 version should be 2");
+
+    uint32_t crc0 = compute_crc32((const uint8_t *)&hp->slots[0], 56);
+    ASSERT(hp->slots[0].checksum == crc0, "slot 0 CRC valid after migration");
+
+    ASSERT_EQ((long)hp->slots[0].key_size, (long)KEY_SIZE, "key_size preserved");
+    ASSERT_EQ((long)data_art_size(env.tree), 0L, "empty tree after migration");
+
+    // Insert keys and checkpoint to verify full functionality
+    printf("  Inserting 20 keys after migration...\n");
+    insert_keys(&env, 0, 20);
+    ASSERT(data_art_checkpoint(env.tree, NULL), "checkpoint after migration");
+
+    printf("  Closing and reopening...\n");
+    close_tree(&env);
+    open_tree(&env);
+
+    printf("  Verifying 20 keys after migration reopen...\n");
+    verify_keys(&env, 0, 20);
+    ASSERT_EQ((long)data_art_size(env.tree), 20L, "tree size after migration reopen");
+
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
+}
+
+// ============================================================================
+// Test 15: Shadow Header — Checkpoint After Corrupt Slot Recovery
+// ============================================================================
+
+static void test_shadow_header_checkpoint_after_recovery(void) {
+    test_env_t env = {0};
+    make_paths(&env, "t15");
+    cleanup_dir(env.dir_path);
+    create_tree(&env);
+
+    // Insert and checkpoint to fill both slots
+    printf("  Inserting 30 keys, 2 checkpoints...\n");
+    insert_keys(&env, 0, 30);
+    ASSERT(data_art_checkpoint(env.tree, NULL), "checkpoint 1");
+    ASSERT(data_art_checkpoint(env.tree, NULL), "checkpoint 2");
+
+    int active = env.tree->mmap_storage->active_slot;
+    char path_copy[512];
+    strncpy(path_copy, env.art_path, sizeof(path_copy));
+    close_tree(&env);
+
+    // Corrupt the active slot
+    printf("  Corrupting active slot %d...\n", active);
+    int fd = open(path_copy, O_RDWR);
+    ASSERT(fd >= 0, "open for corruption");
+    uint32_t garbage = 0xBADBAD;
+    pwrite(fd, &garbage, sizeof(garbage), (off_t)(active * 64 + 56));
+    fsync(fd);
+    close(fd);
+
+    // Reopen (recovers from non-corrupt slot)
+    printf("  Reopening after corruption...\n");
+    open_tree(&env);
+    verify_keys(&env, 0, 30);
+
+    // Now insert more and checkpoint — this should heal the corrupt slot
+    printf("  Inserting 20 more keys and checkpointing...\n");
+    insert_keys(&env, 30, 20);
+    ASSERT(data_art_checkpoint(env.tree, NULL), "checkpoint after recovery");
+
+    // Both slots should now be valid again
+    mmap_header_page_t *hp = (mmap_header_page_t *)env.tree->mmap_storage->base;
+    uint32_t crc_active = compute_crc32(
+        (const uint8_t *)&hp->slots[env.tree->mmap_storage->active_slot], 56);
+    ASSERT(hp->slots[env.tree->mmap_storage->active_slot].checksum == crc_active,
+           "new active slot should have valid CRC");
+
+    // Close and reopen one more time
+    printf("  Final close and reopen...\n");
+    close_tree(&env);
+    open_tree(&env);
+
+    printf("  Verifying all 50 keys...\n");
+    verify_keys(&env, 0, 50);
+    ASSERT_EQ((long)data_art_size(env.tree), 50L, "tree size final");
+
+    close_tree(&env);
+    cleanup_dir(env.dir_path);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -610,6 +886,11 @@ int main(void) {
     RUN_TEST(test_multiple_reopen_cycles);
     RUN_TEST(test_overflow_value_persistence);
     RUN_TEST(test_page_growth_after_deletes);
+    RUN_TEST(test_shadow_header_slot_rotation);
+    RUN_TEST(test_shadow_header_corrupt_active);
+    RUN_TEST(test_shadow_header_both_corrupt);
+    RUN_TEST(test_shadow_header_v1_migration);
+    RUN_TEST(test_shadow_header_checkpoint_after_recovery);
 
     printf("========================================\n");
     printf(" Results: %d/%d tests passed\n", tests_passed, test_count);
