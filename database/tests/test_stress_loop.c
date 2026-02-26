@@ -142,11 +142,22 @@ typedef struct {
 // ---------------------------------------------------------------------------
 
 static void generate_key(uint8_t *key, int index) {
-    memset(key, 0, KEY_SIZE);
-    key[0] = (uint8_t)((index >> 24) & 0xFF);
-    key[1] = (uint8_t)((index >> 16) & 0xFF);
-    key[2] = (uint8_t)((index >> 8) & 0xFF);
-    key[3] = (uint8_t)(index & 0xFF);
+    // Fill all 32 bytes deterministically so the tree exercises full depth.
+    // Uses two Knuth multiplicative hashes to spread bits across the key.
+    uint32_t h = (uint32_t)index * 2654435761u;
+    key[0] = (h >> 24) & 0xFF;
+    key[1] = (h >> 16) & 0xFF;
+    key[2] = (h >> 8)  & 0xFF;
+    key[3] = h & 0xFF;
+    h = ((uint32_t)index + 1) * 2246822519u;
+    key[4] = (h >> 24) & 0xFF;
+    key[5] = (h >> 16) & 0xFF;
+    key[6] = (h >> 8)  & 0xFF;
+    key[7] = h & 0xFF;
+    for (int i = 8; i < KEY_SIZE; i++) {
+        h = h * 1103515245u + 12345;
+        key[i] = (h >> 16) & 0xFF;
+    }
 }
 
 static size_t generate_value(char *buf, int key_index, uint32_t version) {

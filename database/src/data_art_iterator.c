@@ -2,8 +2,8 @@
  * Persistent ART - Iterator (Sorted Key Enumeration)
  *
  * Stack-based depth-first traversal that yields leaves in lexicographic
- * key order. Locks are held for the entire scan lifetime (acquired on
- * first next(), released on destroy or scan completion) enabling zero-copy
+ * key order. Locks are acquired at creation time and held for the entire
+ * scan lifetime (released on destroy or scan completion) enabling zero-copy
  * mmap reads. Key/value buffers are pre-allocated and reused across calls.
  *
  * The iterator captures a snapshot of the committed root at creation time,
@@ -156,6 +156,8 @@ static bool copy_leaf_data(data_art_iterator_t *iter, const data_art_leaf_t *lea
 // Public API
 // ============================================================================
 
+static void end_scan(data_art_iterator_t *iter);
+
 data_art_iterator_t *data_art_iterator_create(data_art_tree_t *tree) {
     if (!tree) return NULL;
 
@@ -164,12 +166,14 @@ data_art_iterator_t *data_art_iterator_create(data_art_tree_t *tree) {
 
     iter->tree = tree;
 
-    // Capture committed root under rdlock to prevent in-place mutation race.
-    // Without the lock, the writer could do in-place mutations between root
-    // capture and first next() call, corrupting the tree structure we iterate.
+    // Acquire scan-lifetime locks and capture root atomically.
+    // Locks held until end_scan() (on destroy or scan completion).
+    // This closes the race where a writer could release/reuse pages
+    // between root capture and first next() call.
     pthread_rwlock_rdlock(&tree->write_lock);
+    data_art_rdlock(tree);
+    iter->scanning = true;
     iter->root = atomic_load_explicit(&tree->committed_root, memory_order_acquire);
-    pthread_rwlock_unlock(&tree->write_lock);
 
     iter->depth = -1;
     iter->done = node_ref_is_null(iter->root);
@@ -177,6 +181,7 @@ data_art_iterator_t *data_art_iterator_create(data_art_tree_t *tree) {
     // Pre-allocate key buffer (fixed size, reused across all next() calls)
     iter->current_key = malloc(tree->key_size);
     if (!iter->current_key) {
+        end_scan(iter);
         free(iter);
         return NULL;
     }
@@ -196,13 +201,6 @@ static void end_scan(data_art_iterator_t *iter) {
 bool data_art_iterator_next(data_art_iterator_t *iter) {
     if (!iter || iter->done) return false;
 
-    // Acquire scan-lifetime locks on first call (held until destroy/done)
-    if (!iter->scanning) {
-        pthread_rwlock_rdlock(&iter->tree->write_lock);
-        data_art_rdlock(iter->tree);
-        iter->scanning = true;
-    }
-
     // First call: push root onto stack
     if (!iter->started) {
         iter->started = true;
@@ -210,8 +208,6 @@ bool data_art_iterator_next(data_art_iterator_t *iter) {
         iter->stack[0].node_ref = iter->root;
         iter->stack[0].child_idx = 0;
     }
-
-    bool result = false;
 
     // DFS traversal to find next leaf
     while (iter->depth >= 0) {
@@ -433,24 +429,12 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
 
     size_t key_depth = 0;  // bytes of seek key consumed
 
-    // Acquire locks if not already held by scan
-    bool acquired_locks = false;
-    if (!iter->scanning) {
-        pthread_rwlock_rdlock(&iter->tree->write_lock);
-        data_art_rdlock(iter->tree);
-        acquired_locks = true;
-    }
-
     // Targeted descent: set up stack so next() finds first leaf >= key
     while (iter->depth >= 0) {
         iter_stack_frame_t *frame = &iter->stack[iter->depth];
         const void *node = data_art_load_node(iter->tree, frame->node_ref);
         if (!node) {
             iter->done = true;
-            if (acquired_locks) {
-                data_art_rdunlock(iter->tree);
-                pthread_rwlock_unlock(&iter->tree->write_lock);
-            }
             return false;
         }
 
@@ -504,10 +488,6 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
             iter->depth++;
             if (iter->depth >= ITER_MAX_DEPTH) {
                 iter->done = true;
-                if (acquired_locks) {
-                    data_art_rdunlock(iter->tree);
-                    pthread_rwlock_unlock(&iter->tree->write_lock);
-                }
                 return false;
             }
             iter->stack[iter->depth].node_ref = child;
@@ -516,22 +496,12 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
             iter->depth++;
             if (iter->depth >= ITER_MAX_DEPTH) {
                 iter->done = true;
-                if (acquired_locks) {
-                    data_art_rdunlock(iter->tree);
-                    pthread_rwlock_unlock(&iter->tree->write_lock);
-                }
                 return false;
             }
             iter->stack[iter->depth].node_ref = child;
             iter->stack[iter->depth].child_idx = 0;
             break;
         }
-    }
-
-    // Release locks if we acquired them — next() will re-acquire via scanning
-    if (acquired_locks) {
-        data_art_rdunlock(iter->tree);
-        pthread_rwlock_unlock(&iter->tree->write_lock);
     }
 
     // Now advance to the first leaf >= target
