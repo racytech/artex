@@ -28,6 +28,13 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+#ifdef __linux__
+#include <linux/fs.h>
+#ifndef SYNC_FILE_RANGE_WRITE
+#define SYNC_FILE_RANGE_WRITE 2
+#endif
+#endif
+
 /* ========================================================================== */
 /* Internal helpers                                                            */
 /* ========================================================================== */
@@ -511,8 +518,25 @@ bool mmap_storage_sync(mmap_storage_t *ms) {
     return true;
 }
 
+void mmap_storage_start_writeback(mmap_storage_t *ms) {
+#ifdef __linux__
+    /* Kick off non-blocking writeback for all dirty pages.
+     * sync_file_range(SYNC_FILE_RANGE_WRITE) tells the kernel to start
+     * flushing dirty pages to disk without waiting for completion.
+     * The kernel internally knows which pages are dirty — we don't need
+     * to scan our bitmap.  One syscall covers the entire mapped region. */
+    if (ms->mapped_size > PAGE_SIZE) {
+        sync_file_range(ms->fd, PAGE_SIZE,
+                        (off_t)(ms->mapped_size - PAGE_SIZE),
+                        SYNC_FILE_RANGE_WRITE);
+    }
+#else
+    (void)ms;
+#endif
+}
+
 /**
- * Sync only dirty data pages to disk (incremental checkpoint).
+ * Sync dirty data pages to disk (incremental checkpoint).
  *
  * Scans the dirty bitmap at word granularity (64 pages = 256KB per word).
  * Contiguous non-zero words are merged into a single msync call to

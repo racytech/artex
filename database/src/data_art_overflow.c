@@ -188,6 +188,12 @@ bool data_art_flush(data_art_tree_t *tree) {
     return mmap_storage_sync(tree->mmap_storage);
 }
 
+void data_art_start_writeback(data_art_tree_t *tree) {
+    if (tree && tree->mmap_storage) {
+        mmap_storage_start_writeback(tree->mmap_storage);
+    }
+}
+
 node_ref_t data_art_get_root(const data_art_tree_t *tree) {
     return tree ? tree->root : NULL_NODE_REF;
 }

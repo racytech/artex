@@ -463,6 +463,9 @@ int main(int argc, char *argv[]) {
     uint64_t keys_so_far = 0;
     uint64_t block_num = 0;
     uint64_t checkpoints_done = 0;
+    double last_ckpt_ms = 0.0;
+    double max_ckpt_ms = 0.0;
+    double total_ckpt_ms = 0.0;
 
     while (keys_so_far < target_keys &&
            !atomic_load_explicit(&g_error, memory_order_acquire)) {
@@ -507,8 +510,15 @@ int main(int argc, char *argv[]) {
         block_num++;
 
         // Periodic checkpoint
-        if (block_num % CHECKPOINT_EVERY_BLOCKS == 0) {
+        if (CHECKPOINT_EVERY_BLOCKS > 0 && block_num % CHECKPOINT_EVERY_BLOCKS == 0) {
+            struct timespec ckpt_start, ckpt_end;
+            clock_gettime(CLOCK_MONOTONIC, &ckpt_start);
             data_art_checkpoint(tree, NULL);
+            clock_gettime(CLOCK_MONOTONIC, &ckpt_end);
+            last_ckpt_ms = (ckpt_end.tv_sec - ckpt_start.tv_sec) * 1000.0
+                         + (ckpt_end.tv_nsec - ckpt_start.tv_nsec) / 1e6;
+            total_ckpt_ms += last_ckpt_ms;
+            if (last_ckpt_ms > max_ckpt_ms) max_ckpt_ms = last_ckpt_ms;
             checkpoints_done++;
         }
 
@@ -534,12 +544,15 @@ int main(int argc, char *argv[]) {
 
             printf("  block %8" PRIu64 " | %7.1fM / %.0fM keys | "
                    "%.0f K/s (avg %.0f K/s) | DB %.2f GB | "
-                   "reads %" PRIu64 " | ckpt %" PRIu64 "\n",
+                   "reads %" PRIu64 " | ckpt %" PRIu64
+                   " (last %.0fms, max %.0fms, avg %.0fms)\n",
                    block_num,
                    (double)keys_so_far / 1e6,
                    (double)target_keys / 1e6,
                    interval_kps, overall_kps, db_gb,
-                   total_reads, checkpoints_done);
+                   total_reads, checkpoints_done,
+                   last_ckpt_ms, max_ckpt_ms,
+                   checkpoints_done > 0 ? total_ckpt_ms / checkpoints_done : 0.0);
             fflush(stdout);
         }
     }

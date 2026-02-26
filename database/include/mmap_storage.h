@@ -203,6 +203,16 @@ void mmap_storage_ensure_capacity(mmap_storage_t *ms, uint64_t total_pages);
 bool mmap_storage_sync(mmap_storage_t *ms);
 
 /**
+ * Start non-blocking writeback of dirty pages.
+ *
+ * Uses sync_file_range(SYNC_FILE_RANGE_WRITE) on Linux to tell the kernel
+ * to start flushing dirty pages to disk without waiting.  Call this after
+ * each transaction commit so that by checkpoint time, most pages are already
+ * on disk and the blocking sync is fast.  No-op on non-Linux platforms.
+ */
+void mmap_storage_start_writeback(mmap_storage_t *ms);
+
+/**
  * Crash-safe checkpoint using shadow header.
  *
  * 1. msync data pages (everything after page 0)

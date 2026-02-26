@@ -667,6 +667,21 @@ size_t data_art_free_overflow_chain(data_art_tree_t *tree, uint64_t first_page);
  */
 bool data_art_flush(data_art_tree_t *tree);
 
+/**
+ * Start non-blocking writeback of dirty pages.
+ *
+ * Tells the kernel to start flushing dirty mmap pages to disk without
+ * waiting for completion.  Call this after committing a transaction when
+ * the writer will be idle (e.g., between Ethereum blocks).  By the time
+ * the next checkpoint runs, most pages will already be on disk, reducing
+ * checkpoint blocking time from hundreds of milliseconds to ~10-20ms.
+ *
+ * This is a hint — the kernel may ignore it.  No-op on non-Linux platforms.
+ *
+ * @param tree Tree instance
+ */
+void data_art_start_writeback(data_art_tree_t *tree);
+
 
 /**
  * Get current root reference (for persistence)
