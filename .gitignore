@@ -144,3 +144,6 @@ failing_test.json
 failure.txt
 
 reference/
+
+# Old checklist
+todo-checklist-old.md

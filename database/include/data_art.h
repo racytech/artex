@@ -41,25 +41,31 @@ typedef struct mvcc_snapshot mvcc_snapshot_t;
  * Reference to a node stored on disk.
  *
  * Packed into a single uint64_t for compact storage in node child arrays:
- *   bits [63:12] = page_id  (52 bits, supports up to 2^52 * 4KB = 16 EB)
- *   bits [11:0]  = offset   (12 bits, 0-4095 within page data area)
+ *   bits [63:OFFSET_BITS] = page_id
+ *   bits [OFFSET_BITS-1:0] = offset within page
  *
+ * OFFSET_BITS is derived from PAGE_SIZE so the packing adapts automatically.
  * A ref of 0 represents NULL (page_id=0 is reserved for the file header).
  */
 typedef uint64_t node_ref_t;
 
+// Number of bits needed for intra-page offset (log2(PAGE_SIZE))
+// 4KB=12, 8KB=13, 16KB=14, 64KB=16
+#define NODE_REF_OFFSET_BITS (__builtin_ctz(PAGE_SIZE))
+#define NODE_REF_OFFSET_MASK ((1ULL << NODE_REF_OFFSET_BITS) - 1)
+
 #define NULL_NODE_REF ((node_ref_t)0)
 
 static inline node_ref_t node_ref_make(uint64_t page_id, uint32_t offset) {
-    return (page_id << 12) | (offset & 0xFFF);
+    return (page_id << NODE_REF_OFFSET_BITS) | (offset & NODE_REF_OFFSET_MASK);
 }
 
 static inline uint64_t node_ref_page_id(node_ref_t ref) {
-    return ref >> 12;
+    return ref >> NODE_REF_OFFSET_BITS;
 }
 
 static inline uint32_t node_ref_offset(node_ref_t ref) {
-    return (uint32_t)(ref & 0xFFF);
+    return (uint32_t)(ref & NODE_REF_OFFSET_MASK);
 }
 
 static inline bool node_ref_is_null(node_ref_t ref) {
