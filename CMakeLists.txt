@@ -187,6 +187,12 @@ add_executable(test_stress_grow
 )
 target_link_libraries(test_stress_grow art_persistent pthread)
 
+# Test: Production-Scale Ethereum Block Processing
+add_executable(test_production_scale
+    database/tests/test_production_scale.c
+)
+target_link_libraries(test_production_scale art_persistent pthread)
+
 # Test: Prefix Key Debug
 add_executable(test_prefix_debug
     database/tests/test_prefix_debug.c
