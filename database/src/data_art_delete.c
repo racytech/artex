@@ -43,6 +43,9 @@ extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
 extern void data_art_reset_arena(void);
 extern void data_art_publish_root(data_art_tree_t *tree);
 
+// Thread-local: when true, skip MVCC logical deletes (inplace mode)
+static __thread bool tls_delete_skip_mvcc = false;
+
 // Forward declarations
 static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
                                    const uint8_t *key, size_t key_len, size_t depth,
@@ -108,6 +111,8 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
         }
     }
 
+    tls_delete_skip_mvcc = skip_mvcc;
+
     bool deleted = false;
     node_ref_t new_root = delete_recursive(tree, tree->root, key, key_len, 0, &deleted);
 
@@ -142,12 +147,14 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
  * Caller is responsible for: write_lock, MVCC txn, WAL logging, root publish.
  * Returns true if key was deleted, false if not found.
  */
-bool data_art_delete_internal(data_art_tree_t *tree, const uint8_t *key, size_t key_len) {
+bool data_art_delete_internal(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
+                               bool inplace) {
     if (!tree || !key) return false;
     if (key_len != tree->key_size) return false;
     if (node_ref_is_null(tree->root)) return false;
 
     data_art_reset_arena();
+    tls_delete_skip_mvcc = inplace;
 
     bool deleted = false;
     node_ref_t new_root = delete_recursive(tree, tree->root, key, key_len, 0, &deleted);
@@ -197,10 +204,8 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             // 1. MVCC manager exists
             // 2. There are active snapshots (concurrent readers need versions preserved)
             // 3. The leaf was created by a different transaction (not in-flight creation)
-            bool has_snapshots = tree->mvcc_manager && 
-                                mvcc_has_active_snapshots(tree->mvcc_manager);
-            bool should_do_logical_delete = has_snapshots && 
-                                           tree->current_txn_id > 0 && 
+            bool should_do_logical_delete = !tls_delete_skip_mvcc &&
+                                           tree->current_txn_id > 0 &&
                                            leaf->xmin != tree->current_txn_id;
             
             if (should_do_logical_delete) {

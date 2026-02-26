@@ -174,6 +174,12 @@ add_executable(test_realworld_stress
 )
 target_link_libraries(test_realworld_stress art_persistent pthread)
 
+# Test: Stress Loop (Ethereum workload, reproducible, looped)
+add_executable(test_stress_loop
+    database/tests/test_stress_loop.c
+)
+target_link_libraries(test_stress_loop art_persistent pthread)
+
 # Test: Prefix Key Debug
 add_executable(test_prefix_debug
     database/tests/test_prefix_debug.c

@@ -556,7 +556,8 @@ bool data_art_insert_internal(data_art_tree_t *tree, const uint8_t *key, size_t 
  * Internal delete — for optimized commit path (lock held, no auto-commit/publish)
  * Returns true if key was deleted, false if not found.
  */
-bool data_art_delete_internal(data_art_tree_t *tree, const uint8_t *key, size_t key_len);
+bool data_art_delete_internal(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
+                               bool inplace);
 
 // ============================================================================
 // Overflow Page Operations

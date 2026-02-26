@@ -5,7 +5,7 @@
  * - data_art_get / data_art_get_snapshot (public API)
  * - data_art_contains
  * - Internal traversal: find_child, leaf_matches
- * - Version chain walk with MVCC visibility checks
+ * - MVCC visibility checks (CoW model — no version chain walk)
  *
  * Search operations are fully lock-free. Readers load the committed root
  * atomically and traverse immutable CoW pages without holding any lock.
@@ -16,6 +16,11 @@
 #include "logger.h"
 
 #include <stdlib.h>
+#include <stdio.h>
+
+// Debug: thread-local trace flag for diagnosing snapshot isolation violations.
+// When non-zero, data_art_get_internal prints each traversal step to stderr.
+__thread int tls_search_trace = 0;
 #include <string.h>
 
 // Forward declarations - functions from data_art_core.c
@@ -125,7 +130,16 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
     node_ref_t current = root;
 
     if (node_ref_is_null(current)) {
+        if (tls_search_trace) fprintf(stderr, "  TRACE: root is NULL\n");
         return NULL;  // Empty tree
+    }
+
+    if (tls_search_trace) {
+        fprintf(stderr, "  TRACE: start traversal root=page=%lu off=%u key=",
+                node_ref_page_id(root), node_ref_offset(root));
+        for (size_t ki = 0; ki < key_len && ki < 20; ki++)
+            fprintf(stderr, "%02x", key[ki]);
+        fprintf(stderr, "\n");
     }
 
     size_t depth = 0;
@@ -140,80 +154,62 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
 
         uint8_t type = *(const uint8_t *)node;
 
+        if (tls_search_trace) {
+            if (type <= DATA_NODE_256) {
+                uint8_t nc = ((const uint8_t *)node)[1];
+                fprintf(stderr, "  TRACE: depth=%zu node type=%u nchildren=%u page=%lu off=%u\n",
+                        depth, type, nc, node_ref_page_id(current), node_ref_offset(current));
+            }
+        }
+
         // Check if leaf
         if (type == DATA_NODE_LEAF) {
             const data_art_leaf_t *leaf = (const data_art_leaf_t *)node;
+            if (tls_search_trace) {
+                fprintf(stderr, "  TRACE: depth=%zu LEAF page=%lu off=%u xmin=%lu xmax=%lu vlen=%u\n",
+                        depth, node_ref_page_id(current), node_ref_offset(current),
+                        leaf->xmin, leaf->xmax, leaf->value_len);
+            }
             LOG_DEBUG("Found LEAF at page=%lu: key_size=%zu, value_len=%u, flags=0x%02x, xmin=%lu, xmax=%lu",
                       node_ref_page_id(current), tree->key_size, leaf->value_len, leaf->flags, leaf->xmin, leaf->xmax);
 
-            // Walk version chain to find visible version
-            node_ref_t version_ref = current;
-            const data_art_leaf_t *visible_leaf = NULL;
-            int chain_length = 0;
-            const int MAX_CHAIN_LENGTH = 1000;  // Prevent infinite loops
-
-            LOG_TRACE("Starting version chain walk from page=%lu offset=%u", node_ref_page_id(version_ref), node_ref_offset(version_ref));
-
-            // Start with the leaf we already loaded
-            const data_art_leaf_t *candidate = leaf;
-
-            while (chain_length < MAX_CHAIN_LENGTH) {
-                if (!candidate || candidate->type != DATA_NODE_LEAF) {
-                    LOG_ERROR("Invalid version chain: candidate=%p, type=%u",
-                              (void*)candidate,
-                              candidate ? candidate->type : 255);
-                    break;
-                }
-
-                LOG_TRACE("Checking version chain[%d]: page=%lu offset=%u xmin=%lu xmax=%lu",
-                         chain_length, node_ref_page_id(version_ref), node_ref_offset(version_ref), candidate->xmin, candidate->xmax);
-
-                // MVCC visibility check
+            // MVCC visibility check — CoW tree model
+            //
+            // In our CoW model, each snapshot captures its own root and traverses
+            // an immutable tree.  The leaf at this position IS the correct version
+            // for the reader's tree.  We do NOT walk prev_version chains because:
+            //
+            // 1. Non-snapshot reads follow the committed root.  The leaf here is
+            //    the latest committed version.  If xmax != 0, the key is deleted.
+            //
+            // 2. Snapshot reads follow the snapshot's captured root.  CoW ensures
+            //    the snapshot's tree still has the leaf that was current at snapshot
+            //    creation time.  Use mvcc_is_visible on this leaf directly.
+            //
+            // Walking prev_version would incorrectly "resurface" old versions
+            // whose xmax was never set (old versions are kept for structural
+            // reasons but are superseded in the tree).
+            {
                 bool visible = true;
                 if (snapshot && tree->mvcc_manager) {
                     visible = mvcc_is_visible(tree->mvcc_manager, snapshot,
-                                              candidate->xmin, candidate->xmax, snapshot_txn_id);
-                    if (!visible) {
-                        LOG_TRACE("Version not visible to snapshot (xmin=%lu, xmax=%lu)",
-                                 candidate->xmin, candidate->xmax);
+                                              leaf->xmin, leaf->xmax, snapshot_txn_id);
+                    if (tls_search_trace && !visible) {
+                        fprintf(stderr, "  TRACE: leaf NOT visible (xmin=%lu xmax=%lu)\n",
+                                leaf->xmin, leaf->xmax);
                     }
-                } else if (candidate->xmax != 0) {
-                    // No snapshot but leaf is deleted - not visible
+                } else if (leaf->xmax != 0) {
                     visible = false;
-                    LOG_TRACE("Version is deleted (xmax=%lu), not visible", candidate->xmax);
+                    if (tls_search_trace) {
+                        fprintf(stderr, "  TRACE: leaf deleted (xmax=%lu), not visible\n", leaf->xmax);
+                    }
                 }
 
-                if (visible) {
-                    visible_leaf = candidate;
-                    LOG_DEBUG("Found visible version at chain[%d]: xmin=%lu xmax=%lu",
-                             chain_length, candidate->xmin, candidate->xmax);
-                    break;
+                if (!visible) {
+                    LOG_DEBUG("Leaf not visible: xmin=%lu xmax=%lu", leaf->xmin, leaf->xmax);
+                    return NULL;
                 }
-
-                // Move to previous version
-                if (node_ref_is_null(candidate->prev_version)) {
-                    LOG_DEBUG("End of version chain (no prev_version)");
-                    break;
-                }
-
-                version_ref = candidate->prev_version;
-                chain_length++;
-
-                // Load next version in chain
-                candidate = (const data_art_leaf_t *)data_art_load_node(tree, version_ref);
             }
-
-            if (chain_length >= MAX_CHAIN_LENGTH) {
-                LOG_ERROR("Version chain too long (>%d), possible corruption", MAX_CHAIN_LENGTH);
-                return NULL;
-            }
-
-            if (!visible_leaf) {
-                LOG_DEBUG("No visible version found in chain (length=%d)", chain_length);
-                return NULL;  // No visible version in chain
-            }
-
-            leaf = visible_leaf;  // Use the visible version
 
             // Debug: Verify the leaf structure makes sense
             if (leaf->value_len > 1024) {  // Suspiciously large
@@ -224,6 +220,9 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
             }
 
             if (leaf_matches(leaf, key, key_len)) {
+                if (tls_search_trace) {
+                    fprintf(stderr, "  TRACE: leaf MATCHES, returning value_len=%u\n", leaf->value_len);
+                }
                 if (value_len) {
                     *value_len = leaf->value_len;
                 }
@@ -259,6 +258,9 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
                 memcpy(value_copy, leaf_key(leaf) + tree->key_size, leaf->value_len);
                 return value_copy;
             }
+            if (tls_search_trace) {
+                fprintf(stderr, "  TRACE: leaf does NOT match key\n");
+            }
             return NULL;
         }
 
@@ -274,6 +276,9 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
         }
 
         current = find_child(tree, current, byte);
+        if (tls_search_trace && node_ref_is_null(current)) {
+            fprintf(stderr, "  TRACE: depth=%zu child for byte=0x%02x NOT FOUND → NULL\n", depth, byte);
+        }
     }
 
     return NULL;  // Not found
@@ -332,5 +337,10 @@ bool data_art_get_into(data_art_tree_t *tree, const uint8_t *key, size_t key_len
 
 bool data_art_contains(data_art_tree_t *tree, const uint8_t *key, size_t key_len) {
     size_t len;
-    return data_art_get(tree, key, key_len, &len) != NULL;
+    const void *val = data_art_get(tree, key, key_len, &len);
+    if (val) {
+        free((void *)val);
+        return true;
+    }
+    return false;
 }

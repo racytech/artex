@@ -399,7 +399,9 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         
         // Update existing leaf
         if (leaf_matches_key(leaf, key, key_len)) {
-            *inserted = false;  // Updated, not inserted
+            // If leaf was logically deleted (xmax != 0), treat as new insert
+            // so tree->size gets incremented to compensate for the delete's decrement
+            *inserted = (leaf->xmax != 0);
             LOG_DEBUG("[UPDATE_LEAF] Updating leaf at page=%lu (old value_len=%u, xmin=%lu, xmax=%lu)",
                      node_ref_page_id(node_ref), leaf->value_len, leaf->xmin, leaf->xmax);
             
@@ -451,22 +453,20 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             }
             free(new_leaf_copy);
 
-            // Mark old version as superseded (set xmax) for MVCC version chains
-            if (tree->mvcc_manager) {
-                size_t old_leaf_size = leaf_total_size(leaf, tree->key_size);
-                data_art_leaf_t *old_leaf_copy = malloc(old_leaf_size);
-                if (old_leaf_copy) {
-                    memcpy(old_leaf_copy, leaf, old_leaf_size);
-                    old_leaf_copy->xmax = tree->current_txn_id;
-                    data_art_write_node(tree, old_leaf_ref, old_leaf_copy, old_leaf_size);
-                    free(old_leaf_copy);
-                    LOG_DEBUG("[UPDATE_LEAF] Marked old version (page=%lu) as superseded: xmax=%lu",
-                             node_ref_page_id(old_leaf_ref), tree->current_txn_id);
-                }
-            } else {
-                LOG_DEBUG("[UPDATE_LEAF] Physical update: old version (page=%lu) kept for version chain",
-                         node_ref_page_id(old_leaf_ref));
-            }
+            // NOTE: Do NOT modify the old leaf's xmax in-place.
+            //
+            // The old leaf may be shared between the snapshot's tree (via old
+            // CoW'd internal nodes) and the writer's current tree.  Writing
+            // xmax in-place would change MVCC visibility for snapshot readers,
+            // breaking snapshot isolation.
+            //
+            // The version chain link (new_leaf.prev_version = old_leaf_ref)
+            // is sufficient: readers walking the current tree find V_new first
+            // and only walk to the old leaf if V_new isn't visible, at which
+            // point the old leaf's original xmax (0 or a prior delete's txn)
+            // gives the correct visibility answer.
+            LOG_DEBUG("[UPDATE_LEAF] Old version (page=%lu) kept with original xmax=%lu (no in-place xmax write)",
+                     node_ref_page_id(old_leaf_ref), leaf->xmax);
 
             LOG_DEBUG("[UPDATE_LEAF] Created new version at page=%lu (new value_len=%zu) -> prev_version=page=%lu",
                      node_ref_page_id(new_leaf_ref), value_len, node_ref_page_id(old_leaf_ref));

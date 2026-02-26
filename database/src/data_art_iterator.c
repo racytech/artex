@@ -164,8 +164,12 @@ data_art_iterator_t *data_art_iterator_create(data_art_tree_t *tree) {
 
     iter->tree = tree;
 
-    // Capture committed root atomically for consistent snapshot
+    // Capture committed root under rdlock to prevent in-place mutation race.
+    // Without the lock, the writer could do in-place mutations between root
+    // capture and first next() call, corrupting the tree structure we iterate.
+    pthread_rwlock_rdlock(&tree->write_lock);
     iter->root = atomic_load_explicit(&tree->committed_root, memory_order_acquire);
+    pthread_rwlock_unlock(&tree->write_lock);
 
     iter->depth = -1;
     iter->done = node_ref_is_null(iter->root);

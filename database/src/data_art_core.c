@@ -1052,7 +1052,7 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
             success = data_art_insert_internal(tree, key, op->key_len,
                                                 value, op->value_len, inplace);
         } else { // TXN_OP_DELETE
-            success = data_art_delete_internal(tree, key, op->key_len);
+            success = data_art_delete_internal(tree, key, op->key_len, inplace);
             if (!success) {
                 // Delete not found — not an error in batch context
                 LOG_DEBUG("Delete for key not found during commit — skipping");
@@ -1158,14 +1158,15 @@ data_art_snapshot_t *data_art_begin_snapshot(data_art_tree_t *tree) {
         return NULL;
     }
     
-    // Capture committed root atomically, coordinating with in-place mutation writers.
-    // rdlock on write_lock ensures no writer is mid-mutation when we read the root.
+    // Capture committed root AND register MVCC snapshot atomically.
+    // Both must happen under rdlock to prevent the race where a writer sees
+    // no active snapshots (via mvcc_has_active_snapshots) and uses in-place
+    // mutations on nodes that this snapshot's root references.
     pthread_rwlock_rdlock(&tree->write_lock);
+    snapshot->mvcc_snapshot = mvcc_snapshot_create(tree->mvcc_manager);
     snapshot->root = atomic_load_explicit(&tree->committed_root, memory_order_acquire);
     pthread_rwlock_unlock(&tree->write_lock);
 
-    // Create MVCC snapshot
-    snapshot->mvcc_snapshot = mvcc_snapshot_create(tree->mvcc_manager);
     if (!snapshot->mvcc_snapshot) {
         LOG_ERROR("Failed to create MVCC snapshot");
         mvcc_abort_txn(tree->mvcc_manager, snapshot->txn_id);
@@ -1212,7 +1213,8 @@ bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out) {
         return false;
     }
 
-    drain_pending_frees(tree);
+    // Only drain if no active snapshots — snapshots may still reference old nodes
+    try_drain_pending_frees(tree);
 
     if (!mmap_storage_checkpoint(tree->mmap_storage,
                                   node_ref_page_id(tree->root),
