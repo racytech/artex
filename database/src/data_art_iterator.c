@@ -2,12 +2,10 @@
  * Persistent ART - Iterator (Sorted Key Enumeration)
  *
  * Stack-based depth-first traversal that yields leaves in lexicographic
- * key order. Locks are acquired at creation time and held for the entire
- * scan lifetime (released on destroy or scan completion) enabling zero-copy
- * mmap reads. Key/value buffers are pre-allocated and reused across calls.
+ * key order.  Uses an MVCC snapshot to provide a consistent view without
+ * holding write_lock — writers proceed freely during the entire scan.
  *
- * The iterator captures a snapshot of the committed root at creation time,
- * providing a consistent view even under concurrent writes.
+ * Key/value buffers are pre-allocated and reused across next() calls.
  */
 
 #include "data_art.h"
@@ -38,12 +36,12 @@ typedef struct {
 struct data_art_iterator {
     data_art_tree_t *tree;
     node_ref_t root;
+    data_art_snapshot_t *snapshot;  // MVCC snapshot (owns root lifetime)
 
     iter_stack_frame_t stack[ITER_MAX_DEPTH];
     int depth;
     bool started;
     bool done;
-    bool scanning;          // true while scan-lifetime locks are held
 
     // Pre-allocated buffers (reused across next() calls)
     uint8_t *current_key;
@@ -163,12 +161,15 @@ data_art_iterator_t *data_art_iterator_create(data_art_tree_t *tree) {
 
     iter->tree = tree;
 
-    // Acquire write_lock rdlock and capture root atomically.
-    // Lock held until end_scan() (on destroy or scan completion).
-    // This coordinates with in-place mutation writers.
-    pthread_rwlock_rdlock(&tree->write_lock);
-    iter->scanning = true;
-    iter->root = atomic_load_explicit(&tree->committed_root, memory_order_acquire);
+    // Take an MVCC snapshot — captures committed root and prevents
+    // page reuse of the snapshot's tree.  No write_lock held; writers
+    // proceed freely (CoW ensures snapshot pages are never mutated).
+    iter->snapshot = data_art_begin_snapshot(tree);
+    if (!iter->snapshot) {
+        free(iter);
+        return NULL;
+    }
+    iter->root = iter->snapshot->root;
 
     iter->depth = -1;
     iter->done = node_ref_is_null(iter->root);
@@ -184,11 +185,11 @@ data_art_iterator_t *data_art_iterator_create(data_art_tree_t *tree) {
     return iter;
 }
 
-// Release scan-lifetime lock (called when scan ends or iterator destroyed)
+// Release MVCC snapshot (called when scan ends or iterator destroyed)
 static void end_scan(data_art_iterator_t *iter) {
-    if (iter->scanning) {
-        iter->scanning = false;
-        pthread_rwlock_unlock(&iter->tree->write_lock);
+    if (iter->snapshot) {
+        data_art_end_snapshot(iter->tree, iter->snapshot);
+        iter->snapshot = NULL;
     }
 }
 
