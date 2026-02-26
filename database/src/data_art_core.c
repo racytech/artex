@@ -538,8 +538,8 @@ data_art_tree_t *data_art_create(const char *path, size_t key_size) {
         return NULL;
     }
 
-    // Save key_size to header for reopen
-    mmap_storage_save_header(ms, 0, 0, 0, key_size);
+    // Persist key_size to header for reopen
+    mmap_storage_checkpoint(ms, 0, 0, 0, key_size);
 
     LOG_INFO("Created ART tree (key_size=%zu, path=%s)", key_size, path);
     return tree;
@@ -629,8 +629,8 @@ void data_art_destroy(data_art_tree_t *tree) {
     free(tree->pending_free_pages);
     free(tree->pending_slot_frees);
 
-    // Save header, then destroy storage
-    mmap_storage_save_header(tree->mmap_storage,
+    // Crash-safe checkpoint, then destroy storage
+    mmap_storage_checkpoint(tree->mmap_storage,
                              node_ref_page_id(tree->root), node_ref_offset(tree->root),
                              tree->size, tree->key_size);
     free(tree->reuse_pool);
@@ -1229,17 +1229,15 @@ bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out) {
     }
 
     drain_pending_frees(tree);
-    mmap_storage_save_header(tree->mmap_storage,
-                             node_ref_page_id(tree->root), node_ref_offset(tree->root),
-                             tree->size, tree->key_size);
-    // Update next_page_id in header
-    mmap_header_t *hdr = (mmap_header_t *)tree->mmap_storage->base;
-    hdr->next_page_id = tree->mmap_storage->next_page_id;
 
-    if (!mmap_storage_sync(tree->mmap_storage)) {
-        LOG_ERROR("checkpoint: msync failed");
+    if (!mmap_storage_checkpoint(tree->mmap_storage,
+                                  node_ref_page_id(tree->root),
+                                  node_ref_offset(tree->root),
+                                  tree->size, tree->key_size)) {
+        LOG_ERROR("checkpoint: mmap_storage_checkpoint failed");
         return false;
     }
+
     if (checkpoint_lsn_out) *checkpoint_lsn_out = 0;
     LOG_INFO("Checkpoint (root=%lu:%u, size=%zu)",
              node_ref_page_id(tree->root), node_ref_offset(tree->root), tree->size);
