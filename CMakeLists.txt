@@ -193,6 +193,12 @@ add_executable(test_production_scale
 )
 target_link_libraries(test_production_scale art_persistent pthread)
 
+# Test: mem_art stress (in-memory ART correctness at scale)
+add_executable(test_stress_mem_art
+    database/tests/test_stress_mem_art.c
+)
+target_link_libraries(test_stress_mem_art art_database)
+
 # Test: Prefix Key Debug
 add_executable(test_prefix_debug
     database/tests/test_prefix_debug.c

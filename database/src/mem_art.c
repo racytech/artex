@@ -28,6 +28,9 @@
 #define NODE48_MAX 48
 #define NODE256_MAX 256
 
+// Maximum prefix bytes stored inline (matches persistent ART)
+#define MAX_PREFIX 32
+
 // Special value for Node48 index indicating no child
 #define NODE48_EMPTY 255
 
@@ -83,7 +86,7 @@ struct art_node {
     art_node_type_t type;  // Type discriminator
     uint32_t num_children;
     uint32_t partial_len;
-    uint8_t partial[10];
+    uint8_t partial[MAX_PREFIX];
     union {
         art_node4_t node4;
         art_node16_t node16;
@@ -129,6 +132,7 @@ static int check_prefix(const art_node_t *node, const uint8_t *key,
 static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child);
 static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **child_out);
 static art_node_t *find_child(const art_node_t *node, uint8_t byte);
+static void replace_child(art_node_t *node, uint8_t byte, art_node_t *new_child);
 
 //==============================================================================
 // Public API Implementation
@@ -385,21 +389,46 @@ void art_foreach(const art_tree_t *tree, art_callback_t callback, void *user_dat
 // Internal Helper Functions
 //==============================================================================
 
+// Header size: type + num_children + partial_len + partial[]
+#define NODE_HEADER_SIZE (offsetof(art_node_t, node4))
+
 static art_node_t *alloc_node(art_node_type_t type) {
-    // Always allocate enough for the full node structure
-    // This includes the type field + union with header + specific node type
-    art_node_t *node = calloc(1, sizeof(art_node_t));
+    // Allocate only what's needed for the specific node type
+    size_t size;
+    switch (type) {
+        case NODE_4:   size = NODE_HEADER_SIZE + sizeof(art_node4_t);   break;
+        case NODE_16:  size = NODE_HEADER_SIZE + sizeof(art_node16_t);  break;
+        case NODE_48:  size = NODE_HEADER_SIZE + sizeof(art_node48_t);  break;
+        case NODE_256: size = NODE_HEADER_SIZE + sizeof(art_node256_t); break;
+        default:       return NULL;
+    }
+
+    art_node_t *node = malloc(size);
     if (!node) return NULL;
-    
+
     node->type = type;
     node->num_children = 0;
     node->partial_len = 0;
-    
-    // Initialize Node48 index array
-    if (type == NODE_48) {
-        memset(node->node48.index, NODE48_EMPTY, 256);
+
+    // Only zero the type-specific part
+    switch (type) {
+        case NODE_4:
+            memset(&node->node4, 0, sizeof(art_node4_t));
+            break;
+        case NODE_16:
+            memset(&node->node16, 0, sizeof(art_node16_t));
+            break;
+        case NODE_48:
+            memset(node->node48.index, NODE48_EMPTY, 256);
+            memset(node->node48.children, 0, sizeof(node->node48.children));
+            break;
+        case NODE_256:
+            memset(&node->node256, 0, sizeof(art_node256_t));
+            break;
+        default:
+            break;
     }
-    
+
     return node;
 }
 
@@ -487,80 +516,20 @@ static bool leaf_matches(const art_node_t *node, const uint8_t *key, size_t key_
 }
 
 /**
- * Check how many bytes of the compressed path match the key
- * Returns the number of matching bytes, or prefix length if all match
- * For lazy expansion (partial_len > 10), may need to check beyond stored bytes
+ * Check how many bytes of the compressed path match the key.
+ * Returns the number of matching bytes.
+ * With MAX_PREFIX=32, the full prefix is always stored inline — no lazy expansion.
  */
 static int check_prefix(const art_node_t *node, const uint8_t *key,
                         size_t key_len, size_t depth) {
-    int max_cmp = node->partial_len < 10 ? node->partial_len : 10;
+    int max_cmp = (int)node->partial_len;
     int idx;
-    
+
     for (idx = 0; idx < max_cmp; idx++) {
         if (depth + idx >= key_len) return idx;
         if (node->partial[idx] != key[depth + idx]) return idx;
     }
-    
-    // If we've checked all stored bytes and partial_len > 10,
-    // we need to verify the remaining bytes match by checking a leaf
-    if (node->partial_len > 10) {
-        LOG_TRACE("check_prefix: lazy expansion, need to check beyond stored 10 bytes (partial_len=%u)",
-                     node->partial_len);
-        // Find any leaf under this node
-        art_node_t *current = (art_node_t *)node;
-        int max_depth = 64;  // Safety limit
-        while (!is_leaf(current) && max_depth-- > 0) {
-            art_node_t *next = NULL;
-            if (current->type == NODE_4 && current->num_children > 0) {
-                next = current->node4.children[0];
-            } else if (current->type == NODE_16 && current->num_children > 0) {
-                next = current->node16.children[0];
-            } else if (current->type == NODE_48) {
-                for (int i = 0; i < NODE48_MAX; i++) {
-                    if (current->node48.children[i]) {
-                        next = current->node48.children[i];
-                        break;
-                    }
-                }
-            } else if (current->type == NODE_256) {
-                for (int i = 0; i < NODE256_MAX; i++) {
-                    if (current->node256.children[i]) {
-                        next = current->node256.children[i];
-                        break;
-                    }
-                }
-            }
-            
-            if (!next) {
-                // No child found - shouldn't happen in valid tree
-                LOG_ERROR("check_prefix: no child found during leaf traversal!");
-                return idx;
-            }
-            current = next;
-        }
-        
-        if (!is_leaf(current)) {
-            LOG_ERROR("check_prefix: max depth reached without finding leaf!");
-            return idx;
-        }
-        
-        // Compare the remaining bytes with the leaf's key
-        const uint8_t *leaf_key_bytes = leaf_key(current);
-        LOG_TRACE("check_prefix: comparing bytes %d to %u with leaf key", idx, node->partial_len);
-        for (; idx < node->partial_len; idx++) {
-            if (depth + idx >= key_len) {
-                LOG_TRACE("check_prefix: key exhausted at idx=%d", idx);
-                return idx;
-            }
-            if (leaf_key_bytes[depth + idx] != key[depth + idx]) {
-                LOG_TRACE("check_prefix: mismatch at idx=%d (leaf=0x%02X, key=0x%02X)",
-                            idx, leaf_key_bytes[depth + idx], key[depth + idx]);
-                return idx;
-            }
-        }
-        LOG_TRACE("check_prefix: full match up to idx=%d", idx);
-    }
-    
+
     return idx;
 }
 
@@ -586,12 +555,7 @@ static const void *search(const art_node_t *node, const uint8_t *key,
     // Check compressed path
     if (node->partial_len > 0) {
         int prefix_len = check_prefix(node, key, key_len, depth);
-        // check_prefix returns the full match length (including lazy expansion for >10 bytes)
-        // so we compare against the full partial_len
-        LOG_TRACE("search: compressed path check, partial_len=%u, prefix_match=%d",
-                     node->partial_len, prefix_len);
-        if (prefix_len != node->partial_len) {
-            LOG_TRACE("search: prefix mismatch, returning NULL");
+        if (prefix_len != (int)node->partial_len) {
             return NULL;  // Prefix mismatch
         }
         depth += node->partial_len;
@@ -653,6 +617,43 @@ static art_node_t *find_child(const art_node_t *node, uint8_t byte) {
     }
 }
 
+/**
+ * Replace a child pointer in-place (no add/remove, no size change).
+ * Used when a recursive operation returns a different pointer for the same key byte.
+ */
+static void replace_child(art_node_t *node, uint8_t byte, art_node_t *new_child) {
+    switch (node->type) {
+        case NODE_4:
+            for (uint32_t i = 0; i < node->num_children; i++) {
+                if (node->node4.keys[i] == byte) {
+                    node->node4.children[i] = new_child;
+                    return;
+                }
+            }
+            break;
+        case NODE_16:
+            for (uint32_t i = 0; i < node->num_children; i++) {
+                if (node->node16.keys[i] == byte) {
+                    node->node16.children[i] = new_child;
+                    return;
+                }
+            }
+            break;
+        case NODE_48: {
+            uint8_t idx = node->node48.index[byte];
+            if (idx != NODE48_EMPTY) {
+                node->node48.children[idx] = new_child;
+            }
+            break;
+        }
+        case NODE_256:
+            node->node256.children[byte] = new_child;
+            break;
+        default:
+            break;
+    }
+}
+
 static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
                                      size_t key_len, size_t depth,
                                      const void *value, size_t value_len,
@@ -710,8 +711,7 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
         // Set compressed path (common prefix)
         new_node->partial_len = prefix_len;
         if (prefix_len > 0) {
-            int copy_len = (prefix_len < 10) ? prefix_len : 10;
-            memcpy(new_node->partial, key + depth, copy_len);
+            memcpy(new_node->partial, key + depth, prefix_len);
         }
         
         // Calculate new depth after compressed path
@@ -733,119 +733,36 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
         int prefix_len = check_prefix(node, key, key_len, depth);
         
         // Prefix mismatch - need to split the node
-        if (prefix_len < node->partial_len) {
-            LOG_DEBUG("insert_recursive: prefix mismatch at depth=%zu, prefix_len=%d, node->partial_len=%u",
-                        depth, prefix_len, node->partial_len);
+        if (prefix_len < (int)node->partial_len) {
             *inserted = true;
-            
-            // Need to get the discriminating byte for the old node
-            // If prefix_len >= 10, we can't trust node->partial[prefix_len]
-            uint8_t old_byte;
-            if (prefix_len < 10) {
-                // Simple case: byte is in the partial array
-                old_byte = node->partial[prefix_len];
-            } else {
-                // Need to get it from a leaf in the subtree
-                art_node_t *current = node;
-                while (!is_leaf(current)) {
-                    // Find first non-null child
-                    if (current->type == NODE_4) {
-                        current = current->node4.children[0];
-                    } else if (current->type == NODE_16) {
-                        current = current->node16.children[0];
-                    } else if (current->type == NODE_48) {
-                        for (int i = 0; i < NODE48_MAX; i++) {
-                            if (current->node48.children[i]) {
-                                current = current->node48.children[i];
-                                break;
-                            }
-                        }
-                    } else { // NODE_256
-                        for (int i = 0; i < NODE256_MAX; i++) {
-                            if (current->node256.children[i]) {
-                                current = current->node256.children[i];
-                                break;
-                            }
-                        }
-                    }
-                }
-                // Get the discriminating byte from the leaf's key
-                const uint8_t *leaf_key_bytes = leaf_key(current);
-                old_byte = leaf_key_bytes[depth + prefix_len];
-            }
-            
-            LOG_DEBUG("insert_recursive: splitting node, old_byte=0x%02X", old_byte);
-            
+
+            // Discriminating byte for old node — always in partial[]
+            uint8_t old_byte = node->partial[prefix_len];
+
             art_node_t *new_node = alloc_node(NODE_4);
             if (!new_node) return node;
-            
+
             // New node gets the matching prefix
             new_node->partial_len = prefix_len;
-            int copy_len = (prefix_len < 10) ? prefix_len : 10;
-            memcpy(new_node->partial, node->partial, copy_len);
-            
-            // Calculate the new partial length for the old node
+            memcpy(new_node->partial, node->partial, prefix_len);
+
+            // Shift old node's prefix: skip matched prefix + discriminating byte
             uint32_t new_partial_len = node->partial_len - (prefix_len + 1);
-            
-            // Adjust old node's prefix
-            // If the old partial was > 10 bytes and remains > 10 bytes after split,
-            // we need to get the bytes from a leaf since we only stored first 10
-            if (node->partial_len > 10 && new_partial_len > 10) {
-                // Find a leaf to get the full path
-                // We'll need to traverse down to find any leaf
-                art_node_t *current = node;
-                while (!is_leaf(current)) {
-                    // Find first non-null child
-                    if (current->type == NODE_4) {
-                        current = current->node4.children[0];
-                    } else if (current->type == NODE_16) {
-                        current = current->node16.children[0];
-                    } else if (current->type == NODE_48) {
-                        for (int i = 0; i < NODE48_MAX; i++) {
-                            if (current->node48.children[i]) {
-                                current = current->node48.children[i];
-                                break;
-                            }
-                        }
-                    } else { // NODE_256
-                        for (int i = 0; i < NODE256_MAX; i++) {
-                            if (current->node256.children[i]) {
-                                current = current->node256.children[i];
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                // Get the full key from the leaf
-                const uint8_t *leaf_key_bytes = leaf_key(current);
-                
-                // Copy the new compressed path from the leaf
-                // Start from: depth + prefix_len + 1 (skip matched prefix + discriminating byte)
-                size_t start = depth + prefix_len + 1;
-                copy_len = (new_partial_len < 10) ? new_partial_len : 10;
-                memcpy(node->partial, leaf_key_bytes + start, copy_len);
-            } else {
-                // Simple case: just shift the partial path
-                memmove(node->partial, node->partial + prefix_len + 1,
-                        (new_partial_len < 10) ? new_partial_len : 10);
-            }
+            memmove(node->partial, node->partial + prefix_len + 1, new_partial_len);
             node->partial_len = new_partial_len;
-            
+
             // Create leaf for new key
             art_node_t *leaf = alloc_leaf(key, key_len, value, value_len);
             if (!leaf) {
                 free(new_node);
                 return node;
             }
-            
-            // Calculate discriminating byte for new key
+
             uint8_t new_byte = (depth + prefix_len < key_len) ? key[depth + prefix_len] : 0x00;
-            
-            // Add both as children
+
             new_node = add_child(new_node, old_byte, node);
             new_node = add_child(new_node, new_byte, (art_node_t *)leaf);
-            
+
             return new_node;
         }
         
@@ -863,13 +780,11 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
         if (depth >= key_len) {
             // Key is consumed, child should be a leaf - update it
             if (is_leaf(child) && leaf_matches(child, key, key_len)) {
-                // Update existing leaf
                 art_node_t *new_leaf = alloc_leaf(key, key_len, value, value_len);
                 if (new_leaf) {
-                    node = remove_child(node, byte, NULL);  // node might shrink
-                    node = add_child(node, byte, new_leaf);
+                    replace_child(node, byte, new_leaf);
                     free(child);
-                    *inserted = false;  // Updated, not inserted
+                    *inserted = false;
                 }
             }
             return node;
@@ -878,9 +793,7 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
         art_node_t *new_child = insert_recursive(child, key, key_len, depth + 1,
                                                   value, value_len, inserted);
         if (new_child != child) {
-            // Child was replaced - update parent
-            node = remove_child(node, byte, NULL);  // node might shrink
-            node = add_child(node, byte, new_child);
+            replace_child(node, byte, new_child);
         }
     } else {
         // No child - create new leaf
@@ -924,7 +837,7 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             
             // Copy header
             new_node->partial_len = node->partial_len;
-            memcpy(new_node->partial, node->partial, 10);
+            memcpy(new_node->partial, node->partial, node->partial_len);
             
             // Copy children
             memcpy(new_node->node16.keys, node->node4.keys, NODE4_MAX);
@@ -960,7 +873,7 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             
             // Copy header
             new_node->partial_len = node->partial_len;
-            memcpy(new_node->partial, node->partial, 10);
+            memcpy(new_node->partial, node->partial, node->partial_len);
             
             // Initialize index array to NODE48_EMPTY
             memset(new_node->node48.index, NODE48_EMPTY, 256);
@@ -995,7 +908,7 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             
             // Copy header
             new_node->partial_len = node->partial_len;
-            memcpy(new_node->partial, node->partial, 10);
+            memcpy(new_node->partial, node->partial, node->partial_len);
             
             // Copy children
             for (int i = 0; i < 256; i++) {
@@ -1055,7 +968,7 @@ static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **chi
                         if (new_node) {
                             new_node->num_children = node->num_children;
                             new_node->partial_len = node->partial_len;
-                            memcpy(new_node->partial, node->partial, 10);
+                            memcpy(new_node->partial, node->partial, node->partial_len);
                             memcpy(new_node->node4.keys, node->node16.keys, node->num_children);
                             memcpy(new_node->node4.children, node->node16.children, 
                                    node->num_children * sizeof(art_node_t *));
@@ -1082,7 +995,7 @@ static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **chi
                     if (new_node) {
                         new_node->num_children = 0;
                         new_node->partial_len = node->partial_len;
-                        memcpy(new_node->partial, node->partial, 10);
+                        memcpy(new_node->partial, node->partial, node->partial_len);
                         // Copy non-null children
                         for (int i = 0; i < NODE256_MAX; i++) {
                             if (node->node48.index[i] != NODE48_EMPTY) {
@@ -1111,7 +1024,7 @@ static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **chi
                 if (new_node) {
                     new_node->num_children = 0;
                     new_node->partial_len = node->partial_len;
-                    memcpy(new_node->partial, node->partial, 10);
+                    memcpy(new_node->partial, node->partial, node->partial_len);
                     // Initialize index array
                     memset(new_node->node48.index, NODE48_EMPTY, NODE256_MAX);
                     // Copy non-null children
@@ -1151,7 +1064,7 @@ static art_node_t *delete_recursive(art_node_t *node, const uint8_t *key,
     // Check compressed path
     if (node->partial_len > 0) {
         int prefix_len = check_prefix(node, key, key_len, depth);
-        if (prefix_len != (node->partial_len < 10 ? node->partial_len : 10)) {
+        if (prefix_len != (int)node->partial_len) {
             return node;  // Prefix mismatch - key not found
         }
         depth += node->partial_len;
@@ -1182,11 +1095,10 @@ static art_node_t *delete_recursive(art_node_t *node, const uint8_t *key,
             // Child was deleted
             node = remove_child(node, byte, NULL);  // node might shrink
         } else {
-            // Child was replaced
-            node = remove_child(node, byte, NULL);  // node might shrink
-            node = add_child(node, byte, new_child);
+            // Child was replaced (e.g., node split) — update pointer in-place
+            replace_child(node, byte, new_child);
         }
     }
-    
+
     return node;
 }
