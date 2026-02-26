@@ -2,13 +2,14 @@
  * Production-Scale Ethereum Block Processing Test
  *
  * Simulates real Ethereum workload:
- *   - 1 writer thread (block executor): batched inserts in transactions
+ *   - 1 writer thread (block executor): batched inserts + deletes in transactions
  *   - 4 reader threads (RPC/websocket): zero-alloc reads with value verification
  *
  * Key properties:
  *   - 32-byte keys (keccak256 hash size)
  *   - Variable-length values (32 bytes to 24 KB, realistic Ethereum distribution)
- *   - No shadow map: verification via deterministic value regeneration
+ *   - Mixed insert/delete workload (~10% deletes per block)
+ *   - Delete bitmap for reader verification (readers skip deleted keys)
  *   - Scales to 300-500M keys
  *   - Seed-based reproducibility (splitmix64 PRNG)
  *
@@ -39,6 +40,7 @@
 #define MAX_VALUE_SIZE            24576   // 24 KB (EIP-170 max contract size)
 #define DEFAULT_TARGET_MILLIONS   10
 #define BLOCK_SIZE                2000    // Inserts per "block" (Ethereum ~2000 txns/block)
+#define DELETE_PER_BLOCK          200     // ~10% deletes (storage slot clears, SELFDESTRUCT)
 #define CHECKPOINT_EVERY_BLOCKS   100
 #define NUM_READERS               4
 #define PROGRESS_EVERY_BLOCKS     500
@@ -145,10 +147,29 @@ static inline uint64_t fnv1a_update(uint64_t hash, const uint8_t *data, size_t l
 }
 
 // ============================================================================
+// Delete bitmap — tracks which key indices have been deleted
+//
+// One bit per key index. Writer sets bits after commit.
+// Readers check bits to skip deleted keys.
+// At 500M keys = 62.5 MB — acceptable.
+// ============================================================================
+
+static uint8_t *g_deleted_bitmap = NULL;  // allocated in main()
+
+static inline void bitmap_set(uint8_t *bm, uint64_t idx) {
+    bm[idx / 8] |= (uint8_t)(1 << (idx % 8));
+}
+
+static inline bool bitmap_test(const uint8_t *bm, uint64_t idx) {
+    return (bm[idx / 8] & (1 << (idx % 8))) != 0;
+}
+
+// ============================================================================
 // Shared atomic state
 // ============================================================================
 
 static _Atomic uint64_t g_committed_key_count = 0;
+static _Atomic uint64_t g_total_deleted = 0;
 static _Atomic bool g_error = false;
 static _Atomic bool g_writer_done = false;
 static _Atomic bool g_error_details_set = false;
@@ -183,6 +204,7 @@ typedef struct {
     uint64_t         reads_ok;
     uint64_t         reads_verified;
     uint64_t         reads_not_found;
+    uint64_t         reads_skipped_deleted;
 } reader_ctx_t;
 
 // ============================================================================
@@ -217,6 +239,12 @@ static void *reader_thread_fn(void *arg) {
 
             uint64_t key_index = rng_next(&rng) % committed;
 
+            // Skip deleted keys — they should not exist in the tree
+            if (bitmap_test(g_deleted_bitmap, key_index)) {
+                ctx->reads_skipped_deleted++;
+                continue;
+            }
+
             generate_key(key_buf, ctx->master_seed, key_index);
             size_t expected_len = generate_value(expected_buf, key_index);
 
@@ -225,11 +253,22 @@ static void *reader_thread_fn(void *arg) {
                                             value_buf, MAX_VALUE_SIZE, &vlen);
 
             if (!found) {
-                ctx->reads_not_found++;
+                // Key might have been deleted between our bitmap check and read.
+                // Re-check bitmap after brief sleep.
                 usleep(100);
+                if (bitmap_test(g_deleted_bitmap, key_index)) {
+                    ctx->reads_skipped_deleted++;
+                    continue;
+                }
+                ctx->reads_not_found++;
                 found = data_art_get_into(ctx->tree, key_buf, KEY_SIZE,
                                            value_buf, MAX_VALUE_SIZE, &vlen);
                 if (!found) {
+                    // Final bitmap check — writer may have just updated it
+                    if (bitmap_test(g_deleted_bitmap, key_index)) {
+                        ctx->reads_skipped_deleted++;
+                        continue;
+                    }
                     FAIL_FAST(ctx->master_seed, key_index,
                               "reader-%d: key NOT FOUND (committed=%" PRIu64 ")",
                               ctx->thread_id, committed);
@@ -409,14 +448,23 @@ int main(int argc, char *argv[]) {
 
     uint64_t target_keys = target_millions * 1000000ULL;
 
+    // Allocate delete bitmap (1 bit per key)
+    size_t bitmap_bytes = (target_keys + 7) / 8;
+    g_deleted_bitmap = calloc(1, bitmap_bytes);
+    if (!g_deleted_bitmap) {
+        fprintf(stderr, "FAIL: cannot allocate delete bitmap (%zu MB)\n",
+                bitmap_bytes / (1024 * 1024));
+        return 1;
+    }
+
     printf("\n");
     printf("=== Production-Scale Ethereum Block Test ===\n");
-    printf("  target:     %" PRIu64 "M keys (%" PRIu64 " total)\n",
+    printf("  target:     %" PRIu64 "M keys (%" PRIu64 " total inserts)\n",
            target_millions, target_keys);
     printf("  seed:       0x%016" PRIx64 "\n", master_seed);
     printf("  key_size:   %d bytes (keccak256 hash)\n", KEY_SIZE);
     printf("  values:     32B-24KB (variable, Ethereum distribution)\n");
-    printf("  block_size: %d inserts/block\n", BLOCK_SIZE);
+    printf("  block_size: %d inserts + %d deletes/block\n", BLOCK_SIZE, DELETE_PER_BLOCK);
     printf("  checkpoint: every %d blocks (%d inserts)\n",
            CHECKPOINT_EVERY_BLOCKS, CHECKPOINT_EVERY_BLOCKS * BLOCK_SIZE);
     printf("  readers:    %d threads (zero-alloc data_art_get_into)\n", NUM_READERS);
@@ -436,6 +484,7 @@ int main(int argc, char *argv[]) {
     data_art_tree_t *tree = data_art_create(art_path, KEY_SIZE);
     if (!tree) {
         fprintf(stderr, "FAIL: data_art_create returned NULL\n");
+        free(g_deleted_bitmap);
         return 1;
     }
 
@@ -461,11 +510,15 @@ int main(int argc, char *argv[]) {
     uint8_t value_buf[MAX_VALUE_SIZE];
 
     uint64_t keys_so_far = 0;
+    uint64_t total_deleted = 0;
     uint64_t block_num = 0;
     uint64_t checkpoints_done = 0;
     double last_ckpt_ms = 0.0;
     double max_ckpt_ms = 0.0;
     double total_ckpt_ms = 0.0;
+
+    // RNG for delete target selection (seeded per-block for determinism)
+    // We use a separate RNG so delete selection doesn't affect key/value generation.
 
     while (keys_so_far < target_keys &&
            !atomic_load_explicit(&g_error, memory_order_acquire)) {
@@ -496,6 +549,34 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        // Delete batch: pick DELETE_PER_BLOCK random old keys to delete.
+        // Only start deleting after we have enough keys (at least 2 blocks).
+        uint64_t keys_after_insert = keys_so_far + (uint64_t)this_block;
+        int deletes_this_block = 0;
+
+        if (keys_so_far >= BLOCK_SIZE * 2) {
+            rng_t del_rng = rng_create(master_seed ^ (block_num * 0xA2F5C3D7E1B94068ULL));
+
+            for (int d = 0; d < DELETE_PER_BLOCK; d++) {
+                // Pick a random key from all previously committed keys
+                uint64_t del_index = rng_next(&del_rng) % keys_so_far;
+
+                // Skip if already deleted
+                if (bitmap_test(g_deleted_bitmap, del_index))
+                    continue;
+
+                generate_key(key_buf, master_seed, del_index);
+
+                if (data_art_delete(tree, key_buf, KEY_SIZE)) {
+                    bitmap_set(g_deleted_bitmap, del_index);
+                    deletes_this_block++;
+                }
+                // delete returning false = key not found (possible if
+                // it was re-inserted then deleted in a prior block — shouldn't
+                // happen here since we never re-insert, but handle gracefully)
+            }
+        }
+
         // Commit
         if (!data_art_commit_txn(tree)) {
             FAIL_FAST(master_seed, keys_so_far,
@@ -506,8 +587,10 @@ int main(int argc, char *argv[]) {
         // Hint kernel to start flushing dirty pages in the background
         data_art_start_writeback(tree);
 
-        // Advance watermark
-        keys_so_far += (uint64_t)this_block;
+        // Advance watermark — must happen AFTER bitmap updates
+        total_deleted += (uint64_t)deletes_this_block;
+        keys_so_far = keys_after_insert;
+        atomic_store_explicit(&g_total_deleted, total_deleted, memory_order_release);
         atomic_store_explicit(&g_committed_key_count, keys_so_far,
                               memory_order_release);
         block_num++;
@@ -540,18 +623,23 @@ int main(int argc, char *argv[]) {
             uint64_t db_bytes = tree->mmap_storage->mapped_size;
             double db_gb = (double)db_bytes / (1024.0 * 1024.0 * 1024.0);
 
+            uint64_t live_keys = keys_so_far - total_deleted;
+
             // Aggregate reader stats for display
             uint64_t total_reads = 0;
             for (int i = 0; i < NUM_READERS; i++)
                 total_reads += reader_ctxs[i].reads_verified;
 
-            printf("  block %8" PRIu64 " | %7.1fM / %.0fM keys | "
+            printf("  block %8" PRIu64 " | %7.1fM / %.0fM ins | "
+                   "live %.1fM (del %.1fM) | "
                    "%.0f Kkeys/s (avg %.0f Kkeys/s) | DB %.2f GB | "
                    "reads %" PRIu64 " | ckpt %" PRIu64
                    " (last %.0fms, max %.0fms, avg %.0fms)\n",
                    block_num,
                    (double)keys_so_far / 1e6,
                    (double)target_keys / 1e6,
+                   (double)live_keys / 1e6,
+                   (double)total_deleted / 1e6,
                    interval_kps, overall_kps, db_gb,
                    total_reads, checkpoints_done,
                    last_ckpt_ms, max_ckpt_ms,
@@ -579,30 +667,37 @@ writer_done:
         fprintf(stderr, "Reproduce: %s %" PRIu64 " 0x%016" PRIx64 "\n",
                 argv[0], target_millions, master_seed);
         data_art_destroy(tree);
+        free(g_deleted_bitmap);
         return 1;
     }
 
     // Aggregate reader stats
     uint64_t total_reads = 0, total_verified = 0, total_not_found = 0;
+    uint64_t total_skipped_deleted = 0;
     for (int i = 0; i < NUM_READERS; i++) {
         total_reads += reader_ctxs[i].reads_ok;
         total_verified += reader_ctxs[i].reads_verified;
         total_not_found += reader_ctxs[i].reads_not_found;
+        total_skipped_deleted += reader_ctxs[i].reads_skipped_deleted;
     }
 
-    printf("\n  Writer done: %" PRIu64 " blocks, %" PRIu64 " keys, "
-           "%" PRIu64 " checkpoints\n",
-           block_num, keys_so_far, checkpoints_done);
-    printf("  Readers: %" PRIu64 " reads, %" PRIu64 " verified, "
-           "%" PRIu64 " transient not-found\n",
-           total_reads, total_verified, total_not_found);
+    uint64_t live_keys = keys_so_far - total_deleted;
 
-    // Final determinism verification
-    if (!run_final_verification(tree, target_keys)) {
+    printf("\n  Writer done: %" PRIu64 " blocks, %" PRIu64 " inserts, "
+           "%" PRIu64 " deletes, %" PRIu64 " live keys, "
+           "%" PRIu64 " checkpoints\n",
+           block_num, keys_so_far, total_deleted, live_keys, checkpoints_done);
+    printf("  Readers: %" PRIu64 " reads, %" PRIu64 " verified, "
+           "%" PRIu64 " skipped(deleted), %" PRIu64 " transient not-found\n",
+           total_reads, total_verified, total_skipped_deleted, total_not_found);
+
+    // Final determinism verification (expected count = inserted - deleted)
+    if (!run_final_verification(tree, live_keys)) {
         fprintf(stderr, "\nFAILED final verification\n");
         fprintf(stderr, "Reproduce: %s %" PRIu64 " 0x%016" PRIx64 "\n",
                 argv[0], target_millions, master_seed);
         data_art_destroy(tree);
+        free(g_deleted_bitmap);
         return 1;
     }
 
@@ -614,14 +709,16 @@ writer_done:
     tree = data_art_open(art_path, KEY_SIZE);
     if (!tree) {
         fprintf(stderr, "FAIL: data_art_open returned NULL after close\n");
+        free(g_deleted_bitmap);
         return 1;
     }
 
-    if (!run_final_verification(tree, target_keys)) {
+    if (!run_final_verification(tree, live_keys)) {
         fprintf(stderr, "\nFAILED post-reopen verification\n");
         fprintf(stderr, "Reproduce: %s %" PRIu64 " 0x%016" PRIx64 "\n",
                 argv[0], target_millions, master_seed);
         data_art_destroy(tree);
+        free(g_deleted_bitmap);
         return 1;
     }
 
@@ -636,10 +733,12 @@ writer_done:
     printf("  ============================================\n");
     printf("  ALL CHECKS PASSED\n");
     printf("  ============================================\n");
-    printf("  keys:        %" PRIu64 " (%.0fM)\n", target_keys, target_keys / 1e6);
+    printf("  inserts:     %" PRIu64 " (%.0fM)\n", keys_so_far, keys_so_far / 1e6);
+    printf("  deletes:     %" PRIu64 " (%.0fM)\n", total_deleted, total_deleted / 1e6);
+    printf("  live keys:   %" PRIu64 " (%.0fM)\n", live_keys, live_keys / 1e6);
     printf("  DB size:     %.2f GB\n", db_gb);
-    printf("  wall time:   %s (%.0f Kkeys/sec)\n", elapsed_str,
-           (double)target_keys / wall_secs / 1000.0);
+    printf("  wall time:   %s (%.0f Kkeys/sec inserts)\n", elapsed_str,
+           (double)keys_so_far / wall_secs / 1000.0);
     printf("  reads:       %" PRIu64 " (%" PRIu64 " verified)\n",
            total_reads, total_verified);
     printf("  blocks:      %" PRIu64 "\n", block_num);
@@ -649,5 +748,6 @@ writer_done:
     printf("  ============================================\n\n");
 
     data_art_destroy(tree);
+    free(g_deleted_bitmap);
     return 0;
 }

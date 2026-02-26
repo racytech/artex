@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
@@ -233,6 +234,14 @@ mmap_storage_t *mmap_storage_create(const char *path, size_t initial_pages) {
         return NULL;
     }
 
+    /* Exclusive lock — prevents two writers on the same file */
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        LOG_ERROR("mmap_storage_create: flock(%s) failed (another process?): %s",
+                  path, strerror(errno));
+        close(fd);
+        return NULL;
+    }
+
     /* Set file size */
     if (ftruncate(fd, (off_t)file_size) != 0) {
         LOG_ERROR("mmap_storage_create: ftruncate(%zu) failed: %s",
@@ -307,6 +316,14 @@ mmap_storage_t *mmap_storage_open(const char *path) {
     int fd = open(path, O_RDWR, 0644);
     if (fd < 0) {
         LOG_ERROR("mmap_storage_open: open(%s) failed: %s", path, strerror(errno));
+        return NULL;
+    }
+
+    /* Exclusive lock — prevents two writers on the same file */
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        LOG_ERROR("mmap_storage_open: flock(%s) failed (another process?): %s",
+                  path, strerror(errno));
+        close(fd);
         return NULL;
     }
 
