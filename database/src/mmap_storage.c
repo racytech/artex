@@ -621,3 +621,53 @@ bool mmap_storage_load_header(mmap_storage_t *ms,
 
     return true;
 }
+
+/* ========================================================================== */
+/* Truncation (for compaction)                                                 */
+/* ========================================================================== */
+
+bool mmap_storage_truncate(mmap_storage_t *ms, uint64_t new_page_count) {
+    if (!ms || !ms->base) return false;
+
+    size_t new_size = new_page_count * PAGE_SIZE;
+    if (new_size >= ms->mapped_size) return true;  /* nothing to do */
+
+    /* Remap the tail back to PROT_NONE (within our VA reservation) */
+    size_t tail_size = ms->mapped_size - new_size;
+    void *tail = mmap(ms->base + new_size, tail_size, PROT_NONE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
+                      -1, 0);
+    if (tail == MAP_FAILED) {
+        LOG_ERROR("mmap_storage_truncate: remap tail to PROT_NONE failed: %s",
+                  strerror(errno));
+        return false;
+    }
+
+    /* Truncate the file */
+    if (ftruncate(ms->fd, (off_t)new_size) != 0) {
+        LOG_ERROR("mmap_storage_truncate: ftruncate to %zu failed: %s",
+                  new_size, strerror(errno));
+        return false;
+    }
+
+    size_t old_pages = ms->mapped_size / PAGE_SIZE;
+    ms->mapped_size = new_size;
+    ms->next_page_id = new_page_count;
+
+    /* Shrink dirty bitmap */
+    size_t new_words = (new_page_count + 63) / 64;
+    if (new_words < ms->dirty_bitmap_words) {
+        /* Zero any partial word bits beyond new page count */
+        if (new_page_count % 64 != 0) {
+            uint64_t mask = (1ULL << (new_page_count % 64)) - 1;
+            ms->dirty_bitmap[new_words - 1] &= mask;
+        }
+        ms->dirty_bitmap_words = new_words;
+    }
+
+    LOG_INFO("mmap_storage_truncate: %zu → %lu pages (freed %zu pages, %.1f MB)",
+             old_pages, new_page_count,
+             old_pages - (size_t)new_page_count,
+             (double)tail_size / (1024.0 * 1024.0));
+    return true;
+}

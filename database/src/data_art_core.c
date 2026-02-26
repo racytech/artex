@@ -22,7 +22,7 @@
 #include <pthread.h>
 
 // Forward declarations
-static void drain_pending_frees(data_art_tree_t *tree);
+void drain_pending_frees(data_art_tree_t *tree);
 void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
 
 // ============================================================================
@@ -669,7 +669,7 @@ node_ref_t data_art_alloc_node_hint(data_art_tree_t *tree, size_t size, uint64_t
  *  - No MVCC manager (single-threaded / recovery)
  *  - No active snapshots
  */
-static void drain_pending_frees(data_art_tree_t *tree) {
+void drain_pending_frees(data_art_tree_t *tree) {
     if (tree->pending_free_count == 0 && tree->pending_slot_free_count == 0) return;
     if (tree->draining_pending) return;  // Prevent recursion
     tree->draining_pending = true;

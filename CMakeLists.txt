@@ -44,6 +44,7 @@ add_library(art_persistent STATIC
     database/src/checkpoint_manager.c
     database/src/data_art_iterator.c
     database/src/data_art_batch.c
+    database/src/data_art_compact.c
     database/src/db_backup.c
     database/src/db_error.c
     database/src/logger.c
@@ -263,6 +264,13 @@ add_executable(test_incremental_checkpoint
 )
 target_link_libraries(test_incremental_checkpoint art_persistent pthread)
 add_test(NAME test_incremental_checkpoint COMMAND test_incremental_checkpoint)
+
+# Test: Online file compaction
+add_executable(test_data_art_compact
+    database/tests/test_data_art_compact.c
+)
+target_link_libraries(test_data_art_compact art_persistent pthread)
+add_test(NAME test_data_art_compact COMMAND test_data_art_compact)
 
 # Benchmark: ART vs LMDB Comparison
 find_library(LMDB_LIB lmdb)

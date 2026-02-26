@@ -878,6 +878,33 @@ data_art_iterator_t *data_art_iterator_create_prefix(
     data_art_tree_t *tree, const uint8_t *prefix, size_t prefix_len);
 
 // ============================================================================
+// Online File Compaction
+// ============================================================================
+
+/**
+ * Compaction result statistics
+ */
+typedef struct {
+    uint64_t pages_before;      // Total pages before compaction
+    uint64_t pages_after;       // Total pages after compaction
+    uint64_t pages_freed;       // pages_before - pages_after
+    uint64_t nodes_relocated;   // Number of nodes moved to front pages
+    uint64_t live_pages;        // Live pages (reachable from root)
+} data_art_compact_result_t;
+
+/**
+ * Compact the data file by relocating live nodes to the front and truncating.
+ *
+ * Requires exclusive write access and no active MVCC snapshots.
+ * After compaction, the file shrinks to fit only the live data.
+ *
+ * @param tree   Tree instance
+ * @param result Output stats (can be NULL)
+ * @return true on success
+ */
+bool data_art_compact(data_art_tree_t *tree, data_art_compact_result_t *result);
+
+// ============================================================================
 // Statistics & Debugging
 // ============================================================================
 

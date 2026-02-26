@@ -805,7 +805,33 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        // ----- 10. Persistence cycle: close → reopen → verify -----
+        // ----- 10. Compaction: compact → verify -----
+        printf("  Compacting...\n");
+        data_art_compact_result_t compact_result;
+        if (!data_art_compact(tree, &compact_result)) {
+            fprintf(stderr, "FAIL: data_art_compact returned false\n");
+            fprintf(stderr, "Reproduce: %s 1 0x%016" PRIx64 "\n", argv[0], master_seed);
+            free(ctxs); free(threads); free(shadow);
+            data_art_destroy(tree);
+            return 1;
+        }
+
+        // Verify tree integrity after compaction
+        if (!verify_shadow_map(tree, shadow, DEFAULT_NUM_KEYS, "compact")) {
+            fprintf(stderr, "Reproduce: %s 1 0x%016" PRIx64 "\n", argv[0], master_seed);
+            free(ctxs); free(threads); free(shadow);
+            data_art_destroy(tree);
+            return 1;
+        }
+
+        if (!verify_iterator_sorted(tree, expected_count, "compact")) {
+            fprintf(stderr, "Reproduce: %s 1 0x%016" PRIx64 "\n", argv[0], master_seed);
+            free(ctxs); free(threads); free(shadow);
+            data_art_destroy(tree);
+            return 1;
+        }
+
+        // ----- 11. Persistence cycle: close → reopen → verify -----
         printf("  Persistence check: close → reopen → verify...\n");
         data_art_destroy(tree);
         tree = NULL;

@@ -229,4 +229,17 @@ bool mmap_storage_load_header(mmap_storage_t *ms,
                               uint64_t *tree_size,
                               uint64_t *key_size);
 
+/**
+ * Truncate the storage file, releasing tail pages.
+ *
+ * Remaps the tail region back to PROT_NONE (within the VA reservation)
+ * and ftruncates the file.  Caller must ensure no live data exists
+ * beyond new_page_count.
+ *
+ * @param ms             Storage instance
+ * @param new_page_count Number of pages to keep (file shrinks to this * PAGE_SIZE)
+ * @return true on success
+ */
+bool mmap_storage_truncate(mmap_storage_t *ms, uint64_t new_page_count);
+
 #endif /* MMAP_STORAGE_H */
