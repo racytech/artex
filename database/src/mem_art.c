@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <emmintrin.h>  // SSE2: _mm_cmpeq_epi8, _mm_set1_epi8, _mm_loadu_si128
 
 /**
  * In-Memory ART Implementation
@@ -523,67 +524,58 @@ static bool leaf_matches(const art_node_t *node, const uint8_t *key, size_t key_
 static int check_prefix(const art_node_t *node, const uint8_t *key,
                         size_t key_len, size_t depth) {
     int max_cmp = (int)node->partial_len;
-    int idx;
-
-    for (idx = 0; idx < max_cmp; idx++) {
-        if (depth + idx >= key_len) return idx;
-        if (node->partial[idx] != key[depth + idx]) return idx;
+    if (depth + max_cmp > (int)key_len) {
+        max_cmp = (int)key_len - (int)depth;
     }
 
-    return idx;
+    // Fast path: full match via memcmp
+    if (memcmp(node->partial, key + depth, max_cmp) == 0) {
+        return max_cmp;
+    }
+
+    // Slow path: find exact mismatch position
+    for (int idx = 0; idx < max_cmp; idx++) {
+        if (node->partial[idx] != key[depth + idx]) return idx;
+    }
+    return max_cmp;
 }
 
 static const void *search(const art_node_t *node, const uint8_t *key,
                           size_t key_len, size_t depth, size_t *value_len) {
-    if (!node) {
-        LOG_TRACE("search: NULL node at depth=%zu", depth);
-        return NULL;
-    }
-    
-    LOG_TRACE("search: depth=%zu, key_len=%zu, node_type=%d", depth, key_len, node->type);
-    
-    // Check if it's a leaf
-    if (is_leaf(node)) {
-        bool matches = leaf_matches(node, key, key_len);
-        LOG_TRACE("search: leaf node, matches=%d", matches);
-        if (matches) {
-            return leaf_value(node, value_len);
+    while (node) {
+        if (is_leaf(node)) {
+            if (leaf_matches(node, key, key_len)) {
+                return leaf_value(node, value_len);
+            }
+            return NULL;
         }
-        return NULL;
-    }
-    
-    // Check compressed path
-    if (node->partial_len > 0) {
-        int prefix_len = check_prefix(node, key, key_len, depth);
-        if (prefix_len != (int)node->partial_len) {
-            return NULL;  // Prefix mismatch
+
+        // Check compressed path
+        if (node->partial_len > 0) {
+            int prefix_len = check_prefix(node, key, key_len, depth);
+            if (prefix_len != (int)node->partial_len) {
+                return NULL;
+            }
+            depth += node->partial_len;
         }
-        depth += node->partial_len;
-        LOG_TRACE("search: after compressed path, depth=%zu", depth);
-    }
-    
-    // Determine which byte to look for (NULL byte if key is consumed)
-    uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
-    LOG_TRACE("search: looking for child at byte=0x%02X (depth=%zu, key_len=%zu)",
-                 byte, depth, key_len);
-    
-    // Find child for this byte
-    art_node_t *child = find_child(node, byte);
-    if (!child) {
-        LOG_TRACE("search: no child found for byte=0x%02X", byte);
-        return NULL;
-    }
-    LOG_TRACE("search: found child, recursing");
-    
-    // If we've consumed the key, the child should be our leaf
-    if (depth >= key_len) {
-        if (is_leaf(child) && leaf_matches(child, key, key_len)) {
-            return leaf_value(child, value_len);
+
+        // Find child for next byte
+        uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
+        art_node_t *child = find_child(node, byte);
+        if (!child) return NULL;
+
+        // If key is consumed, child must be the matching leaf
+        if (depth >= key_len) {
+            if (is_leaf(child) && leaf_matches(child, key, key_len)) {
+                return leaf_value(child, value_len);
+            }
+            return NULL;
         }
-        return NULL;
+
+        node = child;
+        depth++;
     }
-    
-    return search(child, key, key_len, depth + 1, value_len);
+    return NULL;
 }
 
 static art_node_t *find_child(const art_node_t *node, uint8_t byte) {
@@ -597,10 +589,13 @@ static art_node_t *find_child(const art_node_t *node, uint8_t byte) {
             return NULL;
         }
         case NODE_16: {
-            for (int i = 0; i < node->num_children; i++) {
-                if (node->node16.keys[i] == byte) {
-                    return node->node16.children[i];
-                }
+            // SSE: compare all 16 keys in parallel
+            __m128i key_vec = _mm_set1_epi8((char)byte);
+            __m128i cmp = _mm_cmpeq_epi8(key_vec,
+                            _mm_loadu_si128((__m128i *)node->node16.keys));
+            int mask = _mm_movemask_epi8(cmp) & ((1 << node->num_children) - 1);
+            if (mask) {
+                return node->node16.children[__builtin_ctz(mask)];
             }
             return NULL;
         }
@@ -631,14 +626,16 @@ static void replace_child(art_node_t *node, uint8_t byte, art_node_t *new_child)
                 }
             }
             break;
-        case NODE_16:
-            for (uint32_t i = 0; i < node->num_children; i++) {
-                if (node->node16.keys[i] == byte) {
-                    node->node16.children[i] = new_child;
-                    return;
-                }
+        case NODE_16: {
+            __m128i key_vec = _mm_set1_epi8((char)byte);
+            __m128i cmp = _mm_cmpeq_epi8(key_vec,
+                            _mm_loadu_si128((__m128i *)node->node16.keys));
+            int mask = _mm_movemask_epi8(cmp) & ((1 << node->num_children) - 1);
+            if (mask) {
+                node->node16.children[__builtin_ctz(mask)] = new_child;
             }
             break;
+        }
         case NODE_48: {
             uint8_t idx = node->node48.index[byte];
             if (idx != NODE48_EMPTY) {
@@ -1089,7 +1086,7 @@ static art_node_t *delete_recursive(art_node_t *node, const uint8_t *key,
     }
     
     art_node_t *new_child = delete_recursive(child, key, key_len, depth + 1, deleted);
-    
+
     if (new_child != child) {
         if (!new_child) {
             // Child was deleted
@@ -1098,6 +1095,34 @@ static art_node_t *delete_recursive(art_node_t *node, const uint8_t *key,
             // Child was replaced (e.g., node split) — update pointer in-place
             replace_child(node, byte, new_child);
         }
+    }
+
+    // Path collapse: if Node4 has exactly 1 child, merge with that child
+    if (!is_leaf(node) && node->type == NODE_4 && node->num_children == 1) {
+        art_node_t *only_child = node->node4.children[0];
+        uint8_t only_byte = node->node4.keys[0];
+
+        if (is_leaf(only_child)) {
+            // Single leaf child — just return the leaf, free the Node4
+            free(node);
+            return only_child;
+        }
+
+        // Merge prefixes: node->partial + discriminating byte + child->partial
+        uint32_t new_len = node->partial_len + 1 + only_child->partial_len;
+        if (new_len <= MAX_PREFIX) {
+            // Shift child's partial right to make room
+            memmove(only_child->partial + node->partial_len + 1,
+                    only_child->partial, only_child->partial_len);
+            // Copy parent's partial
+            memcpy(only_child->partial, node->partial, node->partial_len);
+            // Insert discriminating byte
+            only_child->partial[node->partial_len] = only_byte;
+            only_child->partial_len = new_len;
+            free(node);
+            return only_child;
+        }
+        // If merged prefix would exceed MAX_PREFIX, keep as-is
     }
 
     return node;
