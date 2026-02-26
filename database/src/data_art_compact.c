@@ -41,11 +41,19 @@ static inline bool bm_test(const uint64_t *bm, uint64_t id) {
     return (bm[id / 64] >> (id % 64)) & 1;
 }
 
-/* ── Phase 1: Build live-page bitmap ─────────────────────────────── */
+/* ── Phase 1: Build live-page bitmap + max-page-id per page ──────── */
 
-static void walk_live(data_art_tree_t *tree, node_ref_t ref,
-                      uint64_t *bm, uint64_t *count) {
-    if (node_ref_is_null(ref)) return;
+/* Read-only walk — no writes, so direct mmap pointer reads are safe
+ * (no aliasing concern).  Avoids costly stack memcpy of every node.
+ *
+ * Returns the highest page_id reachable from this subtree.  Stored in
+ * max_pg[page_id] (per-page max, conservative for multi-node pages).
+ * compact_node uses this to skip subtrees entirely below frontier. */
+
+static uint64_t walk_live(data_art_tree_t *tree, node_ref_t ref,
+                          uint64_t *bm, uint64_t *count,
+                          uint64_t *max_pg) {
+    if (node_ref_is_null(ref)) return 0;
 
     uint64_t pg = node_ref_page_id(ref);
 
@@ -54,41 +62,47 @@ static void walk_live(data_art_tree_t *tree, node_ref_t ref,
         (*count)++;
     }
 
-    const void *node = data_art_load_node(tree, ref);
-    if (!node) return;
+    uint64_t subtree_max = pg;
+
+    page_t *page = mmap_storage_get_page(tree->mmap_storage, pg);
+    const void *node = page->data + node_ref_offset(ref);
 
     uint8_t type = *(const uint8_t *)node;
 
     switch (type) {
     case DATA_NODE_4: {
-        data_art_node4_t n;
-        memcpy(&n, node, sizeof(n));
-        for (int i = 0; i < n.num_children; i++)
-            walk_live(tree, n.children[i], bm, count);
+        const data_art_node4_t *n = node;
+        for (int i = 0; i < n->num_children; i++) {
+            uint64_t cm = walk_live(tree, n->children[i], bm, count, max_pg);
+            if (cm > subtree_max) subtree_max = cm;
+        }
         break;
     }
     case DATA_NODE_16: {
-        data_art_node16_t n;
-        memcpy(&n, node, sizeof(n));
-        for (int i = 0; i < n.num_children; i++)
-            walk_live(tree, n.children[i], bm, count);
+        const data_art_node16_t *n = node;
+        for (int i = 0; i < n->num_children; i++) {
+            uint64_t cm = walk_live(tree, n->children[i], bm, count, max_pg);
+            if (cm > subtree_max) subtree_max = cm;
+        }
         break;
     }
     case DATA_NODE_48: {
-        data_art_node48_t n;
-        memcpy(&n, node, sizeof(n));
+        const data_art_node48_t *n = node;
         for (int i = 0; i < 256; i++) {
-            if (n.keys[i] != NODE48_EMPTY)
-                walk_live(tree, n.children[n.keys[i]], bm, count);
+            if (n->keys[i] != NODE48_EMPTY) {
+                uint64_t cm = walk_live(tree, n->children[n->keys[i]], bm, count, max_pg);
+                if (cm > subtree_max) subtree_max = cm;
+            }
         }
         break;
     }
     case DATA_NODE_256: {
-        data_art_node256_t n;
-        memcpy(&n, node, sizeof(n));
+        const data_art_node256_t *n = node;
         for (int i = 0; i < 256; i++) {
-            if (n.children[i] != NULL_NODE_REF)
-                walk_live(tree, n.children[i], bm, count);
+            if (n->children[i] != NULL_NODE_REF) {
+                uint64_t cm = walk_live(tree, n->children[i], bm, count, max_pg);
+                if (cm > subtree_max) subtree_max = cm;
+            }
         }
         break;
     }
@@ -97,6 +111,7 @@ static void walk_live(data_art_tree_t *tree, node_ref_t ref,
         if (leaf->flags & LEAF_FLAG_OVERFLOW) {
             uint64_t op = leaf_overflow_page(leaf);
             while (op != 0) {
+                if (op > subtree_max) subtree_max = op;
                 if (!bm_test(bm, op)) {
                     bm_set(bm, op);
                     (*count)++;
@@ -109,13 +124,22 @@ static void walk_live(data_art_tree_t *tree, node_ref_t ref,
         break;
     }
     }
+
+    /* Store max for this page (conservative: take max with existing value
+     * since multiple nodes may share a page via slot packing) */
+    if (subtree_max > max_pg[pg])
+        max_pg[pg] = subtree_max;
+
+    return subtree_max;
 }
 
 /* ── Phase 2: Relocate overflow page chain ───────────────────────── */
 
 static void compact_overflow(data_art_tree_t *tree, node_ref_t leaf_ref,
                              uint64_t frontier, uint64_t *relocated) {
-    const data_art_leaf_t *leaf = data_art_load_node(tree, leaf_ref);
+    mmap_storage_t *ms = tree->mmap_storage;
+    page_t *lp = mmap_storage_get_page(ms, node_ref_page_id(leaf_ref));
+    const data_art_leaf_t *leaf = (const data_art_leaf_t *)(lp->data + node_ref_offset(leaf_ref));
     if (!(leaf->flags & LEAF_FLAG_OVERFLOW)) return;
 
     uint64_t prev_page = 0;   /* 0 = head stored in leaf */
@@ -161,12 +185,24 @@ static void compact_overflow(data_art_tree_t *tree, node_ref_t leaf_ref,
 
 /* ── Phase 3: Recursive bottom-up node relocation ────────────────── */
 
+/* max_pg[] (computed in walk_live) stores the highest page_id reachable
+ * from any node on a given page.  If max_pg[page] < frontier, the entire
+ * subtree rooted at that page is already below frontier — skip it. */
+
 static node_ref_t compact_node(data_art_tree_t *tree, node_ref_t ref,
-                                uint64_t frontier, uint64_t *relocated) {
+                                uint64_t frontier, uint64_t *relocated,
+                                const uint64_t *max_pg) {
     if (node_ref_is_null(ref)) return ref;
 
-    const void *node = data_art_load_node(tree, ref);
-    if (!node) return ref;
+    uint64_t pg = node_ref_page_id(ref);
+
+    /* ── Subtree skip: max reachable page < frontier → nothing to do ── */
+    if (pg < frontier && max_pg[pg] < frontier)
+        return ref;
+
+    mmap_storage_t *ms = tree->mmap_storage;
+    page_t *page = mmap_storage_get_page(ms, pg);
+    const void *node = page->data + node_ref_offset(ref);
 
     uint8_t type = *(const uint8_t *)node;
 
@@ -174,36 +210,60 @@ static node_ref_t compact_node(data_art_tree_t *tree, node_ref_t ref,
     if (type == DATA_NODE_LEAF) {
         const data_art_leaf_t *leaf = node;
 
-        /* Relocate overflow pages first */
+        if (pg < frontier) {
+            /* Leaf below frontier: only overflow pages may need relocation */
+            if (leaf->flags & LEAF_FLAG_OVERFLOW)
+                compact_overflow(tree, ref, frontier, relocated);
+            return ref;
+        }
+
+        /* Leaf above frontier: relocate overflow first, then leaf itself */
         if (leaf->flags & LEAF_FLAG_OVERFLOW)
             compact_overflow(tree, ref, frontier, relocated);
 
-        if (node_ref_page_id(ref) >= frontier) {
-            /* Re-load: compact_overflow may have updated overflow_page_id */
-            leaf = data_art_load_node(tree, ref);
-            size_t sz = leaf_total_size(leaf, tree->key_size);
-            node_ref_t new_ref = data_art_alloc_node(tree, sz);
-            if (node_ref_is_null(new_ref)) return ref;
-            data_art_copy_node(tree, new_ref, ref, sz);
-            (*relocated)++;
-            return new_ref;
-        }
-        return ref;
+        /* Re-load: compact_overflow may have updated overflow_page_id */
+        leaf = (const data_art_leaf_t *)(page->data + node_ref_offset(ref));
+        size_t sz = leaf_total_size(leaf, tree->key_size);
+        node_ref_t new_ref = data_art_alloc_node(tree, sz);
+        if (node_ref_is_null(new_ref)) return ref;
+        data_art_copy_node(tree, new_ref, ref, sz);
+        (*relocated)++;
+        return new_ref;
     }
 
-    /* ── Inner node: recurse into children first (bottom-up) ── */
+    /* ── Inner node: recurse into children, batch-write updates ──
+     *
+     * We memcpy the node to the stack, recurse into each child updating
+     * the stack copy in-place, then:
+     *   - Below frontier: single write-back of the node if any child changed
+     *   - Above frontier: write updated stack copy directly to new page
+     * This replaces N separate write_partial + mark_dirty calls with one. */
     size_t node_size = get_node_size(type);
+    bool dirty = false;
 
     switch (type) {
     case DATA_NODE_4: {
         data_art_node4_t n;
         memcpy(&n, node, sizeof(n));
         for (int i = 0; i < n.num_children; i++) {
-            node_ref_t new_child = compact_node(tree, n.children[i], frontier, relocated);
+            node_ref_t new_child = compact_node(tree, n.children[i], frontier, relocated, max_pg);
             if (!node_ref_equals(new_child, n.children[i])) {
-                size_t off = offsetof(data_art_node4_t, children) + i * sizeof(uint64_t);
-                data_art_write_partial(tree, ref, off, &new_child, sizeof(uint64_t));
+                n.children[i] = new_child;
+                dirty = true;
             }
+        }
+        if (pg >= frontier) {
+            node_ref_t new_ref = data_art_alloc_node(tree, node_size);
+            if (node_ref_is_null(new_ref)) return ref;
+            page_t *dp = mmap_storage_get_page(ms, node_ref_page_id(new_ref));
+            memcpy(dp->data + node_ref_offset(new_ref), &n, node_size);
+            mmap_storage_mark_dirty(ms, node_ref_page_id(new_ref));
+            (*relocated)++;
+            return new_ref;
+        }
+        if (dirty) {
+            memcpy(page->data + node_ref_offset(ref), &n, node_size);
+            mmap_storage_mark_dirty(ms, pg);
         }
         break;
     }
@@ -211,11 +271,24 @@ static node_ref_t compact_node(data_art_tree_t *tree, node_ref_t ref,
         data_art_node16_t n;
         memcpy(&n, node, sizeof(n));
         for (int i = 0; i < n.num_children; i++) {
-            node_ref_t new_child = compact_node(tree, n.children[i], frontier, relocated);
+            node_ref_t new_child = compact_node(tree, n.children[i], frontier, relocated, max_pg);
             if (!node_ref_equals(new_child, n.children[i])) {
-                size_t off = offsetof(data_art_node16_t, children) + i * sizeof(uint64_t);
-                data_art_write_partial(tree, ref, off, &new_child, sizeof(uint64_t));
+                n.children[i] = new_child;
+                dirty = true;
             }
+        }
+        if (pg >= frontier) {
+            node_ref_t new_ref = data_art_alloc_node(tree, node_size);
+            if (node_ref_is_null(new_ref)) return ref;
+            page_t *dp = mmap_storage_get_page(ms, node_ref_page_id(new_ref));
+            memcpy(dp->data + node_ref_offset(new_ref), &n, node_size);
+            mmap_storage_mark_dirty(ms, node_ref_page_id(new_ref));
+            (*relocated)++;
+            return new_ref;
+        }
+        if (dirty) {
+            memcpy(page->data + node_ref_offset(ref), &n, node_size);
+            mmap_storage_mark_dirty(ms, pg);
         }
         break;
     }
@@ -225,11 +298,24 @@ static node_ref_t compact_node(data_art_tree_t *tree, node_ref_t ref,
         for (int i = 0; i < 256; i++) {
             if (n.keys[i] == NODE48_EMPTY) continue;
             uint8_t slot = n.keys[i];
-            node_ref_t new_child = compact_node(tree, n.children[slot], frontier, relocated);
+            node_ref_t new_child = compact_node(tree, n.children[slot], frontier, relocated, max_pg);
             if (!node_ref_equals(new_child, n.children[slot])) {
-                size_t off = offsetof(data_art_node48_t, children) + slot * sizeof(uint64_t);
-                data_art_write_partial(tree, ref, off, &new_child, sizeof(uint64_t));
+                n.children[slot] = new_child;
+                dirty = true;
             }
+        }
+        if (pg >= frontier) {
+            node_ref_t new_ref = data_art_alloc_node(tree, node_size);
+            if (node_ref_is_null(new_ref)) return ref;
+            page_t *dp = mmap_storage_get_page(ms, node_ref_page_id(new_ref));
+            memcpy(dp->data + node_ref_offset(new_ref), &n, node_size);
+            mmap_storage_mark_dirty(ms, node_ref_page_id(new_ref));
+            (*relocated)++;
+            return new_ref;
+        }
+        if (dirty) {
+            memcpy(page->data + node_ref_offset(ref), &n, node_size);
+            mmap_storage_mark_dirty(ms, pg);
         }
         break;
     }
@@ -238,23 +324,27 @@ static node_ref_t compact_node(data_art_tree_t *tree, node_ref_t ref,
         memcpy(&n, node, sizeof(n));
         for (int i = 0; i < 256; i++) {
             if (n.children[i] == NULL_NODE_REF) continue;
-            node_ref_t new_child = compact_node(tree, n.children[i], frontier, relocated);
+            node_ref_t new_child = compact_node(tree, n.children[i], frontier, relocated, max_pg);
             if (!node_ref_equals(new_child, n.children[i])) {
-                size_t off = offsetof(data_art_node256_t, children) + i * sizeof(uint64_t);
-                data_art_write_partial(tree, ref, off, &new_child, sizeof(uint64_t));
+                n.children[i] = new_child;
+                dirty = true;
             }
+        }
+        if (pg >= frontier) {
+            node_ref_t new_ref = data_art_alloc_node(tree, node_size);
+            if (node_ref_is_null(new_ref)) return ref;
+            page_t *dp = mmap_storage_get_page(ms, node_ref_page_id(new_ref));
+            memcpy(dp->data + node_ref_offset(new_ref), &n, node_size);
+            mmap_storage_mark_dirty(ms, node_ref_page_id(new_ref));
+            (*relocated)++;
+            return new_ref;
+        }
+        if (dirty) {
+            memcpy(page->data + node_ref_offset(ref), &n, node_size);
+            mmap_storage_mark_dirty(ms, pg);
         }
         break;
     }
-    }
-
-    /* Relocate this inner node if above frontier */
-    if (node_ref_page_id(ref) >= frontier) {
-        node_ref_t new_ref = data_art_alloc_node(tree, node_size);
-        if (node_ref_is_null(new_ref)) return ref;
-        data_art_copy_node(tree, new_ref, ref, node_size);
-        (*relocated)++;
-        return new_ref;
     }
 
     return ref;
@@ -295,10 +385,13 @@ bool data_art_compact(data_art_tree_t *tree, data_art_compact_result_t *result) 
     /* ── Step 0: Drain pending frees into reuse pool ── */
     drain_pending_frees(tree);
 
-    /* ── Step 1: Build live-page bitmap ── */
+    /* ── Step 1: Build live-page bitmap + max-page-id array ── */
     size_t bm_words = (old_pages + 63) / 64;
     uint64_t *live_bm = calloc(bm_words, sizeof(uint64_t));
-    if (!live_bm) {
+    uint64_t *max_pg = calloc(old_pages, sizeof(uint64_t));
+    if (!live_bm || !max_pg) {
+        free(live_bm);
+        free(max_pg);
         pthread_rwlock_unlock(&tree->write_lock);
         return false;
     }
@@ -307,7 +400,7 @@ bool data_art_compact(data_art_tree_t *tree, data_art_compact_result_t *result) 
     bm_set(live_bm, 0);
     uint64_t live_count = 1;
 
-    walk_live(tree, tree->root, live_bm, &live_count);
+    walk_live(tree, tree->root, live_bm, &live_count, max_pg);
 
     /* ── Step 2: Compute frontier ──
      * frontier = live_count  →  pages [0, frontier) hold all live data.
@@ -318,6 +411,7 @@ bool data_art_compact(data_art_tree_t *tree, data_art_compact_result_t *result) 
     if (frontier >= old_pages) {
         /* No dead pages — nothing to compact */
         free(live_bm);
+        free(max_pg);
         pthread_rwlock_unlock(&tree->write_lock);
         if (result) {
             memset(result, 0, sizeof(*result));
@@ -346,6 +440,7 @@ bool data_art_compact(data_art_tree_t *tree, data_art_compact_result_t *result) 
         uint64_t *new_pool = realloc(tree->reuse_pool, dead_below * sizeof(uint64_t));
         if (!new_pool) {
             free(live_bm);
+            free(max_pg);
             pthread_rwlock_unlock(&tree->write_lock);
             return false;
         }
@@ -369,7 +464,9 @@ bool data_art_compact(data_art_tree_t *tree, data_art_compact_result_t *result) 
 
     /* ── Step 4: DFS bottom-up relocation ── */
     uint64_t nodes_relocated = 0;
-    node_ref_t new_root = compact_node(tree, tree->root, frontier, &nodes_relocated);
+    node_ref_t new_root = compact_node(tree, tree->root, frontier, &nodes_relocated, max_pg);
+
+    free(max_pg);
 
     /* Update tree root */
     tree->root = new_root;
