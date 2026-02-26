@@ -392,7 +392,102 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
     uint8_t type = *(const uint8_t *)node;
     LOG_DEBUG("  depth=%zu: node_type=%u at page=%lu offset=%u",
               depth, type, node_ref_page_id(node_ref), node_ref_offset(node_ref));
-    
+
+    // Path compression: check/split compressed prefix on inner nodes
+    if (type <= DATA_NODE_256) {
+        uint8_t plen = node_partial_len(node);
+        if (plen > 0) {
+            // Find how many prefix bytes match the key
+            size_t match_len = 0;
+            const uint8_t *partial = node_partial(node);
+            while (match_len < plen && depth + match_len < key_len &&
+                   partial[match_len] == key[depth + match_len]) {
+                match_len++;
+            }
+
+            if (match_len < plen) {
+                // PREFIX SPLIT: key diverges within this node's compressed prefix.
+                // Create a new Node4 to hold the split point.
+                *inserted = true;
+
+                // 1. Allocate new Node4 for the split
+                node_ref_t split_ref = data_art_alloc_node(tree, sizeof(data_art_node4_t));
+                if (node_ref_is_null(split_ref)) {
+                    LOG_ERROR("Failed to allocate split Node4");
+                    return node_ref;
+                }
+
+                data_art_node4_t split_node;
+                memset(&split_node, 0, sizeof(split_node));
+                split_node.type = DATA_NODE_4;
+                split_node.num_children = 0;
+                // Split node gets the matching portion as its prefix
+                split_node.partial_len = (uint8_t)match_len;
+                memcpy(split_node.partial, partial, match_len);
+
+                if (!data_art_write_node(tree, split_ref, &split_node, sizeof(split_node))) {
+                    LOG_ERROR("Failed to write split Node4");
+                    return node_ref;
+                }
+
+                // 2. CoW copy of current node with shortened prefix (partial[match_len+1..plen])
+                size_t old_size = get_node_size(type);
+                void *old_copy = malloc(old_size);
+                if (!old_copy) {
+                    LOG_ERROR("Failed to allocate old node copy for prefix split");
+                    return node_ref;
+                }
+                memcpy(old_copy, node, old_size);
+
+                // Shorten prefix: remove matched portion + split byte
+                uint8_t new_plen = plen - (uint8_t)match_len - 1;
+                ((uint8_t *)old_copy)[2] = new_plen;
+                if (new_plen > 0) {
+                    memmove((uint8_t *)old_copy + 3, (uint8_t *)old_copy + 3 + match_len + 1, new_plen);
+                }
+
+                node_ref_t old_new_ref = data_art_alloc_node(tree, old_size);
+                if (node_ref_is_null(old_new_ref)) {
+                    free(old_copy);
+                    return node_ref;
+                }
+                if (!data_art_write_node(tree, old_new_ref, old_copy, old_size)) {
+                    free(old_copy);
+                    return node_ref;
+                }
+                free(old_copy);
+
+                // 3. Add old node as child of split node at partial[match_len] byte
+                uint8_t old_split_byte = partial[match_len];
+                split_ref = add_child_to_node(tree, split_ref, old_split_byte, old_new_ref, inplace);
+                if (node_ref_is_null(split_ref)) {
+                    return node_ref;
+                }
+
+                // 4. Create new leaf and add as child at key[depth+match_len] byte
+                uint8_t new_split_byte = key[depth + match_len];
+                // Recurse for the new key from depth+match_len+1
+                node_ref_t new_subtree = insert_recursive(tree, NULL_NODE_REF,
+                    key, key_len, depth + match_len + 1, value, value_len, inserted, inplace);
+                if (node_ref_is_null(new_subtree)) {
+                    return node_ref;
+                }
+
+                split_ref = add_child_to_node(tree, split_ref, new_split_byte, new_subtree, inplace);
+                if (node_ref_is_null(split_ref)) {
+                    return node_ref;
+                }
+
+                // Don't release old node_ref — MVCC snapshots may reference it
+                *inserted = true;
+                return split_ref;
+            }
+
+            // Full prefix match — advance depth past the prefix
+            depth += plen;
+        }
+    }
+
     // If it's a leaf, check for match or split
     if (type == DATA_NODE_LEAF) {
         const data_art_leaf_t *leaf = (const data_art_leaf_t *)node;
@@ -510,24 +605,30 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             return node_ref;
         }
         
-        // Create innermost Node4 with 2 children at the divergence point
+        // Create a single Node4 with compressed prefix for the shared bytes
         node_ref_t inner_ref = data_art_alloc_node(tree, sizeof(data_art_node4_t));
         if (node_ref_is_null(inner_ref)) {
             LOG_ERROR("Failed to allocate NODE_4 for leaf split");
             return node_ref;
         }
-        
+
         data_art_node4_t inner;
         memset(&inner, 0, sizeof(inner));
         inner.type = DATA_NODE_4;
         inner.num_children = 0;
-        
+        // Store shared prefix bytes (depth..split_depth) as compressed prefix
+        size_t prefix_len = split_depth - depth;
+        inner.partial_len = (uint8_t)prefix_len;
+        if (prefix_len > 0) {
+            memcpy(inner.partial, key + depth, prefix_len);
+        }
+
         if (!data_art_write_node(tree, inner_ref, &inner, sizeof(inner))) {
             LOG_ERROR("Failed to write NODE_4");
             return node_ref;
         }
-        
-        // Add both leaves as children (fresh node — safe to mutate inplace)
+
+        // Add both leaves as children at the divergence byte
         uint8_t existing_byte = existing_key_copy[split_depth];
         uint8_t new_byte = key[split_depth];
 
@@ -542,35 +643,7 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
             LOG_ERROR("Failed to add new leaf to new node");
             return node_ref;
         }
-        
-        // Wrap with single-child Node4s for each shared prefix byte
-        // (iterating from split_depth-1 down to depth)
-        for (size_t d = split_depth; d > depth; d--) {
-            node_ref_t wrapper_ref = data_art_alloc_node(tree, sizeof(data_art_node4_t));
-            if (node_ref_is_null(wrapper_ref)) {
-                LOG_ERROR("Failed to allocate wrapper NODE_4");
-                return node_ref;
-            }
-            
-            data_art_node4_t wrapper;
-            memset(&wrapper, 0, sizeof(wrapper));
-            wrapper.type = DATA_NODE_4;
-            wrapper.num_children = 0;
-            
-            if (!data_art_write_node(tree, wrapper_ref, &wrapper, sizeof(wrapper))) {
-                LOG_ERROR("Failed to write wrapper NODE_4");
-                return node_ref;
-            }
-            
-            wrapper_ref = add_child_to_node(tree, wrapper_ref, key[d - 1], inner_ref, inplace);
-            if (node_ref_is_null(wrapper_ref)) {
-                LOG_ERROR("Failed to add child to wrapper NODE_4");
-                return node_ref;
-            }
-            
-            inner_ref = wrapper_ref;
-        }
-        
+
         return inner_ref;
     }
     

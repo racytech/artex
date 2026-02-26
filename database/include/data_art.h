@@ -100,6 +100,19 @@ typedef enum {
     DATA_NODE_OVERFLOW = 5  // Overflow page for large values
 } data_art_node_type_t;
 
+// Path compression: max compressed prefix bytes stored in each inner node.
+// Covers both 20-byte (Ethereum address) and 32-byte (hash) key sizes.
+#define ART_MAX_PREFIX 32
+
+// Generic accessors for partial_len / partial[] — all inner node types have
+// these fields at the same offsets: partial_len at byte 2, partial at byte 3.
+static inline uint8_t node_partial_len(const void *node) {
+    return ((const uint8_t *)node)[2];
+}
+static inline const uint8_t *node_partial(const void *node) {
+    return ((const uint8_t *)node) + 3;
+}
+
 // ============================================================================
 // Slot Page Infrastructure (Multi-Node-Per-Page)
 // ============================================================================
@@ -172,15 +185,17 @@ typedef struct {
 /**
  * NODE_4: Up to 4 children
  *
- * Size: 38 bytes (fixed)
- * Layout: type(1) + num_children(1) + keys(4) + children(32)
+ * Size: 71 bytes (fixed)
+ * Layout: type(1) + num_children(1) + partial_len(1) + partial(32) + keys(4) + children(32)
  *
- * No path compression — keys are fixed-size hashes with uniform distribution,
- * so common prefixes are astronomically rare.
+ * Path compression: partial_len bytes of common prefix stored inline.
+ * Eliminates single-child node chains for hash keys with shared prefixes.
  */
 typedef struct {
     uint8_t type;               // DATA_NODE_4
     uint8_t num_children;       // 0-4
+    uint8_t partial_len;        // compressed prefix length (0 = none)
+    uint8_t partial[ART_MAX_PREFIX]; // compressed key bytes
     uint8_t keys[4];            // Child keys
 
     // Children stored as packed page references (page_id << 12 | offset)
@@ -190,11 +205,13 @@ typedef struct {
 /**
  * NODE_16: Up to 16 children
  *
- * Size: 146 bytes (fixed)
+ * Size: 179 bytes (fixed)
  */
 typedef struct {
     uint8_t type;               // DATA_NODE_16
     uint8_t num_children;       // 0-16
+    uint8_t partial_len;        // compressed prefix length
+    uint8_t partial[ART_MAX_PREFIX];
     uint8_t keys[16];
 
     uint64_t children[16];      // 128 bytes
@@ -211,6 +228,8 @@ typedef struct {
 typedef struct {
     uint8_t type;               // DATA_NODE_48
     uint8_t num_children;       // 0-48
+    uint8_t partial_len;        // compressed prefix length
+    uint8_t partial[ART_MAX_PREFIX];
     uint8_t keys[256];          // Index: byte_value → child_slot
 
     uint64_t children[48];      // 384 bytes
@@ -225,6 +244,8 @@ typedef struct {
 typedef struct {
     uint8_t type;               // DATA_NODE_256
     uint8_t num_children;       // 0-256
+    uint8_t partial_len;        // compressed prefix length
+    uint8_t partial[ART_MAX_PREFIX];
 
     uint64_t children[256];     // 2048 bytes
 } __attribute__((packed)) data_art_node256_t;

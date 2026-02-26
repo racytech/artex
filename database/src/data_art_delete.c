@@ -272,10 +272,19 @@ static node_ref_t delete_recursive(data_art_tree_t *tree, node_ref_t node_ref,
         return node_ref;
     }
     
-    // Inner node — descend to child
-    
+    // Inner node — check compressed prefix, then descend to child
+
+    // Path compression: verify prefix match before child dispatch
+    uint8_t plen = node_partial_len(node);
+    if (plen > 0) {
+        if (depth + plen > key_len ||
+            memcmp(node_partial(node), key + depth, plen) != 0) {
+            return node_ref;  // Key doesn't match prefix, not in tree
+        }
+        depth += plen;
+    }
+
     // Get next byte to search
-    // Fixed-size keys: simplified byte extraction
     uint8_t search_byte = (depth < key_len) ? key[depth] : 0x00;
     size_t next_depth = (depth < key_len) ? depth + 1 : depth;
     
@@ -614,22 +623,55 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref) {
             
         case DATA_NODE_4:
             if (num_children == 1) {
-                // Can only collapse if the single child is a leaf.
-                // If it's an inner node, removing this Node4 would lose a key
-                // byte (the edge label at this depth). Without path compression,
-                // there is no prefix to absorb it.
                 const data_art_node4_t *n4 = (const data_art_node4_t *)node;
                 node_ref_t child_ref = n4->children[0];
                 const void *child = data_art_load_node(tree, child_ref);
-                if (child && *(const uint8_t *)child == DATA_NODE_LEAF) {
+                if (!child) break;
+                uint8_t child_type = *(const uint8_t *)child;
+
+                if (child_type == DATA_NODE_LEAF) {
+                    // Collapse to leaf directly.
                     // NOTE: intentionally do NOT release the Node4 page here.
-                    // MVCC snapshots may still reference the old tree structure
-                    // that traverses through this Node4.  Releasing would let
-                    // slot_free reuse the slot, corrupting snapshot reads.
-                    // The orphaned Node4 will be cleaned up by future compaction/GC.
+                    // MVCC snapshots may still reference the old tree structure.
                     return child_ref;
                 }
-                // Inner-node child: keep the Node4
+
+                // Inner-node child: merge prefix.
+                // new_prefix = this.partial + dispatch_byte + child.partial
+                uint8_t child_plen = node_partial_len(child);
+                uint8_t new_plen = n4->partial_len + 1 + child_plen;
+                if (new_plen <= ART_MAX_PREFIX) {
+                    // Build merged prefix
+                    uint8_t merged[ART_MAX_PREFIX];
+                    memcpy(merged, n4->partial, n4->partial_len);
+                    merged[n4->partial_len] = n4->keys[0];  // dispatch byte
+                    memcpy(merged + n4->partial_len + 1, node_partial(child), child_plen);
+
+                    // CoW copy of child with extended prefix
+                    size_t child_size = get_node_size(child_type);
+                    void *new_child = malloc(child_size);
+                    if (!new_child) break;
+                    memcpy(new_child, child, child_size);
+
+                    // Set new prefix in the copy
+                    ((uint8_t *)new_child)[2] = new_plen;
+                    memcpy((uint8_t *)new_child + 3, merged, new_plen);
+
+                    node_ref_t new_ref = data_art_alloc_node(tree, child_size);
+                    if (node_ref_is_null(new_ref)) {
+                        free(new_child);
+                        break;
+                    }
+                    if (!data_art_write_node(tree, new_ref, new_child, child_size)) {
+                        free(new_child);
+                        break;
+                    }
+                    free(new_child);
+
+                    // Don't release old Node4 or old child — MVCC snapshots may reference them
+                    return new_ref;
+                }
+                // Combined prefix too long (shouldn't happen for 32-byte keys), keep Node4
             }
             break;
     }
@@ -651,10 +693,12 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref) {
     
     uint8_t *new_bytes = (uint8_t *)new_node;
     
-    // Copy header (type + num_children only, no partial fields)
+    // Copy header: type + num_children + partial fields
     new_bytes[0] = new_type;
     new_bytes[1] = num_children;
-    
+    new_bytes[2] = node_partial_len(node);
+    memcpy(new_bytes + 3, node_partial(node), node_partial_len(node));
+
     // Copy children based on conversion
     if (type == DATA_NODE_256 && new_type == DATA_NODE_48) {
         // NODE_256 -> NODE_48

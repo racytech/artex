@@ -466,6 +466,35 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
             }
         }
 
+        // Path compression: check compressed prefix
+        uint8_t plen = node_partial_len(node);
+        if (plen > 0) {
+            const uint8_t *partial = node_partial(node);
+            // Compare prefix with seek key
+            size_t i;
+            for (i = 0; i < plen && key_depth + i < key_len; i++) {
+                if (key[key_depth + i] < partial[i]) {
+                    // seek key < prefix → first leaf in this subtree is >= seek key
+                    // Position at first child and let next() find the leaf
+                    frame->child_idx = 0;
+                    goto seek_done;
+                }
+                if (key[key_depth + i] > partial[i]) {
+                    // seek key > prefix → entire subtree is < seek key
+                    // Backtrack to parent
+                    iter->depth--;
+                    goto seek_done;
+                }
+            }
+            // All compared bytes match
+            if (i < plen) {
+                // seek key exhausted within prefix → first leaf here is >= seek key
+                frame->child_idx = 0;
+                goto seek_done;
+            }
+            key_depth += plen;
+        }
+
         // Find child for next key byte.
         if (key_depth >= key_len) {
             frame->child_idx = 0;
@@ -504,6 +533,7 @@ bool data_art_iterator_seek(data_art_iterator_t *iter,
         }
     }
 
+seek_done:
     // Now advance to the first leaf >= target
     return data_art_iterator_next(iter);
 }

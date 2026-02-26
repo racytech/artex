@@ -58,7 +58,9 @@ static node_ref_t grow_node4_to_node16(data_art_tree_t *tree, node_ref_t old_ref
     
     n16.type = DATA_NODE_16;
     n16.num_children = n4->num_children;
-    
+    n16.partial_len = n4->partial_len;
+    memcpy(n16.partial, n4->partial, n4->partial_len);
+
     // Copy children (sorted)
     for (int i = 0; i < n4->num_children; i++) {
         n16.keys[i] = n4->keys[i];
@@ -96,7 +98,9 @@ static node_ref_t grow_node16_to_node48(data_art_tree_t *tree, node_ref_t old_re
     
     n48.type = DATA_NODE_48;
     n48.num_children = n16->num_children;
-    
+    n48.partial_len = n16->partial_len;
+    memcpy(n48.partial, n16->partial, n16->partial_len);
+
     // Initialize index array to empty
     memset(n48.keys, NODE48_EMPTY, 256);
     
@@ -138,7 +142,9 @@ static node_ref_t grow_node48_to_node256(data_art_tree_t *tree, node_ref_t old_r
     
     n256.type = DATA_NODE_256;
     n256.num_children = n48->num_children;
-    
+    n256.partial_len = n48->partial_len;
+    memcpy(n256.partial, n48->partial, n48->partial_len);
+
     // Copy children to direct index
     for (int i = 0; i < 256; i++) {
         uint8_t idx = n48->keys[i];

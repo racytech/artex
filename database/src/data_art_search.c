@@ -162,6 +162,21 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
             }
         }
 
+        // Path compression: check compressed prefix before child dispatch
+        if (type <= DATA_NODE_256) {
+            uint8_t plen = node_partial_len(node);
+            if (plen > 0) {
+                if (depth + plen > key_len ||
+                    memcmp(node_partial(node), key + depth, plen) != 0) {
+                    if (tls_search_trace) {
+                        fprintf(stderr, "  TRACE: depth=%zu prefix mismatch (plen=%u)\n", depth, plen);
+                    }
+                    return NULL;  // Key doesn't match compressed prefix
+                }
+                depth += plen;
+            }
+        }
+
         // Check if leaf
         if (type == DATA_NODE_LEAF) {
             const data_art_leaf_t *leaf = (const data_art_leaf_t *)node;
