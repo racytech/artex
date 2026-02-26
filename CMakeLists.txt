@@ -257,6 +257,13 @@ add_executable(test_deadlock
 target_link_libraries(test_deadlock art_persistent pthread)
 add_test(NAME test_deadlock COMMAND test_deadlock)
 
+# Test: Incremental checkpoint (dirty page tracking)
+add_executable(test_incremental_checkpoint
+    database/tests/test_incremental_checkpoint.c
+)
+target_link_libraries(test_incremental_checkpoint art_persistent pthread)
+add_test(NAME test_incremental_checkpoint COMMAND test_incremental_checkpoint)
+
 # Benchmark: ART vs LMDB Comparison
 find_library(LMDB_LIB lmdb)
 find_path(LMDB_INCLUDE lmdb.h)

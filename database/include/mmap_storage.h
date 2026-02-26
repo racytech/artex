@@ -109,6 +109,19 @@ static inline void mmap_storage_mark_dirty(mmap_storage_t *ms, uint64_t page_id)
     }
 }
 
+/**
+ * Count the number of dirty pages (set bits in the bitmap).
+ * Used for testing and diagnostics.
+ */
+static inline size_t mmap_storage_dirty_count(const mmap_storage_t *ms) {
+    if (!ms->dirty_bitmap) return 0;
+    size_t count = 0;
+    for (size_t w = 0; w < ms->dirty_bitmap_words; w++) {
+        count += (size_t)__builtin_popcountll(ms->dirty_bitmap[w]);
+    }
+    return count;
+}
+
 /* ========================================================================== */
 /* Lifecycle                                                                   */
 /* ========================================================================== */
