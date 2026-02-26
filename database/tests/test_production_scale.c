@@ -94,6 +94,11 @@ static void generate_key(uint8_t key[KEY_SIZE], uint64_t master_seed, uint64_t i
 static size_t generate_value(uint8_t *buf, uint64_t index) {
     rng_t rng = rng_create(index ^ 0x9E3779B97F4A7C15ULL);
 
+#ifdef FIXED_VALUE_SIZE
+    size_t vlen = FIXED_VALUE_SIZE;
+    (void)rng_next(&rng);  // keep RNG in sync
+    (void)rng_next(&rng);
+#else
     // Determine size bucket
     uint64_t bucket = rng_next(&rng) % 100;
     uint64_t size_rand = rng_next(&rng);
@@ -112,6 +117,7 @@ static size_t generate_value(uint8_t *buf, uint64_t index) {
         // 5%: 4096-24576 bytes
         vlen = 4096 + (size_rand % 20481);
     }
+#endif
 
     // Fill value bytes
     for (size_t i = 0; i < vlen; i += 8) {

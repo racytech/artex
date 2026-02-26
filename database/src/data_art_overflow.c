@@ -18,6 +18,11 @@
 #include <string.h>
 #include <stdio.h>
 
+// Forward declarations from data_art_core.c
+extern node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size);
+extern void *data_art_lock_node_mut(data_art_tree_t *tree, node_ref_t ref);
+extern void data_art_unlock_node_mut(data_art_tree_t *tree);
+
 // ============================================================================
 // Overflow Page Operations
 // ============================================================================
@@ -42,34 +47,21 @@ bool data_art_read_overflow_value(data_art_tree_t *tree,
     size_t inline_value_size = (PAGE_SIZE - PAGE_HEADER_SIZE) - sizeof(data_art_leaf_t) - 8 - tree->key_size;
     memcpy(value_out, value_start, inline_value_size);
 
-    // Traverse overflow chain to get remainder
+    // Traverse overflow chain to get remainder (direct mmap access)
     uint8_t *out_ptr = (uint8_t *)value_out + inline_value_size;
     size_t remaining = leaf->value_len - inline_value_size;
     uint64_t current_page = leaf_overflow_page(leaf);
-    
+
     while (current_page != 0 && remaining > 0) {
         tree->overflow_chain_reads++;
-        
-        // Load overflow page
-        const data_art_overflow_t *overflow =
-            (const data_art_overflow_t *)data_art_load_node(tree,
-                node_ref_make(current_page, 0));
 
-        if (!overflow) {
-            LOG_ERROR("Failed to load overflow page %lu", current_page);
-            return false;
-        }
-        
-        if (overflow->type != DATA_NODE_OVERFLOW) {
-            LOG_ERROR("Invalid overflow page type: %d", overflow->type);
-            return false;
-        }
-        
-        // Copy data from this overflow page
-        size_t to_copy = (overflow->data_len < remaining) ? 
+        const page_t *page = mmap_storage_get_page(tree->mmap_storage, current_page);
+        const data_art_overflow_t *overflow = (const data_art_overflow_t *)page->data;
+
+        size_t to_copy = (overflow->data_len < remaining) ?
                          overflow->data_len : remaining;
         memcpy(out_ptr, overflow->data, to_copy);
-        
+
         out_ptr += to_copy;
         remaining -= to_copy;
         current_page = overflow->next_page;
@@ -91,81 +83,65 @@ uint64_t data_art_write_overflow_value(data_art_tree_t *tree,
         LOG_ERROR("Invalid parameters");
         return 0;
     }
-    
+
     if (value_len <= inline_size) {
-        // Everything fits inline, no overflow needed
         return 0;
     }
-    
-    const uint8_t *data_ptr = (const uint8_t *)value + inline_size;
-    size_t remaining = value_len - inline_size;
-    
-    uint64_t first_page = 0;
-    uint64_t prev_page = 0;
-    
-    while (remaining > 0) {
-        // Allocate overflow page - use fixed overflow structure size
-        size_t overflow_size = sizeof(data_art_overflow_t);
-        node_ref_t ref = data_art_alloc_node(tree, overflow_size);
-        if (node_ref_is_null(ref)) {
-            LOG_ERROR("Failed to allocate overflow page");
-            return 0;
-        }
-        
-        tree->overflow_pages_allocated++;
-        
-        if (first_page == 0) {
-            first_page = node_ref_page_id(ref);
-        }
-        
-        // Create overflow page structure
-        data_art_overflow_t overflow;
-        overflow.type = DATA_NODE_OVERFLOW;
-        memset(overflow.padding, 0, sizeof(overflow.padding));
-        overflow.next_page = 0;  // Will be updated if more pages needed
-        
-        // Copy data
-        size_t to_copy = (remaining < sizeof(overflow.data)) ? 
-                         remaining : sizeof(overflow.data);
-        overflow.data_len = to_copy;
-        memcpy(overflow.data, data_ptr, to_copy);
-        
-        // Zero remaining space for cleaner debugging
-        if (to_copy < sizeof(overflow.data)) {
-            memset(overflow.data + to_copy, 0, sizeof(overflow.data) - to_copy);
-        }
-        
-        // Write overflow page
-        if (!data_art_write_node(tree, ref, &overflow, sizeof(overflow))) {
-            LOG_ERROR("Failed to write overflow page");
-            return 0;
-        }
-        
-        // Link previous page to this one
-        if (prev_page != 0) {
-            // Update previous page's next_page pointer
-            // CRITICAL: Load and COPY immediately before any other operations
-            // that might call data_art_load_node and invalidate the pointer
-            const data_art_overflow_t *prev_overflow =
-                (const data_art_overflow_t *)data_art_load_node(tree,
-                    node_ref_make(prev_page, 0));
 
-            if (prev_overflow) {
-                // IMPORTANT: Copy immediately to avoid stale pointer issues
-                data_art_overflow_t updated = *prev_overflow;
-                // Now safe to do other operations that might call data_art_load_node
-                updated.next_page = node_ref_page_id(ref);
-                data_art_write_node(tree,
-                    node_ref_make(prev_page, 0),
-                    &updated, sizeof(updated));
-            }
+    size_t remaining = value_len - inline_size;
+    size_t data_per_page = sizeof(((data_art_overflow_t *)0)->data);
+
+    // Count pages needed
+    size_t num_pages = (remaining + data_per_page - 1) / data_per_page;
+
+    // Phase 1: Allocate all pages upfront into a small stack array (max ~6 for 24KB)
+    // For values > 24KB we'd need 7+ pages; use a reasonable stack limit.
+    #define MAX_OVERFLOW_STACK 16
+    uint64_t page_ids_stack[MAX_OVERFLOW_STACK];
+    uint64_t *page_ids = page_ids_stack;
+    if (num_pages > MAX_OVERFLOW_STACK) {
+        page_ids = malloc(num_pages * sizeof(uint64_t));
+        if (!page_ids) {
+            LOG_ERROR("Failed to allocate overflow page_ids array");
+            return 0;
         }
-        
-        prev_page = node_ref_page_id(ref);
+    }
+
+    for (size_t i = 0; i < num_pages; i++) {
+        node_ref_t ref = data_art_alloc_node(tree, sizeof(data_art_overflow_t));
+        if (node_ref_is_null(ref)) {
+            LOG_ERROR("Failed to allocate overflow page %zu/%zu", i, num_pages);
+            if (page_ids != page_ids_stack) free(page_ids);
+            return 0;
+        }
+        page_ids[i] = node_ref_page_id(ref);
+        tree->overflow_pages_allocated++;
+    }
+
+    // Phase 2: Write forward — next_page is already known, write directly to mmap
+    const uint8_t *data_ptr = (const uint8_t *)value + inline_size;
+
+    for (size_t i = 0; i < num_pages; i++) {
+        size_t to_copy = (remaining < data_per_page) ? remaining : data_per_page;
+
+        // Get direct mmap pointer (marks page dirty)
+        data_art_overflow_t *ovf = (data_art_overflow_t *)
+            data_art_lock_node_mut(tree, node_ref_make(page_ids[i], 0));
+
+        ovf->type = DATA_NODE_OVERFLOW;
+        memset(ovf->padding, 0, sizeof(ovf->padding));
+        ovf->next_page = (i + 1 < num_pages) ? page_ids[i + 1] : 0;
+        ovf->data_len = (uint32_t)to_copy;
+        memcpy(ovf->data, data_ptr, to_copy);
+
+        data_art_unlock_node_mut(tree);
+
         data_ptr += to_copy;
         remaining -= to_copy;
     }
-    
+
+    uint64_t first_page = page_ids[0];
+    if (page_ids != page_ids_stack) free(page_ids);
     return first_page;
 }
 
@@ -178,23 +154,8 @@ size_t data_art_free_overflow_chain(data_art_tree_t *tree, uint64_t first_page) 
     uint64_t current_page = first_page;
     
     while (current_page != 0) {
-        // Load overflow page to get next pointer
-        const data_art_overflow_t *overflow =
-            (const data_art_overflow_t *)data_art_load_node(tree,
-                node_ref_make(current_page, 0));
-        
-        if (!overflow) {
-            LOG_ERROR("Failed to load overflow page %lu during free", current_page);
-            break;
-        }
-        
-        // Verify it's actually an overflow page
-        if (overflow->type != DATA_NODE_OVERFLOW) {
-            LOG_ERROR("Expected overflow page at %lu but got type %u", 
-                     current_page, overflow->type);
-            break;
-        }
-        
+        const page_t *page = mmap_storage_get_page(tree->mmap_storage, current_page);
+        const data_art_overflow_t *overflow = (const data_art_overflow_t *)page->data;
         uint64_t next_page = overflow->next_page;
         
         // Release current page using reference counting
