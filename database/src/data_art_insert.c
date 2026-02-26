@@ -432,30 +432,24 @@ static node_ref_t insert_recursive(data_art_tree_t *tree, node_ref_t node_ref,
 
                 // 2. CoW copy of current node with shortened prefix (partial[match_len+1..plen])
                 size_t old_size = get_node_size(type);
-                void *old_copy = malloc(old_size);
-                if (!old_copy) {
-                    LOG_ERROR("Failed to allocate old node copy for prefix split");
-                    return node_ref;
-                }
+                uint8_t old_copy[sizeof(data_art_node256_t)];  // stack buffer (largest node)
                 memcpy(old_copy, node, old_size);
 
                 // Shorten prefix: remove matched portion + split byte
                 uint8_t new_plen = plen - (uint8_t)match_len - 1;
-                ((uint8_t *)old_copy)[2] = new_plen;
+                old_copy[2] = new_plen;  // partial_len at byte offset 2
                 if (new_plen > 0) {
-                    memmove((uint8_t *)old_copy + 3, (uint8_t *)old_copy + 3 + match_len + 1, new_plen);
+                    size_t poff = node_partial_offset(type);
+                    memmove(old_copy + poff, old_copy + poff + match_len + 1, new_plen);
                 }
 
                 node_ref_t old_new_ref = data_art_alloc_node(tree, old_size);
                 if (node_ref_is_null(old_new_ref)) {
-                    free(old_copy);
                     return node_ref;
                 }
                 if (!data_art_write_node(tree, old_new_ref, old_copy, old_size)) {
-                    free(old_copy);
                     return node_ref;
                 }
-                free(old_copy);
 
                 // 3. Add old node as child of split node at partial[match_len] byte
                 uint8_t old_split_byte = partial[match_len];

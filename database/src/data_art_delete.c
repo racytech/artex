@@ -649,24 +649,21 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref) {
 
                     // CoW copy of child with extended prefix
                     size_t child_size = get_node_size(child_type);
-                    void *new_child = malloc(child_size);
-                    if (!new_child) break;
-                    memcpy(new_child, child, child_size);
+                    uint8_t new_child_buf[sizeof(data_art_node256_t)];
+                    memcpy(new_child_buf, child, child_size);
 
                     // Set new prefix in the copy
-                    ((uint8_t *)new_child)[2] = new_plen;
-                    memcpy((uint8_t *)new_child + 3, merged, new_plen);
+                    new_child_buf[2] = new_plen;  // partial_len at byte offset 2
+                    size_t poff = node_partial_offset(child_type);
+                    memcpy(new_child_buf + poff, merged, new_plen);
 
                     node_ref_t new_ref = data_art_alloc_node(tree, child_size);
                     if (node_ref_is_null(new_ref)) {
-                        free(new_child);
                         break;
                     }
-                    if (!data_art_write_node(tree, new_ref, new_child, child_size)) {
-                        free(new_child);
+                    if (!data_art_write_node(tree, new_ref, new_child_buf, child_size)) {
                         break;
                     }
-                    free(new_child);
 
                     // Don't release old Node4 or old child — MVCC snapshots may reference them
                     return new_ref;
@@ -696,8 +693,12 @@ static node_ref_t try_shrink_node(data_art_tree_t *tree, node_ref_t node_ref) {
     // Copy header: type + num_children + partial fields
     new_bytes[0] = new_type;
     new_bytes[1] = num_children;
-    new_bytes[2] = node_partial_len(node);
-    memcpy(new_bytes + 3, node_partial(node), node_partial_len(node));
+    uint8_t plen_copy = node_partial_len(node);
+    new_bytes[2] = plen_copy;
+    if (plen_copy > 0) {
+        size_t poff = node_partial_offset(new_type);
+        memcpy(new_bytes + poff, node_partial(node), plen_copy);
+    }
 
     // Copy children based on conversion
     if (type == DATA_NODE_256 && new_type == DATA_NODE_48) {
