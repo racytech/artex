@@ -27,11 +27,22 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <pthread.h>
 
 // Forward declarations
 typedef struct txn_buffer txn_buffer_t;
 typedef struct mvcc_manager mvcc_manager_t;
 typedef struct mvcc_snapshot mvcc_snapshot_t;
+
+// Thread-local transaction context (one per thread, allows multi-writer)
+typedef struct {
+    struct data_art_tree *tree;  // Tree this transaction belongs to
+    uint64_t txn_id;             // Transaction ID
+    txn_buffer_t *txn_buffer;    // Buffer for pending operations
+} thread_txn_context_t;
+
+// Get the calling thread's active transaction context (NULL if none)
+thread_txn_context_t *get_txn_context(void);
 
 // ============================================================================
 // Node Reference (Packed Page-based addressing)
@@ -317,9 +328,8 @@ typedef struct data_art_tree {
     size_t key_size;             // Fixed key size (20 or 32 bytes for Ethereum)
     size_t max_depth;            // Precomputed: key_size + 1 (for 0x00 terminator)
 
-    // Transaction support
-    uint64_t current_txn_id;     // Active transaction ID (0 = no transaction)
-    struct txn_buffer *txn_buffer; // Buffer for pending operations (NULL if not in transaction)
+    // Transaction support (current_txn_id is only set under write_lock)
+    uint64_t current_txn_id;     // Active writer's txn ID (0 = no active writer)
 
     // Concurrency control
     pthread_rwlock_t write_lock;  // Writers: wrlock. Readers: rdlock (coordinates with in-place mutation).

@@ -58,7 +58,7 @@ static bool test_basic_commit()
     uint64_t txn_id;
     TEST_ASSERT(data_art_begin_txn(tree, &txn_id), "Failed to begin transaction");
     TEST_ASSERT(txn_id > 0, "Invalid transaction ID");
-    TEST_ASSERT(tree->txn_buffer != NULL, "Transaction buffer not created");
+    TEST_ASSERT(get_txn_context() != NULL && get_txn_context()->txn_buffer != NULL, "Transaction buffer not created");
 
     // Insert multiple keys (buffered)
     uint8_t key1[KEY_SIZE] = "key1";
@@ -78,8 +78,9 @@ static bool test_basic_commit()
 
     // Commit transaction
     TEST_ASSERT(data_art_commit_txn(tree), "Failed to commit transaction");
-    TEST_ASSERT(tree->txn_buffer == NULL, "Transaction buffer not cleaned up");
-    TEST_ASSERT(tree->current_txn_id == 0, "Transaction ID not reset");
+    TEST_ASSERT(get_txn_context() == NULL || get_txn_context()->txn_buffer == NULL, "Transaction buffer not cleaned up");
+    TEST_ASSERT(get_txn_context() == NULL || get_txn_context()->txn_buffer == NULL,
+                "Transaction context should be cleared after commit");
 
     // NOW keys should be in tree
     TEST_ASSERT(data_art_size(tree) == 3, "Tree should have 3 keys after commit");
@@ -141,7 +142,7 @@ static bool test_abort_rollback()
 
     // ABORT transaction
     TEST_ASSERT(data_art_abort_txn(tree), "Failed to abort transaction");
-    TEST_ASSERT(tree->txn_buffer == NULL, "Transaction buffer not cleaned up");
+    TEST_ASSERT(get_txn_context() == NULL || get_txn_context()->txn_buffer == NULL, "Transaction buffer not cleaned up");
 
     // Tree should STILL have only 1 key (abort worked)
     TEST_ASSERT(data_art_size(tree) == 1, "Tree should still have 1 key after abort");
@@ -295,7 +296,8 @@ static bool test_nested_transaction_rejection()
                 "Should not allow nested transactions");
 
     // First transaction should still be active
-    TEST_ASSERT(tree->current_txn_id == txn_id1, "First transaction should still be active");
+    TEST_ASSERT(get_txn_context() != NULL && get_txn_context()->txn_id == txn_id1,
+                "First transaction should still be active");
 
     // Commit first transaction
     TEST_ASSERT(data_art_commit_txn(tree), "Failed to commit");

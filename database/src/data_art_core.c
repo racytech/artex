@@ -90,28 +90,19 @@ void data_art_publish_root(data_art_tree_t *tree) {
     atomic_store_explicit(&tree->committed_root, tree->root, memory_order_release);
 }
 
-// Thread-local transaction context
-typedef struct {
-    data_art_tree_t *tree;           // Tree this transaction belongs to
-    uint64_t txn_id;                 // Transaction ID
-    txn_buffer_t *txn_buffer;        // Buffer for pending operations
-} thread_txn_context_t;
-
+// Thread-local transaction context (struct defined in data_art.h)
 static pthread_key_t txn_context_key;
 static pthread_once_t txn_context_key_once = PTHREAD_ONCE_INIT;
 
-// Initialize thread-local storage key
-static void make_txn_context_key() {
+static void make_txn_context_key(void) {
     pthread_key_create(&txn_context_key, free);
 }
 
-// Get thread-local transaction context
-static thread_txn_context_t *get_txn_context() {
+thread_txn_context_t *get_txn_context(void) {
     pthread_once(&txn_context_key_once, make_txn_context_key);
     return (thread_txn_context_t *)pthread_getspecific(txn_context_key);
 }
 
-// Set thread-local transaction context
 static void set_txn_context(thread_txn_context_t *ctx) {
     pthread_once(&txn_context_key_once, make_txn_context_key);
     pthread_setspecific(txn_context_key, ctx);
@@ -483,7 +474,6 @@ static bool data_art_init_common(data_art_tree_t *tree, size_t key_size) {
     tree->key_size = key_size;
     tree->max_depth = key_size + 1;
     tree->current_txn_id = 0;
-    tree->txn_buffer = NULL;
 
     if (pthread_rwlock_init(&tree->write_lock, NULL) != 0) {
         LOG_ERROR("Failed to initialize write_lock");
@@ -1001,10 +991,6 @@ bool data_art_begin_txn(data_art_tree_t *tree, uint64_t *txn_id_out) {
     ctx->txn_id = txn_id;
     ctx->txn_buffer = buffer;
 
-    // Also set on tree for backward compatibility (single-threaded access)
-    tree->current_txn_id = txn_id;
-    tree->txn_buffer = buffer;
-
     if (txn_id_out) {
         *txn_id_out = txn_id;
     }
@@ -1037,6 +1023,9 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
 
     // === OPTIMIZED BATCH COMMIT: single lock, single root publish ===
     pthread_rwlock_wrlock(&tree->write_lock);
+
+    // Set current_txn_id under write_lock so internal functions see it
+    tree->current_txn_id = txn_id;
 
     // Use in-place mutations when no snapshots need to see old tree versions
     bool inplace = !mvcc_has_active_snapshots(tree->mvcc_manager);
@@ -1079,10 +1068,9 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
             pthread_rwlock_unlock(&tree->write_lock);
 
             DB_ERROR(DB_ERROR_IO, "failed to apply operation %zu", i);
+            tree->current_txn_id = 0;
             txn_buffer_destroy(buffer);
             ctx->txn_buffer = NULL;
-            tree->txn_buffer = NULL;
-            tree->current_txn_id = 0;
             mvcc_abort_txn(tree->mvcc_manager, txn_id);
             return false;
         }
@@ -1099,13 +1087,12 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
     // Single root publication for the entire batch
     data_art_publish_root(tree);
 
+    tree->current_txn_id = 0;
     pthread_rwlock_unlock(&tree->write_lock);
 
     // Clean up
     txn_buffer_destroy(buffer);
     ctx->txn_buffer = NULL;
-    tree->txn_buffer = NULL;
-    tree->current_txn_id = 0;
 
     LOG_INFO("Committed transaction %lu (%zu ops) for thread %p",
              txn_id, num_ops, (void*)pthread_self());
@@ -1136,14 +1123,11 @@ bool data_art_abort_txn(data_art_tree_t *tree) {
     // Discard all buffered operations (no tree modification)
     txn_buffer_destroy(ctx->txn_buffer);
     ctx->txn_buffer = NULL;
-    tree->txn_buffer = NULL;
 
     // Abort MVCC transaction
     if (!mvcc_abort_txn(tree->mvcc_manager, txn_id)) {
         LOG_ERROR("Failed to abort MVCC transaction %lu", txn_id);
     }
-
-    tree->current_txn_id = 0;
 
     LOG_INFO("Aborted transaction %lu (discarded %zu operations) for thread %p",
              txn_id, num_ops, (void*)pthread_self());

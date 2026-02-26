@@ -69,8 +69,9 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
     }
 
     // If in transaction, buffer the operation instead of applying immediately
-    if (tree->txn_buffer) {
-        return txn_buffer_add_delete(tree->txn_buffer, key, key_len);
+    thread_txn_context_t *ctx = get_txn_context();
+    if (ctx && ctx->txn_buffer) {
+        return txn_buffer_add_delete(ctx->txn_buffer, key, key_len);
     }
 
     if (node_ref_is_null(tree->root)) {

@@ -644,8 +644,9 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
     }
     
     // If in transaction, buffer the operation instead of applying immediately
-    if (tree->txn_buffer) {
-        return txn_buffer_add_insert(tree->txn_buffer, key, key_len, value, value_len);
+    thread_txn_context_t *ctx = get_txn_context();
+    if (ctx && ctx->txn_buffer) {
+        return txn_buffer_add_insert(ctx->txn_buffer, key, key_len, value, value_len);
     }
     
     // Reset thread-local arena — each insert starts fresh
