@@ -89,7 +89,25 @@ typedef struct mmap_storage {
     int active_slot;               /* 0 or 1 — current valid header slot */
     pthread_rwlock_t resize_lock;  /* Protects base pointer during mremap */
     char *path;                    /* File path (for error messages) */
+
+    /* Dirty page tracking for incremental checkpoint.
+     * 1 bit per page — set when a page is written, cleared on checkpoint.
+     * Checkpoint only syncs pages with set bits instead of the entire file. */
+    uint64_t *dirty_bitmap;        /* Bitmap: 1 bit per page */
+    size_t dirty_bitmap_words;     /* Size in uint64_t words */
 } mmap_storage_t;
+
+/**
+ * Mark a page as dirty (modified since last checkpoint).
+ * Must be called whenever page data is written.
+ * Page 0 (header) is skipped — it has its own explicit sync.
+ */
+static inline void mmap_storage_mark_dirty(mmap_storage_t *ms, uint64_t page_id) {
+    if (page_id > 0 && ms->dirty_bitmap &&
+        page_id / 64 < ms->dirty_bitmap_words) {
+        ms->dirty_bitmap[page_id / 64] |= (1ULL << (page_id % 64));
+    }
+}
 
 /* ========================================================================== */
 /* Lifecycle                                                                   */

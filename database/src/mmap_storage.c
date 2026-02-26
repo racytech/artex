@@ -33,6 +33,28 @@
 /* ========================================================================== */
 
 /**
+ * Allocate (or grow) the dirty page bitmap for the given mapped size.
+ */
+static bool dirty_bitmap_ensure(mmap_storage_t *ms, size_t mapped_size) {
+    size_t total_pages = mapped_size / PAGE_SIZE;
+    size_t new_words = (total_pages + 63) / 64;
+
+    if (new_words <= ms->dirty_bitmap_words) return true;
+
+    uint64_t *new_bm = realloc(ms->dirty_bitmap, new_words * sizeof(uint64_t));
+    if (!new_bm) {
+        LOG_ERROR("dirty_bitmap_ensure: realloc failed");
+        return false;
+    }
+    /* Zero the new portion — new pages start clean */
+    memset(new_bm + ms->dirty_bitmap_words, 0,
+           (new_words - ms->dirty_bitmap_words) * sizeof(uint64_t));
+    ms->dirty_bitmap = new_bm;
+    ms->dirty_bitmap_words = new_words;
+    return true;
+}
+
+/**
  * Grow the mapped region to new_size bytes.
  * Caller must hold resize_lock as write-lock.
  */
@@ -54,6 +76,9 @@ static bool mmap_storage_grow(mmap_storage_t *ms, size_t new_size) {
 
     ms->base = (uint8_t *)new_base;
     ms->mapped_size = new_size;
+
+    /* Grow the dirty bitmap to cover new pages */
+    dirty_bitmap_ensure(ms, new_size);
 
     LOG_DEBUG("mmap_storage_grow: resized to %zu bytes (%zu pages)",
               new_size, new_size / PAGE_SIZE);
@@ -206,6 +231,18 @@ mmap_storage_t *mmap_storage_create(const char *path, size_t initial_pages) {
         return NULL;
     }
 
+    /* Allocate dirty page bitmap */
+    ms->dirty_bitmap = NULL;
+    ms->dirty_bitmap_words = 0;
+    if (!dirty_bitmap_ensure(ms, file_size)) {
+        munmap(base, file_size);
+        close(fd);
+        pthread_rwlock_destroy(&ms->resize_lock);
+        free(ms->path);
+        free(ms);
+        return NULL;
+    }
+
     /* Write both header slots (empty tree, checkpoint_num=0) */
     write_slot(ms, 0, 0, 0, 0, 0, 0);
     write_slot(ms, 1, 0, 0, 0, 0, 0);
@@ -278,6 +315,18 @@ mmap_storage_t *mmap_storage_open(const char *path) {
     if (pthread_rwlock_init(&ms->resize_lock, NULL) != 0) {
         munmap(base, file_size);
         close(fd);
+        free(ms->path);
+        free(ms);
+        return NULL;
+    }
+
+    /* Allocate dirty page bitmap */
+    ms->dirty_bitmap = NULL;
+    ms->dirty_bitmap_words = 0;
+    if (!dirty_bitmap_ensure(ms, file_size)) {
+        munmap(base, file_size);
+        close(fd);
+        pthread_rwlock_destroy(&ms->resize_lock);
         free(ms->path);
         free(ms);
         return NULL;
@@ -356,6 +405,7 @@ void mmap_storage_destroy(mmap_storage_t *ms) {
     }
 
     pthread_rwlock_destroy(&ms->resize_lock);
+    free(ms->dirty_bitmap);
     free(ms->path);
     free(ms);
 }
@@ -396,6 +446,7 @@ uint64_t mmap_storage_alloc_page(mmap_storage_t *ms) {
 
     /* Zero the new page for clean state */
     memset(ms->base + page_id * PAGE_SIZE, 0, PAGE_SIZE);
+    mmap_storage_mark_dirty(ms, page_id);
 
     return page_id;
 }
@@ -430,6 +481,66 @@ bool mmap_storage_sync(mmap_storage_t *ms) {
     return true;
 }
 
+/**
+ * Sync only dirty data pages to disk (incremental checkpoint).
+ *
+ * Scans the dirty bitmap at word granularity (64 pages = 256KB per word).
+ * Contiguous non-zero words are merged into a single msync call to
+ * minimise syscall overhead during bulk writes.  Clean 64-page blocks
+ * are skipped entirely.
+ *
+ * Returns true on success, false if any msync fails.
+ */
+static bool sync_dirty_pages(mmap_storage_t *ms) {
+    size_t total_pages = ms->mapped_size / PAGE_SIZE;
+    size_t num_words = ms->dirty_bitmap_words;
+
+    size_t range_start = 0;
+    bool in_range = false;
+
+    for (size_t w = 0; w < num_words; w++) {
+        if (ms->dirty_bitmap[w] != 0) {
+            if (!in_range) {
+                range_start = w * 64;
+                if (range_start == 0) range_start = 1;  /* skip header page */
+                in_range = true;
+            }
+            /* Extend range through contiguous non-zero words */
+        } else {
+            if (in_range) {
+                size_t range_end = w * 64;
+                if (range_end > total_pages) range_end = total_pages;
+                if (range_end > range_start) {
+                    if (msync(ms->base + range_start * PAGE_SIZE,
+                              (range_end - range_start) * PAGE_SIZE, MS_SYNC) != 0) {
+                        LOG_ERROR("sync_dirty_pages: msync [%zu, %zu) failed: %s",
+                                  range_start, range_end, strerror(errno));
+                        return false;
+                    }
+                }
+                in_range = false;
+            }
+        }
+    }
+
+    /* Flush final range */
+    if (in_range) {
+        size_t range_end = total_pages;
+        if (range_end > range_start) {
+            if (msync(ms->base + range_start * PAGE_SIZE,
+                      (range_end - range_start) * PAGE_SIZE, MS_SYNC) != 0) {
+                LOG_ERROR("sync_dirty_pages: msync final [%zu, %zu) failed: %s",
+                          range_start, range_end, strerror(errno));
+                return false;
+            }
+        }
+    }
+
+    /* Clear bitmap — all pages are now clean */
+    memset(ms->dirty_bitmap, 0, num_words * sizeof(uint64_t));
+    return true;
+}
+
 bool mmap_storage_checkpoint(mmap_storage_t *ms,
                               uint64_t root_page_id,
                               uint32_t root_offset,
@@ -437,15 +548,12 @@ bool mmap_storage_checkpoint(mmap_storage_t *ms,
                               uint64_t key_size) {
     if (!ms || !ms->base) return false;
 
-    /* Phase 1: Sync all data pages (skip header page).
+    /* Phase 1: Sync only dirty data pages (skip header page).
      * This guarantees that every CoW tree node reachable from the new root
      * is on stable storage BEFORE the header points to it. */
-    if (ms->mapped_size > PAGE_SIZE) {
-        if (msync(ms->base + PAGE_SIZE, ms->mapped_size - PAGE_SIZE, MS_SYNC) != 0) {
-            LOG_ERROR("mmap_storage_checkpoint: msync data pages failed: %s",
-                      strerror(errno));
-            return false;
-        }
+    if (!sync_dirty_pages(ms)) {
+        LOG_ERROR("mmap_storage_checkpoint: sync_dirty_pages failed");
+        return false;
     }
 
     /* Phase 2: Write to the inactive header slot */

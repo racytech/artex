@@ -336,6 +336,7 @@ static node_ref_t slot_alloc(data_art_tree_t *tree, int class_idx) {
         uint32_t offset = slot_page_alloc_slot(page, cls);
         if (offset != 0) {
             tree->slot_allocs[class_idx]++;
+            mmap_storage_mark_dirty(tree->mmap_storage, cls->current_page_id);
             return node_ref_make(cls->current_page_id, offset);
         }
         cls->current_page_id = 0;
@@ -364,6 +365,7 @@ static node_ref_t slot_alloc(data_art_tree_t *tree, int class_idx) {
     tree->nodes_allocated++;
     tree->slot_pages_created[class_idx]++;
     tree->slot_allocs[class_idx]++;
+    mmap_storage_mark_dirty(tree->mmap_storage, page_id);
 
     return node_ref_make(page_id, offset);
 }
@@ -386,6 +388,7 @@ static node_ref_t slot_alloc_hint(data_art_tree_t *tree, int class_idx, uint64_t
             if (offset != 0) {
                 tree->slot_hint_hits++;
                 tree->slot_allocs[class_idx]++;
+                mmap_storage_mark_dirty(tree->mmap_storage, hint_page_id);
                 return node_ref_make(hint_page_id, offset);
             }
         }
@@ -449,6 +452,7 @@ static void slot_free(data_art_tree_t *tree, uint64_t page_id, uint32_t offset) 
 
     if (class_idx >= 0) tree->slot_frees[class_idx]++;
     uint16_t remaining = slot_page_free_slot(page, offset, cls);
+    mmap_storage_mark_dirty(tree->mmap_storage, page_id);
 
     if (remaining == 0) {
         // Page is empty — reset current_page_id if it matches
@@ -903,6 +907,8 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
     page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
     memcpy(page->data + node_ref_offset(ref), node, size);
     if (need_lock) pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+
+    mmap_storage_mark_dirty(tree->mmap_storage, node_ref_page_id(ref));
     return true;
 }
 
@@ -912,6 +918,7 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
 
 void *data_art_lock_node_mut(data_art_tree_t *tree, node_ref_t ref) {
     if (!tls_rdlock_held) pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
+    mmap_storage_mark_dirty(tree->mmap_storage, node_ref_page_id(ref));
     page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
     return page->data + node_ref_offset(ref);
 }
@@ -928,6 +935,7 @@ bool data_art_write_partial(data_art_tree_t *tree, node_ref_t ref,
     page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
     memcpy(page->data + node_ref_offset(ref) + node_offset, data, len);
     if (need_lock) pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+    mmap_storage_mark_dirty(tree->mmap_storage, node_ref_page_id(ref));
     return true;
 }
 
@@ -939,6 +947,7 @@ bool data_art_copy_node(data_art_tree_t *tree, node_ref_t dst, node_ref_t src, s
     page_t *dst_page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(dst));
     memcpy(dst_page->data + node_ref_offset(dst), src_page->data + node_ref_offset(src), size);
     if (need_lock) pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+    mmap_storage_mark_dirty(tree->mmap_storage, node_ref_page_id(dst));
     return true;
 }
 
