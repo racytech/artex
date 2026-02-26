@@ -28,7 +28,6 @@ extern node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size);
 extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
 extern bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
                                   const void *node, size_t size);
-extern void data_art_reset_arena(void);
 
 // Test result macros
 #define TEST(name) \
@@ -445,7 +444,7 @@ static bool test_node48_add_children(void) {
     uint8_t keys[48];
     for (int i = 0; i < 48; i++) {
         keys[i] = i * 5;
-        data_art_reset_arena();
+
         node_ref_t leaf = create_dummy_leaf(tree, keys[i]);
         if (node_ref_is_null(leaf)) {
             data_art_destroy(tree);
@@ -461,7 +460,7 @@ static bool test_node48_add_children(void) {
 
     // Verify all children exist
     for (int i = 0; i < 48; i++) {
-        data_art_reset_arena();
+
         if (!verify_child_exists(tree, n48_ref, keys[i], keys[i])) {
             data_art_destroy(tree);
             FAIL("child verification failed");
@@ -514,7 +513,7 @@ static bool test_node48_grows_to_node256(void) {
     uint8_t keys[49];
     for (int i = 0; i < 49; i++) {
         keys[i] = i * 5;
-        data_art_reset_arena();
+
         node_ref_t leaf = create_dummy_leaf(tree, keys[i]);
         if (node_ref_is_null(leaf)) {
             data_art_destroy(tree);
@@ -529,7 +528,7 @@ static bool test_node48_grows_to_node256(void) {
     }
 
     // Reset arena before verification (add_child calls accumulated allocations)
-    data_art_reset_arena();
+
 
     // Verify it grew to NODE_256
     const void *node = data_art_load_node(tree, node_ref);
@@ -546,7 +545,7 @@ static bool test_node48_grows_to_node256(void) {
 
     // Verify all children are accessible
     for (int i = 0; i < 49; i++) {
-        data_art_reset_arena();
+
         if (!verify_child_exists(tree, node_ref, keys[i], keys[i])) {
             data_art_destroy(tree);
             FAIL("child verification failed after growth");
@@ -591,7 +590,7 @@ static bool test_node256_add_children(void) {
     uint8_t keys[100];
     for (int i = 0; i < 100; i++) {
         keys[i] = i;
-        data_art_reset_arena();
+
         node_ref_t leaf = create_dummy_leaf(tree, keys[i]);
         if (node_ref_is_null(leaf)) {
             data_art_destroy(tree);
@@ -607,7 +606,7 @@ static bool test_node256_add_children(void) {
 
     // Verify all children exist
     for (int i = 0; i < 100; i++) {
-        data_art_reset_arena();
+
         if (!verify_child_exists(tree, n256_ref, keys[i], keys[i])) {
             data_art_destroy(tree);
             FAIL("child verification failed");
@@ -615,7 +614,7 @@ static bool test_node256_add_children(void) {
     }
 
     // Verify it's still NODE_256
-    data_art_reset_arena();
+
     const data_art_node256_t *final = (const data_art_node256_t *)data_art_load_node(tree, n256_ref);
     if (!final || final->type != DATA_NODE_256 || final->num_children != 100) {
         data_art_destroy(tree);

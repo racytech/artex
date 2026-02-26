@@ -26,58 +26,14 @@ static void drain_pending_frees(data_art_tree_t *tree);
 void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
 
 // ============================================================================
-// Thread-Local Arena for Safe Node Reads
+// Stub: data_art_reset_arena (no-op — arena removed, mmap pointers are stable)
 // ============================================================================
 //
-// data_art_load_node() previously returned raw pointers into buffer pool pages.
-// Under concurrent load, pages could be evicted (and freed) while threads still
-// held pointers — a use-after-free causing checksum corruption.
-//
-// Fix: pin the page, copy node data to this thread-local arena, unpin immediately.
-// The returned pointer is to stable arena memory, immune to buffer pool eviction.
-// Arena is reset at the start of each top-level operation (get/insert/delete).
+// With fixed VA reservation, base never moves.  data_art_load_node() returns
+// direct mmap pointers — no arena copy needed, no resize_lock needed.
 
-#define TLS_ARENA_SIZE (256 * 1024)  // 256KB per thread — fits ~80 Node256 or thousands of small nodes
-static __thread uint8_t tls_arena[TLS_ARENA_SIZE];
-static __thread size_t  tls_arena_offset = 0;
-
-static void tls_arena_reset(void) {
-    tls_arena_offset = 0;
-}
-
-static void *tls_arena_alloc(size_t size) {
-    size = (size + 7) & ~7;  // 8-byte align
-    if (tls_arena_offset + size > TLS_ARENA_SIZE) {
-        return NULL;
-    }
-    void *ptr = tls_arena + tls_arena_offset;
-    tls_arena_offset += size;
-    return ptr;
-}
-
-// Non-static wrapper so data_art_insert.c and data_art_delete.c can reset the arena
 void data_art_reset_arena(void) {
-    tls_arena_reset();
-}
-
-// ============================================================================
-// Zero-Copy Read Support
-// ============================================================================
-//
-// When tls_rdlock_held is true, data_art_load_node() returns direct mmap
-// pointers instead of copying to the TLS arena.  The caller must hold
-// resize_lock as rdlock for the entire operation (via data_art_rdlock/rdunlock).
-
-static __thread bool tls_rdlock_held = false;
-
-void data_art_rdlock(data_art_tree_t *tree) {
-    pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
-    tls_rdlock_held = true;
-}
-
-void data_art_rdunlock(data_art_tree_t *tree) {
-    tls_rdlock_held = false;
-    pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+    /* no-op: kept for API compatibility until callers are cleaned up */
 }
 
 // ============================================================================
@@ -132,25 +88,6 @@ size_t get_node_size(data_art_node_type_t type) {
     }
 }
 
-/**
- * Get the size of a node by inspecting its in-memory data.
- * Unlike get_node_size(), this handles variable-size leaves.
- */
-static size_t data_art_node_size_from_data(const void *node_data, size_t key_size) {
-    uint8_t type = *(const uint8_t *)node_data;
-    switch (type) {
-        case DATA_NODE_4:      return sizeof(data_art_node4_t);
-        case DATA_NODE_16:     return sizeof(data_art_node16_t);
-        case DATA_NODE_48:     return sizeof(data_art_node48_t);
-        case DATA_NODE_256:    return sizeof(data_art_node256_t);
-        case DATA_NODE_OVERFLOW: return sizeof(data_art_overflow_t);
-        case DATA_NODE_LEAF:
-            return leaf_total_size((const data_art_leaf_t *)node_data, key_size);
-        default:
-            LOG_ERROR("Unknown node type %u in data_art_node_size_from_data", type);
-            return PAGE_SIZE - PAGE_HEADER_SIZE;  // safe fallback: copy max possible
-    }
-}
 
 // ============================================================================
 // Slot Page Bitmap Helpers
@@ -858,30 +795,9 @@ const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref) {
         return NULL;
     }
 
-    // Fast path: caller holds resize_lock — return direct mmap pointer (zero-copy)
-    if (tls_rdlock_held) {
-        page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
-        return page->data + node_ref_offset(ref);
-    }
-
-    // Legacy path: lock, copy to arena, unlock
-    pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
-
+    /* Direct mmap pointer — base is stable (fixed VA reservation) */
     page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
-    const void *src = page->data + node_ref_offset(ref);
-    size_t node_size = data_art_node_size_from_data(src, tree->key_size);
-
-    void *copy = tls_arena_alloc(node_size);
-    if (!copy) {
-        LOG_ERROR("TLS arena exhausted (%zu bytes used, need %zu more)",
-                  tls_arena_offset, node_size);
-        pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
-        return NULL;
-    }
-    memcpy(copy, src, node_size);
-
-    pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
-    return copy;
+    return page->data + node_ref_offset(ref);
 }
 
 bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
@@ -902,12 +818,8 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
         return false;
     }
 
-    bool need_lock = !tls_rdlock_held;
-    if (need_lock) pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
     page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
     memcpy(page->data + node_ref_offset(ref), node, size);
-    if (need_lock) pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
-
     mmap_storage_mark_dirty(tree->mmap_storage, node_ref_page_id(ref));
     return true;
 }
@@ -917,36 +829,29 @@ bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
 // ============================================================================
 
 void *data_art_lock_node_mut(data_art_tree_t *tree, node_ref_t ref) {
-    if (!tls_rdlock_held) pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
     mmap_storage_mark_dirty(tree->mmap_storage, node_ref_page_id(ref));
     page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
     return page->data + node_ref_offset(ref);
 }
 
 void data_art_unlock_node_mut(data_art_tree_t *tree) {
-    if (!tls_rdlock_held) pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
+    (void)tree;  /* no-op: no resize_lock to release */
 }
 
 bool data_art_write_partial(data_art_tree_t *tree, node_ref_t ref,
                             size_t node_offset, const void *data, size_t len) {
     if (!tree || !data || node_ref_is_null(ref)) return false;
-    bool need_lock = !tls_rdlock_held;
-    if (need_lock) pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
     page_t *page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(ref));
     memcpy(page->data + node_ref_offset(ref) + node_offset, data, len);
-    if (need_lock) pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
     mmap_storage_mark_dirty(tree->mmap_storage, node_ref_page_id(ref));
     return true;
 }
 
 bool data_art_copy_node(data_art_tree_t *tree, node_ref_t dst, node_ref_t src, size_t size) {
     if (!tree || node_ref_is_null(dst) || node_ref_is_null(src)) return false;
-    bool need_lock = !tls_rdlock_held;
-    if (need_lock) pthread_rwlock_rdlock(&tree->mmap_storage->resize_lock);
     page_t *src_page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(src));
     page_t *dst_page = mmap_storage_get_page(tree->mmap_storage, node_ref_page_id(dst));
     memcpy(dst_page->data + node_ref_offset(dst), src_page->data + node_ref_offset(src), size);
-    if (need_lock) pthread_rwlock_unlock(&tree->mmap_storage->resize_lock);
     mmap_storage_mark_dirty(tree->mmap_storage, node_ref_page_id(dst));
     return true;
 }
@@ -1049,9 +954,6 @@ bool data_art_commit_txn(data_art_tree_t *tree) {
     bool inplace = !mvcc_has_active_snapshots(tree->mvcc_manager);
 
     // Hint: pre-grow mmap to reduce resize frequency during commit.
-    // We do NOT hold resize_lock for the loop — alloc_page may need
-    // wrlock(resize_lock) to grow, which would self-deadlock against rdlock.
-    // Per-operation locking (TLS arena copies) handles resize safety.
     mmap_storage_ensure_capacity(tree->mmap_storage,
                                  tree->mmap_storage->next_page_id + num_ops * 4);
 

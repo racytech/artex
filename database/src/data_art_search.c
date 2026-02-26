@@ -25,9 +25,6 @@ __thread int tls_search_trace = 0;
 
 // Forward declarations - functions from data_art_core.c
 extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
-extern void data_art_reset_arena(void);
-extern void data_art_rdlock(data_art_tree_t *tree);
-extern void data_art_rdunlock(data_art_tree_t *tree);
 
 // Forward declaration - overflow value reader from data_art_overflow.c
 extern bool data_art_read_overflow_value(data_art_tree_t *tree,
@@ -116,9 +113,6 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
         LOG_ERROR("Invalid parameters");
         return NULL;
     }
-
-    // Reset thread-local arena — each get operation starts fresh
-    data_art_reset_arena();
 
     // Validate key size matches tree's configured size
     if (key_len != tree->key_size) {
@@ -299,15 +293,13 @@ static const void *data_art_get_internal(data_art_tree_t *tree, node_ref_t root,
     return NULL;  // Not found
 }
 
-// Public API: Get with snapshot — zero-copy reads via operation-scoped rdlock.
+// Public API: Get with snapshot.
 // Holds write_lock as rdlock to coordinate with in-place mutation writers.
-// Holds resize_lock as rdlock for direct mmap pointer access (zero-copy).
 const void *data_art_get_snapshot(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
                                    size_t *value_len, data_art_snapshot_t *snapshot) {
     if (!tree) return NULL;
 
     pthread_rwlock_rdlock(&tree->write_lock);
-    data_art_rdlock(tree);
 
     node_ref_t root;
     const void *result;
@@ -322,7 +314,6 @@ const void *data_art_get_snapshot(data_art_tree_t *tree, const uint8_t *key, siz
                                         NULL, 0, NULL, 0);
     }
 
-    data_art_rdunlock(tree);
     pthread_rwlock_unlock(&tree->write_lock);
     return result;
 }
@@ -339,13 +330,11 @@ bool data_art_get_into(data_art_tree_t *tree, const uint8_t *key, size_t key_len
     if (!tree) return false;
 
     pthread_rwlock_rdlock(&tree->write_lock);
-    data_art_rdlock(tree);
 
     node_ref_t root = data_art_read_committed_root(tree);
     const void *result = data_art_get_internal(tree, root, key, key_len, value_len,
                                                 NULL, 0, value_buf, buf_size);
 
-    data_art_rdunlock(tree);
     pthread_rwlock_unlock(&tree->write_lock);
     return result != NULL;
 }

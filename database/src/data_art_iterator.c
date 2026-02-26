@@ -19,9 +19,6 @@
 
 // Forward declarations from data_art_core.c
 extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
-extern void data_art_reset_arena(void);
-extern void data_art_rdlock(data_art_tree_t *tree);
-extern void data_art_rdunlock(data_art_tree_t *tree);
 
 // Forward declaration from data_art_overflow.c
 extern bool data_art_read_overflow_value(data_art_tree_t *tree,
@@ -166,12 +163,10 @@ data_art_iterator_t *data_art_iterator_create(data_art_tree_t *tree) {
 
     iter->tree = tree;
 
-    // Acquire scan-lifetime locks and capture root atomically.
-    // Locks held until end_scan() (on destroy or scan completion).
-    // This closes the race where a writer could release/reuse pages
-    // between root capture and first next() call.
+    // Acquire write_lock rdlock and capture root atomically.
+    // Lock held until end_scan() (on destroy or scan completion).
+    // This coordinates with in-place mutation writers.
     pthread_rwlock_rdlock(&tree->write_lock);
-    data_art_rdlock(tree);
     iter->scanning = true;
     iter->root = atomic_load_explicit(&tree->committed_root, memory_order_acquire);
 
@@ -189,11 +184,10 @@ data_art_iterator_t *data_art_iterator_create(data_art_tree_t *tree) {
     return iter;
 }
 
-// Release scan-lifetime locks (called when scan ends or iterator destroyed)
+// Release scan-lifetime lock (called when scan ends or iterator destroyed)
 static void end_scan(data_art_iterator_t *iter) {
     if (iter->scanning) {
         iter->scanning = false;
-        data_art_rdunlock(iter->tree);
         pthread_rwlock_unlock(&iter->tree->write_lock);
     }
 }

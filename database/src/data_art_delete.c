@@ -40,7 +40,6 @@ extern size_t get_node_size(data_art_node_type_t node_type);
 extern node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size);
 extern bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref, const void *data, size_t size);
 extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
-extern void data_art_reset_arena(void);
 extern void data_art_publish_root(data_art_tree_t *tree);
 
 // Thread-local: when true, skip MVCC logical deletes (inplace mode)
@@ -82,9 +81,6 @@ bool data_art_delete(data_art_tree_t *tree, const uint8_t *key, size_t key_len) 
         return false;  // Empty tree, nothing to delete
     }
     
-    // Reset thread-local arena — each delete starts fresh
-    data_art_reset_arena();
-
     // Acquire write lock to serialize all write operations (one writer at a time)
     pthread_rwlock_wrlock(&tree->write_lock);
 
@@ -153,7 +149,6 @@ bool data_art_delete_internal(data_art_tree_t *tree, const uint8_t *key, size_t 
     if (key_len != tree->key_size) return false;
     if (node_ref_is_null(tree->root)) return false;
 
-    data_art_reset_arena();
     tls_delete_skip_mvcc = inplace;
 
     bool deleted = false;

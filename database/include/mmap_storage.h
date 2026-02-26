@@ -10,8 +10,10 @@
  * the slot with the higher valid checkpoint_num is chosen.  If one slot is
  * corrupt (torn write / partial checkpoint), the other is used.
  *
- * Growth: file doubles in size via ftruncate + mremap(MREMAP_MAYMOVE).
- * pthread_rwlock_t protects the base pointer during resize.
+ * Growth: a large virtual address range is reserved at init (up to 1 TiB,
+ * PROT_NONE). The file is mapped with MAP_FIXED at the start of that range.
+ * Growth extends the file and maps the new portion — base never moves.
+ * No resize_lock needed; all pointers into the mapping remain stable.
  */
 
 #ifndef MMAP_STORAGE_H
@@ -22,7 +24,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include <pthread.h>
+#include <pthread.h>  /* still needed for other locks (write_lock, mvcc) */
 
 /* File header magic: "ARTMMAP\0" */
 #define MMAP_MAGIC 0x4152544D4D415000ULL
@@ -83,11 +85,11 @@ typedef struct {
  */
 typedef struct mmap_storage {
     int fd;                        /* File descriptor */
-    uint8_t *base;                 /* mmap base pointer */
-    size_t mapped_size;            /* Current mapped region size (bytes) */
+    uint8_t *base;                 /* mmap base pointer (stable — never moves) */
+    size_t mapped_size;            /* Current file-backed mapped region (bytes) */
+    size_t reserved_size;          /* Total reserved VA space (bytes) */
     uint64_t next_page_id;         /* Next page to allocate */
     int active_slot;               /* 0 or 1 — current valid header slot */
-    pthread_rwlock_t resize_lock;  /* Protects base pointer during mremap */
     char *path;                    /* File path (for error messages) */
 
     /* Dirty page tracking for incremental checkpoint.
@@ -162,8 +164,8 @@ void mmap_storage_destroy(mmap_storage_t *ms);
 /**
  * Get a direct pointer to a page in the mapped region.
  *
- * Caller must hold resize_lock (rdlock) to ensure base pointer stability.
- * The returned pointer is valid until the next mremap (resize).
+ * The base pointer is stable (fixed VA reservation), so the returned
+ * pointer remains valid for the lifetime of the storage instance.
  *
  * @param ms       Storage instance
  * @param page_id  Page ID (must be < next_page_id)
@@ -177,7 +179,7 @@ static inline page_t *mmap_storage_get_page(mmap_storage_t *ms, uint64_t page_id
  * Allocate a new page (bump allocator).
  *
  * Returns next_page_id and increments it. If the file needs to grow,
- * calls ftruncate + mremap under the resize write-lock.
+ * extends the file and maps the new portion into the reserved VA space.
  *
  * @param ms  Storage instance
  * @return Allocated page ID, or 0 on failure
@@ -186,7 +188,6 @@ uint64_t mmap_storage_alloc_page(mmap_storage_t *ms);
 
 /**
  * Pre-grow the mapped region to hold at least total_pages pages.
- * Prevents resize_lock wrlock contention during bulk operations.
  */
 void mmap_storage_ensure_capacity(mmap_storage_t *ms, uint64_t total_pages);
 

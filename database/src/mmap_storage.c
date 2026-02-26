@@ -11,10 +11,10 @@
  *   2. write inactive slot + msync header page
  * Recovery picks the slot with higher valid checkpoint_num.
  *
- * Growth: ftruncate(2x) + mremap(MREMAP_MAYMOVE) under write-lock.
+ * Growth: a large virtual address range is reserved upfront (up to 1 TiB).
+ * The file is overlaid at the start with MAP_FIXED.  Growth extends the file
+ * and maps the new portion — base never moves, no resize_lock needed.
  */
-
-#define _GNU_SOURCE  /* mremap */
 
 #include "mmap_storage.h"
 #include "crc32.h"
@@ -55,10 +55,44 @@ static bool dirty_bitmap_ensure(mmap_storage_t *ms, size_t mapped_size) {
 }
 
 /**
- * Grow the mapped region to new_size bytes.
- * Caller must hold resize_lock as write-lock.
+ * Reserve a large virtual address range (PROT_NONE, MAP_ANONYMOUS).
+ * Tries progressively smaller sizes: 1 TiB → 256 GiB → 64 GiB → 16 GiB.
+ * Returns base pointer and sets *out_size, or MAP_FAILED on failure.
+ */
+static void *reserve_va_space(size_t *out_size) {
+    static const size_t candidates[] = {
+        (size_t)1ULL << 40,  /* 1 TiB */
+        (size_t)256ULL << 30, /* 256 GiB */
+        (size_t)64ULL << 30,  /* 64 GiB  */
+        (size_t)16ULL << 30,  /* 16 GiB  */
+    };
+
+    for (int i = 0; i < 4; i++) {
+        void *p = mmap(NULL, candidates[i], PROT_NONE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (p != MAP_FAILED) {
+            *out_size = candidates[i];
+            LOG_DEBUG("reserve_va_space: reserved %zu bytes (%zu GiB)",
+                      candidates[i], candidates[i] >> 30);
+            return p;
+        }
+    }
+    LOG_ERROR("reserve_va_space: all attempts failed");
+    *out_size = 0;
+    return MAP_FAILED;
+}
+
+/**
+ * Grow the file-backed mapping within the reserved VA space.
+ * Base pointer never moves.
  */
 static bool mmap_storage_grow(mmap_storage_t *ms, size_t new_size) {
+    if (new_size > ms->reserved_size) {
+        LOG_ERROR("mmap_storage_grow: new_size %zu exceeds reserved VA space %zu",
+                  new_size, ms->reserved_size);
+        return false;
+    }
+
     /* Extend the file */
     if (ftruncate(ms->fd, (off_t)new_size) != 0) {
         LOG_ERROR("mmap_storage_grow: ftruncate to %zu failed: %s",
@@ -66,15 +100,17 @@ static bool mmap_storage_grow(mmap_storage_t *ms, size_t new_size) {
         return false;
     }
 
-    /* Remap — MREMAP_MAYMOVE allows the kernel to relocate the mapping */
-    void *new_base = mremap(ms->base, ms->mapped_size, new_size, MREMAP_MAYMOVE);
-    if (new_base == MAP_FAILED) {
-        LOG_ERROR("mmap_storage_grow: mremap from %zu to %zu failed: %s",
+    /* Map the new portion into the reserved VA space (MAP_FIXED overwrites PROT_NONE) */
+    void *p = mmap(ms->base + ms->mapped_size,
+                   new_size - ms->mapped_size,
+                   PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_FIXED, ms->fd, (off_t)ms->mapped_size);
+    if (p == MAP_FAILED) {
+        LOG_ERROR("mmap_storage_grow: mmap new region [%zu, %zu) failed: %s",
                   ms->mapped_size, new_size, strerror(errno));
         return false;
     }
 
-    ms->base = (uint8_t *)new_base;
     ms->mapped_size = new_size;
 
     /* Grow the dirty bitmap to cover new pages */
@@ -198,11 +234,22 @@ mmap_storage_t *mmap_storage_create(const char *path, size_t initial_pages) {
         return NULL;
     }
 
-    /* Memory-map the file */
-    void *base = mmap(NULL, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    /* Reserve VA space (up to 1 TiB) — base will never move */
+    size_t reserved_size;
+    void *base = reserve_va_space(&reserved_size);
     if (base == MAP_FAILED) {
-        LOG_ERROR("mmap_storage_create: mmap(%zu) failed: %s",
+        LOG_ERROR("mmap_storage_create: reserve_va_space failed");
+        close(fd);
+        return NULL;
+    }
+
+    /* Overlay the file at the start of the reserved range */
+    void *mapped = mmap(base, file_size, PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_FIXED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        LOG_ERROR("mmap_storage_create: mmap MAP_FIXED(%zu) failed: %s",
                   file_size, strerror(errno));
+        munmap(base, reserved_size);
         close(fd);
         return NULL;
     }
@@ -210,7 +257,7 @@ mmap_storage_t *mmap_storage_create(const char *path, size_t initial_pages) {
     /* Allocate storage struct */
     mmap_storage_t *ms = calloc(1, sizeof(mmap_storage_t));
     if (!ms) {
-        munmap(base, file_size);
+        munmap(base, reserved_size);
         close(fd);
         return NULL;
     }
@@ -218,26 +265,17 @@ mmap_storage_t *mmap_storage_create(const char *path, size_t initial_pages) {
     ms->fd = fd;
     ms->base = (uint8_t *)base;
     ms->mapped_size = file_size;
+    ms->reserved_size = reserved_size;
     ms->next_page_id = 1;  /* Page 0 = header */
     ms->active_slot = 0;
     ms->path = strdup(path);
-
-    if (pthread_rwlock_init(&ms->resize_lock, NULL) != 0) {
-        LOG_ERROR("mmap_storage_create: pthread_rwlock_init failed");
-        munmap(base, file_size);
-        close(fd);
-        free(ms->path);
-        free(ms);
-        return NULL;
-    }
 
     /* Allocate dirty page bitmap */
     ms->dirty_bitmap = NULL;
     ms->dirty_bitmap_words = 0;
     if (!dirty_bitmap_ensure(ms, file_size)) {
-        munmap(base, file_size);
+        munmap(base, reserved_size);
         close(fd);
-        pthread_rwlock_destroy(&ms->resize_lock);
         free(ms->path);
         free(ms);
         return NULL;
@@ -247,8 +285,8 @@ mmap_storage_t *mmap_storage_create(const char *path, size_t initial_pages) {
     write_slot(ms, 0, 0, 0, 0, 0, 0);
     write_slot(ms, 1, 0, 0, 0, 0, 0);
 
-    LOG_INFO("Created mmap storage: %s (%zu pages, %zu MB)",
-             path, initial_pages, file_size / (1024 * 1024));
+    LOG_INFO("Created mmap storage: %s (%zu pages, %zu MB, VA reserved %zu GiB)",
+             path, initial_pages, file_size / (1024 * 1024), reserved_size >> 30);
 
     return ms;
 }
@@ -280,11 +318,22 @@ mmap_storage_t *mmap_storage_open(const char *path) {
         return NULL;
     }
 
-    /* Memory-map */
-    void *base = mmap(NULL, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    /* Reserve VA space */
+    size_t reserved_size;
+    void *base = reserve_va_space(&reserved_size);
     if (base == MAP_FAILED) {
-        LOG_ERROR("mmap_storage_open: mmap(%zu) failed: %s",
+        LOG_ERROR("mmap_storage_open: reserve_va_space failed");
+        close(fd);
+        return NULL;
+    }
+
+    /* Overlay file at the start of reserved range */
+    void *mapped = mmap(base, file_size, PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_FIXED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        LOG_ERROR("mmap_storage_open: mmap MAP_FIXED(%zu) failed: %s",
                   file_size, strerror(errno));
+        munmap(base, reserved_size);
         close(fd);
         return NULL;
     }
@@ -294,7 +343,7 @@ mmap_storage_t *mmap_storage_open(const char *path) {
     if (slot0->magic != MMAP_MAGIC) {
         LOG_ERROR("mmap_storage_open: bad magic (got 0x%lx, expected 0x%lx)",
                   slot0->magic, MMAP_MAGIC);
-        munmap(base, file_size);
+        munmap(base, reserved_size);
         close(fd);
         return NULL;
     }
@@ -302,7 +351,7 @@ mmap_storage_t *mmap_storage_open(const char *path) {
     /* Allocate struct (needed before migration) */
     mmap_storage_t *ms = calloc(1, sizeof(mmap_storage_t));
     if (!ms) {
-        munmap(base, file_size);
+        munmap(base, reserved_size);
         close(fd);
         return NULL;
     }
@@ -310,23 +359,15 @@ mmap_storage_t *mmap_storage_open(const char *path) {
     ms->fd = fd;
     ms->base = (uint8_t *)base;
     ms->mapped_size = file_size;
+    ms->reserved_size = reserved_size;
     ms->path = strdup(path);
-
-    if (pthread_rwlock_init(&ms->resize_lock, NULL) != 0) {
-        munmap(base, file_size);
-        close(fd);
-        free(ms->path);
-        free(ms);
-        return NULL;
-    }
 
     /* Allocate dirty page bitmap */
     ms->dirty_bitmap = NULL;
     ms->dirty_bitmap_words = 0;
     if (!dirty_bitmap_ensure(ms, file_size)) {
-        munmap(base, file_size);
+        munmap(base, reserved_size);
         close(fd);
-        pthread_rwlock_destroy(&ms->resize_lock);
         free(ms->path);
         free(ms);
         return NULL;
@@ -339,17 +380,17 @@ mmap_storage_t *mmap_storage_open(const char *path) {
         if (v1->page_size != PAGE_SIZE) {
             LOG_ERROR("mmap_storage_open: page_size mismatch (%u vs %u)",
                       v1->page_size, PAGE_SIZE);
-            munmap(base, file_size);
+            munmap(base, reserved_size);
             close(fd);
-            pthread_rwlock_destroy(&ms->resize_lock);
+            free(ms->dirty_bitmap);
             free(ms->path);
             free(ms);
             return NULL;
         }
         if (!migrate_v1_to_v2(ms)) {
-            munmap(base, file_size);
+            munmap(base, reserved_size);
             close(fd);
-            pthread_rwlock_destroy(&ms->resize_lock);
+            free(ms->dirty_bitmap);
             free(ms->path);
             free(ms);
             return NULL;
@@ -361,9 +402,9 @@ mmap_storage_t *mmap_storage_open(const char *path) {
         int active = pick_active_slot(hp);
         if (active < 0) {
             LOG_ERROR("mmap_storage_open: both header slots invalid (corrupt file)");
-            munmap(base, file_size);
+            munmap(base, reserved_size);
             close(fd);
-            pthread_rwlock_destroy(&ms->resize_lock);
+            free(ms->dirty_bitmap);
             free(ms->path);
             free(ms);
             return NULL;
@@ -373,9 +414,9 @@ mmap_storage_t *mmap_storage_open(const char *path) {
         if (s->page_size != PAGE_SIZE) {
             LOG_ERROR("mmap_storage_open: page_size mismatch (%u vs %u)",
                       s->page_size, PAGE_SIZE);
-            munmap(base, file_size);
+            munmap(base, reserved_size);
             close(fd);
-            pthread_rwlock_destroy(&ms->resize_lock);
+            free(ms->dirty_bitmap);
             free(ms->path);
             free(ms);
             return NULL;
@@ -394,17 +435,18 @@ mmap_storage_t *mmap_storage_open(const char *path) {
 void mmap_storage_destroy(mmap_storage_t *ms) {
     if (!ms) return;
 
-    /* Sync to disk */
+    /* Sync to disk, then unmap the entire reserved VA range */
     if (ms->base && ms->mapped_size > 0) {
         msync(ms->base, ms->mapped_size, MS_SYNC);
-        munmap(ms->base, ms->mapped_size);
+    }
+    if (ms->base && ms->reserved_size > 0) {
+        munmap(ms->base, ms->reserved_size);
     }
 
     if (ms->fd >= 0) {
         close(ms->fd);
     }
 
-    pthread_rwlock_destroy(&ms->resize_lock);
     free(ms->dirty_bitmap);
     free(ms->path);
     free(ms);
@@ -420,26 +462,16 @@ uint64_t mmap_storage_alloc_page(mmap_storage_t *ms) {
     uint64_t page_id = ms->next_page_id;
     size_t required_size = (page_id + 1) * PAGE_SIZE;
 
-    /* Grow if needed */
+    /* Grow if needed (base never moves — no lock required) */
     if (required_size > ms->mapped_size) {
-        /* Double the size (or at least reach required_size) */
         size_t new_size = ms->mapped_size * 2;
         if (new_size < required_size) {
             new_size = required_size;
         }
 
-        /* Take write-lock for resize (blocks all readers briefly) */
-        pthread_rwlock_wrlock(&ms->resize_lock);
-
-        /* Double-check after acquiring lock */
-        if (required_size > ms->mapped_size) {
-            if (!mmap_storage_grow(ms, new_size)) {
-                pthread_rwlock_unlock(&ms->resize_lock);
-                return 0;
-            }
+        if (!mmap_storage_grow(ms, new_size)) {
+            return 0;
         }
-
-        pthread_rwlock_unlock(&ms->resize_lock);
     }
 
     ms->next_page_id = page_id + 1;
@@ -460,11 +492,9 @@ void mmap_storage_ensure_capacity(mmap_storage_t *ms, uint64_t total_pages) {
     size_t new_size = ms->mapped_size;
     while (new_size < required) new_size *= 2;
 
-    pthread_rwlock_wrlock(&ms->resize_lock);
     if (new_size > ms->mapped_size) {
         mmap_storage_grow(ms, new_size);
     }
-    pthread_rwlock_unlock(&ms->resize_lock);
 }
 
 /* ========================================================================== */

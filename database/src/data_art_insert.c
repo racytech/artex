@@ -22,7 +22,6 @@ extern node_ref_t data_art_alloc_node(data_art_tree_t *tree, size_t size);
 extern const void *data_art_load_node(data_art_tree_t *tree, node_ref_t ref);
 extern bool data_art_write_node(data_art_tree_t *tree, node_ref_t ref,
                                   const void *node, size_t size);
-extern void data_art_reset_arena(void);
 extern void data_art_publish_root(data_art_tree_t *tree);
 extern void data_art_release_page(data_art_tree_t *tree, node_ref_t old_ref);
 
@@ -716,9 +715,6 @@ bool data_art_insert(data_art_tree_t *tree, const uint8_t *key, size_t key_len,
         return txn_buffer_add_insert(ctx->txn_buffer, key, key_len, value, value_len);
     }
     
-    // Reset thread-local arena — each insert starts fresh
-    data_art_reset_arena();
-
     // Acquire write lock to serialize all write operations (one writer at a time)
     pthread_rwlock_wrlock(&tree->write_lock);
 
@@ -799,8 +795,6 @@ bool data_art_insert_internal(data_art_tree_t *tree, const uint8_t *key, size_t 
                                const void *value, size_t value_len, bool inplace) {
     if (!tree || !key || !value) return false;
     if (key_len != tree->key_size) return false;
-
-    data_art_reset_arena();
 
     tls_skip_mvcc = inplace;
 
