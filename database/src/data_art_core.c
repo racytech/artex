@@ -90,36 +90,43 @@ size_t get_node_size(data_art_node_type_t type) {
 
 
 // ============================================================================
-// Slot Page Bitmap Helpers
+// Slot Page Bitmap Helpers (64-bit word scan via ctzll)
 // ============================================================================
 
 /**
  * Find first free (0) bit in bitmap, searching up to 'count' bits.
  * Returns bit index, or -1 if all occupied.
+ *
+ * Uses 64-bit word scan with __builtin_ctzll — one or two iterations
+ * for up to 128 slots (all current classes fit in 1 word: max 55 slots).
  */
-static int bitmap_find_free(const uint8_t *bitmap, int count) {
-    for (int byte_idx = 0; byte_idx < (count + 7) / 8; byte_idx++) {
-        uint8_t b = bitmap[byte_idx];
-        if (b == 0xFF) continue;  // All 8 bits set
-        for (int bit = 0; bit < 8; bit++) {
-            int idx = byte_idx * 8 + bit;
-            if (idx >= count) return -1;
-            if (!(b & (1u << bit))) return idx;
-        }
+static inline int bitmap_find_free(const uint8_t *bitmap, int count) {
+    const uint64_t *words = (const uint64_t *)bitmap;
+    int remaining = count;
+
+    for (int w = 0; remaining > 0; w++, remaining -= 64) {
+        uint64_t word = words[w];
+        /* Mask off bits beyond count in the last word */
+        int bits_here = remaining < 64 ? remaining : 64;
+        if (bits_here < 64)
+            word |= ~((1ULL << bits_here) - 1);  /* force out-of-range bits to 1 */
+        uint64_t free_bits = ~word;
+        if (free_bits)
+            return w * 64 + __builtin_ctzll(free_bits);
     }
     return -1;
 }
 
 static inline void bitmap_set(uint8_t *bitmap, int idx) {
-    bitmap[idx / 8] |= (1u << (idx % 8));
+    ((uint64_t *)bitmap)[idx / 64] |= (1ULL << (idx % 64));
 }
 
 static inline void bitmap_clear(uint8_t *bitmap, int idx) {
-    bitmap[idx / 8] &= ~(1u << (idx % 8));
+    ((uint64_t *)bitmap)[idx / 64] &= ~(1ULL << (idx % 64));
 }
 
 static inline bool bitmap_test(const uint8_t *bitmap, int idx) {
-    return (bitmap[idx / 8] & (1u << (idx % 8))) != 0;
+    return (((const uint64_t *)bitmap)[idx / 64] >> (idx % 64)) & 1;
 }
 
 // ============================================================================
@@ -177,60 +184,60 @@ static int size_to_slot_class(data_art_tree_t *tree, size_t size) {
 }
 
 /**
- * Read slot page header from a page in the buffer pool.
+ * Read slot page header from a page (copy to stack).
  */
 static void slot_page_read_header(const page_t *page, slot_page_header_t *hdr) {
     memcpy(hdr, page->data, sizeof(slot_page_header_t));
 }
 
 /**
- * Write slot page header to a page in the buffer pool.
+ * Get a direct pointer to the slot page header on the mmap page.
+ * Caller must hold write_lock (header is modified in-place).
  */
-static void slot_page_write_header(page_t *page, const slot_page_header_t *hdr) {
-    memcpy(page->data, hdr, sizeof(slot_page_header_t));
+static inline slot_page_header_t *slot_page_header_mut(page_t *page) {
+    return (slot_page_header_t *)page->data;
+}
+
+static inline const slot_page_header_t *slot_page_header_ref(const page_t *page) {
+    return (const slot_page_header_t *)page->data;
 }
 
 /**
  * Allocate a slot on the given page. Returns offset within page->data, or 0 on failure.
- * The page must be pinned and will be marked dirty.
+ * Works in-place on the mmap page — no memcpy round-trip.
  */
 static uint32_t slot_page_alloc_slot(page_t *page, const slot_class_t *cls) {
-    slot_page_header_t hdr;
-    slot_page_read_header(page, &hdr);
+    slot_page_header_t *hdr = slot_page_header_mut(page);
 
-    if (hdr.used_count >= hdr.slot_count) {
-        return 0;  // Page full
-    }
+    if (hdr->used_count >= hdr->slot_count)
+        return 0;
 
-    int idx = bitmap_find_free(hdr.bitmap, hdr.slot_count);
+    int idx = bitmap_find_free(hdr->bitmap, hdr->slot_count);
     if (idx < 0) return 0;
 
-    bitmap_set(hdr.bitmap, idx);
-    hdr.used_count++;
-    slot_page_write_header(page, &hdr);
+    bitmap_set(hdr->bitmap, idx);
+    hdr->used_count++;
 
     return (uint32_t)(SLOT_PAGE_HEADER_SIZE + idx * cls->slot_size);
 }
 
 /**
  * Free a slot on the given page. Returns new used_count.
- * The page must be pinned and will be marked dirty.
+ * Works in-place on the mmap page — no memcpy round-trip.
  */
 static uint16_t slot_page_free_slot(page_t *page, uint32_t offset, const slot_class_t *cls) {
-    slot_page_header_t hdr;
-    slot_page_read_header(page, &hdr);
+    slot_page_header_t *hdr = slot_page_header_mut(page);
 
     int idx = (offset - SLOT_PAGE_HEADER_SIZE) / cls->slot_size;
-    if (idx < 0 || idx >= hdr.slot_count) {
+    if (idx < 0 || idx >= hdr->slot_count) {
         LOG_ERROR("Invalid slot index %d (offset=%u, slot_size=%u)", idx, offset, cls->slot_size);
-        return hdr.used_count;
+        return hdr->used_count;
     }
 
-    bitmap_clear(hdr.bitmap, idx);
-    if (hdr.used_count > 0) hdr.used_count--;
-    slot_page_write_header(page, &hdr);
+    bitmap_clear(hdr->bitmap, idx);
+    if (hdr->used_count > 0) hdr->used_count--;
 
-    return hdr.used_count;
+    return hdr->used_count;
 }
 
 /**
@@ -238,15 +245,13 @@ static uint16_t slot_page_free_slot(page_t *page, uint32_t offset, const slot_cl
  * The page must be freshly allocated (zero-initialized by mmap).
  */
 static void slot_page_init(page_t *page, const slot_class_t *cls) {
-    slot_page_header_t hdr = {
-        .node_type = cls->node_type,
-        .reserved = 0,
-        .slot_size = cls->slot_size,
-        .slot_count = cls->slots_per_page,
-        .used_count = 0,
-        .bitmap = {0},
-    };
-    slot_page_write_header(page, &hdr);
+    slot_page_header_t *hdr = slot_page_header_mut(page);
+    hdr->node_type = cls->node_type;
+    hdr->reserved = 0;
+    hdr->slot_size = cls->slot_size;
+    hdr->slot_count = cls->slots_per_page;
+    hdr->used_count = 0;
+    memset(hdr->bitmap, 0, sizeof(hdr->bitmap));
 }
 
 /**
@@ -318,9 +323,8 @@ static node_ref_t slot_alloc_hint(data_art_tree_t *tree, int class_idx, uint64_t
 
     if (hint_page_id != 0 && hint_page_id != cls->current_page_id) {
         page_t *page = mmap_storage_get_page(tree->mmap_storage, hint_page_id);
-        slot_page_header_t hdr;
-        slot_page_read_header(page, &hdr);
-        if (hdr.node_type == cls->node_type && hdr.used_count < hdr.slot_count) {
+        const slot_page_header_t *hdr = slot_page_header_ref(page);
+        if (hdr->node_type == cls->node_type && hdr->used_count < hdr->slot_count) {
             uint32_t offset = slot_page_alloc_slot(page, cls);
             if (offset != 0) {
                 tree->slot_hint_hits++;
@@ -367,15 +371,14 @@ static void slot_free(data_art_tree_t *tree, uint64_t page_id, uint32_t offset) 
 
     page_t *page = mmap_storage_get_page(tree->mmap_storage, page_id);
 
-    // Read header to determine class
-    slot_page_header_t hdr;
-    slot_page_read_header(page, &hdr);
+    // Read header to determine class (in-place)
+    const slot_page_header_t *hdr = slot_page_header_ref(page);
 
     // Find the matching class
     slot_class_t *cls = NULL;
     int class_idx = -1;
     for (int i = 0; i < NUM_SLOT_CLASSES; i++) {
-        if (tree->slot_classes[i].node_type == hdr.node_type) {
+        if (tree->slot_classes[i].node_type == hdr->node_type) {
             cls = &tree->slot_classes[i];
             class_idx = i;
             break;
@@ -383,7 +386,7 @@ static void slot_free(data_art_tree_t *tree, uint64_t page_id, uint32_t offset) 
     }
 
     if (!cls) {
-        LOG_ERROR("slot_free: unknown node_type %u on page %lu", hdr.node_type, page_id);
+        LOG_ERROR("slot_free: unknown node_type %u on page %lu", hdr->node_type, page_id);
         return;
     }
 
