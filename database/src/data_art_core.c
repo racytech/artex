@@ -475,10 +475,19 @@ static bool data_art_init_common(data_art_tree_t *tree, size_t key_size) {
     tree->max_depth = key_size + 1;
     tree->current_txn_id = 0;
 
-    if (pthread_rwlock_init(&tree->write_lock, NULL) != 0) {
+    // Writer-preferred rwlock: when a writer is waiting, new readers block
+    // until the writer completes. Prevents writer starvation under heavy
+    // concurrent read load (e.g., many JSON-RPC readers starving the block
+    // executor). Existing readers finish normally before the writer proceeds.
+    pthread_rwlockattr_t rwattr;
+    pthread_rwlockattr_init(&rwattr);
+    pthread_rwlockattr_setkind_np(&rwattr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+    if (pthread_rwlock_init(&tree->write_lock, &rwattr) != 0) {
         LOG_ERROR("Failed to initialize write_lock");
+        pthread_rwlockattr_destroy(&rwattr);
         return false;
     }
+    pthread_rwlockattr_destroy(&rwattr);
 
     tree->mvcc_manager = mvcc_manager_create();
     if (!tree->mvcc_manager) {

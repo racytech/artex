@@ -180,6 +180,12 @@ add_executable(test_stress_loop
 )
 target_link_libraries(test_stress_loop art_persistent pthread)
 
+# Test: Stress Grow (growing DB to target size, determinism checks)
+add_executable(test_stress_grow
+    database/tests/test_stress_grow.c
+)
+target_link_libraries(test_stress_grow art_persistent pthread)
+
 # Test: Prefix Key Debug
 add_executable(test_prefix_debug
     database/tests/test_prefix_debug.c
