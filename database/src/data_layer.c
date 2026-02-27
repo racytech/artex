@@ -3,6 +3,7 @@
 #include "../include/code_store.h"
 #include "../include/compact_art.h"
 #include "../include/mem_art.h"
+#include "../include/checkpoint.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -236,6 +237,68 @@ uint32_t dl_code_length(data_layer_t *dl, const uint8_t *key) {
     if (!(ref & CODE_REF_BIT)) return 0;
 
     return code_store_length(dl->code, ref & ~CODE_REF_BIT);
+}
+
+// ============================================================================
+// Checkpoint / Recovery
+// ============================================================================
+
+bool dl_checkpoint(data_layer_t *dl, const char *index_path,
+                   uint64_t block_number) {
+    if (!dl) return false;
+    return checkpoint_write(index_path, block_number,
+                            &dl->index, dl->store, dl->code);
+}
+
+data_layer_t *dl_open(const char *state_path, const char *code_path,
+                       const char *index_path,
+                       uint32_t key_size, uint32_t value_size,
+                       uint64_t *out_block_number) {
+    data_layer_t *dl = malloc(sizeof(data_layer_t));
+    if (!dl) return NULL;
+    memset(dl, 0, sizeof(*dl));
+    dl->key_size = key_size;
+
+    if (!compact_art_init(&dl->index, key_size, value_size)) {
+        free(dl);
+        return NULL;
+    }
+
+    dl->store = state_store_open(state_path);
+    if (!dl->store) {
+        compact_art_destroy(&dl->index);
+        free(dl);
+        return NULL;
+    }
+
+    if (code_path) {
+        dl->code = code_store_open(code_path);
+        if (!dl->code) {
+            compact_art_destroy(&dl->index);
+            state_store_destroy(dl->store);
+            free(dl);
+            return NULL;
+        }
+    }
+
+    if (!checkpoint_load(index_path, out_block_number,
+                         &dl->index, dl->store, dl->code)) {
+        compact_art_destroy(&dl->index);
+        state_store_destroy(dl->store);
+        if (dl->code) code_store_destroy(dl->code);
+        free(dl);
+        return NULL;
+    }
+
+    if (!art_tree_init(&dl->buffer)) {
+        compact_art_destroy(&dl->index);
+        state_store_destroy(dl->store);
+        if (dl->code) code_store_destroy(dl->code);
+        free(dl);
+        return NULL;
+    }
+
+    return dl;
 }
 
 // ============================================================================

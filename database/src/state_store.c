@@ -148,3 +148,26 @@ uint32_t state_store_free_count(const state_store_t *s) {
 int state_store_fd(const state_store_t *s) {
     return s ? s->fd : -1;
 }
+
+// ============================================================================
+// Checkpoint / Recovery Accessors
+// ============================================================================
+
+const uint32_t *state_store_free_list_ptr(const state_store_t *s) {
+    return s ? s->free_list : NULL;
+}
+
+void state_store_set_next_slot(state_store_t *s, uint32_t next_slot) {
+    if (s) s->next_slot = next_slot;
+}
+
+void state_store_restore_free_list(state_store_t *s,
+                                    const uint32_t *slots, uint32_t count) {
+    if (!s) return;
+    if (count > s->free_cap) {
+        s->free_cap = count;
+        s->free_list = realloc(s->free_list, s->free_cap * sizeof(uint32_t));
+    }
+    memcpy(s->free_list, slots, count * sizeof(uint32_t));
+    s->free_count = count;
+}

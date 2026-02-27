@@ -85,4 +85,22 @@ void code_store_sync(code_store_t *cs);
 uint32_t code_store_count(const code_store_t *cs);
 uint64_t code_store_file_size(const code_store_t *cs);
 
+// ============================================================================
+// Checkpoint / Recovery Accessors
+// ============================================================================
+
+/**
+ * Get entry metadata by index (for checkpoint serialization).
+ * Returns false if index is out of range.
+ */
+bool code_store_get_entry(const code_store_t *cs, uint32_t index,
+                           uint64_t *out_offset, uint32_t *out_length);
+
+/**
+ * Add an entry to the in-memory array without writing to file.
+ * Used by checkpoint recovery to restore the entries index.
+ * Returns false on allocation failure.
+ */
+bool code_store_add_entry(code_store_t *cs, uint64_t offset, uint32_t length);
+
 #endif // CODE_STORE_H

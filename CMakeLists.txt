@@ -31,10 +31,11 @@ add_library(compact_art STATIC
     database/src/compact_art.c
 )
 
-# Data Layer (state store + code store + write buffer + index merge)
+# Data Layer (state store + code store + checkpoint + write buffer + index merge)
 add_library(data_layer STATIC
     database/src/state_store.c
     database/src/code_store.c
+    database/src/checkpoint.c
     database/src/data_layer.c
 )
 target_link_libraries(data_layer compact_art art_database)
@@ -93,6 +94,12 @@ add_executable(test_code_store
     database/tests/test_code_store.c
 )
 target_link_libraries(test_code_store data_layer)
+
+# Test: Checkpoint & Recovery (index.dat serialization + CRC)
+add_executable(test_checkpoint
+    database/tests/test_checkpoint.c
+)
+target_link_libraries(test_checkpoint data_layer)
 
 # PoC: Account Encoding (compact variable-length account serialization)
 add_executable(test_account_encoding

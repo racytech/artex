@@ -195,25 +195,83 @@ static inline uint8_t *node_partial_mut(void *node) {
 }
 
 // ============================================================================
-// check_prefix — compare compressed path against key
+// find_minimum_leaf — leftmost leaf in subtree (for optimistic prefix check)
 // ============================================================================
 
-static int check_prefix(const void *node, const uint8_t *key,
+static compact_ref_t find_minimum_leaf(const compact_art_t *tree,
+                                        compact_ref_t ref) {
+    while (ref != COMPACT_REF_NULL && !COMPACT_IS_LEAF_REF(ref)) {
+        void *node = node_ptr(tree, ref);
+        switch (node_type(node)) {
+            case COMPACT_NODE_4:
+                ref = ((compact_node4_t *)node)->children[0];
+                break;
+            case COMPACT_NODE_16:
+                ref = ((compact_node16_t *)node)->children[0];
+                break;
+            case COMPACT_NODE_32:
+                ref = ((compact_node32_t *)node)->children[0];
+                break;
+            case COMPACT_NODE_48: {
+                compact_node48_t *n = node;
+                for (int i = 0; i < 256; i++) {
+                    if (n->index[i] != COMPACT_NODE48_EMPTY) {
+                        ref = n->children[n->index[i]];
+                        break;
+                    }
+                }
+                break;
+            }
+            case COMPACT_NODE_256: {
+                compact_node256_t *n = node;
+                for (int i = 0; i < 256; i++) {
+                    if (n->children[i] != COMPACT_REF_NULL) {
+                        ref = n->children[i];
+                        break;
+                    }
+                }
+                break;
+            }
+            default:
+                return COMPACT_REF_NULL;
+        }
+    }
+    return ref;
+}
+
+// ============================================================================
+// check_prefix — compare compressed path against key (optimistic)
+//
+// Compares stored prefix bytes first (up to COMPACT_MAX_PREFIX).
+// If prefix is longer, compares remaining bytes against a leaf key.
+// ============================================================================
+
+static int check_prefix(const compact_art_t *tree, compact_ref_t ref,
+                        const void *node, const uint8_t *key,
                         uint32_t key_size, size_t depth) {
     uint8_t plen = node_partial_len(node);
     const uint8_t *partial = node_partial(node);
     int max_cmp = plen;
-    if (depth + max_cmp > key_size) {
+    if (depth + (size_t)max_cmp > key_size) {
         max_cmp = (int)key_size - (int)depth;
     }
 
-    if (memcmp(partial, key + depth, max_cmp) == 0) {
-        return max_cmp;
-    }
-
-    for (int idx = 0; idx < max_cmp; idx++) {
+    // Compare stored bytes (up to COMPACT_MAX_PREFIX)
+    int stored = max_cmp < COMPACT_MAX_PREFIX ? max_cmp : COMPACT_MAX_PREFIX;
+    for (int idx = 0; idx < stored; idx++) {
         if (partial[idx] != key[depth + idx]) return idx;
     }
+
+    // If prefix extends beyond stored bytes, compare against leaf key
+    if (max_cmp > COMPACT_MAX_PREFIX) {
+        compact_ref_t min_leaf = find_minimum_leaf(tree, ref);
+        if (min_leaf == COMPACT_REF_NULL) return COMPACT_MAX_PREFIX;
+        const uint8_t *lk = leaf_key(tree, min_leaf);
+        for (int idx = COMPACT_MAX_PREFIX; idx < max_cmp; idx++) {
+            if (lk[depth + idx] != key[depth + idx]) return idx;
+        }
+    }
+
     return max_cmp;
 }
 
@@ -300,11 +358,13 @@ static void replace_child(const compact_art_t *tree, compact_ref_t node_ref,
 static compact_ref_t add_child(compact_art_t *tree, compact_ref_t node_ref,
                                 uint8_t byte, compact_ref_t child);
 
-// Copy header (partial_len + partial) from old node to new node
+// Copy header (partial_len + partial) from old node to new node.
+// Only copies up to COMPACT_MAX_PREFIX stored bytes.
 static void copy_header(void *dst, const void *src) {
-    ((uint8_t *)dst)[2] = ((const uint8_t *)src)[2];  // partial_len
-    memcpy(node_partial_mut(dst), node_partial(src),
-           node_partial_len(src));
+    uint8_t plen = ((const uint8_t *)src)[2];
+    ((uint8_t *)dst)[2] = plen;
+    uint8_t store = plen < COMPACT_MAX_PREFIX ? plen : COMPACT_MAX_PREFIX;
+    memcpy(node_partial_mut(dst), node_partial(src), store);
 }
 
 static compact_ref_t add_child(compact_art_t *tree, compact_ref_t node_ref,
@@ -597,10 +657,11 @@ static const void *search(const compact_art_t *tree, compact_ref_t ref,
 
         void *node = node_ptr(tree, ref);
 
-        // Check compressed path
+        // Check compressed path (optimistic: uses leaf for long prefixes)
         uint8_t plen = node_partial_len(node);
         if (plen > 0) {
-            int prefix_len = check_prefix(node, key, tree->key_size, depth);
+            int prefix_len = check_prefix(tree, ref, node, key,
+                                           tree->key_size, depth);
             if (prefix_len != plen) return NULL;
             depth += plen;
         }
@@ -664,7 +725,9 @@ static compact_ref_t insert_recursive(compact_art_t *tree, compact_ref_t ref,
         compact_node4_t *new_node = node_ptr(tree, new_node_ref);
         new_node->partial_len = (uint8_t)prefix_len;
         if (prefix_len > 0) {
-            memcpy(new_node->partial, key + depth, prefix_len);
+            size_t store = prefix_len < COMPACT_MAX_PREFIX
+                           ? prefix_len : COMPACT_MAX_PREFIX;
+            memcpy(new_node->partial, key + depth, store);
         }
 
         size_t new_depth = depth + prefix_len;
@@ -681,29 +744,61 @@ static compact_ref_t insert_recursive(compact_art_t *tree, compact_ref_t ref,
     void *node = node_ptr(tree, ref);
     uint8_t plen = node_partial_len(node);
     if (plen > 0) {
-        int prefix_len = check_prefix(node, key, tree->key_size, depth);
+        int prefix_len = check_prefix(tree, ref, node, key,
+                                       tree->key_size, depth);
 
         if (prefix_len < plen) {
             // Prefix mismatch — split
             *inserted = true;
 
+            // Get the mismatch byte from the existing subtree.
+            // If mismatch is within stored bytes, read from partial.
+            // Otherwise, find a leaf and read from the leaf key.
             uint8_t *partial = node_partial_mut(node);
-            uint8_t old_byte = partial[prefix_len];
+            uint8_t old_byte;
+            const uint8_t *leaf_k = NULL;
+            if (prefix_len < COMPACT_MAX_PREFIX) {
+                old_byte = partial[prefix_len];
+            } else {
+                compact_ref_t min_leaf = find_minimum_leaf(tree, ref);
+                leaf_k = leaf_key(tree, min_leaf);
+                old_byte = leaf_k[depth + prefix_len];
+            }
 
             compact_ref_t new_node_ref = alloc_node(tree, COMPACT_NODE_4);
             if (new_node_ref == COMPACT_REF_NULL) return ref;
 
-            // Re-resolve after alloc
+            // Re-resolve after alloc (node pool doesn't move, but be safe)
             node = node_ptr(tree, ref);
             partial = node_partial_mut(node);
 
             compact_node4_t *new_node = node_ptr(tree, new_node_ref);
             new_node->partial_len = (uint8_t)prefix_len;
-            memcpy(new_node->partial, partial, prefix_len);
+            {
+                size_t store = (size_t)prefix_len < COMPACT_MAX_PREFIX
+                               ? (size_t)prefix_len : COMPACT_MAX_PREFIX;
+                memcpy(new_node->partial, partial, store);
+            }
 
-            // Shift old node's prefix
+            // Update old node's prefix: remove first (prefix_len + 1) bytes
             uint8_t new_partial_len = plen - (prefix_len + 1);
-            memmove(partial, partial + prefix_len + 1, new_partial_len);
+            if (prefix_len + 1 < COMPACT_MAX_PREFIX) {
+                // Some stored bytes remain valid — shift them
+                size_t shift = (size_t)prefix_len + 1;
+                size_t avail = COMPACT_MAX_PREFIX - shift;
+                size_t keep = (size_t)new_partial_len < avail
+                              ? (size_t)new_partial_len : avail;
+                memmove(partial, partial + shift, keep);
+            } else {
+                // All stored bytes consumed — repopulate from leaf
+                if (!leaf_k) {
+                    compact_ref_t min_leaf = find_minimum_leaf(tree, ref);
+                    leaf_k = leaf_key(tree, min_leaf);
+                }
+                size_t store = (size_t)new_partial_len < COMPACT_MAX_PREFIX
+                               ? (size_t)new_partial_len : COMPACT_MAX_PREFIX;
+                memcpy(partial, leaf_k + depth + prefix_len + 1, store);
+            }
             ((uint8_t *)node)[2] = new_partial_len;
 
             compact_ref_t leaf = alloc_leaf(tree, key, value);
@@ -769,7 +864,8 @@ static compact_ref_t delete_recursive(compact_art_t *tree, compact_ref_t ref,
     // Check compressed path
     uint8_t plen = node_partial_len(node);
     if (plen > 0) {
-        int prefix_len = check_prefix(node, key, tree->key_size, depth);
+        int prefix_len = check_prefix(tree, ref, node, key,
+                                       tree->key_size, depth);
         if (prefix_len != plen) return ref;
         depth += plen;
     }
@@ -807,22 +903,25 @@ static compact_ref_t delete_recursive(compact_art_t *tree, compact_ref_t ref,
             node_num_children(node) == 1) {
             compact_node4_t *n4 = node;
             compact_ref_t only_child = n4->children[0];
-            uint8_t only_byte = n4->keys[0];
 
             if (COMPACT_IS_LEAF_REF(only_child)) {
                 return only_child;
             }
 
-            // Merge prefixes: node->partial + byte + child->partial
+            // Merge prefixes: parent_partial + byte + child_partial
+            // Use leaf key to reconstruct full prefix safely
             void *child_node = node_ptr(tree, only_child);
             uint8_t child_plen = node_partial_len(child_node);
-            uint32_t new_len = n4->partial_len + 1 + child_plen;
-            if (new_len <= COMPACT_MAX_PREFIX) {
+            uint32_t new_len = (uint32_t)n4->partial_len + 1 + child_plen;
+            if (new_len <= 255) {
+                compact_ref_t min_leaf = find_minimum_leaf(tree, only_child);
+                const uint8_t *lk = leaf_key(tree, min_leaf);
                 uint8_t *child_partial = node_partial_mut(child_node);
-                memmove(child_partial + n4->partial_len + 1,
-                        child_partial, child_plen);
-                memcpy(child_partial, n4->partial, n4->partial_len);
-                child_partial[n4->partial_len] = only_byte;
+                size_t store = (size_t)new_len < COMPACT_MAX_PREFIX
+                               ? (size_t)new_len : COMPACT_MAX_PREFIX;
+                // depth is where the parent node sits; merged prefix
+                // covers key bytes [depth .. depth+new_len-1]
+                memcpy(child_partial, lk + depth, store);
                 ((uint8_t *)child_node)[2] = (uint8_t)new_len;
                 return only_child;
             }

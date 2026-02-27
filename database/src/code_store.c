@@ -156,3 +156,28 @@ uint32_t code_store_count(const code_store_t *cs) {
 uint64_t code_store_file_size(const code_store_t *cs) {
     return cs ? cs->file_size : 0;
 }
+
+// ============================================================================
+// Checkpoint / Recovery Accessors
+// ============================================================================
+
+bool code_store_get_entry(const code_store_t *cs, uint32_t index,
+                           uint64_t *out_offset, uint32_t *out_length) {
+    if (!cs || index >= cs->count) return false;
+    if (out_offset) *out_offset = cs->entries[index].offset;
+    if (out_length) *out_length = cs->entries[index].length;
+    return true;
+}
+
+bool code_store_add_entry(code_store_t *cs, uint64_t offset, uint32_t length) {
+    if (!cs) return false;
+    if (cs->count >= cs->cap) {
+        cs->cap *= 2;
+        code_entry_t *tmp = realloc(cs->entries, cs->cap * sizeof(code_entry_t));
+        if (!tmp) return false;
+        cs->entries = tmp;
+    }
+    cs->entries[cs->count] = (code_entry_t){ .offset = offset, .length = length };
+    cs->count++;
+    return true;
+}

@@ -84,4 +84,24 @@ uint32_t state_store_next_slot(const state_store_t *s);
 uint32_t state_store_free_count(const state_store_t *s);
 int      state_store_fd(const state_store_t *s);
 
+// ============================================================================
+// Checkpoint / Recovery Accessors
+// ============================================================================
+
+/**
+ * Read-only access to the free list array (for checkpoint serialization).
+ */
+const uint32_t *state_store_free_list_ptr(const state_store_t *s);
+
+/**
+ * Restore allocator position (for checkpoint recovery).
+ */
+void state_store_set_next_slot(state_store_t *s, uint32_t next_slot);
+
+/**
+ * Restore the free list from a checkpoint (replaces current free list).
+ */
+void state_store_restore_free_list(state_store_t *s,
+                                    const uint32_t *slots, uint32_t count);
+
 #endif // STATE_STORE_H

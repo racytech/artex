@@ -116,6 +116,29 @@ uint32_t dl_code_length(data_layer_t *dl, const uint8_t *key);
 uint64_t dl_merge(data_layer_t *dl);
 
 // ============================================================================
+// Checkpoint / Recovery
+// ============================================================================
+
+/**
+ * Checkpoint current state to index file (atomic rename).
+ * Serializes compact_art index + state_store free list + code_store entries.
+ * Returns false on I/O error.
+ */
+bool dl_checkpoint(data_layer_t *dl, const char *index_path,
+                   uint64_t block_number);
+
+/**
+ * Open from existing checkpoint (recovery path).
+ * Rebuilds compact_art from index.dat, restores free list and code entries.
+ * out_block_number receives the checkpoint block number.
+ * Returns NULL on failure.
+ */
+data_layer_t *dl_open(const char *state_path, const char *code_path,
+                       const char *index_path,
+                       uint32_t key_size, uint32_t value_size,
+                       uint64_t *out_block_number);
+
+// ============================================================================
 // Diagnostics
 // ============================================================================
 
