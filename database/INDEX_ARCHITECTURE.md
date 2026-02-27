@@ -356,7 +356,219 @@ Maintain a free list of dead slots. When writing new entries during merge,
 reuse free slots first, only extend the file when the free list is empty.
 No separate compaction pass needed.
 
-## Memory Budget (500M keys)
+## Scaling to 1B Keys
+
+At 500M keys with 64 B/key, the index barely fits 32 GB. At 1B keys the
+current design uses ~71 GB — far too much. This section documents three
+optimizations to bring 1B keys down to ~25-30 GB.
+
+### Where memory goes at 1B keys (current design)
+
+```
+Component          Count      Per-item   Total
+─────────────────────────────────────────────────
+Leaves             1B         36 B       36 GB
+Depth-3 nodes      16.7M      2088 B     33 GB    ← Node256 forced
+Depth 0-2 nodes    ~65K       2088 B     0.14 GB
+Depth 4+ nodes     varies     varies     ~2 GB
+─────────────────────────────────────────────────
+Total                                    ~71 GB
+```
+
+Why depth-3 explodes: `1B / 256^3 = ~60 children` per depth-3 node.
+That exceeds Node48's capacity (48), forcing Node256 (2088 bytes) even
+though only 60 of 256 child slots are used.
+
+### Optimization 1: Node64 + Node128 (saves ~17 GB)
+
+New node types using the same indexed-lookup pattern as Node48
+(256-byte index array + N child pointers), just with larger child arrays:
+
+```
+Type      Children   Layout                               Size
+────────────────────────────────────────────────────────────────
+Node48    ≤48        index[256] + children[48]  + partial   680 B
+Node64    ≤64        index[256] + children[64]  + partial   808 B   NEW
+Node128   ≤128       index[256] + children[128] + partial  1320 B   NEW
+Node256   ≤256       children[256]              + partial  2088 B
+```
+
+Growth transitions:
+```
+Node4 → Node16 → Node32 → Node48 → Node64 → Node128 → Node256
+```
+
+At 1B keys, depth-3 children follow Poisson(mean=60):
+
+```
+Range     %     Node type   Count    Size     Total
+─────────────────────────────────────────────────────
+≤48       7%    Node48      1.1M     680 B    0.8 GB
+49-64     65%   Node64      10.9M    808 B    8.8 GB
+65-128    28%   Node128     4.7M     1320 B   6.3 GB
+>128      ~0%   Node256     ~0       2088 B   ~0 GB
+─────────────────────────────────────────────────────
+Total                       16.7M             15.9 GB
+```
+
+Was 33 GB with Node256 only. **Saves ~17 GB.**
+
+Node64 struct:
+```c
+typedef struct {
+    uint8_t type;
+    uint8_t num_children;
+    uint8_t partial_len;
+    uint8_t index[256];
+    uint8_t _pad[5];           // align children to 8 bytes
+    void *children[64];
+    uint8_t partial[COMPACT_MAX_PREFIX];
+} compact_node64_t;            // 808 bytes
+```
+
+Node128 struct:
+```c
+typedef struct {
+    uint8_t type;
+    uint8_t num_children;
+    uint8_t partial_len;
+    uint8_t index[256];
+    uint8_t _pad[5];           // align children to 8 bytes
+    void *children[128];
+    uint8_t partial[COMPACT_MAX_PREFIX];
+} compact_node128_t;           // 1320 bytes
+```
+
+### Optimization 2: Truncated key in leaf (saves ~24 GB)
+
+Store only 8 bytes of the key in each leaf instead of the full 32.
+
+```
+Current leaf:  [32B full key] [4B value] = 36 bytes
+New leaf:      [8B key prefix] [4B value] = 12 bytes
+```
+
+The ART path (edge labels + inner node partial prefixes) already verifies
+bytes 0..(depth-1) during traversal. The 8-byte prefix in the leaf covers
+the remaining verification and insert-split needs.
+
+**Search verification**: ART path verifies bytes 0..(D-1), leaf prefix
+verifies bytes 0..7. Combined: bytes 0..max(D-1,7) verified. Unverified
+region: bytes 8..31 (24 bytes). False positive probability: 1/2^192 —
+same security margin as a keccak256 collision.
+
+**Insert split**: When a new key collides with an existing leaf, we need
+to find the exact divergence byte to create a new inner node. For random
+32-byte keys at typical depth 3-4, the divergence byte is at position D,
+which is < 8. The 8-byte prefix always covers it.
+
+**Rare fallback**: If two keys share the same first 8 bytes but differ
+later (probability ≈ 1/2^32 for random keys), the full key must be read
+from state.dat via pread. This adds one disk read for an extremely rare
+case:
+
+```c
+// In insert_recursive, when leaf prefix matches but we need full key:
+uint32_t ref = leaf_get_value(tree, existing_leaf);
+uint8_t slot[SLOT_SIZE];
+pread(state_fd, slot, SLOT_SIZE, (uint64_t)(ref & 0x7FFFFFFF) * SLOT_SIZE);
+// Full key is in the slot, compare to find divergence byte
+```
+
+**Performance impact of fallback**:
+- Steady-state (~5K writes/block): maybe 0-1 fallback preads per block
+- Bulk load (1B inserts): ~0 fallbacks for random keys (1/2^32 per insert)
+- Even worst case at 1B: NVMe handles 1M IOPS, so any fallbacks are fast
+
+**Savings: 24B × 1B = 24 GB.**
+
+Leaf layout with truncated key:
+```c
+// Leaf in arena: key_prefix[8] + value[4] = 12 bytes, 4-byte aligned
+static inline void *alloc_leaf(compact_art_t *tree, const uint8_t *key,
+                               const void *value) {
+    size_t leaf_size = 8 + tree->value_size;  // 8B prefix + value
+    uint8_t *leaf = arena_alloc(&tree->arena, leaf_size, 4);
+    memcpy(leaf, key, 8);                     // store first 8 bytes
+    memcpy(leaf + 8, value, tree->value_size);
+    return COMPACT_MAKE_LEAF(leaf);
+}
+
+static inline bool leaf_matches(const compact_art_t *tree,
+                                void *tagged_ptr, const uint8_t *key) {
+    uint8_t *leaf = (uint8_t *)COMPACT_GET_LEAF(tagged_ptr);
+    return memcmp(leaf, key, 8) == 0;   // compare 8-byte prefix
+}
+```
+
+Note: the index file format changes too — entries become 12 bytes
+(8B key prefix + 4B ref) instead of 36 bytes (32B key + 4B ref). But
+the full key still exists in state.dat for crash recovery rebuild.
+
+### Optimization 3: 4-byte child offsets (saves ~5 GB)
+
+Replace `void *children[N]` (8 bytes each) with `uint32_t children[N]`
+(4 bytes each). Each child is an arena offset in 8-byte units:
+
+```
+uint32_t offset × 8 bytes = 32 GB addressable
+```
+
+Tagged pointer encoding in 32 bits:
+```
+bit 31 = 1: leaf   → (offset & 0x7FFFFFFF) × 4 into leaf arena
+bit 31 = 0: node   → offset × 8 into node arena
+```
+
+Requires splitting the arena into separate leaf and node arenas so each
+stays within its 32-bit addressing range.
+
+Size reduction:
+```
+Node64:  children from 512B to 256B → 552 bytes (was 808)
+Node128: children from 1024B to 512B → 808 bytes (was 1320)
+Node256: children from 2048B to 1024B → 1064 bytes (was 2088)
+```
+
+At 1B keys, inner nodes shrink from ~16 GB to ~11 GB. **Saves ~5 GB.**
+
+Implementation complexity is high — all pointer dereferences change,
+tagged pointer scheme changes, arena management splits in two. Only
+pursue if optimizations 1+2 aren't sufficient.
+
+### Combined Projections
+
+```
+                         Current   +Node64/128  +TruncKey   +4B Offsets
+─────────────────────────────────────────────────────────────────────────
+Leaves (1B)              36 GB     36 GB        12 GB       12 GB
+Inner nodes (depth 3)    33 GB     15.9 GB      15.9 GB     10.7 GB
+Inner nodes (other)      2.1 GB    2.1 GB       2.1 GB      1.4 GB
+─────────────────────────────────────────────────────────────────────────
+Total                    71.1 GB   54.0 GB      30.0 GB     24.1 GB
+B/key                    71 B      54 B         30 B        24 B
+Fits 32 GB?              No        No           Yes         Yes (headroom)
+Fits 64 GB?              No        Yes          Yes         Yes
+```
+
+### Implementation Priority
+
+```
+Priority   Optimization      Savings   Effort    Target
+─────────────────────────────────────────────────────────
+1          Node64 + Node128  ~17 GB    Medium    1B keys in 64 GB
+2          8B key in leaf    ~24 GB    Medium    1B keys in 32 GB
+3          4B child offsets  ~5 GB     High      Headroom / 2B keys
+```
+
+Node64/128 is the same indexed-lookup pattern as Node48 — straightforward
+to implement. Truncated keys require modifying leaf layout and adding the
+pread fallback path in insert_recursive. 4-byte offsets are a deeper
+refactor, only needed if 1+2 aren't enough.
+
+## Memory Budget
+
+### 500M keys (current design, 64 B/key leaf)
 
 | Component | Size |
 |-----------|------|
@@ -366,13 +578,19 @@ No separate compaction pass needed.
 | OS / process overhead | ~0.3 GB |
 | **Total RAM** | **~32.4 GB** |
 
-Tight for 32 GB. Options to reduce:
-- Smaller write buffer (K=50 blocks): saves ~0.25 GB
-- Compress partial[] in cold inner nodes: saves ~1-2 GB
-- 4-byte key prefix in leaf instead of full 32B key (with hash collision
-  handling): saves ~14 GB but adds complexity
+Requires 64 GB machine (leaves ~31 GB for page cache).
 
-For 64 GB RAM: plenty of headroom, no optimizations needed.
+### 1B keys (with Node64/128 + truncated key, ~30 B/key)
+
+| Component | Size |
+|-----------|------|
+| compact_art index | ~30 GB |
+| code_index array | ~0.7 GB |
+| Write buffer (mem_art, K=100 blocks) | ~0.5 GB |
+| OS / process overhead | ~0.3 GB |
+| **Total RAM** | **~31.5 GB** |
+
+Fits in 32 GB. For 64 GB machine, ~32 GB free for page cache.
 
 ## Disk Budget (500M keys)
 
