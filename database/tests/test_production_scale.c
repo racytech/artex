@@ -600,6 +600,10 @@ int main(int argc, char *argv[]) {
             struct timespec ckpt_start, ckpt_end;
             clock_gettime(CLOCK_MONOTONIC, &ckpt_start);
             data_art_checkpoint(tree, NULL);
+
+            // Compact if >30% of pages are dead (reuse pool + pending frees)
+            data_art_compact_if_needed(tree, 0.3, NULL);
+
             clock_gettime(CLOCK_MONOTONIC, &ckpt_end);
             last_ckpt_ms = (ckpt_end.tv_sec - ckpt_start.tv_sec) * 1000.0
                          + (ckpt_end.tv_nsec - ckpt_start.tv_nsec) / 1e6;

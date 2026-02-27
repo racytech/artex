@@ -460,6 +460,7 @@ bool data_art_compact(data_art_tree_t *tree, data_art_compact_result_t *result) 
     /* Reset slot allocator current pages (force fresh allocation from reuse pool) */
     for (int i = 0; i < NUM_SLOT_CLASSES; i++) {
         tree->slot_classes[i].current_page_id = 0;
+        tree->slot_classes[i].partial_count = 0;
     }
 
     /* ── Step 4: DFS bottom-up relocation ── */
@@ -481,6 +482,8 @@ bool data_art_compact(data_art_tree_t *tree, data_art_compact_result_t *result) 
         /* Keep current_page_id if it's below frontier; clear otherwise */
         if (tree->slot_classes[i].current_page_id >= frontier)
             tree->slot_classes[i].current_page_id = 0;
+        /* Clear partial-page lists — page IDs may be stale after truncation */
+        tree->slot_classes[i].partial_count = 0;
     }
 
     /* ── Step 6: Checkpoint with new root, then truncate ── */
@@ -492,6 +495,7 @@ bool data_art_compact(data_art_tree_t *tree, data_art_compact_result_t *result) 
                              tree->size, tree->key_size);
 
     mmap_storage_truncate(ms, frontier);
+    tree->last_compact_page_count = frontier;
 
     pthread_rwlock_unlock(&tree->write_lock);
 
@@ -513,4 +517,43 @@ bool data_art_compact(data_art_tree_t *tree, data_art_compact_result_t *result) 
     }
 
     return true;
+}
+
+bool data_art_compact_if_needed(data_art_tree_t *tree, double threshold,
+                                 data_art_compact_result_t *result) {
+    if (!tree || !tree->mmap_storage) return true;  /* no-op */
+
+    uint64_t total_pages = tree->mmap_storage->next_page_id;
+    if (total_pages < 256) return true;  /* too small to bother */
+
+    /* Skip compaction when the tree is large — the full DFS + relocation
+     * becomes too expensive (O(live_nodes)) and causes page cache thrashing.
+     * At 8 GB+ the partial-page reuse and hybrid growth handle waste well enough. */
+    size_t mapped_bytes = tree->mmap_storage->mapped_size;
+    if (mapped_bytes > (size_t)8 << 30) return true;  /* > 8 GB → skip */
+
+    /* Heuristic: compare current page count to the page count right after
+     * the last compaction (or tree creation).  If pages have grown by more
+     * than `threshold` fraction, the dead-page ratio is likely high enough
+     * to justify a full compaction.
+     *
+     * Example: threshold=0.3, last_compact=1000 pages, now=1400 pages
+     *   growth = (1400-1000)/1400 = 0.286 → skip
+     *   now=1500: growth = (1500-1000)/1500 = 0.333 → compact
+     *
+     * This works because in-place mode reuses slots but still accumulates
+     * partially-empty pages over time. */
+    uint64_t baseline = tree->last_compact_page_count;
+    if (baseline == 0) baseline = 1;  /* first compaction: use 1 as baseline */
+
+    if (total_pages <= baseline) return true;  /* no growth → skip */
+
+    double growth_ratio = (double)(total_pages - baseline) / (double)total_pages;
+
+    if (growth_ratio < threshold) return true;  /* below threshold — skip */
+
+    LOG_INFO("compact_if_needed: %.1f%% page growth (%lu → %lu) — triggering compaction",
+             growth_ratio * 100.0, baseline, total_pages);
+
+    return data_art_compact(tree, result);
 }

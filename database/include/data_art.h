@@ -158,11 +158,19 @@ typedef struct {
 /**
  * Per-type allocator state — tracks "current page" for each size class
  */
+#define SLOT_PARTIAL_LIST_CAP 64  // Max pages in partial-free list per class
 typedef struct {
     uint64_t current_page_id;   // Page currently accepting allocations (0 = none)
     uint16_t slot_size;         // Aligned slot size for this class
     uint16_t slots_per_page;    // Pre-computed max slots
     uint8_t  node_type;         // DATA_NODE_4, DATA_NODE_16, etc.
+
+    // Partial-page free list: pages with free slots available for reuse.
+    // When a slot is freed on a non-current page, that page is added here.
+    // slot_alloc() checks this list before allocating a fresh page.
+    uint64_t *partial_pages;    // Array of page IDs with free slots
+    size_t    partial_count;    // Number of pages in partial list
+    size_t    partial_capacity; // Capacity of partial_pages array
 } slot_class_t;
 
 // ============================================================================
@@ -427,6 +435,7 @@ typedef struct data_art_tree {
     uint64_t dedicated_pages_created;                // Fallback dedicated page allocs
     uint64_t pages_reused;                           // Pages recycled from reuse pool
     uint64_t inplace_mutations;                      // In-place mutations (skipped CoW)
+    uint64_t last_compact_page_count;                // next_page_id after last compaction
 } data_art_tree_t;
 
 // ============================================================================
@@ -929,6 +938,21 @@ typedef struct {
  * @return true on success
  */
 bool data_art_compact(data_art_tree_t *tree, data_art_compact_result_t *result);
+
+/**
+ * Compact the data file if the dead-page ratio exceeds a threshold.
+ *
+ * Estimates dead pages from the reuse pool + pending free list relative to
+ * total allocated pages.  If the ratio exceeds `threshold` (0.0-1.0),
+ * runs full compaction.  Safe to call frequently — no-op when below threshold.
+ *
+ * @param tree      Tree instance
+ * @param threshold Dead-page ratio threshold (e.g., 0.3 = compact when >30% dead)
+ * @param result    Output stats (can be NULL)
+ * @return true if compaction ran and succeeded (or was skipped), false on error
+ */
+bool data_art_compact_if_needed(data_art_tree_t *tree, double threshold,
+                                 data_art_compact_result_t *result);
 
 // ============================================================================
 // Statistics & Debugging

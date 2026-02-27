@@ -488,7 +488,18 @@ uint64_t mmap_storage_alloc_page(mmap_storage_t *ms) {
 
     /* Grow if needed (base never moves — no lock required) */
     if (required_size > ms->mapped_size) {
-        size_t new_size = ms->mapped_size * 2;
+        /* Hybrid growth: double below 1 GB, +50% below 32 GB, +25% above.
+         * Prevents catastrophic overallocation at production scale
+         * (e.g., 128 GB file for 27 GB of live data).
+         * Result is always page-aligned (required for mmap). */
+        size_t new_size;
+        if (ms->mapped_size < (size_t)1 << 30)        /* < 1 GB */
+            new_size = ms->mapped_size * 2;
+        else if (ms->mapped_size < (size_t)32 << 30)   /* < 32 GB */
+            new_size = ms->mapped_size + ms->mapped_size / 2;
+        else                                            /* >= 32 GB */
+            new_size = ms->mapped_size + ms->mapped_size / 4;
+        new_size = (new_size + PAGE_SIZE - 1) & ~(size_t)(PAGE_SIZE - 1);
         if (new_size < required_size) {
             new_size = required_size;
         }
@@ -514,7 +525,15 @@ void mmap_storage_ensure_capacity(mmap_storage_t *ms, uint64_t total_pages) {
     if (required <= ms->mapped_size) return;
 
     size_t new_size = ms->mapped_size;
-    while (new_size < required) new_size *= 2;
+    while (new_size < required) {
+        if (new_size < (size_t)1 << 30)
+            new_size *= 2;
+        else if (new_size < (size_t)32 << 30)
+            new_size += new_size / 2;
+        else
+            new_size += new_size / 4;
+        new_size = (new_size + PAGE_SIZE - 1) & ~(size_t)(PAGE_SIZE - 1);
+    }
 
     if (new_size > ms->mapped_size) {
         mmap_storage_grow(ms, new_size);

@@ -158,6 +158,9 @@ static void slot_allocator_init(data_art_tree_t *tree) {
         tree->slot_classes[i].slot_size = aligned;
         tree->slot_classes[i].slots_per_page = slots;
         tree->slot_classes[i].current_page_id = 0;
+        tree->slot_classes[i].partial_pages = NULL;
+        tree->slot_classes[i].partial_count = 0;
+        tree->slot_classes[i].partial_capacity = 0;
 
         LOG_DEBUG("Slot class %d: type=%u raw_size=%zu slot_size=%u slots/page=%u",
                   i, classes[i].type, classes[i].raw_size, aligned, slots);
@@ -284,7 +287,24 @@ static node_ref_t slot_alloc(data_art_tree_t *tree, int class_idx) {
         cls->current_page_id = 0;
     }
 
-    // Try reuse pool first, then allocate fresh
+    // Try partial-page list: reuse pages that had slots freed
+    while (cls->partial_count > 0) {
+        uint64_t partial_id = cls->partial_pages[--cls->partial_count];
+        page_t *ppage = mmap_storage_get_page(tree->mmap_storage, partial_id);
+        const slot_page_header_t *phdr = slot_page_header_ref(ppage);
+        if (phdr->node_type == cls->node_type && phdr->used_count < phdr->slot_count) {
+            uint32_t offset = slot_page_alloc_slot(ppage, cls);
+            if (offset != 0) {
+                cls->current_page_id = partial_id;
+                tree->slot_allocs[class_idx]++;
+                mmap_storage_mark_dirty(tree->mmap_storage, partial_id);
+                return node_ref_make(partial_id, offset);
+            }
+        }
+        // Page was full or wrong type — skip it
+    }
+
+    // Try reuse pool (whole freed pages), then allocate fresh
     uint64_t page_id = reuse_pool_pop(tree);
     if (page_id == 0) {
         page_id = mmap_storage_alloc_page(tree->mmap_storage);
@@ -399,8 +419,37 @@ static void slot_free(data_art_tree_t *tree, uint64_t page_id, uint32_t offset) 
         if (cls->current_page_id == page_id) {
             cls->current_page_id = 0;
         }
+        // Remove from partial list if present
+        for (size_t i = 0; i < cls->partial_count; i++) {
+            if (cls->partial_pages[i] == page_id) {
+                cls->partial_pages[i] = cls->partial_pages[--cls->partial_count];
+                break;
+            }
+        }
         // Add to pending free list (whole page)
         data_art_release_page(tree, node_ref_make(page_id, 0));
+    } else if (page_id != cls->current_page_id) {
+        // Page has free slots and isn't the current page — add to partial list
+        // (only if not already present)
+        bool found = false;
+        for (size_t i = 0; i < cls->partial_count; i++) {
+            if (cls->partial_pages[i] == page_id) { found = true; break; }
+        }
+        if (!found) {
+            if (cls->partial_count >= cls->partial_capacity) {
+                size_t new_cap = cls->partial_capacity == 0 ? 16
+                               : cls->partial_capacity * 2;
+                uint64_t *new_list = realloc(cls->partial_pages,
+                                             new_cap * sizeof(uint64_t));
+                if (new_list) {
+                    cls->partial_pages = new_list;
+                    cls->partial_capacity = new_cap;
+                }
+            }
+            if (cls->partial_count < cls->partial_capacity) {
+                cls->partial_pages[cls->partial_count++] = page_id;
+            }
+        }
     }
 }
 
@@ -571,6 +620,11 @@ void data_art_destroy(data_art_tree_t *tree) {
     drain_pending_frees(tree);
     free(tree->pending_free_pages);
     free(tree->pending_slot_frees);
+
+    // Free partial-page lists
+    for (int i = 0; i < NUM_SLOT_CLASSES; i++) {
+        free(tree->slot_classes[i].partial_pages);
+    }
 
     // Crash-safe checkpoint, then destroy storage
     mmap_storage_checkpoint(tree->mmap_storage,
