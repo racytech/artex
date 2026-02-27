@@ -501,6 +501,9 @@ int main(int argc, char *argv[]) {
         pthread_create(&reader_threads[i], NULL, reader_thread_fn, &reader_ctxs[i]);
     }
 
+    // Pin early pages + set MADV_RANDOM (budget: 8 GB or mapped size)
+    data_art_mlock_hot_pages(tree, (size_t)8 << 30, NULL);
+
     // Run writer on main thread
     struct timespec wall_start, now, last_progress;
     clock_gettime(CLOCK_MONOTONIC, &wall_start);
@@ -603,10 +606,6 @@ int main(int argc, char *argv[]) {
 
             // Compact if >30% of pages are dead (reuse pool + pending frees)
             data_art_compact_if_needed(tree, 0.3, NULL);
-
-            // Re-pin hot inner node pages after checkpoint/compaction.
-            // Budget: ~8 GB — enough for all inner nodes at reasonable scale.
-            data_art_mlock_hot_pages(tree, (size_t)8 << 30, NULL);
 
             clock_gettime(CLOCK_MONOTONIC, &ckpt_end);
             last_ckpt_ms = (ckpt_end.tv_sec - ckpt_start.tv_sec) * 1000.0
