@@ -61,7 +61,7 @@ typedef enum {
 #define COMPACT_NODE256_MAX 256
 
 // Maximum prefix bytes stored inline
-#define COMPACT_MAX_PREFIX 32
+#define COMPACT_MAX_PREFIX 8
 
 // Node48 empty index marker
 #define COMPACT_NODE48_EMPTY 255
