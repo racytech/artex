@@ -68,6 +68,12 @@ add_executable(bench_compact_art_index
 )
 target_link_libraries(bench_compact_art_index compact_art art_database)
 
+# Benchmark: per-block merge latency at scale
+add_executable(bench_per_block_merge
+    database/tests/bench_per_block_merge.c
+)
+target_link_libraries(bench_per_block_merge compact_art art_database)
+
 # PoC: Data Layer Integration Test (write buffer + index + state.dat)
 add_executable(test_data_layer_poc
     database/tests/test_data_layer_poc.c
