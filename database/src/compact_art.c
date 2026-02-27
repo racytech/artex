@@ -7,133 +7,119 @@
 #include <emmintrin.h>  // SSE2
 
 /**
- * Compact ART Implementation
+ * Compact ART Implementation — 4-byte child refs
  *
  * Space-efficient in-memory ART for fixed-size keys.
  *
- * Key differences from mem_art:
- * - Arena allocator (no malloc overhead per node/leaf)
- * - Tagged pointers (LSB=1 marks leaf, no type field in leaf)
- * - No per-leaf key_len/value_len (fixed at tree level)
- * - Packed inner node structs (uint8_t header fields)
- * - New Node32 type (2x SSE lookup, fills Node16–Node48 gap)
+ * Key design:
+ * - Two contiguous mmap pools: leaves (fixed-size slots) + nodes (bump-allocated)
+ * - 4-byte compact_ref_t instead of 8-byte void* pointers
+ *   bit 31 = 1: leaf ref (index into leaf pool)
+ *   bit 31 = 0: node ref (byte_offset/8 into node pool), 0 = NULL
+ * - Packed inner node structs (uint8_t header fields, uint32_t children)
+ * - Node32 with 2x SSE lookup
  */
 
 // ============================================================================
-// Arena Allocator
+// Pool Allocator
 // ============================================================================
 
-static bool arena_init(compact_arena_t *arena, size_t slab_size) {
-    arena->slab_size = slab_size;
-    arena->num_slabs = 0;
-    arena->slab_cap = 16;
-    arena->slabs = malloc(arena->slab_cap * sizeof(compact_arena_slab_t));
-    if (!arena->slabs) return false;
-    return true;
-}
+// Default virtual reservations (MAP_NORESERVE — virtual only, demand-paged)
+#define COMPACT_NODE_POOL_RESERVE  (16ULL * 1024 * 1024 * 1024)  // 16 GB
+#define COMPACT_LEAF_POOL_RESERVE  (64ULL * 1024 * 1024 * 1024)  // 64 GB
 
-static void arena_destroy(compact_arena_t *arena) {
-    for (size_t i = 0; i < arena->num_slabs; i++) {
-        munmap(arena->slabs[i].base, arena->slabs[i].capacity);
-    }
-    free(arena->slabs);
-    arena->slabs = NULL;
-    arena->num_slabs = 0;
-}
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
 
-static bool arena_grow(compact_arena_t *arena) {
-    if (arena->num_slabs >= arena->slab_cap) {
-        size_t new_cap = arena->slab_cap * 2;
-        compact_arena_slab_t *new_slabs = realloc(arena->slabs,
-            new_cap * sizeof(compact_arena_slab_t));
-        if (!new_slabs) return false;
-        arena->slabs = new_slabs;
-        arena->slab_cap = new_cap;
-    }
-
-    void *mem = mmap(NULL, arena->slab_size,
+static bool pool_init(compact_pool_t *pool, size_t reserve_bytes) {
+    void *mem = mmap(NULL, reserve_bytes,
                      PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mem == MAP_FAILED) return false;
-
-    compact_arena_slab_t *slab = &arena->slabs[arena->num_slabs];
-    slab->base = mem;
-    slab->capacity = arena->slab_size;
-    slab->used = 0;
-    arena->num_slabs++;
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                     -1, 0);
+    if (mem == MAP_FAILED) {
+        // Fallback: try 1/4 size
+        reserve_bytes /= 4;
+        mem = mmap(NULL, reserve_bytes,
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                   -1, 0);
+        if (mem == MAP_FAILED) return false;
+    }
+    pool->base = mem;
+    pool->reserved = reserve_bytes;
+    pool->used = 0;
     return true;
 }
 
-// Bump-allocate from arena.
-// align: required alignment (must be power of 2). Use 8 for inner nodes, 4 for leaves.
-static void *arena_alloc(compact_arena_t *arena, size_t size, size_t align) {
-    // Try current slab
-    if (arena->num_slabs > 0) {
-        compact_arena_slab_t *slab = &arena->slabs[arena->num_slabs - 1];
-        size_t aligned = (slab->used + align - 1) & ~(align - 1);
-        if (aligned + size <= slab->capacity) {
-            slab->used = aligned + size;
-            return slab->base + aligned;
-        }
+static void pool_destroy(compact_pool_t *pool) {
+    if (pool->base) {
+        munmap(pool->base, pool->reserved);
+        pool->base = NULL;
     }
+    pool->reserved = 0;
+    pool->used = 0;
+}
 
-    // Need new slab
-    size_t needed = size > arena->slab_size ? size : arena->slab_size;
-    size_t saved = arena->slab_size;
-    arena->slab_size = needed;
-    if (!arena_grow(arena)) {
-        arena->slab_size = saved;
-        return NULL;
-    }
-    arena->slab_size = saved;
+// ============================================================================
+// Ref Resolution
+// ============================================================================
 
-    compact_arena_slab_t *slab = &arena->slabs[arena->num_slabs - 1];
-    size_t aligned = (slab->used + align - 1) & ~(align - 1);
-    slab->used = aligned + size;
-    return slab->base + aligned;
+// Resolve a node ref to a raw pointer.
+// Caller guarantees ref is not a leaf ref and not NULL.
+static inline void *node_ptr(const compact_art_t *tree, compact_ref_t ref) {
+    return tree->nodes.base + (size_t)ref * 8;
+}
+
+// Resolve a leaf ref to raw leaf data (key || value).
+static inline uint8_t *leaf_ptr(const compact_art_t *tree, compact_ref_t ref) {
+    return tree->leaves.base +
+           (size_t)COMPACT_LEAF_INDEX(ref) * tree->leaf_size;
 }
 
 // ============================================================================
 // Leaf Helpers
 // ============================================================================
 
-// Leaf is raw bytes: key[key_size] + value[value_size], arena-allocated.
-// Pointer is tagged with LSB=1.
+static inline compact_ref_t alloc_leaf(compact_art_t *tree,
+                                        const uint8_t *key,
+                                        const void *value) {
+    uint32_t idx = tree->leaf_count;
+    size_t offset = (size_t)idx * tree->leaf_size;
+    if (offset + tree->leaf_size > tree->leaves.reserved)
+        return COMPACT_REF_NULL;
 
-static inline void *alloc_leaf(compact_art_t *tree, const uint8_t *key,
-                               const void *value) {
-    size_t leaf_size = tree->key_size + tree->value_size;
-    // 4-byte align: leaves are raw bytes accessed via memcpy, no pointer members.
-    // Tagged pointer uses LSB, so 2-byte align minimum. Use 4 to save vs 8-byte.
-    uint8_t *leaf = arena_alloc(&tree->arena, leaf_size, 4);
-    if (!leaf) return NULL;
+    tree->leaf_count++;
+    if (offset + tree->leaf_size > tree->leaves.used)
+        tree->leaves.used = offset + tree->leaf_size;
 
+    uint8_t *leaf = tree->leaves.base + offset;
     memcpy(leaf, key, tree->key_size);
     memcpy(leaf + tree->key_size, value, tree->value_size);
 
-    return COMPACT_MAKE_LEAF(leaf);
+    return COMPACT_MAKE_LEAF_REF(idx);
 }
 
-static inline const uint8_t *leaf_key(const void *tagged_ptr) {
-    return (const uint8_t *)COMPACT_GET_LEAF(tagged_ptr);
+static inline const uint8_t *leaf_key(const compact_art_t *tree,
+                                       compact_ref_t ref) {
+    return leaf_ptr(tree, ref);
 }
 
 static inline const void *leaf_value(const compact_art_t *tree,
-                                     const void *tagged_ptr) {
-    return (const uint8_t *)COMPACT_GET_LEAF(tagged_ptr) + tree->key_size;
+                                      compact_ref_t ref) {
+    return leaf_ptr(tree, ref) + tree->key_size;
 }
 
 static inline bool leaf_matches(const compact_art_t *tree,
-                                const void *tagged_ptr,
-                                const uint8_t *key) {
-    return memcmp(leaf_key(tagged_ptr), key, tree->key_size) == 0;
+                                 compact_ref_t ref,
+                                 const uint8_t *key) {
+    return memcmp(leaf_key(tree, ref), key, tree->key_size) == 0;
 }
 
-// Update leaf value in-place (arena memory is mutable)
 static inline void leaf_set_value(const compact_art_t *tree,
-                                  void *tagged_ptr,
-                                  const void *value) {
-    uint8_t *leaf = (uint8_t *)COMPACT_GET_LEAF(tagged_ptr);
+                                   compact_ref_t ref,
+                                   const void *value) {
+    uint8_t *leaf = leaf_ptr(tree, ref);
     memcpy(leaf + tree->key_size, value, tree->value_size);
 }
 
@@ -141,7 +127,7 @@ static inline void leaf_set_value(const compact_art_t *tree,
 // Inner Node Allocation
 // ============================================================================
 
-static void *alloc_node(compact_art_t *tree, compact_node_type_t type) {
+static compact_ref_t alloc_node(compact_art_t *tree, compact_node_type_t type) {
     size_t size;
     switch (type) {
         case COMPACT_NODE_4:   size = sizeof(compact_node4_t);   break;
@@ -149,24 +135,25 @@ static void *alloc_node(compact_art_t *tree, compact_node_type_t type) {
         case COMPACT_NODE_32:  size = sizeof(compact_node32_t);  break;
         case COMPACT_NODE_48:  size = sizeof(compact_node48_t);  break;
         case COMPACT_NODE_256: size = sizeof(compact_node256_t); break;
-        default: return NULL;
+        default: return COMPACT_REF_NULL;
     }
 
-    // 8-byte align: inner nodes contain void* children that need pointer alignment
-    void *node = arena_alloc(&tree->arena, size, 8);
-    if (!node) return NULL;
+    // 8-byte aligned bump allocation
+    compact_pool_t *pool = &tree->nodes;
+    size_t aligned = (pool->used + 7) & ~(size_t)7;
+    if (aligned + size > pool->reserved) return COMPACT_REF_NULL;
+    pool->used = aligned + size;
 
-    // Zero the entire node
+    void *node = pool->base + aligned;
     memset(node, 0, size);
-    ((uint8_t *)node)[0] = (uint8_t)type;  // Set type
+    ((uint8_t *)node)[0] = (uint8_t)type;
 
-    // Node48: initialize index to EMPTY
     if (type == COMPACT_NODE_48) {
         compact_node48_t *n48 = node;
         memset(n48->index, COMPACT_NODE48_EMPTY, 256);
     }
 
-    return node;
+    return (compact_ref_t)(aligned / 8);
 }
 
 // ============================================================================
@@ -186,7 +173,6 @@ static inline uint8_t node_partial_len(const void *node) {
 }
 
 static inline const uint8_t *node_partial(const void *node) {
-    // partial[] is at the end of each struct, offset depends on type
     switch (node_type(node)) {
         case COMPACT_NODE_4:   return ((const compact_node4_t *)node)->partial;
         case COMPACT_NODE_16:  return ((const compact_node16_t *)node)->partial;
@@ -232,10 +218,12 @@ static int check_prefix(const void *node, const uint8_t *key,
 }
 
 // ============================================================================
-// find_child — find child pointer for a given byte
+// find_child — find child ref for a given byte
 // ============================================================================
 
-static void **find_child_ptr(void *node, uint8_t byte) {
+static compact_ref_t *find_child_ptr(const compact_art_t *tree,
+                                      compact_ref_t node_ref, uint8_t byte) {
+    void *node = node_ptr(tree, node_ref);
     switch (node_type(node)) {
         case COMPACT_NODE_4: {
             compact_node4_t *n = node;
@@ -255,7 +243,6 @@ static void **find_child_ptr(void *node, uint8_t byte) {
         }
         case COMPACT_NODE_32: {
             compact_node32_t *n = node;
-            // Two SSE compares over sorted 32-byte key array
             __m128i key_vec = _mm_set1_epi8((char)byte);
             __m128i cmp1 = _mm_cmpeq_epi8(key_vec,
                             _mm_loadu_si128((__m128i *)n->keys));
@@ -282,7 +269,7 @@ static void **find_child_ptr(void *node, uint8_t byte) {
         }
         case COMPACT_NODE_256: {
             compact_node256_t *n = node;
-            if (!n->children[byte]) return NULL;
+            if (n->children[byte] == COMPACT_REF_NULL) return NULL;
             return &n->children[byte];
         }
         default:
@@ -290,17 +277,19 @@ static void **find_child_ptr(void *node, uint8_t byte) {
     }
 }
 
-static void *find_child(void *node, uint8_t byte) {
-    void **ptr = find_child_ptr(node, byte);
-    return ptr ? *ptr : NULL;
+static compact_ref_t find_child(const compact_art_t *tree,
+                                 compact_ref_t node_ref, uint8_t byte) {
+    compact_ref_t *ptr = find_child_ptr(tree, node_ref, byte);
+    return ptr ? *ptr : COMPACT_REF_NULL;
 }
 
 // ============================================================================
-// replace_child — replace child pointer in-place
+// replace_child — replace child ref in-place
 // ============================================================================
 
-static void replace_child(void *node, uint8_t byte, void *new_child) {
-    void **ptr = find_child_ptr(node, byte);
+static void replace_child(const compact_art_t *tree, compact_ref_t node_ref,
+                           uint8_t byte, compact_ref_t new_child) {
+    compact_ref_t *ptr = find_child_ptr(tree, node_ref, byte);
     if (ptr) *ptr = new_child;
 }
 
@@ -308,8 +297,8 @@ static void replace_child(void *node, uint8_t byte, void *new_child) {
 // add_child — add a new child, growing node if full
 // ============================================================================
 
-static void *add_child(compact_art_t *tree, void *node, uint8_t byte,
-                        void *child);
+static compact_ref_t add_child(compact_art_t *tree, compact_ref_t node_ref,
+                                uint8_t byte, compact_ref_t child);
 
 // Copy header (partial_len + partial) from old node to new node
 static void copy_header(void *dst, const void *src) {
@@ -318,13 +307,13 @@ static void copy_header(void *dst, const void *src) {
            node_partial_len(src));
 }
 
-static void *add_child(compact_art_t *tree, void *node, uint8_t byte,
-                        void *child) {
+static compact_ref_t add_child(compact_art_t *tree, compact_ref_t node_ref,
+                                uint8_t byte, compact_ref_t child) {
+    void *node = node_ptr(tree, node_ref);
     switch (node_type(node)) {
         case COMPACT_NODE_4: {
             compact_node4_t *n = node;
             if (n->num_children < COMPACT_NODE4_MAX) {
-                // Insert sorted
                 int i;
                 for (i = 0; i < n->num_children; i++) {
                     if (byte < n->keys[i]) break;
@@ -333,23 +322,25 @@ static void *add_child(compact_art_t *tree, void *node, uint8_t byte,
                     memmove(&n->keys[i + 1], &n->keys[i],
                             n->num_children - i);
                     memmove(&n->children[i + 1], &n->children[i],
-                            (n->num_children - i) * sizeof(void *));
+                            (n->num_children - i) * sizeof(compact_ref_t));
                 }
                 n->keys[i] = byte;
                 n->children[i] = child;
                 n->num_children++;
-                return node;
+                return node_ref;
             }
             // Grow to Node16
-            compact_node16_t *n16 = alloc_node(tree, COMPACT_NODE_16);
-            if (!n16) return node;
+            compact_ref_t n16_ref = alloc_node(tree, COMPACT_NODE_16);
+            if (n16_ref == COMPACT_REF_NULL) return node_ref;
+            // Re-resolve after alloc (pool is contiguous, no move, but good hygiene)
+            n = node_ptr(tree, node_ref);
+            compact_node16_t *n16 = node_ptr(tree, n16_ref);
             copy_header(n16, n);
             memcpy(n16->keys, n->keys, COMPACT_NODE4_MAX);
             memcpy(n16->children, n->children,
-                   COMPACT_NODE4_MAX * sizeof(void *));
+                   COMPACT_NODE4_MAX * sizeof(compact_ref_t));
             n16->num_children = COMPACT_NODE4_MAX;
-            // Arena: old node is abandoned (not freed)
-            return add_child(tree, n16, byte, child);
+            return add_child(tree, n16_ref, byte, child);
         }
 
         case COMPACT_NODE_16: {
@@ -363,22 +354,24 @@ static void *add_child(compact_art_t *tree, void *node, uint8_t byte,
                     memmove(&n->keys[i + 1], &n->keys[i],
                             n->num_children - i);
                     memmove(&n->children[i + 1], &n->children[i],
-                            (n->num_children - i) * sizeof(void *));
+                            (n->num_children - i) * sizeof(compact_ref_t));
                 }
                 n->keys[i] = byte;
                 n->children[i] = child;
                 n->num_children++;
-                return node;
+                return node_ref;
             }
             // Grow to Node32
-            compact_node32_t *n32 = alloc_node(tree, COMPACT_NODE_32);
-            if (!n32) return node;
+            compact_ref_t n32_ref = alloc_node(tree, COMPACT_NODE_32);
+            if (n32_ref == COMPACT_REF_NULL) return node_ref;
+            n = node_ptr(tree, node_ref);
+            compact_node32_t *n32 = node_ptr(tree, n32_ref);
             copy_header(n32, n);
             memcpy(n32->keys, n->keys, COMPACT_NODE16_MAX);
             memcpy(n32->children, n->children,
-                   COMPACT_NODE16_MAX * sizeof(void *));
+                   COMPACT_NODE16_MAX * sizeof(compact_ref_t));
             n32->num_children = COMPACT_NODE16_MAX;
-            return add_child(tree, n32, byte, child);
+            return add_child(tree, n32_ref, byte, child);
         }
 
         case COMPACT_NODE_32: {
@@ -392,41 +385,44 @@ static void *add_child(compact_art_t *tree, void *node, uint8_t byte,
                     memmove(&n->keys[i + 1], &n->keys[i],
                             n->num_children - i);
                     memmove(&n->children[i + 1], &n->children[i],
-                            (n->num_children - i) * sizeof(void *));
+                            (n->num_children - i) * sizeof(compact_ref_t));
                 }
                 n->keys[i] = byte;
                 n->children[i] = child;
                 n->num_children++;
-                return node;
+                return node_ref;
             }
             // Grow to Node48
-            compact_node48_t *n48 = alloc_node(tree, COMPACT_NODE_48);
-            if (!n48) return node;
+            compact_ref_t n48_ref = alloc_node(tree, COMPACT_NODE_48);
+            if (n48_ref == COMPACT_REF_NULL) return node_ref;
+            n = node_ptr(tree, node_ref);
+            compact_node48_t *n48 = node_ptr(tree, n48_ref);
             copy_header(n48, n);
             for (int i = 0; i < COMPACT_NODE32_MAX; i++) {
                 n48->index[n->keys[i]] = i;
                 n48->children[i] = n->children[i];
             }
             n48->num_children = COMPACT_NODE32_MAX;
-            return add_child(tree, n48, byte, child);
+            return add_child(tree, n48_ref, byte, child);
         }
 
         case COMPACT_NODE_48: {
             compact_node48_t *n = node;
             if (n->num_children < COMPACT_NODE48_MAX) {
-                // Find free slot
                 int slot;
                 for (slot = 0; slot < COMPACT_NODE48_MAX; slot++) {
-                    if (!n->children[slot]) break;
+                    if (n->children[slot] == COMPACT_REF_NULL) break;
                 }
                 n->index[byte] = (uint8_t)slot;
                 n->children[slot] = child;
                 n->num_children++;
-                return node;
+                return node_ref;
             }
             // Grow to Node256
-            compact_node256_t *n256 = alloc_node(tree, COMPACT_NODE_256);
-            if (!n256) return node;
+            compact_ref_t n256_ref = alloc_node(tree, COMPACT_NODE_256);
+            if (n256_ref == COMPACT_REF_NULL) return node_ref;
+            n = node_ptr(tree, node_ref);
+            compact_node256_t *n256 = node_ptr(tree, n256_ref);
             copy_header(n256, n);
             for (int i = 0; i < 256; i++) {
                 if (n->index[i] != COMPACT_NODE48_EMPTY) {
@@ -434,20 +430,20 @@ static void *add_child(compact_art_t *tree, void *node, uint8_t byte,
                 }
             }
             n256->num_children = n->num_children;
-            return add_child(tree, n256, byte, child);
+            return add_child(tree, n256_ref, byte, child);
         }
 
         case COMPACT_NODE_256: {
             compact_node256_t *n = node;
-            if (!n->children[byte]) {
+            if (n->children[byte] == COMPACT_REF_NULL) {
                 n->num_children++;
             }
             n->children[byte] = child;
-            return node;
+            return node_ref;
         }
 
         default:
-            return node;
+            return node_ref;
     }
 }
 
@@ -455,7 +451,9 @@ static void *add_child(compact_art_t *tree, void *node, uint8_t byte,
 // remove_child — remove a child, shrinking node if needed
 // ============================================================================
 
-static void *remove_child(compact_art_t *tree, void *node, uint8_t byte) {
+static compact_ref_t remove_child(compact_art_t *tree, compact_ref_t node_ref,
+                                   uint8_t byte) {
+    void *node = node_ptr(tree, node_ref);
     switch (node_type(node)) {
         case COMPACT_NODE_4: {
             compact_node4_t *n = node;
@@ -464,9 +462,9 @@ static void *remove_child(compact_art_t *tree, void *node, uint8_t byte) {
                     memmove(&n->keys[i], &n->keys[i + 1],
                             n->num_children - i - 1);
                     memmove(&n->children[i], &n->children[i + 1],
-                            (n->num_children - i - 1) * sizeof(void *));
+                            (n->num_children - i - 1) * sizeof(compact_ref_t));
                     n->num_children--;
-                    return node;
+                    return node_ref;
                 }
             }
             break;
@@ -478,21 +476,22 @@ static void *remove_child(compact_art_t *tree, void *node, uint8_t byte) {
                     memmove(&n->keys[i], &n->keys[i + 1],
                             n->num_children - i - 1);
                     memmove(&n->children[i], &n->children[i + 1],
-                            (n->num_children - i - 1) * sizeof(void *));
+                            (n->num_children - i - 1) * sizeof(compact_ref_t));
                     n->num_children--;
-                    // Shrink Node16 → Node4
                     if (n->num_children <= COMPACT_NODE4_MAX) {
-                        compact_node4_t *n4 = alloc_node(tree, COMPACT_NODE_4);
-                        if (n4) {
+                        compact_ref_t n4_ref = alloc_node(tree, COMPACT_NODE_4);
+                        if (n4_ref != COMPACT_REF_NULL) {
+                            n = node_ptr(tree, node_ref);
+                            compact_node4_t *n4 = node_ptr(tree, n4_ref);
                             copy_header(n4, n);
                             n4->num_children = n->num_children;
                             memcpy(n4->keys, n->keys, n->num_children);
                             memcpy(n4->children, n->children,
-                                   n->num_children * sizeof(void *));
-                            return n4;
+                                   n->num_children * sizeof(compact_ref_t));
+                            return n4_ref;
                         }
                     }
-                    return node;
+                    return node_ref;
                 }
             }
             break;
@@ -504,21 +503,22 @@ static void *remove_child(compact_art_t *tree, void *node, uint8_t byte) {
                     memmove(&n->keys[i], &n->keys[i + 1],
                             n->num_children - i - 1);
                     memmove(&n->children[i], &n->children[i + 1],
-                            (n->num_children - i - 1) * sizeof(void *));
+                            (n->num_children - i - 1) * sizeof(compact_ref_t));
                     n->num_children--;
-                    // Shrink Node32 → Node16
                     if (n->num_children <= COMPACT_NODE16_MAX) {
-                        compact_node16_t *n16 = alloc_node(tree, COMPACT_NODE_16);
-                        if (n16) {
+                        compact_ref_t n16_ref = alloc_node(tree, COMPACT_NODE_16);
+                        if (n16_ref != COMPACT_REF_NULL) {
+                            n = node_ptr(tree, node_ref);
+                            compact_node16_t *n16 = node_ptr(tree, n16_ref);
                             copy_header(n16, n);
                             n16->num_children = n->num_children;
                             memcpy(n16->keys, n->keys, n->num_children);
                             memcpy(n16->children, n->children,
-                                   n->num_children * sizeof(void *));
-                            return n16;
+                                   n->num_children * sizeof(compact_ref_t));
+                            return n16_ref;
                         }
                     }
-                    return node;
+                    return node_ref;
                 }
             }
             break;
@@ -527,72 +527,75 @@ static void *remove_child(compact_art_t *tree, void *node, uint8_t byte) {
             compact_node48_t *n = node;
             uint8_t idx = n->index[byte];
             if (idx != COMPACT_NODE48_EMPTY) {
-                n->children[idx] = NULL;
+                n->children[idx] = COMPACT_REF_NULL;
                 n->index[byte] = COMPACT_NODE48_EMPTY;
                 n->num_children--;
-                // Shrink Node48 → Node32
                 if (n->num_children <= COMPACT_NODE32_MAX) {
-                    compact_node32_t *n32 = alloc_node(tree, COMPACT_NODE_32);
-                    if (n32) {
+                    compact_ref_t n32_ref = alloc_node(tree, COMPACT_NODE_32);
+                    if (n32_ref != COMPACT_REF_NULL) {
+                        n = node_ptr(tree, node_ref);
+                        compact_node32_t *n32 = node_ptr(tree, n32_ref);
                         copy_header(n32, n);
                         n32->num_children = 0;
                         for (int i = 0; i < 256; i++) {
                             if (n->index[i] != COMPACT_NODE48_EMPTY) {
-                                // Insert sorted
                                 int pos = n32->num_children;
                                 n32->keys[pos] = (uint8_t)i;
                                 n32->children[pos] = n->children[n->index[i]];
                                 n32->num_children++;
                             }
                         }
-                        return n32;
+                        return n32_ref;
                     }
                 }
-                return node;
+                return node_ref;
             }
             break;
         }
         case COMPACT_NODE_256: {
             compact_node256_t *n = node;
-            n->children[byte] = NULL;
+            n->children[byte] = COMPACT_REF_NULL;
             n->num_children--;
-            // Shrink Node256 → Node48
             if (n->num_children <= COMPACT_NODE48_MAX) {
-                compact_node48_t *n48 = alloc_node(tree, COMPACT_NODE_48);
-                if (n48) {
+                compact_ref_t n48_ref = alloc_node(tree, COMPACT_NODE_48);
+                if (n48_ref != COMPACT_REF_NULL) {
+                    n = node_ptr(tree, node_ref);
+                    compact_node48_t *n48 = node_ptr(tree, n48_ref);
                     copy_header(n48, n);
                     n48->num_children = 0;
                     for (int i = 0; i < 256; i++) {
-                        if (n->children[i]) {
+                        if (n->children[i] != COMPACT_REF_NULL) {
                             n48->index[i] = n48->num_children;
                             n48->children[n48->num_children] = n->children[i];
                             n48->num_children++;
                         }
                     }
-                    return n48;
+                    return n48_ref;
                 }
             }
-            return node;
+            return node_ref;
         }
         default:
             break;
     }
-    return node;
+    return node_ref;
 }
 
 // ============================================================================
 // search — iterative lookup
 // ============================================================================
 
-static const void *search(const compact_art_t *tree, const void *node,
+static const void *search(const compact_art_t *tree, compact_ref_t ref,
                           const uint8_t *key, size_t depth) {
-    while (node) {
-        if (COMPACT_IS_LEAF(node)) {
-            if (leaf_matches(tree, node, key)) {
-                return leaf_value(tree, node);
+    while (ref != COMPACT_REF_NULL) {
+        if (COMPACT_IS_LEAF_REF(ref)) {
+            if (leaf_matches(tree, ref, key)) {
+                return leaf_value(tree, ref);
             }
             return NULL;
         }
+
+        void *node = node_ptr(tree, ref);
 
         // Check compressed path
         uint8_t plen = node_partial_len(node);
@@ -603,17 +606,17 @@ static const void *search(const compact_art_t *tree, const void *node,
         }
 
         uint8_t byte = (depth < tree->key_size) ? key[depth] : 0x00;
-        void *child = find_child((void *)node, byte);
-        if (!child) return NULL;
+        compact_ref_t child = find_child(tree, ref, byte);
+        if (child == COMPACT_REF_NULL) return NULL;
 
         if (depth >= tree->key_size) {
-            if (COMPACT_IS_LEAF(child) && leaf_matches(tree, child, key)) {
+            if (COMPACT_IS_LEAF_REF(child) && leaf_matches(tree, child, key)) {
                 return leaf_value(tree, child);
             }
             return NULL;
         }
 
-        node = child;
+        ref = child;
         depth++;
     }
     return NULL;
@@ -623,30 +626,29 @@ static const void *search(const compact_art_t *tree, const void *node,
 // insert_recursive
 // ============================================================================
 
-static void *insert_recursive(compact_art_t *tree, void *node,
-                               const uint8_t *key, size_t depth,
-                               const void *value, bool *inserted) {
+static compact_ref_t insert_recursive(compact_art_t *tree, compact_ref_t ref,
+                                       const uint8_t *key, size_t depth,
+                                       const void *value, bool *inserted) {
     // Base case: empty slot
-    if (!node) {
+    if (ref == COMPACT_REF_NULL) {
         *inserted = true;
         return alloc_leaf(tree, key, value);
     }
 
     // Leaf: match or split
-    if (COMPACT_IS_LEAF(node)) {
-        if (leaf_matches(tree, node, key)) {
-            // Update value in-place
-            leaf_set_value(tree, node, value);
+    if (COMPACT_IS_LEAF_REF(ref)) {
+        if (leaf_matches(tree, ref, key)) {
+            leaf_set_value(tree, ref, value);
             *inserted = false;
-            return node;
+            return ref;
         }
 
         // Keys differ — create new inner node
         *inserted = true;
-        void *new_leaf = alloc_leaf(tree, key, value);
-        if (!new_leaf) return node;
+        compact_ref_t new_leaf = alloc_leaf(tree, key, value);
+        if (new_leaf == COMPACT_REF_NULL) return ref;
 
-        const uint8_t *existing_key = leaf_key(node);
+        const uint8_t *existing_key = leaf_key(tree, ref);
 
         // Find common prefix from current depth
         size_t limit = tree->key_size;
@@ -656,9 +658,10 @@ static void *insert_recursive(compact_art_t *tree, void *node,
             prefix_len++;
         }
 
-        compact_node4_t *new_node = alloc_node(tree, COMPACT_NODE_4);
-        if (!new_node) return node;
+        compact_ref_t new_node_ref = alloc_node(tree, COMPACT_NODE_4);
+        if (new_node_ref == COMPACT_REF_NULL) return ref;
 
+        compact_node4_t *new_node = node_ptr(tree, new_node_ref);
         new_node->partial_len = (uint8_t)prefix_len;
         if (prefix_len > 0) {
             memcpy(new_node->partial, key + depth, prefix_len);
@@ -669,12 +672,13 @@ static void *insert_recursive(compact_art_t *tree, void *node,
         uint8_t old_byte = (new_depth < tree->key_size) ?
                             existing_key[new_depth] : 0x00;
 
-        void *result = add_child(tree, new_node, new_byte, new_leaf);
-        result = add_child(tree, result, old_byte, node);
+        compact_ref_t result = add_child(tree, new_node_ref, new_byte, new_leaf);
+        result = add_child(tree, result, old_byte, ref);
         return result;
     }
 
     // Inner node: check compressed path
+    void *node = node_ptr(tree, ref);
     uint8_t plen = node_partial_len(node);
     if (plen > 0) {
         int prefix_len = check_prefix(node, key, tree->key_size, depth);
@@ -686,24 +690,29 @@ static void *insert_recursive(compact_art_t *tree, void *node,
             uint8_t *partial = node_partial_mut(node);
             uint8_t old_byte = partial[prefix_len];
 
-            compact_node4_t *new_node = alloc_node(tree, COMPACT_NODE_4);
-            if (!new_node) return node;
+            compact_ref_t new_node_ref = alloc_node(tree, COMPACT_NODE_4);
+            if (new_node_ref == COMPACT_REF_NULL) return ref;
 
+            // Re-resolve after alloc
+            node = node_ptr(tree, ref);
+            partial = node_partial_mut(node);
+
+            compact_node4_t *new_node = node_ptr(tree, new_node_ref);
             new_node->partial_len = (uint8_t)prefix_len;
             memcpy(new_node->partial, partial, prefix_len);
 
             // Shift old node's prefix
             uint8_t new_partial_len = plen - (prefix_len + 1);
             memmove(partial, partial + prefix_len + 1, new_partial_len);
-            ((uint8_t *)node)[2] = new_partial_len;  // Set partial_len
+            ((uint8_t *)node)[2] = new_partial_len;
 
-            void *leaf = alloc_leaf(tree, key, value);
-            if (!leaf) return node;
+            compact_ref_t leaf = alloc_leaf(tree, key, value);
+            if (leaf == COMPACT_REF_NULL) return ref;
 
             uint8_t new_byte = (depth + prefix_len < tree->key_size) ?
                                 key[depth + prefix_len] : 0x00;
 
-            void *result = add_child(tree, new_node, old_byte, node);
+            compact_ref_t result = add_child(tree, new_node_ref, old_byte, ref);
             result = add_child(tree, result, new_byte, leaf);
             return result;
         }
@@ -712,108 +721,115 @@ static void *insert_recursive(compact_art_t *tree, void *node,
     }
 
     uint8_t byte = (depth < tree->key_size) ? key[depth] : 0x00;
-    void *child = find_child(node, byte);
+    compact_ref_t child = find_child(tree, ref, byte);
 
-    if (child) {
+    if (child != COMPACT_REF_NULL) {
         if (depth >= tree->key_size) {
-            // Key consumed, child should be matching leaf
-            if (COMPACT_IS_LEAF(child) && leaf_matches(tree, child, key)) {
+            if (COMPACT_IS_LEAF_REF(child) && leaf_matches(tree, child, key)) {
                 leaf_set_value(tree, child, value);
                 *inserted = false;
             }
-            return node;
+            return ref;
         }
-        void *new_child = insert_recursive(tree, child, key, depth + 1,
-                                            value, inserted);
+        compact_ref_t new_child = insert_recursive(tree, child, key, depth + 1,
+                                                    value, inserted);
         if (new_child != child) {
-            replace_child(node, byte, new_child);
+            replace_child(tree, ref, byte, new_child);
         }
     } else {
         *inserted = true;
-        void *leaf = alloc_leaf(tree, key, value);
-        if (leaf) {
-            node = add_child(tree, node, byte, leaf);
+        compact_ref_t leaf = alloc_leaf(tree, key, value);
+        if (leaf != COMPACT_REF_NULL) {
+            ref = add_child(tree, ref, byte, leaf);
         }
     }
 
-    return node;
+    return ref;
 }
 
 // ============================================================================
 // delete_recursive
 // ============================================================================
 
-static void *delete_recursive(compact_art_t *tree, void *node,
-                               const uint8_t *key, size_t depth,
-                               bool *deleted) {
-    if (!node) return NULL;
+static compact_ref_t delete_recursive(compact_art_t *tree, compact_ref_t ref,
+                                       const uint8_t *key, size_t depth,
+                                       bool *deleted) {
+    if (ref == COMPACT_REF_NULL) return COMPACT_REF_NULL;
 
-    if (COMPACT_IS_LEAF(node)) {
-        if (leaf_matches(tree, node, key)) {
+    if (COMPACT_IS_LEAF_REF(ref)) {
+        if (leaf_matches(tree, ref, key)) {
             *deleted = true;
-            // Arena: leaf memory is not reclaimed
-            return NULL;
+            return COMPACT_REF_NULL;
         }
-        return node;
+        return ref;
     }
+
+    void *node = node_ptr(tree, ref);
 
     // Check compressed path
     uint8_t plen = node_partial_len(node);
     if (plen > 0) {
         int prefix_len = check_prefix(node, key, tree->key_size, depth);
-        if (prefix_len != plen) return node;
+        if (prefix_len != plen) return ref;
         depth += plen;
     }
 
     uint8_t byte = (depth < tree->key_size) ? key[depth] : 0x00;
-    void *child = find_child(node, byte);
-    if (!child) return node;
+    compact_ref_t child = find_child(tree, ref, byte);
+    if (child == COMPACT_REF_NULL) return ref;
 
     if (depth >= tree->key_size) {
-        if (COMPACT_IS_LEAF(child) && leaf_matches(tree, child, key)) {
+        if (COMPACT_IS_LEAF_REF(child) && leaf_matches(tree, child, key)) {
             *deleted = true;
-            node = remove_child(tree, node, byte);
-            return node;
+            ref = remove_child(tree, ref, byte);
+            // Re-resolve after remove_child (may have returned different ref)
+            node = node_ptr(tree, ref);
         }
-        return node;
-    }
+        // Fall through to path collapse check if we deleted
+        if (!*deleted) return ref;
+    } else {
+        compact_ref_t new_child = delete_recursive(tree, child, key,
+                                                    depth + 1, deleted);
 
-    void *new_child = delete_recursive(tree, child, key, depth + 1, deleted);
-
-    if (new_child != child) {
-        if (!new_child) {
-            node = remove_child(tree, node, byte);
-        } else {
-            replace_child(node, byte, new_child);
+        if (new_child != child) {
+            if (new_child == COMPACT_REF_NULL) {
+                ref = remove_child(tree, ref, byte);
+            } else {
+                replace_child(tree, ref, byte, new_child);
+            }
         }
     }
 
     // Path collapse: if Node4 has exactly 1 child, merge with child
-    if (!COMPACT_IS_LEAF(node) && node_type(node) == COMPACT_NODE_4 &&
-        node_num_children(node) == 1) {
-        compact_node4_t *n4 = node;
-        void *only_child = n4->children[0];
-        uint8_t only_byte = n4->keys[0];
+    if (!COMPACT_IS_LEAF_REF(ref) && ref != COMPACT_REF_NULL) {
+        node = node_ptr(tree, ref);
+        if (node_type(node) == COMPACT_NODE_4 &&
+            node_num_children(node) == 1) {
+            compact_node4_t *n4 = node;
+            compact_ref_t only_child = n4->children[0];
+            uint8_t only_byte = n4->keys[0];
 
-        if (COMPACT_IS_LEAF(only_child)) {
-            return only_child;
-        }
+            if (COMPACT_IS_LEAF_REF(only_child)) {
+                return only_child;
+            }
 
-        // Merge prefixes: node->partial + byte + child->partial
-        uint8_t child_plen = node_partial_len(only_child);
-        uint32_t new_len = n4->partial_len + 1 + child_plen;
-        if (new_len <= COMPACT_MAX_PREFIX) {
-            uint8_t *child_partial = node_partial_mut(only_child);
-            memmove(child_partial + n4->partial_len + 1,
-                    child_partial, child_plen);
-            memcpy(child_partial, n4->partial, n4->partial_len);
-            child_partial[n4->partial_len] = only_byte;
-            ((uint8_t *)only_child)[2] = (uint8_t)new_len;
-            return only_child;
+            // Merge prefixes: node->partial + byte + child->partial
+            void *child_node = node_ptr(tree, only_child);
+            uint8_t child_plen = node_partial_len(child_node);
+            uint32_t new_len = n4->partial_len + 1 + child_plen;
+            if (new_len <= COMPACT_MAX_PREFIX) {
+                uint8_t *child_partial = node_partial_mut(child_node);
+                memmove(child_partial + n4->partial_len + 1,
+                        child_partial, child_plen);
+                memcpy(child_partial, n4->partial, n4->partial_len);
+                child_partial[n4->partial_len] = only_byte;
+                ((uint8_t *)child_node)[2] = (uint8_t)new_len;
+                return only_child;
+            }
         }
     }
 
-    return node;
+    return ref;
 }
 
 // ============================================================================
@@ -824,19 +840,37 @@ bool compact_art_init(compact_art_t *tree, uint32_t key_size,
                       uint32_t value_size) {
     if (!tree || key_size == 0) return false;
 
-    tree->root = NULL;
+    tree->root = COMPACT_REF_NULL;
     tree->size = 0;
     tree->key_size = key_size;
     tree->value_size = value_size;
+    tree->leaf_size = key_size + value_size;
+    tree->leaf_count = 0;
 
-    return arena_init(&tree->arena, COMPACT_ARENA_SLAB_SIZE);
+    if (!pool_init(&tree->nodes, COMPACT_NODE_POOL_RESERVE)) return false;
+    // Skip offset 0 so ref=0 means NULL
+    tree->nodes.used = 8;
+
+    // Leaf pool: reserve enough for ~1.8B leaves
+    size_t leaf_reserve = (size_t)tree->leaf_size * (1UL << 31);
+    if (leaf_reserve > COMPACT_LEAF_POOL_RESERVE)
+        leaf_reserve = COMPACT_LEAF_POOL_RESERVE;
+
+    if (!pool_init(&tree->leaves, leaf_reserve)) {
+        pool_destroy(&tree->nodes);
+        return false;
+    }
+
+    return true;
 }
 
 void compact_art_destroy(compact_art_t *tree) {
     if (!tree) return;
-    arena_destroy(&tree->arena);
-    tree->root = NULL;
+    pool_destroy(&tree->nodes);
+    pool_destroy(&tree->leaves);
+    tree->root = COMPACT_REF_NULL;
     tree->size = 0;
+    tree->leaf_count = 0;
 }
 
 bool compact_art_insert(compact_art_t *tree, const uint8_t *key,
@@ -847,7 +881,7 @@ bool compact_art_insert(compact_art_t *tree, const uint8_t *key,
     tree->root = insert_recursive(tree, tree->root, key, 0, value, &inserted);
 
     if (inserted) tree->size++;
-    return tree->root != NULL;
+    return tree->root != COMPACT_REF_NULL;
 }
 
 const void *compact_art_get(const compact_art_t *tree, const uint8_t *key) {
@@ -887,7 +921,7 @@ typedef struct {
     bool done;
     bool started;
     struct {
-        void *node;
+        compact_ref_t ref;
         int child_idx;
     } stack[64];
     int depth;
@@ -906,7 +940,7 @@ compact_art_iterator_t *compact_art_iterator_create(const compact_art_t *tree) {
 
     iter->tree = tree;
     memset(&iter->state, 0, sizeof(compact_iter_state_t));
-    iter->state.done = (tree->root == NULL);
+    iter->state.done = (tree->root == COMPACT_REF_NULL);
     iter->state.depth = -1;
 
     return iter;
@@ -921,21 +955,21 @@ bool compact_art_iterator_next(compact_art_iterator_t *iter) {
     // First call — push root
     if (!s->started) {
         s->started = true;
-        if (!iter->tree->root) {
+        if (iter->tree->root == COMPACT_REF_NULL) {
             s->done = true;
             return false;
         }
         s->depth = 0;
-        s->stack[0].node = iter->tree->root;
+        s->stack[0].ref = iter->tree->root;
         s->stack[0].child_idx = -1;
     }
 
     while (s->depth >= 0) {
-        void *node = s->stack[s->depth].node;
+        compact_ref_t ref = s->stack[s->depth].ref;
 
-        if (COMPACT_IS_LEAF(node)) {
-            s->key = leaf_key(node);
-            s->value = leaf_value(iter->tree, node);
+        if (COMPACT_IS_LEAF_REF(ref)) {
+            s->key = leaf_key(iter->tree, ref);
+            s->value = leaf_value(iter->tree, ref);
             s->depth--;
             return true;
         }
@@ -943,7 +977,8 @@ bool compact_art_iterator_next(compact_art_iterator_t *iter) {
         int *ci = &s->stack[s->depth].child_idx;
         (*ci)++;
 
-        void *next_child = NULL;
+        void *node = node_ptr(iter->tree, ref);
+        compact_ref_t next_child = COMPACT_REF_NULL;
 
         switch (node_type(node)) {
             case COMPACT_NODE_4: {
@@ -979,8 +1014,10 @@ bool compact_art_iterator_next(compact_art_iterator_t *iter) {
             case COMPACT_NODE_256: {
                 compact_node256_t *n = node;
                 while (*ci < 256) {
-                    next_child = n->children[*ci];
-                    if (next_child) break;
+                    if (n->children[*ci] != COMPACT_REF_NULL) {
+                        next_child = n->children[*ci];
+                        break;
+                    }
                     (*ci)++;
                 }
                 break;
@@ -989,13 +1026,13 @@ bool compact_art_iterator_next(compact_art_iterator_t *iter) {
                 break;
         }
 
-        if (next_child) {
+        if (next_child != COMPACT_REF_NULL) {
             s->depth++;
             if (s->depth >= 64) {
                 s->done = true;
                 return false;
             }
-            s->stack[s->depth].node = next_child;
+            s->stack[s->depth].ref = next_child;
             s->stack[s->depth].child_idx = -1;
         } else {
             s->depth--;
