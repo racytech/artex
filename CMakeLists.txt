@@ -302,11 +302,11 @@ else()
     message(STATUS "LMDB not found — benchmark_comparison runs ART-only")
 endif()
 
-# Benchmark: ART vs uthash
-add_executable(benchmark_art_vs_uthash
-    benchmark_art_vs_uthash.c
-)
-target_link_libraries(benchmark_art_vs_uthash art_database)
+# Benchmark: ART vs uthash (source file not yet in repo)
+# add_executable(benchmark_art_vs_uthash
+#     benchmark_art_vs_uthash.c
+# )
+# target_link_libraries(benchmark_art_vs_uthash art_database)
 
 #==============================================================================
 # Build Summary

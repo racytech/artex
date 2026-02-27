@@ -41,7 +41,7 @@
 #define DEFAULT_TARGET_MILLIONS   10
 #define BLOCK_SIZE                2000    // Inserts per "block" (Ethereum ~2000 txns/block)
 #define DELETE_PER_BLOCK          200     // ~10% deletes (storage slot clears, SELFDESTRUCT)
-#define CHECKPOINT_EVERY_BLOCKS   20
+#define CHECKPOINT_EVERY_BLOCKS   100
 #define NUM_READERS               4
 #define PROGRESS_EVERY_BLOCKS     500
 #define READER_BATCH_SIZE         1000
