@@ -41,34 +41,34 @@
  */
 
 // Forward declarations
-typedef struct art_tree art_tree_t;
-typedef struct art_node art_node_t;
-typedef struct art_iterator art_iterator_t;
+typedef struct mem_art mem_art_t;
+typedef struct mem_art_node mem_art_node_t;
+typedef struct mem_art_iterator mem_art_iterator_t;
 
 /**
  * Node types in the ART structure
  */
 typedef enum {
-    NODE_4   = 0,  // Up to 4 children
-    NODE_16  = 1,  // Up to 16 children
-    NODE_48  = 2,  // Up to 48 children (indexed)
-    NODE_256 = 3,  // Up to 256 children (direct array)
-    NODE_LEAF = 4  // Leaf node containing key-value pair
-} art_node_type_t;
+    MEM_NODE_4   = 0,  // Up to 4 children
+    MEM_NODE_16  = 1,  // Up to 16 children
+    MEM_NODE_48  = 2,  // Up to 48 children (indexed)
+    MEM_NODE_256 = 3,  // Up to 256 children (direct array)
+    MEM_NODE_LEAF = 4  // Leaf node containing key-value pair
+} mem_art_node_type_t;
 
 /**
  * ART tree structure
  */
-struct art_tree {
-    art_node_t *root;     // Root node of the tree
+struct mem_art {
+    mem_art_node_t *root;     // Root node of the tree
     size_t size;          // Number of key-value pairs in the tree
 };
 
 /**
  * Iterator for ordered traversal of the tree
  */
-struct art_iterator {
-    art_tree_t *tree;     // Reference to the tree
+struct mem_art_iterator {
+    mem_art_t *tree;     // Reference to the tree
     void *internal;       // Internal iterator state (opaque)
 };
 
@@ -78,14 +78,14 @@ struct art_iterator {
  * @param tree Pointer to the tree structure to initialize
  * @return true on success, false on failure
  */
-bool art_tree_init(art_tree_t *tree);
+bool mem_art_init(mem_art_t *tree);
 
 /**
  * Destroy an ART tree and free all resources
  * 
  * @param tree Pointer to the tree to destroy
  */
-void art_tree_destroy(art_tree_t *tree);
+void mem_art_destroy(mem_art_t *tree);
 
 /**
  * Insert or update a key-value pair in the tree
@@ -97,7 +97,7 @@ void art_tree_destroy(art_tree_t *tree);
  * @param value_len Length of the value in bytes
  * @return true on success, false on failure (e.g., allocation error)
  */
-bool art_insert(art_tree_t *tree, const uint8_t *key, size_t key_len,
+bool mem_art_insert(mem_art_t *tree, const uint8_t *key, size_t key_len,
                 const void *value, size_t value_len);
 
 /**
@@ -109,7 +109,7 @@ bool art_insert(art_tree_t *tree, const uint8_t *key, size_t key_len,
  * @param value_len Output parameter for the value length (can be NULL)
  * @return Pointer to the value if found, NULL if not found
  */
-const void *art_get(const art_tree_t *tree, const uint8_t *key, size_t key_len,
+const void *mem_art_get(const mem_art_t *tree, const uint8_t *key, size_t key_len,
                     size_t *value_len);
 
 /**
@@ -120,7 +120,7 @@ const void *art_get(const art_tree_t *tree, const uint8_t *key, size_t key_len,
  * @param key_len Length of the key in bytes
  * @return true if the key was found and deleted, false if not found
  */
-bool art_delete(art_tree_t *tree, const uint8_t *key, size_t key_len);
+bool mem_art_delete(mem_art_t *tree, const uint8_t *key, size_t key_len);
 
 /**
  * Check if a key exists in the tree
@@ -130,7 +130,7 @@ bool art_delete(art_tree_t *tree, const uint8_t *key, size_t key_len);
  * @param key_len Length of the key in bytes
  * @return true if the key exists, false otherwise
  */
-bool art_contains(const art_tree_t *tree, const uint8_t *key, size_t key_len);
+bool mem_art_contains(const mem_art_t *tree, const uint8_t *key, size_t key_len);
 
 /**
  * Get the number of key-value pairs in the tree
@@ -138,7 +138,7 @@ bool art_contains(const art_tree_t *tree, const uint8_t *key, size_t key_len);
  * @param tree Pointer to the tree
  * @return Number of entries
  */
-size_t art_size(const art_tree_t *tree);
+size_t mem_art_size(const mem_art_t *tree);
 
 /**
  * Check if the tree is empty
@@ -146,7 +146,7 @@ size_t art_size(const art_tree_t *tree);
  * @param tree Pointer to the tree
  * @return true if empty, false otherwise
  */
-bool art_is_empty(const art_tree_t *tree);
+bool mem_art_is_empty(const mem_art_t *tree);
 
 /**
  * Create an iterator for ordered traversal
@@ -156,7 +156,7 @@ bool art_is_empty(const art_tree_t *tree);
  * @param tree Pointer to the tree to iterate
  * @return Pointer to iterator, or NULL on allocation failure
  */
-art_iterator_t *art_iterator_create(const art_tree_t *tree);
+mem_art_iterator_t *mem_art_iterator_create(const mem_art_t *tree);
 
 /**
  * Move iterator to the next key-value pair
@@ -164,7 +164,7 @@ art_iterator_t *art_iterator_create(const art_tree_t *tree);
  * @param iter Pointer to the iterator
  * @return true if moved to next item, false if end of iteration
  */
-bool art_iterator_next(art_iterator_t *iter);
+bool mem_art_iterator_next(mem_art_iterator_t *iter);
 
 /**
  * Get the current key from the iterator
@@ -173,7 +173,7 @@ bool art_iterator_next(art_iterator_t *iter);
  * @param key_len Output parameter for key length (can be NULL)
  * @return Pointer to key bytes, or NULL if iterator is at end
  */
-const uint8_t *art_iterator_key(const art_iterator_t *iter, size_t *key_len);
+const uint8_t *mem_art_iterator_key(const mem_art_iterator_t *iter, size_t *key_len);
 
 /**
  * Get the current value from the iterator
@@ -182,7 +182,7 @@ const uint8_t *art_iterator_key(const art_iterator_t *iter, size_t *key_len);
  * @param value_len Output parameter for value length (can be NULL)
  * @return Pointer to value, or NULL if iterator is at end
  */
-const void *art_iterator_value(const art_iterator_t *iter, size_t *value_len);
+const void *mem_art_iterator_value(const mem_art_iterator_t *iter, size_t *value_len);
 
 /**
  * Check if iterator has reached the end
@@ -190,14 +190,14 @@ const void *art_iterator_value(const art_iterator_t *iter, size_t *value_len);
  * @param iter Pointer to the iterator
  * @return true if at end, false otherwise
  */
-bool art_iterator_done(const art_iterator_t *iter);
+bool mem_art_iterator_done(const mem_art_iterator_t *iter);
 
 /**
  * Destroy an iterator and free resources
  * 
  * @param iter Pointer to the iterator to destroy
  */
-void art_iterator_destroy(art_iterator_t *iter);
+void mem_art_iterator_destroy(mem_art_iterator_t *iter);
 
 /**
  * Callback function type for iteration
@@ -209,7 +209,7 @@ void art_iterator_destroy(art_iterator_t *iter);
  * @param user_data User-provided context pointer
  * @return true to continue iteration, false to stop
  */
-typedef bool (*art_callback_t)(const uint8_t *key, size_t key_len,
+typedef bool (*mem_art_callback_t)(const uint8_t *key, size_t key_len,
                                 const void *value, size_t value_len,
                                 void *user_data);
 
@@ -222,6 +222,6 @@ typedef bool (*art_callback_t)(const uint8_t *key, size_t key_len,
  * @param callback Function to call for each key-value pair
  * @param user_data User-provided context pointer passed to callback
  */
-void art_foreach(const art_tree_t *tree, art_callback_t callback, void *user_data);
+void mem_art_foreach(const mem_art_t *tree, mem_art_callback_t callback, void *user_data);
 
 #endif // MEM_ART_H

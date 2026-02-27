@@ -172,7 +172,7 @@ static bool store_write(state_store_t *s, uint32_t slot,
 typedef struct {
     compact_art_t index;
     state_store_t store;
-    art_tree_t buffer;
+    mem_art_t buffer;
     uint64_t key_count;
 } data_layer_t;
 
@@ -183,7 +183,7 @@ static bool dl_init(data_layer_t *dl, const char *path) {
         compact_art_destroy(&dl->index);
         return false;
     }
-    if (!art_tree_init(&dl->buffer)) {
+    if (!mem_art_init(&dl->buffer)) {
         compact_art_destroy(&dl->index);
         store_destroy(&dl->store);
         return false;
@@ -194,7 +194,7 @@ static bool dl_init(data_layer_t *dl, const char *path) {
 static void dl_destroy(data_layer_t *dl) {
     compact_art_destroy(&dl->index);
     store_destroy(&dl->store);
-    art_tree_destroy(&dl->buffer);
+    mem_art_destroy(&dl->buffer);
 }
 
 static bool dl_buf_put(data_layer_t *dl, const uint8_t key[KEY_SIZE],
@@ -202,25 +202,25 @@ static bool dl_buf_put(data_layer_t *dl, const uint8_t key[KEY_SIZE],
     uint8_t buf[1 + MAX_VALUE_LEN];
     buf[0] = BUF_FLAG_WRITE;
     memcpy(buf + 1, value, len);
-    return art_insert(&dl->buffer, key, KEY_SIZE, buf, 1 + len);
+    return mem_art_insert(&dl->buffer, key, KEY_SIZE, buf, 1 + len);
 }
 
 static bool dl_buf_delete(data_layer_t *dl, const uint8_t key[KEY_SIZE]) {
     uint8_t tombstone = BUF_FLAG_TOMBSTONE;
-    return art_insert(&dl->buffer, key, KEY_SIZE, &tombstone, 1);
+    return mem_art_insert(&dl->buffer, key, KEY_SIZE, &tombstone, 1);
 }
 
 // Merge buffer into index + state.dat. No fdatasync (checkpoint handles that).
 static uint64_t dl_merge(data_layer_t *dl) {
     uint64_t count = 0;
 
-    art_iterator_t *iter = art_iterator_create(&dl->buffer);
+    mem_art_iterator_t *iter = mem_art_iterator_create(&dl->buffer);
     if (!iter) return 0;
 
-    while (art_iterator_next(iter)) {
+    while (mem_art_iterator_next(iter)) {
         size_t klen = 0, vlen = 0;
-        const uint8_t *key = art_iterator_key(iter, &klen);
-        const void *val = art_iterator_value(iter, &vlen);
+        const uint8_t *key = mem_art_iterator_key(iter, &klen);
+        const void *val = mem_art_iterator_value(iter, &vlen);
         if (!key || !val || klen != KEY_SIZE || vlen < 1) continue;
 
         uint8_t flag = *(const uint8_t *)val;
@@ -253,9 +253,9 @@ static uint64_t dl_merge(data_layer_t *dl) {
         count++;
     }
 
-    art_iterator_destroy(iter);
-    art_tree_destroy(&dl->buffer);
-    art_tree_init(&dl->buffer);
+    mem_art_iterator_destroy(iter);
+    mem_art_destroy(&dl->buffer);
+    mem_art_init(&dl->buffer);
     return count;
 }
 

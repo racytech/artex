@@ -191,7 +191,7 @@ static bool store_read(state_store_t *s, uint32_t slot,
 typedef struct {
     compact_art_t index;
     state_store_t store;
-    art_tree_t buffer;
+    mem_art_t buffer;
     uint64_t disk_keys;
     uint64_t total_merged;
 } data_layer_t;
@@ -203,7 +203,7 @@ static bool dl_init(data_layer_t *dl, const char *state_path) {
         compact_art_destroy(&dl->index);
         return false;
     }
-    if (!art_tree_init(&dl->buffer)) {
+    if (!mem_art_init(&dl->buffer)) {
         compact_art_destroy(&dl->index);
         store_destroy(&dl->store);
         return false;
@@ -214,7 +214,7 @@ static bool dl_init(data_layer_t *dl, const char *state_path) {
 static void dl_destroy(data_layer_t *dl) {
     compact_art_destroy(&dl->index);
     store_destroy(&dl->store);
-    art_tree_destroy(&dl->buffer);
+    mem_art_destroy(&dl->buffer);
 }
 
 // Write to buffer (memory only)
@@ -223,13 +223,13 @@ static bool dl_put(data_layer_t *dl, const uint8_t key[KEY_SIZE],
     uint8_t buf[1 + MAX_VALUE_LEN];
     buf[0] = BUF_FLAG_WRITE;
     memcpy(buf + 1, value, len);
-    return art_insert(&dl->buffer, key, KEY_SIZE, buf, 1 + len);
+    return mem_art_insert(&dl->buffer, key, KEY_SIZE, buf, 1 + len);
 }
 
 // Delete via tombstone in buffer
 static bool dl_delete(data_layer_t *dl, const uint8_t key[KEY_SIZE]) {
     uint8_t tombstone = BUF_FLAG_TOMBSTONE;
-    return art_insert(&dl->buffer, key, KEY_SIZE, &tombstone, 1);
+    return mem_art_insert(&dl->buffer, key, KEY_SIZE, &tombstone, 1);
 }
 
 // Read: buffer first → index → disk
@@ -237,7 +237,7 @@ static bool dl_get(data_layer_t *dl, const uint8_t key[KEY_SIZE],
                    void *out_value, uint16_t *out_len) {
     // 1. Check write buffer
     size_t vlen = 0;
-    const void *bval = art_get(&dl->buffer, key, KEY_SIZE, &vlen);
+    const void *bval = mem_art_get(&dl->buffer, key, KEY_SIZE, &vlen);
     if (bval) {
         uint8_t flag = *(const uint8_t *)bval;
         if (flag == BUF_FLAG_TOMBSTONE) return false;  // deleted
@@ -264,13 +264,13 @@ static uint64_t dl_merge(data_layer_t *dl) {
     uint64_t count = 0;
     uint64_t inserts = 0, updates = 0, deletes = 0;
 
-    art_iterator_t *iter = art_iterator_create(&dl->buffer);
+    mem_art_iterator_t *iter = mem_art_iterator_create(&dl->buffer);
     if (!iter) return 0;
 
-    while (art_iterator_next(iter)) {
+    while (mem_art_iterator_next(iter)) {
         size_t klen = 0, vlen = 0;
-        const uint8_t *key = art_iterator_key(iter, &klen);
-        const void *val = art_iterator_value(iter, &vlen);
+        const uint8_t *key = mem_art_iterator_key(iter, &klen);
+        const void *val = mem_art_iterator_value(iter, &vlen);
         if (!key || !val || klen != KEY_SIZE || vlen < 1) continue;
 
         uint8_t flag = *(const uint8_t *)val;
@@ -309,12 +309,12 @@ static uint64_t dl_merge(data_layer_t *dl) {
         count++;
     }
 
-    art_iterator_destroy(iter);
+    mem_art_iterator_destroy(iter);
     fdatasync(dl->store.fd);
 
     // Clear buffer
-    art_tree_destroy(&dl->buffer);
-    art_tree_init(&dl->buffer);
+    mem_art_destroy(&dl->buffer);
+    mem_art_init(&dl->buffer);
 
     dl->total_merged += count;
     return count;
@@ -343,7 +343,7 @@ static bool phase1(data_layer_t *dl, uint64_t seed, uint64_t num_keys,
     double t1 = now_sec();
     printf("  buffer writes: %" PRIu64 " keys in %.2fs (%.1f Kk/s)\n",
            num_keys, t1 - t0, num_keys / (t1 - t0) / 1000.0);
-    printf("  buffer size:   %zu entries\n", art_size(&dl->buffer));
+    printf("  buffer size:   %zu entries\n", mem_art_size(&dl->buffer));
     printf("  RSS:           %zu MB\n", get_rss_mb());
 
     // Merge
@@ -431,7 +431,7 @@ static bool phase2(data_layer_t *dl, uint64_t seed,
         if (dl_get(dl, key, got, &got_len)) {
             // Check which path it took
             size_t vlen = 0;
-            const void *bval = art_get(&dl->buffer, key, KEY_SIZE, &vlen);
+            const void *bval = mem_art_get(&dl->buffer, key, KEY_SIZE, &vlen);
             if (bval && *(const uint8_t *)bval == BUF_FLAG_WRITE) {
                 buf_hits++;
             } else {
@@ -521,7 +521,7 @@ static bool phase3(data_layer_t *dl, uint64_t seed,
     printf("  updates:  %" PRIu64 "\n", num_updates);
     printf("  deletes:  %" PRIu64 "\n", num_deletes);
     printf("  inserts:  %" PRIu64 "\n", num_inserts);
-    printf("  buffer:   %zu entries in %.3fs\n", art_size(&dl->buffer), t1 - t0);
+    printf("  buffer:   %zu entries in %.3fs\n", mem_art_size(&dl->buffer), t1 - t0);
 
     // Merge
     uint64_t keys_before = dl->disk_keys;

@@ -1,5 +1,4 @@
 #include "mem_art.h"
-#include "logger.h"
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -41,8 +40,8 @@
  */
 typedef struct {
     uint8_t keys[NODE4_MAX];           // Sorted array of key bytes
-    art_node_t *children[NODE4_MAX];   // Corresponding child pointers
-} art_node4_t;
+    mem_art_node_t *children[NODE4_MAX];   // Corresponding child pointers
+} mem_node4_t;
 
 /**
  * Node16: Up to 16 children
@@ -50,8 +49,8 @@ typedef struct {
  */
 typedef struct {
     uint8_t keys[NODE16_MAX];          // Sorted array of key bytes
-    art_node_t *children[NODE16_MAX];  // Corresponding child pointers
-} art_node16_t;
+    mem_art_node_t *children[NODE16_MAX];  // Corresponding child pointers
+} mem_node16_t;
 
 /**
  * Node48: Up to 48 children with indexed lookup
@@ -59,40 +58,40 @@ typedef struct {
  */
 typedef struct {
     uint8_t index[256];                // Maps key byte to child index (255 = empty)
-    art_node_t *children[NODE48_MAX];  // Child pointers
-} art_node48_t;
+    mem_art_node_t *children[NODE48_MAX];  // Child pointers
+} mem_node48_t;
 
 /**
  * Node256: Up to 256 children with direct indexing
  * Memory: ~2KB (256 pointers)
  */
 typedef struct {
-    art_node_t *children[NODE256_MAX]; // Direct array of child pointers
-} art_node256_t;
+    mem_art_node_t *children[NODE256_MAX]; // Direct array of child pointers
+} mem_node256_t;
 
 /**
  * Leaf node structure - allocated separately with variable size
  */
 typedef struct {
-    art_node_type_t type;  // Always NODE_LEAF
+    mem_art_node_type_t type;  // Always MEM_NODE_LEAF
     uint32_t key_len;
     uint32_t value_len;
     uint8_t data[];  // Flexible array: key bytes followed by value bytes
-} art_leaf_node_t;
+} mem_leaf_node_t;
 
 /**
  * Inner node structure - all inner nodes use this structure
  */
-struct art_node {
-    art_node_type_t type;  // Type discriminator
+struct mem_art_node {
+    mem_art_node_type_t type;  // Type discriminator
     uint32_t num_children;
     uint32_t partial_len;
     uint8_t partial[MAX_PREFIX];
     union {
-        art_node4_t node4;
-        art_node16_t node16;
-        art_node48_t node48;
-        art_node256_t node256;
+        mem_node4_t node4;
+        mem_node16_t node16;
+        mem_node48_t node48;
+        mem_node256_t node256;
     };
 };
 
@@ -108,45 +107,45 @@ typedef struct {
     bool started;  // Track if iteration has begun
     // Stack for depth-first traversal
     struct {
-        art_node_t *node;
+        mem_art_node_t *node;
         int child_idx;
     } stack[64];  // Max depth
     int depth;
-} art_iterator_state_t;
+} mem_iterator_state_t;
 
 // Forward declarations of internal functions
-static art_node_t *alloc_node(art_node_type_t type);
-static void free_node(art_node_t *node);
-static art_node_t *alloc_leaf(const uint8_t *key, size_t key_len,
+static mem_art_node_t *alloc_node(mem_art_node_type_t type);
+static void free_node(mem_art_node_t *node);
+static mem_art_node_t *alloc_leaf(const uint8_t *key, size_t key_len,
                                const void *value, size_t value_len);
-static bool is_leaf(const art_node_t *node);
-static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
+static bool is_leaf(const mem_art_node_t *node);
+static mem_art_node_t *insert_recursive(mem_art_node_t *node, const uint8_t *key,
                                      size_t key_len, size_t depth,
                                      const void *value, size_t value_len,
                                      bool *inserted);
-static art_node_t *delete_recursive(art_node_t *node, const uint8_t *key,
+static mem_art_node_t *delete_recursive(mem_art_node_t *node, const uint8_t *key,
                                      size_t key_len, size_t depth, bool *deleted);
-static const void *search(const art_node_t *node, const uint8_t *key,
+static const void *search(const mem_art_node_t *node, const uint8_t *key,
                           size_t key_len, size_t depth, size_t *value_len);
-static int check_prefix(const art_node_t *node, const uint8_t *key,
+static int check_prefix(const mem_art_node_t *node, const uint8_t *key,
                         size_t key_len, size_t depth);
-static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child);
-static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **child_out);
-static art_node_t *find_child(const art_node_t *node, uint8_t byte);
-static void replace_child(art_node_t *node, uint8_t byte, art_node_t *new_child);
+static mem_art_node_t *add_child(mem_art_node_t *node, uint8_t byte, mem_art_node_t *child);
+static mem_art_node_t *remove_child(mem_art_node_t *node, uint8_t byte, mem_art_node_t **child_out);
+static mem_art_node_t *find_child(const mem_art_node_t *node, uint8_t byte);
+static void replace_child(mem_art_node_t *node, uint8_t byte, mem_art_node_t *new_child);
 
 //==============================================================================
 // Public API Implementation
 //==============================================================================
 
-bool art_tree_init(art_tree_t *tree) {
+bool mem_art_init(mem_art_t *tree) {
     if (!tree) return false;
     tree->root = NULL;
     tree->size = 0;
     return true;
 }
 
-void art_tree_destroy(art_tree_t *tree) {
+void mem_art_destroy(mem_art_t *tree) {
     if (!tree) return;
     if (tree->root) {
         free_node(tree->root);
@@ -155,32 +154,27 @@ void art_tree_destroy(art_tree_t *tree) {
     tree->size = 0;
 }
 
-bool art_insert(art_tree_t *tree, const uint8_t *key, size_t key_len,
+bool mem_art_insert(mem_art_t *tree, const uint8_t *key, size_t key_len,
                 const void *value, size_t value_len) {
     if (!tree || !key || key_len == 0) return false;
-    
-    LOG_DEBUG("art_insert: key_len=%zu", key_len);
-    
+
     bool inserted = false;
     tree->root = insert_recursive(tree->root, key, key_len, 0, value, value_len, &inserted);
     
     if (inserted) {
         tree->size++;
-        LOG_DEBUG("art_insert: new entry inserted, size now %zu", tree->size);
-    } else {
-        LOG_DEBUG("art_insert: existing entry updated");
     }
-    
+
     return tree->root != NULL;
 }
 
-const void *art_get(const art_tree_t *tree, const uint8_t *key, size_t key_len,
+const void *mem_art_get(const mem_art_t *tree, const uint8_t *key, size_t key_len,
                     size_t *value_len) {
     if (!tree || !key || key_len == 0) return NULL;
     return search(tree->root, key, key_len, 0, value_len);
 }
 
-bool art_delete(art_tree_t *tree, const uint8_t *key, size_t key_len) {
+bool mem_art_delete(mem_art_t *tree, const uint8_t *key, size_t key_len) {
     if (!tree || !key || key_len == 0) return false;
 
     bool deleted = false;
@@ -193,15 +187,15 @@ bool art_delete(art_tree_t *tree, const uint8_t *key, size_t key_len) {
     return deleted;
 }
 
-bool art_contains(const art_tree_t *tree, const uint8_t *key, size_t key_len) {
-    return art_get(tree, key, key_len, NULL) != NULL;
+bool mem_art_contains(const mem_art_t *tree, const uint8_t *key, size_t key_len) {
+    return mem_art_get(tree, key, key_len, NULL) != NULL;
 }
 
-size_t art_size(const art_tree_t *tree) {
+size_t mem_art_size(const mem_art_t *tree) {
     return tree ? tree->size : 0;
 }
 
-bool art_is_empty(const art_tree_t *tree) {
+bool mem_art_is_empty(const mem_art_t *tree) {
     return tree ? (tree->size == 0) : true;
 }
 
@@ -209,35 +203,35 @@ bool art_is_empty(const art_tree_t *tree) {
 // Iterator Implementation
 //==============================================================================
 
-art_iterator_t *art_iterator_create(const art_tree_t *tree) {
+mem_art_iterator_t *mem_art_iterator_create(const mem_art_t *tree) {
     if (!tree) return NULL;
     
-    art_iterator_t *iter = malloc(sizeof(art_iterator_t));
+    mem_art_iterator_t *iter = malloc(sizeof(mem_art_iterator_t));
     if (!iter) return NULL;
     
-    art_iterator_state_t *state = malloc(sizeof(art_iterator_state_t));
+    mem_iterator_state_t *state = malloc(sizeof(mem_iterator_state_t));
     if (!state) {
         free(iter);
         return NULL;
     }
     
-    iter->tree = (art_tree_t *)tree;
+    iter->tree = (mem_art_t *)tree;
     iter->internal = state;
     
-    memset(state, 0, sizeof(art_iterator_state_t));
+    memset(state, 0, sizeof(mem_iterator_state_t));
     state->done = (tree->root == NULL);
     state->depth = -1;
     
     return iter;
 }
 
-bool art_iterator_next(art_iterator_t *iter) {
+bool mem_art_iterator_next(mem_art_iterator_t *iter) {
     if (!iter || !iter->internal) return false;
     
-    art_iterator_state_t *state = (art_iterator_state_t *)iter->internal;
+    mem_iterator_state_t *state = (mem_iterator_state_t *)iter->internal;
     if (state->done) return false;
     
-    art_node_t *node;
+    mem_art_node_t *node;
     
     // First call - initialize stack with root
     if (!state->started) {
@@ -257,7 +251,7 @@ bool art_iterator_next(art_iterator_t *iter) {
         
         // If this is a leaf, return it
         if (is_leaf(node)) {
-            art_leaf_node_t *leaf = (art_leaf_node_t *)node;
+            mem_leaf_node_t *leaf = (mem_leaf_node_t *)node;
             state->key = leaf->data;
             state->key_len = leaf->key_len;
             state->value = leaf->data + leaf->key_len;
@@ -272,21 +266,21 @@ bool art_iterator_next(art_iterator_t *iter) {
         int *child_idx = &state->stack[state->depth].child_idx;
         (*child_idx)++;
         
-        art_node_t *next_child = NULL;
+        mem_art_node_t *next_child = NULL;
         
         // Get next child based on node type
         switch (node->type) {
-            case NODE_4:
+            case MEM_NODE_4:
                 if (*child_idx < (int)node->num_children) {
                     next_child = node->node4.children[*child_idx];
                 }
                 break;
-            case NODE_16:
+            case MEM_NODE_16:
                 if (*child_idx < (int)node->num_children) {
                     next_child = node->node16.children[*child_idx];
                 }
                 break;
-            case NODE_48:
+            case MEM_NODE_48:
                 // Find next non-empty child
                 while (*child_idx < 256) {
                     uint8_t idx = node->node48.index[*child_idx];
@@ -297,7 +291,7 @@ bool art_iterator_next(art_iterator_t *iter) {
                     (*child_idx)++;
                 }
                 break;
-            case NODE_256:
+            case MEM_NODE_256:
                 // Find next non-NULL child
                 while (*child_idx < 256) {
                     next_child = node->node256.children[*child_idx];
@@ -330,34 +324,34 @@ bool art_iterator_next(art_iterator_t *iter) {
     return false;
 }
 
-const uint8_t *art_iterator_key(const art_iterator_t *iter, size_t *key_len) {
+const uint8_t *mem_art_iterator_key(const mem_art_iterator_t *iter, size_t *key_len) {
     if (!iter || !iter->internal) return NULL;
     
-    art_iterator_state_t *state = (art_iterator_state_t *)iter->internal;
+    mem_iterator_state_t *state = (mem_iterator_state_t *)iter->internal;
     if (state->done) return NULL;
     
     if (key_len) *key_len = state->key_len;
     return state->key;
 }
 
-const void *art_iterator_value(const art_iterator_t *iter, size_t *value_len) {
+const void *mem_art_iterator_value(const mem_art_iterator_t *iter, size_t *value_len) {
     if (!iter || !iter->internal) return NULL;
     
-    art_iterator_state_t *state = (art_iterator_state_t *)iter->internal;
+    mem_iterator_state_t *state = (mem_iterator_state_t *)iter->internal;
     if (state->done) return NULL;
     
     if (value_len) *value_len = state->value_len;
     return state->value;
 }
 
-bool art_iterator_done(const art_iterator_t *iter) {
+bool mem_art_iterator_done(const mem_art_iterator_t *iter) {
     if (!iter || !iter->internal) return true;
     
-    art_iterator_state_t *state = (art_iterator_state_t *)iter->internal;
+    mem_iterator_state_t *state = (mem_iterator_state_t *)iter->internal;
     return state->done;
 }
 
-void art_iterator_destroy(art_iterator_t *iter) {
+void mem_art_iterator_destroy(mem_art_iterator_t *iter) {
     if (!iter) return;
     if (iter->internal) {
         free(iter->internal);
@@ -365,16 +359,16 @@ void art_iterator_destroy(art_iterator_t *iter) {
     free(iter);
 }
 
-void art_foreach(const art_tree_t *tree, art_callback_t callback, void *user_data) {
+void mem_art_foreach(const mem_art_t *tree, mem_art_callback_t callback, void *user_data) {
     if (!tree || !callback) return;
     
-    art_iterator_t *iter = art_iterator_create(tree);
+    mem_art_iterator_t *iter = mem_art_iterator_create(tree);
     if (!iter) return;
     
-    while (art_iterator_next(iter)) {
+    while (mem_art_iterator_next(iter)) {
         size_t key_len, value_len;
-        const uint8_t *key = art_iterator_key(iter, &key_len);
-        const void *value = art_iterator_value(iter, &value_len);
+        const uint8_t *key = mem_art_iterator_key(iter, &key_len);
+        const void *value = mem_art_iterator_value(iter, &value_len);
         
         if (key && value) {
             if (!callback(key, key_len, value, value_len, user_data)) {
@@ -383,7 +377,7 @@ void art_foreach(const art_tree_t *tree, art_callback_t callback, void *user_dat
         }
     }
     
-    art_iterator_destroy(iter);
+    mem_art_iterator_destroy(iter);
 }
 
 //==============================================================================
@@ -391,20 +385,20 @@ void art_foreach(const art_tree_t *tree, art_callback_t callback, void *user_dat
 //==============================================================================
 
 // Header size: type + num_children + partial_len + partial[]
-#define NODE_HEADER_SIZE (offsetof(art_node_t, node4))
+#define NODE_HEADER_SIZE (offsetof(mem_art_node_t, node4))
 
-static art_node_t *alloc_node(art_node_type_t type) {
+static mem_art_node_t *alloc_node(mem_art_node_type_t type) {
     // Allocate only what's needed for the specific node type
     size_t size;
     switch (type) {
-        case NODE_4:   size = NODE_HEADER_SIZE + sizeof(art_node4_t);   break;
-        case NODE_16:  size = NODE_HEADER_SIZE + sizeof(art_node16_t);  break;
-        case NODE_48:  size = NODE_HEADER_SIZE + sizeof(art_node48_t);  break;
-        case NODE_256: size = NODE_HEADER_SIZE + sizeof(art_node256_t); break;
+        case MEM_NODE_4:   size = NODE_HEADER_SIZE + sizeof(mem_node4_t);   break;
+        case MEM_NODE_16:  size = NODE_HEADER_SIZE + sizeof(mem_node16_t);  break;
+        case MEM_NODE_48:  size = NODE_HEADER_SIZE + sizeof(mem_node48_t);  break;
+        case MEM_NODE_256: size = NODE_HEADER_SIZE + sizeof(mem_node256_t); break;
         default:       return NULL;
     }
 
-    art_node_t *node = malloc(size);
+    mem_art_node_t *node = malloc(size);
     if (!node) return NULL;
 
     node->type = type;
@@ -413,18 +407,18 @@ static art_node_t *alloc_node(art_node_type_t type) {
 
     // Only zero the type-specific part
     switch (type) {
-        case NODE_4:
-            memset(&node->node4, 0, sizeof(art_node4_t));
+        case MEM_NODE_4:
+            memset(&node->node4, 0, sizeof(mem_node4_t));
             break;
-        case NODE_16:
-            memset(&node->node16, 0, sizeof(art_node16_t));
+        case MEM_NODE_16:
+            memset(&node->node16, 0, sizeof(mem_node16_t));
             break;
-        case NODE_48:
+        case MEM_NODE_48:
             memset(node->node48.index, NODE48_EMPTY, 256);
             memset(node->node48.children, 0, sizeof(node->node48.children));
             break;
-        case NODE_256:
-            memset(&node->node256, 0, sizeof(art_node256_t));
+        case MEM_NODE_256:
+            memset(&node->node256, 0, sizeof(mem_node256_t));
             break;
         default:
             break;
@@ -433,7 +427,7 @@ static art_node_t *alloc_node(art_node_type_t type) {
     return node;
 }
 
-static void free_node(art_node_t *node) {
+static void free_node(mem_art_node_t *node) {
     if (!node) return;
     
     if (is_leaf(node)) {
@@ -443,19 +437,19 @@ static void free_node(art_node_t *node) {
     
     // Recursively free children
     switch (node->type) {
-        case NODE_4: {
+        case MEM_NODE_4: {
             for (int i = 0; i < node->num_children; i++) {
                 free_node(node->node4.children[i]);
             }
             break;
         }
-        case NODE_16: {
+        case MEM_NODE_16: {
             for (int i = 0; i < node->num_children; i++) {
                 free_node(node->node16.children[i]);
             }
             break;
         }
-        case NODE_48: {
+        case MEM_NODE_48: {
             for (int i = 0; i < NODE48_MAX; i++) {
                 if (node->node48.children[i]) {
                     free_node(node->node48.children[i]);
@@ -463,7 +457,7 @@ static void free_node(art_node_t *node) {
             }
             break;
         }
-        case NODE_256: {
+        case MEM_NODE_256: {
             for (int i = 0; i < NODE256_MAX; i++) {
                 if (node->node256.children[i]) {
                     free_node(node->node256.children[i]);
@@ -478,13 +472,13 @@ static void free_node(art_node_t *node) {
     free(node);
 }
 
-static art_node_t *alloc_leaf(const uint8_t *key, size_t key_len,
+static mem_art_node_t *alloc_leaf(const uint8_t *key, size_t key_len,
                                const void *value, size_t value_len) {
-    size_t total_size = sizeof(art_leaf_node_t) + key_len + value_len;
-    art_leaf_node_t *leaf = malloc(total_size);
+    size_t total_size = sizeof(mem_leaf_node_t) + key_len + value_len;
+    mem_leaf_node_t *leaf = malloc(total_size);
     if (!leaf) return NULL;
     
-    leaf->type = NODE_LEAF;
+    leaf->type = MEM_NODE_LEAF;
     leaf->key_len = key_len;
     leaf->value_len = value_len;
     
@@ -492,26 +486,26 @@ static art_node_t *alloc_leaf(const uint8_t *key, size_t key_len,
     memcpy(leaf->data, key, key_len);
     memcpy(leaf->data + key_len, value, value_len);
     
-    return (art_node_t *)leaf;
+    return (mem_art_node_t *)leaf;
 }
 
-static bool is_leaf(const art_node_t *node) {
-    return node && node->type == NODE_LEAF;
+static bool is_leaf(const mem_art_node_t *node) {
+    return node && node->type == MEM_NODE_LEAF;
 }
 
-static const uint8_t *leaf_key(const art_node_t *node) {
-    const art_leaf_node_t *leaf = (const art_leaf_node_t *)node;
+static const uint8_t *leaf_key(const mem_art_node_t *node) {
+    const mem_leaf_node_t *leaf = (const mem_leaf_node_t *)node;
     return leaf->data;
 }
 
-static const void *leaf_value(const art_node_t *node, size_t *value_len) {
-    const art_leaf_node_t *leaf = (const art_leaf_node_t *)node;
+static const void *leaf_value(const mem_art_node_t *node, size_t *value_len) {
+    const mem_leaf_node_t *leaf = (const mem_leaf_node_t *)node;
     if (value_len) *value_len = leaf->value_len;
     return leaf->data + leaf->key_len;
 }
 
-static bool leaf_matches(const art_node_t *node, const uint8_t *key, size_t key_len) {
-    const art_leaf_node_t *leaf = (const art_leaf_node_t *)node;
+static bool leaf_matches(const mem_art_node_t *node, const uint8_t *key, size_t key_len) {
+    const mem_leaf_node_t *leaf = (const mem_leaf_node_t *)node;
     if (leaf->key_len != key_len) return false;
     return memcmp(leaf_key(node), key, key_len) == 0;
 }
@@ -521,7 +515,7 @@ static bool leaf_matches(const art_node_t *node, const uint8_t *key, size_t key_
  * Returns the number of matching bytes.
  * With MAX_PREFIX=32, the full prefix is always stored inline — no lazy expansion.
  */
-static int check_prefix(const art_node_t *node, const uint8_t *key,
+static int check_prefix(const mem_art_node_t *node, const uint8_t *key,
                         size_t key_len, size_t depth) {
     int max_cmp = (int)node->partial_len;
     if (depth + max_cmp > (int)key_len) {
@@ -540,7 +534,7 @@ static int check_prefix(const art_node_t *node, const uint8_t *key,
     return max_cmp;
 }
 
-static const void *search(const art_node_t *node, const uint8_t *key,
+static const void *search(const mem_art_node_t *node, const uint8_t *key,
                           size_t key_len, size_t depth, size_t *value_len) {
     while (node) {
         if (is_leaf(node)) {
@@ -561,7 +555,7 @@ static const void *search(const art_node_t *node, const uint8_t *key,
 
         // Find child for next byte
         uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
-        art_node_t *child = find_child(node, byte);
+        mem_art_node_t *child = find_child(node, byte);
         if (!child) return NULL;
 
         // If key is consumed, child must be the matching leaf
@@ -578,9 +572,9 @@ static const void *search(const art_node_t *node, const uint8_t *key,
     return NULL;
 }
 
-static art_node_t *find_child(const art_node_t *node, uint8_t byte) {
+static mem_art_node_t *find_child(const mem_art_node_t *node, uint8_t byte) {
     switch (node->type) {
-        case NODE_4: {
+        case MEM_NODE_4: {
             for (int i = 0; i < node->num_children; i++) {
                 if (node->node4.keys[i] == byte) {
                     return node->node4.children[i];
@@ -588,7 +582,7 @@ static art_node_t *find_child(const art_node_t *node, uint8_t byte) {
             }
             return NULL;
         }
-        case NODE_16: {
+        case MEM_NODE_16: {
             // SSE: compare all 16 keys in parallel
             __m128i key_vec = _mm_set1_epi8((char)byte);
             __m128i cmp = _mm_cmpeq_epi8(key_vec,
@@ -599,12 +593,12 @@ static art_node_t *find_child(const art_node_t *node, uint8_t byte) {
             }
             return NULL;
         }
-        case NODE_48: {
+        case MEM_NODE_48: {
             uint8_t idx = node->node48.index[byte];
             if (idx == NODE48_EMPTY) return NULL;
             return node->node48.children[idx];
         }
-        case NODE_256: {
+        case MEM_NODE_256: {
             return node->node256.children[byte];
         }
         default:
@@ -616,9 +610,9 @@ static art_node_t *find_child(const art_node_t *node, uint8_t byte) {
  * Replace a child pointer in-place (no add/remove, no size change).
  * Used when a recursive operation returns a different pointer for the same key byte.
  */
-static void replace_child(art_node_t *node, uint8_t byte, art_node_t *new_child) {
+static void replace_child(mem_art_node_t *node, uint8_t byte, mem_art_node_t *new_child) {
     switch (node->type) {
-        case NODE_4:
+        case MEM_NODE_4:
             for (uint32_t i = 0; i < node->num_children; i++) {
                 if (node->node4.keys[i] == byte) {
                     node->node4.children[i] = new_child;
@@ -626,7 +620,7 @@ static void replace_child(art_node_t *node, uint8_t byte, art_node_t *new_child)
                 }
             }
             break;
-        case NODE_16: {
+        case MEM_NODE_16: {
             __m128i key_vec = _mm_set1_epi8((char)byte);
             __m128i cmp = _mm_cmpeq_epi8(key_vec,
                             _mm_loadu_si128((__m128i *)node->node16.keys));
@@ -636,14 +630,14 @@ static void replace_child(art_node_t *node, uint8_t byte, art_node_t *new_child)
             }
             break;
         }
-        case NODE_48: {
+        case MEM_NODE_48: {
             uint8_t idx = node->node48.index[byte];
             if (idx != NODE48_EMPTY) {
                 node->node48.children[idx] = new_child;
             }
             break;
         }
-        case NODE_256:
+        case MEM_NODE_256:
             node->node256.children[byte] = new_child;
             break;
         default:
@@ -651,27 +645,22 @@ static void replace_child(art_node_t *node, uint8_t byte, art_node_t *new_child)
     }
 }
 
-static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
+static mem_art_node_t *insert_recursive(mem_art_node_t *node, const uint8_t *key,
                                      size_t key_len, size_t depth,
                                      const void *value, size_t value_len,
                                      bool *inserted) {
-    LOG_TRACE("insert_recursive: depth=%zu, key_len=%zu, node=%p", depth, key_len, (void*)node);
-    
     // Base case: create new leaf
     if (!node) {
-        LOG_DEBUG("insert_recursive: creating new leaf at depth=%zu", depth);
         *inserted = true;
-        return (art_node_t *)alloc_leaf(key, key_len, value, value_len);
+        return (mem_art_node_t *)alloc_leaf(key, key_len, value, value_len);
     }
-    
-    LOG_TRACE("insert_recursive: node_type=%d", node->type);
-    
+
     // If it's a leaf, check for match or split
     if (is_leaf(node)) {
         // Update existing leaf
         if (leaf_matches(node, key, key_len)) {
             // Replace value
-            art_node_t *new_leaf = alloc_leaf(key, key_len, value, value_len);
+            mem_art_node_t *new_leaf = alloc_leaf(key, key_len, value, value_len);
             if (new_leaf) {
                 free(node);
                 *inserted = false;  // Updated, not inserted
@@ -682,12 +671,12 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
         
         // Keys differ - need to create a new node to hold both leaves
         *inserted = true;
-        art_node_t *new_leaf = alloc_leaf(key, key_len, value, value_len);
+        mem_art_node_t *new_leaf = alloc_leaf(key, key_len, value, value_len);
         if (!new_leaf) return node;
         
         // Find longest common prefix between the two full keys
         const uint8_t *leaf_key_bytes = leaf_key(node);
-        const art_leaf_node_t *leaf = (const art_leaf_node_t *)node;
+        const mem_leaf_node_t *leaf = (const mem_leaf_node_t *)node;
         size_t leaf_key_len = leaf->key_len;
         
         // Calculate common prefix from current depth
@@ -699,7 +688,7 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
         }
         
         // Create new node to hold both leaves
-        art_node_t *new_node = alloc_node(NODE_4);
+        mem_art_node_t *new_node = alloc_node(MEM_NODE_4);
         if (!new_node) {
             free(new_leaf);
             return node;
@@ -736,7 +725,7 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
             // Discriminating byte for old node — always in partial[]
             uint8_t old_byte = node->partial[prefix_len];
 
-            art_node_t *new_node = alloc_node(NODE_4);
+            mem_art_node_t *new_node = alloc_node(MEM_NODE_4);
             if (!new_node) return node;
 
             // New node gets the matching prefix
@@ -749,7 +738,7 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
             node->partial_len = new_partial_len;
 
             // Create leaf for new key
-            art_node_t *leaf = alloc_leaf(key, key_len, value, value_len);
+            mem_art_node_t *leaf = alloc_leaf(key, key_len, value, value_len);
             if (!leaf) {
                 free(new_node);
                 return node;
@@ -758,7 +747,7 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
             uint8_t new_byte = (depth + prefix_len < key_len) ? key[depth + prefix_len] : 0x00;
 
             new_node = add_child(new_node, old_byte, node);
-            new_node = add_child(new_node, new_byte, (art_node_t *)leaf);
+            new_node = add_child(new_node, new_byte, (mem_art_node_t *)leaf);
 
             return new_node;
         }
@@ -770,14 +759,14 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
     uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
     
     // Find child for this byte
-    art_node_t *child = find_child(node, byte);
+    mem_art_node_t *child = find_child(node, byte);
     
     if (child) {
         // Child exists
         if (depth >= key_len) {
             // Key is consumed, child should be a leaf - update it
             if (is_leaf(child) && leaf_matches(child, key, key_len)) {
-                art_node_t *new_leaf = alloc_leaf(key, key_len, value, value_len);
+                mem_art_node_t *new_leaf = alloc_leaf(key, key_len, value, value_len);
                 if (new_leaf) {
                     replace_child(node, byte, new_leaf);
                     free(child);
@@ -787,7 +776,7 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
             return node;
         }
         // Recurse with remaining key
-        art_node_t *new_child = insert_recursive(child, key, key_len, depth + 1,
+        mem_art_node_t *new_child = insert_recursive(child, key, key_len, depth + 1,
                                                   value, value_len, inserted);
         if (new_child != child) {
             replace_child(node, byte, new_child);
@@ -795,7 +784,7 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
     } else {
         // No child - create new leaf
         *inserted = true;
-        art_node_t *leaf = alloc_leaf(key, key_len, value, value_len);
+        mem_art_node_t *leaf = alloc_leaf(key, key_len, value, value_len);
         if (leaf) {
             node = add_child(node, byte, leaf);
         }
@@ -804,11 +793,9 @@ static art_node_t *insert_recursive(art_node_t *node, const uint8_t *key,
     return node;
 }
 
-static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) {
-    LOG_TRACE("add_child: node_type=%d, byte=0x%02X, num_children=%u",
-                 node->type, byte, node->num_children);
+static mem_art_node_t *add_child(mem_art_node_t *node, uint8_t byte, mem_art_node_t *child) {
     switch (node->type) {
-        case NODE_4: {
+        case MEM_NODE_4: {
             if (node->num_children < NODE4_MAX) {
                 // Find insertion position to keep sorted
                 int i;
@@ -819,17 +806,16 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
                 if (i < node->num_children) {
                     memmove(&node->node4.keys[i + 1], &node->node4.keys[i], node->num_children - i);
                     memmove(&node->node4.children[i + 1], &node->node4.children[i],
-                            (node->num_children - i) * sizeof(art_node_t *));
+                            (node->num_children - i) * sizeof(mem_art_node_t *));
                 }
                 node->node4.keys[i] = byte;
                 node->node4.children[i] = child;
                 node->num_children++;
-                LOG_TRACE("add_child: added to Node4 at position %d, num_children now %u", i, node->num_children);
                 return node;
             }
             
             // Grow to Node16
-            art_node_t *new_node = alloc_node(NODE_16);
+            mem_art_node_t *new_node = alloc_node(MEM_NODE_16);
             if (!new_node) return node;
             
             // Copy header
@@ -838,14 +824,14 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             
             // Copy children
             memcpy(new_node->node16.keys, node->node4.keys, NODE4_MAX);
-            memcpy(new_node->node16.children, node->node4.children, NODE4_MAX * sizeof(art_node_t *));
+            memcpy(new_node->node16.children, node->node4.children, NODE4_MAX * sizeof(mem_art_node_t *));
             new_node->num_children = NODE4_MAX;
             
             free(node);
             return add_child(new_node, byte, child);
         }
         
-        case NODE_16: {
+        case MEM_NODE_16: {
             if (node->num_children < NODE16_MAX) {
                 // Find insertion position
                 int i;
@@ -856,7 +842,7 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
                 if (i < node->num_children) {
                     memmove(&node->node16.keys[i + 1], &node->node16.keys[i], node->num_children - i);
                     memmove(&node->node16.children[i + 1], &node->node16.children[i],
-                            (node->num_children - i) * sizeof(art_node_t *));
+                            (node->num_children - i) * sizeof(mem_art_node_t *));
                 }
                 node->node16.keys[i] = byte;
                 node->node16.children[i] = child;
@@ -865,7 +851,7 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             }
             
             // Grow to Node48
-            art_node_t *new_node = alloc_node(NODE_48);
+            mem_art_node_t *new_node = alloc_node(MEM_NODE_48);
             if (!new_node) return node;
             
             // Copy header
@@ -886,7 +872,7 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             return add_child(new_node, byte, child);
         }
         
-        case NODE_48: {
+        case MEM_NODE_48: {
             if (node->num_children < NODE48_MAX) {
                 // Find free slot
                 int slot;
@@ -900,7 +886,7 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             }
             
             // Grow to Node256
-            art_node_t *new_node = alloc_node(NODE_256);
+            mem_art_node_t *new_node = alloc_node(MEM_NODE_256);
             if (!new_node) return node;
             
             // Copy header
@@ -919,7 +905,7 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
             return add_child(new_node, byte, child);
         }
         
-        case NODE_256: {
+        case MEM_NODE_256: {
             if (!node->node256.children[byte]) {
                 node->num_children++;
             }
@@ -932,43 +918,43 @@ static art_node_t *add_child(art_node_t *node, uint8_t byte, art_node_t *child) 
     }
 }
 
-static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **child_out) {
+static mem_art_node_t *remove_child(mem_art_node_t *node, uint8_t byte, mem_art_node_t **child_out) {
     if (!node) return NULL;
     
     switch (node->type) {
-        case NODE_4: {
+        case MEM_NODE_4: {
             for (int i = 0; i < node->num_children; i++) {
                 if (node->node4.keys[i] == byte) {
                     if (child_out) *child_out = node->node4.children[i];
                     // Shift remaining elements
                     memmove(&node->node4.keys[i], &node->node4.keys[i + 1], node->num_children - i - 1);
                     memmove(&node->node4.children[i], &node->node4.children[i + 1],
-                            (node->num_children - i - 1) * sizeof(art_node_t *));
+                            (node->num_children - i - 1) * sizeof(mem_art_node_t *));
                     node->num_children--;
-                    return node;  // NODE_4 cannot shrink further
+                    return node;  // MEM_NODE_4 cannot shrink further
                 }
             }
             break;
         }
-        case NODE_16: {
+        case MEM_NODE_16: {
             for (int i = 0; i < node->num_children; i++) {
                 if (node->node16.keys[i] == byte) {
                     if (child_out) *child_out = node->node16.children[i];
                     memmove(&node->node16.keys[i], &node->node16.keys[i + 1], node->num_children - i - 1);
                     memmove(&node->node16.children[i], &node->node16.children[i + 1],
-                            (node->num_children - i - 1) * sizeof(art_node_t *));
+                            (node->num_children - i - 1) * sizeof(mem_art_node_t *));
                     node->num_children--;
                     
-                    // Shrink NODE_16 → NODE_4 if children <= 4
+                    // Shrink MEM_NODE_16 → MEM_NODE_4 if children <= 4
                     if (node->num_children <= NODE4_MAX) {
-                        art_node_t *new_node = alloc_node(NODE_4);
+                        mem_art_node_t *new_node = alloc_node(MEM_NODE_4);
                         if (new_node) {
                             new_node->num_children = node->num_children;
                             new_node->partial_len = node->partial_len;
                             memcpy(new_node->partial, node->partial, node->partial_len);
                             memcpy(new_node->node4.keys, node->node16.keys, node->num_children);
                             memcpy(new_node->node4.children, node->node16.children, 
-                                   node->num_children * sizeof(art_node_t *));
+                                   node->num_children * sizeof(mem_art_node_t *));
                             free(node);
                             return new_node;
                         }
@@ -978,7 +964,7 @@ static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **chi
             }
             break;
         }
-        case NODE_48: {
+        case MEM_NODE_48: {
             uint8_t idx = node->node48.index[byte];
             if (idx != NODE48_EMPTY) {
                 if (child_out) *child_out = node->node48.children[idx];
@@ -986,9 +972,9 @@ static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **chi
                 node->node48.index[byte] = NODE48_EMPTY;
                 node->num_children--;
                 
-                // Shrink NODE_48 → NODE_16 if children <= 16
+                // Shrink MEM_NODE_48 → MEM_NODE_16 if children <= 16
                 if (node->num_children <= NODE16_MAX) {
-                    art_node_t *new_node = alloc_node(NODE_16);
+                    mem_art_node_t *new_node = alloc_node(MEM_NODE_16);
                     if (new_node) {
                         new_node->num_children = 0;
                         new_node->partial_len = node->partial_len;
@@ -1010,14 +996,14 @@ static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **chi
             }
             break;
         }
-        case NODE_256: {
+        case MEM_NODE_256: {
             if (child_out) *child_out = node->node256.children[byte];
             node->node256.children[byte] = NULL;
             node->num_children--;
             
-            // Shrink NODE_256 → NODE_48 if children <= 48
+            // Shrink MEM_NODE_256 → MEM_NODE_48 if children <= 48
             if (node->num_children <= NODE48_MAX) {
-                art_node_t *new_node = alloc_node(NODE_48);
+                mem_art_node_t *new_node = alloc_node(MEM_NODE_48);
                 if (new_node) {
                     new_node->num_children = 0;
                     new_node->partial_len = node->partial_len;
@@ -1044,7 +1030,7 @@ static art_node_t *remove_child(art_node_t *node, uint8_t byte, art_node_t **chi
     return node;
 }
 
-static art_node_t *delete_recursive(art_node_t *node, const uint8_t *key,
+static mem_art_node_t *delete_recursive(mem_art_node_t *node, const uint8_t *key,
                                      size_t key_len, size_t depth, bool *deleted) {
     if (!node) return NULL;
     
@@ -1071,7 +1057,7 @@ static art_node_t *delete_recursive(art_node_t *node, const uint8_t *key,
     uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
     
     // Find and delete from child
-    art_node_t *child = find_child(node, byte);
+    mem_art_node_t *child = find_child(node, byte);
     if (!child) return node;
     
     // If key is consumed, child should be the leaf to delete
@@ -1085,7 +1071,7 @@ static art_node_t *delete_recursive(art_node_t *node, const uint8_t *key,
         return node;
     }
     
-    art_node_t *new_child = delete_recursive(child, key, key_len, depth + 1, deleted);
+    mem_art_node_t *new_child = delete_recursive(child, key, key_len, depth + 1, deleted);
 
     if (new_child != child) {
         if (!new_child) {
@@ -1098,8 +1084,8 @@ static art_node_t *delete_recursive(art_node_t *node, const uint8_t *key,
     }
 
     // Path collapse: if Node4 has exactly 1 child, merge with that child
-    if (!is_leaf(node) && node->type == NODE_4 && node->num_children == 1) {
-        art_node_t *only_child = node->node4.children[0];
+    if (!is_leaf(node) && node->type == MEM_NODE_4 && node->num_children == 1) {
+        mem_art_node_t *only_child = node->node4.children[0];
         uint8_t only_byte = node->node4.keys[0];
 
         if (is_leaf(only_child)) {

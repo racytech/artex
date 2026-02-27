@@ -118,11 +118,11 @@ static void format_elapsed(double secs, char *buf, size_t bufsz) {
 // Full iterator scan: count, sorted order, FNV-1a hash
 // ============================================================================
 
-static bool full_scan(art_tree_t *tree, uint64_t expected_count,
+static bool full_scan(mem_art_t *tree, uint64_t expected_count,
                       uint64_t *out_hash, const char *label) {
     double t0 = now_sec();
 
-    art_iterator_t *iter = art_iterator_create(tree);
+    mem_art_iterator_t *iter = mem_art_iterator_create(tree);
     if (!iter) {
         fprintf(stderr, "FAIL [%s]: iterator create failed\n", label);
         return false;
@@ -133,15 +133,15 @@ static bool full_scan(art_tree_t *tree, uint64_t expected_count,
     uint8_t prev_key[KEY_SIZE];
     bool have_prev = false;
 
-    while (art_iterator_next(iter)) {
+    while (mem_art_iterator_next(iter)) {
         size_t klen, vlen;
-        const uint8_t *k = art_iterator_key(iter, &klen);
-        const void *v = art_iterator_value(iter, &vlen);
+        const uint8_t *k = mem_art_iterator_key(iter, &klen);
+        const void *v = mem_art_iterator_value(iter, &vlen);
 
         if (!k || !v || klen != KEY_SIZE || vlen != VALUE_SIZE) {
             fprintf(stderr, "FAIL [%s]: bad iterator entry at count=%" PRIu64 "\n",
                     label, count);
-            art_iterator_destroy(iter);
+            mem_art_iterator_destroy(iter);
             return false;
         }
 
@@ -149,7 +149,7 @@ static bool full_scan(art_tree_t *tree, uint64_t expected_count,
         if (have_prev && memcmp(prev_key, k, KEY_SIZE) >= 0) {
             fprintf(stderr, "FAIL [%s]: sort order violation at count=%" PRIu64 "\n",
                     label, count);
-            art_iterator_destroy(iter);
+            mem_art_iterator_destroy(iter);
             return false;
         }
         memcpy(prev_key, k, KEY_SIZE);
@@ -160,7 +160,7 @@ static bool full_scan(art_tree_t *tree, uint64_t expected_count,
         count++;
     }
 
-    art_iterator_destroy(iter);
+    mem_art_iterator_destroy(iter);
 
     if (count != expected_count) {
         fprintf(stderr, "FAIL [%s]: expected %" PRIu64 " keys, got %" PRIu64 "\n",
@@ -180,7 +180,7 @@ static bool full_scan(art_tree_t *tree, uint64_t expected_count,
 // Phase 1: Bulk insert + sample verification
 // ============================================================================
 
-static bool phase1_bulk_insert(art_tree_t *tree, uint64_t target,
+static bool phase1_bulk_insert(mem_art_t *tree, uint64_t target,
                                uint64_t seed, uint64_t *out_hash) {
     printf("\n--- Phase 1: Bulk insert %" PRIu64 " keys ---\n", target);
     double t0 = now_sec();
@@ -192,7 +192,7 @@ static bool phase1_bulk_insert(art_tree_t *tree, uint64_t target,
         generate_key(key, seed, i);
         generate_value(value, seed, i);
 
-        if (!art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE)) {
+        if (!mem_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE)) {
             fprintf(stderr, "FAIL: insert failed at index %" PRIu64 "\n", i);
             return false;
         }
@@ -208,7 +208,7 @@ static bool phase1_bulk_insert(art_tree_t *tree, uint64_t target,
                 generate_value(exp_val, seed, idx);
 
                 size_t vlen;
-                const void *got = art_get(tree, exp_key, KEY_SIZE, &vlen);
+                const void *got = mem_art_get(tree, exp_key, KEY_SIZE, &vlen);
                 if (!got) {
                     fprintf(stderr, "FAIL: key index %" PRIu64 " not found "
                             "(inserted %" PRIu64 " so far)\n", idx, i + 1);
@@ -229,9 +229,9 @@ static bool phase1_bulk_insert(art_tree_t *tree, uint64_t target,
         }
     }
 
-    if (art_size(tree) != (size_t)target) {
+    if (mem_art_size(tree) != (size_t)target) {
         fprintf(stderr, "FAIL: expected size %" PRIu64 ", got %zu\n",
-                target, art_size(tree));
+                target, mem_art_size(tree));
         return false;
     }
 
@@ -247,7 +247,7 @@ static bool phase1_bulk_insert(art_tree_t *tree, uint64_t target,
 // Phase 2: Mixed insert/delete (20% churn)
 // ============================================================================
 
-static bool phase2_mixed(art_tree_t *tree, uint64_t target,
+static bool phase2_mixed(mem_art_t *tree, uint64_t target,
                          uint64_t seed, uint64_t *next_index) {
     uint64_t churn = target / 5;  // 20%
     printf("\n--- Phase 2: Mixed insert/delete (%" PRIu64 " ops) ---\n", churn);
@@ -285,7 +285,7 @@ static bool phase2_mixed(art_tree_t *tree, uint64_t target,
 
         if (attempts < 100) {
             generate_key(key, seed, del_idx);
-            if (art_delete(tree, key, KEY_SIZE)) {
+            if (mem_art_delete(tree, key, KEY_SIZE)) {
                 alive[del_idx / 8] &= ~(uint8_t)(1 << (del_idx % 8));
                 deleted++;
             }
@@ -294,7 +294,7 @@ static bool phase2_mixed(art_tree_t *tree, uint64_t target,
         // Insert a new key
         generate_key(key, seed, new_index);
         generate_value(value, seed, new_index);
-        if (!art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE)) {
+        if (!mem_art_insert(tree, key, KEY_SIZE, value, VALUE_SIZE)) {
             fprintf(stderr, "FAIL: insert failed at new_index %" PRIu64 "\n", new_index);
             free(alive);
             return false;
@@ -308,24 +308,24 @@ static bool phase2_mixed(art_tree_t *tree, uint64_t target,
             printf("  %7.1fM / %.1fM churn | del %" PRIu64 " ins %" PRIu64
                    " | size %zu | %.1fs\n",
                    (double)(i + 1) / 1e6, (double)churn / 1e6,
-                   deleted, inserted, art_size(tree), elapsed);
+                   deleted, inserted, mem_art_size(tree), elapsed);
         }
     }
 
     free(alive);
 
     uint64_t expected_size = target - deleted + inserted;
-    if (art_size(tree) != (size_t)expected_size) {
+    if (mem_art_size(tree) != (size_t)expected_size) {
         fprintf(stderr, "FAIL: expected size %" PRIu64 " (%" PRIu64 " - %" PRIu64
                 " + %" PRIu64 "), got %zu\n",
-                expected_size, target, deleted, inserted, art_size(tree));
+                expected_size, target, deleted, inserted, mem_art_size(tree));
         return false;
     }
 
     double elapsed = now_sec() - t0;
     printf("  Phase 2 done: del %" PRIu64 ", ins %" PRIu64
            ", size %zu (%.2fs)\n",
-           deleted, inserted, art_size(tree), elapsed);
+           deleted, inserted, mem_art_size(tree), elapsed);
 
     *next_index = new_index;
 
@@ -337,9 +337,9 @@ static bool phase2_mixed(art_tree_t *tree, uint64_t target,
 // Phase 3: Delete all keys
 // ============================================================================
 
-static bool phase3_delete_all(art_tree_t *tree, uint64_t seed,
+static bool phase3_delete_all(mem_art_t *tree, uint64_t seed,
                               uint64_t total_indices) {
-    size_t before = art_size(tree);
+    size_t before = mem_art_size(tree);
     printf("\n--- Phase 3: Delete all %zu keys ---\n", before);
     double t0 = now_sec();
 
@@ -348,7 +348,7 @@ static bool phase3_delete_all(art_tree_t *tree, uint64_t seed,
 
     for (uint64_t i = 0; i < total_indices; i++) {
         generate_key(key, seed, i);
-        if (art_delete(tree, key, KEY_SIZE)) {
+        if (mem_art_delete(tree, key, KEY_SIZE)) {
             deleted++;
         }
 
@@ -359,26 +359,26 @@ static bool phase3_delete_all(art_tree_t *tree, uint64_t seed,
         }
     }
 
-    if (art_size(tree) != 0) {
+    if (mem_art_size(tree) != 0) {
         fprintf(stderr, "FAIL: tree not empty after deleting all (size=%zu)\n",
-                art_size(tree));
+                mem_art_size(tree));
         return false;
     }
 
-    if (!art_is_empty(tree)) {
-        fprintf(stderr, "FAIL: art_is_empty returned false\n");
+    if (!mem_art_is_empty(tree)) {
+        fprintf(stderr, "FAIL: mem_art_is_empty returned false\n");
         return false;
     }
 
     // Iterator should yield nothing
-    art_iterator_t *iter = art_iterator_create(tree);
+    mem_art_iterator_t *iter = mem_art_iterator_create(tree);
     if (iter) {
-        if (art_iterator_next(iter)) {
+        if (mem_art_iterator_next(iter)) {
             fprintf(stderr, "FAIL: iterator returned entry on empty tree\n");
-            art_iterator_destroy(iter);
+            mem_art_iterator_destroy(iter);
             return false;
         }
-        art_iterator_destroy(iter);
+        mem_art_iterator_destroy(iter);
     }
 
     double elapsed = now_sec() - t0;
@@ -397,31 +397,31 @@ static bool run_all_phases(uint64_t target, uint64_t seed,
     printf("\n========== Run %d (seed=0x%016" PRIx64 ") ==========\n",
            run_num, seed);
 
-    art_tree_t tree;
-    if (!art_tree_init(&tree)) {
-        fprintf(stderr, "FAIL: art_tree_init failed\n");
+    mem_art_t tree;
+    if (!mem_art_init(&tree)) {
+        fprintf(stderr, "FAIL: mem_art_init failed\n");
         return false;
     }
 
     uint64_t phase1_hash = 0;
     if (!phase1_bulk_insert(&tree, target, seed, &phase1_hash)) {
-        art_tree_destroy(&tree);
+        mem_art_destroy(&tree);
         return false;
     }
     if (out_phase1_hash) *out_phase1_hash = phase1_hash;
 
     uint64_t next_index = 0;
     if (!phase2_mixed(&tree, target, seed, &next_index)) {
-        art_tree_destroy(&tree);
+        mem_art_destroy(&tree);
         return false;
     }
 
     if (!phase3_delete_all(&tree, seed, next_index)) {
-        art_tree_destroy(&tree);
+        mem_art_destroy(&tree);
         return false;
     }
 
-    art_tree_destroy(&tree);
+    mem_art_destroy(&tree);
     return true;
 }
 

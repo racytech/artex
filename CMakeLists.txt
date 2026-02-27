@@ -23,7 +23,6 @@ include_directories(
 # In-Memory ART Tree (general-purpose, variable-size keys/values)
 add_library(art_database STATIC
     database/src/mem_art.c
-    database/src/logger.c
 )
 
 # Compact ART — Space-Efficient Index (fixed-size keys/values, arena-allocated)

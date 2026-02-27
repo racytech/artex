@@ -177,8 +177,8 @@ static int bench_mem(uint64_t target, uint64_t seed) {
     printf("  RSS before: %zu MB\n", get_rss_mb());
     printf("\n");
 
-    art_tree_t tree;
-    art_tree_init(&tree);
+    mem_art_t tree;
+    mem_art_init(&tree);
 
     uint8_t key[KEY_SIZE];
     uint8_t value[VALUE_SIZE];
@@ -194,9 +194,9 @@ static int bench_mem(uint64_t target, uint64_t seed) {
         uint32_t val = (uint32_t)(i & 0xFFFFFFFF);
         memcpy(value, &val, 4);
 
-        if (!art_insert(&tree, key, KEY_SIZE, value, VALUE_SIZE)) {
+        if (!mem_art_insert(&tree, key, KEY_SIZE, value, VALUE_SIZE)) {
             fprintf(stderr, "FAIL: insert at %" PRIu64 "\n", i);
-            art_tree_destroy(&tree);
+            mem_art_destroy(&tree);
             return 1;
         }
 
@@ -232,10 +232,10 @@ static int bench_mem(uint64_t target, uint64_t seed) {
            (double)(final_rss * 1024 * 1024) / (double)target);
     printf("  time:        %.1fs (%.0f Kkeys/sec)\n",
            total, target / total / 1000.0);
-    printf("  tree size:   %zu\n", art_size(&tree));
+    printf("  tree size:   %zu\n", mem_art_size(&tree));
     printf("  ============================================\n\n");
 
-    art_tree_destroy(&tree);
+    mem_art_destroy(&tree);
     return 0;
 }
 

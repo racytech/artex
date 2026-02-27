@@ -24,7 +24,7 @@ struct data_layer {
     compact_art_t index;
     state_store_t *store;
     code_store_t *code;
-    art_tree_t buffer;
+    mem_art_t buffer;
     uint32_t key_size;
     uint64_t total_merged;
 };
@@ -62,7 +62,7 @@ data_layer_t *dl_create(const char *state_path, const char *code_path,
         }
     }
 
-    if (!art_tree_init(&dl->buffer)) {
+    if (!mem_art_init(&dl->buffer)) {
         compact_art_destroy(&dl->index);
         state_store_destroy(dl->store);
         if (dl->code) code_store_destroy(dl->code);
@@ -78,7 +78,7 @@ void dl_destroy(data_layer_t *dl) {
     compact_art_destroy(&dl->index);
     state_store_destroy(dl->store);
     if (dl->code) code_store_destroy(dl->code);
-    art_tree_destroy(&dl->buffer);
+    mem_art_destroy(&dl->buffer);
     free(dl);
 }
 
@@ -91,19 +91,19 @@ bool dl_put(data_layer_t *dl, const uint8_t *key,
     uint8_t buf[1 + STATE_STORE_MAX_VALUE];
     buf[0] = BUF_FLAG_WRITE;
     memcpy(buf + 1, value, len);
-    return art_insert(&dl->buffer, key, dl->key_size, buf, 1 + len);
+    return mem_art_insert(&dl->buffer, key, dl->key_size, buf, 1 + len);
 }
 
 bool dl_delete(data_layer_t *dl, const uint8_t *key) {
     uint8_t tombstone = BUF_FLAG_TOMBSTONE;
-    return art_insert(&dl->buffer, key, dl->key_size, &tombstone, 1);
+    return mem_art_insert(&dl->buffer, key, dl->key_size, &tombstone, 1);
 }
 
 bool dl_get(data_layer_t *dl, const uint8_t *key,
             void *out_value, uint16_t *out_len) {
     // 1. Check write buffer
     size_t vlen = 0;
-    const void *bval = art_get(&dl->buffer, key, dl->key_size, &vlen);
+    const void *bval = mem_art_get(&dl->buffer, key, dl->key_size, &vlen);
     if (bval) {
         uint8_t flag = *(const uint8_t *)bval;
         if (flag == BUF_FLAG_TOMBSTONE) return false;
@@ -133,13 +133,13 @@ bool dl_get(data_layer_t *dl, const uint8_t *key,
 uint64_t dl_merge(data_layer_t *dl) {
     uint64_t count = 0;
 
-    art_iterator_t *iter = art_iterator_create(&dl->buffer);
+    mem_art_iterator_t *iter = mem_art_iterator_create(&dl->buffer);
     if (!iter) return 0;
 
-    while (art_iterator_next(iter)) {
+    while (mem_art_iterator_next(iter)) {
         size_t klen = 0, vlen = 0;
-        const uint8_t *key = art_iterator_key(iter, &klen);
-        const void *val = art_iterator_value(iter, &vlen);
+        const uint8_t *key = mem_art_iterator_key(iter, &klen);
+        const void *val = mem_art_iterator_value(iter, &vlen);
         if (!key || !val || klen != dl->key_size || vlen < 1) continue;
 
         uint8_t flag = *(const uint8_t *)val;
@@ -175,11 +175,11 @@ uint64_t dl_merge(data_layer_t *dl) {
         count++;
     }
 
-    art_iterator_destroy(iter);
+    mem_art_iterator_destroy(iter);
 
     // Clear buffer (no fdatasync — checkpoint concern)
-    art_tree_destroy(&dl->buffer);
-    art_tree_init(&dl->buffer);
+    mem_art_destroy(&dl->buffer);
+    mem_art_init(&dl->buffer);
 
     dl->total_merged += count;
     return count;
@@ -290,7 +290,7 @@ data_layer_t *dl_open(const char *state_path, const char *code_path,
         return NULL;
     }
 
-    if (!art_tree_init(&dl->buffer)) {
+    if (!mem_art_init(&dl->buffer)) {
         compact_art_destroy(&dl->index);
         state_store_destroy(dl->store);
         if (dl->code) code_store_destroy(dl->code);
@@ -309,7 +309,7 @@ dl_stats_t dl_stats(const data_layer_t *dl) {
     dl_stats_t s = {0};
     if (!dl) return s;
     s.index_keys = compact_art_size(&dl->index);
-    s.buffer_entries = art_size(&dl->buffer);
+    s.buffer_entries = mem_art_size(&dl->buffer);
     s.total_merged = dl->total_merged;
     s.free_slots = state_store_free_count(dl->store);
     s.code_count = dl->code ? code_store_count(dl->code) : 0;

@@ -1,12 +1,11 @@
 /*
- * Minimal logging implementation for ART database
+ * Minimal logging implementation
  */
 
 #include "logger.h"
 #include <stdarg.h>
 #include <time.h>
 #include <string.h>
-#include <unistd.h>
 
 /* ============================================================================
  * Global State
@@ -30,7 +29,7 @@ static const char* LEVEL_STRINGS[] = {
     "INFO ",
     "WARN ",
     "ERROR",
-    "CRIT "
+    "FATAL"
 };
 
 static const char* LEVEL_COLORS[] = {
@@ -39,7 +38,14 @@ static const char* LEVEL_COLORS[] = {
     "\x1b[32m",  /* INFO  - green */
     "\x1b[33m",  /* WARN  - yellow */
     "\x1b[31m",  /* ERROR - red */
-    "\x1b[35m"   /* CRITICAL - magenta */
+    "\x1b[35m"   /* FATAL - magenta */
+};
+
+static const char* COMPONENT_STRINGS[] = {
+    "database",
+    "state",
+    "evm",
+    "common"
 };
 
 static const char* COLOR_RESET = "\x1b[0m";
@@ -51,11 +57,18 @@ static const char* COLOR_RESET = "\x1b[0m";
 /* Extract filename from full path */
 static const char* extract_filename(const char* path) {
     const char* slash = strrchr(path, '/');
-    return slash ? slash + 1 : path;
+    if (slash) {
+        return slash + 1;
+    }
+    return path;
 }
 
 /* Check if output supports colors (simple tty check) */
 static int supports_color(FILE* stream) {
+    /* Check if stderr/stdout is a terminal */
+    extern int isatty(int fd);
+    extern int fileno(FILE* stream);
+    
     if (stream == stderr) {
         return isatty(fileno(stderr));
     } else if (stream == stdout) {
@@ -83,6 +96,7 @@ log_level_t log_get_level(void) {
 
 void log_write(
     log_level_t level,
+    log_component_t component,
     const char* file,
     int line,
     const char* fmt,
@@ -107,18 +121,17 @@ void log_write(
     
     /* Print log prefix with color */
     if (use_color) {
-        fprintf(out, "%s[%s] %s%s%s [%s:%d] ",
-            LEVEL_COLORS[level],
-            time_buf,
+        fprintf(out, "%s%s%s [%s][%s:%d] ",
             LEVEL_COLORS[level],
             LEVEL_STRINGS[level],
             COLOR_RESET,
+            COMPONENT_STRINGS[component],
             extract_filename(file),
             line);
     } else {
-        fprintf(out, "[%s] %s [%s:%d] ",
-            time_buf,
+        fprintf(out, "%s [%s][%s:%d] ",
             LEVEL_STRINGS[level],
+            COMPONENT_STRINGS[component],
             extract_filename(file),
             line);
     }
