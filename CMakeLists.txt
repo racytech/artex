@@ -297,6 +297,13 @@ if(LMDB_LIB AND LMDB_INCLUDE)
     target_link_libraries(benchmark_comparison art_persistent ${LMDB_LIB} pthread)
     target_compile_definitions(benchmark_comparison PRIVATE HAVE_LMDB=1)
     message(STATUS "LMDB found — benchmark_comparison includes LMDB comparison")
+
+    # LMDB production-scale benchmark (same workload as test_production_scale)
+    add_executable(bench_lmdb_production
+        database/tests/bench_lmdb_production.c
+    )
+    target_include_directories(bench_lmdb_production PRIVATE ${LMDB_INCLUDE})
+    target_link_libraries(bench_lmdb_production ${LMDB_LIB} pthread)
 else()
     target_link_libraries(benchmark_comparison art_persistent pthread)
     message(STATUS "LMDB not found — benchmark_comparison runs ART-only")
