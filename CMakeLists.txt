@@ -65,6 +65,14 @@ add_library(art_database STATIC
 )
 
 #==============================================================================
+# Database Library (Compact ART — Space-Efficient Index)
+#==============================================================================
+
+add_library(compact_art STATIC
+    database/src/compact_art.c
+)
+
+#==============================================================================
 # Tests
 #==============================================================================
 
@@ -193,11 +201,29 @@ add_executable(test_production_scale
 )
 target_link_libraries(test_production_scale art_persistent pthread)
 
+# Test: Production-Scale with Write Buffer (Option A: mem_art buffer → sorted merge)
+add_executable(test_production_scale_buffered
+    database/tests/test_production_scale_buffered.c
+)
+target_link_libraries(test_production_scale_buffered art_persistent art_database pthread)
+
 # Test: mem_art stress (in-memory ART correctness at scale)
 add_executable(test_stress_mem_art
     database/tests/test_stress_mem_art.c
 )
 target_link_libraries(test_stress_mem_art art_database)
+
+# Benchmark: mem_art as index (memory usage measurement)
+add_executable(bench_mem_art_index
+    database/tests/bench_mem_art_index.c
+)
+target_link_libraries(bench_mem_art_index art_database)
+
+# Benchmark: compact_art vs mem_art (memory comparison)
+add_executable(bench_compact_art_index
+    database/tests/bench_compact_art_index.c
+)
+target_link_libraries(bench_compact_art_index compact_art art_database)
 
 # Test: Prefix Key Debug
 add_executable(test_prefix_debug
