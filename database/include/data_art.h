@@ -955,6 +955,51 @@ bool data_art_compact_if_needed(data_art_tree_t *tree, double threshold,
                                  data_art_compact_result_t *result);
 
 // ============================================================================
+// Hot Page Pinning (mlock)
+// ============================================================================
+
+/**
+ * Result of mlock operation.
+ */
+typedef struct {
+    size_t pages_locked;        // Number of unique pages mlocked
+    size_t bytes_locked;        // Total bytes locked (pages_locked * PAGE_SIZE)
+    size_t inner_nodes_visited; // Inner nodes visited during BFS
+    size_t leaves_skipped;      // Leaf nodes skipped (not pinned)
+} data_art_mlock_result_t;
+
+/**
+ * Pin hot inner-node pages in RAM using mlock().
+ *
+ * Performs a BFS from the current committed root, visiting inner nodes
+ * (Node4/16/48/256) and locking their pages into physical memory.
+ * Leaf nodes are NOT locked — they are cold after insertion and can
+ * be safely evicted by the kernel.
+ *
+ * Call after checkpoint or compaction (pages may have moved).
+ * Safe to call from any thread; uses committed_root (lock-free).
+ *
+ * @param tree          Tree instance
+ * @param budget_bytes  Maximum bytes to mlock (0 = no limit).
+ *                      Recommended: 25-50% of physical RAM.
+ * @param result        Output stats (can be NULL)
+ * @return Number of pages locked, or -1 on error
+ */
+int64_t data_art_mlock_hot_pages(data_art_tree_t *tree, size_t budget_bytes,
+                                  data_art_mlock_result_t *result);
+
+/**
+ * Unlock all previously mlocked pages.
+ *
+ * Calls munlock() on the entire mapped region.  Safe to call even if
+ * no pages were locked.
+ *
+ * @param tree  Tree instance
+ * @return true on success
+ */
+bool data_art_munlock_all(data_art_tree_t *tree);
+
+// ============================================================================
 // Statistics & Debugging
 // ============================================================================
 

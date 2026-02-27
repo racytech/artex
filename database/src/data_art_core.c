@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 
 // Forward declarations
@@ -1200,5 +1201,194 @@ bool data_art_checkpoint(data_art_tree_t *tree, uint64_t *checkpoint_lsn_out) {
     if (checkpoint_lsn_out) *checkpoint_lsn_out = 0;
     LOG_INFO("Checkpoint (root=%lu:%u, size=%zu)",
              node_ref_page_id(tree->root), node_ref_offset(tree->root), tree->size);
+    return true;
+}
+
+// ============================================================================
+// Hot Page Pinning (mlock)
+// ============================================================================
+
+#include <sys/mman.h>
+
+/**
+ * Get child refs from an inner node for BFS traversal.
+ * Returns number of children written to out_children[].
+ */
+static int mlock_get_children(const void *node, node_ref_t *out_children, int max) {
+    uint8_t type = *(const uint8_t *)node;
+    int count = 0;
+
+    switch (type) {
+        case DATA_NODE_4: {
+            const data_art_node4_t *n = (const data_art_node4_t *)node;
+            for (int i = 0; i < n->num_children && count < max; i++) {
+                if (!node_ref_is_null(n->children[i]))
+                    out_children[count++] = n->children[i];
+            }
+            break;
+        }
+        case DATA_NODE_16: {
+            const data_art_node16_t *n = (const data_art_node16_t *)node;
+            for (int i = 0; i < n->num_children && count < max; i++) {
+                if (!node_ref_is_null(n->children[i]))
+                    out_children[count++] = n->children[i];
+            }
+            break;
+        }
+        case DATA_NODE_48: {
+            const data_art_node48_t *n = (const data_art_node48_t *)node;
+            for (int i = 0; i < 48 && count < max; i++) {
+                if (!node_ref_is_null(n->children[i]))
+                    out_children[count++] = n->children[i];
+            }
+            break;
+        }
+        case DATA_NODE_256: {
+            const data_art_node256_t *n = (const data_art_node256_t *)node;
+            for (int i = 0; i < 256 && count < max; i++) {
+                if (!node_ref_is_null(n->children[i]))
+                    out_children[count++] = n->children[i];
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    return count;
+}
+
+int64_t data_art_mlock_hot_pages(data_art_tree_t *tree, size_t budget_bytes,
+                                  data_art_mlock_result_t *result) {
+    if (!tree || !tree->mmap_storage) return -1;
+
+    node_ref_t root = atomic_load_explicit(&tree->committed_root, memory_order_acquire);
+    if (node_ref_is_null(root)) return 0;
+
+    mmap_storage_t *ms = tree->mmap_storage;
+
+    /* Track which pages we've already locked to avoid duplicates.
+     * Use a simple bitmap — 1 bit per page.  At 56 GB / 4KB = 14M pages
+     * that's ~1.75 MB for the bitmap, acceptable. */
+    uint64_t total_pages = ms->next_page_id;
+    size_t bitmap_words = (total_pages + 63) / 64;
+    uint64_t *locked_bitmap = calloc(bitmap_words, sizeof(uint64_t));
+    if (!locked_bitmap) return -1;
+
+    /* BFS queue — start with root, expand children of inner nodes.
+     * Max queue size: 256 children per node × depth.  Use a dynamic array. */
+    size_t queue_cap = 4096;
+    size_t queue_head = 0, queue_tail = 0;
+    node_ref_t *queue = malloc(queue_cap * sizeof(node_ref_t));
+    if (!queue) { free(locked_bitmap); return -1; }
+
+    queue[queue_tail++] = root;
+
+    size_t pages_locked = 0;
+    size_t bytes_locked = 0;
+    size_t inner_nodes = 0;
+    size_t leaves_skipped = 0;
+
+    node_ref_t children_buf[256];
+
+    while (queue_head < queue_tail) {
+        /* Check budget */
+        if (budget_bytes > 0 && bytes_locked >= budget_bytes)
+            break;
+
+        node_ref_t ref = queue[queue_head++];
+        if (node_ref_is_null(ref)) continue;
+
+        uint64_t page_id = node_ref_page_id(ref);
+        if (page_id == 0 || page_id >= total_pages) continue;
+
+        /* Skip if already locked */
+        uint64_t word_idx = page_id / 64;
+        uint64_t bit_mask = 1ULL << (page_id % 64);
+        if (locked_bitmap[word_idx] & bit_mask) {
+            /* Page already locked — still need to explore children */
+            const void *node = data_art_load_node(tree, ref);
+            if (!node) continue;
+            uint8_t type = *(const uint8_t *)node;
+            if (type >= DATA_NODE_LEAF) continue;
+
+            int nchildren = mlock_get_children(node, children_buf, 256);
+            /* Grow queue if needed */
+            if (queue_tail + (size_t)nchildren > queue_cap) {
+                queue_cap = queue_cap * 2 + (size_t)nchildren;
+                node_ref_t *nq = realloc(queue, queue_cap * sizeof(node_ref_t));
+                if (!nq) break;
+                queue = nq;
+            }
+            for (int i = 0; i < nchildren; i++)
+                queue[queue_tail++] = children_buf[i];
+            continue;
+        }
+
+        /* Load the node */
+        const void *node = data_art_load_node(tree, ref);
+        if (!node) continue;
+
+        uint8_t type = *(const uint8_t *)node;
+
+        /* Skip leaves — they're cold after insertion */
+        if (type >= DATA_NODE_LEAF) {
+            leaves_skipped++;
+            continue;
+        }
+
+        /* Lock this page */
+        void *page_addr = (void *)(ms->base + page_id * PAGE_SIZE);
+        if (mlock(page_addr, PAGE_SIZE) == 0) {
+            locked_bitmap[word_idx] |= bit_mask;
+            pages_locked++;
+            bytes_locked += PAGE_SIZE;
+        }
+
+        inner_nodes++;
+
+        /* Enqueue children */
+        int nchildren = mlock_get_children(node, children_buf, 256);
+
+        /* Grow queue if needed */
+        if (queue_tail + (size_t)nchildren > queue_cap) {
+            queue_cap = queue_cap * 2 + (size_t)nchildren;
+            node_ref_t *nq = realloc(queue, queue_cap * sizeof(node_ref_t));
+            if (!nq) break;
+            queue = nq;
+        }
+
+        for (int i = 0; i < nchildren; i++)
+            queue[queue_tail++] = children_buf[i];
+    }
+
+    free(queue);
+    free(locked_bitmap);
+
+    if (result) {
+        result->pages_locked = pages_locked;
+        result->bytes_locked = bytes_locked;
+        result->inner_nodes_visited = inner_nodes;
+        result->leaves_skipped = leaves_skipped;
+    }
+
+    LOG_INFO("mlock_hot_pages: locked %zu pages (%.1f MB), "
+             "visited %zu inner nodes, skipped %zu leaves",
+             pages_locked, bytes_locked / (1024.0 * 1024.0),
+             inner_nodes, leaves_skipped);
+
+    return (int64_t)pages_locked;
+}
+
+bool data_art_munlock_all(data_art_tree_t *tree) {
+    if (!tree || !tree->mmap_storage) return false;
+    mmap_storage_t *ms = tree->mmap_storage;
+    if (!ms->base || ms->mapped_size == 0) return false;
+
+    int rc = munlock(ms->base, ms->mapped_size);
+    if (rc != 0) {
+        LOG_ERROR("munlock_all: munlock(%p, %zu) failed: %s",
+                  (void *)ms->base, ms->mapped_size, strerror(errno));
+        return false;
+    }
     return true;
 }
