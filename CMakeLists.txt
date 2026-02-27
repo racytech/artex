@@ -56,6 +56,12 @@ add_executable(bench_mem_art_index
 )
 target_link_libraries(bench_mem_art_index art_database)
 
+# Test: compact_art stress (correctness at scale)
+add_executable(test_stress_compact_art
+    database/tests/test_stress_compact_art.c
+)
+target_link_libraries(test_stress_compact_art compact_art)
+
 # Benchmark: compact_art vs mem_art (memory comparison)
 add_executable(bench_compact_art_index
     database/tests/bench_compact_art_index.c
