@@ -175,6 +175,37 @@ pread avoids this by:
 
 NVMe SSD with 500 GB is sufficient.
 
+## Account Encoding (TODO)
+
+Ethereum accounts use a two-slot layout in state.dat:
+
+```
+Slot 1 (always):  [1B flags] [8B nonce] [balance bytes...]
+Slot 2 (if code): [32B code_hash] [30B reserved]
+```
+
+Flags byte:
+- bit 0: `has_code` — second slot exists
+- bits 1-4: `balance_len` (0-32, compact big-endian, no leading zeros)
+
+If `has_code` is set, the last 4 bytes of slot 1 data hold the slot index
+of slot 2:
+
+```
+Slot 1 with code: [1B flags][8B nonce][N bal bytes][4B slot2_id]
+  max: 1 + 8 + 32 + 4 = 45B — fits in 62B
+```
+
+EOAs (externally owned accounts, ~70% of all accounts) use a single slot.
+Contract accounts use two slots. The second slot is allocated independently
+via `state_store_alloc()` — no adjacent-slot pairing required, which keeps
+the allocator and free list simple.
+
+Read path for contracts: decode slot 1 flags → extract slot2_id →
+`pread` slot 2. Two syscalls instead of one, but contract reads are
+followed by bytecode execution (thousands of opcodes), so the extra pread
+is negligible. Hot contracts stay in page cache.
+
 ## Optional: Application-Level Read Cache
 
 If page cache hit rate drops under pressure (other processes competing
