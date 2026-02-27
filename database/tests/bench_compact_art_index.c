@@ -3,7 +3,7 @@
  *
  * Measures memory usage of both ART implementations as a pure index:
  *   - 32-byte keys (keccak256)
- *   - 12-byte values (8B file offset + 4B value length)
+ *   - 4-byte values (opaque — caller decides encoding)
  *
  * Reports RSS at each milestone for direct comparison.
  *
@@ -22,7 +22,7 @@
 #include <time.h>
 
 #define KEY_SIZE    32
-#define VALUE_SIZE  12   // 8B offset + 4B length
+#define VALUE_SIZE  4
 
 typedef struct { uint64_t state; } rng_t;
 
@@ -95,10 +95,8 @@ static int bench_compact(uint64_t target, uint64_t seed) {
     for (uint64_t i = 0; i < target; i++) {
         generate_key(key, seed, i);
 
-        uint64_t offset = i * 256;
-        uint32_t len = 200;
-        memcpy(value, &offset, 8);
-        memcpy(value + 8, &len, 4);
+        uint32_t val = (uint32_t)(i & 0xFFFFFFFF);
+        memcpy(value, &val, 4);
 
         if (!compact_art_insert(&tree, key, value)) {
             fprintf(stderr, "FAIL: insert at %" PRIu64 "\n", i);
@@ -142,10 +140,10 @@ static int bench_compact(uint64_t target, uint64_t seed) {
             compact_art_destroy(&tree);
             return 1;
         }
-        uint64_t expected_offset = i * 256;
-        uint64_t got_offset;
-        memcpy(&got_offset, v, 8);
-        if (got_offset != expected_offset) {
+        uint32_t expected_val = (uint32_t)(i & 0xFFFFFFFF);
+        uint32_t got_val;
+        memcpy(&got_val, v, 4);
+        if (got_val != expected_val) {
             fprintf(stderr, "\n  FAIL: key %" PRIu64 " wrong value!\n", i);
             compact_art_destroy(&tree);
             return 1;
@@ -193,10 +191,8 @@ static int bench_mem(uint64_t target, uint64_t seed) {
     for (uint64_t i = 0; i < target; i++) {
         generate_key(key, seed, i);
 
-        uint64_t offset = i * 256;
-        uint32_t len = 200;
-        memcpy(value, &offset, 8);
-        memcpy(value + 8, &len, 4);
+        uint32_t val = (uint32_t)(i & 0xFFFFFFFF);
+        memcpy(value, &val, 4);
 
         if (!art_insert(&tree, key, KEY_SIZE, value, VALUE_SIZE)) {
             fprintf(stderr, "FAIL: insert at %" PRIu64 "\n", i);
