@@ -94,6 +94,11 @@ add_executable(test_code_store
 )
 target_link_libraries(test_code_store data_layer)
 
+# PoC: Account Encoding (compact variable-length account serialization)
+add_executable(test_account_encoding
+    database/tests/test_account_encoding.c
+)
+
 # PoC: Data Layer Integration Test (write buffer + index + state.dat)
 add_executable(test_data_layer_poc
     database/tests/test_data_layer_poc.c
