@@ -553,23 +553,66 @@ void mmap_storage_start_writeback(mmap_storage_t *ms) {
 }
 
 /**
- * Sync dirty data pages to disk (incremental checkpoint).
+ * Sync dirty data pages to disk (checkpoint phase 1).
  *
- * Scans the dirty bitmap at word granularity (64 pages = 256KB per word).
- * Contiguous non-zero words are merged into a single msync call to
- * minimise syscall overhead during bulk writes.  Clean 64-page blocks
- * are skipped entirely.
+ * On Linux, uses a two-phase approach:
+ *   1. sync_file_range(WAIT_BEFORE) — drain any in-flight writeback that was
+ *      kicked off by start_writeback() between checkpoints.  This is fast if
+ *      the kernel has been flushing pages in the background.
+ *   2. fdatasync() — one syscall to guarantee remaining dirty pages reach
+ *      stable storage.  Faster than scanning our bitmap and issuing many
+ *      individual msync() calls.
  *
- * Returns true on success, false if any msync fails.
+ * On non-Linux: single msync(MS_SYNC) on the data region.
+ *
+ * Returns true on success, false on I/O error.
  */
 static bool sync_dirty_pages(mmap_storage_t *ms) {
-    size_t total_pages = ms->mapped_size / PAGE_SIZE;
+#ifdef __linux__
+    /* Phase 1: wait for in-flight writeback from start_writeback() calls. */
+    if (ms->mapped_size > PAGE_SIZE) {
+        sync_file_range(ms->fd, PAGE_SIZE,
+                        (off_t)(ms->mapped_size - PAGE_SIZE),
+                        SYNC_FILE_RANGE_WAIT_BEFORE);
+    }
+
+    /* Phase 2: crash-safe sync of any remaining dirty pages. */
+    if (fdatasync(ms->fd) != 0) {
+        LOG_ERROR("sync_dirty_pages: fdatasync failed: %s", strerror(errno));
+        return false;
+    }
+#else
+    if (ms->mapped_size > PAGE_SIZE) {
+        if (msync(ms->base + PAGE_SIZE, ms->mapped_size - PAGE_SIZE, MS_SYNC) != 0) {
+            LOG_ERROR("sync_dirty_pages: msync failed: %s", strerror(errno));
+            return false;
+        }
+    }
+#endif
+
+    /* Clear bitmap — all pages are now clean */
+    memset(ms->dirty_bitmap, 0, ms->dirty_bitmap_words * sizeof(uint64_t));
+    return true;
+}
+
+size_t mmap_storage_flush_dirty_batch(mmap_storage_t *ms, size_t max_pages) {
+    if (!ms || !ms->dirty_bitmap || max_pages == 0) return 0;
+
     size_t num_words = ms->dirty_bitmap_words;
+    size_t total_pages = ms->mapped_size / PAGE_SIZE;
+    if (num_words == 0) return 0;
+
+    /* Ensure cursor is in bounds */
+    if (ms->flush_cursor >= num_words) ms->flush_cursor = 0;
+
+    size_t pages_synced = 0;
+    size_t words_scanned = 0;
+    size_t w = ms->flush_cursor;
 
     size_t range_start = 0;
     bool in_range = false;
 
-    for (size_t w = 0; w < num_words; w++) {
+    while (words_scanned < num_words && pages_synced < max_pages) {
         if (ms->dirty_bitmap[w] != 0) {
             if (!in_range) {
                 range_start = w * 64;
@@ -582,34 +625,44 @@ static bool sync_dirty_pages(mmap_storage_t *ms) {
                 size_t range_end = w * 64;
                 if (range_end > total_pages) range_end = total_pages;
                 if (range_end > range_start) {
-                    if (msync(ms->base + range_start * PAGE_SIZE,
-                              (range_end - range_start) * PAGE_SIZE, MS_SYNC) != 0) {
-                        LOG_ERROR("sync_dirty_pages: msync [%zu, %zu) failed: %s",
-                                  range_start, range_end, strerror(errno));
-                        return false;
+                    msync(ms->base + range_start * PAGE_SIZE,
+                          (range_end - range_start) * PAGE_SIZE, MS_SYNC);
+                    pages_synced += (range_end - range_start);
+                    /* Clear dirty bits for the synced words */
+                    size_t start_word = (range_start <= 1) ? 0 : range_start / 64;
+                    for (size_t cw = start_word; cw < w; cw++) {
+                        ms->dirty_bitmap[cw] = 0;
                     }
                 }
                 in_range = false;
             }
         }
+
+        words_scanned++;
+        w++;
+        if (w >= num_words) w = 0;  /* wrap around */
     }
 
-    /* Flush final range */
+    /* Flush final range if still in one */
     if (in_range) {
-        size_t range_end = total_pages;
+        size_t range_end = w * 64;
+        if (range_end == 0) range_end = total_pages;  /* wrapped to start */
+        if (range_end > total_pages) range_end = total_pages;
         if (range_end > range_start) {
-            if (msync(ms->base + range_start * PAGE_SIZE,
-                      (range_end - range_start) * PAGE_SIZE, MS_SYNC) != 0) {
-                LOG_ERROR("sync_dirty_pages: msync final [%zu, %zu) failed: %s",
-                          range_start, range_end, strerror(errno));
-                return false;
+            msync(ms->base + range_start * PAGE_SIZE,
+                  (range_end - range_start) * PAGE_SIZE, MS_SYNC);
+            pages_synced += (range_end - range_start);
+            size_t start_word = (range_start <= 1) ? 0 : range_start / 64;
+            size_t end_word = (range_end + 63) / 64;
+            if (end_word > num_words) end_word = num_words;
+            for (size_t cw = start_word; cw < end_word; cw++) {
+                ms->dirty_bitmap[cw] = 0;
             }
         }
     }
 
-    /* Clear bitmap — all pages are now clean */
-    memset(ms->dirty_bitmap, 0, num_words * sizeof(uint64_t));
-    return true;
+    ms->flush_cursor = w;
+    return pages_synced;
 }
 
 bool mmap_storage_checkpoint(mmap_storage_t *ms,

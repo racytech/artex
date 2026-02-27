@@ -97,6 +97,7 @@ typedef struct mmap_storage {
      * Checkpoint only syncs pages with set bits instead of the entire file. */
     uint64_t *dirty_bitmap;        /* Bitmap: 1 bit per page */
     size_t dirty_bitmap_words;     /* Size in uint64_t words */
+    size_t flush_cursor;           /* Word index for incremental flush */
 } mmap_storage_t;
 
 /**
@@ -211,6 +212,23 @@ bool mmap_storage_sync(mmap_storage_t *ms);
  * on disk and the blocking sync is fast.  No-op on non-Linux platforms.
  */
 void mmap_storage_start_writeback(mmap_storage_t *ms);
+
+/**
+ * Incrementally flush dirty pages to disk.
+ *
+ * Scans the dirty bitmap starting from an internal cursor, msyncs up to
+ * max_pages worth of dirty pages (coalescing contiguous ranges), clears
+ * their dirty bits, and advances the cursor.  Wraps around at the end.
+ *
+ * Unlike start_writeback (non-blocking hint), this call blocks until the
+ * pages are on stable storage.  Call after each transaction commit to
+ * spread I/O and keep checkpoint residual small.
+ *
+ * Does NOT update the header — that is only done in mmap_storage_checkpoint().
+ *
+ * @return Number of pages actually synced.
+ */
+size_t mmap_storage_flush_dirty_batch(mmap_storage_t *ms, size_t max_pages);
 
 /**
  * Crash-safe checkpoint using shadow header.

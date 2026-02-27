@@ -194,6 +194,11 @@ void data_art_start_writeback(data_art_tree_t *tree) {
     }
 }
 
+size_t data_art_flush_dirty(data_art_tree_t *tree, size_t max_pages) {
+    if (!tree || !tree->mmap_storage) return 0;
+    return mmap_storage_flush_dirty_batch(tree->mmap_storage, max_pages);
+}
+
 node_ref_t data_art_get_root(const data_art_tree_t *tree) {
     return tree ? tree->root : NULL_NODE_REF;
 }

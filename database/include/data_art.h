@@ -682,6 +682,17 @@ bool data_art_flush(data_art_tree_t *tree);
  */
 void data_art_start_writeback(data_art_tree_t *tree);
 
+/**
+ * Incrementally flush dirty pages to disk (blocking).
+ *
+ * Syncs up to max_pages dirty pages via msync, clearing their dirty bits.
+ * Call after each transaction commit to spread I/O between checkpoints.
+ *
+ * @param tree      Tree instance
+ * @param max_pages Maximum number of pages to sync
+ * @return Number of pages actually synced
+ */
+size_t data_art_flush_dirty(data_art_tree_t *tree, size_t max_pages);
 
 /**
  * Get current root reference (for persistence)
