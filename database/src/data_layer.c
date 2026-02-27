@@ -1,5 +1,6 @@
 #include "../include/data_layer.h"
 #include "../include/state_store.h"
+#include "../include/code_store.h"
 #include "../include/compact_art.h"
 #include "../include/mem_art.h"
 
@@ -12,6 +13,7 @@
 
 #define BUF_FLAG_WRITE     0x01
 #define BUF_FLAG_TOMBSTONE 0x02
+#define CODE_REF_BIT       0x80000000u
 
 // ============================================================================
 // Opaque struct
@@ -20,6 +22,7 @@
 struct data_layer {
     compact_art_t index;
     state_store_t *store;
+    code_store_t *code;
     art_tree_t buffer;
     uint32_t key_size;
     uint64_t total_merged;
@@ -29,7 +32,7 @@ struct data_layer {
 // Lifecycle
 // ============================================================================
 
-data_layer_t *dl_create(const char *state_path,
+data_layer_t *dl_create(const char *state_path, const char *code_path,
                          uint32_t key_size, uint32_t value_size) {
     data_layer_t *dl = malloc(sizeof(data_layer_t));
     if (!dl) return NULL;
@@ -48,9 +51,20 @@ data_layer_t *dl_create(const char *state_path,
         return NULL;
     }
 
+    if (code_path) {
+        dl->code = code_store_create(code_path);
+        if (!dl->code) {
+            compact_art_destroy(&dl->index);
+            state_store_destroy(dl->store);
+            free(dl);
+            return NULL;
+        }
+    }
+
     if (!art_tree_init(&dl->buffer)) {
         compact_art_destroy(&dl->index);
         state_store_destroy(dl->store);
+        if (dl->code) code_store_destroy(dl->code);
         free(dl);
         return NULL;
     }
@@ -62,6 +76,7 @@ void dl_destroy(data_layer_t *dl) {
     if (!dl) return;
     compact_art_destroy(&dl->index);
     state_store_destroy(dl->store);
+    if (dl->code) code_store_destroy(dl->code);
     art_tree_destroy(&dl->buffer);
     free(dl);
 }
@@ -106,6 +121,7 @@ bool dl_get(data_layer_t *dl, const uint8_t *key,
 
     uint32_t slot;
     memcpy(&slot, ref, 4);
+    if (slot & CODE_REF_BIT) return false;  // code ref, not state
     return state_store_read(dl->store, slot, out_value, out_len);
 }
 
@@ -132,7 +148,10 @@ uint64_t dl_merge(data_layer_t *dl) {
             if (ref) {
                 uint32_t slot;
                 memcpy(&slot, ref, 4);
-                state_store_free(dl->store, slot);
+                if (!(slot & CODE_REF_BIT)) {
+                    // Only free state_store slots, not code entries
+                    state_store_free(dl->store, slot);
+                }
                 compact_art_delete(&dl->index, key);
             }
         } else if (flag == BUF_FLAG_WRITE && vlen > 1) {
@@ -166,6 +185,60 @@ uint64_t dl_merge(data_layer_t *dl) {
 }
 
 // ============================================================================
+// Code Operations
+// ============================================================================
+
+bool dl_put_code(data_layer_t *dl, const uint8_t *key,
+                 const void *bytecode, uint32_t len) {
+    if (!dl || !dl->code) return false;
+
+    // Dedup: if key already in index, skip
+    const void *existing = compact_art_get(&dl->index, key);
+    if (existing) return true;
+
+    // Append to code.dat
+    uint32_t index = code_store_append(dl->code, bytecode, len);
+    if (index == UINT32_MAX) return false;
+
+    // Insert into compact_art with bit 31 set
+    uint32_t ref = index | CODE_REF_BIT;
+    return compact_art_insert(&dl->index, key, &ref);
+}
+
+bool dl_get_code(data_layer_t *dl, const uint8_t *key,
+                 void *out, uint32_t *out_len) {
+    if (!dl || !dl->code) return false;
+
+    const void *ref_ptr = compact_art_get(&dl->index, key);
+    if (!ref_ptr) return false;
+
+    uint32_t ref;
+    memcpy(&ref, ref_ptr, 4);
+    if (!(ref & CODE_REF_BIT)) return false;  // state ref, not code
+
+    uint32_t index = ref & ~CODE_REF_BIT;
+    uint32_t length = code_store_length(dl->code, index);
+    if (length == 0) return false;
+
+    if (out_len) *out_len = length;
+    if (out) return code_store_read(dl->code, index, out, length);
+    return true;
+}
+
+uint32_t dl_code_length(data_layer_t *dl, const uint8_t *key) {
+    if (!dl || !dl->code) return 0;
+
+    const void *ref_ptr = compact_art_get(&dl->index, key);
+    if (!ref_ptr) return 0;
+
+    uint32_t ref;
+    memcpy(&ref, ref_ptr, 4);
+    if (!(ref & CODE_REF_BIT)) return 0;
+
+    return code_store_length(dl->code, ref & ~CODE_REF_BIT);
+}
+
+// ============================================================================
 // Diagnostics
 // ============================================================================
 
@@ -176,5 +249,7 @@ dl_stats_t dl_stats(const data_layer_t *dl) {
     s.buffer_entries = art_size(&dl->buffer);
     s.total_merged = dl->total_merged;
     s.free_slots = state_store_free_count(dl->store);
+    s.code_count = dl->code ? code_store_count(dl->code) : 0;
+    s.code_file_size = dl->code ? code_store_file_size(dl->code) : 0;
     return s;
 }

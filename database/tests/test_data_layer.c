@@ -485,7 +485,7 @@ int main(int argc, char *argv[]) {
     printf("slot size:  %d bytes\n", STATE_STORE_SLOT_SIZE);
     printf("RSS:        %zu MB\n", get_rss_mb());
 
-    data_layer_t *dl = dl_create(state_path, KEY_SIZE, 4);
+    data_layer_t *dl = dl_create(state_path, NULL, KEY_SIZE, 4);
     if (!dl) {
         fprintf(stderr, "FAIL: dl_create\n");
         return 1;

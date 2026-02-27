@@ -31,9 +31,10 @@ add_library(compact_art STATIC
     database/src/compact_art.c
 )
 
-# Data Layer (state store + write buffer + index merge)
+# Data Layer (state store + code store + write buffer + index merge)
 add_library(data_layer STATIC
     database/src/state_store.c
+    database/src/code_store.c
     database/src/data_layer.c
 )
 target_link_libraries(data_layer compact_art art_database)
@@ -87,6 +88,12 @@ add_executable(test_data_layer
 )
 target_link_libraries(test_data_layer data_layer)
 
+# Test: Code Store (code.dat + dedup + mixed state/code)
+add_executable(test_code_store
+    database/tests/test_code_store.c
+)
+target_link_libraries(test_code_store data_layer)
+
 # PoC: Data Layer Integration Test (write buffer + index + state.dat)
 add_executable(test_data_layer_poc
     database/tests/test_data_layer_poc.c
@@ -108,6 +115,6 @@ message(STATUS "")
 message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
 message(STATUS "  - compact_art (space-efficient index ART)")
-message(STATUS "  - data_layer (state store + write buffer + merge)")
+message(STATUS "  - data_layer (state store + code store + write buffer + merge)")
 message(STATUS "========================================")
 message(STATUS "")
