@@ -344,15 +344,8 @@ static void run_block(data_layer_t *dl, sim_state_t *sim, uint64_t block_num) {
     sim->total_merge_time += (t1 - t0);
     sim->total_blocks++;
 
-    // --- Checkpoint every 128 blocks ---
-    if (sim->total_blocks % CHECKPOINT_INTERVAL == 0) {
-        double ct0 = now_sec();
-        bool ok = dl_checkpoint(dl, INDEX_PATH, sim->total_blocks);
-        double ct1 = now_sec();
-        ASSERT_MSG(ok, "dl_checkpoint failed at block %" PRIu64, sim->total_blocks);
-        sim->total_checkpoint_time += (ct1 - ct0);
-        sim->last_checkpoint_block = sim->total_blocks;
-    }
+    // Checkpoint disabled during block loop — blocks are the WAL.
+    // A single checkpoint is written at the end for recovery verification.
 }
 
 // ============================================================================
@@ -373,7 +366,7 @@ int main(int argc, char *argv[]) {
     printf("============================================\n");
     printf("  target:     %" PRIu64 "M keys\n", target_millions);
     printf("  ops/block:  %d-%d (70/20/10 ins/upd/del)\n", OPS_MIN, OPS_MAX);
-    printf("  checkpoint: every %d blocks\n", CHECKPOINT_INTERVAL);
+    printf("  checkpoint: disabled (final only)\n");
     printf("  code:       1-10 deploys/block (%d-%d bytes)\n",
            CODE_SIZE_MIN, CODE_SIZE_MAX);
     printf("  seed:       0x%016" PRIx64 "\n", (uint64_t)MASTER_SEED);
@@ -420,21 +413,13 @@ int main(int argc, char *argv[]) {
             double avg_merge_ms = (sim.total_merge_time / sim.total_blocks) * 1000.0;
             double throughput = sim.next_state_id / total_elapsed / 1000.0;
 
-            // Last checkpoint time (or 0 if none this interval)
-            double last_ckpt_ms = 0;
-            if (sim.last_checkpoint_block == sim.total_blocks) {
-                last_ckpt_ms = sim.total_checkpoint_time * 1000.0 /
-                    (sim.total_blocks / CHECKPOINT_INTERVAL);
-            }
-
             printf("block %5" PRIu64 " | index %6.2fM | "
-                   "merge %5.1fms | ckpt %5.0fms | "
+                   "merge %5.1fms | "
                    "state %4zuMB | code %4zuMB | RSS %4zuMB | "
                    "%6.0fK k/s\n",
                    sim.total_blocks,
                    st.index_keys / 1e6,
                    avg_merge_ms,
-                   last_ckpt_ms,
                    state_mb, code_mb, get_rss_mb(),
                    throughput);
             fflush(stdout);
