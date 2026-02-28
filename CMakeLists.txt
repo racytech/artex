@@ -48,6 +48,12 @@ add_library(data_layer STATIC
 )
 target_link_libraries(data_layer compact_art art_database)
 
+# State DB (account state + contract storage — dual data_layer wrapper)
+add_library(state_db STATIC
+    database/src/state_db.c
+)
+target_link_libraries(state_db data_layer)
+
 # Intermediate Hashes (MPT commitment via flat hash storage)
 add_library(intermediate_hashes STATIC
     database/src/intermediate_hashes.c
@@ -132,6 +138,13 @@ add_executable(test_stress_data_layer
 )
 target_link_libraries(test_stress_data_layer data_layer)
 
+# Test: State DB (account state + contract storage + checkpoint)
+add_executable(test_state_db
+    database/tests/test_state_db.c
+)
+target_link_libraries(test_state_db state_db)
+add_test(NAME test_state_db COMMAND test_state_db)
+
 # Test: Intermediate Hashes (MPT commitment)
 add_executable(test_intermediate_hashes
     database/tests/test_intermediate_hashes.c
@@ -156,6 +169,7 @@ message(STATUS "  - art_database (in-memory ART tree)")
 message(STATUS "  - compact_art (space-efficient index ART)")
 message(STATUS "  - common (keccak256, hash, rlp, bytes)")
 message(STATUS "  - data_layer (state store + code store + write buffer + merge)")
+message(STATUS "  - state_db (account state + contract storage wrapper)")
 message(STATUS "  - intermediate_hashes (MPT commitment via flat hash storage)")
 message(STATUS "========================================")
 message(STATUS "")
