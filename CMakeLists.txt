@@ -74,6 +74,31 @@ add_library(intermediate_hashes STATIC
 )
 target_link_libraries(intermediate_hashes compact_art common)
 
+# EVM (Ethereum Virtual Machine)
+add_library(evm STATIC
+    evm/src/evm.c
+    evm/src/evm_stack.c
+    evm/src/evm_memory.c
+    evm/src/gas.c
+    evm/src/interpreter.c
+    evm/src/fork.c
+    evm/src/transaction.c
+    evm/src/opcodes/arithmetic.c
+    evm/src/opcodes/comparison.c
+    evm/src/opcodes/crypto.c
+    evm/src/opcodes/stack.c
+    evm/src/opcodes/memory.c
+    evm/src/opcodes/logging.c
+    evm/src/opcodes/storage.c
+    evm/src/opcodes/environmental.c
+    evm/src/opcodes/call.c
+    evm/src/opcodes/control.c
+    evm/src/opcodes/block.c
+    evm/src/opcodes/create.c
+)
+target_include_directories(evm PUBLIC ${CMAKE_SOURCE_DIR}/evm/include)
+target_link_libraries(evm evm_state common)
+
 #==============================================================================
 # Tests
 #==============================================================================

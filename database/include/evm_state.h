@@ -79,6 +79,9 @@ hash_t   evm_state_get_code_hash(evm_state_t *es, const address_t *addr);
 uint32_t evm_state_get_code_size(evm_state_t *es, const address_t *addr);
 bool     evm_state_get_code(evm_state_t *es, const address_t *addr,
                             uint8_t *out, uint32_t *out_len);
+/** Return pointer to cached code bytes (valid for lifetime of evm_state). */
+const uint8_t *evm_state_get_code_ptr(evm_state_t *es, const address_t *addr,
+                                       uint32_t *out_len);
 void     evm_state_set_code(evm_state_t *es, const address_t *addr,
                             const uint8_t *code, uint32_t len);
 

@@ -428,6 +428,49 @@ bool evm_state_get_code(evm_state_t *es, const address_t *addr,
     return true;
 }
 
+const uint8_t *evm_state_get_code_ptr(evm_state_t *es, const address_t *addr,
+                                       uint32_t *out_len) {
+    if (!es || !addr) {
+        if (out_len) *out_len = 0;
+        return NULL;
+    }
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca || !ca->account.has_code) {
+        if (out_len) *out_len = 0;
+        return NULL;
+    }
+
+    // Load code into cache if not already loaded
+    if (!ca->code) {
+        uint8_t addr_hash[32];
+        hash_address(addr, addr_hash);
+
+        uint32_t len = sdb_code_length(es->sdb, addr_hash);
+        if (len == 0) {
+            if (out_len) *out_len = 0;
+            return NULL;
+        }
+
+        ca->code = malloc(len);
+        if (!ca->code) {
+            if (out_len) *out_len = 0;
+            return NULL;
+        }
+
+        uint32_t got_len = 0;
+        if (!sdb_get_code(es->sdb, addr_hash, ca->code, &got_len)) {
+            free(ca->code);
+            ca->code = NULL;
+            if (out_len) *out_len = 0;
+            return NULL;
+        }
+        ca->code_size = got_len;
+    }
+
+    if (out_len) *out_len = ca->code_size;
+    return ca->code;
+}
+
 void evm_state_set_code(evm_state_t *es, const address_t *addr,
                         const uint8_t *code, uint32_t len) {
     if (!es || !addr) return;
