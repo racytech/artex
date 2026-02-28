@@ -137,6 +137,10 @@ evm_status_t op_dup(evm_t *evm, uint8_t n)
 
     if (!evm_stack_dup(evm->stack, n))
     {
+        // Distinguish overflow (stack full at 1024) from underflow (not enough items)
+        if (evm->stack->size >= EVM_STACK_MAX_DEPTH) {
+            return EVM_STACK_OVERFLOW;
+        }
         return EVM_STACK_UNDERFLOW;
     }
 

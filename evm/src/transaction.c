@@ -215,6 +215,11 @@ bool transaction_execute(
         evm_state_add_balance(state, &recipient, &tx->value);
     }
 
+    // Snapshot AFTER pre-execution changes (nonce, gas deduction, value transfer)
+    // On EVM error/revert, we revert to here (undoing execution state changes
+    // but keeping nonce increment and gas deduction)
+    uint32_t exec_snapshot = evm_state_snapshot(state);
+
     //==========================================================================
     // EVM Execution
     //==========================================================================
@@ -258,15 +263,27 @@ bool transaction_execute(
         return false;
     }
 
-    // Store execution result
+    // Handle execution result based on status
     result->status = evm_result.status;
-    result->gas_used = intrinsic_gas + (gas_for_execution - evm_result.gas_left);
-    result->gas_refund = evm_result.gas_refund;
 
-    // Handle contract creation
-    if (tx->is_create) {
-        if (evm_result.status == EVM_SUCCESS) {
-            // Store deployed code
+    if (evm_result.status != EVM_SUCCESS && evm_result.status != EVM_REVERT) {
+        // EVM error (STACK_OVERFLOW, OUT_OF_GAS, INVALID_JUMP, etc.)
+        // Per Ethereum spec: revert state changes from execution and consume ALL gas
+        evm_state_revert(state, exec_snapshot);
+        result->gas_used = tx->gas_limit;
+        result->gas_refund = 0;
+    } else if (evm_result.status == EVM_REVERT) {
+        // REVERT opcode: revert state changes but refund unused gas
+        evm_state_revert(state, exec_snapshot);
+        result->gas_used = intrinsic_gas + (gas_for_execution - evm_result.gas_left);
+        result->gas_refund = 0;
+    } else {
+        // SUCCESS: keep state changes, normal gas accounting
+        result->gas_used = intrinsic_gas + (gas_for_execution - evm_result.gas_left);
+        result->gas_refund = evm_result.gas_refund;
+
+        // Handle contract creation on success
+        if (tx->is_create) {
             if (evm_result.output_data && evm_result.output_size > 0) {
                 // Charge deployment gas (200 gas per byte)
                 const uint64_t G_CODE_DEPOSIT = 200;
@@ -275,9 +292,10 @@ bool transaction_execute(
                 // Check if enough gas left for deployment
                 if (evm_result.gas_left < deployment_gas) {
                     LOG_EVM_DEBUG("Insufficient gas for code deployment");
-                    evm_state_self_destruct(state, &contract_address);
+                    evm_state_revert(state, exec_snapshot);
                     result->status = EVM_OUT_OF_GAS;
-                    result->gas_used = tx->gas_limit - intrinsic_gas;
+                    result->gas_used = tx->gas_limit;
+                    result->gas_refund = 0;
                     result->contract_created = false;
                 } else {
                     // Deduct deployment gas
@@ -296,13 +314,6 @@ bool transaction_execute(
                 result->contract_address = contract_address;
                 result->contract_created = true;
             }
-        } else if (evm_result.status == EVM_REVERT) {
-            evm_state_self_destruct(state, &contract_address);
-            result->status = EVM_SUCCESS;
-            result->contract_created = false;
-        } else {
-            evm_state_self_destruct(state, &contract_address);
-            result->contract_created = false;
         }
     }
 

@@ -270,34 +270,11 @@ bool test_runner_run_state_test(test_runner_t *runner,
             // Free access list
             if (tx_access_list) free(tx_access_list);
             
-            // Check execution status
-            if (tx_result.status != EVM_SUCCESS && tx_result.status != EVM_REVERT) {
-                result->status = TEST_FAIL;
-                
-                const char *status_str = "UNKNOWN";
-                switch (tx_result.status) {
-                    case EVM_OUT_OF_GAS: status_str = "OUT_OF_GAS"; break;
-                    case EVM_INVALID_OPCODE: status_str = "INVALID_OPCODE"; break;
-                    case EVM_STACK_OVERFLOW: status_str = "STACK_OVERFLOW"; break;
-                    case EVM_STACK_UNDERFLOW: status_str = "STACK_UNDERFLOW"; break;
-                    case EVM_INVALID_JUMP: status_str = "INVALID_JUMP"; break;
-                    case EVM_INVALID_MEMORY_ACCESS: status_str = "INVALID_MEMORY_ACCESS"; break;
-                    default: break;
-                }
-                
-                char failure_msg[256];
-                snprintf(failure_msg, sizeof(failure_msg), 
-                        "Transaction execution failed: %s", status_str);
-                test_result_add_failure(result, "execution_status", "SUCCESS", status_str, 
-                                      failure_msg);
-                
-                transaction_result_free(&tx_result);
-                
-                if (runner->config.stop_on_fail) {
-                    goto cleanup;
-                }
-            }
-            
+            // Note: EVM errors (STACK_UNDERFLOW, OUT_OF_GAS, etc.) are valid
+            // transaction outcomes in Ethereum — the transaction is still processed
+            // (nonce incremented, gas consumed), just the EVM execution effects are
+            // reverted. The state root check below is the sole arbiter of correctness.
+
             transaction_result_free(&tx_result);
             
             // Verify state root
