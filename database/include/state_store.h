@@ -72,7 +72,7 @@ bool state_store_read(state_store_t *s, uint32_t slot,
 // ============================================================================
 
 /**
- * Flush pending writes to disk (fdatasync).
+ * Flush pending writes to disk (fdatasync). Blocks until durable.
  */
 void state_store_sync(state_store_t *s);
 

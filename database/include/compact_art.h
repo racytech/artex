@@ -222,4 +222,12 @@ const void *compact_art_iterator_value(const compact_art_iterator_t *iter);
 bool compact_art_iterator_done(const compact_art_iterator_t *iter);
 void compact_art_iterator_destroy(compact_art_iterator_t *iter);
 
+/**
+ * Seek iterator to the first entry with key >= the given key (lower bound).
+ * Returns true if positioned at a valid entry, false if all entries < key.
+ * After seek, call iterator_next() to retrieve the current entry and advance.
+ * Can be called at any point to re-position the iterator.
+ */
+bool compact_art_iterator_seek(compact_art_iterator_t *iter, const uint8_t *key);
+
 #endif // COMPACT_ART_H

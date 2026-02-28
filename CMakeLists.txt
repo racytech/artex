@@ -66,7 +66,7 @@ target_link_libraries(account common)
 add_library(evm_state STATIC
     database/src/evm_state.c
 )
-target_link_libraries(evm_state state_db account common)
+target_link_libraries(evm_state state_db account common art_database)
 
 # Intermediate Hashes (MPT commitment via flat hash storage)
 add_library(intermediate_hashes STATIC
@@ -177,6 +177,18 @@ add_executable(test_stress_data_layer
 )
 target_link_libraries(test_stress_data_layer data_layer)
 
+# Scale Test: Data Layer (realistic Ethereum block simulation, long-running)
+add_executable(test_scale_data_layer
+    database/tests/test_scale_data_layer.c
+)
+target_link_libraries(test_scale_data_layer data_layer)
+
+# Benchmark: MPT commitment (state root computation at scale)
+add_executable(bench_mpt
+    database/tests/bench_mpt.c
+)
+target_link_libraries(bench_mpt data_layer intermediate_hashes common)
+
 # Test: State DB (account state + contract storage + checkpoint)
 add_executable(test_state_db
     database/tests/test_state_db.c
@@ -197,6 +209,29 @@ add_executable(test_intermediate_hashes
 )
 target_link_libraries(test_intermediate_hashes intermediate_hashes compact_art common)
 add_test(NAME test_intermediate_hashes COMMAND test_intermediate_hashes)
+
+# Test: Compact ART Iterator Seek (lower-bound)
+add_executable(test_compact_art_seek
+    database/tests/test_compact_art_seek.c
+)
+target_link_libraries(test_compact_art_seek compact_art)
+add_test(NAME test_compact_art_seek COMMAND test_compact_art_seek)
+
+# Test: MPT Cross-Validation (Python HexaryTrie reference)
+add_executable(test_mpt_cross_validation
+    database/tests/test_mpt_cross_validation.c
+)
+target_link_libraries(test_mpt_cross_validation intermediate_hashes compact_art common)
+add_test(NAME test_mpt_cross_validation
+    COMMAND test_mpt_cross_validation
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# Benchmark: uthash vs mem_art (cache performance comparison)
+add_executable(bench_uthash_vs_art
+    database/tests/bench_uthash_vs_art.c
+)
+target_link_libraries(bench_uthash_vs_art art_database)
 
 #==============================================================================
 # Build Summary

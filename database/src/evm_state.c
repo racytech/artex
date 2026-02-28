@@ -1,7 +1,7 @@
 #include "../include/evm_state.h"
 #include "../include/account.h"
+#include "../include/mem_art.h"
 #include "../../common/include/keccak256.h"
-#include "uthash.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +22,7 @@
 // --- Account cache ---
 
 typedef struct cached_account {
-    address_t  addr;            // uthash key (20 bytes)
+    address_t  addr;            // key (20 bytes) — kept for finalize/revert
     account_t  account;
     uint8_t   *code;            // loaded bytecode (NULL until needed)
     uint32_t   code_size;
@@ -31,17 +31,15 @@ typedef struct cached_account {
     bool created;               // newly created this execution
     bool existed;               // existed in state_db before
     bool self_destructed;
-    UT_hash_handle hh;
 } cached_account_t;
 
 // --- Storage cache ---
 
 typedef struct cached_slot {
-    uint8_t   key[SLOT_KEY_SIZE];   // uthash key: addr[20] || slot_be[32]
+    uint8_t   key[SLOT_KEY_SIZE];   // addr[20] || slot_be[32] — kept for finalize
     uint256_t original;             // value when first loaded
     uint256_t current;
     bool dirty;
-    UT_hash_handle hh;
 } cached_slot_t;
 
 // --- Journal ---
@@ -69,29 +67,17 @@ typedef struct {
     } data;
 } journal_entry_t;
 
-// --- Access lists ---
-
-typedef struct {
-    address_t addr;
-    UT_hash_handle hh;
-} warm_addr_t;
-
-typedef struct {
-    uint8_t key[SLOT_KEY_SIZE];
-    UT_hash_handle hh;
-} warm_slot_t;
-
 // --- Main struct ---
 
 struct evm_state {
     state_db_t       *sdb;
-    cached_account_t *accounts;     // uthash table (NULL = empty)
-    cached_slot_t    *storage;      // uthash table
+    mem_art_t         accounts;     // key: addr[20], value: cached_account_t
+    mem_art_t         storage;      // key: skey[52], value: cached_slot_t
     journal_entry_t  *journal;
     uint32_t          journal_len;
     uint32_t          journal_cap;
-    warm_addr_t      *warm_addrs;   // uthash set
-    warm_slot_t      *warm_slots;   // uthash set
+    mem_art_t         warm_addrs;   // key: addr[20], value: (none, 0 bytes)
+    mem_art_t         warm_slots;   // key: skey[52], value: (none, 0 bytes)
 };
 
 // ============================================================================
@@ -131,15 +117,15 @@ static bool journal_push(evm_state_t *es, const journal_entry_t *entry) {
 
 // Load account from state_db into cache. Creates empty if not found.
 static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) {
-    cached_account_t *ca = NULL;
-    HASH_FIND(hh, es->accounts, addr->bytes, ADDRESS_SIZE, ca);
+    cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+        &es->accounts, addr->bytes, ADDRESS_SIZE, NULL);
     if (ca) return ca;
 
-    ca = calloc(1, sizeof(cached_account_t));
-    if (!ca) return NULL;
-
-    address_copy(&ca->addr, addr);
-    ca->account = account_empty();
+    // Build on stack, insert into arena
+    cached_account_t ca_local;
+    memset(&ca_local, 0, sizeof(ca_local));
+    address_copy(&ca_local.addr, addr);
+    ca_local.account = account_empty();
 
     // Try loading from state_db
     uint8_t addr_hash[32];
@@ -148,13 +134,17 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
     uint8_t buf[ACCOUNT_MAX_ENCODED];
     uint16_t buf_len = 0;
     if (sdb_get(es->sdb, addr_hash, buf, &buf_len)) {
-        if (account_decode(buf, buf_len, &ca->account)) {
-            ca->existed = true;
+        if (account_decode(buf, buf_len, &ca_local.account)) {
+            ca_local.existed = true;
         }
     }
 
-    HASH_ADD(hh, es->accounts, addr, ADDRESS_SIZE, ca);
-    return ca;
+    if (!mem_art_insert(&es->accounts, addr->bytes, ADDRESS_SIZE,
+                        &ca_local, sizeof(cached_account_t)))
+        return NULL;
+
+    return (cached_account_t *)mem_art_get_mut(
+        &es->accounts, addr->bytes, ADDRESS_SIZE, NULL);
 }
 
 // Load storage slot from state_db into cache.
@@ -163,16 +153,16 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
     uint8_t skey[SLOT_KEY_SIZE];
     make_slot_key(addr, slot, skey);
 
-    cached_slot_t *cs = NULL;
-    HASH_FIND(hh, es->storage, skey, SLOT_KEY_SIZE, cs);
+    cached_slot_t *cs = (cached_slot_t *)mem_art_get_mut(
+        &es->storage, skey, SLOT_KEY_SIZE, NULL);
     if (cs) return cs;
 
-    cs = calloc(1, sizeof(cached_slot_t));
-    if (!cs) return NULL;
-
-    memcpy(cs->key, skey, SLOT_KEY_SIZE);
-    cs->original = UINT256_ZERO_INIT;
-    cs->current = UINT256_ZERO_INIT;
+    // Build on stack, insert into arena
+    cached_slot_t cs_local;
+    memset(&cs_local, 0, sizeof(cs_local));
+    memcpy(cs_local.key, skey, SLOT_KEY_SIZE);
+    cs_local.original = UINT256_ZERO_INIT;
+    cs_local.current = UINT256_ZERO_INIT;
 
     // Try loading from state_db
     uint8_t addr_hash[32], slot_hash[32];
@@ -182,12 +172,16 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
     uint8_t val_buf[32];
     uint16_t val_len = 0;
     if (sdb_get_storage(es->sdb, addr_hash, slot_hash, val_buf, &val_len)) {
-        cs->original = uint256_from_bytes(val_buf, val_len);
-        cs->current = cs->original;
+        cs_local.original = uint256_from_bytes(val_buf, val_len);
+        cs_local.current = cs_local.original;
     }
 
-    HASH_ADD(hh, es->storage, key, SLOT_KEY_SIZE, cs);
-    return cs;
+    if (!mem_art_insert(&es->storage, skey, SLOT_KEY_SIZE,
+                        &cs_local, sizeof(cached_slot_t)))
+        return NULL;
+
+    return (cached_slot_t *)mem_art_get_mut(
+        &es->storage, skey, SLOT_KEY_SIZE, NULL);
 }
 
 // ============================================================================
@@ -208,39 +202,43 @@ evm_state_t *evm_state_create(state_db_t *sdb) {
         return NULL;
     }
 
+    if (!mem_art_init(&es->accounts) ||
+        !mem_art_init(&es->storage) ||
+        !mem_art_init(&es->warm_addrs) ||
+        !mem_art_init(&es->warm_slots)) {
+        mem_art_destroy(&es->accounts);
+        mem_art_destroy(&es->storage);
+        mem_art_destroy(&es->warm_addrs);
+        mem_art_destroy(&es->warm_slots);
+        free(es->journal);
+        free(es);
+        return NULL;
+    }
+
     return es;
+}
+
+// Callback: free heap-allocated code pointers before arena destroy
+static bool free_code_cb(const uint8_t *key, size_t key_len,
+                          const void *value, size_t value_len,
+                          void *user_data) {
+    (void)key; (void)key_len; (void)value_len; (void)user_data;
+    cached_account_t *ca = (cached_account_t *)value;
+    free(ca->code);
+    return true;
 }
 
 void evm_state_destroy(evm_state_t *es) {
     if (!es) return;
 
-    // Free account cache
-    cached_account_t *ca, *ca_tmp;
-    HASH_ITER(hh, es->accounts, ca, ca_tmp) {
-        HASH_DEL(es->accounts, ca);
-        free(ca->code);
-        free(ca);
-    }
+    // Free code pointers owned by cached accounts
+    mem_art_foreach(&es->accounts, free_code_cb, NULL);
 
-    // Free storage cache
-    cached_slot_t *cs, *cs_tmp;
-    HASH_ITER(hh, es->storage, cs, cs_tmp) {
-        HASH_DEL(es->storage, cs);
-        free(cs);
-    }
-
-    // Free access lists
-    warm_addr_t *wa, *wa_tmp;
-    HASH_ITER(hh, es->warm_addrs, wa, wa_tmp) {
-        HASH_DEL(es->warm_addrs, wa);
-        free(wa);
-    }
-
-    warm_slot_t *ws, *ws_tmp;
-    HASH_ITER(hh, es->warm_slots, ws, ws_tmp) {
-        HASH_DEL(es->warm_slots, ws);
-        free(ws);
-    }
+    // Destroy all trees (O(1) — just frees arenas)
+    mem_art_destroy(&es->accounts);
+    mem_art_destroy(&es->storage);
+    mem_art_destroy(&es->warm_addrs);
+    mem_art_destroy(&es->warm_slots);
 
     // Free any code pointers still owned by journal entries (not reverted)
     for (uint32_t i = 0; i < es->journal_len; i++) {
@@ -592,8 +590,8 @@ void evm_state_self_destruct(evm_state_t *es, const address_t *addr) {
 
 bool evm_state_is_self_destructed(evm_state_t *es, const address_t *addr) {
     if (!es || !addr) return false;
-    cached_account_t *ca = NULL;
-    HASH_FIND(hh, es->accounts, addr->bytes, ADDRESS_SIZE, ca);
+    const cached_account_t *ca = (const cached_account_t *)mem_art_get(
+        &es->accounts, addr->bytes, ADDRESS_SIZE, NULL);
     if (!ca) return false;
     return ca->self_destructed;
 }
@@ -617,20 +615,20 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
 
         switch (je->type) {
         case JOURNAL_NONCE: {
-            cached_account_t *ca = NULL;
-            HASH_FIND(hh, es->accounts, je->addr.bytes, ADDRESS_SIZE, ca);
+            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+                &es->accounts, je->addr.bytes, ADDRESS_SIZE, NULL);
             if (ca) ca->account.nonce = je->data.old_nonce;
             break;
         }
         case JOURNAL_BALANCE: {
-            cached_account_t *ca = NULL;
-            HASH_FIND(hh, es->accounts, je->addr.bytes, ADDRESS_SIZE, ca);
+            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+                &es->accounts, je->addr.bytes, ADDRESS_SIZE, NULL);
             if (ca) ca->account.balance = je->data.old_balance;
             break;
         }
         case JOURNAL_CODE: {
-            cached_account_t *ca = NULL;
-            HASH_FIND(hh, es->accounts, je->addr.bytes, ADDRESS_SIZE, ca);
+            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+                &es->accounts, je->addr.bytes, ADDRESS_SIZE, NULL);
             if (ca) {
                 ca->account.code_hash = je->data.code.old_hash;
                 ca->account.has_code = je->data.code.old_has_code;
@@ -647,8 +645,8 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
         case JOURNAL_STORAGE: {
             uint8_t skey[SLOT_KEY_SIZE];
             make_slot_key(&je->addr, &je->data.storage.slot, skey);
-            cached_slot_t *cs = NULL;
-            HASH_FIND(hh, es->storage, skey, SLOT_KEY_SIZE, cs);
+            cached_slot_t *cs = (cached_slot_t *)mem_art_get_mut(
+                &es->storage, skey, SLOT_KEY_SIZE, NULL);
             if (cs) {
                 cs->current = je->data.storage.old_value;
                 // If reverted back to original, no longer dirty
@@ -657,8 +655,8 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
             break;
         }
         case JOURNAL_ACCOUNT_CREATE: {
-            cached_account_t *ca = NULL;
-            HASH_FIND(hh, es->accounts, je->addr.bytes, ADDRESS_SIZE, ca);
+            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+                &es->accounts, je->addr.bytes, ADDRESS_SIZE, NULL);
             if (ca) {
                 ca->created = false;
                 // If it didn't exist before, it's back to not existing
@@ -667,29 +665,19 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
             break;
         }
         case JOURNAL_SELF_DESTRUCT: {
-            cached_account_t *ca = NULL;
-            HASH_FIND(hh, es->accounts, je->addr.bytes, ADDRESS_SIZE, ca);
+            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+                &es->accounts, je->addr.bytes, ADDRESS_SIZE, NULL);
             if (ca) ca->self_destructed = false;
             break;
         }
         case JOURNAL_WARM_ADDR: {
-            warm_addr_t *wa = NULL;
-            HASH_FIND(hh, es->warm_addrs, je->addr.bytes, ADDRESS_SIZE, wa);
-            if (wa) {
-                HASH_DEL(es->warm_addrs, wa);
-                free(wa);
-            }
+            mem_art_delete(&es->warm_addrs, je->addr.bytes, ADDRESS_SIZE);
             break;
         }
         case JOURNAL_WARM_SLOT: {
             uint8_t skey[SLOT_KEY_SIZE];
             make_slot_key(&je->addr, &je->data.slot, skey);
-            warm_slot_t *ws = NULL;
-            HASH_FIND(hh, es->warm_slots, skey, SLOT_KEY_SIZE, ws);
-            if (ws) {
-                HASH_DEL(es->warm_slots, ws);
-                free(ws);
-            }
+            mem_art_delete(&es->warm_slots, skey, SLOT_KEY_SIZE);
             break;
         }
         }
@@ -703,14 +691,10 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
 bool evm_state_warm_address(evm_state_t *es, const address_t *addr) {
     if (!es || !addr) return false;
 
-    warm_addr_t *wa = NULL;
-    HASH_FIND(hh, es->warm_addrs, addr->bytes, ADDRESS_SIZE, wa);
-    if (wa) return true;  // already warm
+    if (mem_art_contains(&es->warm_addrs, addr->bytes, ADDRESS_SIZE))
+        return true;  // already warm
 
-    wa = malloc(sizeof(warm_addr_t));
-    if (!wa) return false;
-    address_copy(&wa->addr, addr);
-    HASH_ADD(hh, es->warm_addrs, addr, ADDRESS_SIZE, wa);
+    mem_art_insert(&es->warm_addrs, addr->bytes, ADDRESS_SIZE, NULL, 0);
 
     // Journal for revert
     journal_entry_t je = {
@@ -729,14 +713,10 @@ bool evm_state_warm_slot(evm_state_t *es, const address_t *addr,
     uint8_t skey[SLOT_KEY_SIZE];
     make_slot_key(addr, key, skey);
 
-    warm_slot_t *ws = NULL;
-    HASH_FIND(hh, es->warm_slots, skey, SLOT_KEY_SIZE, ws);
-    if (ws) return true;  // already warm
+    if (mem_art_contains(&es->warm_slots, skey, SLOT_KEY_SIZE))
+        return true;  // already warm
 
-    ws = malloc(sizeof(warm_slot_t));
-    if (!ws) return false;
-    memcpy(ws->key, skey, SLOT_KEY_SIZE);
-    HASH_ADD(hh, es->warm_slots, key, SLOT_KEY_SIZE, ws);
+    mem_art_insert(&es->warm_slots, skey, SLOT_KEY_SIZE, NULL, 0);
 
     // Journal for revert
     journal_entry_t je = {
@@ -751,11 +731,7 @@ bool evm_state_warm_slot(evm_state_t *es, const address_t *addr,
 
 bool evm_state_is_address_warm(const evm_state_t *es, const address_t *addr) {
     if (!es || !addr) return false;
-    warm_addr_t *wa = NULL;
-    // Cast away const for uthash lookup (read-only operation)
-    warm_addr_t **table = (warm_addr_t **)&es->warm_addrs;
-    HASH_FIND(hh, *table, addr->bytes, ADDRESS_SIZE, wa);
-    return wa != NULL;
+    return mem_art_contains(&es->warm_addrs, addr->bytes, ADDRESS_SIZE);
 }
 
 bool evm_state_is_slot_warm(const evm_state_t *es, const address_t *addr,
@@ -763,86 +739,110 @@ bool evm_state_is_slot_warm(const evm_state_t *es, const address_t *addr,
     if (!es || !addr || !key) return false;
     uint8_t skey[SLOT_KEY_SIZE];
     make_slot_key(addr, key, skey);
-    warm_slot_t *ws = NULL;
-    warm_slot_t **table = (warm_slot_t **)&es->warm_slots;
-    HASH_FIND(hh, *table, skey, SLOT_KEY_SIZE, ws);
-    return ws != NULL;
+    return mem_art_contains(&es->warm_slots, skey, SLOT_KEY_SIZE);
 }
 
 // ============================================================================
 // Finalize
 // ============================================================================
 
-bool evm_state_finalize(evm_state_t *es) {
-    if (!es) return false;
+typedef struct {
+    evm_state_t *es;
+    bool ok;
+} finalize_ctx_t;
 
-    // Write dirty accounts
-    cached_account_t *ca, *ca_tmp;
-    HASH_ITER(hh, es->accounts, ca, ca_tmp) {
-        if (ca->self_destructed) {
-            // Delete account from state_db
-            uint8_t addr_hash[32];
-            hash_address(&ca->addr, addr_hash);
-            sdb_delete(es->sdb, addr_hash);
-            // Note: storage deletion for self-destructed accounts would
-            // require iterating all storage slots — deferred for now.
-            // The MPT commitment will handle this by not including deleted accounts.
-            continue;
-        }
+static bool finalize_account_cb(const uint8_t *key, size_t key_len,
+                                 const void *value, size_t value_len,
+                                 void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    finalize_ctx_t *ctx = (finalize_ctx_t *)user_data;
+    const cached_account_t *ca = (const cached_account_t *)value;
 
-        if (!ca->dirty && !ca->code_dirty) continue;
-
+    if (ca->self_destructed) {
         uint8_t addr_hash[32];
         hash_address(&ca->addr, addr_hash);
+        sdb_delete(ctx->es->sdb, addr_hash);
+        return true;
+    }
 
-        // Write account state
-        if (ca->dirty) {
-            // Skip writing empty accounts that never existed
-            if (!ca->existed && !ca->created && evm_state_is_empty(es, &ca->addr)) {
-                continue;
-            }
+    if (!ca->dirty && !ca->code_dirty) return true;
 
-            uint8_t buf[ACCOUNT_MAX_ENCODED];
-            uint16_t len = account_encode(&ca->account, buf);
-            if (len == 0) return false;
-            if (!sdb_put(es->sdb, addr_hash, buf, len)) return false;
-        }
+    uint8_t addr_hash[32];
+    hash_address(&ca->addr, addr_hash);
 
-        // Write code
-        if (ca->code_dirty && ca->code && ca->code_size > 0) {
-            if (!sdb_put_code(es->sdb, addr_hash, ca->code, ca->code_size))
-                return false;
+    if (ca->dirty) {
+        // Skip writing empty accounts that never existed (inline is_empty check)
+        bool is_empty = (ca->account.nonce == 0 &&
+                         uint256_is_zero(&ca->account.balance) &&
+                         !ca->account.has_code);
+        if (!ca->existed && !ca->created && is_empty) return true;
+
+        uint8_t buf[ACCOUNT_MAX_ENCODED];
+        uint16_t len = account_encode(&ca->account, buf);
+        if (len == 0) { ctx->ok = false; return false; }
+        if (!sdb_put(ctx->es->sdb, addr_hash, buf, len)) {
+            ctx->ok = false;
+            return false;
         }
     }
 
-    // Write dirty storage slots
-    cached_slot_t *cs, *cs_tmp;
-    HASH_ITER(hh, es->storage, cs, cs_tmp) {
-        if (!cs->dirty) continue;
-
-        // Extract address and slot from composite key
-        address_t addr = address_from_bytes(cs->key);
-        uint256_t slot = uint256_from_bytes(cs->key + ADDRESS_SIZE, 32);
-
-        uint8_t addr_hash[32], slot_hash[32];
-        hash_address(&addr, addr_hash);
-        hash_slot(&slot, slot_hash);
-
-        if (uint256_is_zero(&cs->current)) {
-            // Delete zero-valued slots
-            sdb_delete_storage(es->sdb, addr_hash, slot_hash);
-        } else {
-            uint8_t val_bytes[32];
-            uint256_to_bytes(&cs->current, val_bytes);
-            // Store only significant bytes
-            uint8_t start = 0;
-            while (start < 31 && val_bytes[start] == 0) start++;
-            uint16_t val_len = 32 - start;
-            if (!sdb_put_storage(es->sdb, addr_hash, slot_hash,
-                                 val_bytes + start, val_len))
-                return false;
+    if (ca->code_dirty && ca->code && ca->code_size > 0) {
+        if (!sdb_put_code(ctx->es->sdb, addr_hash, ca->code, ca->code_size)) {
+            ctx->ok = false;
+            return false;
         }
     }
 
     return true;
+}
+
+static bool finalize_storage_cb(const uint8_t *key, size_t key_len,
+                                 const void *value, size_t value_len,
+                                 void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    finalize_ctx_t *ctx = (finalize_ctx_t *)user_data;
+    const cached_slot_t *cs = (const cached_slot_t *)value;
+
+    if (!cs->dirty) return true;
+
+    // Extract address and slot from composite key
+    address_t addr = address_from_bytes(cs->key);
+    uint256_t slot = uint256_from_bytes(cs->key + ADDRESS_SIZE, 32);
+
+    uint8_t addr_hash[32], slot_hash[32];
+    hash_address(&addr, addr_hash);
+    hash_slot(&slot, slot_hash);
+
+    if (uint256_is_zero(&cs->current)) {
+        // Delete zero-valued slots
+        sdb_delete_storage(ctx->es->sdb, addr_hash, slot_hash);
+    } else {
+        uint8_t val_bytes[32];
+        uint256_to_bytes(&cs->current, val_bytes);
+        // Store only significant bytes
+        uint8_t start = 0;
+        while (start < 31 && val_bytes[start] == 0) start++;
+        uint16_t val_len = 32 - start;
+        if (!sdb_put_storage(ctx->es->sdb, addr_hash, slot_hash,
+                             val_bytes + start, val_len)) {
+            ctx->ok = false;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool evm_state_finalize(evm_state_t *es) {
+    if (!es) return false;
+
+    finalize_ctx_t ctx = { .es = es, .ok = true };
+
+    // Write dirty accounts
+    mem_art_foreach(&es->accounts, finalize_account_cb, &ctx);
+    if (!ctx.ok) return false;
+
+    // Write dirty storage slots
+    mem_art_foreach(&es->storage, finalize_storage_cb, &ctx);
+    return ctx.ok;
 }

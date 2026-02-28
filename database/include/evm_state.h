@@ -12,10 +12,10 @@
  * EVM State — Typed, in-memory state interface above state_db.
  *
  * Architecture:
- *   - Account cache (uthash by address_t): load-on-demand from state_db
- *   - Storage cache (uthash by addr[20]+slot[32]): load-on-demand
+ *   - Account cache (mem_art by address_t): load-on-demand from state_db
+ *   - Storage cache (mem_art by addr[20]+slot[32]): load-on-demand
  *   - Journal (dynamic array): snapshot = journal position, revert = undo
- *   - Access lists (uthash sets): EIP-2929 warm/cold tracking
+ *   - Access lists (mem_art sets): EIP-2929 warm/cold tracking
  *
  * Lifecycle:
  *   1. evm_state_create(sdb) — create for block execution

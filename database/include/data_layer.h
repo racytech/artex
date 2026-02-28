@@ -139,6 +139,51 @@ data_layer_t *dl_open(const char *state_path, const char *code_path,
                        uint64_t *out_block_number);
 
 // ============================================================================
+// Cursor (for MPT commitment — ih_cursor_t adapter)
+// ============================================================================
+
+#include "intermediate_hashes.h"
+
+typedef struct dl_cursor dl_cursor_t;
+
+/**
+ * Create a cursor over the committed index (post-merge state).
+ * Returns actual values (not slot refs) via state_store reads.
+ * Skips code refs (bit 31 set). Caller must destroy when done.
+ */
+dl_cursor_t *dl_cursor_create(data_layer_t *dl);
+void         dl_cursor_destroy(dl_cursor_t *cursor);
+
+/**
+ * Get an ih_cursor_t interface backed by this cursor.
+ * The returned struct is valid for the lifetime of the dl_cursor.
+ */
+ih_cursor_t  dl_cursor_as_ih(dl_cursor_t *cursor);
+
+// ============================================================================
+// Dirty Key Extraction (for MPT commitment — pre-merge)
+// ============================================================================
+
+typedef struct {
+    uint8_t  **keys;        // sorted 32-byte keys (owned)
+    uint8_t  **values;      // value bytes; NULL for deletes (owned)
+    size_t    *value_lens;  // value lengths; 0 for deletes
+    size_t     count;
+} dl_dirty_set_t;
+
+/**
+ * Extract sorted dirty keys + values from write buffer.
+ * Must be called BEFORE dl_merge() (merge clears the buffer).
+ * Returns false on allocation failure or empty buffer.
+ */
+bool dl_extract_dirty(data_layer_t *dl, dl_dirty_set_t *out);
+
+/**
+ * Free all memory owned by a dirty set.
+ */
+void dl_dirty_set_free(dl_dirty_set_t *ds);
+
+// ============================================================================
 // Diagnostics
 // ============================================================================
 

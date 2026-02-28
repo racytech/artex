@@ -163,16 +163,21 @@ static void test_real_ethereum_hashes(void) {
 
 static void test_hash_keccak256(void) {
     printf("Testing hash_keccak256...\n");
-    
-    // Note: This is a placeholder test since keccak256 is not implemented yet
+
+    // keccak256("hello") = 1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8
     const char* test_data = "hello";
     hash_t h = hash_keccak256((const uint8_t*)test_data, strlen(test_data));
-    
-    // Currently returns zero hash (placeholder)
-    assert(hash_is_zero(&h));
-    
-    printf("  ⚠️  Keccak-256 is placeholder (returns zero hash)\n");
-    printf("✅ hash_keccak256 placeholder passed\n");
+    assert(!hash_is_zero(&h));
+    assert(h.bytes[0] == 0x1c && h.bytes[1] == 0x8a);
+
+    // keccak256(0x80) = empty trie root
+    uint8_t rlp_empty[] = {0x80};
+    hash_t empty = hash_keccak256(rlp_empty, 1);
+    assert(hash_equal(&empty, &HASH_EMPTY_STORAGE));
+
+    printf("  keccak256(\"hello\"): ok\n");
+    printf("  keccak256(0x80) == HASH_EMPTY_STORAGE: ok\n");
+    printf("✅ hash_keccak256 passed\n");
 }
 
 int main(void) {
