@@ -173,6 +173,13 @@ add_executable(test_intermediate_hashes
 target_link_libraries(test_intermediate_hashes intermediate_hashes compact_art common)
 add_test(NAME test_intermediate_hashes COMMAND test_intermediate_hashes)
 
+# Test: Compact ART Iterator Seek (lower-bound)
+add_executable(test_compact_art_seek
+    database/tests/test_compact_art_seek.c
+)
+target_link_libraries(test_compact_art_seek compact_art)
+add_test(NAME test_compact_art_seek COMMAND test_compact_art_seek)
+
 #==============================================================================
 # Build Summary
 #==============================================================================

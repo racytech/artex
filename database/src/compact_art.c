@@ -1160,3 +1160,370 @@ bool compact_art_iterator_done(const compact_art_iterator_t *iter) {
 void compact_art_iterator_destroy(compact_art_iterator_t *iter) {
     free(iter);
 }
+
+// ============================================================================
+// Iterator Seek (lower-bound)
+// ============================================================================
+
+// Compare node's compressed partial prefix against seek key bytes.
+// Returns <0 if partial < key, 0 if match, >0 if partial > key.
+static int compare_prefix_seek(const compact_art_t *tree, compact_ref_t ref,
+                                const void *node, const uint8_t *key,
+                                uint32_t key_size, size_t depth) {
+    uint8_t plen = node_partial_len(node);
+    const uint8_t *partial = node_partial(node);
+    int cmp_len = plen;
+    if (depth + (size_t)cmp_len > key_size)
+        cmp_len = (int)key_size - (int)depth;
+
+    // Compare stored bytes (up to COMPACT_MAX_PREFIX)
+    int stored = cmp_len < COMPACT_MAX_PREFIX ? cmp_len : COMPACT_MAX_PREFIX;
+    for (int i = 0; i < stored; i++) {
+        if (partial[i] != key[depth + i])
+            return (int)partial[i] - (int)key[depth + i];
+    }
+
+    // If prefix extends beyond stored bytes, compare against leaf key
+    if (cmp_len > COMPACT_MAX_PREFIX) {
+        compact_ref_t min_leaf = find_minimum_leaf(tree, ref);
+        if (min_leaf == COMPACT_REF_NULL) return 0;
+        const uint8_t *lk = leaf_key(tree, min_leaf);
+        for (int i = COMPACT_MAX_PREFIX; i < cmp_len; i++) {
+            if (lk[depth + i] != key[depth + i])
+                return (int)lk[depth + i] - (int)key[depth + i];
+        }
+    }
+
+    return 0;
+}
+
+// Find the first child with byte >= target in a node.
+// Sets *out_child_idx to the iterator-compatible index (physical for 4/16/32,
+// byte value for 48/256). Returns child ref or COMPACT_REF_NULL.
+static compact_ref_t find_ge_child(const compact_art_t *tree,
+                                    compact_ref_t node_ref,
+                                    uint8_t target,
+                                    int *out_child_idx,
+                                    uint8_t *out_actual_byte) {
+    void *node = node_ptr(tree, node_ref);
+    switch (node_type(node)) {
+        case COMPACT_NODE_4: {
+            compact_node4_t *n = node;
+            for (int i = 0; i < n->num_children; i++) {
+                if (n->keys[i] >= target) {
+                    *out_child_idx = i;
+                    *out_actual_byte = n->keys[i];
+                    return n->children[i];
+                }
+            }
+            return COMPACT_REF_NULL;
+        }
+        case COMPACT_NODE_16: {
+            compact_node16_t *n = node;
+            for (int i = 0; i < n->num_children; i++) {
+                if (n->keys[i] >= target) {
+                    *out_child_idx = i;
+                    *out_actual_byte = n->keys[i];
+                    return n->children[i];
+                }
+            }
+            return COMPACT_REF_NULL;
+        }
+        case COMPACT_NODE_32: {
+            compact_node32_t *n = node;
+            for (int i = 0; i < n->num_children; i++) {
+                if (n->keys[i] >= target) {
+                    *out_child_idx = i;
+                    *out_actual_byte = n->keys[i];
+                    return n->children[i];
+                }
+            }
+            return COMPACT_REF_NULL;
+        }
+        case COMPACT_NODE_48: {
+            compact_node48_t *n = node;
+            for (int b = target; b < 256; b++) {
+                if (n->index[b] != COMPACT_NODE48_EMPTY) {
+                    *out_child_idx = b;
+                    *out_actual_byte = (uint8_t)b;
+                    return n->children[n->index[b]];
+                }
+            }
+            return COMPACT_REF_NULL;
+        }
+        case COMPACT_NODE_256: {
+            compact_node256_t *n = node;
+            for (int b = target; b < 256; b++) {
+                if (n->children[b] != COMPACT_REF_NULL) {
+                    *out_child_idx = b;
+                    *out_actual_byte = (uint8_t)b;
+                    return n->children[b];
+                }
+            }
+            return COMPACT_REF_NULL;
+        }
+        default:
+            return COMPACT_REF_NULL;
+    }
+}
+
+// Descend from ref to the minimum (leftmost) leaf, pushing all nodes
+// onto the iterator stack. Sets up key/value on the state.
+// Returns true if a leaf was found.
+static bool descend_to_min_leaf(const compact_art_t *tree,
+                                 compact_iter_state_t *s,
+                                 compact_ref_t ref) {
+    while (ref != COMPACT_REF_NULL) {
+        if (COMPACT_IS_LEAF_REF(ref)) {
+            // Push leaf onto stack
+            s->depth++;
+            if (s->depth >= 64) { s->done = true; return false; }
+            s->stack[s->depth].ref = ref;
+            s->stack[s->depth].child_idx = -1;
+            s->key = leaf_key(tree, ref);
+            s->value = leaf_value(tree, ref);
+            return true;
+        }
+
+        void *node = node_ptr(tree, ref);
+        int first_idx = -1;
+        compact_ref_t first_child = COMPACT_REF_NULL;
+
+        switch (node_type(node)) {
+            case COMPACT_NODE_4: {
+                compact_node4_t *n = node;
+                if (n->num_children > 0) {
+                    first_idx = 0;
+                    first_child = n->children[0];
+                }
+                break;
+            }
+            case COMPACT_NODE_16: {
+                compact_node16_t *n = node;
+                if (n->num_children > 0) {
+                    first_idx = 0;
+                    first_child = n->children[0];
+                }
+                break;
+            }
+            case COMPACT_NODE_32: {
+                compact_node32_t *n = node;
+                if (n->num_children > 0) {
+                    first_idx = 0;
+                    first_child = n->children[0];
+                }
+                break;
+            }
+            case COMPACT_NODE_48: {
+                compact_node48_t *n = node;
+                for (int b = 0; b < 256; b++) {
+                    if (n->index[b] != COMPACT_NODE48_EMPTY) {
+                        first_idx = b;
+                        first_child = n->children[n->index[b]];
+                        break;
+                    }
+                }
+                break;
+            }
+            case COMPACT_NODE_256: {
+                compact_node256_t *n = node;
+                for (int b = 0; b < 256; b++) {
+                    if (n->children[b] != COMPACT_REF_NULL) {
+                        first_idx = b;
+                        first_child = n->children[b];
+                        break;
+                    }
+                }
+                break;
+            }
+            default:
+                return false;
+        }
+
+        if (first_child == COMPACT_REF_NULL) return false;
+
+        s->depth++;
+        if (s->depth >= 64) { s->done = true; return false; }
+        s->stack[s->depth].ref = ref;
+        s->stack[s->depth].child_idx = first_idx;
+        ref = first_child;
+    }
+    return false;
+}
+
+bool compact_art_iterator_seek(compact_art_iterator_t *iter,
+                                const uint8_t *key) {
+    if (!iter || !key) return false;
+
+    const compact_art_t *tree = iter->tree;
+    compact_iter_state_t *s = &iter->state;
+
+    // Reset iterator state
+    memset(s, 0, sizeof(compact_iter_state_t));
+    s->depth = -1;
+    s->started = true;  // seek counts as started
+
+    if (tree->root == COMPACT_REF_NULL) {
+        s->done = true;
+        return false;
+    }
+
+    compact_ref_t ref = tree->root;
+    size_t depth = 0;  // byte depth in the key
+
+    while (ref != COMPACT_REF_NULL) {
+        // Leaf: compare directly
+        if (COMPACT_IS_LEAF_REF(ref)) {
+            const uint8_t *lk = leaf_key(tree, ref);
+            if (memcmp(lk, key, tree->key_size) >= 0) {
+                // leaf >= key: this is our answer
+                s->depth++;
+                if (s->depth >= 64) { s->done = true; return false; }
+                s->stack[s->depth].ref = ref;
+                s->stack[s->depth].child_idx = -1;
+                s->key = lk;
+                s->value = leaf_value(tree, ref);
+                return true;
+            }
+            // leaf < key: need to backtrack and find next
+            goto backtrack;
+        }
+
+        void *node = node_ptr(tree, ref);
+        uint8_t plen = node_partial_len(node);
+
+        // Compare partial prefix
+        if (plen > 0) {
+            int cmp = compare_prefix_seek(tree, ref, node, key,
+                                           tree->key_size, depth);
+            if (cmp > 0) {
+                // Subtree > key: minimum leaf here is the answer
+                // Push this node with child_idx=-1 so that when we later
+                // call next() after returning, it starts from child 0
+                // Actually we need descend_to_min_leaf to push properly
+                return descend_to_min_leaf(tree, s, ref);
+            }
+            if (cmp < 0) {
+                // Subtree < key: backtrack
+                goto backtrack;
+            }
+            depth += plen;
+        }
+
+        // Prefix matches. If we've consumed all key bytes, the minimum
+        // leaf in this subtree is the answer (all leaves here >= key prefix).
+        if (depth >= tree->key_size) {
+            return descend_to_min_leaf(tree, s, ref);
+        }
+
+        // Find first child >= key[depth]
+        int child_idx;
+        uint8_t actual_byte;
+        compact_ref_t child = find_ge_child(tree, ref, key[depth],
+                                             &child_idx, &actual_byte);
+
+        if (child == COMPACT_REF_NULL) {
+            // No child >= target: backtrack
+            goto backtrack;
+        }
+
+        // Push current node onto stack
+        s->depth++;
+        if (s->depth >= 64) { s->done = true; return false; }
+        s->stack[s->depth].ref = ref;
+        s->stack[s->depth].child_idx = child_idx;
+
+        if (actual_byte > key[depth]) {
+            // Child > target: minimum leaf in child subtree is the answer
+            return descend_to_min_leaf(tree, s, child);
+        }
+
+        // Exact byte match: descend into child
+        depth++;
+        ref = child;
+        continue;
+
+    backtrack:
+        // Walk up the stack looking for a parent with a next sibling
+        while (s->depth >= 0) {
+            compact_ref_t parent_ref = s->stack[s->depth].ref;
+            int ci = s->stack[s->depth].child_idx;
+
+            // Try next child after ci
+            int next_ci = ci + 1;
+            uint8_t unused_byte;
+            compact_ref_t next_child = COMPACT_REF_NULL;
+            void *pnode = node_ptr(tree, parent_ref);
+
+            switch (node_type(pnode)) {
+                case COMPACT_NODE_4: {
+                    compact_node4_t *n = pnode;
+                    if (next_ci < n->num_children) {
+                        next_child = n->children[next_ci];
+                        unused_byte = n->keys[next_ci];
+                    }
+                    break;
+                }
+                case COMPACT_NODE_16: {
+                    compact_node16_t *n = pnode;
+                    if (next_ci < n->num_children) {
+                        next_child = n->children[next_ci];
+                        unused_byte = n->keys[next_ci];
+                    }
+                    break;
+                }
+                case COMPACT_NODE_32: {
+                    compact_node32_t *n = pnode;
+                    if (next_ci < n->num_children) {
+                        next_child = n->children[next_ci];
+                        unused_byte = n->keys[next_ci];
+                    }
+                    break;
+                }
+                case COMPACT_NODE_48: {
+                    compact_node48_t *n = pnode;
+                    for (int b = next_ci; b < 256; b++) {
+                        if (n->index[b] != COMPACT_NODE48_EMPTY) {
+                            next_child = n->children[n->index[b]];
+                            next_ci = b;
+                            unused_byte = (uint8_t)b;
+                            break;
+                        }
+                    }
+                    break;
+                }
+                case COMPACT_NODE_256: {
+                    compact_node256_t *n = pnode;
+                    for (int b = next_ci; b < 256; b++) {
+                        if (n->children[b] != COMPACT_REF_NULL) {
+                            next_child = n->children[b];
+                            next_ci = b;
+                            unused_byte = (uint8_t)b;
+                            break;
+                        }
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+            (void)unused_byte;
+
+            if (next_child != COMPACT_REF_NULL) {
+                // Found a next sibling: its min leaf is the answer
+                s->stack[s->depth].child_idx = next_ci;
+                return descend_to_min_leaf(tree, s, next_child);
+            }
+
+            // No more children at this level, pop up
+            s->depth--;
+        }
+
+        // Exhausted entire tree
+        s->done = true;
+        return false;
+    }
+
+    s->done = true;
+    return false;
+}
