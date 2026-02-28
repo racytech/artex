@@ -31,12 +31,14 @@ add_library(compact_art STATIC
     database/src/compact_art.c
 )
 
-# Common Utilities (keccak256, hash, rlp, bytes)
+# Common Utilities (keccak256, hash, rlp, bytes, uint256, address)
 add_library(common STATIC
     common/src/keccak256.c
     common/src/hash.c
     common/src/rlp.c
     common/src/bytes.c
+    common/src/uint256.c
+    common/src/address.c
 )
 
 # Data Layer (state store + code store + checkpoint + write buffer + index merge)
@@ -53,6 +55,18 @@ add_library(state_db STATIC
     database/src/state_db.c
 )
 target_link_libraries(state_db data_layer)
+
+# Account Encoding (shared module — compact variable-length account serialization)
+add_library(account STATIC
+    database/src/account.c
+)
+target_link_libraries(account common)
+
+# EVM State (typed in-memory interface over state_db)
+add_library(evm_state STATIC
+    database/src/evm_state.c
+)
+target_link_libraries(evm_state state_db account common)
 
 # Intermediate Hashes (MPT commitment via flat hash storage)
 add_library(intermediate_hashes STATIC
@@ -145,6 +159,13 @@ add_executable(test_state_db
 target_link_libraries(test_state_db state_db)
 add_test(NAME test_state_db COMMAND test_state_db)
 
+# Test: EVM State (typed interface over state_db)
+add_executable(test_evm_state
+    database/tests/test_evm_state.c
+)
+target_link_libraries(test_evm_state evm_state)
+add_test(NAME test_evm_state COMMAND test_evm_state)
+
 # Test: Intermediate Hashes (MPT commitment)
 add_executable(test_intermediate_hashes
     database/tests/test_intermediate_hashes.c
@@ -170,6 +191,8 @@ message(STATUS "  - compact_art (space-efficient index ART)")
 message(STATUS "  - common (keccak256, hash, rlp, bytes)")
 message(STATUS "  - data_layer (state store + code store + write buffer + merge)")
 message(STATUS "  - state_db (account state + contract storage wrapper)")
+message(STATUS "  - account (compact variable-length account encoding)")
+message(STATUS "  - evm_state (typed in-memory EVM state interface)")
 message(STATUS "  - intermediate_hashes (MPT commitment via flat hash storage)")
 message(STATUS "========================================")
 message(STATUS "")

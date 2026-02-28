@@ -76,6 +76,7 @@ bool sdb_put_code(state_db_t *sdb, const uint8_t key[32],
                   const void *bytecode, uint32_t len);
 bool sdb_get_code(state_db_t *sdb, const uint8_t key[32],
                   void *out, uint32_t *out_len);
+uint32_t sdb_code_length(state_db_t *sdb, const uint8_t key[32]);
 
 // ============================================================================
 // Storage Slots (builds 64-byte composite key internally)

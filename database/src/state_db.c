@@ -196,6 +196,11 @@ bool sdb_get_code(state_db_t *sdb, const uint8_t key[32],
     return dl_get_code(sdb->accounts, key, out, out_len);
 }
 
+uint32_t sdb_code_length(state_db_t *sdb, const uint8_t key[32]) {
+    if (!sdb) return 0;
+    return dl_code_length(sdb->accounts, key);
+}
+
 // ============================================================================
 // Storage Slots
 // ============================================================================

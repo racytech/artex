@@ -1,0 +1,805 @@
+#include "../include/evm_state.h"
+#include "../include/account.h"
+#include "../../common/include/keccak256.h"
+#include "uthash.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+// ============================================================================
+// Internal constants
+// ============================================================================
+
+#define JOURNAL_INIT_CAP   256
+#define SLOT_KEY_SIZE      52   // addr[20] + slot[32]
+#define MAX_CODE_SIZE      (24 * 1024 + 1)  // EIP-170: 24576 bytes
+
+// ============================================================================
+// Internal types
+// ============================================================================
+
+// --- Account cache ---
+
+typedef struct cached_account {
+    address_t  addr;            // uthash key (20 bytes)
+    account_t  account;
+    uint8_t   *code;            // loaded bytecode (NULL until needed)
+    uint32_t   code_size;
+    bool dirty;
+    bool code_dirty;
+    bool created;               // newly created this execution
+    bool existed;               // existed in state_db before
+    bool self_destructed;
+    UT_hash_handle hh;
+} cached_account_t;
+
+// --- Storage cache ---
+
+typedef struct cached_slot {
+    uint8_t   key[SLOT_KEY_SIZE];   // uthash key: addr[20] || slot_be[32]
+    uint256_t original;             // value when first loaded
+    uint256_t current;
+    bool dirty;
+    UT_hash_handle hh;
+} cached_slot_t;
+
+// --- Journal ---
+
+typedef enum {
+    JOURNAL_NONCE,
+    JOURNAL_BALANCE,
+    JOURNAL_CODE,
+    JOURNAL_STORAGE,
+    JOURNAL_ACCOUNT_CREATE,
+    JOURNAL_SELF_DESTRUCT,
+    JOURNAL_WARM_ADDR,
+    JOURNAL_WARM_SLOT,
+} journal_type_t;
+
+typedef struct {
+    journal_type_t type;
+    address_t addr;
+    union {
+        uint64_t old_nonce;
+        uint256_t old_balance;
+        struct { hash_t old_hash; bool old_has_code; uint8_t *old_code; uint32_t old_code_size; } code;
+        struct { uint256_t slot; uint256_t old_value; } storage;
+        uint256_t slot;             // WARM_SLOT
+    } data;
+} journal_entry_t;
+
+// --- Access lists ---
+
+typedef struct {
+    address_t addr;
+    UT_hash_handle hh;
+} warm_addr_t;
+
+typedef struct {
+    uint8_t key[SLOT_KEY_SIZE];
+    UT_hash_handle hh;
+} warm_slot_t;
+
+// --- Main struct ---
+
+struct evm_state {
+    state_db_t       *sdb;
+    cached_account_t *accounts;     // uthash table (NULL = empty)
+    cached_slot_t    *storage;      // uthash table
+    journal_entry_t  *journal;
+    uint32_t          journal_len;
+    uint32_t          journal_cap;
+    warm_addr_t      *warm_addrs;   // uthash set
+    warm_slot_t      *warm_slots;   // uthash set
+};
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+static void hash_address(const address_t *addr, uint8_t out[32]) {
+    hash_t h = hash_keccak256(addr->bytes, ADDRESS_SIZE);
+    memcpy(out, h.bytes, 32);
+}
+
+static void hash_slot(const uint256_t *slot, uint8_t out[32]) {
+    uint8_t slot_bytes[32];
+    uint256_to_bytes(slot, slot_bytes);
+    hash_t h = hash_keccak256(slot_bytes, 32);
+    memcpy(out, h.bytes, 32);
+}
+
+static void make_slot_key(const address_t *addr, const uint256_t *slot,
+                          uint8_t out[SLOT_KEY_SIZE]) {
+    memcpy(out, addr->bytes, ADDRESS_SIZE);
+    uint256_to_bytes(slot, out + ADDRESS_SIZE);
+}
+
+static bool journal_push(evm_state_t *es, const journal_entry_t *entry) {
+    if (es->journal_len >= es->journal_cap) {
+        uint32_t new_cap = es->journal_cap * 2;
+        journal_entry_t *new_j = realloc(es->journal,
+                                          new_cap * sizeof(journal_entry_t));
+        if (!new_j) return false;
+        es->journal = new_j;
+        es->journal_cap = new_cap;
+    }
+    es->journal[es->journal_len++] = *entry;
+    return true;
+}
+
+// Load account from state_db into cache. Creates empty if not found.
+static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) {
+    cached_account_t *ca = NULL;
+    HASH_FIND(hh, es->accounts, addr->bytes, ADDRESS_SIZE, ca);
+    if (ca) return ca;
+
+    ca = calloc(1, sizeof(cached_account_t));
+    if (!ca) return NULL;
+
+    address_copy(&ca->addr, addr);
+    ca->account = account_empty();
+
+    // Try loading from state_db
+    uint8_t addr_hash[32];
+    hash_address(addr, addr_hash);
+
+    uint8_t buf[ACCOUNT_MAX_ENCODED];
+    uint16_t buf_len = 0;
+    if (sdb_get(es->sdb, addr_hash, buf, &buf_len)) {
+        if (account_decode(buf, buf_len, &ca->account)) {
+            ca->existed = true;
+        }
+    }
+
+    HASH_ADD(hh, es->accounts, addr, ADDRESS_SIZE, ca);
+    return ca;
+}
+
+// Load storage slot from state_db into cache.
+static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
+                                  const uint256_t *slot) {
+    uint8_t skey[SLOT_KEY_SIZE];
+    make_slot_key(addr, slot, skey);
+
+    cached_slot_t *cs = NULL;
+    HASH_FIND(hh, es->storage, skey, SLOT_KEY_SIZE, cs);
+    if (cs) return cs;
+
+    cs = calloc(1, sizeof(cached_slot_t));
+    if (!cs) return NULL;
+
+    memcpy(cs->key, skey, SLOT_KEY_SIZE);
+    cs->original = UINT256_ZERO_INIT;
+    cs->current = UINT256_ZERO_INIT;
+
+    // Try loading from state_db
+    uint8_t addr_hash[32], slot_hash[32];
+    hash_address(addr, addr_hash);
+    hash_slot(slot, slot_hash);
+
+    uint8_t val_buf[32];
+    uint16_t val_len = 0;
+    if (sdb_get_storage(es->sdb, addr_hash, slot_hash, val_buf, &val_len)) {
+        cs->original = uint256_from_bytes(val_buf, val_len);
+        cs->current = cs->original;
+    }
+
+    HASH_ADD(hh, es->storage, key, SLOT_KEY_SIZE, cs);
+    return cs;
+}
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
+
+evm_state_t *evm_state_create(state_db_t *sdb) {
+    if (!sdb) return NULL;
+
+    evm_state_t *es = calloc(1, sizeof(evm_state_t));
+    if (!es) return NULL;
+
+    es->sdb = sdb;
+    es->journal_cap = JOURNAL_INIT_CAP;
+    es->journal = malloc(es->journal_cap * sizeof(journal_entry_t));
+    if (!es->journal) {
+        free(es);
+        return NULL;
+    }
+
+    return es;
+}
+
+void evm_state_destroy(evm_state_t *es) {
+    if (!es) return;
+
+    // Free account cache
+    cached_account_t *ca, *ca_tmp;
+    HASH_ITER(hh, es->accounts, ca, ca_tmp) {
+        HASH_DEL(es->accounts, ca);
+        free(ca->code);
+        free(ca);
+    }
+
+    // Free storage cache
+    cached_slot_t *cs, *cs_tmp;
+    HASH_ITER(hh, es->storage, cs, cs_tmp) {
+        HASH_DEL(es->storage, cs);
+        free(cs);
+    }
+
+    // Free access lists
+    warm_addr_t *wa, *wa_tmp;
+    HASH_ITER(hh, es->warm_addrs, wa, wa_tmp) {
+        HASH_DEL(es->warm_addrs, wa);
+        free(wa);
+    }
+
+    warm_slot_t *ws, *ws_tmp;
+    HASH_ITER(hh, es->warm_slots, ws, ws_tmp) {
+        HASH_DEL(es->warm_slots, ws);
+        free(ws);
+    }
+
+    // Free any code pointers still owned by journal entries (not reverted)
+    for (uint32_t i = 0; i < es->journal_len; i++) {
+        if (es->journal[i].type == JOURNAL_CODE) {
+            free(es->journal[i].data.code.old_code);
+        }
+    }
+
+    free(es->journal);
+    free(es);
+}
+
+// ============================================================================
+// Account Existence
+// ============================================================================
+
+bool evm_state_exists(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return false;
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca) return false;
+    if (ca->self_destructed) return false;
+    return ca->existed || ca->created;
+}
+
+bool evm_state_is_empty(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return true;
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca) return true;
+    return ca->account.nonce == 0 &&
+           uint256_is_zero(&ca->account.balance) &&
+           !ca->account.has_code;
+}
+
+// ============================================================================
+// Nonce
+// ============================================================================
+
+uint64_t evm_state_get_nonce(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return 0;
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca) return 0;
+    return ca->account.nonce;
+}
+
+void evm_state_set_nonce(evm_state_t *es, const address_t *addr, uint64_t nonce) {
+    if (!es || !addr) return;
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca) return;
+
+    journal_entry_t je = {
+        .type = JOURNAL_NONCE,
+        .addr = *addr,
+        .data.old_nonce = ca->account.nonce
+    };
+    journal_push(es, &je);
+
+    ca->account.nonce = nonce;
+    ca->dirty = true;
+}
+
+void evm_state_increment_nonce(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return;
+    uint64_t n = evm_state_get_nonce(es, addr);
+    evm_state_set_nonce(es, addr, n + 1);
+}
+
+// ============================================================================
+// Balance
+// ============================================================================
+
+uint256_t evm_state_get_balance(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return UINT256_ZERO_INIT;
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca) return UINT256_ZERO_INIT;
+    return ca->account.balance;
+}
+
+void evm_state_set_balance(evm_state_t *es, const address_t *addr,
+                           const uint256_t *balance) {
+    if (!es || !addr || !balance) return;
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca) return;
+
+    journal_entry_t je = {
+        .type = JOURNAL_BALANCE,
+        .addr = *addr,
+        .data.old_balance = ca->account.balance
+    };
+    journal_push(es, &je);
+
+    ca->account.balance = *balance;
+    ca->dirty = true;
+}
+
+void evm_state_add_balance(evm_state_t *es, const address_t *addr,
+                           const uint256_t *amount) {
+    if (!es || !addr || !amount) return;
+    uint256_t bal = evm_state_get_balance(es, addr);
+    uint256_t new_bal = uint256_add(&bal, amount);
+    evm_state_set_balance(es, addr, &new_bal);
+}
+
+bool evm_state_sub_balance(evm_state_t *es, const address_t *addr,
+                           const uint256_t *amount) {
+    if (!es || !addr || !amount) return false;
+    uint256_t bal = evm_state_get_balance(es, addr);
+    if (uint256_lt(&bal, amount)) return false;
+    uint256_t new_bal = uint256_sub(&bal, amount);
+    evm_state_set_balance(es, addr, &new_bal);
+    return true;
+}
+
+// ============================================================================
+// Code
+// ============================================================================
+
+hash_t evm_state_get_code_hash(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return hash_zero();
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca) return hash_zero();
+    if (!ca->account.has_code) return HASH_EMPTY_CODE;
+    return ca->account.code_hash;
+}
+
+uint32_t evm_state_get_code_size(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return 0;
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca) return 0;
+
+    // If code is cached, return cached size
+    if (ca->code) return ca->code_size;
+
+    // If no code, return 0
+    if (!ca->account.has_code) return 0;
+
+    // Load code size from state_db
+    uint8_t addr_hash[32];
+    hash_address(addr, addr_hash);
+    ca->code_size = sdb_code_length(es->sdb, addr_hash);
+    return ca->code_size;
+}
+
+bool evm_state_get_code(evm_state_t *es, const address_t *addr,
+                        uint8_t *out, uint32_t *out_len) {
+    if (!es || !addr) return false;
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca) return false;
+
+    if (!ca->account.has_code) {
+        if (out_len) *out_len = 0;
+        return true;
+    }
+
+    // Load code into cache if not already loaded
+    if (!ca->code) {
+        uint8_t addr_hash[32];
+        hash_address(addr, addr_hash);
+
+        uint32_t len = 0;
+        // First get the length
+        len = sdb_code_length(es->sdb, addr_hash);
+        if (len == 0) return false;
+
+        ca->code = malloc(len);
+        if (!ca->code) return false;
+
+        uint32_t got_len = 0;
+        if (!sdb_get_code(es->sdb, addr_hash, ca->code, &got_len)) {
+            free(ca->code);
+            ca->code = NULL;
+            return false;
+        }
+        ca->code_size = got_len;
+    }
+
+    if (out && out_len) {
+        uint32_t copy_len = ca->code_size;
+        if (copy_len > *out_len) copy_len = *out_len;
+        memcpy(out, ca->code, copy_len);
+        *out_len = ca->code_size;
+    } else if (out_len) {
+        *out_len = ca->code_size;
+    }
+
+    return true;
+}
+
+void evm_state_set_code(evm_state_t *es, const address_t *addr,
+                        const uint8_t *code, uint32_t len) {
+    if (!es || !addr) return;
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca) return;
+
+    // Journal old state — transfer code ownership to journal
+    journal_entry_t je = {
+        .type = JOURNAL_CODE,
+        .addr = *addr,
+        .data.code = {
+            .old_hash = ca->account.code_hash,
+            .old_has_code = ca->account.has_code,
+            .old_code = ca->code,
+            .old_code_size = ca->code_size
+        }
+    };
+    journal_push(es, &je);
+
+    // Old code ownership transferred to journal — don't free
+    ca->code = NULL;
+    ca->code_size = 0;
+
+    if (code && len > 0) {
+        ca->code = malloc(len);
+        if (ca->code) {
+            memcpy(ca->code, code, len);
+            ca->code_size = len;
+        }
+        ca->account.has_code = true;
+        ca->account.code_hash = hash_keccak256(code, len);
+    } else {
+        ca->account.has_code = false;
+        ca->account.code_hash = hash_zero();
+    }
+
+    ca->dirty = true;
+    ca->code_dirty = true;
+}
+
+// ============================================================================
+// Storage
+// ============================================================================
+
+uint256_t evm_state_get_storage(evm_state_t *es, const address_t *addr,
+                                const uint256_t *key) {
+    if (!es || !addr || !key) return UINT256_ZERO_INIT;
+    cached_slot_t *cs = ensure_slot(es, addr, key);
+    if (!cs) return UINT256_ZERO_INIT;
+    return cs->current;
+}
+
+void evm_state_set_storage(evm_state_t *es, const address_t *addr,
+                           const uint256_t *key, const uint256_t *value) {
+    if (!es || !addr || !key || !value) return;
+    cached_slot_t *cs = ensure_slot(es, addr, key);
+    if (!cs) return;
+
+    // Journal old value
+    journal_entry_t je = {
+        .type = JOURNAL_STORAGE,
+        .addr = *addr,
+        .data.storage = {
+            .slot = *key,
+            .old_value = cs->current
+        }
+    };
+    journal_push(es, &je);
+
+    cs->current = *value;
+    cs->dirty = true;
+}
+
+// ============================================================================
+// Account Creation
+// ============================================================================
+
+void evm_state_create_account(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return;
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca) return;
+
+    // Journal the creation
+    journal_entry_t je = {
+        .type = JOURNAL_ACCOUNT_CREATE,
+        .addr = *addr,
+    };
+    journal_push(es, &je);
+
+    // Reset account to empty
+    ca->account = account_empty();
+    free(ca->code);
+    ca->code = NULL;
+    ca->code_size = 0;
+    ca->created = true;
+    ca->dirty = true;
+    ca->code_dirty = false;
+    ca->self_destructed = false;
+}
+
+// ============================================================================
+// Self-Destruct
+// ============================================================================
+
+void evm_state_self_destruct(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return;
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca) return;
+
+    journal_entry_t je = {
+        .type = JOURNAL_SELF_DESTRUCT,
+        .addr = *addr,
+    };
+    journal_push(es, &je);
+
+    ca->self_destructed = true;
+    ca->dirty = true;
+}
+
+bool evm_state_is_self_destructed(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return false;
+    cached_account_t *ca = NULL;
+    HASH_FIND(hh, es->accounts, addr->bytes, ADDRESS_SIZE, ca);
+    if (!ca) return false;
+    return ca->self_destructed;
+}
+
+// ============================================================================
+// Snapshot / Revert
+// ============================================================================
+
+uint32_t evm_state_snapshot(evm_state_t *es) {
+    if (!es) return 0;
+    return es->journal_len;
+}
+
+void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
+    if (!es) return;
+    if (snap_id > es->journal_len) return;
+
+    while (es->journal_len > snap_id) {
+        es->journal_len--;
+        journal_entry_t *je = &es->journal[es->journal_len];
+
+        switch (je->type) {
+        case JOURNAL_NONCE: {
+            cached_account_t *ca = NULL;
+            HASH_FIND(hh, es->accounts, je->addr.bytes, ADDRESS_SIZE, ca);
+            if (ca) ca->account.nonce = je->data.old_nonce;
+            break;
+        }
+        case JOURNAL_BALANCE: {
+            cached_account_t *ca = NULL;
+            HASH_FIND(hh, es->accounts, je->addr.bytes, ADDRESS_SIZE, ca);
+            if (ca) ca->account.balance = je->data.old_balance;
+            break;
+        }
+        case JOURNAL_CODE: {
+            cached_account_t *ca = NULL;
+            HASH_FIND(hh, es->accounts, je->addr.bytes, ADDRESS_SIZE, ca);
+            if (ca) {
+                ca->account.code_hash = je->data.code.old_hash;
+                ca->account.has_code = je->data.code.old_has_code;
+                // Free current code, restore old code from journal
+                free(ca->code);
+                ca->code = je->data.code.old_code;
+                ca->code_size = je->data.code.old_code_size;
+                // Don't clear code_dirty — pre-snapshot code may still be dirty
+            }
+            // Ownership transferred back, clear journal's pointer
+            je->data.code.old_code = NULL;
+            break;
+        }
+        case JOURNAL_STORAGE: {
+            uint8_t skey[SLOT_KEY_SIZE];
+            make_slot_key(&je->addr, &je->data.storage.slot, skey);
+            cached_slot_t *cs = NULL;
+            HASH_FIND(hh, es->storage, skey, SLOT_KEY_SIZE, cs);
+            if (cs) {
+                cs->current = je->data.storage.old_value;
+                // If reverted back to original, no longer dirty
+                cs->dirty = !uint256_is_equal(&cs->current, &cs->original);
+            }
+            break;
+        }
+        case JOURNAL_ACCOUNT_CREATE: {
+            cached_account_t *ca = NULL;
+            HASH_FIND(hh, es->accounts, je->addr.bytes, ADDRESS_SIZE, ca);
+            if (ca) {
+                ca->created = false;
+                // If it didn't exist before, it's back to not existing
+                // The account stays in cache but will be treated as non-existent
+            }
+            break;
+        }
+        case JOURNAL_SELF_DESTRUCT: {
+            cached_account_t *ca = NULL;
+            HASH_FIND(hh, es->accounts, je->addr.bytes, ADDRESS_SIZE, ca);
+            if (ca) ca->self_destructed = false;
+            break;
+        }
+        case JOURNAL_WARM_ADDR: {
+            warm_addr_t *wa = NULL;
+            HASH_FIND(hh, es->warm_addrs, je->addr.bytes, ADDRESS_SIZE, wa);
+            if (wa) {
+                HASH_DEL(es->warm_addrs, wa);
+                free(wa);
+            }
+            break;
+        }
+        case JOURNAL_WARM_SLOT: {
+            uint8_t skey[SLOT_KEY_SIZE];
+            make_slot_key(&je->addr, &je->data.slot, skey);
+            warm_slot_t *ws = NULL;
+            HASH_FIND(hh, es->warm_slots, skey, SLOT_KEY_SIZE, ws);
+            if (ws) {
+                HASH_DEL(es->warm_slots, ws);
+                free(ws);
+            }
+            break;
+        }
+        }
+    }
+}
+
+// ============================================================================
+// Access Lists (EIP-2929)
+// ============================================================================
+
+bool evm_state_warm_address(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return false;
+
+    warm_addr_t *wa = NULL;
+    HASH_FIND(hh, es->warm_addrs, addr->bytes, ADDRESS_SIZE, wa);
+    if (wa) return true;  // already warm
+
+    wa = malloc(sizeof(warm_addr_t));
+    if (!wa) return false;
+    address_copy(&wa->addr, addr);
+    HASH_ADD(hh, es->warm_addrs, addr, ADDRESS_SIZE, wa);
+
+    // Journal for revert
+    journal_entry_t je = {
+        .type = JOURNAL_WARM_ADDR,
+        .addr = *addr,
+    };
+    journal_push(es, &je);
+
+    return false;  // was cold
+}
+
+bool evm_state_warm_slot(evm_state_t *es, const address_t *addr,
+                         const uint256_t *key) {
+    if (!es || !addr || !key) return false;
+
+    uint8_t skey[SLOT_KEY_SIZE];
+    make_slot_key(addr, key, skey);
+
+    warm_slot_t *ws = NULL;
+    HASH_FIND(hh, es->warm_slots, skey, SLOT_KEY_SIZE, ws);
+    if (ws) return true;  // already warm
+
+    ws = malloc(sizeof(warm_slot_t));
+    if (!ws) return false;
+    memcpy(ws->key, skey, SLOT_KEY_SIZE);
+    HASH_ADD(hh, es->warm_slots, key, SLOT_KEY_SIZE, ws);
+
+    // Journal for revert
+    journal_entry_t je = {
+        .type = JOURNAL_WARM_SLOT,
+        .addr = *addr,
+        .data.slot = *key,
+    };
+    journal_push(es, &je);
+
+    return false;  // was cold
+}
+
+bool evm_state_is_address_warm(const evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return false;
+    warm_addr_t *wa = NULL;
+    // Cast away const for uthash lookup (read-only operation)
+    warm_addr_t **table = (warm_addr_t **)&es->warm_addrs;
+    HASH_FIND(hh, *table, addr->bytes, ADDRESS_SIZE, wa);
+    return wa != NULL;
+}
+
+bool evm_state_is_slot_warm(const evm_state_t *es, const address_t *addr,
+                            const uint256_t *key) {
+    if (!es || !addr || !key) return false;
+    uint8_t skey[SLOT_KEY_SIZE];
+    make_slot_key(addr, key, skey);
+    warm_slot_t *ws = NULL;
+    warm_slot_t **table = (warm_slot_t **)&es->warm_slots;
+    HASH_FIND(hh, *table, skey, SLOT_KEY_SIZE, ws);
+    return ws != NULL;
+}
+
+// ============================================================================
+// Finalize
+// ============================================================================
+
+bool evm_state_finalize(evm_state_t *es) {
+    if (!es) return false;
+
+    // Write dirty accounts
+    cached_account_t *ca, *ca_tmp;
+    HASH_ITER(hh, es->accounts, ca, ca_tmp) {
+        if (ca->self_destructed) {
+            // Delete account from state_db
+            uint8_t addr_hash[32];
+            hash_address(&ca->addr, addr_hash);
+            sdb_delete(es->sdb, addr_hash);
+            // Note: storage deletion for self-destructed accounts would
+            // require iterating all storage slots — deferred for now.
+            // The MPT commitment will handle this by not including deleted accounts.
+            continue;
+        }
+
+        if (!ca->dirty && !ca->code_dirty) continue;
+
+        uint8_t addr_hash[32];
+        hash_address(&ca->addr, addr_hash);
+
+        // Write account state
+        if (ca->dirty) {
+            // Skip writing empty accounts that never existed
+            if (!ca->existed && !ca->created && evm_state_is_empty(es, &ca->addr)) {
+                continue;
+            }
+
+            uint8_t buf[ACCOUNT_MAX_ENCODED];
+            uint16_t len = account_encode(&ca->account, buf);
+            if (len == 0) return false;
+            if (!sdb_put(es->sdb, addr_hash, buf, len)) return false;
+        }
+
+        // Write code
+        if (ca->code_dirty && ca->code && ca->code_size > 0) {
+            if (!sdb_put_code(es->sdb, addr_hash, ca->code, ca->code_size))
+                return false;
+        }
+    }
+
+    // Write dirty storage slots
+    cached_slot_t *cs, *cs_tmp;
+    HASH_ITER(hh, es->storage, cs, cs_tmp) {
+        if (!cs->dirty) continue;
+
+        // Extract address and slot from composite key
+        address_t addr = address_from_bytes(cs->key);
+        uint256_t slot = uint256_from_bytes(cs->key + ADDRESS_SIZE, 32);
+
+        uint8_t addr_hash[32], slot_hash[32];
+        hash_address(&addr, addr_hash);
+        hash_slot(&slot, slot_hash);
+
+        if (uint256_is_zero(&cs->current)) {
+            // Delete zero-valued slots
+            sdb_delete_storage(es->sdb, addr_hash, slot_hash);
+        } else {
+            uint8_t val_bytes[32];
+            uint256_to_bytes(&cs->current, val_bytes);
+            // Store only significant bytes
+            uint8_t start = 0;
+            while (start < 31 && val_bytes[start] == 0) start++;
+            uint16_t val_len = 32 - start;
+            if (!sdb_put_storage(es->sdb, addr_hash, slot_hash,
+                                 val_bytes + start, val_len))
+                return false;
+        }
+    }
+
+    return true;
+}
