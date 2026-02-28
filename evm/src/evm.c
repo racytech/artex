@@ -459,7 +459,7 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     
     // Determine if this is a subcall (depth > 0)
     bool is_subcall = (msg->depth > 0);
-    evm_context_t saved_context;
+    evm_context_t saved_context = {0};
     
     if (is_subcall)
     {

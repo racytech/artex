@@ -243,8 +243,8 @@ rlp_item_t* rlp_decode(const uint8_t* data, size_t len) {
         return rlp_string(data + header_len, str_len);
     }
     
-    // List
-    if (prefix <= 0xff) {
+    // List (prefix 0xc0..0xff)
+    {
         size_t list_len, header_len;
         if (!decode_length(data, len, &list_len, &header_len)) {
             return NULL;

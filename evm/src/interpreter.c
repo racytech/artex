@@ -800,162 +800,162 @@ op_jumpdest:
     //==========================================================================
 
 op_push1:
-    status = op_push1(evm);
+    status = op_push(evm, 1);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push2:
-    status = op_push2(evm);
+    status = op_push(evm, 2);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push3:
-    status = op_push3(evm);
+    status = op_push(evm, 3);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push4:
-    status = op_push4(evm);
+    status = op_push(evm, 4);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push5:
-    status = op_push5(evm);
+    status = op_push(evm, 5);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push6:
-    status = op_push6(evm);
+    status = op_push(evm, 6);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push7:
-    status = op_push7(evm);
+    status = op_push(evm, 7);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push8:
-    status = op_push8(evm);
+    status = op_push(evm, 8);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push9:
-    status = op_push9(evm);
+    status = op_push(evm, 9);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push10:
-    status = op_push10(evm);
+    status = op_push(evm, 10);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push11:
-    status = op_push11(evm);
+    status = op_push(evm, 11);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push12:
-    status = op_push12(evm);
+    status = op_push(evm, 12);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push13:
-    status = op_push13(evm);
+    status = op_push(evm, 13);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push14:
-    status = op_push14(evm);
+    status = op_push(evm, 14);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push15:
-    status = op_push15(evm);
+    status = op_push(evm, 15);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push16:
-    status = op_push16(evm);
+    status = op_push(evm, 16);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push17:
-    status = op_push17(evm);
+    status = op_push(evm, 17);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push18:
-    status = op_push18(evm);
+    status = op_push(evm, 18);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push19:
-    status = op_push19(evm);
+    status = op_push(evm, 19);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push20:
-    status = op_push20(evm);
+    status = op_push(evm, 20);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push21:
-    status = op_push21(evm);
+    status = op_push(evm, 21);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push22:
-    status = op_push22(evm);
+    status = op_push(evm, 22);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push23:
-    status = op_push23(evm);
+    status = op_push(evm, 23);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push24:
-    status = op_push24(evm);
+    status = op_push(evm, 24);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push25:
-    status = op_push25(evm);
+    status = op_push(evm, 25);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push26:
-    status = op_push26(evm);
+    status = op_push(evm, 26);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push27:
-    status = op_push27(evm);
+    status = op_push(evm, 27);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push28:
-    status = op_push28(evm);
+    status = op_push(evm, 28);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push29:
-    status = op_push29(evm);
+    status = op_push(evm, 29);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push30:
-    status = op_push30(evm);
+    status = op_push(evm, 30);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push31:
-    status = op_push31(evm);
+    status = op_push(evm, 31);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
 op_push32:
-    status = op_push32(evm);
+    status = op_push(evm, 32);
     if (status != EVM_SUCCESS)
         goto error;
     DISPATCH();
@@ -965,82 +965,82 @@ op_push32:
     //==========================================================================
 
 op_dup1:
-    status = op_dup1(evm);
+    status = op_dup(evm, 1);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup2:
-    status = op_dup2(evm);
+    status = op_dup(evm, 2);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup3:
-    status = op_dup3(evm);
+    status = op_dup(evm, 3);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup4:
-    status = op_dup4(evm);
+    status = op_dup(evm, 4);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup5:
-    status = op_dup5(evm);
+    status = op_dup(evm, 5);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup6:
-    status = op_dup6(evm);
+    status = op_dup(evm, 6);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup7:
-    status = op_dup7(evm);
+    status = op_dup(evm, 7);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup8:
-    status = op_dup8(evm);
+    status = op_dup(evm, 8);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup9:
-    status = op_dup9(evm);
+    status = op_dup(evm, 9);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup10:
-    status = op_dup10(evm);
+    status = op_dup(evm, 10);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup11:
-    status = op_dup11(evm);
+    status = op_dup(evm, 11);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup12:
-    status = op_dup12(evm);
+    status = op_dup(evm, 12);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup13:
-    status = op_dup13(evm);
+    status = op_dup(evm, 13);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup14:
-    status = op_dup14(evm);
+    status = op_dup(evm, 14);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup15:
-    status = op_dup15(evm);
+    status = op_dup(evm, 15);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_dup16:
-    status = op_dup16(evm);
+    status = op_dup(evm, 16);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
@@ -1050,82 +1050,82 @@ op_dup16:
     //==========================================================================
 
 op_swap1:
-    status = op_swap1(evm);
+    status = op_swap(evm, 1);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap2:
-    status = op_swap2(evm);
+    status = op_swap(evm, 2);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap3:
-    status = op_swap3(evm);
+    status = op_swap(evm, 3);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap4:
-    status = op_swap4(evm);
+    status = op_swap(evm, 4);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap5:
-    status = op_swap5(evm);
+    status = op_swap(evm, 5);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap6:
-    status = op_swap6(evm);
+    status = op_swap(evm, 6);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap7:
-    status = op_swap7(evm);
+    status = op_swap(evm, 7);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap8:
-    status = op_swap8(evm);
+    status = op_swap(evm, 8);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap9:
-    status = op_swap9(evm);
+    status = op_swap(evm, 9);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap10:
-    status = op_swap10(evm);
+    status = op_swap(evm, 10);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap11:
-    status = op_swap11(evm);
+    status = op_swap(evm, 11);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap12:
-    status = op_swap12(evm);
+    status = op_swap(evm, 12);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap13:
-    status = op_swap13(evm);
+    status = op_swap(evm, 13);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap14:
-    status = op_swap14(evm);
+    status = op_swap(evm, 14);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap15:
-    status = op_swap15(evm);
+    status = op_swap(evm, 15);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
 op_swap16:
-    status = op_swap16(evm);
+    status = op_swap(evm, 16);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
