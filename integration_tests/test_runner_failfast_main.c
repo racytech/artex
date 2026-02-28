@@ -33,7 +33,7 @@ static void print_usage(const char *program) {
     printf("  -h, --help             Show this help message\n\n");
     printf("Examples:\n");
     printf("  %s large_test_file.json\n", program);
-    printf("  %s -o failed.txt -v integration_tests/fixture_01/state_tests/\n", program);
+    printf("  %s -o failed.txt -v integration_tests/fixtures/state_tests/\n", program);
     printf("  %s -f Berlin integration_tests/\n\n", program);
 }
 

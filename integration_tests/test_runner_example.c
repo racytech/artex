@@ -13,8 +13,8 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Usage: %s <state_test.json> [fork]\n", argv[0]);
         printf("\nExample:\n");
-        printf("  %s integration_tests/fixture_01/state_tests/frontier/opcodes/test_dup.json\n", argv[0]);
-        printf("  %s integration_tests/fixture_01/state_tests/frontier/opcodes/test_dup.json Berlin\n", argv[0]);
+        printf("  %s integration_tests/fixtures/state_tests/frontier/opcodes/test_dup.json\n", argv[0]);
+        printf("  %s integration_tests/fixtures/state_tests/frontier/opcodes/test_dup.json Berlin\n", argv[0]);
         return 1;
     }
     

@@ -21,8 +21,8 @@ static void print_usage(const char *program) {
     printf("  -t, --timeout <ms>     Test timeout in milliseconds (default: 30000)\n");
     printf("  -h, --help             Show this help message\n\n");
     printf("Examples:\n");
-    printf("  %s integration_tests/fixture_01/state_tests/frontier/\n", program);
-    printf("  %s -v -f Berlin integration_tests/fixture_01/\n", program);
+    printf("  %s integration_tests/fixtures/state_tests/frontier/\n", program);
+    printf("  %s -v -f Berlin integration_tests/fixtures/\n", program);
     printf("  %s --stop-on-fail test1.json test2.json\n\n", program);
 }
 

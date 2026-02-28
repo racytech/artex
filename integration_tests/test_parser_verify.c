@@ -118,9 +118,9 @@ int main(int argc, char **argv) {
         printf("\nTrying default test files...\n");
         
         // Try parsing different test types
-        test_state_test("integration_tests/fixture_01/state_tests/frontier/opcodes/test_dup.json");
-        test_blockchain_test("integration_tests/fixture_01/blockchain_tests/frontier/examples/test_block_intermediate_state.json");
-        test_transaction_test("integration_tests/fixture_01/transaction_tests/prague/eip7702_set_code_tx/test_empty_authorization_list.json");
+        test_state_test("integration_tests/fixtures/state_tests/frontier/opcodes/test_dup.json");
+        test_blockchain_test("integration_tests/fixtures/blockchain_tests/frontier/examples/test_block_intermediate_state.json");
+        test_transaction_test("integration_tests/fixtures/transaction_tests/prague/eip7702_set_code_tx/test_empty_authorization_list.json");
         
         return 0;
     }
