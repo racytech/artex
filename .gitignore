@@ -122,9 +122,8 @@ Thumbs.db
 # Archive directory
 __archive/
 
-# Temporary test fixtures
-integration_tests/fixture_01/
-integration_tests/fixture_02/
+# Test fixtures
+integration_tests/fixtures/
 
 # Root directory test/benchmark files
 /*.c

@@ -39,6 +39,7 @@ add_library(common STATIC
     common/src/bytes.c
     common/src/uint256.c
     common/src/address.c
+    common/src/logger.c
 )
 
 # Data Layer (state store + code store + checkpoint + write buffer + index merge)
@@ -232,6 +233,57 @@ add_executable(bench_uthash_vs_art
     database/tests/bench_uthash_vs_art.c
 )
 target_link_libraries(bench_uthash_vs_art art_database)
+
+#==============================================================================
+# Integration Tests (Ethereum test vectors — cJSON required)
+#==============================================================================
+
+find_package(PkgConfig QUIET)
+if(PKG_CONFIG_FOUND)
+    pkg_check_modules(CJSON QUIET libcjson)
+endif()
+if(NOT CJSON_FOUND)
+    find_library(CJSON_LIBRARY NAMES cjson)
+    find_path(CJSON_INCLUDE_DIR NAMES cjson/cJSON.h)
+    if(CJSON_LIBRARY AND CJSON_INCLUDE_DIR)
+        set(CJSON_FOUND TRUE)
+        set(CJSON_LIBRARIES ${CJSON_LIBRARY})
+        set(CJSON_INCLUDE_DIRS ${CJSON_INCLUDE_DIR})
+    endif()
+endif()
+
+if(CJSON_FOUND)
+    message(STATUS "Found cJSON: ${CJSON_LIBRARIES}")
+
+    file(GLOB_RECURSE INTEGRATION_TEST_SOURCES "integration_tests/src/*.c")
+    if(INTEGRATION_TEST_SOURCES)
+        add_library(integration_tests STATIC ${INTEGRATION_TEST_SOURCES})
+        target_include_directories(integration_tests PUBLIC
+            integration_tests/include
+            ${CJSON_INCLUDE_DIRS}
+        )
+        target_link_libraries(integration_tests PUBLIC
+            evm
+            evm_state
+            common
+            ${CJSON_LIBRARIES}
+        )
+
+        add_executable(test_parser_verify integration_tests/test_parser_verify.c)
+        target_link_libraries(test_parser_verify integration_tests)
+
+        add_executable(test_runner_example integration_tests/test_runner_example.c)
+        target_link_libraries(test_runner_example integration_tests)
+
+        add_executable(test_runner_batch integration_tests/test_runner_batch_main.c)
+        target_link_libraries(test_runner_batch integration_tests)
+
+        add_executable(test_runner_failfast integration_tests/test_runner_failfast_main.c)
+        target_link_libraries(test_runner_failfast integration_tests)
+    endif()
+else()
+    message(STATUS "cJSON not found — skipping integration tests (install: sudo apt-get install libcjson-dev)")
+endif()
 
 #==============================================================================
 # Build Summary
