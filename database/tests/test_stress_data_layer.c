@@ -15,8 +15,8 @@
  *   4. Post-recovery: 50 more blocks, prove system functional
  *   5. Final verification: full scan + determinism hash
  *
- * Usage: ./test_stress_data_layer [scale_factor]
- *   Default: scale=1 (50K genesis accounts, 5K ops/block, 200+50 blocks)
+ * Usage: ./test_stress_data_layer [millions]
+ *   Default: 1 (≈1M total keys across all phases)
  */
 
 #include "../include/data_layer.h"
@@ -41,12 +41,21 @@
 #define CODE_MIN_LEN        64
 #define CODE_MAX_LEN        2048
 
-#define DEFAULT_GENESIS_ACCOUNTS    50000
-#define DEFAULT_GENESIS_CONTRACTS   2000
-#define DEFAULT_NUM_BLOCKS_P2       200
-#define DEFAULT_NUM_BLOCKS_P4       50
-#define DEFAULT_OPS_PER_BLOCK       5000
-#define DEFAULT_CHECKPOINT_INTERVAL 50
+// Scaling: these are "per million" ratios. Multiply by N for N million target.
+// Approximate key budget per million:
+//   genesis state:  250K (25%)
+//   genesis code:    10K ( 1%)
+//   P2 blocks new:  580K (58%) — 200 blocks, mixed ops
+//   P4 blocks new:  160K (16%) — 50 blocks, post-recovery
+//   total:         ~1.0M
+#define GENESIS_ACCOUNTS_PER_M  250000
+#define GENESIS_CONTRACTS_PER_M 10000
+#define OPS_PER_BLOCK_PER_M     25000
+
+#define NUM_BLOCKS_P2           200
+#define NUM_BLOCKS_P4           50
+#define CHECKPOINT_INTERVAL     50
+#define STATS_INTERVAL          50      // print stats every N blocks
 
 #define HOT_KEY_POOL_SIZE       500
 #define HOT_KEY_PROBABILITY     20      // percent
@@ -445,12 +454,14 @@ static void phase2_blocks(data_layer_t *dl, uint64_t num_blocks,
     uint8_t *code_buf = malloc(CODE_MAX_LEN);
     double phase_start = now_sec();
 
+    // Cumulative stats for periodic reporting
+    uint64_t cum_puts = 0, cum_deletes = 0, cum_codes = 0, cum_reads = 0;
+    double cum_merge_time = 0;
+    double interval_start = phase_start;
+
     for (uint64_t b = 0; b < num_blocks; b++) {
         uint64_t block_num = b + 1;  // block 0 was genesis
         rng_t brng = rng_create(MASTER_SEED ^ (block_num * 0x426C6F636B000000ULL));
-
-        uint64_t puts = 0, deletes = 0, codes = 0, reads = 0;
-        uint64_t buf_ops = 0;  // ops that go through buffer (puts + deletes)
 
         for (uint64_t op = 0; op < ops_per_block; op++) {
             uint64_t roll = rng_next(&brng) % 100;
@@ -479,8 +490,7 @@ static void phase2_blocks(data_layer_t *dl, uint64_t num_blocks,
                         shadow_put(key, state_val, STATE_VALUE_LEN, false);
                     }
                 }
-                puts++;
-                buf_ops++;
+                cum_puts++;
 
             } else if (roll < 65) {
                 // DELETE (15%)
@@ -490,8 +500,7 @@ static void phase2_blocks(data_layer_t *dl, uint64_t num_blocks,
                     bool ok = dl_delete(dl, key);
                     ASSERT_MSG(ok, "dl_delete failed block %" PRIu64, block_num);
                     shadow_delete(key);
-                    deletes++;
-                    buf_ops++;
+                    cum_deletes++;
                 }
 
             } else if (roll < 75) {
@@ -503,7 +512,7 @@ static void phase2_blocks(data_layer_t *dl, uint64_t num_blocks,
                 bool ok = dl_put_code(dl, key, code_buf, code_len);
                 ASSERT_MSG(ok, "dl_put_code failed block %" PRIu64, block_num);
                 shadow_put(key, code_buf, code_len, true);
-                codes++;
+                cum_codes++;
 
             } else {
                 // READ/VERIFY (25%)
@@ -514,7 +523,7 @@ static void phase2_blocks(data_layer_t *dl, uint64_t num_blocks,
                         verify_key(dl, key, "block-read");
                     }
                 }
-                reads++;
+                cum_reads++;
             }
         }
 
@@ -523,6 +532,7 @@ static void phase2_blocks(data_layer_t *dl, uint64_t num_blocks,
         uint64_t merged = dl_merge(dl);
         double t1 = now_sec();
         (void)merged;
+        cum_merge_time += (t1 - t0);
 
         dl_stats_t st = dl_stats(dl);
         ASSERT_MSG(st.buffer_entries == 0,
@@ -536,15 +546,6 @@ static void phase2_blocks(data_layer_t *dl, uint64_t num_blocks,
             verify_key(dl, key, "block-spot");
         }
 
-        // Progress every 10 blocks
-        if (block_num % 10 == 0 || block_num == num_blocks) {
-            printf("  block %3" PRIu64 " | %4" PRIu64 "p %3" PRIu64 "d %3" PRIu64
-                   "c %4" PRIu64 "r | merge %.3fs | index %" PRIu64
-                   "K | free %u | RSS %zu MB\n",
-                   block_num, puts, deletes, codes, reads, t1 - t0,
-                   st.index_keys / 1000, st.free_slots, get_rss_mb());
-        }
-
         // Checkpoint
         if (block_num % ckpt_interval == 0) {
             double ct0 = now_sec();
@@ -552,20 +553,43 @@ static void phase2_blocks(data_layer_t *dl, uint64_t num_blocks,
             double ct1 = now_sec();
             ASSERT_MSG(ok, "dl_checkpoint failed at block %" PRIu64, block_num);
 
-            // Snapshot shadow
             if (g_checkpoint_snap) shadow_destroy_map(&g_checkpoint_snap);
             g_checkpoint_snap = shadow_snapshot();
             g_checkpoint_block = block_num;
 
-            printf("  ** CHECKPOINT at block %" PRIu64 " | %.3fs | index %"
+            printf("  ** CHECKPOINT block %" PRIu64 " | %.3fs | index %"
                    PRIu64 "K | code %u\n",
                    block_num, ct1 - ct0, st.index_keys / 1000, st.code_count);
+        }
+
+        // Periodic stats
+        if (block_num % STATS_INTERVAL == 0 || block_num == num_blocks) {
+            double interval_elapsed = now_sec() - interval_start;
+            uint64_t interval_ops = cum_puts + cum_deletes + cum_codes + cum_reads;
+            double ops_per_sec = interval_ops / interval_elapsed;
+            double avg_merge_ms = (cum_merge_time / block_num) * 1000.0;
+
+            printf("  block %4" PRIu64 "/%"PRIu64" | %.1f Kops/s | "
+                   "avg merge %.1fms | index %" PRIu64 "K | "
+                   "puts %" PRIu64 "K dels %" PRIu64 "K code %" PRIu64 "K | "
+                   "RSS %zu MB\n",
+                   block_num, num_blocks, ops_per_sec / 1000.0,
+                   avg_merge_ms, st.index_keys / 1000,
+                   cum_puts / 1000, cum_deletes / 1000, cum_codes / 1000,
+                   get_rss_mb());
         }
     }
 
     free(code_buf);
     double elapsed = now_sec() - phase_start;
-    printf("\n  total: %.1fs (%.0f blocks/s)\n", elapsed, num_blocks / elapsed);
+    uint64_t total_ops = cum_puts + cum_deletes + cum_codes + cum_reads;
+    printf("\n  summary: %" PRIu64 " blocks in %.1fs (%.0f blocks/s, %.1f Kops/s)\n",
+           num_blocks, elapsed, num_blocks / elapsed, total_ops / elapsed / 1000.0);
+    printf("  puts: %" PRIu64 " | deletes: %" PRIu64
+           " | code: %" PRIu64 " | reads: %" PRIu64 "\n",
+           cum_puts, cum_deletes, cum_codes, cum_reads);
+    printf("  avg merge: %.1fms | total merge: %.1fs\n",
+           (cum_merge_time / num_blocks) * 1000.0, cum_merge_time);
     printf("  state keys generated: %" PRIu64 "\n", g_next_state_idx);
     printf("  code keys generated:  %" PRIu64 "\n", g_next_code_idx);
     printf("  Phase 2: PASS\n");
@@ -715,12 +739,13 @@ static void phase4_post_recovery(data_layer_t *dl, uint64_t num_blocks,
     uint8_t *code_buf = malloc(CODE_MAX_LEN);
     double phase_start = now_sec();
 
+    uint64_t cum_puts = 0, cum_deletes = 0, cum_codes = 0;
+    double cum_merge_time = 0;
+
     for (uint64_t b = 0; b < num_blocks; b++) {
         uint64_t block_num = g_checkpoint_block + 1 + b;
         rng_t brng = rng_create(MASTER_SEED ^
                                 ((block_num + 10000) * 0x426C6F636B000000ULL));
-
-        uint64_t puts = 0, deletes = 0, codes = 0;
 
         for (uint64_t op = 0; op < ops_per_block; op++) {
             uint64_t roll = rng_next(&brng) % 100;
@@ -748,14 +773,14 @@ static void phase4_post_recovery(data_layer_t *dl, uint64_t num_blocks,
                         shadow_put(key, state_val, STATE_VALUE_LEN, false);
                     }
                 }
-                puts++;
+                cum_puts++;
             } else if (roll < 65) {
                 uint64_t idx = live_remove_random(&brng);
                 if (idx != UINT64_MAX) {
                     generate_key(key, STATE_KEY_SEED, idx);
                     dl_delete(dl, key);
                     shadow_delete(key);
-                    deletes++;
+                    cum_deletes++;
                 }
             } else if (roll < 75) {
                 uint64_t idx = g_next_code_idx++;
@@ -764,11 +789,14 @@ static void phase4_post_recovery(data_layer_t *dl, uint64_t num_blocks,
                 generate_value(code_buf, code_len, CODE_KEY_SEED, idx);
                 dl_put_code(dl, key, code_buf, code_len);
                 shadow_put(key, code_buf, code_len, true);
-                codes++;
+                cum_codes++;
             }
         }
 
+        double t0 = now_sec();
         dl_merge(dl);
+        double t1 = now_sec();
+        cum_merge_time += (t1 - t0);
 
         // Spot check
         rng_t vrng = rng_create(MASTER_SEED ^
@@ -779,11 +807,15 @@ static void phase4_post_recovery(data_layer_t *dl, uint64_t num_blocks,
             verify_key(dl, key, "post-recovery-spot");
         }
 
-        if (block_num % 10 == 0 || b == num_blocks - 1) {
+        if ((b + 1) % STATS_INTERVAL == 0 || b == num_blocks - 1) {
             dl_stats_t st = dl_stats(dl);
-            printf("  block %3" PRIu64 " | %4" PRIu64 "p %3" PRIu64 "d %3" PRIu64
-                   "c | index %" PRIu64 "K | RSS %zu MB\n",
-                   block_num, puts, deletes, codes,
+            double elapsed = now_sec() - phase_start;
+            uint64_t total_ops = cum_puts + cum_deletes + cum_codes;
+            printf("  block %4" PRIu64 "/%" PRIu64 " | %.1f Kops/s | "
+                   "avg merge %.1fms | index %" PRIu64 "K | RSS %zu MB\n",
+                   block_num, g_checkpoint_block + num_blocks,
+                   total_ops / elapsed / 1000.0,
+                   (cum_merge_time / (b + 1)) * 1000.0,
                    st.index_keys / 1000, get_rss_mb());
         }
     }
@@ -795,7 +827,11 @@ static void phase4_post_recovery(data_layer_t *dl, uint64_t num_blocks,
 
     free(code_buf);
     double elapsed = now_sec() - phase_start;
-    printf("\n  total: %.1fs (%.0f blocks/s)\n", elapsed, num_blocks / elapsed);
+    uint64_t total_ops = cum_puts + cum_deletes + cum_codes;
+    printf("\n  summary: %" PRIu64 " blocks in %.1fs (%.0f blocks/s, %.1f Kops/s)\n",
+           num_blocks, elapsed, num_blocks / elapsed, total_ops / elapsed / 1000.0);
+    printf("  avg merge: %.1fms | total merge: %.1fs\n",
+           (cum_merge_time / num_blocks) * 1000.0, cum_merge_time);
     printf("  checkpoint at block %" PRIu64 "\n", final_block);
     printf("  Phase 4: PASS\n");
 }
@@ -881,28 +917,28 @@ static void phase5_final(data_layer_t *dl) {
 // ============================================================================
 
 int main(int argc, char *argv[]) {
-    uint64_t scale = 1;
-    if (argc >= 2) scale = (uint64_t)atoll(argv[1]);
-    if (scale == 0) scale = 1;
+    uint64_t millions = 1;
+    if (argc >= 2) millions = (uint64_t)atoll(argv[1]);
+    if (millions == 0) millions = 1;
 
-    uint64_t genesis_accounts  = DEFAULT_GENESIS_ACCOUNTS * scale;
-    uint64_t genesis_contracts = DEFAULT_GENESIS_CONTRACTS * scale;
-    uint64_t num_blocks_p2     = DEFAULT_NUM_BLOCKS_P2;
-    uint64_t num_blocks_p4     = DEFAULT_NUM_BLOCKS_P4;
-    uint64_t ops_per_block     = DEFAULT_OPS_PER_BLOCK * scale;
-    uint64_t ckpt_interval     = DEFAULT_CHECKPOINT_INTERVAL;
+    uint64_t genesis_accounts  = GENESIS_ACCOUNTS_PER_M * millions;
+    uint64_t genesis_contracts = GENESIS_CONTRACTS_PER_M * millions;
+    uint64_t num_blocks_p2     = NUM_BLOCKS_P2;
+    uint64_t num_blocks_p4     = NUM_BLOCKS_P4;
+    uint64_t ops_per_block     = OPS_PER_BLOCK_PER_M * millions;
+    uint64_t ckpt_interval     = CHECKPOINT_INTERVAL;
 
     printf("============================================\n");
     printf("  Data Layer Integration Stress Test\n");
     printf("============================================\n");
-    printf("  scale factor:     %" PRIu64 "\n", scale);
+    printf("  target:           %" PRIu64 "M keys\n", millions);
     printf("  genesis accounts: %" PRIu64 "\n", genesis_accounts);
     printf("  genesis contracts:%" PRIu64 "\n", genesis_contracts);
     printf("  blocks (P2+P4):   %" PRIu64 "+%" PRIu64 "\n",
            num_blocks_p2, num_blocks_p4);
     printf("  ops/block:        %" PRIu64 "\n", ops_per_block);
     printf("  checkpoint every: %" PRIu64 " blocks\n", ckpt_interval);
-    printf("  master seed:      0x%016" PRIx64 "\n", MASTER_SEED);
+    printf("  master seed:      0x%016" PRIx64 "\n", (uint64_t)MASTER_SEED);
     printf("============================================\n");
 
     double total_start = now_sec();
