@@ -8,6 +8,7 @@
 #include "evm_stack.h"
 #include "gas.h"
 #include "logger.h"
+#include <stdlib.h>
 
 //==============================================================================
 // Helper Functions

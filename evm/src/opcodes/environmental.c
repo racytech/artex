@@ -559,7 +559,7 @@ evm_status_t op_extcodesize(evm_t *evm)
         return EVM_STACK_OVERFLOW;
     }
 
-    LOG_EVM_DEBUG("EXTCODESIZE: address=0x...%02x%02x, size=%zu", 
+    LOG_EVM_DEBUG("EXTCODESIZE: address=0x...%02x%02x, size=%u",
                   addr.bytes[18], addr.bytes[19], code_size);
 
     return EVM_SUCCESS;
@@ -639,7 +639,7 @@ evm_status_t op_extcodecopy(evm_t *evm)
             evm_memory_write_byte(evm->memory, dest_offset + i, byte);
         }
 
-        LOG_EVM_DEBUG("EXTCODECOPY: code_size=%zu, offset=%lu, size=%lu", 
+        LOG_EVM_DEBUG("EXTCODECOPY: code_size=%u, offset=%lu, size=%lu",
                       code_size, code_offset, size);
     }
 
