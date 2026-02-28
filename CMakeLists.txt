@@ -31,6 +31,11 @@ add_library(compact_art STATIC
     database/src/compact_art.c
 )
 
+# Nibble Trie — 16-way nibble trie with COW persistence (MPT root generation)
+add_library(nibble_trie STATIC
+    database/src/nibble_trie.c
+)
+
 # Common Utilities (keccak256, hash, rlp, bytes, uint256, address)
 add_library(common STATIC
     common/src/keccak256.c
@@ -208,6 +213,19 @@ add_executable(bench_uthash_vs_art
 )
 target_link_libraries(bench_uthash_vs_art art_database)
 
+# Test: Nibble Trie (16-way nibble trie with COW persistence)
+add_executable(test_nibble_trie
+    database/tests/test_nibble_trie.c
+)
+target_link_libraries(test_nibble_trie nibble_trie)
+add_test(NAME test_nibble_trie COMMAND test_nibble_trie)
+
+# Stress Test: Nibble Trie (fail-fast correctness)
+add_executable(test_stress_nibble_trie
+    database/tests/test_stress_nibble_trie.c
+)
+target_link_libraries(test_stress_nibble_trie nibble_trie)
+
 #==============================================================================
 # Build Summary
 #==============================================================================
@@ -223,6 +241,7 @@ message(STATUS "")
 message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
 message(STATUS "  - compact_art (space-efficient index ART)")
+message(STATUS "  - nibble_trie (16-way nibble trie, COW persistence)")
 message(STATUS "  - common (keccak256, hash, rlp, bytes)")
 message(STATUS "  - data_layer (state store + code store + write buffer + merge)")
 message(STATUS "  - state_db (account state + contract storage wrapper)")
