@@ -6,7 +6,7 @@ Outputs a binary file consumed by test_mpt_cross_validation.c.
 Format:
   [4 bytes: num_scenarios (little-endian)]
   For each scenario:
-    [1 byte: scenario_type]  0=build, 1=update
+    [1 byte: scenario_type]  0=build, 1=update, 2=multiblock
     [4 bytes: num_keys]
     For each key:
       [32 bytes: key]
@@ -20,6 +20,15 @@ Format:
         [2 bytes: value_len (LE)]  (0 = delete)
         [value_len bytes: value]
       [32 bytes: expected_root_after_update]
+    If scenario_type == 2 (multiblock):
+      [4 bytes: num_blocks]
+      For each block:
+        [4 bytes: num_dirty]
+        For each dirty key:
+          [32 bytes: key]
+          [2 bytes: value_len (LE)]  (0 = delete)
+          [value_len bytes: value]
+        [32 bytes: expected_root_after_block]
 """
 
 import os
@@ -91,6 +100,46 @@ def gen_update_scenario(f, initial_kvs, dirty_kvs, label=""):
         print(f"  {label}: {len(initial_kvs)} initial, "
               f"{len(dirty_kvs)} dirty, root={new_root.hex()}")
     return new_root
+
+
+def gen_multiblock_scenario(f, initial_kvs, blocks, label=""):
+    """Write a multi-block scenario: build initial, then apply blocks sequentially.
+
+    blocks: list of [(key, value), ...] per block. value=b"" means delete.
+    """
+    # Initial build
+    initial_root = scenario_build(initial_kvs)
+
+    f.write(struct.pack('B', 2))  # type = multiblock
+    write_key_values(f, initial_kvs)
+    f.write(initial_root)
+    f.write(struct.pack('<I', len(blocks)))
+
+    # Apply blocks sequentially
+    merged = dict(initial_kvs)
+    block_roots = []
+    for block_dirty in blocks:
+        for k, v in block_dirty:
+            if len(v) == 0:
+                merged.pop(k, None)
+            else:
+                merged[k] = v
+        root = scenario_build(list(merged.items()))
+        block_roots.append(root)
+
+        # Write dirty set for this block
+        f.write(struct.pack('<I', len(block_dirty)))
+        for k, v in block_dirty:
+            assert len(k) == 32
+            f.write(k)
+            f.write(struct.pack('<H', len(v)))
+            f.write(v)
+        f.write(root)
+
+    if label:
+        print(f"  {label}: {len(initial_kvs)} initial, {len(blocks)} blocks, "
+              f"final root={block_roots[-1].hex()}")
+    return block_roots[-1]
 
 
 def make_key(i):
@@ -209,6 +258,97 @@ def main():
     ]
     scenarios.append(("update", keys10, mixed_dirty, "mixed update+insert"))
 
+    # -- Multi-block scenarios --
+
+    # 19. Five blocks of pure inserts (growing trie)
+    mb_initial_1 = [(make_key(i), make_value(i)) for i in range(5)]
+    mb_initial_1.sort()
+    mb_blocks_1 = []
+    for blk in range(5):
+        base = 100 + blk * 3
+        mb_blocks_1.append([(make_key(base + j), make_value(base + j))
+                            for j in range(3)])
+    scenarios.append(("multiblock", mb_initial_1, mb_blocks_1,
+                      "5 blocks pure inserts"))
+
+    # 20. Five blocks of mixed ops (insert + update + delete)
+    mb_initial_2 = [(make_key(i), make_value(i)) for i in range(20)]
+    mb_initial_2.sort()
+    mb_blocks_2 = []
+    next_id = 200
+    live_keys = [make_key(i) for i in range(20)]
+    for blk in range(5):
+        dirty = []
+        # 3 inserts
+        for _ in range(3):
+            dirty.append((make_key(next_id), make_value(next_id)))
+            live_keys.append(make_key(next_id))
+            next_id += 1
+        # 2 updates (pick from existing)
+        for j in range(2):
+            idx = (blk * 2 + j) % len(live_keys)
+            dirty.append((live_keys[idx], make_value(next_id, b"upd")))
+            next_id += 1
+        # 1 delete (pick key that exists and wasn't just inserted)
+        del_idx = blk + 5  # keys 5,6,7,8,9
+        if del_idx < len(live_keys):
+            dk = live_keys[del_idx]
+            dirty.append((dk, b""))  # delete
+        mb_blocks_2.append(dirty)
+    scenarios.append(("multiblock", mb_initial_2, mb_blocks_2,
+                      "5 blocks mixed ops"))
+
+    # 21. Ten blocks of single-key ops (minimal dirty set per block)
+    mb_initial_3 = [(make_key(i), make_value(i)) for i in range(10)]
+    mb_initial_3.sort()
+    mb_blocks_3 = []
+    single_next = 300
+    for blk in range(10):
+        if blk % 3 == 0:
+            # insert
+            mb_blocks_3.append([(make_key(single_next),
+                                 make_value(single_next))])
+            single_next += 1
+        elif blk % 3 == 1:
+            # update existing key
+            mb_blocks_3.append([(make_key(blk % 10),
+                                 make_value(single_next, b"mod"))])
+            single_next += 1
+        else:
+            # delete (use key from initial set that we haven't deleted)
+            dk = make_key(blk)
+            mb_blocks_3.append([(dk, b"")])
+    scenarios.append(("multiblock", mb_initial_3, mb_blocks_3,
+                      "10 blocks single-key ops"))
+
+    # 22. Five blocks at moderate scale (200 initial, ~20 dirty per block)
+    mb_initial_4 = [(make_key(i), make_value(i)) for i in range(200)]
+    mb_initial_4.sort()
+    mb_blocks_4 = []
+    scale_next = 400
+    scale_live = list(range(200))  # track live key indices
+    for blk in range(5):
+        dirty = []
+        # 10 inserts
+        for _ in range(10):
+            dirty.append((make_key(scale_next), make_value(scale_next)))
+            scale_live.append(scale_next)
+            scale_next += 1
+        # 7 updates
+        for j in range(7):
+            idx = scale_live[(blk * 7 + j) % len(scale_live)]
+            dirty.append((make_key(idx), make_value(scale_next, b"sc")))
+            scale_next += 1
+        # 3 deletes
+        for j in range(3):
+            del_pos = blk * 3 + j + 50  # keys 50-64
+            if del_pos < len(scale_live):
+                dk_idx = scale_live[del_pos]
+                dirty.append((make_key(dk_idx), b""))
+        mb_blocks_4.append(dirty)
+    scenarios.append(("multiblock", mb_initial_4, mb_blocks_4,
+                      "5 blocks moderate scale"))
+
     # Write binary file
     with open(outpath, 'wb') as f:
         # Count scenarios
@@ -219,9 +359,12 @@ def main():
             if s[0] == "build":
                 _, kvs, label = s
                 gen_build_scenario(f, kvs, label)
-            else:
+            elif s[0] == "update":
                 _, initial, dirty, label = s
                 gen_update_scenario(f, initial, dirty, label)
+            else:
+                _, initial, blocks, label = s
+                gen_multiblock_scenario(f, initial, blocks, label)
 
     print(f"\nWrote {num} scenarios to {outpath}")
     print(f"File size: {os.path.getsize(outpath)} bytes")
