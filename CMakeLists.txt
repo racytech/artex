@@ -126,6 +126,12 @@ add_executable(test_data_layer_poc
 )
 target_link_libraries(test_data_layer_poc compact_art art_database)
 
+# Test: Data Layer Integration Stress (state + code + checkpoint + recovery)
+add_executable(test_stress_data_layer
+    database/tests/test_stress_data_layer.c
+)
+target_link_libraries(test_stress_data_layer data_layer)
+
 # Test: Intermediate Hashes (MPT commitment)
 add_executable(test_intermediate_hashes
     database/tests/test_intermediate_hashes.c
