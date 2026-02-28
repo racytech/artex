@@ -13,6 +13,7 @@ set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG")
 # Include directories
 include_directories(
     ${CMAKE_SOURCE_DIR}/database/include
+    ${CMAKE_SOURCE_DIR}/common/include
     ${CMAKE_SOURCE_DIR}/third_party
 )
 
@@ -30,6 +31,14 @@ add_library(compact_art STATIC
     database/src/compact_art.c
 )
 
+# Common Utilities (keccak256, hash, rlp, bytes)
+add_library(common STATIC
+    common/src/keccak256.c
+    common/src/hash.c
+    common/src/rlp.c
+    common/src/bytes.c
+)
+
 # Data Layer (state store + code store + checkpoint + write buffer + index merge)
 add_library(data_layer STATIC
     database/src/state_store.c
@@ -38,6 +47,12 @@ add_library(data_layer STATIC
     database/src/data_layer.c
 )
 target_link_libraries(data_layer compact_art art_database)
+
+# Intermediate Hashes (MPT commitment via flat hash storage)
+add_library(intermediate_hashes STATIC
+    database/src/intermediate_hashes.c
+)
+target_link_libraries(intermediate_hashes compact_art common)
 
 #==============================================================================
 # Tests
@@ -111,6 +126,13 @@ add_executable(test_data_layer_poc
 )
 target_link_libraries(test_data_layer_poc compact_art art_database)
 
+# Test: Intermediate Hashes (MPT commitment)
+add_executable(test_intermediate_hashes
+    database/tests/test_intermediate_hashes.c
+)
+target_link_libraries(test_intermediate_hashes intermediate_hashes compact_art common)
+add_test(NAME test_intermediate_hashes COMMAND test_intermediate_hashes)
+
 #==============================================================================
 # Build Summary
 #==============================================================================
@@ -126,6 +148,8 @@ message(STATUS "")
 message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
 message(STATUS "  - compact_art (space-efficient index ART)")
+message(STATUS "  - common (keccak256, hash, rlp, bytes)")
 message(STATUS "  - data_layer (state store + code store + write buffer + merge)")
+message(STATUS "  - intermediate_hashes (MPT commitment via flat hash storage)")
 message(STATUS "========================================")
 message(STATUS "")

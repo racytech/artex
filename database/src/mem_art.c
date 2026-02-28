@@ -20,6 +20,17 @@
  * 
  * All pointers are direct memory addresses (not page references).
  * For persistent, disk-backed version, see data_art.c instead.
+ *
+ * TODO: Replace malloc/free with bump arena allocator.
+ * mem_art serves dual purpose: write buffer (accumulate dirty state, merge into
+ * compact_art) and EVM state cache (SLOAD/SSTORE/BALANCE lookups during execution).
+ * Same tree handles both — dirty writes and reads in one place.
+ * It's on the hot path for every state-touching opcode. Arena allocation gives:
+ *   - Better cache locality (nodes packed in contiguous memory)
+ *   - Faster allocation (pointer bump vs malloc)
+ *   - Faster destroy (free arena chunks vs recursive tree walk)
+ *   - Less overhead (no 16-32B malloc metadata per allocation)
+ * Bump arena works because the tree resets per block — no individual frees needed.
  */
 
 // Maximum children per node type
