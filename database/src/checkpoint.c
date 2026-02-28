@@ -5,34 +5,33 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <nmmintrin.h>
 
 // ============================================================================
-// CRC32 (standard IEEE 802.3, polynomial 0xEDB88320)
+// CRC32C — hardware-accelerated via SSE4.2 (Castagnoli polynomial)
 // ============================================================================
-
-static uint32_t crc32_table[256];
-static bool crc32_table_ready = false;
-
-static void crc32_init_table(void) {
-    if (crc32_table_ready) return;
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int j = 0; j < 8; j++) {
-            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-        }
-        crc32_table[i] = c;
-    }
-    crc32_table_ready = true;
-}
 
 uint32_t crc32_update(uint32_t crc, const void *data, size_t len) {
-    crc32_init_table();
     const uint8_t *p = (const uint8_t *)data;
-    crc = ~crc;
-    for (size_t i = 0; i < len; i++) {
-        crc = crc32_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    uint64_t c = ~(uint64_t)crc;
+
+    // Process 8 bytes at a time
+    while (len >= 8) {
+        uint64_t val;
+        memcpy(&val, p, 8);
+        c = _mm_crc32_u64(c, val);
+        p += 8;
+        len -= 8;
     }
-    return ~crc;
+
+    // Process remaining bytes
+    while (len > 0) {
+        c = _mm_crc32_u8((uint32_t)c, *p);
+        p++;
+        len--;
+    }
+
+    return ~(uint32_t)c;
 }
 
 // ============================================================================

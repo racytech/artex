@@ -246,6 +246,11 @@ uint32_t dl_code_length(data_layer_t *dl, const uint8_t *key) {
 bool dl_checkpoint(data_layer_t *dl, const char *index_path,
                    uint64_t block_number) {
     if (!dl) return false;
+    // Ensure data files are durable before committing the checkpoint.
+    // The checkpoint references slots in state.dat and offsets in code.dat;
+    // those must be on disk before the index rename makes them reachable.
+    state_store_sync(dl->store);
+    if (dl->code) code_store_sync(dl->code);
     return checkpoint_write(index_path, block_number,
                             &dl->index, dl->store, dl->code);
 }

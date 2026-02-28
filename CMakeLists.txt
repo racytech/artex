@@ -152,6 +152,12 @@ add_executable(test_stress_data_layer
 )
 target_link_libraries(test_stress_data_layer data_layer)
 
+# Scale Test: Data Layer (realistic Ethereum block simulation, long-running)
+add_executable(test_scale_data_layer
+    database/tests/test_scale_data_layer.c
+)
+target_link_libraries(test_scale_data_layer data_layer)
+
 # Test: State DB (account state + contract storage + checkpoint)
 add_executable(test_state_db
     database/tests/test_state_db.c
