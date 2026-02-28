@@ -180,6 +180,16 @@ add_executable(test_compact_art_seek
 target_link_libraries(test_compact_art_seek compact_art)
 add_test(NAME test_compact_art_seek COMMAND test_compact_art_seek)
 
+# Test: MPT Cross-Validation (Python HexaryTrie reference)
+add_executable(test_mpt_cross_validation
+    database/tests/test_mpt_cross_validation.c
+)
+target_link_libraries(test_mpt_cross_validation intermediate_hashes compact_art common)
+add_test(NAME test_mpt_cross_validation
+    COMMAND test_mpt_cross_validation
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
 #==============================================================================
 # Build Summary
 #==============================================================================
