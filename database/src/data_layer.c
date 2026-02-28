@@ -177,7 +177,12 @@ uint64_t dl_merge(data_layer_t *dl) {
 
     mem_art_iterator_destroy(iter);
 
-    // Clear buffer (no fdatasync — checkpoint concern)
+    // No explicit sync here — the kernel writeback daemon flushes dirty
+    // pages in the background (~5s interval). By checkpoint time (128+
+    // blocks later), most pages are already on disk. The blocking
+    // fdatasync in dl_checkpoint() handles the rest.
+
+    // Clear buffer
     mem_art_destroy(&dl->buffer);
     mem_art_init(&dl->buffer);
 
@@ -246,9 +251,9 @@ uint32_t dl_code_length(data_layer_t *dl, const uint8_t *key) {
 bool dl_checkpoint(data_layer_t *dl, const char *index_path,
                    uint64_t block_number) {
     if (!dl) return false;
-    // Ensure data files are durable before committing the checkpoint.
-    // The checkpoint references slots in state.dat and offsets in code.dat;
-    // those must be on disk before the index rename makes them reachable.
+    // Merge kicks off async writeback each block, so most pages are already
+    // on disk. This blocking fdatasync ensures everything is durable before
+    // the checkpoint commit (rename) makes the new index reachable.
     state_store_sync(dl->store);
     if (dl->code) code_store_sync(dl->code);
     return checkpoint_write(index_path, block_number,
