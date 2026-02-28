@@ -16,8 +16,8 @@
  * Architecture: Erigon-style (see PROOF_GENERATION.md, INTERMEDIATE_HASHES.md).
  * No trie nodes in memory. No value duplication.
  *
- * Phase 1: ih_build (full computation from sorted keys).
- * Phase 2 (future): ih_update (incremental per-block update).
+ * ih_build: full computation from sorted keys (initial sync).
+ * ih_update: incremental per-block update from dirty keys + data cursor.
  */
 
 typedef struct ih_state ih_state_t;

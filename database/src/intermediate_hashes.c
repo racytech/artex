@@ -9,22 +9,15 @@
 /**
  * Intermediate Hash Table — MPT Commitment
  *
- * Stores branch node hashes in a compact_art (key=33, value=34).
+ * Stores branch node hashes in a compact_art (key=33, value=51).
  * Computes Ethereum MPT root hashes via recursive build over sorted keys.
  *
  * Node hashing uses manual RLP construction for correct inline embedding.
  * Extension merging handled naturally by find_branch_depth().
  *
- * TODO: Phase 2 — ih_update() for incremental per-block updates.
- *   Currently ih_build() recomputes the entire trie from all keys (~17 min at
- *   500M keys). For normal block processing we need ih_update() that takes only
- *   dirty keys (~2K-50K per block) and reuses cached branch hashes from ih_tree.
- *   Requirements:
- *     - Prefix scan on compact_art (load existing children for a branch frame)
- *     - Stack-based streaming algorithm (see INTERMEDIATE_HASHES.md pseudocode)
- *     - Delete handling (NULL values remove leaves, may collapse branches)
- *     - Integration with data layer write buffer (sorted dirty keys after EVM)
- *   Expected performance: ~117ms per block vs ~17 min for full rebuild.
+ * Two modes:
+ *   - ih_build: full trie computation from all sorted keys (initial sync)
+ *   - ih_update: incremental per-block update from dirty keys + data cursor
  */
 
 // ============================================================================
