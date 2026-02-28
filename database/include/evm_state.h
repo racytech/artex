@@ -147,4 +147,19 @@ bool evm_state_is_slot_warm(const evm_state_t *es, const address_t *addr,
  */
 bool evm_state_finalize(evm_state_t *es);
 
+// ============================================================================
+// State Root
+// ============================================================================
+
+/**
+ * Compute Ethereum MPT state root from current in-memory state.
+ *
+ * Builds the full MPT over keccak256(address) → RLP([nonce, balance, storageRoot, codeHash]).
+ * Storage roots are computed per-account from keccak256(slot) → trimmed_uint256.
+ * Uses ih_build() for full trie computation.
+ *
+ * Does NOT require finalize — reads directly from in-memory caches.
+ */
+hash_t evm_state_compute_state_root(evm_state_t *es);
+
 #endif // EVM_STATE_H

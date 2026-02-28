@@ -185,7 +185,7 @@ bool test_runner_run_state_test(test_runner_t *runner,
                 .gas_limit = uint256_to_uint64(&test->env.gas_limit),
                 .difficulty = test->env.difficulty,
                 .base_fee = test->env.base_fee,
-                .skip_coinbase_payment = true  // State tests don't include coinbase in expected state
+                .skip_coinbase_payment = false  // State tests include coinbase payment in expected state root
             };
             
             // Set block environment BEFORE applying access list (this sets the fork)
@@ -299,12 +299,6 @@ bool test_runner_run_state_test(test_runner_t *runner,
             }
             
             transaction_result_free(&tx_result);
-            
-            // Compute final state root
-            printf("DEBUG: Computing state root after transaction\n");
-            
-            // TODO: State root computation requires MPT (intermediate_hashes)
-            printf("DEBUG: State root computation not yet integrated\n");
             
             // Verify state root
             hash_t actual_root;

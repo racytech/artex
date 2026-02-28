@@ -291,16 +291,13 @@ bool test_runner_verify_state_root(evm_state_t *state,
                                    hash_t *actual_root) {
     if (!state || !expected_root) return false;
 
-    // TODO: State root computation requires MPT (intermediate_hashes integration)
-    // For now, return empty hash — state root verification will always fail
-    hash_t computed_root;
-    memset(&computed_root, 0, sizeof(computed_root));
+    hash_t computed_root = evm_state_compute_state_root(state);
 
     if (actual_root) {
         *actual_root = computed_root;
     }
 
-    return hash_equals(&computed_root, expected_root);
+    return hash_equal(&computed_root, expected_root);
 }
 
 //==============================================================================

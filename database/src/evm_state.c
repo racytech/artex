@@ -1,7 +1,9 @@
 #include "../include/evm_state.h"
 #include "../include/account.h"
 #include "../include/mem_art.h"
+#include "../include/intermediate_hashes.h"
 #include "../../common/include/keccak256.h"
+#include "../../common/include/rlp.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -845,4 +847,248 @@ bool evm_state_finalize(evm_state_t *es) {
     // Write dirty storage slots
     mem_art_foreach(&es->storage, finalize_storage_cb, &ctx);
     return ctx.ok;
+}
+
+// ============================================================================
+// State Root Computation
+// ============================================================================
+
+// --- Storage root helpers ---
+
+// Entry for sorting hashed storage slots
+typedef struct {
+    uint8_t hashed_key[32];
+    uint8_t value[32];     // trimmed big-endian value
+    uint16_t value_len;
+} storage_entry_t;
+
+// Collector context for iterating storage slots of one address
+typedef struct {
+    const uint8_t *target_addr;  // 20-byte address to match
+    storage_entry_t *entries;
+    size_t count;
+    size_t cap;
+} storage_collect_ctx_t;
+
+static int compare_32b_keys(const void *a, const void *b) {
+    return memcmp(a, b, 32);
+}
+
+static bool collect_storage_cb(const uint8_t *key, size_t key_len,
+                                const void *value, size_t value_len,
+                                void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    storage_collect_ctx_t *ctx = (storage_collect_ctx_t *)user_data;
+    const cached_slot_t *cs = (const cached_slot_t *)value;
+
+    // Only collect slots for the target address
+    if (memcmp(cs->key, ctx->target_addr, ADDRESS_SIZE) != 0) return true;
+
+    // Skip zero-valued slots
+    if (uint256_is_zero(&cs->current)) return true;
+
+    // Grow array if needed
+    if (ctx->count >= ctx->cap) {
+        size_t new_cap = ctx->cap == 0 ? 16 : ctx->cap * 2;
+        storage_entry_t *new_entries = realloc(ctx->entries,
+                                                new_cap * sizeof(storage_entry_t));
+        if (!new_entries) return false;
+        ctx->entries = new_entries;
+        ctx->cap = new_cap;
+    }
+
+    storage_entry_t *e = &ctx->entries[ctx->count];
+
+    // Hash the slot key: keccak256(slot_be[32])
+    hash_t h = hash_keccak256(cs->key + ADDRESS_SIZE, 32);
+    memcpy(e->hashed_key, h.bytes, 32);
+
+    // Trimmed big-endian value
+    uint256_to_bytes(&cs->current, e->value);
+    uint8_t start = 0;
+    while (start < 31 && e->value[start] == 0) start++;
+    e->value_len = 32 - start;
+    if (start > 0) memmove(e->value, e->value + start, e->value_len);
+
+    ctx->count++;
+    return true;
+}
+
+static hash_t compute_storage_root(evm_state_t *es, const address_t *addr) {
+    storage_collect_ctx_t ctx = {
+        .target_addr = addr->bytes,
+        .entries = NULL,
+        .count = 0,
+        .cap = 0
+    };
+
+    mem_art_foreach(&es->storage, collect_storage_cb, &ctx);
+
+    if (ctx.count == 0) {
+        free(ctx.entries);
+        return HASH_EMPTY_STORAGE;
+    }
+
+    // Sort by hashed key
+    qsort(ctx.entries, ctx.count, sizeof(storage_entry_t), compare_32b_keys);
+
+    // Build arrays for ih_build
+    const uint8_t **keys = malloc(ctx.count * sizeof(uint8_t *));
+    const uint8_t **values = malloc(ctx.count * sizeof(uint8_t *));
+    uint16_t *value_lens = malloc(ctx.count * sizeof(uint16_t));
+
+    for (size_t i = 0; i < ctx.count; i++) {
+        keys[i] = ctx.entries[i].hashed_key;
+        values[i] = ctx.entries[i].value;
+        value_lens[i] = ctx.entries[i].value_len;
+    }
+
+    ih_state_t *ih = ih_create();
+    hash_t root = ih_build(ih, keys, values, value_lens, ctx.count);
+    ih_destroy(ih);
+
+    free(keys);
+    free(values);
+    free(value_lens);
+    free(ctx.entries);
+    return root;
+}
+
+// --- Account trie helpers ---
+
+typedef struct {
+    uint8_t hashed_key[32];
+    uint8_t *rlp_value;    // heap-allocated RLP([nonce, balance, storageRoot, codeHash])
+    uint16_t rlp_len;
+} account_entry_t;
+
+typedef struct {
+    evm_state_t *es;
+    account_entry_t *entries;
+    size_t count;
+    size_t cap;
+} account_collect_ctx_t;
+
+// Convert uint256 to trimmed big-endian bytes, return length (0 for zero)
+static size_t uint256_to_trimmed_be(const uint256_t *val, uint8_t out[32]) {
+    uint256_to_bytes(val, out);
+    size_t start = 0;
+    while (start < 32 && out[start] == 0) start++;
+    size_t len = 32 - start;
+    if (start > 0 && len > 0) memmove(out, out + start, len);
+    return len;
+}
+
+static bool collect_account_cb(const uint8_t *key, size_t key_len,
+                                const void *value, size_t value_len,
+                                void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    account_collect_ctx_t *ctx = (account_collect_ctx_t *)user_data;
+    const cached_account_t *ca = (const cached_account_t *)value;
+
+    // Skip self-destructed accounts
+    if (ca->self_destructed) return true;
+
+    // Skip empty accounts that never existed (same logic as finalize_account_cb)
+    bool is_empty = (ca->account.nonce == 0 &&
+                     uint256_is_zero(&ca->account.balance) &&
+                     !ca->account.has_code);
+    if (!ca->existed && !ca->created && is_empty) return true;
+
+    // Grow array if needed
+    if (ctx->count >= ctx->cap) {
+        size_t new_cap = ctx->cap == 0 ? 16 : ctx->cap * 2;
+        account_entry_t *new_entries = realloc(ctx->entries,
+                                                new_cap * sizeof(account_entry_t));
+        if (!new_entries) return false;
+        ctx->entries = new_entries;
+        ctx->cap = new_cap;
+    }
+
+    account_entry_t *e = &ctx->entries[ctx->count];
+
+    // Hash the address: keccak256(addr[20])
+    hash_t h = hash_keccak256(ca->addr.bytes, ADDRESS_SIZE);
+    memcpy(e->hashed_key, h.bytes, 32);
+
+    // Compute storage root for this account
+    hash_t storage_root = compute_storage_root(ctx->es, &ca->addr);
+
+    // Code hash: HASH_EMPTY_CODE if no code, else the stored hash
+    hash_t code_hash = ca->account.has_code ? ca->account.code_hash : HASH_EMPTY_CODE;
+
+    // Build RLP([nonce, balance, storageRoot, codeHash])
+    rlp_item_t *list = rlp_list_new();
+
+    // Nonce
+    rlp_list_append(list, rlp_uint64(ca->account.nonce));
+
+    // Balance (trimmed big-endian)
+    uint8_t bal_be[32];
+    size_t bal_len = uint256_to_trimmed_be(&ca->account.balance, bal_be);
+    rlp_list_append(list, rlp_string(bal_be, bal_len));
+
+    // Storage root (32 bytes)
+    rlp_list_append(list, rlp_string(storage_root.bytes, 32));
+
+    // Code hash (32 bytes)
+    rlp_list_append(list, rlp_string(code_hash.bytes, 32));
+
+    bytes_t encoded = rlp_encode(list);
+    rlp_item_free(list);
+
+    e->rlp_value = encoded.data;
+    e->rlp_len = (uint16_t)encoded.len;
+    ctx->count++;
+    return true;
+}
+
+hash_t evm_state_compute_state_root(evm_state_t *es) {
+    if (!es) return HASH_EMPTY_STORAGE;
+
+    if (mem_art_is_empty(&es->accounts)) return HASH_EMPTY_STORAGE;
+
+    // Phase 1: Collect all accounts with their RLP-encoded values
+    account_collect_ctx_t ctx = {
+        .es = es,
+        .entries = NULL,
+        .count = 0,
+        .cap = 0
+    };
+
+    mem_art_foreach(&es->accounts, collect_account_cb, &ctx);
+
+    if (ctx.count == 0) {
+        free(ctx.entries);
+        return HASH_EMPTY_STORAGE;
+    }
+
+    // Phase 2: Sort by hashed address key
+    qsort(ctx.entries, ctx.count, sizeof(account_entry_t), compare_32b_keys);
+
+    // Phase 3: Build arrays for ih_build
+    const uint8_t **keys = malloc(ctx.count * sizeof(uint8_t *));
+    const uint8_t **values = malloc(ctx.count * sizeof(uint8_t *));
+    uint16_t *value_lens = malloc(ctx.count * sizeof(uint16_t));
+
+    for (size_t i = 0; i < ctx.count; i++) {
+        keys[i] = ctx.entries[i].hashed_key;
+        values[i] = ctx.entries[i].rlp_value;
+        value_lens[i] = ctx.entries[i].rlp_len;
+    }
+
+    ih_state_t *ih = ih_create();
+    hash_t root = ih_build(ih, keys, values, value_lens, ctx.count);
+    ih_destroy(ih);
+
+    // Cleanup
+    free(keys);
+    free(values);
+    free(value_lens);
+    for (size_t i = 0; i < ctx.count; i++) {
+        free(ctx.entries[i].rlp_value);
+    }
+    free(ctx.entries);
+
+    return root;
 }

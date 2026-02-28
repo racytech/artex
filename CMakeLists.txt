@@ -67,7 +67,7 @@ target_link_libraries(account common)
 add_library(evm_state STATIC
     database/src/evm_state.c
 )
-target_link_libraries(evm_state state_db account common art_database)
+target_link_libraries(evm_state state_db account common art_database intermediate_hashes)
 
 # Intermediate Hashes (MPT commitment via flat hash storage)
 add_library(intermediate_hashes STATIC
