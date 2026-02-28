@@ -112,8 +112,8 @@ typedef struct {
 // ============================================================================
 
 static mem_ref_t arena_alloc(mem_art_t *tree, size_t bytes, bool is_leaf) {
-    // 4-byte alignment
-    size_t aligned = (tree->arena_used + 3) & ~(size_t)3;
+    // 16-byte alignment (required for struct values with __uint128_t fields)
+    size_t aligned = (tree->arena_used + 15) & ~(size_t)15;
     if (aligned + bytes > tree->arena_cap) {
         size_t new_cap = tree->arena_cap * 2;
         while (aligned + bytes > new_cap) new_cap *= 2;
@@ -176,9 +176,17 @@ static inline uint8_t *node_partial(void *node) {
 // Leaf Helpers
 // ============================================================================
 
+static inline size_t leaf_value_offset(size_t key_len, size_t value_len) {
+    if (value_len == 0) return sizeof(mem_leaf_t) + key_len;
+    // Align value start to 16 bytes for struct values with __uint128_t
+    size_t hdr_key = sizeof(mem_leaf_t) + key_len;
+    return (hdr_key + 15) & ~(size_t)15;
+}
+
 static mem_ref_t alloc_leaf(mem_art_t *tree, const uint8_t *key, size_t key_len,
                             const void *value, size_t value_len) {
-    size_t total = sizeof(mem_leaf_t) + key_len + value_len;
+    size_t val_off = leaf_value_offset(key_len, value_len);
+    size_t total = val_off + value_len;
     mem_ref_t ref = arena_alloc(tree, total, true);
     if (ref == MEM_REF_NULL) return MEM_REF_NULL;
 
@@ -186,7 +194,10 @@ static mem_ref_t alloc_leaf(mem_art_t *tree, const uint8_t *key, size_t key_len,
     leaf->key_len = (uint16_t)key_len;
     leaf->value_len = (uint16_t)value_len;
     memcpy(leaf->data, key, key_len);
-    memcpy(leaf->data + key_len, value, value_len);
+    if (value_len > 0) {
+        uint8_t *base = (uint8_t *)leaf;
+        memcpy(base + val_off, value, value_len);
+    }
     return ref;
 }
 
@@ -202,7 +213,8 @@ static inline const void *leaf_value(const mem_art_t *tree, mem_ref_t ref,
                                      size_t *value_len) {
     mem_leaf_t *leaf = leaf_ptr(tree, ref);
     if (value_len) *value_len = leaf->value_len;
-    return leaf->data + leaf->key_len;
+    size_t val_off = leaf_value_offset(leaf->key_len, leaf->value_len);
+    return (const uint8_t *)leaf + val_off;
 }
 
 static inline bool leaf_matches(const mem_art_t *tree, mem_ref_t ref,
@@ -1054,6 +1066,11 @@ const void *mem_art_get(const mem_art_t *tree, const uint8_t *key,
     return search(tree, tree->root, key, key_len, 0, value_len);
 }
 
+void *mem_art_get_mut(mem_art_t *tree, const uint8_t *key,
+                      size_t key_len, size_t *value_len) {
+    return (void *)mem_art_get(tree, key, key_len, value_len);
+}
+
 bool mem_art_delete(mem_art_t *tree, const uint8_t *key, size_t key_len) {
     if (!tree || !key || key_len == 0) return false;
 
@@ -1142,8 +1159,9 @@ bool mem_art_iterator_next(mem_art_iterator_t *iter) {
             mem_leaf_t *leaf = leaf_ptr(iter->tree, ref);
             state->key = leaf->data;
             state->key_len = leaf->key_len;
-            state->value = leaf->data + leaf->key_len;
             state->value_len = leaf->value_len;
+            size_t val_off = leaf_value_offset(leaf->key_len, leaf->value_len);
+            state->value = (const uint8_t *)leaf + val_off;
 
             // Pop this leaf from stack for next iteration
             state->depth--;

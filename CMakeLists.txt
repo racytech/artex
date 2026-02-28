@@ -66,7 +66,7 @@ target_link_libraries(account common)
 add_library(evm_state STATIC
     database/src/evm_state.c
 )
-target_link_libraries(evm_state state_db account common)
+target_link_libraries(evm_state state_db account common art_database)
 
 # Intermediate Hashes (MPT commitment via flat hash storage)
 add_library(intermediate_hashes STATIC
@@ -201,6 +201,12 @@ add_test(NAME test_mpt_cross_validation
     COMMAND test_mpt_cross_validation
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
+
+# Benchmark: uthash vs mem_art (cache performance comparison)
+add_executable(bench_uthash_vs_art
+    database/tests/bench_uthash_vs_art.c
+)
+target_link_libraries(bench_uthash_vs_art art_database)
 
 #==============================================================================
 # Build Summary

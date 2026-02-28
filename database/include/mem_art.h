@@ -69,6 +69,9 @@ bool mem_art_insert(mem_art_t *tree, const uint8_t *key, size_t key_len,
 const void *mem_art_get(const mem_art_t *tree, const uint8_t *key, size_t key_len,
                     size_t *value_len);
 
+void *mem_art_get_mut(mem_art_t *tree, const uint8_t *key, size_t key_len,
+                      size_t *value_len);
+
 bool mem_art_delete(mem_art_t *tree, const uint8_t *key, size_t key_len);
 bool mem_art_contains(const mem_art_t *tree, const uint8_t *key, size_t key_len);
 size_t mem_art_size(const mem_art_t *tree);
