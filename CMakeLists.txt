@@ -31,6 +31,11 @@ add_library(compact_art STATIC
     database/src/compact_art.c
 )
 
+# Persistent ART — COW file-backed ART index (mmap + dual-meta atomic commit)
+add_library(persistent_art STATIC
+    database/src/persistent_art.c
+)
+
 # Common Utilities (keccak256, hash, rlp, bytes, uint256, address)
 add_library(common STATIC
     common/src/keccak256.c
@@ -208,6 +213,13 @@ add_executable(bench_uthash_vs_art
 )
 target_link_libraries(bench_uthash_vs_art art_database)
 
+# Test: Persistent ART (COW file-backed ART index)
+add_executable(test_persistent_art
+    database/tests/test_persistent_art.c
+)
+target_link_libraries(test_persistent_art persistent_art)
+add_test(NAME test_persistent_art COMMAND test_persistent_art)
+
 #==============================================================================
 # Build Summary
 #==============================================================================
@@ -223,6 +235,7 @@ message(STATUS "")
 message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
 message(STATUS "  - compact_art (space-efficient index ART)")
+message(STATUS "  - persistent_art (COW file-backed ART index)")
 message(STATUS "  - common (keccak256, hash, rlp, bytes)")
 message(STATUS "  - data_layer (state store + code store + write buffer + merge)")
 message(STATUS "  - state_db (account state + contract storage wrapper)")
