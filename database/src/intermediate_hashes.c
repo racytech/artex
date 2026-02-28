@@ -30,17 +30,18 @@ typedef struct {
     uint8_t len;        // 32 = hash, 1-31 = inline RLP, 0 = empty
 } node_ref_t;
 
-// Result from build_subtree: the ref + branch depth for child_depths tracking
+// Result from build_subtree: the ref + stored branch depth for child_depths tracking
+// Uses +1 encoding: 0 = leaf (no branch stored), N = branch at nibble depth N-1
 typedef struct {
     node_ref_t ref;
-    size_t branch_depth;  // 0 = leaf (no branch stored), >0 = branch at this depth
+    size_t branch_depth;  // 0 = leaf, >0 = branch at depth (branch_depth - 1)
 } subtree_result_t;
 
 struct ih_state {
     compact_art_t tree;     // key=33, value=51
     hash_t root;            // cached root
     bool initialized;       // tree has been init'd
-    size_t root_branch_depth; // nibble depth of root branch (0 = leaf/empty)
+    size_t root_branch_depth; // +1 encoded: 0 = leaf/empty, N = branch at depth N-1
 };
 
 // ih_tree value layout:
@@ -244,16 +245,97 @@ static node_ref_t hash_extension(const uint8_t *nibbles, size_t count,
 // ih_tree Helpers
 // ============================================================================
 
-// Build 33-byte key: [nibble_count] [packed nibbles, zero-padded]
+// Build 33-byte key: [packed nibbles, zero-padded] [nibble_count]
+// Packed-first layout ensures entries under a common nibble prefix are
+// contiguous in sort order, enabling efficient prefix-delete operations.
 static void make_ih_key(const uint8_t *nibbles, size_t count,
                         uint8_t out[IH_KEY_SIZE]) {
     memset(out, 0, IH_KEY_SIZE);
-    out[0] = (uint8_t)count;
     for (size_t i = 0; i < count; i += 2) {
         uint8_t hi = nibbles[i];
         uint8_t lo = (i + 1 < count) ? nibbles[i + 1] : 0;
-        out[1 + i / 2] = (hi << 4) | lo;
+        out[i / 2] = (hi << 4) | lo;
     }
+    out[32] = (uint8_t)count;
+}
+
+// Delete all ih_tree entries whose nibble prefix starts with `nibbles[0..count)`.
+// With packed-first key layout, these entries are contiguous in sort order.
+static void ih_delete_prefix(ih_state_t *ih,
+                             const uint8_t *nibbles, size_t count) {
+    if (!ih->initialized) return;
+
+    // Build seek key: packed prefix, zero-padded, count=0 (sorts before all entries)
+    uint8_t seek[IH_KEY_SIZE];
+    memset(seek, 0, IH_KEY_SIZE);
+    for (size_t i = 0; i < count; i += 2) {
+        uint8_t hi = nibbles[i];
+        uint8_t lo = (i + 1 < count) ? nibbles[i + 1] : 0;
+        seek[i / 2] = (hi << 4) | lo;
+    }
+    // seek[32] = 0 → sorts before any real entry with this prefix
+
+    compact_art_iterator_t *iter = compact_art_iterator_create(&ih->tree);
+    if (!iter) return;
+
+    if (!compact_art_iterator_seek(iter, seek)) {
+        compact_art_iterator_destroy(iter);
+        return;
+    }
+
+    // Number of full bytes in prefix
+    size_t full_bytes = count / 2;
+    bool odd = (count % 2) != 0;
+
+    // Collect keys to delete (can't delete during iteration)
+    size_t cap = 64, n = 0;
+    uint8_t *del_keys = malloc(cap * IH_KEY_SIZE);
+    if (!del_keys) {
+        compact_art_iterator_destroy(iter);
+        return;
+    }
+
+    while (!compact_art_iterator_done(iter)) {
+        const uint8_t *k = compact_art_iterator_key(iter);
+        if (!k) break;
+
+        // Check full bytes match
+        bool match = true;
+        for (size_t i = 0; i < full_bytes && match; i++) {
+            if (k[i] != seek[i]) match = false;
+        }
+        // Check odd nibble (high nibble of next byte)
+        if (match && odd) {
+            if ((k[full_bytes] & 0xF0) != (seek[full_bytes] & 0xF0))
+                match = false;
+        }
+
+        if (!match) break;  // sorted order → no more matches
+
+        // Entry's nibble count must be >= prefix count
+        if (k[32] < count) {
+            compact_art_iterator_next(iter);
+            continue;
+        }
+
+        if (n >= cap) {
+            cap *= 2;
+            uint8_t *tmp = realloc(del_keys, cap * IH_KEY_SIZE);
+            if (!tmp) break;
+            del_keys = tmp;
+        }
+        memcpy(del_keys + n * IH_KEY_SIZE, k, IH_KEY_SIZE);
+        n++;
+
+        compact_art_iterator_next(iter);
+    }
+
+    compact_art_iterator_destroy(iter);
+
+    for (size_t i = 0; i < n; i++) {
+        compact_art_delete(&ih->tree, del_keys + i * IH_KEY_SIZE);
+    }
+    free(del_keys);
 }
 
 // Store a branch entry in ih_tree.
@@ -402,6 +484,7 @@ static subtree_result_t build_subtree(ih_state_t *ih,
                                          data_from, to, depth);
     }
 
+
     // Partition by nibble at branch_depth
     node_ref_t children[16] = {{0}};
     uint16_t bitmap = 0;
@@ -435,11 +518,11 @@ static subtree_result_t build_subtree(ih_state_t *ih,
         node_ref_t ext_ref = hash_extension(
             nibble_arrays[data_from] + depth, branch_depth - depth,
             &branch_ref);
-        subtree_result_t r = {ext_ref, branch_depth};
+        subtree_result_t r = {ext_ref, branch_depth + 1};
         return r;
     }
 
-    subtree_result_t r = {branch_ref, branch_depth};
+    subtree_result_t r = {branch_ref, branch_depth + 1};
     return r;
 }
 
@@ -674,19 +757,22 @@ static subtree_result_t get_clean_child_ref(
     }
 
     // Branch child → load from ih_tree, wrap with extension if needed.
+    // Decode +1 encoding: actual depth = child_branch_depth - 1
+    size_t actual_depth = child_branch_depth - 1;
+
     // Use cursor key's nibbles to get the extension path.
     memcpy(path + child_prefix_len, knibbles + child_prefix_len,
-           child_branch_depth - child_prefix_len);
+           actual_depth - child_prefix_len);
 
     uint16_t bitmap;
     node_ref_t branch_ref;
-    if (!ih_load(ih, knibbles, child_branch_depth, &bitmap, &branch_ref, NULL))
+    if (!ih_load(ih, knibbles, actual_depth, &bitmap, &branch_ref, NULL))
         return empty;
 
-    if (child_branch_depth > child_prefix_len) {
+    if (actual_depth > child_prefix_len) {
         node_ref_t ext_ref = hash_extension(
             knibbles + child_prefix_len,
-            child_branch_depth - child_prefix_len,
+            actual_depth - child_prefix_len,
             &branch_ref);
         subtree_result_t r = {ext_ref, child_branch_depth};
         return r;
@@ -706,6 +792,17 @@ static subtree_result_t rebuild_from_cursor(
         const uint8_t *path,
         size_t path_len) {
     subtree_result_t empty = {{{0}, 0}, 0};
+
+    // Delete all stale ih_tree entries under this prefix before rebuilding.
+    // Without this, old branch entries from the previous structure accumulate
+    // and corrupt subsequent hash computations.
+    if (path_len > 0) {
+        ih_delete_prefix(ih, path, path_len);
+    } else {
+        // Full rebuild from root — clear entire ih_tree
+        compact_art_destroy(&ih->tree);
+        compact_art_init(&ih->tree, IH_KEY_SIZE, IH_VALUE_SIZE);
+    }
 
     uint8_t seek_key[32];
     nibbles_to_key(path, path_len, seek_key);
@@ -811,7 +908,7 @@ static subtree_result_t update_subtree(
         const size_t *dirty_vlens,
         size_t from, size_t to,
         size_t depth,
-        size_t branch_depth,
+        size_t stored_depth,    // +1 encoded: 0 = no branch, >0 = branch at (stored_depth-1)
         ih_cursor_t *cursor,
         uint8_t *path) {
     subtree_result_t empty = {{{0}, 0}, 0};
@@ -819,9 +916,12 @@ static subtree_result_t update_subtree(
     if (from >= to) return empty;
 
     // Case 1: No existing branch — was leaf or empty → rebuild from cursor
-    if (branch_depth == 0) {
+    if (stored_depth == 0) {
         return rebuild_from_cursor(ih, depth, cursor, path, depth);
     }
+
+    // Decode +1 encoding to get actual branch depth
+    size_t branch_depth = stored_depth - 1;
 
     // Case 2: Extension check (branch_depth > depth)
     if (branch_depth > depth) {
@@ -892,7 +992,7 @@ static subtree_result_t update_subtree(
         }
 
         if (!is_dirty && existed) {
-            // Clean child → cached ref
+            // Clean child → cached ref (child_depths are +1 encoded)
             subtree_result_t cr = get_clean_child_ref(
                 ih, path, branch_depth, n,
                 old_child_depths[n], cursor);
@@ -906,7 +1006,7 @@ static subtree_result_t update_subtree(
         path[branch_depth] = n;
 
         if (existed && old_child_depths[n] > 0) {
-            // Had a branch → recurse
+            // Had a branch → recurse (child_depths are +1 encoded)
             subtree_result_t cr = update_subtree(
                 ih, dirty_nibs, dirty_nib_lens,
                 dirty_vals, dirty_vlens,
@@ -952,18 +1052,18 @@ static subtree_result_t update_subtree(
     // Case 6: Re-hash branch
     node_ref_t branch_ref = hash_branch(children, NULL, 0);
 
-    // Store updated branch in ih_tree
+    // Store updated branch in ih_tree (child_depths already +1 encoded)
     ih_store(ih, path, branch_depth, new_bitmap, &branch_ref, new_child_depths);
 
     // Wrap with extension if needed
     if (branch_depth > depth) {
         node_ref_t ext_ref = hash_extension(
             path + depth, branch_depth - depth, &branch_ref);
-        subtree_result_t r = {ext_ref, branch_depth};
+        subtree_result_t r = {ext_ref, branch_depth + 1};
         return r;
     }
 
-    subtree_result_t r = {branch_ref, branch_depth};
+    subtree_result_t r = {branch_ref, branch_depth + 1};
     return r;
 }
 
@@ -1035,7 +1135,9 @@ hash_t ih_root(const ih_state_t *ih) {
     return ih->root;
 }
 
+
 size_t ih_entry_count(const ih_state_t *ih) {
     if (!ih || !ih->initialized) return 0;
     return compact_art_size(&ih->tree);
 }
+

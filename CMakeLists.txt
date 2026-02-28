@@ -158,6 +158,12 @@ add_executable(test_scale_data_layer
 )
 target_link_libraries(test_scale_data_layer data_layer)
 
+# Benchmark: MPT commitment (state root computation at scale)
+add_executable(bench_mpt
+    database/tests/bench_mpt.c
+)
+target_link_libraries(bench_mpt data_layer intermediate_hashes common)
+
 # Test: State DB (account state + contract storage + checkpoint)
 add_executable(test_state_db
     database/tests/test_state_db.c

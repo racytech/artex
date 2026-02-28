@@ -312,6 +312,208 @@ data_layer_t *dl_open(const char *state_path, const char *code_path,
 }
 
 // ============================================================================
+// Cursor (ih_cursor_t adapter over compact_art + state_store)
+// ============================================================================
+
+struct dl_cursor {
+    compact_art_iterator_t *iter;
+    state_store_t *store;
+    uint32_t key_size;
+    uint8_t value_buf[STATE_STORE_MAX_VALUE];
+    uint16_t value_len;
+    bool has_value;
+    bool seek_pending;  // after seek, first next() must skip the seek leaf
+};
+
+// Load value from current iterator position into cursor buffer.
+static bool dl_cursor_load_value(dl_cursor_t *cur) {
+    cur->has_value = false;
+    const void *ref_ptr = compact_art_iterator_value(cur->iter);
+    if (!ref_ptr) return false;
+
+    uint32_t slot;
+    memcpy(&slot, ref_ptr, 4);
+    if (slot & CODE_REF_BIT) return false;  // skip code refs
+
+    if (!state_store_read(cur->store, slot, cur->value_buf, &cur->value_len))
+        return false;
+
+    cur->has_value = true;
+    return true;
+}
+
+static bool dl_cursor_seek_fn(void *ctx, const uint8_t *key, size_t key_len) {
+    dl_cursor_t *cur = ctx;
+    (void)key_len;
+    if (!compact_art_iterator_seek(cur->iter, key))
+        return false;
+    // compact_art_iterator_seek positions at the entry and sets internal
+    // key/value, but the entry is still on the iterator stack. The first
+    // compact_art_iterator_next() call will re-read this same entry (popping
+    // the leaf) rather than advancing. We mark seek_pending so that our
+    // next_fn consumes this leaf before actually advancing.
+    dl_cursor_load_value(cur);
+    cur->seek_pending = true;
+    return true;
+}
+
+static bool dl_cursor_next_fn(void *ctx) {
+    dl_cursor_t *cur = ctx;
+    if (cur->seek_pending) {
+        // Consume the seek leaf from the iterator stack (re-reads same entry)
+        compact_art_iterator_next(cur->iter);
+        cur->seek_pending = false;
+    }
+    if (!compact_art_iterator_next(cur->iter))
+        return false;
+    dl_cursor_load_value(cur);
+    return true;
+}
+
+static bool dl_cursor_valid_fn(void *ctx) {
+    dl_cursor_t *cur = ctx;
+    return !compact_art_iterator_done(cur->iter);
+}
+
+static const uint8_t *dl_cursor_key_fn(void *ctx, size_t *out_len) {
+    dl_cursor_t *cur = ctx;
+    if (compact_art_iterator_done(cur->iter)) return NULL;
+    *out_len = cur->key_size;
+    return compact_art_iterator_key(cur->iter);
+}
+
+static const uint8_t *dl_cursor_value_fn(void *ctx, size_t *out_len) {
+    dl_cursor_t *cur = ctx;
+    if (!cur->has_value) {
+        *out_len = 0;
+        return NULL;
+    }
+    *out_len = cur->value_len;
+    return cur->value_buf;
+}
+
+dl_cursor_t *dl_cursor_create(data_layer_t *dl) {
+    if (!dl) return NULL;
+    dl_cursor_t *cur = malloc(sizeof(dl_cursor_t));
+    if (!cur) return NULL;
+    memset(cur, 0, sizeof(*cur));
+
+    cur->iter = compact_art_iterator_create(&dl->index);
+    if (!cur->iter) {
+        free(cur);
+        return NULL;
+    }
+    cur->store = dl->store;
+    cur->key_size = dl->key_size;
+    return cur;
+}
+
+void dl_cursor_destroy(dl_cursor_t *cursor) {
+    if (!cursor) return;
+    compact_art_iterator_destroy(cursor->iter);
+    free(cursor);
+}
+
+ih_cursor_t dl_cursor_as_ih(dl_cursor_t *cursor) {
+    ih_cursor_t c;
+    c.ctx = cursor;
+    c.seek = dl_cursor_seek_fn;
+    c.next = dl_cursor_next_fn;
+    c.valid = dl_cursor_valid_fn;
+    c.key = dl_cursor_key_fn;
+    c.value = dl_cursor_value_fn;
+    return c;
+}
+
+// ============================================================================
+// Dirty Key Extraction (pre-merge)
+// ============================================================================
+
+bool dl_extract_dirty(data_layer_t *dl, dl_dirty_set_t *out) {
+    if (!dl || !out) return false;
+    memset(out, 0, sizeof(*out));
+
+    size_t buf_size = mem_art_size(&dl->buffer);
+    if (buf_size == 0) return false;
+
+    // Allocate arrays
+    out->keys = malloc(buf_size * sizeof(uint8_t *));
+    out->values = malloc(buf_size * sizeof(uint8_t *));
+    out->value_lens = malloc(buf_size * sizeof(size_t));
+    if (!out->keys || !out->values || !out->value_lens) {
+        free(out->keys); free(out->values); free(out->value_lens);
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+
+    mem_art_iterator_t *iter = mem_art_iterator_create(&dl->buffer);
+    if (!iter) {
+        free(out->keys); free(out->values); free(out->value_lens);
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+
+    size_t count = 0;
+    while (mem_art_iterator_next(iter)) {
+        size_t klen = 0, vlen = 0;
+        const uint8_t *key = mem_art_iterator_key(iter, &klen);
+        const void *val = mem_art_iterator_value(iter, &vlen);
+        if (!key || !val || klen != dl->key_size || vlen < 1) continue;
+
+        uint8_t flag = *(const uint8_t *)val;
+
+        // Copy key
+        uint8_t *kcopy = malloc(dl->key_size);
+        if (!kcopy) goto fail;
+        memcpy(kcopy, key, dl->key_size);
+        out->keys[count] = kcopy;
+
+        if (flag == BUF_FLAG_TOMBSTONE) {
+            out->values[count] = NULL;
+            out->value_lens[count] = 0;
+        } else if (flag == BUF_FLAG_WRITE && vlen > 1) {
+            size_t data_len = vlen - 1;
+            uint8_t *vcopy = malloc(data_len);
+            if (!vcopy) { free(kcopy); goto fail; }
+            memcpy(vcopy, (const uint8_t *)val + 1, data_len);
+            out->values[count] = vcopy;
+            out->value_lens[count] = data_len;
+        } else {
+            free(kcopy);
+            continue;  // skip invalid entries
+        }
+        count++;
+    }
+
+    mem_art_iterator_destroy(iter);
+    out->count = count;
+    return count > 0;
+
+fail:
+    mem_art_iterator_destroy(iter);
+    // Free everything allocated so far
+    for (size_t i = 0; i < count; i++) {
+        free(out->keys[i]);
+        free(out->values[i]);
+    }
+    free(out->keys); free(out->values); free(out->value_lens);
+    memset(out, 0, sizeof(*out));
+    return false;
+}
+
+void dl_dirty_set_free(dl_dirty_set_t *ds) {
+    if (!ds) return;
+    for (size_t i = 0; i < ds->count; i++) {
+        free(ds->keys[i]);
+        free(ds->values[i]);
+    }
+    free(ds->keys);
+    free(ds->values);
+    free(ds->value_lens);
+    memset(ds, 0, sizeof(*ds));
+}
+
+// ============================================================================
 // Diagnostics
 // ============================================================================
 

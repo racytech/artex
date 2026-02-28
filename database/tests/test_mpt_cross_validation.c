@@ -371,21 +371,41 @@ int main(void) {
                 .value = mock_value,
             };
 
-            // Step 3: Build dirty key arrays
+            // Step 3: Build dirty key arrays and sort by key
+            //         (ih_update requires dirty keys in sorted ascending order)
+            typedef struct { const uint8_t *key; const uint8_t *val; size_t vlen; } dk_entry_t;
+            dk_entry_t *dk_entries = malloc(num_dirty * sizeof(dk_entry_t));
+            for (uint32_t d = 0; d < num_dirty; d++) {
+                dk_entries[d].key = dirty_keys + d * 32;
+                dk_entries[d].val = dirty_val_buf + dirty_val_offsets[d];
+                dk_entries[d].vlen = dirty_vlens[d];
+            }
+            // Sort dirty entries by key
+            for (uint32_t i = 1; i < num_dirty; i++) {
+                dk_entry_t tmp = dk_entries[i];
+                uint32_t j = i;
+                while (j > 0 && memcmp(dk_entries[j-1].key, tmp.key, 32) > 0) {
+                    dk_entries[j] = dk_entries[j-1];
+                    j--;
+                }
+                dk_entries[j] = tmp;
+            }
             const uint8_t **dk_ptrs = malloc(num_dirty * sizeof(uint8_t *));
             const uint8_t **dv_ptrs = malloc(num_dirty * sizeof(uint8_t *));
+            size_t *sorted_dirty_vlens = malloc(num_dirty * sizeof(size_t));
             for (uint32_t d = 0; d < num_dirty; d++) {
-                dk_ptrs[d] = dirty_keys + d * 32;
-                dv_ptrs[d] = dirty_val_buf + dirty_val_offsets[d];
+                dk_ptrs[d] = dk_entries[d].key;
+                dv_ptrs[d] = dk_entries[d].val;
+                sorted_dirty_vlens[d] = dk_entries[d].vlen;
             }
+            free(dk_entries);
 
             // Step 4: ih_update
             hash_t update_root = ih_update(ih, dk_ptrs, dv_ptrs,
-                                           dirty_vlens, num_dirty, &cursor);
+                                           sorted_dirty_vlens, num_dirty, &cursor);
 
             print_hash("expected", &expected_after);
             print_hash("got     ", &update_root);
-            ASSERT(hash_equal(&update_root, &expected_after));
 
             // Step 5: Also verify ih_build on merged gives same result
             ih_state_t *ih2 = ih_create();
@@ -395,12 +415,15 @@ int main(void) {
 
             hash_t rebuild_root = ih_build(ih2, cursor_keys, cursor_vals,
                                            merged_vlens16, merged_count);
+
+            ASSERT(hash_equal(&update_root, &expected_after));
             ASSERT(hash_equal(&rebuild_root, &expected_after));
 
             // Cleanup
             free(merged_vlens16);
             free(dk_ptrs);
             free(dv_ptrs);
+            free(sorted_dirty_vlens);
             free(cursor_keys);
             free(cursor_vals);
             free(cursor_vlens);
