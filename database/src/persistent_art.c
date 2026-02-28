@@ -605,7 +605,7 @@ static part_ref_t do_path_collapse(persistent_art_t *tree, const void *parent,
         uint8_t *cp = node_partial_mut(child_node);
         size_t store = (size_t)new_plen < PART_MAX_PREFIX
                        ? (size_t)new_plen : PART_MAX_PREFIX;
-        memcpy(cp, lk + depth, store);
+        memcpy(cp, lk + depth - parent_plen, store);
         ((uint8_t *)child_node)[2] = (uint8_t)new_plen;
     }
 

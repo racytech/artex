@@ -327,7 +327,7 @@ static bart_ref_t do_path_collapse(bitmap_art_t *tree,
         const uint8_t *lk = leaf_key(tree, min_leaf);
         size_t store = (size_t)new_plen < BART_MAX_PREFIX
                        ? (size_t)new_plen : BART_MAX_PREFIX;
-        memcpy(cn->partial, lk + depth, store);
+        memcpy(cn->partial, lk + depth - parent_plen, store);
         cn->partial_len = (uint8_t)new_plen;
     }
 
@@ -1055,10 +1055,8 @@ static bool descend_to_min_leaf(const bitmap_art_t *tree,
                                  bart_ref_t ref) {
     while (ref != BART_REF_NULL) {
         if (BART_IS_LEAF_REF(ref)) {
-            s->depth++;
-            if (s->depth >= 64) { s->done = true; return false; }
-            s->stack[s->depth].ref = ref;
-            s->stack[s->depth].child_idx = -1;
+            // Don't push leaf — just set key/value.
+            // Stack stays at parent so next() advances past this leaf.
             s->key = leaf_key(tree, ref);
             s->value = leaf_value(tree, ref);
             return true;
@@ -1100,10 +1098,8 @@ bool bart_iterator_seek(bart_iterator_t *iter, const uint8_t *key) {
         if (BART_IS_LEAF_REF(ref)) {
             const uint8_t *lk = leaf_key(tree, ref);
             if (memcmp(lk, key, tree->key_size) >= 0) {
-                s->depth++;
-                if (s->depth >= 64) { s->done = true; return false; }
-                s->stack[s->depth].ref = ref;
-                s->stack[s->depth].child_idx = -1;
+                // Don't push leaf — just set key/value.
+                // Stack stays at parent so next() advances past this leaf.
                 s->key = lk;
                 s->value = leaf_value(tree, ref);
                 return true;

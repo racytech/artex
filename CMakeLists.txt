@@ -232,6 +232,12 @@ add_executable(test_bitmap_art
 target_link_libraries(test_bitmap_art bitmap_art)
 add_test(NAME test_bitmap_art COMMAND test_bitmap_art)
 
+# Stress Test: Bitmap ART (fail-fast correctness)
+add_executable(test_stress_bitmap_art
+    database/tests/test_stress_bitmap_art.c
+)
+target_link_libraries(test_stress_bitmap_art bitmap_art)
+
 #==============================================================================
 # Build Summary
 #==============================================================================
