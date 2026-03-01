@@ -113,7 +113,7 @@ static void make_val(uint8_t *val, uint32_t i) {
 
 static int test_sequential_50k(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     const int N = 50000;
     uint8_t key[32], val[32];
@@ -155,7 +155,7 @@ static int test_sequential_50k(void) {
 
 static int test_random_keys_20k(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     const int N = 20000;
     rng_seed(0xDEADBEEF);
@@ -193,7 +193,7 @@ static int test_random_keys_20k(void) {
 
 static int test_dense_prefix_10k(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     const int N = 10000;
     uint8_t key[32], val[32];
@@ -229,7 +229,7 @@ static int test_dense_prefix_10k(void) {
 
 static int test_full_fanout_16(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     uint8_t key[32], val[32];
 
@@ -269,7 +269,7 @@ static int test_full_fanout_16(void) {
 
 static int test_multi_fanout_256(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     uint8_t key[32], val[32];
 
@@ -305,7 +305,7 @@ static int test_multi_fanout_256(void) {
 
 static int test_random_ops_50k(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     rng_seed(0x12345678);
     const int N = 50000;
@@ -354,7 +354,7 @@ static int test_random_ops_50k(void) {
 
 static int test_iterator_order(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     rng_seed(0xCAFEBABE);
     const int N = 5000;
@@ -412,7 +412,7 @@ static int test_commit_reopen_large(void) {
 
     {
         nibble_trie_t t;
-        ASSERT(nt_open(&t, TEST_PATH), "open");
+        ASSERT(nt_open(&t, TEST_PATH, 32), "open");
         for (int i = 0; i < N; i++) {
             key_sequential(key, i);
             make_val(val, i);
@@ -424,7 +424,7 @@ static int test_commit_reopen_large(void) {
 
     {
         nibble_trie_t t;
-        ASSERT(nt_open(&t, TEST_PATH), "reopen");
+        ASSERT(nt_open(&t, TEST_PATH, 32), "reopen");
         ASSERT(nt_size(&t) == (size_t)N, "size=%zu", nt_size(&t));
 
         for (int i = 0; i < N; i++) {
@@ -446,7 +446,7 @@ static int test_commit_reopen_large(void) {
 
 static int test_multi_commit_cycles(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     uint8_t key[32], val[32];
     const int BATCH = 1000;
@@ -466,7 +466,7 @@ static int test_multi_commit_cycles(void) {
     nt_close(&t);
 
     /* Reopen and verify all */
-    ASSERT(nt_open(&t, TEST_PATH), "reopen");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "reopen");
     ASSERT(nt_size(&t) == (size_t)(CYCLES * BATCH), "size after reopen");
 
     for (int i = 0; i < CYCLES * BATCH; i++) {
@@ -487,7 +487,7 @@ static int test_multi_commit_cycles(void) {
 
 static int test_rollback_stress(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     uint8_t key[32], val[32];
 
@@ -529,7 +529,7 @@ static int test_rollback_stress(void) {
 
 static int test_mass_update(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     const int N = 5000;
     uint8_t key[32], val[32];
@@ -568,7 +568,7 @@ static int test_mass_update(void) {
 
 static int test_seek_stress(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     /* Insert every 10th key */
     uint8_t key[32], val[32];
@@ -603,7 +603,7 @@ static int test_seek_stress(void) {
 
 static int test_delete_all_reinsert(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     const int N = 5000;
     uint8_t key[32], val[32];
@@ -650,7 +650,7 @@ static int test_delete_all_reinsert(void) {
 
 static int test_reverse_insert_forward_delete(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     const int N = 10000;
     uint8_t key[32], val[32];
@@ -686,7 +686,7 @@ static int test_reverse_insert_forward_delete(void) {
 
 static int test_seek_then_walk(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     uint8_t key[32], val[32];
 
@@ -732,7 +732,7 @@ static int test_seek_then_walk(void) {
 
 static int test_last_byte_diff(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     uint8_t key[32], val[32];
 
@@ -764,7 +764,7 @@ static int test_last_byte_diff(void) {
 
 static int test_first_byte_diff(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     uint8_t key[32], val[32];
 
@@ -796,7 +796,7 @@ static int test_first_byte_diff(void) {
 
 static int test_commit_uncommitted_interleave(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     uint8_t key[32], val[32];
 
@@ -823,7 +823,7 @@ static int test_commit_uncommitted_interleave(void) {
     nt_close(&t);
 
     /* Reopen: should see committed state (500 keys) */
-    ASSERT(nt_open(&t, TEST_PATH), "reopen");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "reopen");
     ASSERT(nt_size(&t) == 500, "committed size=%zu", nt_size(&t));
 
     for (int i = 0; i < 500; i++) {
@@ -845,7 +845,7 @@ static int test_commit_uncommitted_interleave(void) {
 
 static int test_large_200k(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     const int N = 200000;
     uint8_t key[32], val[32];
@@ -889,7 +889,7 @@ static int test_large_200k(void) {
 
 static int test_iterator_size_consistency(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     rng_seed(0xBEEFCAFE);
     uint8_t key[32], val[32];
@@ -931,7 +931,7 @@ static int test_iterator_size_consistency(void) {
 
 static int test_nibble_boundary(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     uint8_t base[32], key[32], val[32];
     memset(base, 0x77, 32);
@@ -991,7 +991,7 @@ static int test_nibble_boundary(void) {
 
 static int test_extension_merge_chain(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     uint8_t key_a[32], key_b[32], key_c[32];
     uint8_t val[32];
@@ -1038,7 +1038,7 @@ static int test_extension_merge_chain(void) {
 
 static int test_alternating_insert_delete(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH), "open");
+    ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
     const int N = 20000;
     uint8_t key[32], val[32];
@@ -1089,7 +1089,7 @@ static int test_commit_delete_commit_reopen(void) {
 
     {
         nibble_trie_t t;
-        ASSERT(nt_open(&t, TEST_PATH), "open");
+        ASSERT(nt_open(&t, TEST_PATH, 32), "open");
 
         for (int i = 0; i < N; i++) {
             key_sequential(key, i);
@@ -1109,7 +1109,7 @@ static int test_commit_delete_commit_reopen(void) {
 
     {
         nibble_trie_t t;
-        ASSERT(nt_open(&t, TEST_PATH), "reopen");
+        ASSERT(nt_open(&t, TEST_PATH, 32), "reopen");
         ASSERT(nt_size(&t) == (size_t)(N / 2), "size=%zu", nt_size(&t));
 
         for (int i = 0; i < N / 2; i++) {

@@ -125,7 +125,7 @@ static void bench_nt(uint64_t target) {
 
     unlink(NT_PATH);
     nibble_trie_t t;
-    if (!nt_open(&t, NT_PATH)) {
+    if (!nt_open(&t, NT_PATH, VALUE_SIZE)) {
         printf("  FAILED to open\n");
         return;
     }
@@ -223,7 +223,7 @@ static void bench_nt(uint64_t target) {
     /* --- REOPEN --- */
     nt_close(&t);
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    nt_open(&t, NT_PATH);
+    nt_open(&t, NT_PATH, VALUE_SIZE);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double reopen_ms = elapsed_ms(&t0, &t1);
     printf("  Reopen:              %.1f ms (size=%" PRIu64 ")\n",
