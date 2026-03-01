@@ -149,6 +149,13 @@ static size_t get_file_size_path(const char *path) {
     return (size_t)st.st_size;
 }
 
+/* Actual disk usage for sparse files (st_blocks * 512) */
+static size_t get_file_disk_usage(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return (size_t)st.st_blocks * 512;
+}
+
 // ============================================================================
 // Bitset — 1 bit per key_id for tracking live keys
 // ============================================================================
@@ -236,6 +243,7 @@ typedef struct {
     uint64_t total_code_deploys;
     double   total_merge_time;
     double   total_checkpoint_time;
+    uint64_t total_checkpoints;
     uint64_t last_checkpoint_block;
     bitset_t state_live;
     // Per-block value lengths — track last written length per key for verification
@@ -345,8 +353,16 @@ static void run_block(data_layer_t *dl, sim_state_t *sim, uint64_t block_num) {
     sim->total_merge_time += (t1 - t0);
     sim->total_blocks++;
 
-    // Checkpoint disabled during block loop — blocks are the WAL.
-    // A single checkpoint is written at the end for recovery verification.
+    // --- Checkpoint every CHECKPOINT_INTERVAL blocks ---
+    if (sim->total_blocks % CHECKPOINT_INTERVAL == 0) {
+        double tc0 = now_sec();
+        bool ok = dl_checkpoint(dl, META_PATH, sim->total_blocks);
+        double tc1 = now_sec();
+        ASSERT_MSG(ok, "checkpoint failed at block %" PRIu64, sim->total_blocks);
+        sim->total_checkpoint_time += (tc1 - tc0);
+        sim->total_checkpoints++;
+        sim->last_checkpoint_block = sim->total_blocks;
+    }
 }
 
 // ============================================================================
@@ -367,7 +383,8 @@ int main(int argc, char *argv[]) {
     printf("============================================\n");
     printf("  target:     %" PRIu64 "M keys\n", target_millions);
     printf("  ops/block:  %d-%d (70/20/10 ins/upd/del)\n", OPS_MIN, OPS_MAX);
-    printf("  checkpoint: disabled (final only)\n");
+    printf("  checkpoint: every %d blocks (nibble_trie + meta sidecar)\n",
+           CHECKPOINT_INTERVAL);
     printf("  code:       1-10 deploys/block (%d-%d bytes)\n",
            CODE_SIZE_MIN, CODE_SIZE_MAX);
     printf("  seed:       0x%016" PRIx64 "\n", (uint64_t)MASTER_SEED);
@@ -411,18 +428,21 @@ int main(int argc, char *argv[]) {
             dl_stats_t st = dl_stats(dl);
             size_t state_mb = get_file_size_path(STATE_PATH) / (1024 * 1024);
             size_t code_mb = get_file_size_path(CODE_PATH) / (1024 * 1024);
+            size_t trie_mb = get_file_disk_usage(TRIE_PATH) / (1024 * 1024);
 
             double avg_merge_ms = (sim.total_merge_time / sim.total_blocks) * 1000.0;
+            double avg_ckpt_ms = sim.total_checkpoints > 0
+                ? (sim.total_checkpoint_time / sim.total_checkpoints) * 1000.0 : 0;
             double throughput = sim.next_state_id / total_elapsed / 1000.0;
 
             printf("block %5" PRIu64 " | index %6.2fM | "
-                   "merge %5.1fms | "
-                   "state %4zuMB | code %4zuMB | RSS %4zuMB | "
+                   "merge %5.1fms | ckpt %5.1fms | "
+                   "state %4zuMB | trie %4zuMB | code %4zuMB | RSS %4zuMB | "
                    "%6.0fK k/s\n",
                    sim.total_blocks,
                    st.index_keys / 1e6,
-                   avg_merge_ms,
-                   state_mb, code_mb, get_rss_mb(),
+                   avg_merge_ms, avg_ckpt_ms,
+                   state_mb, trie_mb, code_mb, get_rss_mb(),
                    throughput);
             fflush(stdout);
         }
@@ -431,6 +451,11 @@ int main(int argc, char *argv[]) {
     double block_elapsed = now_sec() - t_start;
 
     dl_stats_t final_stats = dl_stats(dl);
+    size_t final_state_mb = get_file_size_path(STATE_PATH) / (1024 * 1024);
+    size_t final_trie_mb = get_file_disk_usage(TRIE_PATH) / (1024 * 1024);
+    size_t final_code_mb = get_file_size_path(CODE_PATH) / (1024 * 1024);
+    size_t final_meta_kb = get_file_size_path(META_PATH) / 1024;
+
     printf("\n--- Block Phase Complete ---\n");
     printf("  blocks:       %" PRIu64 "\n", sim.total_blocks);
     printf("  inserts:      %" PRIu64 "\n", sim.total_inserts);
@@ -443,6 +468,15 @@ int main(int argc, char *argv[]) {
     printf("  free slots:   %u\n", final_stats.free_slots);
     printf("  avg merge:    %.2fms\n",
            (sim.total_merge_time / sim.total_blocks) * 1000.0);
+    printf("  checkpoints:  %" PRIu64 "\n", sim.total_checkpoints);
+    printf("  avg ckpt:     %.2fms\n",
+           sim.total_checkpoints > 0
+               ? (sim.total_checkpoint_time / sim.total_checkpoints) * 1000.0
+               : 0.0);
+    printf("  state.dat:    %zuMB\n", final_state_mb);
+    printf("  trie.dat:     %zuMB\n", final_trie_mb);
+    printf("  code.dat:     %zuMB\n", final_code_mb);
+    printf("  meta.dat:     %zuKB\n", final_meta_kb);
     printf("  time:         %.1fs\n", block_elapsed);
     printf("  throughput:   %.0fK keys/s\n",
            sim.next_state_id / block_elapsed / 1000.0);
@@ -493,12 +527,14 @@ int main(int argc, char *argv[]) {
                "code_count mismatch: got %u expected %u",
                recovered_stats.code_count, ckpt_code_count);
 
-    printf("  dl_open:        %.3fs\n", t_recover_end - t_recover_start);
+    printf("  dl_open:        %.3fs (rebuild compact_art from nibble_trie)\n",
+           t_recover_end - t_recover_start);
     printf("  recovered blk:  %" PRIu64 "\n", recovered_block);
     printf("  index_keys:     %" PRIu64 " (expected %" PRIu64 ")\n",
            recovered_stats.index_keys, ckpt_index_keys);
     printf("  code_count:     %u (expected %u)\n",
            recovered_stats.code_count, ckpt_code_count);
+    printf("  free_slots:     %u\n", recovered_stats.free_slots);
     printf("  checkpoint recovery: OK\n\n");
 
     // ========================================================================
