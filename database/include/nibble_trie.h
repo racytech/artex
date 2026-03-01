@@ -52,8 +52,9 @@ struct nibble_trie {
     uint8_t  *node_base;            /* mmap'd node pool (branches + extensions, 64B slots) */
     uint8_t  *leaf_base;            /* mmap'd leaf pool (key + value, variable slot size) */
 
+    uint32_t  key_size;             /* key size in bytes (set at open, e.g. 32 or 64) */
     uint32_t  value_size;           /* value size in bytes (set at open) */
-    uint32_t  leaf_slot_size;       /* NT_KEY_SIZE + value_size, 8-byte aligned */
+    uint32_t  leaf_slot_size;       /* key_size + value_size, 8-byte aligned */
 
     nt_ref_t  root;
     uint64_t  size;                 /* number of key-value pairs */
@@ -74,7 +75,7 @@ struct nibble_trie {
  * Lifecycle
  * ======================================================================== */
 
-bool nt_open(nibble_trie_t *t, const char *path, uint32_t value_size);
+bool nt_open(nibble_trie_t *t, const char *path, uint32_t key_size, uint32_t value_size);
 void nt_close(nibble_trie_t *t);
 
 /* ========================================================================
