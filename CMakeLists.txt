@@ -53,7 +53,7 @@ add_library(data_layer STATIC
     database/src/checkpoint.c
     database/src/data_layer.c
 )
-target_link_libraries(data_layer compact_art art_database)
+target_link_libraries(data_layer nibble_trie art_database)
 
 # State DB (account state + contract storage — dual data_layer wrapper)
 add_library(state_db STATIC

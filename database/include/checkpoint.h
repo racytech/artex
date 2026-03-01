@@ -5,12 +5,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#include "compact_art.h"
+#include "nibble_trie.h"
 #include "state_store.h"
 #include "code_store.h"
 
 /**
- * Checkpoint — Serialize/restore compact_art index + state_store free list
+ * Checkpoint — Serialize/restore nibble_trie index + state_store free list
  * + code_store entries to/from a single index.dat file.
  *
  * Format:
@@ -33,7 +33,7 @@ typedef struct __attribute__((packed)) {
     char     magic[8];          // "ARTIDX01"
     uint32_t version;           // 1
     uint64_t block_number;
-    uint64_t num_entries;       // compact_art size
+    uint64_t num_entries;       // nibble_trie size
     uint32_t key_size;          // 32
     uint32_t value_size;        // 4
     uint32_t next_slot;         // state_store allocator position
@@ -55,21 +55,21 @@ uint32_t crc32_update(uint32_t crc, const void *data, size_t len);
 // ============================================================================
 
 /**
- * Write checkpoint: iterate compact_art, serialize to temp file, atomic rename.
+ * Write checkpoint: iterate nibble_trie, serialize to temp file, atomic rename.
  * code may be NULL if code store is not configured.
  */
 bool checkpoint_write(const char *path, uint64_t block_number,
-                      const compact_art_t *index,
+                      const nibble_trie_t *index,
                       const state_store_t *store,
                       const code_store_t *code);
 
 /**
- * Load checkpoint: rebuild compact_art, restore free list + code entries.
+ * Load checkpoint: rebuild nibble_trie, restore free list + code entries.
  * code may be NULL if code store is not configured.
  * Returns false on failure (bad magic, CRC mismatch, I/O error).
  */
 bool checkpoint_load(const char *path, uint64_t *out_block_number,
-                     compact_art_t *index,
+                     nibble_trie_t *index,
                      state_store_t *store,
                      code_store_t *code);
 

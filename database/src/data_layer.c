@@ -1,7 +1,7 @@
 #include "../include/data_layer.h"
 #include "../include/state_store.h"
 #include "../include/code_store.h"
-#include "../include/compact_art.h"
+#include "../include/nibble_trie.h"
 #include "../include/mem_art.h"
 #include "../include/checkpoint.h"
 
@@ -21,7 +21,7 @@
 // ============================================================================
 
 struct data_layer {
-    compact_art_t index;
+    nibble_trie_t index;
     state_store_t *store;
     code_store_t *code;
     mem_art_t buffer;
@@ -40,14 +40,14 @@ data_layer_t *dl_create(const char *state_path, const char *code_path,
     memset(dl, 0, sizeof(*dl));
     dl->key_size = key_size;
 
-    if (!compact_art_init(&dl->index, key_size, value_size)) {
+    if (!nt_init(&dl->index, key_size, value_size)) {
         free(dl);
         return NULL;
     }
 
     dl->store = state_store_create(state_path);
     if (!dl->store) {
-        compact_art_destroy(&dl->index);
+        nt_destroy(&dl->index);
         free(dl);
         return NULL;
     }
@@ -55,7 +55,7 @@ data_layer_t *dl_create(const char *state_path, const char *code_path,
     if (code_path) {
         dl->code = code_store_create(code_path);
         if (!dl->code) {
-            compact_art_destroy(&dl->index);
+            nt_destroy(&dl->index);
             state_store_destroy(dl->store);
             free(dl);
             return NULL;
@@ -63,7 +63,7 @@ data_layer_t *dl_create(const char *state_path, const char *code_path,
     }
 
     if (!mem_art_init(&dl->buffer)) {
-        compact_art_destroy(&dl->index);
+        nt_destroy(&dl->index);
         state_store_destroy(dl->store);
         if (dl->code) code_store_destroy(dl->code);
         free(dl);
@@ -75,7 +75,7 @@ data_layer_t *dl_create(const char *state_path, const char *code_path,
 
 void dl_destroy(data_layer_t *dl) {
     if (!dl) return;
-    compact_art_destroy(&dl->index);
+    nt_destroy(&dl->index);
     state_store_destroy(dl->store);
     if (dl->code) code_store_destroy(dl->code);
     mem_art_destroy(&dl->buffer);
@@ -117,7 +117,7 @@ bool dl_get(data_layer_t *dl, const uint8_t *key,
     }
 
     // 2. Check index → disk
-    const void *ref = compact_art_get(&dl->index, key);
+    const void *ref = nt_get(&dl->index, key);
     if (!ref) return false;
 
     uint32_t slot;
@@ -145,7 +145,7 @@ uint64_t dl_merge(data_layer_t *dl) {
         uint8_t flag = *(const uint8_t *)val;
 
         if (flag == BUF_FLAG_TOMBSTONE) {
-            const void *ref = compact_art_get(&dl->index, key);
+            const void *ref = nt_get(&dl->index, key);
             if (ref) {
                 uint32_t slot;
                 memcpy(&slot, ref, 4);
@@ -153,13 +153,13 @@ uint64_t dl_merge(data_layer_t *dl) {
                     // Only free state_store slots, not code entries
                     state_store_free(dl->store, slot);
                 }
-                compact_art_delete(&dl->index, key);
+                nt_delete(&dl->index, key);
             }
         } else if (flag == BUF_FLAG_WRITE && vlen > 1) {
             const uint8_t *data = (const uint8_t *)val + 1;
             uint16_t data_len = (uint16_t)(vlen - 1);
 
-            const void *ref = compact_art_get(&dl->index, key);
+            const void *ref = nt_get(&dl->index, key);
             if (ref) {
                 // Update: rewrite same slot
                 uint32_t slot;
@@ -169,7 +169,7 @@ uint64_t dl_merge(data_layer_t *dl) {
                 // Insert: allocate new slot
                 uint32_t slot = state_store_alloc(dl->store);
                 state_store_write(dl->store, slot, data, data_len);
-                compact_art_insert(&dl->index, key, &slot);
+                nt_insert(&dl->index, key, &slot);
             }
         }
         count++;
@@ -199,7 +199,7 @@ bool dl_put_code(data_layer_t *dl, const uint8_t *key,
     if (!dl || !dl->code) return false;
 
     // Dedup: if key already in index, skip
-    const void *existing = compact_art_get(&dl->index, key);
+    const void *existing = nt_get(&dl->index, key);
     if (existing) return true;
 
     // Append to code.dat
@@ -208,14 +208,14 @@ bool dl_put_code(data_layer_t *dl, const uint8_t *key,
 
     // Insert into compact_art with bit 31 set
     uint32_t ref = index | CODE_REF_BIT;
-    return compact_art_insert(&dl->index, key, &ref);
+    return nt_insert(&dl->index, key, &ref);
 }
 
 bool dl_get_code(data_layer_t *dl, const uint8_t *key,
                  void *out, uint32_t *out_len) {
     if (!dl || !dl->code) return false;
 
-    const void *ref_ptr = compact_art_get(&dl->index, key);
+    const void *ref_ptr = nt_get(&dl->index, key);
     if (!ref_ptr) return false;
 
     uint32_t ref;
@@ -234,7 +234,7 @@ bool dl_get_code(data_layer_t *dl, const uint8_t *key,
 uint32_t dl_code_length(data_layer_t *dl, const uint8_t *key) {
     if (!dl || !dl->code) return 0;
 
-    const void *ref_ptr = compact_art_get(&dl->index, key);
+    const void *ref_ptr = nt_get(&dl->index, key);
     if (!ref_ptr) return 0;
 
     uint32_t ref;
@@ -269,14 +269,14 @@ data_layer_t *dl_open(const char *state_path, const char *code_path,
     memset(dl, 0, sizeof(*dl));
     dl->key_size = key_size;
 
-    if (!compact_art_init(&dl->index, key_size, value_size)) {
+    if (!nt_init(&dl->index, key_size, value_size)) {
         free(dl);
         return NULL;
     }
 
     dl->store = state_store_open(state_path);
     if (!dl->store) {
-        compact_art_destroy(&dl->index);
+        nt_destroy(&dl->index);
         free(dl);
         return NULL;
     }
@@ -284,7 +284,7 @@ data_layer_t *dl_open(const char *state_path, const char *code_path,
     if (code_path) {
         dl->code = code_store_open(code_path);
         if (!dl->code) {
-            compact_art_destroy(&dl->index);
+            nt_destroy(&dl->index);
             state_store_destroy(dl->store);
             free(dl);
             return NULL;
@@ -293,7 +293,7 @@ data_layer_t *dl_open(const char *state_path, const char *code_path,
 
     if (!checkpoint_load(index_path, out_block_number,
                          &dl->index, dl->store, dl->code)) {
-        compact_art_destroy(&dl->index);
+        nt_destroy(&dl->index);
         state_store_destroy(dl->store);
         if (dl->code) code_store_destroy(dl->code);
         free(dl);
@@ -301,7 +301,7 @@ data_layer_t *dl_open(const char *state_path, const char *code_path,
     }
 
     if (!mem_art_init(&dl->buffer)) {
-        compact_art_destroy(&dl->index);
+        nt_destroy(&dl->index);
         state_store_destroy(dl->store);
         if (dl->code) code_store_destroy(dl->code);
         free(dl);
@@ -312,23 +312,22 @@ data_layer_t *dl_open(const char *state_path, const char *code_path,
 }
 
 // ============================================================================
-// Cursor (ih_cursor_t adapter over compact_art + state_store)
+// Cursor (ih_cursor_t adapter over nibble_trie + state_store)
 // ============================================================================
 
 struct dl_cursor {
-    compact_art_iterator_t *iter;
+    nt_iterator_t *iter;
     state_store_t *store;
     uint32_t key_size;
     uint8_t value_buf[STATE_STORE_MAX_VALUE];
     uint16_t value_len;
     bool has_value;
-    bool seek_pending;  // after seek, first next() must skip the seek leaf
 };
 
 // Load value from current iterator position into cursor buffer.
 static bool dl_cursor_load_value(dl_cursor_t *cur) {
     cur->has_value = false;
-    const void *ref_ptr = compact_art_iterator_value(cur->iter);
+    const void *ref_ptr = nt_iterator_value(cur->iter);
     if (!ref_ptr) return false;
 
     uint32_t slot;
@@ -345,26 +344,15 @@ static bool dl_cursor_load_value(dl_cursor_t *cur) {
 static bool dl_cursor_seek_fn(void *ctx, const uint8_t *key, size_t key_len) {
     dl_cursor_t *cur = ctx;
     (void)key_len;
-    if (!compact_art_iterator_seek(cur->iter, key))
+    if (!nt_iterator_seek(cur->iter, key))
         return false;
-    // compact_art_iterator_seek positions at the entry and sets internal
-    // key/value, but the entry is still on the iterator stack. The first
-    // compact_art_iterator_next() call will re-read this same entry (popping
-    // the leaf) rather than advancing. We mark seek_pending so that our
-    // next_fn consumes this leaf before actually advancing.
     dl_cursor_load_value(cur);
-    cur->seek_pending = true;
     return true;
 }
 
 static bool dl_cursor_next_fn(void *ctx) {
     dl_cursor_t *cur = ctx;
-    if (cur->seek_pending) {
-        // Consume the seek leaf from the iterator stack (re-reads same entry)
-        compact_art_iterator_next(cur->iter);
-        cur->seek_pending = false;
-    }
-    if (!compact_art_iterator_next(cur->iter))
+    if (!nt_iterator_next(cur->iter))
         return false;
     dl_cursor_load_value(cur);
     return true;
@@ -372,14 +360,14 @@ static bool dl_cursor_next_fn(void *ctx) {
 
 static bool dl_cursor_valid_fn(void *ctx) {
     dl_cursor_t *cur = ctx;
-    return !compact_art_iterator_done(cur->iter);
+    return !nt_iterator_done(cur->iter);
 }
 
 static const uint8_t *dl_cursor_key_fn(void *ctx, size_t *out_len) {
     dl_cursor_t *cur = ctx;
-    if (compact_art_iterator_done(cur->iter)) return NULL;
+    if (nt_iterator_done(cur->iter)) return NULL;
     *out_len = cur->key_size;
-    return compact_art_iterator_key(cur->iter);
+    return nt_iterator_key(cur->iter);
 }
 
 static const uint8_t *dl_cursor_value_fn(void *ctx, size_t *out_len) {
@@ -398,7 +386,7 @@ dl_cursor_t *dl_cursor_create(data_layer_t *dl) {
     if (!cur) return NULL;
     memset(cur, 0, sizeof(*cur));
 
-    cur->iter = compact_art_iterator_create(&dl->index);
+    cur->iter = nt_iterator_create(&dl->index);
     if (!cur->iter) {
         free(cur);
         return NULL;
@@ -410,7 +398,7 @@ dl_cursor_t *dl_cursor_create(data_layer_t *dl) {
 
 void dl_cursor_destroy(dl_cursor_t *cursor) {
     if (!cursor) return;
-    compact_art_iterator_destroy(cursor->iter);
+    nt_iterator_destroy(cursor->iter);
     free(cursor);
 }
 
@@ -520,7 +508,7 @@ void dl_dirty_set_free(dl_dirty_set_t *ds) {
 dl_stats_t dl_stats(const data_layer_t *dl) {
     dl_stats_t s = {0};
     if (!dl) return s;
-    s.index_keys = compact_art_size(&dl->index);
+    s.index_keys = nt_size(&dl->index);
     s.buffer_entries = mem_art_size(&dl->buffer);
     s.total_merged = dl->total_merged;
     s.free_slots = state_store_free_count(dl->store);

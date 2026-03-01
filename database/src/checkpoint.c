@@ -82,7 +82,7 @@ static void bw_write(buffered_writer_t *bw, const void *data, size_t len) {
 // ============================================================================
 
 bool checkpoint_write(const char *path, uint64_t block_number,
-                      const compact_art_t *index,
+                      const nibble_trie_t *index,
                       const state_store_t *store,
                       const code_store_t *code) {
     if (!path || !index || !store) return false;
@@ -105,7 +105,7 @@ bool checkpoint_write(const char *path, uint64_t block_number,
     memcpy(hdr.magic, CHECKPOINT_MAGIC, 8);
     hdr.version = CHECKPOINT_VERSION;
     hdr.block_number = block_number;
-    hdr.num_entries = compact_art_size(index);
+    hdr.num_entries = nt_size(index);
     hdr.key_size = index->key_size;
     hdr.value_size = index->value_size;
     hdr.next_slot = state_store_next_slot(store);
@@ -125,7 +125,7 @@ bool checkpoint_write(const char *path, uint64_t block_number,
     bw_init(&bw, fd);
 
     // Write sorted key+ref pairs
-    compact_art_iterator_t *iter = compact_art_iterator_create(index);
+    nt_iterator_t *iter = nt_iterator_create(index);
     if (!iter) {
         close(fd);
         unlink(tmp_path);
@@ -133,13 +133,13 @@ bool checkpoint_write(const char *path, uint64_t block_number,
         return false;
     }
 
-    while (compact_art_iterator_next(iter)) {
-        const uint8_t *key = compact_art_iterator_key(iter);
-        const void *val = compact_art_iterator_value(iter);
+    while (nt_iterator_next(iter)) {
+        const uint8_t *key = nt_iterator_key(iter);
+        const void *val = nt_iterator_value(iter);
         bw_write(&bw, key, index->key_size);
         bw_write(&bw, val, index->value_size);
     }
-    compact_art_iterator_destroy(iter);
+    nt_iterator_destroy(iter);
 
     // Write free list
     const uint32_t *free_list = state_store_free_list_ptr(store);
@@ -200,7 +200,7 @@ bool checkpoint_write(const char *path, uint64_t block_number,
 #define READ_BUF_SIZE (64 * 1024)
 
 bool checkpoint_load(const char *path, uint64_t *out_block_number,
-                     compact_art_t *index,
+                     nibble_trie_t *index,
                      state_store_t *store,
                      code_store_t *code) {
     if (!path || !index || !store) return false;
@@ -227,7 +227,7 @@ bool checkpoint_load(const char *path, uint64_t *out_block_number,
     uint32_t entry_size = hdr.key_size + hdr.value_size;
     uint32_t crc = 0;
 
-    // Read entries in buffered chunks and insert into compact_art
+    // Read entries in buffered chunks and insert into nibble_trie
     uint8_t *read_buf = malloc(READ_BUF_SIZE);
     if (!read_buf) {
         close(fd);
@@ -252,7 +252,7 @@ bool checkpoint_load(const char *path, uint64_t *out_block_number,
         for (uint32_t i = 0; i < batch; i++) {
             const uint8_t *key = read_buf + (size_t)i * entry_size;
             const void *val = key + hdr.key_size;
-            compact_art_insert(index, key, val);
+            nt_insert(index, key, val);
         }
         entries_remaining -= batch;
     }

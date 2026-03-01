@@ -223,6 +223,189 @@ static void bench_rss(uint64_t target, int key_size) {
 }
 
 /* ========================================================================
+ * Index simulation: 4B values (slot refs), matches real data_layer
+ *
+ * Runs both nibble_trie and compact_art side-by-side with the actual
+ * value size used in production (uint32_t slot references).
+ * ======================================================================== */
+
+static void bench_index(uint64_t target_storage) {
+    struct timespec t0, t1;
+    rng_t rng = rng_create(0x494E44455856414CULL);  /* "INDEXVAL" */
+
+    uint64_t target_accounts = target_storage / 15;
+    if (target_accounts < 1000) target_accounts = 1000;
+
+    printf("\n============================================\n");
+    printf("  Index Simulation (4B values = slot refs)\n");
+    printf("============================================\n");
+    printf("  accounts: 32B keys, target ~%" PRIu64 "\n", target_accounts);
+    printf("  storage:  64B keys, target ~%" PRIu64 "\n", target_storage);
+    printf("  ops/block: ~200 account + ~3000 storage\n");
+    printf("  mix:       70%% ins / 20%% upd / 10%% del\n");
+    printf("============================================\n");
+
+    /* --- nibble_trie --- */
+    {
+        rng_t r = rng;  /* copy seed so both runs see same ops */
+        nibble_trie_t acct, stor;
+        if (!nt_init(&acct, 32, 4)) { printf("  FAIL nt acct\n"); return; }
+        if (!nt_init(&stor, 64, 4)) { printf("  FAIL nt stor\n"); return; }
+
+        uint8_t key64[64];
+        uint32_t slot_val = 0;
+        uint64_t acct_next = 0, stor_next = 0, block = 0;
+
+        uint64_t report = target_storage / 5;
+        if (report == 0) report = 1;
+        uint64_t next_report = report;
+
+        printf("\n  --- nibble_trie (4B val) ---\n");
+        printf("  %10s  %10s  %10s  %8s\n",
+               "acct keys", "stor keys", "total", "RSS MB");
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        while (nt_size(&stor) < target_storage) {
+            block++;
+            int acct_ops = 150 + (int)(rng_next(&r) % 100);
+            for (int i = 0; i < acct_ops; i++) {
+                int op = (int)(rng_next(&r) % 100);
+                if (op < 70 || nt_size(&acct) < 100) {
+                    generate_key(key64, 32, SEED, acct_next++);
+                    slot_val = (uint32_t)(rng_next(&r) & 0x7FFFFFFF);
+                    nt_insert(&acct, key64, &slot_val);
+                } else if (op < 90) {
+                    uint64_t idx = rng_next(&r) % acct_next;
+                    generate_key(key64, 32, SEED, idx);
+                    slot_val = (uint32_t)(rng_next(&r) & 0x7FFFFFFF);
+                    nt_insert(&acct, key64, &slot_val);
+                } else {
+                    uint64_t idx = rng_next(&r) % acct_next;
+                    generate_key(key64, 32, SEED, idx);
+                    nt_delete(&acct, key64);
+                }
+            }
+            int stor_ops = 2500 + (int)(rng_next(&r) % 1000);
+            for (int i = 0; i < stor_ops; i++) {
+                int op = (int)(rng_next(&r) % 100);
+                if (op < 70 || nt_size(&stor) < 1000) {
+                    generate_key(key64, 64, SEED, stor_next++);
+                    slot_val = (uint32_t)(rng_next(&r) & 0x7FFFFFFF);
+                    nt_insert(&stor, key64, &slot_val);
+                } else if (op < 90) {
+                    uint64_t idx = rng_next(&r) % stor_next;
+                    generate_key(key64, 64, SEED, idx);
+                    slot_val = (uint32_t)(rng_next(&r) & 0x7FFFFFFF);
+                    nt_insert(&stor, key64, &slot_val);
+                } else {
+                    uint64_t idx = rng_next(&r) % stor_next;
+                    generate_key(key64, 64, SEED, idx);
+                    nt_delete(&stor, key64);
+                }
+            }
+            uint64_t total = nt_size(&acct) + nt_size(&stor);
+            if (total >= next_report || nt_size(&stor) >= target_storage) {
+                printf("  %10" PRIu64 "  %10" PRIu64 "  %10" PRIu64 "  %8zu\n",
+                       (uint64_t)nt_size(&acct), (uint64_t)nt_size(&stor),
+                       total, get_rss_mb());
+                next_report += report;
+            }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint64_t total = nt_size(&acct) + nt_size(&stor);
+        size_t rss = get_rss_mb();
+        printf("\n  NT FINAL: %" PRIu64 " keys | %.1fs | RSS %zu MB | %zu B/key\n",
+               total, elapsed_ms(&t0, &t1) / 1e3, rss,
+               rss * 1024 * 1024 / total);
+
+        nt_destroy(&acct);
+        nt_destroy(&stor);
+    }
+
+    /* --- compact_art --- */
+    {
+        rng_t r = rng;  /* same seed */
+        compact_art_t acct, stor;
+        if (!compact_art_init(&acct, 32, 4)) { printf("  FAIL cart acct\n"); return; }
+        if (!compact_art_init(&stor, 64, 4)) { printf("  FAIL cart stor\n"); return; }
+
+        uint8_t key64[64];
+        uint32_t slot_val = 0;
+        uint64_t acct_next = 0, stor_next = 0, block = 0;
+
+        uint64_t report = target_storage / 5;
+        if (report == 0) report = 1;
+        uint64_t next_report = report;
+
+        printf("\n  --- compact_art (4B val) ---\n");
+        printf("  %10s  %10s  %10s  %8s\n",
+               "acct keys", "stor keys", "total", "RSS MB");
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        while (compact_art_size(&stor) < target_storage) {
+            block++;
+            int acct_ops = 150 + (int)(rng_next(&r) % 100);
+            for (int i = 0; i < acct_ops; i++) {
+                int op = (int)(rng_next(&r) % 100);
+                if (op < 70 || compact_art_size(&acct) < 100) {
+                    generate_key(key64, 32, SEED, acct_next++);
+                    slot_val = (uint32_t)(rng_next(&r) & 0x7FFFFFFF);
+                    compact_art_insert(&acct, key64, &slot_val);
+                } else if (op < 90) {
+                    uint64_t idx = rng_next(&r) % acct_next;
+                    generate_key(key64, 32, SEED, idx);
+                    slot_val = (uint32_t)(rng_next(&r) & 0x7FFFFFFF);
+                    compact_art_insert(&acct, key64, &slot_val);
+                } else {
+                    uint64_t idx = rng_next(&r) % acct_next;
+                    generate_key(key64, 32, SEED, idx);
+                    compact_art_delete(&acct, key64);
+                }
+            }
+            int stor_ops = 2500 + (int)(rng_next(&r) % 1000);
+            for (int i = 0; i < stor_ops; i++) {
+                int op = (int)(rng_next(&r) % 100);
+                if (op < 70 || compact_art_size(&stor) < 1000) {
+                    generate_key(key64, 64, SEED, stor_next++);
+                    slot_val = (uint32_t)(rng_next(&r) & 0x7FFFFFFF);
+                    compact_art_insert(&stor, key64, &slot_val);
+                } else if (op < 90) {
+                    uint64_t idx = rng_next(&r) % stor_next;
+                    generate_key(key64, 64, SEED, idx);
+                    slot_val = (uint32_t)(rng_next(&r) & 0x7FFFFFFF);
+                    compact_art_insert(&stor, key64, &slot_val);
+                } else {
+                    uint64_t idx = rng_next(&r) % stor_next;
+                    generate_key(key64, 64, SEED, idx);
+                    compact_art_delete(&stor, key64);
+                }
+            }
+            uint64_t total = compact_art_size(&acct) + compact_art_size(&stor);
+            if (total >= next_report || compact_art_size(&stor) >= target_storage) {
+                printf("  %10" PRIu64 "  %10" PRIu64 "  %10" PRIu64 "  %8zu\n",
+                       (uint64_t)compact_art_size(&acct),
+                       (uint64_t)compact_art_size(&stor),
+                       total, get_rss_mb());
+                next_report += report;
+            }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint64_t total = compact_art_size(&acct) + compact_art_size(&stor);
+        size_t rss = get_rss_mb();
+        printf("\n  CART FINAL: %" PRIu64 " keys | %.1fs | RSS %zu MB | %zu B/key\n",
+               total, elapsed_ms(&t0, &t1) / 1e3, rss,
+               rss * 1024 * 1024 / total);
+
+        compact_art_destroy(&acct);
+        compact_art_destroy(&stor);
+    }
+}
+
+/* ========================================================================
  * Realistic mixed workload: compact_art — accounts (32B) + storage (64B)
  * ======================================================================== */
 
@@ -577,6 +760,8 @@ int main(int argc, char **argv) {
         bench_real(target);
     if (strcmp(mode, "real_cart") == 0)
         bench_real_cart(target);
+    if (strcmp(mode, "index") == 0)
+        bench_index(target);
 
     printf("\nDone.\n");
     return 0;

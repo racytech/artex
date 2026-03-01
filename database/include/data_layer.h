@@ -6,16 +6,16 @@
 #include <stdbool.h>
 
 /**
- * Data Layer — Write buffer + compact_art index + state.dat + code.dat.
+ * Data Layer — Write buffer + nibble_trie index + state.dat + code.dat.
  *
  * Architecture:
  *   dl_put/dl_delete  → write buffer (mem_art, in-memory)
- *   dl_merge          → flush buffer to compact_art index + state.dat
+ *   dl_merge          → flush buffer to nibble_trie index + state.dat
  *   dl_get            → buffer → index → disk (read path)
  *   dl_put_code       → direct to code.dat + index (bypasses buffer)
  *   dl_get_code       → index → code.dat (read path)
  *
- * Ref encoding in compact_art (4-byte value):
+ * Ref encoding in nibble_trie (4-byte value):
  *   bit 31 = 0 → state_store slot index
  *   bit 31 = 1 → code_store entry index
  *
@@ -28,7 +28,7 @@
 typedef struct data_layer data_layer_t;
 
 typedef struct {
-    uint64_t index_keys;      // compact_art size (committed entries)
+    uint64_t index_keys;      // nibble_trie size (committed entries)
     uint64_t buffer_entries;   // write buffer size (pending entries)
     uint64_t total_merged;     // lifetime merged entries
     uint32_t free_slots;       // state_store free list size
@@ -43,7 +43,7 @@ typedef struct {
 /**
  * Create a new data layer. Truncates state and code files at paths.
  * key_size: fixed key length (e.g., 32 for keccak256 hashes)
- * value_size: compact_art value size (e.g., 4 for uint32_t slot refs)
+ * value_size: nibble_trie value size (e.g., 4 for uint32_t slot refs)
  * code_path: path for code.dat (NULL to disable code store)
  * Returns NULL on failure.
  */
@@ -121,7 +121,7 @@ uint64_t dl_merge(data_layer_t *dl);
 
 /**
  * Checkpoint current state to index file (atomic rename).
- * Serializes compact_art index + state_store free list + code_store entries.
+ * Serializes nibble_trie index + state_store free list + code_store entries.
  * Returns false on I/O error.
  */
 bool dl_checkpoint(data_layer_t *dl, const char *index_path,
@@ -129,7 +129,7 @@ bool dl_checkpoint(data_layer_t *dl, const char *index_path,
 
 /**
  * Open from existing checkpoint (recovery path).
- * Rebuilds compact_art from index.dat, restores free list and code entries.
+ * Rebuilds nibble_trie from index.dat, restores free list and code entries.
  * out_block_number receives the checkpoint block number.
  * Returns NULL on failure.
  */
