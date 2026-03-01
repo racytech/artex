@@ -178,6 +178,14 @@ static nt_ref_t alloc_extension_raw(nibble_trie_t *t) {
 }
 
 /* ========================================================================
+ * Dirty check: slot was allocated after last commit → safe to mutate in place
+ * ======================================================================== */
+
+static inline bool is_dirty(const nibble_trie_t *t, nt_ref_t ref) {
+    return NT_REF_INDEX(ref) >= t->committed_slot_count;
+}
+
+/* ========================================================================
  * Extension construction helpers
  * ======================================================================== */
 
@@ -251,6 +259,10 @@ static nt_ref_t cow_insert(nibble_trie_t *t, nt_ref_t ref,
         if (memcmp(existing->key, key, NT_KEY_SIZE) == 0) {
             /* Update existing key */
             *inserted = false;
+            if (is_dirty(t, ref)) {
+                memcpy(existing->value, value, NT_VALUE_SIZE);
+                return ref;
+            }
             return alloc_leaf(t, key, value);
         }
 
@@ -302,6 +314,12 @@ static nt_ref_t cow_insert(nibble_trie_t *t, nt_ref_t ref,
             nt_ref_t new_child = cow_insert(t, old_child, key,
                                              depth + skip, value, inserted);
             if (new_child == old_child) return ref;
+
+            /* Dirty: mutate in place */
+            if (is_dirty(t, ref)) {
+                ext_ptr(t, ref)->child = new_child;
+                return ref;
+            }
 
             /* COW copy extension with updated child */
             ext = ext_ptr(t, ref);  /* re-resolve */
@@ -365,6 +383,12 @@ static nt_ref_t cow_insert(nibble_trie_t *t, nt_ref_t ref,
 
     nt_ref_t new_child = cow_insert(t, child, key, depth + 1, value, inserted);
     if (new_child == child) return ref;
+
+    /* Dirty: mutate in place */
+    if (is_dirty(t, ref)) {
+        branch_ptr(t, ref)->children[nib] = new_child;
+        return ref;
+    }
 
     /* COW copy branch with updated child */
     nt_ref_t new_ref = alloc_branch(t);
@@ -456,7 +480,12 @@ static nt_ref_t cow_delete(nibble_trie_t *t, nt_ref_t ref,
             return merged;
         }
 
-        /* Child is still a branch — COW copy extension */
+        /* Child is still a branch — update extension */
+        if (is_dirty(t, ref)) {
+            ext_ptr(t, ref)->child = new_child;
+            return ref;
+        }
+
         ext = ext_ptr(t, ref);  /* re-resolve */
         nt_ref_t new_ext = alloc_extension_raw(t);
         if (new_ext == NT_REF_NULL) return ref;
@@ -529,7 +558,12 @@ static nt_ref_t cow_delete(nibble_trie_t *t, nt_ref_t ref,
         return make_extension_single(t, (uint8_t)last_nib, sole);
     }
 
-    /* >= 2 remaining — COW copy branch */
+    /* >= 2 remaining — update branch */
+    if (is_dirty(t, ref)) {
+        branch_ptr(t, ref)->children[nib] = new_child;
+        return ref;
+    }
+
     nt_ref_t new_ref = alloc_branch(t);
     if (new_ref == NT_REF_NULL) return ref;
 
