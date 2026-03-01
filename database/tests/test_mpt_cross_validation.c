@@ -1,4 +1,6 @@
 #include "intermediate_hashes.h"
+#include "../include/nt_hash.h"
+#include "../include/nibble_trie.h"
 #include "hash.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,6 +167,8 @@ static void free_dirty_set(dirty_set_t *ds) {
     memset(ds, 0, sizeof(*ds));
 }
 
+static int nt_pass = 0, nt_skip = 0;
+
 // ============================================================================
 // Mock Cursor (for ih_update tests)
 // ============================================================================
@@ -266,6 +270,66 @@ static void apply_dirty(kv_entry_t **entries, size_t *count, size_t *cap,
     }
 }
 
+// ============================================================================
+// nt_hash cross-validation (nibble_trie tree walk)
+// ============================================================================
+
+/**
+ * Cross-validate with nt_root_hash: build nibble_trie from key-value entries,
+ * compute root hash via tree walk, verify it matches expected.
+ *
+ * Only works when all values have uniform length (nibble_trie constraint).
+ * Skips (with note) when values are mixed length.
+ */
+static void verify_nt_hash(const kv_entry_t *entries, size_t count,
+                            const hash_t *expected) {
+    if (count == 0) {
+        nibble_trie_t t;
+        ASSERT(nt_init(&t, 1));
+        hash_t root = nt_root_hash(&t);
+        print_hash("nt_hash ", &root);
+        ASSERT(hash_equal(&root, expected));
+        nt_destroy(&t);
+        nt_pass++;
+        return;
+    }
+
+    /* Check uniform value length */
+    size_t vlen = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].vlen == 0) continue;
+        if (vlen == 0) vlen = entries[i].vlen;
+        else if (entries[i].vlen != vlen) {
+            printf("    [nt_hash: SKIP (variable value lengths)]\n");
+            nt_skip++;
+            return;
+        }
+    }
+    if (vlen == 0) {
+        printf("    [nt_hash: SKIP (no values)]\n");
+        nt_skip++;
+        return;
+    }
+
+    nibble_trie_t t;
+    ASSERT(nt_init(&t, vlen));
+
+    for (size_t i = 0; i < count; i++)
+        if (entries[i].vlen > 0)
+            ASSERT(nt_insert(&t, entries[i].key, entries[i].val));
+
+    hash_t root = nt_root_hash(&t);
+    print_hash("nt_hash ", &root);
+    ASSERT(hash_equal(&root, expected));
+
+    nt_destroy(&t);
+    nt_pass++;
+}
+
+// ============================================================================
+// ih_update verification
+// ============================================================================
+
 /**
  * Run ih_update with dirty set against merged state, verify root matches
  * expected. Also cross-validates via ih_build on merged state.
@@ -348,6 +412,9 @@ static void verify_update(ih_state_t *ih, const dirty_set_t *ds,
     free(cursor_keys);
     free(cursor_vals);
     free(cursor_vlens);
+
+    // Cross-validate: nt_root_hash (tree walk) on merged state
+    verify_nt_hash(merged, merged_count, expected);
 }
 
 // ============================================================================
@@ -410,6 +477,18 @@ int main(void) {
                 free(key_ptrs);
                 free(val_ptrs);
                 free(vlens);
+            }
+
+            // Cross-validate: nt_root_hash (tree walk)
+            {
+                kv_entry_t *entries = malloc((kv.count > 0 ? kv.count : 1) * sizeof(kv_entry_t));
+                for (size_t i = 0; i < kv.count; i++) {
+                    entries[i].key = kv.keys + i * 32;
+                    entries[i].val = kv.values + kv.val_offsets[i];
+                    entries[i].vlen = kv.val_lens[i];
+                }
+                verify_nt_hash(entries, kv.count, &expected);
+                free(entries);
             }
 
             ih_destroy(ih);
@@ -552,6 +631,8 @@ int main(void) {
     printf("  Build scenarios:      %d passed\n", build_pass);
     printf("  Update scenarios:     %d passed\n", update_pass);
     printf("  Multi-block scenarios: %d passed\n", multiblock_pass);
+    printf("  nt_hash validated:    %d passed, %d skipped (variable-length values)\n",
+           nt_pass, nt_skip);
     printf("  Total assertions:     %d\n", assertions);
     return 0;
 }

@@ -108,7 +108,7 @@ static void make_val(uint8_t *val, uint32_t i) {
 
 static int test_sequential_50k(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     const int N = 50000;
     uint8_t key[32], val[32];
@@ -150,7 +150,7 @@ static int test_sequential_50k(void) {
 
 static int test_random_keys_20k(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     const int N = 20000;
     rng_seed(0xDEADBEEF);
@@ -188,7 +188,7 @@ static int test_random_keys_20k(void) {
 
 static int test_dense_prefix_10k(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     const int N = 10000;
     uint8_t key[32], val[32];
@@ -224,7 +224,7 @@ static int test_dense_prefix_10k(void) {
 
 static int test_full_fanout_16(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -264,7 +264,7 @@ static int test_full_fanout_16(void) {
 
 static int test_multi_fanout_256(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -300,7 +300,7 @@ static int test_multi_fanout_256(void) {
 
 static int test_random_ops_50k(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     rng_seed(0x12345678);
     const int N = 50000;
@@ -349,7 +349,7 @@ static int test_random_ops_50k(void) {
 
 static int test_iterator_order(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     rng_seed(0xCAFEBABE);
     const int N = 5000;
@@ -403,7 +403,7 @@ static int test_iterator_order(void) {
 
 static int test_mass_update(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     const int N = 5000;
     uint8_t key[32], val[32];
@@ -442,7 +442,7 @@ static int test_mass_update(void) {
 
 static int test_seek_stress(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     /* Insert every 10th key */
     uint8_t key[32], val[32];
@@ -477,7 +477,7 @@ static int test_seek_stress(void) {
 
 static int test_delete_all_reinsert(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     const int N = 5000;
     uint8_t key[32], val[32];
@@ -524,7 +524,7 @@ static int test_delete_all_reinsert(void) {
 
 static int test_reverse_insert_forward_delete(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     const int N = 10000;
     uint8_t key[32], val[32];
@@ -560,7 +560,7 @@ static int test_reverse_insert_forward_delete(void) {
 
 static int test_seek_then_walk(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -606,7 +606,7 @@ static int test_seek_then_walk(void) {
 
 static int test_last_byte_diff(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -638,7 +638,7 @@ static int test_last_byte_diff(void) {
 
 static int test_first_byte_diff(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -670,7 +670,7 @@ static int test_first_byte_diff(void) {
 
 static int test_large_200k(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     const int N = 200000;
     uint8_t key[32], val[32];
@@ -714,7 +714,7 @@ static int test_large_200k(void) {
 
 static int test_iterator_size_consistency(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     rng_seed(0xBEEFCAFE);
     uint8_t key[32], val[32];
@@ -756,7 +756,7 @@ static int test_iterator_size_consistency(void) {
 
 static int test_nibble_boundary(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     uint8_t base[32], key[32], val[32];
     memset(base, 0x77, 32);
@@ -816,7 +816,7 @@ static int test_nibble_boundary(void) {
 
 static int test_extension_merge_chain(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     uint8_t key_a[32], key_b[32], key_c[32];
     uint8_t val[32];
@@ -863,7 +863,7 @@ static int test_extension_merge_chain(void) {
 
 static int test_alternating_insert_delete(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     const int N = 20000;
     uint8_t key[32], val[32];
@@ -909,7 +909,7 @@ static int test_alternating_insert_delete(void) {
 
 static int test_clear_and_reuse(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32, 32), "init");
+    ASSERT(nt_init(&t, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -947,303 +947,6 @@ static int test_clear_and_reuse(void) {
 }
 
 /* ========================================================================
- * Storage slot helpers (64B keys = addr_hash[32] || slot_hash[32], 4B values)
- * ======================================================================== */
-
-static void make_storage_key(uint8_t key[64], uint32_t account, uint32_t slot) {
-    /* Simulate keccak256(address): deterministic pseudo-hash from account id */
-    memset(key, 0, 64);
-    uint64_t seed = (uint64_t)account * 0x9E3779B97F4A7C15ULL;
-    for (int i = 0; i < 32; i += 8) {
-        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
-        int n = 32 - i < 8 ? 32 - i : 8;
-        memcpy(key + i, &seed, n);
-    }
-    /* Simulate keccak256(slot): deterministic pseudo-hash from slot id */
-    seed = (uint64_t)slot * 0x517CC1B727220A95ULL;
-    for (int i = 0; i < 32; i += 8) {
-        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
-        int n = 32 - i < 8 ? 32 - i : 8;
-        memcpy(key + 32 + i, &seed, n);
-    }
-}
-
-static void make_slot_ref(uint8_t val[4], uint32_t ref) {
-    memcpy(val, &ref, 4);
-}
-
-/* ========================================================================
- * 21. Storage slots — multi-account insert + verify (64B keys, 4B values)
- * ======================================================================== */
-
-static int test_storage_64b_basic(void) {
-    nibble_trie_t t;
-    ASSERT(nt_init(&t, 64, 4), "init");
-
-    const int ACCOUNTS = 50;
-    const int SLOTS = 200;
-    uint8_t key[64];
-    uint8_t val[4];
-
-    /* Insert: 50 accounts x 200 slots = 10K entries */
-    for (int a = 0; a < ACCOUNTS; a++) {
-        for (int s = 0; s < SLOTS; s++) {
-            make_storage_key(key, a, s);
-            uint32_t ref = a * SLOTS + s;
-            make_slot_ref(val, ref);
-            ASSERT(nt_insert(&t, key, val), "insert a=%d s=%d", a, s);
-        }
-    }
-    ASSERT(nt_size(&t) == (size_t)(ACCOUNTS * SLOTS),
-           "size=%zu expected=%d", nt_size(&t), ACCOUNTS * SLOTS);
-
-    /* Verify all */
-    for (int a = 0; a < ACCOUNTS; a++) {
-        for (int s = 0; s < SLOTS; s++) {
-            make_storage_key(key, a, s);
-            const void *got = nt_get(&t, key);
-            ASSERT(got != NULL, "missing a=%d s=%d", a, s);
-            uint32_t expected_ref = a * SLOTS + s;
-            uint32_t got_ref;
-            memcpy(&got_ref, got, 4);
-            ASSERT(got_ref == expected_ref,
-                   "val mismatch a=%d s=%d got=%u exp=%u",
-                   a, s, got_ref, expected_ref);
-        }
-    }
-
-    /* Delete all */
-    for (int a = 0; a < ACCOUNTS; a++) {
-        for (int s = 0; s < SLOTS; s++) {
-            make_storage_key(key, a, s);
-            ASSERT(nt_delete(&t, key), "delete a=%d s=%d", a, s);
-        }
-    }
-    ASSERT(nt_size(&t) == 0, "not empty");
-
-    nt_destroy(&t);
-    return 1;
-}
-
-/* ========================================================================
- * 22. Storage slots — per-account prefix grouping in iteration
- * ======================================================================== */
-
-static int test_storage_64b_sorted_order(void) {
-    nibble_trie_t t;
-    ASSERT(nt_init(&t, 64, 4), "init");
-
-    const int ACCOUNTS = 20;
-    const int SLOTS = 100;
-    uint8_t key[64];
-    uint8_t val[4];
-
-    for (int a = 0; a < ACCOUNTS; a++) {
-        for (int s = 0; s < SLOTS; s++) {
-            make_storage_key(key, a, s);
-            uint32_t ref = a * SLOTS + s;
-            make_slot_ref(val, ref);
-            nt_insert(&t, key, val);
-        }
-    }
-
-    /* Verify sorted order via iterator */
-    nt_iterator_t *it = nt_iterator_create(&t);
-    ASSERT(it != NULL, "create");
-
-    int count = 0;
-    uint8_t prev[64];
-    memset(prev, 0, 64);
-
-    while (nt_iterator_next(it)) {
-        const uint8_t *k = nt_iterator_key(it);
-        ASSERT(k != NULL, "null key");
-        if (count > 0) {
-            ASSERT(memcmp(prev, k, 64) < 0,
-                   "order violation at count=%d", count);
-        }
-        memcpy(prev, k, 64);
-        count++;
-    }
-    ASSERT((size_t)count == nt_size(&t),
-           "iter count=%d size=%zu", count, nt_size(&t));
-
-    nt_iterator_destroy(it);
-    nt_destroy(&t);
-    return 1;
-}
-
-/* ========================================================================
- * 23. Storage slots — mixed ops simulating block execution
- * ======================================================================== */
-
-static int test_storage_64b_mixed_ops(void) {
-    nibble_trie_t t;
-    ASSERT(nt_init(&t, 64, 4), "init");
-
-    const int ACCOUNTS = 100;
-    const int INITIAL_SLOTS = 50;
-    uint8_t key[64];
-    uint8_t val[4];
-
-    /* Phase 1: insert initial state (100 accounts x 50 slots) */
-    for (int a = 0; a < ACCOUNTS; a++) {
-        for (int s = 0; s < INITIAL_SLOTS; s++) {
-            make_storage_key(key, a, s);
-            uint32_t ref = a * 1000 + s;
-            make_slot_ref(val, ref);
-            nt_insert(&t, key, val);
-        }
-    }
-    size_t initial_size = nt_size(&t);
-    ASSERT(initial_size == (size_t)(ACCOUNTS * INITIAL_SLOTS), "initial size");
-
-    /* Phase 2: simulate block — update some, delete some, add new */
-    rng_seed(0x53544F524147455FULL);
-    size_t expected = initial_size;
-
-    /* Update 1000 random existing slots */
-    for (int i = 0; i < 1000; i++) {
-        int a = rng_u32() % ACCOUNTS;
-        int s = rng_u32() % INITIAL_SLOTS;
-        make_storage_key(key, a, s);
-        uint32_t new_ref = 100000 + i;
-        make_slot_ref(val, new_ref);
-        nt_insert(&t, key, val);
-    }
-
-    /* Delete 500 random slots (some might miss — that's fine) */
-    int actual_deletes = 0;
-    for (int i = 0; i < 500; i++) {
-        int a = rng_u32() % ACCOUNTS;
-        int s = rng_u32() % INITIAL_SLOTS;
-        make_storage_key(key, a, s);
-        if (nt_delete(&t, key)) {
-            actual_deletes++;
-            expected--;
-        }
-    }
-
-    /* Add 2000 new slots (slot IDs beyond INITIAL_SLOTS) */
-    for (int i = 0; i < 2000; i++) {
-        int a = rng_u32() % ACCOUNTS;
-        int s = INITIAL_SLOTS + i;
-        make_storage_key(key, a, s);
-        uint32_t ref = 200000 + i;
-        make_slot_ref(val, ref);
-        nt_insert(&t, key, val);
-        expected++;
-    }
-
-    ASSERT(nt_size(&t) == expected,
-           "size=%zu expected=%zu", nt_size(&t), expected);
-
-    nt_destroy(&t);
-    return 1;
-}
-
-/* ========================================================================
- * 24. Storage slots — large scale (50K slots across 500 accounts)
- * ======================================================================== */
-
-static int test_storage_64b_large(void) {
-    nibble_trie_t t;
-    ASSERT(nt_init(&t, 64, 4), "init");
-
-    const int ACCOUNTS = 500;
-    const int SLOTS_PER = 100;
-    const int TOTAL = ACCOUNTS * SLOTS_PER;
-    uint8_t key[64];
-    uint8_t val[4];
-
-    for (int a = 0; a < ACCOUNTS; a++) {
-        for (int s = 0; s < SLOTS_PER; s++) {
-            make_storage_key(key, a, s);
-            uint32_t ref = a * SLOTS_PER + s;
-            make_slot_ref(val, ref);
-            nt_insert(&t, key, val);
-        }
-    }
-    ASSERT(nt_size(&t) == (size_t)TOTAL, "size=%zu expected=%d",
-           nt_size(&t), TOTAL);
-
-    /* Verify random sample */
-    rng_seed(0x4C41524745ULL);
-    for (int i = 0; i < 5000; i++) {
-        int a = rng_u32() % ACCOUNTS;
-        int s = rng_u32() % SLOTS_PER;
-        make_storage_key(key, a, s);
-        const void *got = nt_get(&t, key);
-        ASSERT(got != NULL, "missing a=%d s=%d", a, s);
-        uint32_t expected_ref = a * SLOTS_PER + s;
-        uint32_t got_ref;
-        memcpy(&got_ref, got, 4);
-        ASSERT(got_ref == expected_ref, "val a=%d s=%d", a, s);
-    }
-
-    /* Delete half the accounts, verify the other half */
-    for (int a = 0; a < ACCOUNTS / 2; a++) {
-        for (int s = 0; s < SLOTS_PER; s++) {
-            make_storage_key(key, a, s);
-            ASSERT(nt_delete(&t, key), "delete a=%d s=%d", a, s);
-        }
-    }
-    ASSERT(nt_size(&t) == (size_t)(TOTAL / 2), "half size");
-
-    for (int a = ACCOUNTS / 2; a < ACCOUNTS; a++) {
-        int s = rng_u32() % SLOTS_PER;
-        make_storage_key(key, a, s);
-        ASSERT(nt_get(&t, key) != NULL, "missing after half-delete a=%d", a);
-    }
-
-    nt_destroy(&t);
-    return 1;
-}
-
-/* ========================================================================
- * 25. Storage slots — seek with 64B keys
- * ======================================================================== */
-
-static int test_storage_64b_seek(void) {
-    nibble_trie_t t;
-    ASSERT(nt_init(&t, 64, 4), "init");
-
-    /* Insert slots for 10 accounts, 10 slots each */
-    uint8_t key[64];
-    uint8_t val[4];
-    for (int a = 0; a < 10; a++) {
-        for (int s = 0; s < 10; s++) {
-            make_storage_key(key, a, s);
-            uint32_t ref = a * 10 + s;
-            make_slot_ref(val, ref);
-            nt_insert(&t, key, val);
-        }
-    }
-    ASSERT(nt_size(&t) == 100, "size");
-
-    nt_iterator_t *it = nt_iterator_create(&t);
-    ASSERT(it != NULL, "create");
-
-    /* Seek to each account's first slot, verify we land on or after it */
-    for (int a = 0; a < 10; a++) {
-        make_storage_key(key, a, 0);
-        bool found = nt_iterator_seek(it, key);
-        ASSERT(found, "seek a=%d", a);
-        const uint8_t *k = nt_iterator_key(it);
-        ASSERT(memcmp(k, key, 64) >= 0, "seek result < target a=%d", a);
-
-        /* Walk a few entries */
-        int walked = 0;
-        while (nt_iterator_next(it) && walked < 5)
-            walked++;
-    }
-
-    nt_iterator_destroy(it);
-    nt_destroy(&t);
-    return 1;
-}
-
-/* ========================================================================
  * main
  * ======================================================================== */
 
@@ -1270,14 +973,6 @@ int main(void) {
     RUN_TEST(test_extension_merge_chain);
     RUN_TEST(test_alternating_insert_delete);
     RUN_TEST(test_clear_and_reuse);
-
-    printf("\n--- Storage Slots (64B keys, 4B values) ---\n\n");
-
-    RUN_TEST(test_storage_64b_basic);
-    RUN_TEST(test_storage_64b_sorted_order);
-    RUN_TEST(test_storage_64b_mixed_ops);
-    RUN_TEST(test_storage_64b_large);
-    RUN_TEST(test_storage_64b_seek);
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

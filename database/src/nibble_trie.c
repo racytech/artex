@@ -7,38 +7,29 @@
  * Constants
  * ======================================================================== */
 
-#define NT_NODE_SLOT_SIZE   64
-#define NT_INITIAL_NODES    1024
+#define NT_BRANCH_SLOT_SIZE 64
+#define NT_EXT_SLOT_SIZE    40
+#define NT_INITIAL_BRANCHES 1024
+#define NT_INITIAL_EXTS     1024
 #define NT_INITIAL_LEAVES   1024
 
-#define NT_MAX_KEY_SIZE     64
-#define NT_MAX_NIBBLES      128  /* NT_MAX_KEY_SIZE * 2 */
-
 /* ========================================================================
- * Node structures (all 64 bytes)
+ * Node structures
  * ======================================================================== */
 
 typedef struct {
-    uint32_t children[16];
+    uint32_t children[16];              /* 64B */
 } nt_branch_t;
 
 typedef struct {
-    uint8_t  skip_len;
-    uint8_t  nibbles[59];
-    uint32_t child;
-} nt_extension_t;
-
-#define NT_MAX_EXT_NIBBLES  118  /* max nibbles in one extension (59 * 2) */
-
-typedef union {
-    nt_branch_t    branch;
-    nt_extension_t extension;
-    uint8_t        raw[NT_NODE_SLOT_SIZE];
-} nt_node_slot_t;
+    uint8_t  skip_len;                  /*  1B: nibble count (1-63) */
+    uint8_t  nibbles[32];               /* 32B: packed nibbles (max 64) */
+    uint8_t  _pad[3];                   /*  3B: alignment */
+    uint32_t child;                     /*  4B: child ref */
+} nt_extension_t;                       /* 40B total */
 
 _Static_assert(sizeof(nt_branch_t)    == 64, "branch must be 64 bytes");
-_Static_assert(sizeof(nt_extension_t) == 64, "extension must be 64 bytes");
-_Static_assert(sizeof(nt_node_slot_t) == 64, "node slot must be 64 bytes");
+_Static_assert(sizeof(nt_extension_t) == 40, "extension must be 40 bytes");
 
 /* ========================================================================
  * Nibble helpers
@@ -62,13 +53,14 @@ static inline void set_nibble(uint8_t *data, int i, uint8_t val) {
 }
 
 /* ========================================================================
- * Arena allocator
+ * Arena allocator (bump + intrusive free list)
  * ======================================================================== */
 
 static bool arena_init(nt_arena_t *a, uint32_t slot_size, uint32_t initial_cap) {
     a->slot_size = slot_size;
     a->count = 1;       /* skip index 0 so ref=0 means NULL */
     a->capacity = initial_cap;
+    a->free_head = 0;
     a->base = malloc((size_t)initial_cap * slot_size);
     if (!a->base) return false;
     memset(a->base, 0, (size_t)slot_size); /* zero slot 0 */
@@ -81,10 +73,21 @@ static void arena_destroy(nt_arena_t *a) {
 }
 
 static void arena_clear(nt_arena_t *a) {
-    a->count = 1; /* keep allocation, reset to empty */
+    a->count = 1;
+    a->free_head = 0;
 }
 
 static uint32_t arena_alloc(nt_arena_t *a) {
+    /* Try free list first */
+    if (a->free_head != 0) {
+        uint32_t idx = a->free_head;
+        uint32_t *slot = (uint32_t *)(a->base + (size_t)idx * a->slot_size);
+        a->free_head = *slot;
+        memset(slot, 0, a->slot_size);
+        return idx;
+    }
+
+    /* Bump allocate */
     if (a->count >= a->capacity) {
         uint32_t new_cap = a->capacity * 2;
         uint8_t *new_base = realloc(a->base, (size_t)new_cap * a->slot_size);
@@ -97,20 +100,42 @@ static uint32_t arena_alloc(nt_arena_t *a) {
     return idx;
 }
 
+static void arena_free(nt_arena_t *a, uint32_t idx) {
+    uint32_t *slot = (uint32_t *)(a->base + (size_t)idx * a->slot_size);
+    *slot = a->free_head;
+    a->free_head = idx;
+}
+
+static void arena_shrink_to_fit(nt_arena_t *a) {
+    if (a->count >= a->capacity || a->count <= 1) return;
+    uint8_t *new_base = realloc(a->base, (size_t)a->count * a->slot_size);
+    if (new_base) {
+        a->base = new_base;
+        a->capacity = a->count;
+    }
+}
+
+static bool arena_reserve(nt_arena_t *a, uint32_t min_capacity) {
+    if (a->capacity >= min_capacity) return true;
+    uint8_t *new_base = realloc(a->base, (size_t)min_capacity * a->slot_size);
+    if (!new_base) return false;
+    a->base = new_base;
+    a->capacity = min_capacity;
+    return true;
+}
+
 /* ========================================================================
  * Pointer resolution
  * ======================================================================== */
 
 static inline nt_branch_t *branch_ptr(const nibble_trie_t *t, nt_ref_t ref) {
     uint32_t idx = NT_REF_INDEX(ref);
-    return &((nt_node_slot_t *)(t->nodes.base +
-             (size_t)idx * NT_NODE_SLOT_SIZE))->branch;
+    return (nt_branch_t *)(t->branches.base + (size_t)idx * NT_BRANCH_SLOT_SIZE);
 }
 
 static inline nt_extension_t *ext_ptr(const nibble_trie_t *t, nt_ref_t ref) {
     uint32_t idx = NT_REF_INDEX(ref);
-    return &((nt_node_slot_t *)(t->nodes.base +
-             (size_t)idx * NT_NODE_SLOT_SIZE))->extension;
+    return (nt_extension_t *)(t->extensions.base + (size_t)idx * NT_EXT_SLOT_SIZE);
 }
 
 static inline uint8_t *leaf_key_ptr(const nibble_trie_t *t, nt_ref_t ref) {
@@ -119,7 +144,7 @@ static inline uint8_t *leaf_key_ptr(const nibble_trie_t *t, nt_ref_t ref) {
 }
 
 static inline void *leaf_value_ptr(const nibble_trie_t *t, nt_ref_t ref) {
-    return leaf_key_ptr(t, ref) + t->key_size;
+    return leaf_key_ptr(t, ref) + NT_KEY_SIZE;
 }
 
 /* ========================================================================
@@ -132,19 +157,19 @@ static nt_ref_t alloc_leaf(nibble_trie_t *t,
     if (idx == 0) return NT_REF_NULL;
 
     uint8_t *lk = t->leaves.base + (size_t)idx * t->leaves.slot_size;
-    memcpy(lk, key, t->key_size);
-    memcpy(lk + t->key_size, value, t->value_size);
+    memcpy(lk, key, NT_KEY_SIZE);
+    memcpy(lk + NT_KEY_SIZE, value, t->value_size);
     return NT_MAKE_LEAF_REF(idx);
 }
 
 static nt_ref_t alloc_branch(nibble_trie_t *t) {
-    uint32_t idx = arena_alloc(&t->nodes);
+    uint32_t idx = arena_alloc(&t->branches);
     if (idx == 0) return NT_REF_NULL;
     return NT_MAKE_BRANCH_REF(idx);
 }
 
 static nt_ref_t alloc_extension_raw(nibble_trie_t *t) {
-    uint32_t idx = arena_alloc(&t->nodes);
+    uint32_t idx = arena_alloc(&t->extensions);
     if (idx == 0) return NT_REF_NULL;
     return NT_MAKE_EXTENSION_REF(idx);
 }
@@ -157,16 +182,6 @@ static nt_ref_t make_extension_from_key(nibble_trie_t *t,
                                          const uint8_t *key, int depth,
                                          int count, nt_ref_t child) {
     if (count == 0) return child;
-
-    /* Chain extensions if prefix exceeds single-node capacity */
-    if (count > NT_MAX_EXT_NIBBLES) {
-        nt_ref_t inner = make_extension_from_key(t, key,
-                            depth + NT_MAX_EXT_NIBBLES,
-                            count - NT_MAX_EXT_NIBBLES, child);
-        if (inner == NT_REF_NULL) return NT_REF_NULL;
-        count = NT_MAX_EXT_NIBBLES;
-        child = inner;
-    }
 
     nt_ref_t ref = alloc_extension_raw(t);
     if (ref == NT_REF_NULL) return NT_REF_NULL;
@@ -185,16 +200,6 @@ static nt_ref_t make_extension_from_buf(nibble_trie_t *t,
                                          int start, int count,
                                          nt_ref_t child) {
     if (count == 0) return child;
-
-    /* Chain extensions if prefix exceeds single-node capacity */
-    if (count > NT_MAX_EXT_NIBBLES) {
-        nt_ref_t inner = make_extension_from_buf(t, saved_nibbles,
-                            start + NT_MAX_EXT_NIBBLES,
-                            count - NT_MAX_EXT_NIBBLES, child);
-        if (inner == NT_REF_NULL) return NT_REF_NULL;
-        count = NT_MAX_EXT_NIBBLES;
-        child = inner;
-    }
 
     nt_ref_t ref = alloc_extension_raw(t);
     if (ref == NT_REF_NULL) return NT_REF_NULL;
@@ -237,7 +242,7 @@ static nt_ref_t do_insert(nibble_trie_t *t, nt_ref_t ref,
     if (NT_IS_LEAF(ref)) {
         uint8_t *existing_key = leaf_key_ptr(t, ref);
 
-        if (memcmp(existing_key, key, t->key_size) == 0) {
+        if (memcmp(existing_key, key, NT_KEY_SIZE) == 0) {
             *inserted = false;
             memcpy(leaf_value_ptr(t, ref), value, t->value_size);
             return ref;
@@ -245,12 +250,11 @@ static nt_ref_t do_insert(nibble_trie_t *t, nt_ref_t ref,
 
         *inserted = true;
 
-        uint8_t saved_key[NT_MAX_KEY_SIZE];
-        memcpy(saved_key, existing_key, t->key_size);
+        uint8_t saved_key[NT_KEY_SIZE];
+        memcpy(saved_key, existing_key, NT_KEY_SIZE);
 
-        int num_nibbles = (int)(t->key_size * 2);
         int diff = depth;
-        while (diff < num_nibbles &&
+        while (diff < NT_MAX_NIBBLES &&
                key_nibble(key, diff) == key_nibble(saved_key, diff))
             diff++;
 
@@ -292,10 +296,13 @@ static nt_ref_t do_insert(nibble_trie_t *t, nt_ref_t ref,
         /* Partial match — split */
         *inserted = true;
 
-        uint8_t saved_nibbles[59];
-        memcpy(saved_nibbles, ext->nibbles, 59);
+        uint8_t saved_nibbles[32];
+        memcpy(saved_nibbles, ext->nibbles, 32);
         int saved_skip = skip;
         nt_ref_t saved_child = ext->child;
+
+        /* Free the old extension slot being split */
+        arena_free(&t->extensions, NT_REF_INDEX(ref));
 
         nt_ref_t new_leaf = alloc_leaf(t, key, value);
         if (new_leaf == NT_REF_NULL) return ref;
@@ -349,8 +356,9 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
 
     /* Leaf */
     if (NT_IS_LEAF(ref)) {
-        if (memcmp(leaf_key_ptr(t, ref), key, t->key_size) == 0) {
+        if (memcmp(leaf_key_ptr(t, ref), key, NT_KEY_SIZE) == 0) {
             *deleted = true;
+            arena_free(&t->leaves, NT_REF_INDEX(ref));
             return NT_REF_NULL;
         }
         *deleted = false;
@@ -375,11 +383,15 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
         if (!*deleted) return ref;
         if (new_child == old_child) return ref;
 
-        if (new_child == NT_REF_NULL)
+        if (new_child == NT_REF_NULL) {
+            arena_free(&t->extensions, NT_REF_INDEX(ref));
             return NT_REF_NULL;
+        }
 
-        if (NT_IS_LEAF(new_child))
+        if (NT_IS_LEAF(new_child)) {
+            arena_free(&t->extensions, NT_REF_INDEX(ref));
             return new_child;
+        }
 
         /* Child became extension — merge */
         if (NT_IS_EXTENSION(new_child)) {
@@ -397,11 +409,15 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
 
             int total = our_skip + child_skip;
 
-            /* Pack tmp nibbles into a byte buffer for make_extension_from_buf */
+            /* Pack tmp nibbles into a byte buffer */
             uint8_t packed[(NT_MAX_NIBBLES + 1) / 2];
             memset(packed, 0, sizeof(packed));
             for (int i = 0; i < total; i++)
                 set_nibble(packed, i, tmp[i]);
+
+            /* Free both old extensions before allocating new one */
+            arena_free(&t->extensions, NT_REF_INDEX(ref));
+            arena_free(&t->extensions, NT_REF_INDEX(new_child));
 
             return make_extension_from_buf(t, packed, 0, total, child_child);
         }
@@ -436,15 +452,19 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
         }
     }
 
-    if (remaining == 0)
+    if (remaining == 0) {
+        arena_free(&t->branches, NT_REF_INDEX(ref));
         return NT_REF_NULL;
+    }
 
     if (remaining == 1) {
         nt_ref_t sole = (last_nib == nib) ? new_child
                                           : br->children[last_nib];
 
-        if (NT_IS_LEAF(sole))
+        if (NT_IS_LEAF(sole)) {
+            arena_free(&t->branches, NT_REF_INDEX(ref));
             return sole;
+        }
 
         /* Extension — prepend this nibble */
         if (NT_IS_EXTENSION(sole)) {
@@ -463,10 +483,14 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
             for (int i = 0; i < total; i++)
                 set_nibble(packed, i, tmp[i]);
 
+            arena_free(&t->branches, NT_REF_INDEX(ref));
+            arena_free(&t->extensions, NT_REF_INDEX(sole));
+
             return make_extension_from_buf(t, packed, 0, total, child_child);
         }
 
         /* Branch — wrap in 1-nibble extension */
+        arena_free(&t->branches, NT_REF_INDEX(ref));
         return make_extension_single(t, (uint8_t)last_nib, sole);
     }
 
@@ -487,7 +511,7 @@ const void *nt_get(const nibble_trie_t *t, const uint8_t *key) {
 
     while (ref != NT_REF_NULL) {
         if (NT_IS_LEAF(ref)) {
-            if (memcmp(leaf_key_ptr(t, ref), key, t->key_size) == 0)
+            if (memcmp(leaf_key_ptr(t, ref), key, NT_KEY_SIZE) == 0)
                 return leaf_value_ptr(t, ref);
             return NULL;
         }
@@ -516,19 +540,22 @@ const void *nt_get(const nibble_trie_t *t, const uint8_t *key) {
  * Public API
  * ======================================================================== */
 
-bool nt_init(nibble_trie_t *t, uint32_t key_size, uint32_t value_size) {
-    if (!t || key_size == 0 || key_size > NT_MAX_KEY_SIZE || value_size == 0)
-        return false;
+bool nt_init(nibble_trie_t *t, uint32_t value_size) {
+    if (!t || value_size == 0) return false;
     memset(t, 0, sizeof(*t));
-    t->key_size = key_size;
     t->value_size = value_size;
 
-    uint32_t leaf_slot_size = (key_size + value_size + 7) & ~(uint32_t)7;
+    uint32_t leaf_slot_size = (NT_KEY_SIZE + value_size + 7) & ~(uint32_t)7;
 
-    if (!arena_init(&t->nodes, NT_NODE_SLOT_SIZE, NT_INITIAL_NODES))
+    if (!arena_init(&t->branches, NT_BRANCH_SLOT_SIZE, NT_INITIAL_BRANCHES))
         return false;
+    if (!arena_init(&t->extensions, NT_EXT_SLOT_SIZE, NT_INITIAL_EXTS)) {
+        arena_destroy(&t->branches);
+        return false;
+    }
     if (!arena_init(&t->leaves, leaf_slot_size, NT_INITIAL_LEAVES)) {
-        arena_destroy(&t->nodes);
+        arena_destroy(&t->branches);
+        arena_destroy(&t->extensions);
         return false;
     }
 
@@ -537,17 +564,39 @@ bool nt_init(nibble_trie_t *t, uint32_t key_size, uint32_t value_size) {
 
 void nt_destroy(nibble_trie_t *t) {
     if (!t) return;
-    arena_destroy(&t->nodes);
+    arena_destroy(&t->branches);
+    arena_destroy(&t->extensions);
     arena_destroy(&t->leaves);
     memset(t, 0, sizeof(*t));
 }
 
 void nt_clear(nibble_trie_t *t) {
     if (!t) return;
-    arena_clear(&t->nodes);
+    arena_clear(&t->branches);
+    arena_clear(&t->extensions);
     arena_clear(&t->leaves);
     t->root = NT_REF_NULL;
     t->size = 0;
+}
+
+void nt_shrink_to_fit(nibble_trie_t *t) {
+    if (!t) return;
+    arena_shrink_to_fit(&t->branches);
+    arena_shrink_to_fit(&t->extensions);
+    arena_shrink_to_fit(&t->leaves);
+}
+
+bool nt_reserve(nibble_trie_t *t, size_t expected_keys) {
+    if (!t) return false;
+
+    uint32_t leaf_cap = (uint32_t)(expected_keys + 1);  /* +1 for sentinel */
+    /* Heuristic: ~keys/5 branches and ~keys/5 extensions for random keys */
+    uint32_t internal_cap = (uint32_t)(expected_keys / 5 + 1);
+
+    if (!arena_reserve(&t->branches, internal_cap)) return false;
+    if (!arena_reserve(&t->extensions, internal_cap)) return false;
+    if (!arena_reserve(&t->leaves, leaf_cap)) return false;
+    return true;
 }
 
 bool nt_insert(nibble_trie_t *t, const uint8_t *key, const void *value) {
@@ -712,7 +761,7 @@ bool nt_iterator_seek(nt_iterator_t *it, const uint8_t *key) {
     while (ref != NT_REF_NULL) {
         if (NT_IS_LEAF(ref)) {
             const uint8_t *lk = leaf_key_ptr(t, ref);
-            if (memcmp(lk, key, t->key_size) >= 0) {
+            if (memcmp(lk, key, NT_KEY_SIZE) >= 0) {
                 s->key = lk;
                 s->value = leaf_value_ptr(t, ref);
                 return true;

@@ -1,17 +1,15 @@
 /*
  * Index Structure Scale Benchmark
  *
- * Compares two implementations across two workloads:
+ * Compares two implementations:
  *
  *   nibble_trie:  16-way nibble trie (in-memory, arena-allocated)
  *   compact_art:  in-memory ART (no persistence)
  *
- * Workloads:
- *   accounts:  32B keys + 32B values (account index)
- *   storage:   64B keys + 4B values  (storage slot index)
+ * Workload: 32B keys + 32B values (account index)
  *
  * Usage: ./bench_nibble_trie [target_millions] [mode]
- *   Modes: nt | cart | both | nt-stor | cart-stor | stor | all
+ *   Modes: nt | cart | both
  *   Default: 1M keys, both
  */
 
@@ -62,37 +60,6 @@ static void generate_val32(uint8_t val[32], uint64_t seed, uint64_t index) {
     }
 }
 
-/* Storage key: 64 bytes (addr_hash[32] || slot_hash[32])
- * Simulates realistic distribution: N_ACCOUNTS accounts, each with
- * target/N_ACCOUNTS slots. Same account -> same first 32 bytes. */
-#define STOR_N_ACCOUNTS  10000
-
-static void generate_storage_key(uint8_t key[64], uint64_t seed,
-                                  uint64_t index) {
-    uint64_t account_id = index % STOR_N_ACCOUNTS;
-    uint64_t slot_id = index / STOR_N_ACCOUNTS;
-
-    /* addr_hash: deterministic from account_id */
-    rng_t rng = rng_create(seed ^ (account_id * 0xA44E55C0FFFULL));
-    for (int i = 0; i < 32; i += 8) {
-        uint64_t r = rng_next(&rng);
-        memcpy(key + i, &r, 8);
-    }
-
-    /* slot_hash: deterministic from slot_id */
-    rng = rng_create(seed ^ (slot_id * 0x517CC1B727220A95ULL));
-    for (int i = 0; i < 32; i += 8) {
-        uint64_t r = rng_next(&rng);
-        memcpy(key + 32 + i, &r, 8);
-    }
-}
-
-/* Storage value: 4 bytes (slot ref) */
-static void generate_slot_ref(uint8_t val[4], uint64_t index) {
-    uint32_t ref = (uint32_t)(index & 0x7FFFFFFF);
-    memcpy(val, &ref, 4);
-}
-
 /* ========================================================================
  * Helpers
  * ======================================================================== */
@@ -130,7 +97,7 @@ static void bench_nt(uint64_t target) {
     printf("  target: %" PRIu64 " keys (in-memory, arena-allocated)\n\n", target);
 
     nibble_trie_t t;
-    if (!nt_init(&t, 32, 32)) {
+    if (!nt_init(&t, 32)) {
         printf("  FAILED to init\n");
         return;
     }
@@ -194,96 +161,6 @@ static void bench_nt(uint64_t target) {
     uint64_t deleted = 0;
     for (uint64_t i = 0; i < target; i += 2) {
         generate_key32(key, SEED, i);
-        if (nt_delete(&t, key)) deleted++;
-    }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("  DELETE half  %8" PRIu64 " %8.0f %8.0f\n",
-           deleted, elapsed_ms(&t0, &t1),
-           (double)deleted / elapsed_ms(&t0, &t1));
-
-    printf("\n  Memory (RSS):  %zu MB\n", get_rss_mb());
-    printf("  Tree size:     %" PRIu64 " keys\n", (uint64_t)nt_size(&t));
-
-    nt_destroy(&t);
-}
-
-/* ========================================================================
- * Benchmark: nibble_trie — storage slots (64B keys, 4B values)
- * ======================================================================== */
-
-static void bench_nt_storage(uint64_t target) {
-    struct timespec t0, t1;
-
-    printf("\n=== nibble_trie — Storage (64B key + 4B val) ===\n");
-    printf("  target:   %" PRIu64 " slots (in-memory, arena-allocated)\n", target);
-    printf("  accounts: %d (%" PRIu64 " slots/account avg)\n\n",
-           STOR_N_ACCOUNTS, target / STOR_N_ACCOUNTS);
-
-    nibble_trie_t t;
-    if (!nt_init(&t, 64, 4)) {
-        printf("  FAILED to init\n");
-        return;
-    }
-
-    uint8_t key[64], val[4];
-    uint64_t milestone = target < 1000000 ? target / 10 : 1000000;
-    if (milestone == 0) milestone = 1;
-
-    printf("  %-12s %8s %8s %8s %8s\n",
-           "Phase", "Keys", "ms", "Kk/s", "RSS MB");
-    printf("  %-12s %8s %8s %8s %8s\n",
-           "-----", "----", "--", "----", "------");
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    struct timespec last = t0;
-
-    for (uint64_t i = 0; i < target; i++) {
-        generate_storage_key(key, SEED, i);
-        generate_slot_ref(val, i);
-        nt_insert(&t, key, val);
-
-        if ((i + 1) % milestone == 0) {
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            double ms = elapsed_ms(&last, &t1);
-            double kks = (double)milestone / ms;
-            printf("  insert       %8" PRIu64 " %8.0f %8.0f %8zu\n",
-                   i + 1, elapsed_ms(&t0, &t1), kks, get_rss_mb());
-            last = t1;
-        }
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double insert_ms = elapsed_ms(&t0, &t1);
-    printf("  INSERT TOTAL %8" PRIu64 " %8.0f %8.0f %8zu\n\n",
-           target, insert_ms, (double)target / insert_ms, get_rss_mb());
-
-    uint64_t lookups = target < 1000000 ? target : 1000000;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    uint64_t found = 0;
-    for (uint64_t i = 0; i < lookups; i++) {
-        uint64_t idx = (i * 7919) % target;
-        generate_storage_key(key, SEED, idx);
-        if (nt_get(&t, key) != NULL) found++;
-    }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("  LOOKUP       %8" PRIu64 " %8.0f %8.0f %8s (found=%" PRIu64 ")\n",
-           lookups, elapsed_ms(&t0, &t1), (double)lookups / elapsed_ms(&t0, &t1),
-           "", found);
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    nt_iterator_t *it = nt_iterator_create(&t);
-    uint64_t iter_count = 0;
-    while (nt_iterator_next(it)) iter_count++;
-    nt_iterator_destroy(it);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("  ITERATE      %8" PRIu64 " %8.0f %8.0f\n",
-           iter_count, elapsed_ms(&t0, &t1),
-           (double)iter_count / elapsed_ms(&t0, &t1));
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    uint64_t deleted = 0;
-    for (uint64_t i = 0; i < target; i += 2) {
-        generate_storage_key(key, SEED, i);
         if (nt_delete(&t, key)) deleted++;
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -390,100 +267,6 @@ static void bench_cart(uint64_t target) {
 }
 
 /* ========================================================================
- * Benchmark: compact_art — storage slots (64B keys, 4B values)
- * ======================================================================== */
-
-static void bench_cart_storage(uint64_t target) {
-    struct timespec t0, t1;
-
-    printf("\n=== compact_art — Storage (64B key + 4B val) ===\n");
-    printf("  target:   %" PRIu64 " slots (in-memory, no persistence)\n", target);
-    printf("  accounts: %d (%" PRIu64 " slots/account avg)\n\n",
-           STOR_N_ACCOUNTS, target / STOR_N_ACCOUNTS);
-
-    compact_art_t tree;
-    if (!compact_art_init(&tree, 64, 4)) {
-        printf("  FAILED to init\n");
-        return;
-    }
-
-    uint8_t key[64], val[4];
-    uint64_t milestone = target < 1000000 ? target / 10 : 1000000;
-    if (milestone == 0) milestone = 1;
-
-    printf("  %-12s %8s %8s %8s %8s\n",
-           "Phase", "Keys", "ms", "Kk/s", "RSS MB");
-    printf("  %-12s %8s %8s %8s %8s\n",
-           "-----", "----", "--", "----", "------");
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    struct timespec last = t0;
-
-    for (uint64_t i = 0; i < target; i++) {
-        generate_storage_key(key, SEED, i);
-        generate_slot_ref(val, i);
-        compact_art_insert(&tree, key, val);
-
-        if ((i + 1) % milestone == 0) {
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            double ms = elapsed_ms(&last, &t1);
-            double kks = (double)milestone / ms;
-            printf("  insert       %8" PRIu64 " %8.0f %8.0f %8zu\n",
-                   i + 1, elapsed_ms(&t0, &t1), kks, get_rss_mb());
-            last = t1;
-        }
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double insert_ms = elapsed_ms(&t0, &t1);
-    printf("  INSERT TOTAL %8" PRIu64 " %8.0f %8.0f %8zu\n\n",
-           target, insert_ms, (double)target / insert_ms, get_rss_mb());
-
-    printf("  COMMIT       %8s %8s %8s %8s (N/A — in-memory)\n",
-           "", "", "", "");
-
-    uint64_t lookups = target < 1000000 ? target : 1000000;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    uint64_t found = 0;
-    for (uint64_t i = 0; i < lookups; i++) {
-        uint64_t idx = (i * 7919) % target;
-        generate_storage_key(key, SEED, idx);
-        if (compact_art_get(&tree, key) != NULL) found++;
-    }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("  LOOKUP       %8" PRIu64 " %8.0f %8.0f %8s (found=%" PRIu64 ")\n",
-           lookups, elapsed_ms(&t0, &t1), (double)lookups / elapsed_ms(&t0, &t1),
-           "", found);
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    compact_art_iterator_t *it = compact_art_iterator_create(&tree);
-    uint64_t iter_count = 0;
-    while (compact_art_iterator_next(it)) iter_count++;
-    compact_art_iterator_destroy(it);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("  ITERATE      %8" PRIu64 " %8.0f %8.0f\n",
-           iter_count, elapsed_ms(&t0, &t1),
-           (double)iter_count / elapsed_ms(&t0, &t1));
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    uint64_t deleted = 0;
-    for (uint64_t i = 0; i < target; i += 2) {
-        generate_storage_key(key, SEED, i);
-        if (compact_art_delete(&tree, key)) deleted++;
-    }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("  DELETE half  %8" PRIu64 " %8.0f %8.0f\n",
-           deleted, elapsed_ms(&t0, &t1),
-           (double)deleted / elapsed_ms(&t0, &t1));
-
-    printf("\n  Memory (RSS):  %zu MB\n", get_rss_mb());
-    printf("  Tree size:     %" PRIu64 " keys\n",
-           (uint64_t)compact_art_size(&tree));
-
-    compact_art_destroy(&tree);
-}
-
-/* ========================================================================
  * Main
  * ======================================================================== */
 
@@ -499,19 +282,10 @@ int main(int argc, char **argv) {
     printf("  Target: %" PRIu64 " keys (%.1fM)\n", target, (double)target / 1e6);
     printf("  Mode:   %s\n", mode);
 
-    bool run_all = strcmp(mode, "all") == 0;
-
-    /* Account workloads (32B keys) */
-    if (strcmp(mode, "nt") == 0 || strcmp(mode, "both") == 0 || run_all)
+    if (strcmp(mode, "nt") == 0 || strcmp(mode, "both") == 0)
         bench_nt(target);
-    if (strcmp(mode, "cart") == 0 || strcmp(mode, "both") == 0 || run_all)
+    if (strcmp(mode, "cart") == 0 || strcmp(mode, "both") == 0)
         bench_cart(target);
-
-    /* Storage workloads (64B keys) */
-    if (strcmp(mode, "nt-stor") == 0 || strcmp(mode, "stor") == 0 || run_all)
-        bench_nt_storage(target);
-    if (strcmp(mode, "cart-stor") == 0 || strcmp(mode, "stor") == 0 || run_all)
-        bench_cart_storage(target);
 
     printf("\nDone.\n");
     return 0;

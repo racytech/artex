@@ -79,6 +79,12 @@ add_library(intermediate_hashes STATIC
 )
 target_link_libraries(intermediate_hashes compact_art common)
 
+# Nibble Trie Hash (MPT root computation via tree walk)
+add_library(nt_hash STATIC
+    database/src/nt_hash.c
+)
+target_link_libraries(nt_hash nibble_trie common)
+
 #==============================================================================
 # Tests
 #==============================================================================
@@ -201,7 +207,7 @@ add_test(NAME test_compact_art_seek COMMAND test_compact_art_seek)
 add_executable(test_mpt_cross_validation
     database/tests/test_mpt_cross_validation.c
 )
-target_link_libraries(test_mpt_cross_validation intermediate_hashes compact_art common)
+target_link_libraries(test_mpt_cross_validation intermediate_hashes nt_hash compact_art common)
 add_test(NAME test_mpt_cross_validation
     COMMAND test_mpt_cross_validation
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -232,6 +238,13 @@ add_executable(bench_nibble_trie
 )
 target_link_libraries(bench_nibble_trie nibble_trie compact_art)
 
+# Test: Nibble Trie Root Hash (MPT cross-validation at scale)
+add_executable(test_nt_hash
+    database/tests/test_nt_hash.c
+)
+target_link_libraries(test_nt_hash nt_hash intermediate_hashes compact_art common)
+add_test(NAME test_nt_hash COMMAND test_nt_hash)
+
 #==============================================================================
 # Build Summary
 #==============================================================================
@@ -247,7 +260,8 @@ message(STATUS "")
 message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
 message(STATUS "  - compact_art (space-efficient index ART)")
-message(STATUS "  - nibble_trie (16-way nibble trie, COW persistence)")
+message(STATUS "  - nibble_trie (16-way nibble trie, in-memory arena-allocated)")
+message(STATUS "  - nt_hash (MPT root hash via nibble_trie walk)")
 message(STATUS "  - common (keccak256, hash, rlp, bytes)")
 message(STATUS "  - data_layer (state store + code store + write buffer + merge)")
 message(STATUS "  - state_db (account state + contract storage wrapper)")

@@ -11,6 +11,8 @@
  * Pure in-memory, arena-allocated. No file I/O, no persistence.
  * Structure matches Ethereum's hex-prefix trie (branch/extension/leaf).
  *
+ * Fixed 32-byte keys (keccak256 hashes). Value size configurable at init.
+ *
  * Ref encoding (32-bit):
  *   Bits 31-30 : type tag
  *     11 = branch     (0xC0000000)
@@ -19,6 +21,9 @@
  *     00 = NULL       (ref == 0)
  *   Bits 29-0  : pool index
  * ======================================================================== */
+
+#define NT_KEY_SIZE         32
+#define NT_MAX_NIBBLES      64   /* NT_KEY_SIZE * 2 */
 
 typedef uint32_t nt_ref_t;
 
@@ -43,14 +48,15 @@ typedef uint32_t nt_ref_t;
 #define NT_MAKE_LEAF_REF(i)      ((nt_ref_t)(i) | NT_TYPE_LEAF)
 
 /* ========================================================================
- * Arena — growable bump allocator
+ * Arena — growable bump allocator with free list
  * ======================================================================== */
 
 typedef struct {
     uint8_t  *base;      /* heap allocation */
-    uint32_t  count;     /* slots used */
+    uint32_t  count;     /* slots used (high-water mark) */
     uint32_t  capacity;  /* slots allocated */
     uint32_t  slot_size; /* bytes per slot */
+    uint32_t  free_head; /* intrusive free list head (0 = empty) */
 } nt_arena_t;
 
 /* ========================================================================
@@ -61,10 +67,10 @@ typedef struct nibble_trie nibble_trie_t;
 typedef struct nt_iterator nt_iterator_t;
 
 struct nibble_trie {
-    nt_arena_t nodes;    /* branches + extensions (64B slots) */
-    nt_arena_t leaves;   /* key + value per slot */
+    nt_arena_t branches;     /* 64B slots */
+    nt_arena_t extensions;   /* 40B slots */
+    nt_arena_t leaves;       /* (NT_KEY_SIZE + value_size) per slot */
 
-    uint32_t  key_size;
     uint32_t  value_size;
 
     nt_ref_t  root;
@@ -75,11 +81,17 @@ struct nibble_trie {
  * Lifecycle
  * ======================================================================== */
 
-bool nt_init(nibble_trie_t *t, uint32_t key_size, uint32_t value_size);
+bool nt_init(nibble_trie_t *t, uint32_t value_size);
 void nt_destroy(nibble_trie_t *t);
 
 /* Reset to empty without freeing arena memory (reuse allocations) */
 void nt_clear(nibble_trie_t *t);
+
+/* Shrink arenas to exactly fit current contents. Call after bulk loading. */
+void nt_shrink_to_fit(nibble_trie_t *t);
+
+/* Pre-allocate arenas for expected number of keys. Avoids repeated doubling. */
+bool nt_reserve(nibble_trie_t *t, size_t expected_keys);
 
 /* ========================================================================
  * Mutations (in-place, no COW)
