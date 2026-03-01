@@ -3,9 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-
-#define TEST_PATH  "/tmp/test_nibble_trie.dat"
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -18,7 +15,6 @@ static int tests_passed = 0;
 } while(0)
 
 #define RUN_TEST(fn) do { \
-    unlink(TEST_PATH); \
     tests_run++; \
     printf("%-50s ", #fn); \
     fflush(stdout); \
@@ -28,7 +24,6 @@ static int tests_passed = 0;
     } else { \
         printf("FAIL\n"); \
     } \
-    unlink(TEST_PATH); \
 } while(0)
 
 /* Generate deterministic 32-byte key from integer */
@@ -54,17 +49,17 @@ static void make_value(uint8_t *val, uint32_t i) {
 
 /* ====================================================================== */
 
-static int test_create_close(void) {
+static int test_create_destroy(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
     ASSERT(nt_size(&t) == 0, "empty");
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 static int test_insert_get_single(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
     make_key(key, 1);
@@ -81,13 +76,13 @@ static int test_insert_get_single(void) {
     make_key(miss, 999);
     ASSERT(nt_get(&t, miss) == NULL, "miss is null");
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 static int test_insert_multiple(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 1000;
     uint8_t key[32], val[32];
@@ -110,13 +105,13 @@ static int test_insert_multiple(void) {
     make_key(key, N + 1);
     ASSERT(nt_get(&t, key) == NULL, "miss");
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 static int test_update(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val1[32], val2[32];
     make_key(key, 42);
@@ -133,13 +128,13 @@ static int test_update(void) {
     ASSERT(got != NULL, "get");
     ASSERT(memcmp(got, val2, 32) == 0, "updated value");
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 static int test_delete(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
     make_key(key, 1);
@@ -154,13 +149,13 @@ static int test_delete(void) {
 
     ASSERT(!nt_delete(&t, key), "double delete fails");
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 static int test_delete_multiple(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 200;
     uint8_t key[32], val[32];
@@ -192,96 +187,48 @@ static int test_delete_multiple(void) {
         }
     }
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
-static int test_commit_reopen(void) {
+static int test_clear(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
-    const int N = 500;
     uint8_t key[32], val[32];
-
-    for (int i = 0; i < N; i++) {
+    for (int i = 0; i < 500; i++) {
         make_key(key, i);
         make_value(val, i);
         nt_insert(&t, key, val);
     }
-    ASSERT(nt_commit(&t), "commit");
-    nt_close(&t);
+    ASSERT(nt_size(&t) == 500, "size 500");
 
-    /* Reopen */
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "reopen");
-    ASSERT(nt_size(&t) == (size_t)N, "size preserved");
+    nt_clear(&t);
+    ASSERT(nt_size(&t) == 0, "cleared");
 
-    for (int i = 0; i < N; i++) {
+    /* Reinsert after clear */
+    for (int i = 0; i < 100; i++) {
+        make_key(key, i);
+        make_value(val, i);
+        ASSERT(nt_insert(&t, key, val), "reinsert");
+    }
+    ASSERT(nt_size(&t) == 100, "reinserted");
+
+    for (int i = 0; i < 100; i++) {
         make_key(key, i);
         make_value(val, i);
         const uint8_t *got = nt_get(&t, key);
-        ASSERT(got != NULL, "get after reopen");
-        ASSERT(memcmp(got, val, 32) == 0, "value after reopen");
+        ASSERT(got != NULL, "get after clear+reinsert");
+        ASSERT(memcmp(got, val, 32) == 0, "value after clear+reinsert");
     }
 
-    nt_close(&t);
-    return 1;
-}
-
-static int test_uncommitted_lost(void) {
-    nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
-
-    uint8_t key1[32], val1[32], key2[32], val2[32];
-    make_key(key1, 1);
-    make_value(val1, 1);
-    make_key(key2, 2);
-    make_value(val2, 2);
-
-    nt_insert(&t, key1, val1);
-    ASSERT(nt_commit(&t), "commit key1");
-
-    nt_insert(&t, key2, val2);
-    /* no commit */
-    nt_close(&t);
-
-    /* Reopen: key2 should be lost */
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "reopen");
-    ASSERT(nt_size(&t) == 1, "only committed");
-    ASSERT(nt_get(&t, key1) != NULL, "key1 present");
-    ASSERT(nt_get(&t, key2) == NULL, "key2 lost");
-
-    nt_close(&t);
-    return 1;
-}
-
-static int test_rollback(void) {
-    nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
-
-    uint8_t key1[32], val1[32], key2[32], val2[32];
-    make_key(key1, 1);
-    make_value(val1, 1);
-    make_key(key2, 2);
-    make_value(val2, 2);
-
-    nt_insert(&t, key1, val1);
-    ASSERT(nt_commit(&t), "commit");
-
-    nt_insert(&t, key2, val2);
-    ASSERT(nt_size(&t) == 2, "size 2");
-
-    nt_rollback(&t);
-    ASSERT(nt_size(&t) == 1, "rolled back");
-    ASSERT(nt_get(&t, key1) != NULL, "key1 present");
-    ASSERT(nt_get(&t, key2) == NULL, "key2 rolled back");
-
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 static int test_iterator(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 100;
     uint8_t key[32], val[32];
@@ -313,13 +260,13 @@ static int test_iterator(void) {
     ASSERT(nt_iterator_done(it), "done");
     nt_iterator_destroy(it);
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 static int test_seek(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     /* Insert keys 0, 10, 20, ..., 90 */
     uint8_t key[32], val[32];
@@ -347,13 +294,13 @@ static int test_seek(void) {
     ASSERT(memcmp(nt_iterator_key(it), expected, 32) == 0, "next is 40");
 
     nt_iterator_destroy(it);
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 static int test_contains(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
     make_key(key, 42);
@@ -365,62 +312,13 @@ static int test_contains(void) {
     nt_delete(&t, key);
     ASSERT(!nt_contains(&t, key), "deleted");
 
-    nt_close(&t);
-    return 1;
-}
-
-static int test_multiple_commits(void) {
-    nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
-
-    uint8_t key[32], val[32];
-
-    /* Commit cycle 1: insert 0-99 */
-    for (int i = 0; i < 100; i++) {
-        make_key(key, i);
-        make_value(val, i);
-        nt_insert(&t, key, val);
-    }
-    ASSERT(nt_commit(&t), "commit 1");
-
-    /* Commit cycle 2: delete evens, insert 100-149 */
-    for (int i = 0; i < 100; i += 2) {
-        make_key(key, i);
-        nt_delete(&t, key);
-    }
-    for (int i = 100; i < 150; i++) {
-        make_key(key, i);
-        make_value(val, i);
-        nt_insert(&t, key, val);
-    }
-    ASSERT(nt_commit(&t), "commit 2");
-
-    nt_close(&t);
-
-    /* Reopen and verify */
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "reopen");
-    ASSERT(nt_size(&t) == 100, "50 odds + 50 new = 100");
-
-    for (int i = 0; i < 100; i++) {
-        make_key(key, i);
-        if (i % 2 == 0) {
-            ASSERT(nt_get(&t, key) == NULL, "even deleted");
-        } else {
-            ASSERT(nt_get(&t, key) != NULL, "odd present");
-        }
-    }
-    for (int i = 100; i < 150; i++) {
-        make_key(key, i);
-        ASSERT(nt_get(&t, key) != NULL, "new present");
-    }
-
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 static int test_stress(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 100000;
     uint8_t key[32], val[32];
@@ -441,38 +339,23 @@ static int test_stress(void) {
         ASSERT(memcmp(got, val, 32) == 0, "val");
     }
 
-    ASSERT(nt_commit(&t), "commit");
-    nt_close(&t);
-
-    /* Reopen and verify */
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "reopen");
-    ASSERT(nt_size(&t) == (size_t)N, "size after reopen");
-
-    for (int i = 0; i < N; i++) {
-        make_key(key, i);
-        make_value(val, i);
-        const uint8_t *got = nt_get(&t, key);
-        ASSERT(got != NULL, "get after reopen");
-        ASSERT(memcmp(got, val, 32) == 0, "val after reopen");
-    }
-
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 static int test_mixed_operations(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
 
-    /* Phase 1: insert 0-499, commit */
+    /* Phase 1: insert 0-499 */
     for (int i = 0; i < 500; i++) {
         make_key(key, i);
         make_value(val, i);
         nt_insert(&t, key, val);
     }
-    ASSERT(nt_commit(&t), "commit 1");
+    ASSERT(nt_size(&t) == 500, "size 500");
 
     /* Phase 2: delete 0-249, update 250-499, insert 500-749 */
     for (int i = 0; i < 250; i++) {
@@ -489,11 +372,6 @@ static int test_mixed_operations(void) {
         make_value(val, i);
         nt_insert(&t, key, val);
     }
-    ASSERT(nt_commit(&t), "commit 2");
-    nt_close(&t);
-
-    /* Verify */
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "reopen");
     ASSERT(nt_size(&t) == 500, "500 left");
 
     for (int i = 0; i < 250; i++) {
@@ -515,13 +393,13 @@ static int test_mixed_operations(void) {
         ASSERT(memcmp(got, val, 32) == 0, "new value");
     }
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 static int test_empty_iterator(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     nt_iterator_t *it = nt_iterator_create(&t);
     ASSERT(it != NULL, "create");
@@ -529,26 +407,23 @@ static int test_empty_iterator(void) {
     ASSERT(nt_iterator_done(it), "done");
     nt_iterator_destroy(it);
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 int main(void) {
     printf("=== Nibble Trie Tests ===\n\n");
 
-    RUN_TEST(test_create_close);
+    RUN_TEST(test_create_destroy);
     RUN_TEST(test_insert_get_single);
     RUN_TEST(test_insert_multiple);
     RUN_TEST(test_update);
     RUN_TEST(test_delete);
     RUN_TEST(test_delete_multiple);
-    RUN_TEST(test_commit_reopen);
-    RUN_TEST(test_uncommitted_lost);
-    RUN_TEST(test_rollback);
+    RUN_TEST(test_clear);
     RUN_TEST(test_iterator);
     RUN_TEST(test_seek);
     RUN_TEST(test_contains);
-    RUN_TEST(test_multiple_commits);
     RUN_TEST(test_stress);
     RUN_TEST(test_mixed_operations);
     RUN_TEST(test_empty_iterator);

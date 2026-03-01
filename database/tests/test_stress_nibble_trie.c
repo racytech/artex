@@ -3,11 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <time.h>
-
-#define TEST_PATH "/tmp/test_stress_nt.dat"
-#define TEST_PATH_64 "/tmp/test_stress_nt_64.dat"
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -24,8 +20,6 @@ static int tests_failed = 0;
 } while(0)
 
 #define RUN_TEST(fn) do { \
-    unlink(TEST_PATH); \
-    unlink(TEST_PATH_64); \
     tests_run++; \
     printf("%-55s ", #fn); \
     fflush(stdout); \
@@ -37,8 +31,6 @@ static int tests_failed = 0;
                 (t1.tv_nsec - t0.tv_nsec)/1e6; \
     if (_ok) { printf("PASS  (%.0fms)\n", ms); tests_passed++; } \
     else     { printf("FAIL  (%.0fms)\n", ms); } \
-    unlink(TEST_PATH); \
-    unlink(TEST_PATH_64); \
 } while(0)
 
 /* ========================================================================
@@ -116,7 +108,7 @@ static void make_val(uint8_t *val, uint32_t i) {
 
 static int test_sequential_50k(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 50000;
     uint8_t key[32], val[32];
@@ -148,7 +140,7 @@ static int test_sequential_50k(void) {
         ASSERT(nt_get(&t, key) == NULL, "still present i=%d", i);
     }
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
@@ -158,7 +150,7 @@ static int test_sequential_50k(void) {
 
 static int test_random_keys_20k(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 20000;
     rng_seed(0xDEADBEEF);
@@ -186,7 +178,7 @@ static int test_random_keys_20k(void) {
     ASSERT(nt_size(&t) == 0, "not empty after delete, size=%zu", nt_size(&t));
 
     free(keys);
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
@@ -196,7 +188,7 @@ static int test_random_keys_20k(void) {
 
 static int test_dense_prefix_10k(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 10000;
     uint8_t key[32], val[32];
@@ -222,7 +214,7 @@ static int test_dense_prefix_10k(void) {
     }
     ASSERT(nt_size(&t) == 0, "not empty");
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
@@ -232,7 +224,7 @@ static int test_dense_prefix_10k(void) {
 
 static int test_full_fanout_16(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -262,7 +254,7 @@ static int test_full_fanout_16(void) {
     }
     ASSERT(nt_size(&t) == 0, "not empty");
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
@@ -272,7 +264,7 @@ static int test_full_fanout_16(void) {
 
 static int test_multi_fanout_256(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -298,7 +290,7 @@ static int test_multi_fanout_256(void) {
     }
     ASSERT(nt_size(&t) == 0, "not empty");
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
@@ -308,7 +300,7 @@ static int test_multi_fanout_256(void) {
 
 static int test_random_ops_50k(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     rng_seed(0x12345678);
     const int N = 50000;
@@ -347,7 +339,7 @@ static int test_random_ops_50k(void) {
            nt_size(&t), expected_size);
 
     free(keys);
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
@@ -357,7 +349,7 @@ static int test_random_ops_50k(void) {
 
 static int test_iterator_order(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     rng_seed(0xCAFEBABE);
     const int N = 5000;
@@ -401,138 +393,17 @@ static int test_iterator_order(void) {
            count, nt_size(&t));
 
     nt_iterator_destroy(it);
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 8. Commit + reopen (large)
- * ======================================================================== */
-
-static int test_commit_reopen_large(void) {
-    const int N = 10000;
-    uint8_t key[32], val[32];
-
-    {
-        nibble_trie_t t;
-        ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
-        for (int i = 0; i < N; i++) {
-            key_sequential(key, i);
-            make_val(val, i);
-            nt_insert(&t, key, val);
-        }
-        ASSERT(nt_commit(&t), "commit");
-        nt_close(&t);
-    }
-
-    {
-        nibble_trie_t t;
-        ASSERT(nt_open(&t, TEST_PATH, 32, 32), "reopen");
-        ASSERT(nt_size(&t) == (size_t)N, "size=%zu", nt_size(&t));
-
-        for (int i = 0; i < N; i++) {
-            key_sequential(key, i);
-            make_val(val, i);
-            const uint8_t *got = nt_get(&t, key);
-            ASSERT(got != NULL, "missing i=%d", i);
-            ASSERT(memcmp(got, val, 32) == 0, "val i=%d", i);
-        }
-        nt_close(&t);
-    }
-
-    return 1;
-}
-
-/* ========================================================================
- * 9. Multi-commit cycles
- * ======================================================================== */
-
-static int test_multi_commit_cycles(void) {
-    nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
-
-    uint8_t key[32], val[32];
-    const int BATCH = 1000;
-    const int CYCLES = 5;
-
-    for (int c = 0; c < CYCLES; c++) {
-        int base = c * BATCH;
-        for (int i = 0; i < BATCH; i++) {
-            key_sequential(key, base + i);
-            make_val(val, base + i);
-            nt_insert(&t, key, val);
-        }
-        ASSERT(nt_commit(&t), "commit cycle=%d", c);
-    }
-    ASSERT(nt_size(&t) == (size_t)(CYCLES * BATCH), "size");
-
-    nt_close(&t);
-
-    /* Reopen and verify all */
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "reopen");
-    ASSERT(nt_size(&t) == (size_t)(CYCLES * BATCH), "size after reopen");
-
-    for (int i = 0; i < CYCLES * BATCH; i++) {
-        key_sequential(key, i);
-        make_val(val, i);
-        const uint8_t *got = nt_get(&t, key);
-        ASSERT(got != NULL, "missing i=%d", i);
-        ASSERT(memcmp(got, val, 32) == 0, "val i=%d", i);
-    }
-
-    nt_close(&t);
-    return 1;
-}
-
-/* ========================================================================
- * 10. Rollback stress
- * ======================================================================== */
-
-static int test_rollback_stress(void) {
-    nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
-
-    uint8_t key[32], val[32];
-
-    /* Insert 500, commit */
-    for (int i = 0; i < 500; i++) {
-        key_sequential(key, i);
-        make_val(val, i);
-        nt_insert(&t, key, val);
-    }
-    ASSERT(nt_commit(&t), "commit");
-
-    /* Insert 500 more, rollback */
-    for (int i = 500; i < 1000; i++) {
-        key_sequential(key, i);
-        make_val(val, i);
-        nt_insert(&t, key, val);
-    }
-    ASSERT(nt_size(&t) == 1000, "size before rollback");
-    nt_rollback(&t);
-    ASSERT(nt_size(&t) == 500, "size after rollback");
-
-    /* Verify only committed keys exist */
-    for (int i = 0; i < 500; i++) {
-        key_sequential(key, i);
-        ASSERT(nt_get(&t, key) != NULL, "committed key missing i=%d", i);
-    }
-    for (int i = 500; i < 1000; i++) {
-        key_sequential(key, i);
-        ASSERT(nt_get(&t, key) == NULL, "rolled back key present i=%d", i);
-    }
-
-    nt_close(&t);
-    return 1;
-}
-
-/* ========================================================================
- * 11. Mass update — insert N, then update all with new values
+ * 8. Mass update — insert N, then update all with new values
  * ======================================================================== */
 
 static int test_mass_update(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 5000;
     uint8_t key[32], val[32];
@@ -561,17 +432,17 @@ static int test_mass_update(void) {
         ASSERT(memcmp(got, val, 32) == 0, "old val at i=%d", i);
     }
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 12. Seek stress — seek to random positions, verify lower-bound
+ * 9. Seek stress — seek to random positions, verify lower-bound
  * ======================================================================== */
 
 static int test_seek_stress(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     /* Insert every 10th key */
     uint8_t key[32], val[32];
@@ -596,17 +467,17 @@ static int test_seek_stress(void) {
     }
 
     nt_iterator_destroy(it);
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 13. Delete all + reinsert
+ * 10. Delete all + reinsert
  * ======================================================================== */
 
 static int test_delete_all_reinsert(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 5000;
     uint8_t key[32], val[32];
@@ -643,17 +514,17 @@ static int test_delete_all_reinsert(void) {
         ASSERT(memcmp(got, val, 32) == 0, "wrong val after reinsert i=%d", i);
     }
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 14. Reverse insert, forward delete
+ * 11. Reverse insert, forward delete
  * ======================================================================== */
 
 static int test_reverse_insert_forward_delete(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 10000;
     uint8_t key[32], val[32];
@@ -679,17 +550,17 @@ static int test_reverse_insert_forward_delete(void) {
     }
     ASSERT(nt_size(&t) == 0, "not empty");
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 15. Seek then walk — verify seek+next produces correct sequence
+ * 12. Seek then walk — verify seek+next produces correct sequence
  * ======================================================================== */
 
 static int test_seek_then_walk(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -725,17 +596,17 @@ static int test_seek_then_walk(void) {
     ASSERT(nt_iterator_done(it), "done flag");
 
     nt_iterator_destroy(it);
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 16. Last byte differs — stress deep extension splitting
+ * 13. Last byte differs — stress deep extension splitting
  * ======================================================================== */
 
 static int test_last_byte_diff(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -757,17 +628,17 @@ static int test_last_byte_diff(void) {
     }
     ASSERT(nt_size(&t) == 0, "not empty");
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 17. First byte differs — stress shallow branching
+ * 14. First byte differs — stress shallow branching
  * ======================================================================== */
 
 static int test_first_byte_diff(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -789,66 +660,17 @@ static int test_first_byte_diff(void) {
     }
     ASSERT(nt_size(&t) == 0, "not empty");
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 18. Commit + uncommitted interleave
- * ======================================================================== */
-
-static int test_commit_uncommitted_interleave(void) {
-    nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
-
-    uint8_t key[32], val[32];
-
-    /* Committed batch */
-    for (int i = 0; i < 500; i++) {
-        key_sequential(key, i);
-        make_val(val, i);
-        nt_insert(&t, key, val);
-    }
-    ASSERT(nt_commit(&t), "commit");
-
-    /* Uncommitted inserts + deletes */
-    for (int i = 500; i < 800; i++) {
-        key_sequential(key, i);
-        make_val(val, i);
-        nt_insert(&t, key, val);
-    }
-    for (int i = 0; i < 100; i++) {
-        key_sequential(key, i);
-        nt_delete(&t, key);
-    }
-
-    /* Close without commit */
-    nt_close(&t);
-
-    /* Reopen: should see committed state (500 keys) */
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "reopen");
-    ASSERT(nt_size(&t) == 500, "committed size=%zu", nt_size(&t));
-
-    for (int i = 0; i < 500; i++) {
-        key_sequential(key, i);
-        ASSERT(nt_get(&t, key) != NULL, "committed key missing i=%d", i);
-    }
-    for (int i = 500; i < 800; i++) {
-        key_sequential(key, i);
-        ASSERT(nt_get(&t, key) == NULL, "uncommitted key present i=%d", i);
-    }
-
-    nt_close(&t);
-    return 1;
-}
-
-/* ========================================================================
- * 19. Large scale (200K)
+ * 15. Large scale (200K)
  * ======================================================================== */
 
 static int test_large_200k(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 200000;
     uint8_t key[32], val[32];
@@ -882,17 +704,17 @@ static int test_large_200k(void) {
         ASSERT(nt_get(&t, key) != NULL, "missing second half i=%d", i);
     }
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 20. Iterator size consistency
+ * 16. Iterator size consistency
  * ======================================================================== */
 
 static int test_iterator_size_consistency(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     rng_seed(0xBEEFCAFE);
     uint8_t key[32], val[32];
@@ -924,17 +746,17 @@ static int test_iterator_size_consistency(void) {
            "iter count=%d size=%zu", count, nt_size(&t));
 
     nt_iterator_destroy(it);
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 21. Nibble boundary stress — keys differing at every nibble position
+ * 17. Nibble boundary stress — keys differing at every nibble position
  * ======================================================================== */
 
 static int test_nibble_boundary(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t base[32], key[32], val[32];
     memset(base, 0x77, 32);
@@ -984,17 +806,17 @@ static int test_nibble_boundary(void) {
     ASSERT(nt_delete(&t, base), "delete base");
     ASSERT(nt_size(&t) == 0, "not empty");
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 22. Extension merge chain — build long extensions, then trigger merges
+ * 18. Extension merge chain — build long extensions, then trigger merges
  * ======================================================================== */
 
 static int test_extension_merge_chain(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key_a[32], key_b[32], key_c[32];
     uint8_t val[32];
@@ -1031,17 +853,17 @@ static int test_extension_merge_chain(void) {
     ASSERT(nt_delete(&t, key_c), "delete c");
     ASSERT(nt_size(&t) == 0, "empty");
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 23. Alternating insert/delete at scale — every other key
+ * 19. Alternating insert/delete at scale — every other key
  * ======================================================================== */
 
 static int test_alternating_insert_delete(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 20000;
     uint8_t key[32], val[32];
@@ -1077,58 +899,50 @@ static int test_alternating_insert_delete(void) {
             ASSERT(nt_get(&t, key) != NULL, "missing i=%d", i);
     }
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 24. Commit, delete half, commit, reopen — verify persistence across
- *     structural changes (extension collapses)
+ * 20. Clear and reuse
  * ======================================================================== */
 
-static int test_commit_delete_commit_reopen(void) {
-    const int N = 5000;
+static int test_clear_and_reuse(void) {
+    nibble_trie_t t;
+    ASSERT(nt_init(&t, 32, 32), "init");
+
     uint8_t key[32], val[32];
 
-    {
-        nibble_trie_t t;
-        ASSERT(nt_open(&t, TEST_PATH, 32, 32), "open");
-
-        for (int i = 0; i < N; i++) {
-            key_sequential(key, i);
-            make_val(val, i);
-            nt_insert(&t, key, val);
-        }
-        ASSERT(nt_commit(&t), "commit 1");
-
-        /* Delete first half */
-        for (int i = 0; i < N / 2; i++) {
-            key_sequential(key, i);
-            nt_delete(&t, key);
-        }
-        ASSERT(nt_commit(&t), "commit 2");
-        nt_close(&t);
+    /* Fill with 5K entries */
+    for (int i = 0; i < 5000; i++) {
+        key_sequential(key, i);
+        make_val(val, i);
+        nt_insert(&t, key, val);
     }
+    ASSERT(nt_size(&t) == 5000, "size before clear");
 
-    {
-        nibble_trie_t t;
-        ASSERT(nt_open(&t, TEST_PATH, 32, 32), "reopen");
-        ASSERT(nt_size(&t) == (size_t)(N / 2), "size=%zu", nt_size(&t));
+    /* Clear and refill */
+    nt_clear(&t);
+    ASSERT(nt_size(&t) == 0, "size after clear");
 
-        for (int i = 0; i < N / 2; i++) {
-            key_sequential(key, i);
-            ASSERT(nt_get(&t, key) == NULL, "deleted still present i=%d", i);
-        }
-        for (int i = N / 2; i < N; i++) {
-            key_sequential(key, i);
-            make_val(val, i);
-            const uint8_t *got = nt_get(&t, key);
-            ASSERT(got != NULL, "missing i=%d", i);
-            ASSERT(memcmp(got, val, 32) == 0, "val i=%d", i);
-        }
-        nt_close(&t);
+    for (int i = 0; i < 3000; i++) {
+        key_sequential(key, i + 10000);
+        make_val(val, i + 10000);
+        nt_insert(&t, key, val);
     }
+    ASSERT(nt_size(&t) == 3000, "size after refill");
 
+    /* Verify old keys gone, new keys present */
+    key_sequential(key, 0);
+    ASSERT(nt_get(&t, key) == NULL, "old key still present");
+
+    key_sequential(key, 10000);
+    make_val(val, 10000);
+    const uint8_t *got = nt_get(&t, key);
+    ASSERT(got != NULL, "new key missing");
+    ASSERT(memcmp(got, val, 32) == 0, "new key value");
+
+    nt_destroy(&t);
     return 1;
 }
 
@@ -1159,19 +973,19 @@ static void make_slot_ref(uint8_t val[4], uint32_t ref) {
 }
 
 /* ========================================================================
- * 25. Storage slots — multi-account insert + verify (64B keys, 4B values)
+ * 21. Storage slots — multi-account insert + verify (64B keys, 4B values)
  * ======================================================================== */
 
 static int test_storage_64b_basic(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH_64, 64, 4), "open");
+    ASSERT(nt_init(&t, 64, 4), "init");
 
     const int ACCOUNTS = 50;
     const int SLOTS = 200;
     uint8_t key[64];
     uint8_t val[4];
 
-    /* Insert: 50 accounts × 200 slots = 10K entries */
+    /* Insert: 50 accounts x 200 slots = 10K entries */
     for (int a = 0; a < ACCOUNTS; a++) {
         for (int s = 0; s < SLOTS; s++) {
             make_storage_key(key, a, s);
@@ -1207,17 +1021,17 @@ static int test_storage_64b_basic(void) {
     }
     ASSERT(nt_size(&t) == 0, "not empty");
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 26. Storage slots — per-account prefix grouping in iteration
+ * 22. Storage slots — per-account prefix grouping in iteration
  * ======================================================================== */
 
 static int test_storage_64b_sorted_order(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH_64, 64, 4), "open");
+    ASSERT(nt_init(&t, 64, 4), "init");
 
     const int ACCOUNTS = 20;
     const int SLOTS = 100;
@@ -1255,76 +1069,24 @@ static int test_storage_64b_sorted_order(void) {
            "iter count=%d size=%zu", count, nt_size(&t));
 
     nt_iterator_destroy(it);
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 27. Storage slots — commit/reopen persistence (64B keys)
- * ======================================================================== */
-
-static int test_storage_64b_commit_reopen(void) {
-    const int ACCOUNTS = 30;
-    const int SLOTS = 100;
-    uint8_t key[64];
-    uint8_t val[4];
-
-    {
-        nibble_trie_t t;
-        ASSERT(nt_open(&t, TEST_PATH_64, 64, 4), "open");
-
-        for (int a = 0; a < ACCOUNTS; a++) {
-            for (int s = 0; s < SLOTS; s++) {
-                make_storage_key(key, a, s);
-                uint32_t ref = a * SLOTS + s;
-                make_slot_ref(val, ref);
-                nt_insert(&t, key, val);
-            }
-        }
-        ASSERT(nt_commit(&t), "commit");
-        nt_close(&t);
-    }
-
-    {
-        nibble_trie_t t;
-        ASSERT(nt_open(&t, TEST_PATH_64, 64, 4), "reopen");
-        ASSERT(nt_size(&t) == (size_t)(ACCOUNTS * SLOTS),
-               "size=%zu expected=%d", nt_size(&t), ACCOUNTS * SLOTS);
-
-        /* Verify all values */
-        for (int a = 0; a < ACCOUNTS; a++) {
-            for (int s = 0; s < SLOTS; s++) {
-                make_storage_key(key, a, s);
-                const void *got = nt_get(&t, key);
-                ASSERT(got != NULL, "missing a=%d s=%d", a, s);
-                uint32_t expected_ref = a * SLOTS + s;
-                uint32_t got_ref;
-                memcpy(&got_ref, got, 4);
-                ASSERT(got_ref == expected_ref,
-                       "val a=%d s=%d got=%u exp=%u",
-                       a, s, got_ref, expected_ref);
-            }
-        }
-        nt_close(&t);
-    }
-
-    return 1;
-}
-
-/* ========================================================================
- * 28. Storage slots — mixed ops simulating block execution
+ * 23. Storage slots — mixed ops simulating block execution
  * ======================================================================== */
 
 static int test_storage_64b_mixed_ops(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH_64, 64, 4), "open");
+    ASSERT(nt_init(&t, 64, 4), "init");
 
     const int ACCOUNTS = 100;
     const int INITIAL_SLOTS = 50;
     uint8_t key[64];
     uint8_t val[4];
 
-    /* Phase 1: insert initial state (100 accounts × 50 slots) */
+    /* Phase 1: insert initial state (100 accounts x 50 slots) */
     for (int a = 0; a < ACCOUNTS; a++) {
         for (int s = 0; s < INITIAL_SLOTS; s++) {
             make_storage_key(key, a, s);
@@ -1333,7 +1095,6 @@ static int test_storage_64b_mixed_ops(void) {
             nt_insert(&t, key, val);
         }
     }
-    ASSERT(nt_commit(&t), "commit initial");
     size_t initial_size = nt_size(&t);
     ASSERT(initial_size == (size_t)(ACCOUNTS * INITIAL_SLOTS), "initial size");
 
@@ -1377,23 +1138,17 @@ static int test_storage_64b_mixed_ops(void) {
     ASSERT(nt_size(&t) == expected,
            "size=%zu expected=%zu", nt_size(&t), expected);
 
-    ASSERT(nt_commit(&t), "commit block");
-
-    /* Rollback should be no-op after commit */
-    nt_rollback(&t);
-    ASSERT(nt_size(&t) == expected, "size after rollback");
-
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 29. Storage slots — large scale (50K slots across 500 accounts)
+ * 24. Storage slots — large scale (50K slots across 500 accounts)
  * ======================================================================== */
 
 static int test_storage_64b_large(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH_64, 64, 4), "open");
+    ASSERT(nt_init(&t, 64, 4), "init");
 
     const int ACCOUNTS = 500;
     const int SLOTS_PER = 100;
@@ -1441,17 +1196,17 @@ static int test_storage_64b_large(void) {
         ASSERT(nt_get(&t, key) != NULL, "missing after half-delete a=%d", a);
     }
 
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
 /* ========================================================================
- * 30. Storage slots — seek with 64B keys
+ * 25. Storage slots — seek with 64B keys
  * ======================================================================== */
 
 static int test_storage_64b_seek(void) {
     nibble_trie_t t;
-    ASSERT(nt_open(&t, TEST_PATH_64, 64, 4), "open");
+    ASSERT(nt_init(&t, 64, 4), "init");
 
     /* Insert slots for 10 accounts, 10 slots each */
     uint8_t key[64];
@@ -1484,7 +1239,7 @@ static int test_storage_64b_seek(void) {
     }
 
     nt_iterator_destroy(it);
-    nt_close(&t);
+    nt_destroy(&t);
     return 1;
 }
 
@@ -1502,9 +1257,6 @@ int main(void) {
     RUN_TEST(test_multi_fanout_256);
     RUN_TEST(test_random_ops_50k);
     RUN_TEST(test_iterator_order);
-    RUN_TEST(test_commit_reopen_large);
-    RUN_TEST(test_multi_commit_cycles);
-    RUN_TEST(test_rollback_stress);
     RUN_TEST(test_mass_update);
     RUN_TEST(test_seek_stress);
     RUN_TEST(test_delete_all_reinsert);
@@ -1512,19 +1264,17 @@ int main(void) {
     RUN_TEST(test_seek_then_walk);
     RUN_TEST(test_last_byte_diff);
     RUN_TEST(test_first_byte_diff);
-    RUN_TEST(test_commit_uncommitted_interleave);
     RUN_TEST(test_large_200k);
     RUN_TEST(test_iterator_size_consistency);
     RUN_TEST(test_nibble_boundary);
     RUN_TEST(test_extension_merge_chain);
     RUN_TEST(test_alternating_insert_delete);
-    RUN_TEST(test_commit_delete_commit_reopen);
+    RUN_TEST(test_clear_and_reuse);
 
     printf("\n--- Storage Slots (64B keys, 4B values) ---\n\n");
 
     RUN_TEST(test_storage_64b_basic);
     RUN_TEST(test_storage_64b_sorted_order);
-    RUN_TEST(test_storage_64b_commit_reopen);
     RUN_TEST(test_storage_64b_mixed_ops);
     RUN_TEST(test_storage_64b_large);
     RUN_TEST(test_storage_64b_seek);

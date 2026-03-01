@@ -6,16 +6,18 @@
 #include <stdbool.h>
 
 /* ========================================================================
- * Ref encoding (32-bit)
+ * Nibble Trie — in-memory 16-way trie for MPT root computation
  *
+ * Pure in-memory, arena-allocated. No file I/O, no persistence.
+ * Structure matches Ethereum's hex-prefix trie (branch/extension/leaf).
+ *
+ * Ref encoding (32-bit):
  *   Bits 31-30 : type tag
  *     11 = branch     (0xC0000000)
  *     10 = extension  (0x80000000)
  *     01 = leaf       (0x40000000)
  *     00 = NULL       (ref == 0)
  *   Bits 29-0  : pool index
- *     branch/extension → node pool (64-byte slots)
- *     leaf             → leaf pool (key_size + value_size, 8-byte aligned)
  * ======================================================================== */
 
 typedef uint32_t nt_ref_t;
@@ -41,6 +43,17 @@ typedef uint32_t nt_ref_t;
 #define NT_MAKE_LEAF_REF(i)      ((nt_ref_t)(i) | NT_TYPE_LEAF)
 
 /* ========================================================================
+ * Arena — growable bump allocator
+ * ======================================================================== */
+
+typedef struct {
+    uint8_t  *base;      /* heap allocation */
+    uint32_t  count;     /* slots used */
+    uint32_t  capacity;  /* slots allocated */
+    uint32_t  slot_size; /* bytes per slot */
+} nt_arena_t;
+
+/* ========================================================================
  * Tree structure
  * ======================================================================== */
 
@@ -48,38 +61,28 @@ typedef struct nibble_trie nibble_trie_t;
 typedef struct nt_iterator nt_iterator_t;
 
 struct nibble_trie {
-    int       fd;
-    uint8_t  *node_base;            /* mmap'd node pool (branches + extensions, 64B slots) */
-    uint8_t  *leaf_base;            /* mmap'd leaf pool (key + value, variable slot size) */
+    nt_arena_t nodes;    /* branches + extensions (64B slots) */
+    nt_arena_t leaves;   /* key + value per slot */
 
-    uint32_t  key_size;             /* key size in bytes (set at open, e.g. 32 or 64) */
-    uint32_t  value_size;           /* value size in bytes (set at open) */
-    uint32_t  leaf_slot_size;       /* key_size + value_size, 8-byte aligned */
+    uint32_t  key_size;
+    uint32_t  value_size;
 
     nt_ref_t  root;
-    uint64_t  size;                 /* number of key-value pairs */
-    uint32_t  node_count;           /* node slots allocated (branches + extensions) */
-    uint32_t  leaf_count;           /* leaf slots allocated */
-
-    /* committed-state snapshot (for rollback) */
-    nt_ref_t  committed_root;
-    uint64_t  committed_size;
-    uint32_t  committed_node_count;
-    uint32_t  committed_leaf_count;
-
-    uint64_t  generation;
-    int       active_meta;          /* 0 or 1 */
+    uint64_t  size;      /* number of key-value pairs */
 };
 
 /* ========================================================================
  * Lifecycle
  * ======================================================================== */
 
-bool nt_open(nibble_trie_t *t, const char *path, uint32_t key_size, uint32_t value_size);
-void nt_close(nibble_trie_t *t);
+bool nt_init(nibble_trie_t *t, uint32_t key_size, uint32_t value_size);
+void nt_destroy(nibble_trie_t *t);
+
+/* Reset to empty without freeing arena memory (reuse allocations) */
+void nt_clear(nibble_trie_t *t);
 
 /* ========================================================================
- * COW mutations (pending until commit)
+ * Mutations (in-place, no COW)
  * ======================================================================== */
 
 bool nt_insert(nibble_trie_t *t, const uint8_t *key, const void *value);
@@ -92,13 +95,6 @@ bool nt_delete(nibble_trie_t *t, const uint8_t *key);
 const void    *nt_get(const nibble_trie_t *t, const uint8_t *key);
 bool           nt_contains(const nibble_trie_t *t, const uint8_t *key);
 size_t         nt_size(const nibble_trie_t *t);
-
-/* ========================================================================
- * Persistence
- * ======================================================================== */
-
-bool nt_commit(nibble_trie_t *t);
-void nt_rollback(nibble_trie_t *t);
 
 /* ========================================================================
  * Iterator (sorted nibble order = sorted key order)

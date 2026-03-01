@@ -3,7 +3,7 @@
  *
  * Compares two implementations across two workloads:
  *
- *   nibble_trie:  64-byte fixed-slot nibble trie (COW, file-backed)
+ *   nibble_trie:  16-way nibble trie (in-memory, arena-allocated)
  *   compact_art:  in-memory ART (no persistence)
  *
  * Workloads:
@@ -24,11 +24,6 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <time.h>
-#include <unistd.h>
-#include <sys/stat.h>
-
-#define NT_PATH     "/tmp/bench_nt.dat"
-#define NT_STOR_PATH "/tmp/bench_nt_stor.dat"
 
 /* ========================================================================
  * SplitMix64 RNG + key generation
@@ -69,7 +64,7 @@ static void generate_val32(uint8_t val[32], uint64_t seed, uint64_t index) {
 
 /* Storage key: 64 bytes (addr_hash[32] || slot_hash[32])
  * Simulates realistic distribution: N_ACCOUNTS accounts, each with
- * target/N_ACCOUNTS slots. Same account → same first 32 bytes. */
+ * target/N_ACCOUNTS slots. Same account -> same first 32 bytes. */
 #define STOR_N_ACCOUNTS  10000
 
 static void generate_storage_key(uint8_t key[64], uint64_t seed,
@@ -117,12 +112,6 @@ static size_t get_rss_mb(void) {
     return rss_kb / 1024;
 }
 
-static size_t file_size_mb(const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) return 0;
-    return (size_t)(st.st_blocks * 512) / (1024 * 1024);
-}
-
 static double elapsed_ms(struct timespec *t0, struct timespec *t1) {
     return (t1->tv_sec - t0->tv_sec) * 1e3 +
            (t1->tv_nsec - t0->tv_nsec) / 1e6;
@@ -138,12 +127,11 @@ static void bench_nt(uint64_t target) {
     struct timespec t0, t1;
 
     printf("\n=== nibble_trie — Accounts (32B key + 32B val) ===\n");
-    printf("  target: %" PRIu64 " keys\n\n", target);
+    printf("  target: %" PRIu64 " keys (in-memory, arena-allocated)\n\n", target);
 
-    unlink(NT_PATH);
     nibble_trie_t t;
-    if (!nt_open(&t, NT_PATH, 32, 32)) {
-        printf("  FAILED to open\n");
+    if (!nt_init(&t, 32, 32)) {
+        printf("  FAILED to init\n");
         return;
     }
 
@@ -179,12 +167,6 @@ static void bench_nt(uint64_t target) {
     printf("  INSERT TOTAL %8" PRIu64 " %8.0f %8.0f %8zu\n\n",
            target, insert_ms, (double)target / insert_ms, get_rss_mb());
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    nt_commit(&t);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("  COMMIT       %8s %8.0f %8s %8zu\n",
-           "", elapsed_ms(&t0, &t1), "", get_rss_mb());
-
     uint64_t lookups = target < 1000000 ? target : 1000000;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     uint64_t found = 0;
@@ -219,18 +201,10 @@ static void bench_nt(uint64_t target) {
            deleted, elapsed_ms(&t0, &t1),
            (double)deleted / elapsed_ms(&t0, &t1));
 
-    printf("\n  File size (on disk): %zu MB\n", file_size_mb(NT_PATH));
-    printf("  Tree size:           %" PRIu64 " keys\n", (uint64_t)nt_size(&t));
+    printf("\n  Memory (RSS):  %zu MB\n", get_rss_mb());
+    printf("  Tree size:     %" PRIu64 " keys\n", (uint64_t)nt_size(&t));
 
-    nt_close(&t);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    nt_open(&t, NT_PATH, 32, 32);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("  Reopen:              %.1f ms (size=%" PRIu64 ")\n",
-           elapsed_ms(&t0, &t1), (uint64_t)nt_size(&t));
-
-    nt_close(&t);
-    unlink(NT_PATH);
+    nt_destroy(&t);
 }
 
 /* ========================================================================
@@ -241,14 +215,13 @@ static void bench_nt_storage(uint64_t target) {
     struct timespec t0, t1;
 
     printf("\n=== nibble_trie — Storage (64B key + 4B val) ===\n");
-    printf("  target:   %" PRIu64 " slots\n", target);
+    printf("  target:   %" PRIu64 " slots (in-memory, arena-allocated)\n", target);
     printf("  accounts: %d (%" PRIu64 " slots/account avg)\n\n",
            STOR_N_ACCOUNTS, target / STOR_N_ACCOUNTS);
 
-    unlink(NT_STOR_PATH);
     nibble_trie_t t;
-    if (!nt_open(&t, NT_STOR_PATH, 64, 4)) {
-        printf("  FAILED to open\n");
+    if (!nt_init(&t, 64, 4)) {
+        printf("  FAILED to init\n");
         return;
     }
 
@@ -284,12 +257,6 @@ static void bench_nt_storage(uint64_t target) {
     printf("  INSERT TOTAL %8" PRIu64 " %8.0f %8.0f %8zu\n\n",
            target, insert_ms, (double)target / insert_ms, get_rss_mb());
 
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    nt_commit(&t);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("  COMMIT       %8s %8.0f %8s %8zu\n",
-           "", elapsed_ms(&t0, &t1), "", get_rss_mb());
-
     uint64_t lookups = target < 1000000 ? target : 1000000;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     uint64_t found = 0;
@@ -324,18 +291,10 @@ static void bench_nt_storage(uint64_t target) {
            deleted, elapsed_ms(&t0, &t1),
            (double)deleted / elapsed_ms(&t0, &t1));
 
-    printf("\n  File size (on disk): %zu MB\n", file_size_mb(NT_STOR_PATH));
-    printf("  Tree size:           %" PRIu64 " keys\n", (uint64_t)nt_size(&t));
+    printf("\n  Memory (RSS):  %zu MB\n", get_rss_mb());
+    printf("  Tree size:     %" PRIu64 " keys\n", (uint64_t)nt_size(&t));
 
-    nt_close(&t);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    nt_open(&t, NT_STOR_PATH, 64, 4);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("  Reopen:              %.1f ms (size=%" PRIu64 ")\n",
-           elapsed_ms(&t0, &t1), (uint64_t)nt_size(&t));
-
-    nt_close(&t);
-    unlink(NT_STOR_PATH);
+    nt_destroy(&t);
 }
 
 /* ========================================================================
