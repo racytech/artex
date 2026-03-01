@@ -25,8 +25,8 @@
 
 #define NT_META_MAGIC       0x4952545F4C424E55ULL  /* "UNBL_TRI" */
 
-#define NT_KEY_SIZE         32
-#define NT_NUM_NIBBLES      64  /* 32 bytes × 2 nibbles/byte */
+#define NT_MAX_KEY_SIZE     64  /* max supported key size in bytes */
+#define NT_MAX_NIBBLES      128 /* NT_MAX_KEY_SIZE × 2 */
 
 /* ========================================================================
  * Node structures (all 64 bytes, in the node pool)
@@ -53,8 +53,8 @@ _Static_assert(sizeof(nt_extension_t) == 64, "extension must be 64 bytes");
 _Static_assert(sizeof(nt_node_slot_t) == 64, "node slot must be 64 bytes");
 
 /* Leaf layout (in the leaf pool, variable size):
- *   [key: NT_KEY_SIZE bytes][value: value_size bytes]
- * Total: leaf_slot_size = (NT_KEY_SIZE + value_size + 7) & ~7
+ *   [key: key_size bytes][value: value_size bytes]
+ * Total: leaf_slot_size = (key_size + value_size + 7) & ~7
  */
 
 /* ========================================================================
@@ -68,6 +68,7 @@ typedef struct {
     uint32_t root;               /* root ref (with type bits) */
     uint32_t node_count;         /* node slots allocated */
     uint32_t leaf_count;         /* leaf slots allocated */
+    uint32_t key_size;           /* key size in bytes */
     uint32_t value_size;         /* value size in bytes */
     uint32_t crc32c;
     uint32_t _pad;
@@ -140,7 +141,7 @@ static inline uint8_t *leaf_key_ptr(const nibble_trie_t *t, nt_ref_t ref) {
 }
 
 static inline void *leaf_value_ptr(const nibble_trie_t *t, nt_ref_t ref) {
-    return leaf_key_ptr(t, ref) + NT_KEY_SIZE;
+    return leaf_key_ptr(t, ref) + t->key_size;
 }
 
 /* ========================================================================
@@ -176,8 +177,8 @@ static nt_ref_t alloc_leaf(nibble_trie_t *t,
     if (idx == 0) return NT_REF_NULL;
 
     uint8_t *lk = t->leaf_base + (size_t)idx * t->leaf_slot_size;
-    memcpy(lk, key, NT_KEY_SIZE);
-    memcpy(lk + NT_KEY_SIZE, value, t->value_size);
+    memcpy(lk, key, t->key_size);
+    memcpy(lk + t->key_size, value, t->value_size);
     return NT_MAKE_LEAF_REF(idx);
 }
 
@@ -275,7 +276,7 @@ static nt_ref_t cow_insert(nibble_trie_t *t, nt_ref_t ref,
     if (NT_IS_LEAF(ref)) {
         uint8_t *existing_key = leaf_key_ptr(t, ref);
 
-        if (memcmp(existing_key, key, NT_KEY_SIZE) == 0) {
+        if (memcmp(existing_key, key, t->key_size) == 0) {
             /* Update existing key */
             *inserted = false;
             if (is_dirty(t, ref)) {
@@ -289,11 +290,12 @@ static nt_ref_t cow_insert(nibble_trie_t *t, nt_ref_t ref,
         *inserted = true;
 
         /* Save existing key before allocs */
-        uint8_t saved_key[NT_KEY_SIZE];
-        memcpy(saved_key, existing_key, NT_KEY_SIZE);
+        uint8_t saved_key[NT_MAX_KEY_SIZE];
+        memcpy(saved_key, existing_key, t->key_size);
 
+        int num_nibbles = (int)(t->key_size * 2);
         int diff = depth;
-        while (diff < NT_NUM_NIBBLES &&
+        while (diff < num_nibbles &&
                key_nibble(key, diff) == key_nibble(saved_key, diff))
             diff++;
 
@@ -434,7 +436,7 @@ static nt_ref_t cow_delete(nibble_trie_t *t, nt_ref_t ref,
 
     /* Case 2: leaf */
     if (NT_IS_LEAF(ref)) {
-        if (memcmp(leaf_key_ptr(t, ref), key, NT_KEY_SIZE) == 0) {
+        if (memcmp(leaf_key_ptr(t, ref), key, t->key_size) == 0) {
             *deleted = true;
             return NT_REF_NULL;
         }
@@ -604,7 +606,7 @@ const void *nt_get(const nibble_trie_t *t, const uint8_t *key) {
 
     while (ref != NT_REF_NULL) {
         if (NT_IS_LEAF(ref)) {
-            if (memcmp(leaf_key_ptr(t, ref), key, NT_KEY_SIZE) == 0)
+            if (memcmp(leaf_key_ptr(t, ref), key, t->key_size) == 0)
                 return leaf_value_ptr(t, ref);
             return NULL;
         }
@@ -692,12 +694,15 @@ static bool meta_write(int fd, int page, const nt_meta_t *meta) {
  * Lifecycle
  * ======================================================================== */
 
-bool nt_open(nibble_trie_t *t, const char *path, uint32_t value_size) {
-    if (!t || !path || value_size == 0) return false;
+bool nt_open(nibble_trie_t *t, const char *path,
+             uint32_t key_size, uint32_t value_size) {
+    if (!t || !path || key_size == 0 || key_size > NT_MAX_KEY_SIZE ||
+        value_size == 0) return false;
     memset(t, 0, sizeof(*t));
     t->fd = -1;
+    t->key_size = key_size;
     t->value_size = value_size;
-    t->leaf_slot_size = (NT_KEY_SIZE + value_size + 7) & ~(uint32_t)7;
+    t->leaf_slot_size = (key_size + value_size + 7) & ~(uint32_t)7;
 
     bool created = false;
     int fd = open(path, O_RDWR, 0644);
@@ -753,6 +758,7 @@ bool nt_open(nibble_trie_t *t, const char *path, uint32_t value_size) {
         meta.size = 0;
         meta.node_count = 1;
         meta.leaf_count = 1;
+        meta.key_size = key_size;
         meta.value_size = value_size;
         meta.crc32c = nt_crc32c(&meta, NT_META_CRC_LEN);
 
@@ -791,8 +797,8 @@ bool nt_open(nibble_trie_t *t, const char *path, uint32_t value_size) {
             return false;
         }
 
-        /* Validate value_size matches */
-        if (active->value_size != value_size) {
+        /* Validate key_size and value_size match */
+        if (active->key_size != key_size || active->value_size != value_size) {
             nt_close(t);
             return false;
         }
@@ -846,6 +852,7 @@ bool nt_commit(nibble_trie_t *t) {
     meta.size = t->size;
     meta.node_count = t->node_count;
     meta.leaf_count = t->leaf_count;
+    meta.key_size = t->key_size;
     meta.value_size = t->value_size;
     meta.crc32c = nt_crc32c(&meta, NT_META_CRC_LEN);
 
@@ -890,7 +897,7 @@ typedef struct {
     struct {
         nt_ref_t ref;       /* branch ref */
         int      nibble;    /* current nibble (0-15) */
-    } stack[65];
+    } stack[NT_MAX_NIBBLES + 1];
     int depth;
 } nt_iter_state_t;
 
@@ -927,7 +934,7 @@ static bool descend_to_min(const nibble_trie_t *t,
         if (first < 0) return false;
 
         s->depth++;
-        if (s->depth >= 65) { s->done = true; return false; }
+        if (s->depth >= NT_MAX_NIBBLES + 1) { s->done = true; return false; }
         s->stack[s->depth].ref = ref;
         s->stack[s->depth].nibble = first;
 
@@ -1020,7 +1027,7 @@ bool nt_iterator_seek(nt_iterator_t *it, const uint8_t *key) {
     while (ref != NT_REF_NULL) {
         if (NT_IS_LEAF(ref)) {
             const uint8_t *lk = leaf_key_ptr(t, ref);
-            if (memcmp(lk, key, NT_KEY_SIZE) >= 0) {
+            if (memcmp(lk, key, t->key_size) >= 0) {
                 s->key = lk;
                 s->value = leaf_value_ptr(t, ref);
                 return true;
@@ -1066,7 +1073,7 @@ bool nt_iterator_seek(nt_iterator_t *it, const uint8_t *key) {
             if (found < 0) goto backtrack;
 
             s->depth++;
-            if (s->depth >= 65) { s->done = true; return false; }
+            if (s->depth >= NT_MAX_NIBBLES + 1) { s->done = true; return false; }
             s->stack[s->depth].ref = ref;
             s->stack[s->depth].nibble = found;
 
