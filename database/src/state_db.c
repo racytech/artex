@@ -32,16 +32,19 @@ struct state_db {
 
 static void build_account_paths(const char *dir,
                                 char *state_path, char *code_path,
-                                char *index_path) {
+                                char *trie_path, char *meta_path) {
     snprintf(state_path, MAX_PATH, "%s/state.dat", dir);
     snprintf(code_path, MAX_PATH, "%s/code.dat", dir);
-    snprintf(index_path, MAX_PATH, "%s/index.dat", dir);
+    snprintf(trie_path, MAX_PATH, "%s/trie.dat", dir);
+    snprintf(meta_path, MAX_PATH, "%s/meta.dat", dir);
 }
 
 static void build_storage_paths(const char *dir,
-                                char *state_path, char *index_path) {
+                                char *state_path,
+                                char *trie_path, char *meta_path) {
     snprintf(state_path, MAX_PATH, "%s/storage/state.dat", dir);
-    snprintf(index_path, MAX_PATH, "%s/storage/index.dat", dir);
+    snprintf(trie_path, MAX_PATH, "%s/storage/trie.dat", dir);
+    snprintf(meta_path, MAX_PATH, "%s/storage/meta.dat", dir);
 }
 
 static bool ensure_dir(const char *path) {
@@ -64,12 +67,11 @@ state_db_t *sdb_create(const char *dir) {
     if (!ensure_dir(storage_dir)) return NULL;
 
     // Build paths
-    char acct_state[MAX_PATH], acct_code[MAX_PATH], acct_index[MAX_PATH];
-    char stor_state[MAX_PATH], stor_index[MAX_PATH];
-    build_account_paths(dir, acct_state, acct_code, acct_index);
-    build_storage_paths(dir, stor_state, stor_index);
-    (void)acct_index;  // not used for create
-    (void)stor_index;
+    char acct_state[MAX_PATH], acct_code[MAX_PATH];
+    char acct_trie[MAX_PATH], acct_meta[MAX_PATH];
+    char stor_state[MAX_PATH], stor_trie[MAX_PATH], stor_meta[MAX_PATH];
+    build_account_paths(dir, acct_state, acct_code, acct_trie, acct_meta);
+    build_storage_paths(dir, stor_state, stor_trie, stor_meta);
 
     state_db_t *sdb = malloc(sizeof(state_db_t));
     if (!sdb) return NULL;
@@ -81,7 +83,7 @@ state_db_t *sdb_create(const char *dir) {
         return NULL;
     }
 
-    sdb->accounts = dl_create(acct_state, acct_code,
+    sdb->accounts = dl_create(acct_state, acct_code, acct_trie,
                                ACCOUNT_KEY_SIZE, REF_SIZE);
     if (!sdb->accounts) {
         free(sdb->dir);
@@ -89,7 +91,7 @@ state_db_t *sdb_create(const char *dir) {
         return NULL;
     }
 
-    sdb->storage = dl_create(stor_state, NULL,
+    sdb->storage = dl_create(stor_state, NULL, stor_trie,
                               STORAGE_KEY_SIZE, REF_SIZE);
     if (!sdb->storage) {
         dl_destroy(sdb->accounts);
@@ -104,10 +106,11 @@ state_db_t *sdb_create(const char *dir) {
 state_db_t *sdb_open(const char *dir, uint64_t *out_block_number) {
     if (!dir) return NULL;
 
-    char acct_state[MAX_PATH], acct_code[MAX_PATH], acct_index[MAX_PATH];
-    char stor_state[MAX_PATH], stor_index[MAX_PATH];
-    build_account_paths(dir, acct_state, acct_code, acct_index);
-    build_storage_paths(dir, stor_state, stor_index);
+    char acct_state[MAX_PATH], acct_code[MAX_PATH];
+    char acct_trie[MAX_PATH], acct_meta[MAX_PATH];
+    char stor_state[MAX_PATH], stor_trie[MAX_PATH], stor_meta[MAX_PATH];
+    build_account_paths(dir, acct_state, acct_code, acct_trie, acct_meta);
+    build_storage_paths(dir, stor_state, stor_trie, stor_meta);
 
     state_db_t *sdb = malloc(sizeof(state_db_t));
     if (!sdb) return NULL;
@@ -121,7 +124,7 @@ state_db_t *sdb_open(const char *dir, uint64_t *out_block_number) {
 
     uint64_t acct_block = 0, stor_block = 0;
 
-    sdb->accounts = dl_open(acct_state, acct_code, acct_index,
+    sdb->accounts = dl_open(acct_state, acct_code, acct_trie, acct_meta,
                              ACCOUNT_KEY_SIZE, REF_SIZE, &acct_block);
     if (!sdb->accounts) {
         free(sdb->dir);
@@ -129,7 +132,7 @@ state_db_t *sdb_open(const char *dir, uint64_t *out_block_number) {
         return NULL;
     }
 
-    sdb->storage = dl_open(stor_state, NULL, stor_index,
+    sdb->storage = dl_open(stor_state, NULL, stor_trie, stor_meta,
                             STORAGE_KEY_SIZE, REF_SIZE, &stor_block);
     if (!sdb->storage) {
         dl_destroy(sdb->accounts);
@@ -251,13 +254,13 @@ uint64_t sdb_merge(state_db_t *sdb) {
 bool sdb_checkpoint(state_db_t *sdb, uint64_t block_number) {
     if (!sdb) return false;
 
-    char acct_index[MAX_PATH], stor_index[MAX_PATH];
-    snprintf(acct_index, MAX_PATH, "%s/index.dat", sdb->dir);
-    snprintf(stor_index, MAX_PATH, "%s/storage/index.dat", sdb->dir);
+    char acct_meta[MAX_PATH], stor_meta[MAX_PATH];
+    snprintf(acct_meta, MAX_PATH, "%s/meta.dat", sdb->dir);
+    snprintf(stor_meta, MAX_PATH, "%s/storage/meta.dat", sdb->dir);
 
-    if (!dl_checkpoint(sdb->accounts, acct_index, block_number))
+    if (!dl_checkpoint(sdb->accounts, acct_meta, block_number))
         return false;
-    if (!dl_checkpoint(sdb->storage, stor_index, block_number))
+    if (!dl_checkpoint(sdb->storage, stor_meta, block_number))
         return false;
 
     return true;

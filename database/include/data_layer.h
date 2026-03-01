@@ -6,21 +6,23 @@
 #include <stdbool.h>
 
 /**
- * Data Layer — Write buffer + compact_art index + state.dat + code.dat.
+ * Data Layer — Write buffer + compact_art index + nibble_trie persistence
+ *              + state.dat + code.dat.
  *
  * Architecture:
  *   dl_put/dl_delete  → write buffer (mem_art, in-memory)
- *   dl_merge          → flush buffer to compact_art index + state.dat
- *   dl_get            → buffer → index → disk (read path)
+ *   dl_merge          → flush buffer to compact_art + nibble_trie + state.dat
+ *   dl_get            → buffer → compact_art → disk (read path)
  *   dl_put_code       → direct to code.dat + index (bypasses buffer)
  *   dl_get_code       → index → code.dat (read path)
+ *   dl_checkpoint     → nt_commit (O(1)) + meta sidecar (free list + code)
  *
- * Ref encoding in compact_art (4-byte value):
+ * Ref encoding in index (4-byte value):
  *   bit 31 = 0 → state_store slot index
  *   bit 31 = 1 → code_store entry index
  *
- * Merge is cheap (~17ms at 100M keys): memory ops + pwrite to page cache.
- * No fdatasync — that's a checkpoint concern (Stage 3).
+ * compact_art:   in-memory index for fast reads during block execution
+ * nibble_trie:   persistent COW index for durability + future MPT root
  *
  * Opaque handle — struct defined in data_layer.c.
  */
@@ -43,11 +45,13 @@ typedef struct {
 /**
  * Create a new data layer. Truncates state and code files at paths.
  * key_size: fixed key length (e.g., 32 for keccak256 hashes)
- * value_size: compact_art value size (e.g., 4 for uint32_t slot refs)
+ * value_size: index value size (e.g., 4 for uint32_t slot refs)
  * code_path: path for code.dat (NULL to disable code store)
+ * trie_path: path for nibble_trie persistent index (NULL to disable)
  * Returns NULL on failure.
  */
 data_layer_t *dl_create(const char *state_path, const char *code_path,
+                         const char *trie_path,
                          uint32_t key_size, uint32_t value_size);
 
 /**
@@ -120,21 +124,20 @@ uint64_t dl_merge(data_layer_t *dl);
 // ============================================================================
 
 /**
- * Checkpoint current state to index file (atomic rename).
- * Serializes compact_art index + state_store free list + code_store entries.
+ * Checkpoint: nt_commit (O(1) meta flip) + slim meta sidecar.
  * Returns false on I/O error.
  */
-bool dl_checkpoint(data_layer_t *dl, const char *index_path,
+bool dl_checkpoint(data_layer_t *dl, const char *meta_path,
                    uint64_t block_number);
 
 /**
- * Open from existing checkpoint (recovery path).
- * Rebuilds compact_art from index.dat, restores free list and code entries.
+ * Open from existing nibble_trie + meta sidecar (recovery path).
+ * Rebuilds compact_art from nibble_trie, restores free list and code entries.
  * out_block_number receives the checkpoint block number.
  * Returns NULL on failure.
  */
 data_layer_t *dl_open(const char *state_path, const char *code_path,
-                       const char *index_path,
+                       const char *trie_path, const char *meta_path,
                        uint32_t key_size, uint32_t value_size,
                        uint64_t *out_block_number);
 

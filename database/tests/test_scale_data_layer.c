@@ -45,6 +45,8 @@
 #define STATE_PATH  "/tmp/art_scale_state.dat"
 #define CODE_PATH   "/tmp/art_scale_code.dat"
 #define INDEX_PATH  "/tmp/art_scale_index.dat"
+#define TRIE_PATH   "/tmp/art_scale_trie.dat"
+#define META_PATH   "/tmp/art_scale_meta.dat"
 
 #define MASTER_SEED 0x5343414C45544553ULL
 
@@ -376,9 +378,11 @@ int main(int argc, char *argv[]) {
     unlink(STATE_PATH);
     unlink(CODE_PATH);
     unlink(INDEX_PATH);
+    unlink(TRIE_PATH);
+    unlink(META_PATH);
 
     // Create data layer
-    data_layer_t *dl = dl_create(STATE_PATH, CODE_PATH, KEY_SIZE, 4);
+    data_layer_t *dl = dl_create(STATE_PATH, CODE_PATH, TRIE_PATH, KEY_SIZE, 4);
     ASSERT_MSG(dl != NULL, "dl_create failed");
 
     // Init simulation state
@@ -458,7 +462,7 @@ int main(int argc, char *argv[]) {
     if (sim.last_checkpoint_block != sim.total_blocks) {
         printf("  writing final checkpoint at block %" PRIu64 "...\n",
                sim.total_blocks);
-        bool ok = dl_checkpoint(dl, INDEX_PATH, sim.total_blocks);
+        bool ok = dl_checkpoint(dl, META_PATH, sim.total_blocks);
         ASSERT_MSG(ok, "final checkpoint failed");
         sim.last_checkpoint_block = sim.total_blocks;
         // Refresh stats after checkpoint
@@ -474,7 +478,7 @@ int main(int argc, char *argv[]) {
     // Recover
     double t_recover_start = now_sec();
     uint64_t recovered_block = 0;
-    dl = dl_open(STATE_PATH, CODE_PATH, INDEX_PATH,
+    dl = dl_open(STATE_PATH, CODE_PATH, TRIE_PATH, META_PATH,
                  KEY_SIZE, 4, &recovered_block);
     double t_recover_end = now_sec();
 
@@ -621,6 +625,8 @@ int main(int argc, char *argv[]) {
     unlink(STATE_PATH);
     unlink(CODE_PATH);
     unlink(INDEX_PATH);
+    unlink(TRIE_PATH);
+    unlink(META_PATH);
 
     printf("============================================\n");
     printf("  ALL PHASES PASSED\n");

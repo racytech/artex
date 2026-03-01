@@ -36,6 +36,7 @@
 
 #define STATE_PATH "/tmp/art_bench_mpt_state.dat"
 #define INDEX_PATH "/tmp/art_bench_mpt_index.dat"
+#define TRIE_PATH  "/tmp/art_bench_mpt_trie.dat"
 
 #define MASTER_SEED 0x4D50544245000000ULL   // "MPTBE\0\0\0"
 #define STATE_KEY_SEED (MASTER_SEED ^ 0x5354415445000000ULL)
@@ -223,9 +224,10 @@ int main(int argc, char *argv[]) {
     // Clean up
     unlink(STATE_PATH);
     unlink(INDEX_PATH);
+    unlink(TRIE_PATH);
 
     // Create data layer (no code store — focusing on state commitment)
-    data_layer_t *dl = dl_create(STATE_PATH, NULL, KEY_SIZE, 4);
+    data_layer_t *dl = dl_create(STATE_PATH, NULL, TRIE_PATH, KEY_SIZE, 4);
     ASSERT_MSG(dl != NULL, "dl_create failed");
 
     // Create intermediate hash state
@@ -434,6 +436,7 @@ int main(int argc, char *argv[]) {
     dl_destroy(dl);
     unlink(STATE_PATH);
     unlink(INDEX_PATH);
+    unlink(TRIE_PATH);
 
     printf("============================================\n");
     if (roots_match) {

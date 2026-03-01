@@ -63,6 +63,8 @@
 #define STATE_PATH  "/tmp/stress_dl_state.dat"
 #define CODE_PATH   "/tmp/stress_dl_code.dat"
 #define INDEX_PATH  "/tmp/stress_dl_index.dat"
+#define TRIE_PATH   "/tmp/stress_dl_trie.dat"
+#define META_PATH   "/tmp/stress_dl_meta.dat"
 
 #define MASTER_SEED 0x5354524553534454ULL
 
@@ -549,7 +551,7 @@ static void phase2_blocks(data_layer_t *dl, uint64_t num_blocks,
         // Checkpoint
         if (block_num % ckpt_interval == 0) {
             double ct0 = now_sec();
-            bool ok = dl_checkpoint(dl, INDEX_PATH, block_num);
+            bool ok = dl_checkpoint(dl, META_PATH, block_num);
             double ct1 = now_sec();
             ASSERT_MSG(ok, "dl_checkpoint failed at block %" PRIu64, block_num);
 
@@ -677,7 +679,7 @@ static void phase3_recovery(data_layer_t **dl_ptr) {
     // Recover
     double t0 = now_sec();
     uint64_t recovered_block = 0;
-    *dl_ptr = dl_open(STATE_PATH, CODE_PATH, INDEX_PATH,
+    *dl_ptr = dl_open(STATE_PATH, CODE_PATH, TRIE_PATH, META_PATH,
                        KEY_SIZE, 4, &recovered_block);
     double t1 = now_sec();
     dl = *dl_ptr;
@@ -822,7 +824,7 @@ static void phase4_post_recovery(data_layer_t *dl, uint64_t num_blocks,
 
     // Final checkpoint
     uint64_t final_block = g_checkpoint_block + num_blocks;
-    bool ok = dl_checkpoint(dl, INDEX_PATH, final_block);
+    bool ok = dl_checkpoint(dl, META_PATH, final_block);
     ASSERT_MSG(ok, "final checkpoint failed");
 
     free(code_buf);
@@ -947,9 +949,11 @@ int main(int argc, char *argv[]) {
     unlink(STATE_PATH);
     unlink(CODE_PATH);
     unlink(INDEX_PATH);
+    unlink(TRIE_PATH);
+    unlink(META_PATH);
 
     // Create data layer
-    data_layer_t *dl = dl_create(STATE_PATH, CODE_PATH, KEY_SIZE, 4);
+    data_layer_t *dl = dl_create(STATE_PATH, CODE_PATH, TRIE_PATH, KEY_SIZE, 4);
     ASSERT_MSG(dl != NULL, "dl_create failed");
 
     // Phase 1: Genesis
@@ -974,6 +978,8 @@ int main(int argc, char *argv[]) {
     unlink(STATE_PATH);
     unlink(CODE_PATH);
     unlink(INDEX_PATH);
+    unlink(TRIE_PATH);
+    unlink(META_PATH);
 
     double total = now_sec() - total_start;
     printf("\n============================================\n");

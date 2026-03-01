@@ -2,6 +2,7 @@
 #include "../include/state_store.h"
 #include "../include/code_store.h"
 #include "../include/compact_art.h"
+#include "../include/nibble_trie.h"
 #include "../include/mem_art.h"
 #include "../include/checkpoint.h"
 
@@ -21,12 +22,15 @@
 // ============================================================================
 
 struct data_layer {
-    compact_art_t index;
+    compact_art_t index;        /* in-memory index (fast reads) */
+    nibble_trie_t trie;         /* persistent index (COW, file-backed) */
     state_store_t *store;
     code_store_t *code;
     mem_art_t buffer;
     uint32_t key_size;
+    uint32_t value_size;
     uint64_t total_merged;
+    bool trie_open;
 };
 
 // ============================================================================
@@ -34,11 +38,13 @@ struct data_layer {
 // ============================================================================
 
 data_layer_t *dl_create(const char *state_path, const char *code_path,
+                         const char *trie_path,
                          uint32_t key_size, uint32_t value_size) {
     data_layer_t *dl = malloc(sizeof(data_layer_t));
     if (!dl) return NULL;
     memset(dl, 0, sizeof(*dl));
     dl->key_size = key_size;
+    dl->value_size = value_size;
 
     if (!compact_art_init(&dl->index, key_size, value_size)) {
         free(dl);
@@ -62,8 +68,21 @@ data_layer_t *dl_create(const char *state_path, const char *code_path,
         }
     }
 
+    /* Open nibble_trie (persistent index) */
+    if (trie_path) {
+        if (!nt_open(&dl->trie, trie_path, key_size, value_size)) {
+            compact_art_destroy(&dl->index);
+            state_store_destroy(dl->store);
+            if (dl->code) code_store_destroy(dl->code);
+            free(dl);
+            return NULL;
+        }
+        dl->trie_open = true;
+    }
+
     if (!mem_art_init(&dl->buffer)) {
         compact_art_destroy(&dl->index);
+        if (dl->trie_open) nt_close(&dl->trie);
         state_store_destroy(dl->store);
         if (dl->code) code_store_destroy(dl->code);
         free(dl);
@@ -76,6 +95,7 @@ data_layer_t *dl_create(const char *state_path, const char *code_path,
 void dl_destroy(data_layer_t *dl) {
     if (!dl) return;
     compact_art_destroy(&dl->index);
+    if (dl->trie_open) nt_close(&dl->trie);
     state_store_destroy(dl->store);
     if (dl->code) code_store_destroy(dl->code);
     mem_art_destroy(&dl->buffer);
@@ -154,6 +174,7 @@ uint64_t dl_merge(data_layer_t *dl) {
                     state_store_free(dl->store, slot);
                 }
                 compact_art_delete(&dl->index, key);
+                if (dl->trie_open) nt_delete(&dl->trie, key);
             }
         } else if (flag == BUF_FLAG_WRITE && vlen > 1) {
             const uint8_t *data = (const uint8_t *)val + 1;
@@ -161,7 +182,7 @@ uint64_t dl_merge(data_layer_t *dl) {
 
             const void *ref = compact_art_get(&dl->index, key);
             if (ref) {
-                // Update: rewrite same slot
+                // Update: rewrite same slot (slot ref unchanged, no trie update)
                 uint32_t slot;
                 memcpy(&slot, ref, 4);
                 state_store_write(dl->store, slot, data, data_len);
@@ -170,6 +191,7 @@ uint64_t dl_merge(data_layer_t *dl) {
                 uint32_t slot = state_store_alloc(dl->store);
                 state_store_write(dl->store, slot, data, data_len);
                 compact_art_insert(&dl->index, key, &slot);
+                if (dl->trie_open) nt_insert(&dl->trie, key, &slot);
             }
         }
         count++;
@@ -208,7 +230,10 @@ bool dl_put_code(data_layer_t *dl, const uint8_t *key,
 
     // Insert into compact_art with bit 31 set
     uint32_t ref = index | CODE_REF_BIT;
-    return compact_art_insert(&dl->index, key, &ref);
+    if (!compact_art_insert(&dl->index, key, &ref))
+        return false;
+    if (dl->trie_open) nt_insert(&dl->trie, key, &ref);
+    return true;
 }
 
 bool dl_get_code(data_layer_t *dl, const uint8_t *key,
@@ -248,26 +273,33 @@ uint32_t dl_code_length(data_layer_t *dl, const uint8_t *key) {
 // Checkpoint / Recovery
 // ============================================================================
 
-bool dl_checkpoint(data_layer_t *dl, const char *index_path,
+bool dl_checkpoint(data_layer_t *dl, const char *meta_path,
                    uint64_t block_number) {
     if (!dl) return false;
-    // Merge kicks off async writeback each block, so most pages are already
-    // on disk. This blocking fdatasync ensures everything is durable before
-    // the checkpoint commit (rename) makes the new index reachable.
+
     state_store_sync(dl->store);
     if (dl->code) code_store_sync(dl->code);
-    return checkpoint_write(index_path, block_number,
-                            &dl->index, dl->store, dl->code);
+
+    /* Commit nibble_trie (O(1) meta page flip) */
+    if (dl->trie_open) {
+        nt_set_block_number(&dl->trie, block_number);
+        if (!nt_commit(&dl->trie)) return false;
+    }
+
+    /* Write slim sidecar: free list + code entries */
+    return checkpoint_meta_write(meta_path, block_number,
+                                  dl->store, dl->code);
 }
 
 data_layer_t *dl_open(const char *state_path, const char *code_path,
-                       const char *index_path,
+                       const char *trie_path, const char *meta_path,
                        uint32_t key_size, uint32_t value_size,
                        uint64_t *out_block_number) {
     data_layer_t *dl = malloc(sizeof(data_layer_t));
     if (!dl) return NULL;
     memset(dl, 0, sizeof(*dl));
     dl->key_size = key_size;
+    dl->value_size = value_size;
 
     if (!compact_art_init(&dl->index, key_size, value_size)) {
         free(dl);
@@ -291,8 +323,21 @@ data_layer_t *dl_open(const char *state_path, const char *code_path,
         }
     }
 
-    if (!checkpoint_load(index_path, out_block_number,
-                         &dl->index, dl->store, dl->code)) {
+    /* Open nibble_trie (persistent index) */
+    if (!nt_open(&dl->trie, trie_path, key_size, value_size)) {
+        compact_art_destroy(&dl->index);
+        state_store_destroy(dl->store);
+        if (dl->code) code_store_destroy(dl->code);
+        free(dl);
+        return NULL;
+    }
+    dl->trie_open = true;
+
+    /* Load slim sidecar: free list + code entries */
+    uint64_t meta_block = 0;
+    if (!checkpoint_meta_load(meta_path, &meta_block,
+                               dl->store, dl->code)) {
+        nt_close(&dl->trie);
         compact_art_destroy(&dl->index);
         state_store_destroy(dl->store);
         if (dl->code) code_store_destroy(dl->code);
@@ -300,7 +345,21 @@ data_layer_t *dl_open(const char *state_path, const char *code_path,
         return NULL;
     }
 
+    /* Rebuild compact_art from nibble_trie */
+    nt_iterator_t *it = nt_iterator_create(&dl->trie);
+    if (it) {
+        while (nt_iterator_next(it)) {
+            const uint8_t *k = nt_iterator_key(it);
+            const void *v = nt_iterator_value(it);
+            if (k && v) compact_art_insert(&dl->index, k, v);
+        }
+        nt_iterator_destroy(it);
+    }
+
+    if (out_block_number) *out_block_number = meta_block;
+
     if (!mem_art_init(&dl->buffer)) {
+        nt_close(&dl->trie);
         compact_art_destroy(&dl->index);
         state_store_destroy(dl->store);
         if (dl->code) code_store_destroy(dl->code);

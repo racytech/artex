@@ -67,6 +67,9 @@ struct nibble_trie {
     uint32_t  committed_node_count;
     uint32_t  committed_leaf_count;
 
+    uint64_t  block_number;          /* block number (set by caller before commit) */
+    uint64_t  committed_block_number;
+
     uint64_t  generation;
     int       active_meta;          /* 0 or 1 */
 };
@@ -99,6 +102,9 @@ size_t         nt_size(const nibble_trie_t *t);
 
 bool nt_commit(nibble_trie_t *t);
 void nt_rollback(nibble_trie_t *t);
+
+void     nt_set_block_number(nibble_trie_t *t, uint64_t block_number);
+uint64_t nt_get_block_number(const nibble_trie_t *t);
 
 /* ========================================================================
  * Iterator (sorted nibble order = sorted key order)

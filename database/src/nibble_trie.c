@@ -37,10 +37,12 @@ typedef struct {
 } nt_branch_t;
 
 typedef struct {
-    uint8_t  skip_len;           /* number of nibbles (1-63) */
+    uint8_t  skip_len;           /* number of nibbles (1-118) */
     uint8_t  nibbles[59];        /* packed 2/byte, high nibble first */
     uint32_t child;              /* ref to next node (always a branch) */
 } nt_extension_t;
+
+#define NT_MAX_EXT_NIBBLES  118  /* max nibbles in one extension (59 * 2) */
 
 typedef union {
     nt_branch_t    branch;
@@ -70,6 +72,7 @@ typedef struct {
     uint32_t leaf_count;         /* leaf slots allocated */
     uint32_t key_size;           /* key size in bytes */
     uint32_t value_size;         /* value size in bytes */
+    uint64_t block_number;       /* block number at last commit */
     uint32_t crc32c;
     uint32_t _pad;
 } nt_meta_t;
@@ -215,6 +218,16 @@ static nt_ref_t make_extension_from_key(nibble_trie_t *t,
                                          int count, nt_ref_t child) {
     if (count == 0) return child;
 
+    /* Chain extensions if prefix exceeds single-node capacity */
+    if (count > NT_MAX_EXT_NIBBLES) {
+        nt_ref_t inner = make_extension_from_key(t, key,
+                            depth + NT_MAX_EXT_NIBBLES,
+                            count - NT_MAX_EXT_NIBBLES, child);
+        if (inner == NT_REF_NULL) return NT_REF_NULL;
+        count = NT_MAX_EXT_NIBBLES;
+        child = inner;
+    }
+
     nt_ref_t ref = alloc_extension_raw(t);
     if (ref == NT_REF_NULL) return NT_REF_NULL;
 
@@ -233,6 +246,16 @@ static nt_ref_t make_extension_from_buf(nibble_trie_t *t,
                                          int start, int count,
                                          nt_ref_t child) {
     if (count == 0) return child;
+
+    /* Chain extensions if prefix exceeds single-node capacity */
+    if (count > NT_MAX_EXT_NIBBLES) {
+        nt_ref_t inner = make_extension_from_buf(t, saved_nibbles,
+                            start + NT_MAX_EXT_NIBBLES,
+                            count - NT_MAX_EXT_NIBBLES, child);
+        if (inner == NT_REF_NULL) return NT_REF_NULL;
+        count = NT_MAX_EXT_NIBBLES;
+        child = inner;
+    }
 
     nt_ref_t ref = alloc_extension_raw(t);
     if (ref == NT_REF_NULL) return NT_REF_NULL;
@@ -486,18 +509,15 @@ static nt_ref_t cow_delete(nibble_trie_t *t, nt_ref_t ref,
             memcpy(child_nibs, child_ext->nibbles, 59);
 
             int total = our_skip + child_skip;
-            nt_ref_t merged = alloc_extension_raw(t);
-            if (merged == NT_REF_NULL) return ref;
-
-            nt_extension_t *me = ext_ptr(t, merged);
-            me->skip_len = (uint8_t)total;
-            me->child = child_child;
+            /* Assemble combined nibbles into temp buffer */
+            uint8_t merged_nibs[NT_MAX_NIBBLES / 2];
             for (int i = 0; i < our_skip; i++)
-                set_nibble(me->nibbles, i, key_nibble(our_nibs, i));
+                set_nibble(merged_nibs, i, key_nibble(our_nibs, i));
             for (int i = 0; i < child_skip; i++)
-                set_nibble(me->nibbles, our_skip + i,
+                set_nibble(merged_nibs, our_skip + i,
                            key_nibble(child_nibs, i));
-            return merged;
+            return make_extension_from_buf(t, merged_nibs, 0, total,
+                                            child_child);
         }
 
         /* Child is still a branch — update extension */
@@ -562,16 +582,13 @@ static nt_ref_t cow_delete(nibble_trie_t *t, nt_ref_t ref,
             uint8_t child_nibs[59];
             memcpy(child_nibs, child_ext->nibbles, 59);
 
-            nt_ref_t merged = alloc_extension_raw(t);
-            if (merged == NT_REF_NULL) return ref;
-
-            nt_extension_t *me = ext_ptr(t, merged);
-            me->skip_len = (uint8_t)(1 + child_skip);
-            me->child = child_child;
-            set_nibble(me->nibbles, 0, (uint8_t)last_nib);
+            int total = 1 + child_skip;
+            uint8_t merged_nibs[NT_MAX_NIBBLES / 2];
+            set_nibble(merged_nibs, 0, (uint8_t)last_nib);
             for (int i = 0; i < child_skip; i++)
-                set_nibble(me->nibbles, 1 + i, key_nibble(child_nibs, i));
-            return merged;
+                set_nibble(merged_nibs, 1 + i, key_nibble(child_nibs, i));
+            return make_extension_from_buf(t, merged_nibs, 0, total,
+                                            child_child);
         }
 
         /* Branch — wrap in 1-nibble extension */
@@ -807,6 +824,7 @@ bool nt_open(nibble_trie_t *t, const char *path,
         t->size = active->size;
         t->node_count = active->node_count;
         t->leaf_count = active->leaf_count;
+        t->block_number = active->block_number;
         t->generation = active->generation;
         t->active_meta = active_page;
     }
@@ -816,6 +834,7 @@ bool nt_open(nibble_trie_t *t, const char *path,
     t->committed_size = t->size;
     t->committed_node_count = t->node_count;
     t->committed_leaf_count = t->leaf_count;
+    t->committed_block_number = t->block_number;
 
     return true;
 }
@@ -854,6 +873,7 @@ bool nt_commit(nibble_trie_t *t) {
     meta.leaf_count = t->leaf_count;
     meta.key_size = t->key_size;
     meta.value_size = t->value_size;
+    meta.block_number = t->block_number;
     meta.crc32c = nt_crc32c(&meta, NT_META_CRC_LEN);
 
     if (!meta_write(t->fd, inactive, &meta)) {
@@ -873,6 +893,7 @@ bool nt_commit(nibble_trie_t *t) {
     t->committed_size = t->size;
     t->committed_node_count = t->node_count;
     t->committed_leaf_count = t->leaf_count;
+    t->committed_block_number = t->block_number;
 
     return true;
 }
@@ -883,6 +904,15 @@ void nt_rollback(nibble_trie_t *t) {
     t->size = t->committed_size;
     t->node_count = t->committed_node_count;
     t->leaf_count = t->committed_leaf_count;
+    t->block_number = t->committed_block_number;
+}
+
+void nt_set_block_number(nibble_trie_t *t, uint64_t block_number) {
+    if (t) t->block_number = block_number;
+}
+
+uint64_t nt_get_block_number(const nibble_trie_t *t) {
+    return t ? t->block_number : 0;
 }
 
 /* ========================================================================
