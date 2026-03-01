@@ -11,7 +11,7 @@
  * Pure in-memory, arena-allocated. No file I/O, no persistence.
  * Structure matches Ethereum's hex-prefix trie (branch/extension/leaf).
  *
- * Fixed 32-byte keys (keccak256 hashes). Value size configurable at init.
+ * Key size configurable at init (max 64 bytes). Value size configurable.
  *
  * Ref encoding (32-bit):
  *   Bits 31-30 : type tag
@@ -22,8 +22,8 @@
  *   Bits 29-0  : pool index
  * ======================================================================== */
 
-#define NT_KEY_SIZE         32
-#define NT_MAX_NIBBLES      64   /* NT_KEY_SIZE * 2 */
+#define NT_MAX_KEY_SIZE     64
+#define NT_MAX_NIBBLES      128  /* NT_MAX_KEY_SIZE * 2 */
 
 typedef uint32_t nt_ref_t;
 
@@ -84,8 +84,9 @@ typedef struct nt_iterator nt_iterator_t;
 struct nibble_trie {
     nt_arena_t branches;     /* 64B slots */
     nt_arena_t extensions;   /* 40B slots */
-    nt_arena_t leaves;       /* (NT_KEY_SIZE + value_size) per slot */
+    nt_arena_t leaves;       /* (key_size + value_size) per slot */
 
+    uint32_t  key_size;
     uint32_t  value_size;
 
     nt_ref_t  root;
@@ -101,7 +102,7 @@ struct nibble_trie {
  * Lifecycle
  * ======================================================================== */
 
-bool nt_init(nibble_trie_t *t, uint32_t value_size);
+bool nt_init(nibble_trie_t *t, uint32_t key_size, uint32_t value_size);
 void nt_destroy(nibble_trie_t *t);
 
 /* Reset to empty without freeing arena memory (reuse allocations) */

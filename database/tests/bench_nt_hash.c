@@ -186,7 +186,7 @@ int main(int argc, char *argv[]) {
     printf("============================================\n\n");
 
     nibble_trie_t t;
-    ASSERT_MSG(nt_init(&t, VALUE_SIZE), "nt_init");
+    ASSERT_MSG(nt_init(&t, KEY_SIZE, VALUE_SIZE), "nt_init");
 
     uint64_t next_id = 0;
     uint64_t total_blocks = 0;

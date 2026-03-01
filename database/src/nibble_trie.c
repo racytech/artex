@@ -8,7 +8,6 @@
  * ======================================================================== */
 
 #define NT_BRANCH_SLOT_SIZE 64
-#define NT_EXT_SLOT_SIZE    40
 #define NT_INITIAL_BRANCHES 1024
 #define NT_INITIAL_EXTS     1024
 #define NT_INITIAL_LEAVES   1024
@@ -21,15 +20,14 @@ typedef struct {
     uint32_t children[16];              /* 64B */
 } nt_branch_t;
 
-typedef struct {
-    uint8_t  skip_len;                  /*  1B: nibble count (1-63) */
-    uint8_t  nibbles[32];               /* 32B: packed nibbles (max 64) */
-    uint8_t  _pad[3];                   /*  3B: alignment */
-    uint32_t child;                     /*  4B: child ref */
-} nt_extension_t;                       /* 40B total */
+_Static_assert(sizeof(nt_branch_t) == 64, "branch must be 64 bytes");
 
-_Static_assert(sizeof(nt_branch_t)    == 64, "branch must be 64 bytes");
-_Static_assert(sizeof(nt_extension_t) == 40, "extension must be 40 bytes");
+/* Extension layout is key-size-dependent:
+ *   [skip_len:1][nibbles:key_size][pad to 4-align][child:4]
+ * child is always the last 4 bytes of the slot. */
+static inline uint32_t compute_ext_slot_size(uint32_t key_size) {
+    return ((1 + key_size + 3) & ~3u) + 4;
+}
 
 /* ========================================================================
  * Nibble helpers
@@ -37,10 +35,6 @@ _Static_assert(sizeof(nt_extension_t) == 40, "extension must be 40 bytes");
 
 static inline uint8_t key_nibble(const uint8_t *data, int i) {
     return (data[i / 2] >> (4 * (1 - (i & 1)))) & 0x0F;
-}
-
-static inline uint8_t ext_nibble(const nt_extension_t *ext, int i) {
-    return key_nibble(ext->nibbles, i);
 }
 
 static inline void set_nibble(uint8_t *data, int i, uint8_t val) {
@@ -133,18 +127,41 @@ static inline nt_branch_t *branch_ptr(const nibble_trie_t *t, nt_ref_t ref) {
     return (nt_branch_t *)(t->branches.base + (size_t)idx * NT_BRANCH_SLOT_SIZE);
 }
 
-static inline nt_extension_t *ext_ptr(const nibble_trie_t *t, nt_ref_t ref) {
-    uint32_t idx = NT_REF_INDEX(ref);
-    return (nt_extension_t *)(t->extensions.base + (size_t)idx * NT_EXT_SLOT_SIZE);
-}
-
 static inline uint8_t *leaf_key_ptr(const nibble_trie_t *t, nt_ref_t ref) {
     uint32_t idx = NT_REF_INDEX(ref);
     return t->leaves.base + (size_t)idx * t->leaves.slot_size;
 }
 
 static inline void *leaf_value_ptr(const nibble_trie_t *t, nt_ref_t ref) {
-    return leaf_key_ptr(t, ref) + NT_KEY_SIZE;
+    return leaf_key_ptr(t, ref) + t->key_size;
+}
+
+/* Extension field accessors — layout: [skip_len:1][nibbles:key_size][pad][child:4] */
+static inline uint8_t *ext_slot(const nibble_trie_t *t, nt_ref_t ref) {
+    uint32_t idx = NT_REF_INDEX(ref);
+    return t->extensions.base + (size_t)idx * t->extensions.slot_size;
+}
+
+static inline int ext_skip_len(const nibble_trie_t *t, nt_ref_t ref) {
+    return ext_slot(t, ref)[0];
+}
+
+static inline void ext_set_skip_len(const nibble_trie_t *t, nt_ref_t ref,
+                                     uint8_t len) {
+    ext_slot(t, ref)[0] = len;
+}
+
+static inline uint8_t *ext_nibbles(const nibble_trie_t *t, nt_ref_t ref) {
+    return ext_slot(t, ref) + 1;
+}
+
+static inline nt_ref_t ext_child(const nibble_trie_t *t, nt_ref_t ref) {
+    return *(uint32_t *)(ext_slot(t, ref) + t->extensions.slot_size - 4);
+}
+
+static inline void ext_set_child(const nibble_trie_t *t, nt_ref_t ref,
+                                  nt_ref_t child) {
+    *(uint32_t *)(ext_slot(t, ref) + t->extensions.slot_size - 4) = child;
 }
 
 /* ========================================================================
@@ -171,8 +188,8 @@ static nt_ref_t alloc_leaf(nibble_trie_t *t,
     if (idx == 0) return NT_REF_NULL;
 
     uint8_t *lk = t->leaves.base + (size_t)idx * t->leaves.slot_size;
-    memcpy(lk, key, NT_KEY_SIZE);
-    memcpy(lk + NT_KEY_SIZE, value, t->value_size);
+    memcpy(lk, key, t->key_size);
+    memcpy(lk + t->key_size, value, t->value_size);
     nt_ref_t ref = NT_MAKE_LEAF_REF(idx);
     invalidate_hash(t, ref);  /* clear stale cache from recycled slot */
     return ref;
@@ -206,11 +223,11 @@ static nt_ref_t make_extension_from_key(nibble_trie_t *t,
     nt_ref_t ref = alloc_extension_raw(t);
     if (ref == NT_REF_NULL) return NT_REF_NULL;
 
-    nt_extension_t *ext = ext_ptr(t, ref);
-    ext->skip_len = (uint8_t)count;
-    ext->child = child;
+    ext_set_skip_len(t, ref, (uint8_t)count);
+    ext_set_child(t, ref, child);
+    uint8_t *nibs = ext_nibbles(t, ref);
     for (int i = 0; i < count; i++)
-        set_nibble(ext->nibbles, i, key_nibble(key, depth + i));
+        set_nibble(nibs, i, key_nibble(key, depth + i));
 
     return ref;
 }
@@ -224,11 +241,11 @@ static nt_ref_t make_extension_from_buf(nibble_trie_t *t,
     nt_ref_t ref = alloc_extension_raw(t);
     if (ref == NT_REF_NULL) return NT_REF_NULL;
 
-    nt_extension_t *ext = ext_ptr(t, ref);
-    ext->skip_len = (uint8_t)count;
-    ext->child = child;
+    ext_set_skip_len(t, ref, (uint8_t)count);
+    ext_set_child(t, ref, child);
+    uint8_t *nibs = ext_nibbles(t, ref);
     for (int i = 0; i < count; i++)
-        set_nibble(ext->nibbles, i, key_nibble(saved_nibbles, start + i));
+        set_nibble(nibs, i, key_nibble(saved_nibbles, start + i));
 
     return ref;
 }
@@ -238,10 +255,9 @@ static nt_ref_t make_extension_single(nibble_trie_t *t,
     nt_ref_t ref = alloc_extension_raw(t);
     if (ref == NT_REF_NULL) return NT_REF_NULL;
 
-    nt_extension_t *ext = ext_ptr(t, ref);
-    ext->skip_len = 1;
-    ext->child = child;
-    set_nibble(ext->nibbles, 0, nib);
+    ext_set_skip_len(t, ref, 1);
+    ext_set_child(t, ref, child);
+    set_nibble(ext_nibbles(t, ref), 0, nib);
     return ref;
 }
 
@@ -262,7 +278,7 @@ static nt_ref_t do_insert(nibble_trie_t *t, nt_ref_t ref,
     if (NT_IS_LEAF(ref)) {
         uint8_t *existing_key = leaf_key_ptr(t, ref);
 
-        if (memcmp(existing_key, key, NT_KEY_SIZE) == 0) {
+        if (memcmp(existing_key, key, t->key_size) == 0) {
             *inserted = false;
             memcpy(leaf_value_ptr(t, ref), value, t->value_size);
             invalidate_hash(t, ref);
@@ -271,11 +287,12 @@ static nt_ref_t do_insert(nibble_trie_t *t, nt_ref_t ref,
 
         *inserted = true;
 
-        uint8_t saved_key[NT_KEY_SIZE];
-        memcpy(saved_key, existing_key, NT_KEY_SIZE);
+        uint8_t saved_key[NT_MAX_KEY_SIZE];
+        memcpy(saved_key, existing_key, t->key_size);
 
+        int total_nibbles = (int)(t->key_size * 2);
         int diff = depth;
-        while (diff < NT_MAX_NIBBLES &&
+        while (diff < total_nibbles &&
                key_nibble(key, diff) == key_nibble(saved_key, diff))
             diff++;
 
@@ -298,20 +315,20 @@ static nt_ref_t do_insert(nibble_trie_t *t, nt_ref_t ref,
 
     /* Extension */
     if (NT_IS_EXTENSION(ref)) {
-        nt_extension_t *ext = ext_ptr(t, ref);
-        int skip = ext->skip_len;
+        int skip = ext_skip_len(t, ref);
 
         int match = 0;
         while (match < skip &&
-               ext_nibble(ext, match) == key_nibble(key, depth + match))
+               key_nibble(ext_nibbles(t, ref), match) ==
+               key_nibble(key, depth + match))
             match++;
 
         if (match == skip) {
-            nt_ref_t old_child = ext->child;
+            nt_ref_t old_child = ext_child(t, ref);
             nt_ref_t new_child = do_insert(t, old_child, key,
                                             depth + skip, value, inserted);
             if (new_child != old_child)
-                ext_ptr(t, ref)->child = new_child;
+                ext_set_child(t, ref, new_child);
             invalidate_hash(t, ref);
             return ref;
         }
@@ -319,10 +336,10 @@ static nt_ref_t do_insert(nibble_trie_t *t, nt_ref_t ref,
         /* Partial match — split */
         *inserted = true;
 
-        uint8_t saved_nibbles[32];
-        memcpy(saved_nibbles, ext->nibbles, 32);
+        uint8_t saved_nibbles[NT_MAX_KEY_SIZE];
+        memcpy(saved_nibbles, ext_nibbles(t, ref), t->key_size);
         int saved_skip = skip;
-        nt_ref_t saved_child = ext->child;
+        nt_ref_t saved_child = ext_child(t, ref);
 
         /* Free the old extension slot being split */
         arena_free(&t->extensions, NT_REF_INDEX(ref));
@@ -380,7 +397,7 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
 
     /* Leaf */
     if (NT_IS_LEAF(ref)) {
-        if (memcmp(leaf_key_ptr(t, ref), key, NT_KEY_SIZE) == 0) {
+        if (memcmp(leaf_key_ptr(t, ref), key, t->key_size) == 0) {
             *deleted = true;
             arena_free(&t->leaves, NT_REF_INDEX(ref));
             return NT_REF_NULL;
@@ -391,17 +408,17 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
 
     /* Extension */
     if (NT_IS_EXTENSION(ref)) {
-        nt_extension_t *ext = ext_ptr(t, ref);
-        int skip = ext->skip_len;
+        int skip = ext_skip_len(t, ref);
 
         for (int i = 0; i < skip; i++) {
-            if (ext_nibble(ext, i) != key_nibble(key, depth + i)) {
+            if (key_nibble(ext_nibbles(t, ref), i) !=
+                key_nibble(key, depth + i)) {
                 *deleted = false;
                 return ref;
             }
         }
 
-        nt_ref_t old_child = ext->child;
+        nt_ref_t old_child = ext_child(t, ref);
         nt_ref_t new_child = do_delete(t, old_child, key,
                                         depth + skip, deleted);
         if (!*deleted) return ref;
@@ -423,17 +440,17 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
 
         /* Child became extension — merge */
         if (NT_IS_EXTENSION(new_child)) {
-            ext = ext_ptr(t, ref);
             uint8_t tmp[NT_MAX_NIBBLES];
-            int our_skip = ext->skip_len;
+            int our_skip = ext_skip_len(t, ref);
+            uint8_t *our_nibs = ext_nibbles(t, ref);
             for (int i = 0; i < our_skip; i++)
-                tmp[i] = ext_nibble(ext, i);
+                tmp[i] = key_nibble(our_nibs, i);
 
-            nt_extension_t *child_ext = ext_ptr(t, new_child);
-            int child_skip = child_ext->skip_len;
-            nt_ref_t child_child = child_ext->child;
+            int child_skip = ext_skip_len(t, new_child);
+            nt_ref_t child_child = ext_child(t, new_child);
+            uint8_t *child_nibs = ext_nibbles(t, new_child);
             for (int i = 0; i < child_skip; i++)
-                tmp[our_skip + i] = ext_nibble(child_ext, i);
+                tmp[our_skip + i] = key_nibble(child_nibs, i);
 
             int total = our_skip + child_skip;
 
@@ -451,7 +468,7 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
         }
 
         /* Child is still a branch — update */
-        ext_ptr(t, ref)->child = new_child;
+        ext_set_child(t, ref, new_child);
         invalidate_hash(t, ref);
         return ref;
     }
@@ -498,14 +515,14 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
 
         /* Extension — prepend this nibble */
         if (NT_IS_EXTENSION(sole)) {
-            nt_extension_t *child_ext = ext_ptr(t, sole);
-            int child_skip = child_ext->skip_len;
-            nt_ref_t child_child = child_ext->child;
+            int child_skip = ext_skip_len(t, sole);
+            nt_ref_t child_child = ext_child(t, sole);
 
             uint8_t tmp[NT_MAX_NIBBLES];
             tmp[0] = (uint8_t)last_nib;
+            uint8_t *child_nibs = ext_nibbles(t, sole);
             for (int i = 0; i < child_skip; i++)
-                tmp[1 + i] = ext_nibble(child_ext, i);
+                tmp[1 + i] = key_nibble(child_nibs, i);
 
             int total = 1 + child_skip;
             uint8_t packed[(NT_MAX_NIBBLES + 1) / 2];
@@ -542,19 +559,20 @@ const void *nt_get(const nibble_trie_t *t, const uint8_t *key) {
 
     while (ref != NT_REF_NULL) {
         if (NT_IS_LEAF(ref)) {
-            if (memcmp(leaf_key_ptr(t, ref), key, NT_KEY_SIZE) == 0)
+            if (memcmp(leaf_key_ptr(t, ref), key, t->key_size) == 0)
                 return leaf_value_ptr(t, ref);
             return NULL;
         }
 
         if (NT_IS_EXTENSION(ref)) {
-            nt_extension_t *ext = ext_ptr(t, ref);
-            for (int i = 0; i < ext->skip_len; i++) {
-                if (ext_nibble(ext, i) != key_nibble(key, depth + i))
+            int skip = ext_skip_len(t, ref);
+            uint8_t *nibs = ext_nibbles(t, ref);
+            for (int i = 0; i < skip; i++) {
+                if (key_nibble(nibs, i) != key_nibble(key, depth + i))
                     return NULL;
             }
-            depth += ext->skip_len;
-            ref = ext->child;
+            depth += skip;
+            ref = ext_child(t, ref);
             continue;
         }
 
@@ -571,16 +589,19 @@ const void *nt_get(const nibble_trie_t *t, const uint8_t *key) {
  * Public API
  * ======================================================================== */
 
-bool nt_init(nibble_trie_t *t, uint32_t value_size) {
-    if (!t || value_size == 0) return false;
+bool nt_init(nibble_trie_t *t, uint32_t key_size, uint32_t value_size) {
+    if (!t || key_size == 0 || key_size > NT_MAX_KEY_SIZE || value_size == 0)
+        return false;
     memset(t, 0, sizeof(*t));
+    t->key_size = key_size;
     t->value_size = value_size;
 
-    uint32_t leaf_slot_size = (NT_KEY_SIZE + value_size + 7) & ~(uint32_t)7;
+    uint32_t leaf_slot_size = (key_size + value_size + 7) & ~(uint32_t)7;
+    uint32_t ext_slot_size = compute_ext_slot_size(key_size);
 
     if (!arena_init(&t->branches, NT_BRANCH_SLOT_SIZE, NT_INITIAL_BRANCHES))
         return false;
-    if (!arena_init(&t->extensions, NT_EXT_SLOT_SIZE, NT_INITIAL_EXTS)) {
+    if (!arena_init(&t->extensions, ext_slot_size, NT_INITIAL_EXTS)) {
         arena_destroy(&t->branches);
         return false;
     }
@@ -727,7 +748,7 @@ static bool descend_to_min(const nibble_trie_t *t,
         }
 
         if (NT_IS_EXTENSION(ref)) {
-            ref = ext_ptr(t, ref)->child;
+            ref = ext_child(t, ref);
             continue;
         }
 
@@ -834,7 +855,7 @@ bool nt_iterator_seek(nt_iterator_t *it, const uint8_t *key) {
     while (ref != NT_REF_NULL) {
         if (NT_IS_LEAF(ref)) {
             const uint8_t *lk = leaf_key_ptr(t, ref);
-            if (memcmp(lk, key, NT_KEY_SIZE) >= 0) {
+            if (memcmp(lk, key, t->key_size) >= 0) {
                 s->key = lk;
                 s->value = leaf_value_ptr(t, ref);
                 return true;
@@ -843,12 +864,12 @@ bool nt_iterator_seek(nt_iterator_t *it, const uint8_t *key) {
         }
 
         if (NT_IS_EXTENSION(ref)) {
-            nt_extension_t *ext = ext_ptr(t, ref);
-            int skip = ext->skip_len;
+            int skip = ext_skip_len(t, ref);
+            uint8_t *nibs = ext_nibbles(t, ref);
             int cmp = 0;
 
             for (int i = 0; i < skip && cmp == 0; i++) {
-                int en = ext_nibble(ext, i);
+                int en = key_nibble(nibs, i);
                 int kn = key_nibble(key, depth + i);
                 cmp = en - kn;
             }
@@ -859,7 +880,7 @@ bool nt_iterator_seek(nt_iterator_t *it, const uint8_t *key) {
                 goto backtrack;
 
             depth += skip;
-            ref = ext->child;
+            ref = ext_child(t, ref);
             continue;
         }
 

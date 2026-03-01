@@ -51,7 +51,7 @@ static void make_value(uint8_t *val, uint32_t i) {
 
 static int test_create_destroy(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
     ASSERT(nt_size(&t) == 0, "empty");
     nt_destroy(&t);
     return 1;
@@ -59,7 +59,7 @@ static int test_create_destroy(void) {
 
 static int test_insert_get_single(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
     make_key(key, 1);
@@ -82,7 +82,7 @@ static int test_insert_get_single(void) {
 
 static int test_insert_multiple(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 1000;
     uint8_t key[32], val[32];
@@ -111,7 +111,7 @@ static int test_insert_multiple(void) {
 
 static int test_update(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val1[32], val2[32];
     make_key(key, 42);
@@ -134,7 +134,7 @@ static int test_update(void) {
 
 static int test_delete(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
     make_key(key, 1);
@@ -155,7 +155,7 @@ static int test_delete(void) {
 
 static int test_delete_multiple(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 200;
     uint8_t key[32], val[32];
@@ -193,7 +193,7 @@ static int test_delete_multiple(void) {
 
 static int test_clear(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
     for (int i = 0; i < 500; i++) {
@@ -228,7 +228,7 @@ static int test_clear(void) {
 
 static int test_iterator(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 100;
     uint8_t key[32], val[32];
@@ -266,7 +266,7 @@ static int test_iterator(void) {
 
 static int test_seek(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     /* Insert keys 0, 10, 20, ..., 90 */
     uint8_t key[32], val[32];
@@ -300,7 +300,7 @@ static int test_seek(void) {
 
 static int test_contains(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
     make_key(key, 42);
@@ -318,7 +318,7 @@ static int test_contains(void) {
 
 static int test_stress(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 100000;
     uint8_t key[32], val[32];
@@ -345,7 +345,7 @@ static int test_stress(void) {
 
 static int test_mixed_operations(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -399,7 +399,7 @@ static int test_mixed_operations(void) {
 
 static int test_empty_iterator(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     nt_iterator_t *it = nt_iterator_create(&t);
     ASSERT(it != NULL, "create");

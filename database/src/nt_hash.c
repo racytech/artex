@@ -12,18 +12,10 @@
  * ======================================================================== */
 
 #define NT_BRANCH_SLOT_SIZE 64
-#define NT_EXT_SLOT_SIZE    40
 
 typedef struct {
     uint32_t children[16];
 } nt_branch_t;
-
-typedef struct {
-    uint8_t  skip_len;
-    uint8_t  nibbles[32];
-    uint8_t  _pad[3];
-    uint32_t child;
-} nt_extension_t;
 
 /* ========================================================================
  * Pointer resolution (same logic as nibble_trie.c)
@@ -34,26 +26,39 @@ static inline nt_branch_t *branch_ptr(const nibble_trie_t *t, nt_ref_t ref) {
     return (nt_branch_t *)(t->branches.base + (size_t)idx * NT_BRANCH_SLOT_SIZE);
 }
 
-static inline nt_extension_t *ext_ptr(const nibble_trie_t *t, nt_ref_t ref) {
-    uint32_t idx = NT_REF_INDEX(ref);
-    return (nt_extension_t *)(t->extensions.base + (size_t)idx * NT_EXT_SLOT_SIZE);
-}
-
 static inline uint8_t *leaf_key_ptr(const nibble_trie_t *t, nt_ref_t ref) {
     uint32_t idx = NT_REF_INDEX(ref);
     return t->leaves.base + (size_t)idx * t->leaves.slot_size;
 }
 
 static inline void *leaf_value_ptr(const nibble_trie_t *t, nt_ref_t ref) {
-    return leaf_key_ptr(t, ref) + NT_KEY_SIZE;
+    return leaf_key_ptr(t, ref) + t->key_size;
+}
+
+/* Extension field accessors — layout: [skip_len:1][nibbles:key_size][pad][child:4] */
+static inline uint8_t *ext_slot(const nibble_trie_t *t, nt_ref_t ref) {
+    uint32_t idx = NT_REF_INDEX(ref);
+    return t->extensions.base + (size_t)idx * t->extensions.slot_size;
+}
+
+static inline int ext_skip_len(const nibble_trie_t *t, nt_ref_t ref) {
+    return ext_slot(t, ref)[0];
+}
+
+static inline uint8_t *ext_nibbles(const nibble_trie_t *t, nt_ref_t ref) {
+    return ext_slot(t, ref) + 1;
+}
+
+static inline nt_ref_t ext_child(const nibble_trie_t *t, nt_ref_t ref) {
+    return *(uint32_t *)(ext_slot(t, ref) + t->extensions.slot_size - 4);
 }
 
 /* ========================================================================
  * Nibble helpers
  * ======================================================================== */
 
-static inline uint8_t ext_nibble(const nt_extension_t *ext, int i) {
-    return (ext->nibbles[i / 2] >> (4 * (1 - (i & 1)))) & 0x0F;
+static inline uint8_t key_nibble(const uint8_t *data, int i) {
+    return (data[i / 2] >> (4 * (1 - (i & 1)))) & 0x0F;
 }
 
 static void key_to_nibbles(const uint8_t *key, size_t key_len,
@@ -266,22 +271,25 @@ static node_ref_t hash_node(nibble_trie_t *t, nt_ref_t ref, int depth) {
     }
 
     node_ref_t result;
+    int total_nibbles = (int)(t->key_size * 2);
 
     if (NT_IS_LEAF(ref)) {
         uint8_t *key = leaf_key_ptr(t, ref);
         uint8_t *val = leaf_value_ptr(t, ref);
         uint8_t nibbles[NT_MAX_NIBBLES];
-        key_to_nibbles(key, NT_KEY_SIZE, nibbles);
-        result = nref_hash_leaf(nibbles, depth, NT_MAX_NIBBLES,
+        key_to_nibbles(key, t->key_size, nibbles);
+        result = nref_hash_leaf(nibbles, depth, total_nibbles,
                                 val, t->value_size);
     } else if (NT_IS_EXTENSION(ref)) {
-        nt_extension_t *ext = ext_ptr(t, ref);
+        int skip = ext_skip_len(t, ref);
         uint8_t ext_nibs[NT_MAX_NIBBLES];
-        for (int i = 0; i < ext->skip_len; i++)
-            ext_nibs[i] = ext_nibble(ext, i);
+        uint8_t *nibs = ext_nibbles(t, ref);
+        for (int i = 0; i < skip; i++)
+            ext_nibs[i] = key_nibble(nibs, i);
 
-        node_ref_t child_ref = hash_node(t, ext->child, depth + ext->skip_len);
-        result = nref_hash_extension(ext_nibs, ext->skip_len, &child_ref);
+        node_ref_t child_ref = hash_node(t, ext_child(t, ref),
+                                          depth + skip);
+        result = nref_hash_extension(ext_nibs, skip, &child_ref);
     } else if (NT_IS_BRANCH(ref)) {
         nt_branch_t *b = branch_ptr(t, ref);
         node_ref_t children[16];

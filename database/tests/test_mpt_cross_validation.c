@@ -285,7 +285,7 @@ static void verify_nt_hash(const kv_entry_t *entries, size_t count,
                             const hash_t *expected) {
     if (count == 0) {
         nibble_trie_t t;
-        ASSERT(nt_init(&t, 1));
+        ASSERT(nt_init(&t, 32, 1));
         hash_t root = nt_root_hash(&t);
         print_hash("nt_hash ", &root);
         ASSERT(hash_equal(&root, expected));
@@ -312,7 +312,7 @@ static void verify_nt_hash(const kv_entry_t *entries, size_t count,
     }
 
     nibble_trie_t t;
-    ASSERT(nt_init(&t, vlen));
+    ASSERT(nt_init(&t, 32, vlen));
 
     for (size_t i = 0; i < count; i++)
         if (entries[i].vlen > 0)

@@ -167,7 +167,7 @@ static int cross_validate(size_t n) {
 
     /* Insert into nibble_trie */
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "nt_init");
+    ASSERT(nt_init(&t, 32, 32), "nt_init");
 
     for (size_t i = 0; i < n; i++)
         ASSERT(nt_insert(&t, keys + i * 32, values + i * 32), "insert i=%zu", i);
@@ -209,7 +209,7 @@ static int cross_validate(size_t n) {
 
 static int test_empty(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
     hash_t root = nt_root_hash(&t);
     ASSERT(hash_equal(&root, &HASH_EMPTY_STORAGE), "empty root");
     nt_destroy(&t);
@@ -254,7 +254,7 @@ static int test_after_deletes(void) {
 
     /* Insert all into nibble_trie */
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "nt_init");
+    ASSERT(nt_init(&t, 32, 32), "nt_init");
 
     for (size_t i = 0; i < N; i++)
         nt_insert(&t, keys + i * 32, values + i * 32);
@@ -312,7 +312,7 @@ static int test_sequential_keys(void) {
 
     /* nibble_trie */
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "nt_init");
+    ASSERT(nt_init(&t, 32, 32), "nt_init");
     for (size_t i = 0; i < N; i++)
         nt_insert(&t, keys + i * 32, values + i * 32);
 

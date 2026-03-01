@@ -108,7 +108,7 @@ static void make_val(uint8_t *val, uint32_t i) {
 
 static int test_sequential_50k(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 50000;
     uint8_t key[32], val[32];
@@ -150,7 +150,7 @@ static int test_sequential_50k(void) {
 
 static int test_random_keys_20k(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 20000;
     rng_seed(0xDEADBEEF);
@@ -188,7 +188,7 @@ static int test_random_keys_20k(void) {
 
 static int test_dense_prefix_10k(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 10000;
     uint8_t key[32], val[32];
@@ -224,7 +224,7 @@ static int test_dense_prefix_10k(void) {
 
 static int test_full_fanout_16(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -264,7 +264,7 @@ static int test_full_fanout_16(void) {
 
 static int test_multi_fanout_256(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -300,7 +300,7 @@ static int test_multi_fanout_256(void) {
 
 static int test_random_ops_50k(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     rng_seed(0x12345678);
     const int N = 50000;
@@ -349,7 +349,7 @@ static int test_random_ops_50k(void) {
 
 static int test_iterator_order(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     rng_seed(0xCAFEBABE);
     const int N = 5000;
@@ -403,7 +403,7 @@ static int test_iterator_order(void) {
 
 static int test_mass_update(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 5000;
     uint8_t key[32], val[32];
@@ -442,7 +442,7 @@ static int test_mass_update(void) {
 
 static int test_seek_stress(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     /* Insert every 10th key */
     uint8_t key[32], val[32];
@@ -477,7 +477,7 @@ static int test_seek_stress(void) {
 
 static int test_delete_all_reinsert(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 5000;
     uint8_t key[32], val[32];
@@ -524,7 +524,7 @@ static int test_delete_all_reinsert(void) {
 
 static int test_reverse_insert_forward_delete(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 10000;
     uint8_t key[32], val[32];
@@ -560,7 +560,7 @@ static int test_reverse_insert_forward_delete(void) {
 
 static int test_seek_then_walk(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -606,7 +606,7 @@ static int test_seek_then_walk(void) {
 
 static int test_last_byte_diff(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -638,7 +638,7 @@ static int test_last_byte_diff(void) {
 
 static int test_first_byte_diff(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
 
@@ -670,7 +670,7 @@ static int test_first_byte_diff(void) {
 
 static int test_large_200k(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 200000;
     uint8_t key[32], val[32];
@@ -714,7 +714,7 @@ static int test_large_200k(void) {
 
 static int test_iterator_size_consistency(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     rng_seed(0xBEEFCAFE);
     uint8_t key[32], val[32];
@@ -756,7 +756,7 @@ static int test_iterator_size_consistency(void) {
 
 static int test_nibble_boundary(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t base[32], key[32], val[32];
     memset(base, 0x77, 32);
@@ -816,7 +816,7 @@ static int test_nibble_boundary(void) {
 
 static int test_extension_merge_chain(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key_a[32], key_b[32], key_c[32];
     uint8_t val[32];
@@ -863,7 +863,7 @@ static int test_extension_merge_chain(void) {
 
 static int test_alternating_insert_delete(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     const int N = 20000;
     uint8_t key[32], val[32];
@@ -909,7 +909,7 @@ static int test_alternating_insert_delete(void) {
 
 static int test_clear_and_reuse(void) {
     nibble_trie_t t;
-    ASSERT(nt_init(&t, 32), "init");
+    ASSERT(nt_init(&t, 32, 32), "init");
 
     uint8_t key[32], val[32];
 
