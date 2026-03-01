@@ -173,7 +173,7 @@ target_link_libraries(test_scale_data_layer data_layer)
 add_executable(bench_mpt
     database/tests/bench_mpt.c
 )
-target_link_libraries(bench_mpt data_layer intermediate_hashes common)
+target_link_libraries(bench_mpt nibble_trie nt_hash intermediate_hashes common)
 
 # Benchmark: nt_root_hash (tree walk MPT root)
 add_executable(bench_nt_hash
