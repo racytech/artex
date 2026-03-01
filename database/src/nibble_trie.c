@@ -148,6 +148,20 @@ static inline void *leaf_value_ptr(const nibble_trie_t *t, nt_ref_t ref) {
 }
 
 /* ========================================================================
+ * Hash cache invalidation
+ * ======================================================================== */
+
+static inline void invalidate_hash(nibble_trie_t *t, nt_ref_t ref) {
+    uint32_t idx = NT_REF_INDEX(ref);
+    if (NT_IS_BRANCH(ref) && idx < t->branch_cache.capacity)
+        t->branch_cache.entries[idx].len = 0;
+    else if (NT_IS_EXTENSION(ref) && idx < t->ext_cache.capacity)
+        t->ext_cache.entries[idx].len = 0;
+    else if (NT_IS_LEAF(ref) && idx < t->leaf_cache.capacity)
+        t->leaf_cache.entries[idx].len = 0;
+}
+
+/* ========================================================================
  * Allocation helpers
  * ======================================================================== */
 
@@ -159,19 +173,25 @@ static nt_ref_t alloc_leaf(nibble_trie_t *t,
     uint8_t *lk = t->leaves.base + (size_t)idx * t->leaves.slot_size;
     memcpy(lk, key, NT_KEY_SIZE);
     memcpy(lk + NT_KEY_SIZE, value, t->value_size);
-    return NT_MAKE_LEAF_REF(idx);
+    nt_ref_t ref = NT_MAKE_LEAF_REF(idx);
+    invalidate_hash(t, ref);  /* clear stale cache from recycled slot */
+    return ref;
 }
 
 static nt_ref_t alloc_branch(nibble_trie_t *t) {
     uint32_t idx = arena_alloc(&t->branches);
     if (idx == 0) return NT_REF_NULL;
-    return NT_MAKE_BRANCH_REF(idx);
+    nt_ref_t ref = NT_MAKE_BRANCH_REF(idx);
+    invalidate_hash(t, ref);  /* clear stale cache from recycled slot */
+    return ref;
 }
 
 static nt_ref_t alloc_extension_raw(nibble_trie_t *t) {
     uint32_t idx = arena_alloc(&t->extensions);
     if (idx == 0) return NT_REF_NULL;
-    return NT_MAKE_EXTENSION_REF(idx);
+    nt_ref_t ref = NT_MAKE_EXTENSION_REF(idx);
+    invalidate_hash(t, ref);  /* clear stale cache from recycled slot */
+    return ref;
 }
 
 /* ========================================================================
@@ -245,6 +265,7 @@ static nt_ref_t do_insert(nibble_trie_t *t, nt_ref_t ref,
         if (memcmp(existing_key, key, NT_KEY_SIZE) == 0) {
             *inserted = false;
             memcpy(leaf_value_ptr(t, ref), value, t->value_size);
+            invalidate_hash(t, ref);
             return ref;
         }
 
@@ -267,6 +288,7 @@ static nt_ref_t do_insert(nibble_trie_t *t, nt_ref_t ref,
         nt_branch_t *br = branch_ptr(t, br_ref);
         br->children[key_nibble(key, diff)] = new_leaf;
         br->children[key_nibble(saved_key, diff)] = ref;
+        invalidate_hash(t, ref);  /* leaf moved deeper — depth-dependent hash */
 
         int prefix_len = diff - depth;
         if (prefix_len > 0)
@@ -288,8 +310,9 @@ static nt_ref_t do_insert(nibble_trie_t *t, nt_ref_t ref,
             nt_ref_t old_child = ext->child;
             nt_ref_t new_child = do_insert(t, old_child, key,
                                             depth + skip, value, inserted);
-            if (new_child == old_child) return ref;
-            ext_ptr(t, ref)->child = new_child;
+            if (new_child != old_child)
+                ext_ptr(t, ref)->child = new_child;
+            invalidate_hash(t, ref);
             return ref;
         }
 
@@ -340,6 +363,7 @@ static nt_ref_t do_insert(nibble_trie_t *t, nt_ref_t ref,
 
     nt_ref_t new_child = do_insert(t, child, key, depth + 1, value, inserted);
     branch_ptr(t, ref)->children[nib] = new_child;
+    invalidate_hash(t, ref);
     return ref;
 }
 
@@ -381,7 +405,10 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
         nt_ref_t new_child = do_delete(t, old_child, key,
                                         depth + skip, deleted);
         if (!*deleted) return ref;
-        if (new_child == old_child) return ref;
+        if (new_child == old_child) {
+            invalidate_hash(t, ref);
+            return ref;
+        }
 
         if (new_child == NT_REF_NULL) {
             arena_free(&t->extensions, NT_REF_INDEX(ref));
@@ -390,6 +417,7 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
 
         if (NT_IS_LEAF(new_child)) {
             arena_free(&t->extensions, NT_REF_INDEX(ref));
+            invalidate_hash(t, new_child);  /* leaf moved up — depth-dependent hash */
             return new_child;
         }
 
@@ -424,6 +452,7 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
 
         /* Child is still a branch — update */
         ext_ptr(t, ref)->child = new_child;
+        invalidate_hash(t, ref);
         return ref;
     }
 
@@ -463,6 +492,7 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
 
         if (NT_IS_LEAF(sole)) {
             arena_free(&t->branches, NT_REF_INDEX(ref));
+            invalidate_hash(t, sole);  /* leaf moved up — depth-dependent hash */
             return sole;
         }
 
@@ -496,6 +526,7 @@ static nt_ref_t do_delete(nibble_trie_t *t, nt_ref_t ref,
 
     /* >= 2 remaining — update branch */
     branch_ptr(t, ref)->children[nib] = new_child;
+    invalidate_hash(t, ref);
     return ref;
 }
 
@@ -567,6 +598,9 @@ void nt_destroy(nibble_trie_t *t) {
     arena_destroy(&t->branches);
     arena_destroy(&t->extensions);
     arena_destroy(&t->leaves);
+    free(t->branch_cache.entries);
+    free(t->ext_cache.entries);
+    free(t->leaf_cache.entries);
     memset(t, 0, sizeof(*t));
 }
 
@@ -575,8 +609,28 @@ void nt_clear(nibble_trie_t *t) {
     arena_clear(&t->branches);
     arena_clear(&t->extensions);
     arena_clear(&t->leaves);
+    if (t->branch_cache.entries)
+        memset(t->branch_cache.entries, 0, t->branch_cache.capacity * sizeof(nt_node_hash_t));
+    if (t->ext_cache.entries)
+        memset(t->ext_cache.entries, 0, t->ext_cache.capacity * sizeof(nt_node_hash_t));
+    if (t->leaf_cache.entries)
+        memset(t->leaf_cache.entries, 0, t->leaf_cache.capacity * sizeof(nt_node_hash_t));
     t->root = NT_REF_NULL;
     t->size = 0;
+}
+
+static void hash_cache_shrink(nt_hash_cache_t *c, uint32_t count) {
+    if (count == 0) {
+        free(c->entries);
+        c->entries = NULL;
+        c->capacity = 0;
+    } else if (count < c->capacity) {
+        nt_node_hash_t *new_entries = realloc(c->entries, count * sizeof(nt_node_hash_t));
+        if (new_entries) {
+            c->entries = new_entries;
+            c->capacity = count;
+        }
+    }
 }
 
 void nt_shrink_to_fit(nibble_trie_t *t) {
@@ -584,6 +638,22 @@ void nt_shrink_to_fit(nibble_trie_t *t) {
     arena_shrink_to_fit(&t->branches);
     arena_shrink_to_fit(&t->extensions);
     arena_shrink_to_fit(&t->leaves);
+    hash_cache_shrink(&t->branch_cache, t->branches.count);
+    hash_cache_shrink(&t->ext_cache, t->extensions.count);
+    hash_cache_shrink(&t->leaf_cache, t->leaves.count);
+}
+
+static bool hash_cache_reserve(nt_hash_cache_t *c, uint32_t cap) {
+    if (cap <= c->capacity) return true;
+    nt_node_hash_t *new_entries = calloc(cap, sizeof(nt_node_hash_t));
+    if (!new_entries) return false;
+    if (c->entries) {
+        memcpy(new_entries, c->entries, c->capacity * sizeof(nt_node_hash_t));
+        free(c->entries);
+    }
+    c->entries = new_entries;
+    c->capacity = cap;
+    return true;
 }
 
 bool nt_reserve(nibble_trie_t *t, size_t expected_keys) {
@@ -596,6 +666,9 @@ bool nt_reserve(nibble_trie_t *t, size_t expected_keys) {
     if (!arena_reserve(&t->branches, internal_cap)) return false;
     if (!arena_reserve(&t->extensions, internal_cap)) return false;
     if (!arena_reserve(&t->leaves, leaf_cap)) return false;
+    if (!hash_cache_reserve(&t->branch_cache, internal_cap)) return false;
+    if (!hash_cache_reserve(&t->ext_cache, internal_cap)) return false;
+    if (!hash_cache_reserve(&t->leaf_cache, leaf_cap)) return false;
     return true;
 }
 

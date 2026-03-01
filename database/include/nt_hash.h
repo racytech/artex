@@ -9,10 +9,11 @@
  *
  * The trie already matches Ethereum's hex-prefix trie (branch/extension/leaf).
  * This function walks nodes recursively, RLP-encodes each one, and produces
- * the standard keccak256 root hash.
+ * the standard keccak256 root hash. Caches per-node hashes for incremental
+ * recomputation — only dirty subtrees are rehashed on subsequent calls.
  *
  * Returns HASH_EMPTY_STORAGE for empty tries.
  */
-hash_t nt_root_hash(const nibble_trie_t *t);
+hash_t nt_root_hash(nibble_trie_t *t);
 
 #endif /* NT_HASH_H */

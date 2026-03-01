@@ -175,6 +175,12 @@ add_executable(bench_mpt
 )
 target_link_libraries(bench_mpt data_layer intermediate_hashes common)
 
+# Benchmark: nt_root_hash (tree walk MPT root)
+add_executable(bench_nt_hash
+    database/tests/bench_nt_hash.c
+)
+target_link_libraries(bench_nt_hash nibble_trie nt_hash intermediate_hashes common)
+
 # Test: State DB (account state + contract storage + checkpoint)
 add_executable(test_state_db
     database/tests/test_state_db.c

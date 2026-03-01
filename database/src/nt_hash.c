@@ -217,51 +217,102 @@ static node_ref_t nref_hash_extension(const uint8_t *nibbles, int count,
 }
 
 /* ========================================================================
- * Recursive Tree Walk
+ * Hash cache helpers
  * ======================================================================== */
 
-static node_ref_t hash_node(const nibble_trie_t *t, nt_ref_t ref, int depth) {
+static bool ensure_cache_capacity(nt_hash_cache_t *cache, uint32_t count) {
+    if (count <= cache->capacity) return true;
+    uint32_t new_cap = count * 2;
+    nt_node_hash_t *new_entries = calloc(new_cap, sizeof(nt_node_hash_t));
+    if (!new_entries) return false;
+    if (cache->entries) {
+        memcpy(new_entries, cache->entries,
+               cache->capacity * sizeof(nt_node_hash_t));
+        free(cache->entries);
+    }
+    cache->entries = new_entries;
+    cache->capacity = new_cap;
+    return true;
+}
+
+static inline nt_node_hash_t *get_hash_cache(nibble_trie_t *t, nt_ref_t ref) {
+    uint32_t idx = NT_REF_INDEX(ref);
+
+    if (NT_IS_BRANCH(ref) && idx < t->branch_cache.capacity)
+        return &t->branch_cache.entries[idx];
+    if (NT_IS_EXTENSION(ref) && idx < t->ext_cache.capacity)
+        return &t->ext_cache.entries[idx];
+    if (NT_IS_LEAF(ref) && idx < t->leaf_cache.capacity)
+        return &t->leaf_cache.entries[idx];
+
+    return NULL;
+}
+
+/* ========================================================================
+ * Recursive Tree Walk (with hash caching)
+ * ======================================================================== */
+
+static node_ref_t hash_node(nibble_trie_t *t, nt_ref_t ref, int depth) {
     node_ref_t empty = {.len = 0};
 
     if (ref == NT_REF_NULL) return empty;
+
+    /* Check cache */
+    nt_node_hash_t *cached = get_hash_cache(t, ref);
+    if (cached && cached->len > 0) {
+        node_ref_t result = {.len = cached->len};
+        memcpy(result.data, cached->data, cached->len);
+        return result;
+    }
+
+    node_ref_t result;
 
     if (NT_IS_LEAF(ref)) {
         uint8_t *key = leaf_key_ptr(t, ref);
         uint8_t *val = leaf_value_ptr(t, ref);
         uint8_t nibbles[NT_MAX_NIBBLES];
         key_to_nibbles(key, NT_KEY_SIZE, nibbles);
-        return nref_hash_leaf(nibbles, depth, NT_MAX_NIBBLES,
-                              val, t->value_size);
-    }
-
-    if (NT_IS_EXTENSION(ref)) {
+        result = nref_hash_leaf(nibbles, depth, NT_MAX_NIBBLES,
+                                val, t->value_size);
+    } else if (NT_IS_EXTENSION(ref)) {
         nt_extension_t *ext = ext_ptr(t, ref);
         uint8_t ext_nibs[NT_MAX_NIBBLES];
         for (int i = 0; i < ext->skip_len; i++)
             ext_nibs[i] = ext_nibble(ext, i);
 
         node_ref_t child_ref = hash_node(t, ext->child, depth + ext->skip_len);
-        return nref_hash_extension(ext_nibs, ext->skip_len, &child_ref);
-    }
-
-    if (NT_IS_BRANCH(ref)) {
+        result = nref_hash_extension(ext_nibs, ext->skip_len, &child_ref);
+    } else if (NT_IS_BRANCH(ref)) {
         nt_branch_t *b = branch_ptr(t, ref);
         node_ref_t children[16];
         for (int i = 0; i < 16; i++)
             children[i] = hash_node(t, b->children[i], depth + 1);
-        return nref_hash_branch(children);
+        result = nref_hash_branch(children);
+    } else {
+        return empty;
     }
 
-    return empty;
+    /* Store in cache */
+    if (cached) {
+        memcpy(cached->data, result.data, result.len);
+        cached->len = result.len;
+    }
+
+    return result;
 }
 
 /* ========================================================================
  * Public API
  * ======================================================================== */
 
-hash_t nt_root_hash(const nibble_trie_t *t) {
+hash_t nt_root_hash(nibble_trie_t *t) {
     if (!t || t->root == NT_REF_NULL)
         return HASH_EMPTY_STORAGE;
+
+    /* Pre-allocate caches to arena sizes so hash_node never grows mid-walk */
+    ensure_cache_capacity(&t->branch_cache, t->branches.count);
+    ensure_cache_capacity(&t->ext_cache, t->extensions.count);
+    ensure_cache_capacity(&t->leaf_cache, t->leaves.count);
 
     node_ref_t root_ref = hash_node(t, t->root, 0);
 

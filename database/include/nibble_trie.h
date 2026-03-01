@@ -60,6 +60,21 @@ typedef struct {
 } nt_arena_t;
 
 /* ========================================================================
+ * Hash cache — per-node cached node_ref_t for incremental nt_root_hash
+ * ======================================================================== */
+
+typedef struct {
+    uint8_t data[32];  /* cached hash or inline RLP */
+    uint8_t len;       /* 32=hash, 1-31=inline, 0=dirty/uncached */
+    uint8_t _pad;
+} nt_node_hash_t;      /* 34 bytes */
+
+typedef struct {
+    nt_node_hash_t *entries;  /* growable array, indexed by pool index */
+    uint32_t capacity;
+} nt_hash_cache_t;
+
+/* ========================================================================
  * Tree structure
  * ======================================================================== */
 
@@ -75,6 +90,11 @@ struct nibble_trie {
 
     nt_ref_t  root;
     uint64_t  size;      /* number of key-value pairs */
+
+    /* Per-node hash cache for incremental nt_root_hash */
+    nt_hash_cache_t branch_cache;
+    nt_hash_cache_t ext_cache;
+    nt_hash_cache_t leaf_cache;
 };
 
 /* ========================================================================
