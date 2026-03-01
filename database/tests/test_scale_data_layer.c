@@ -44,7 +44,6 @@
 
 #define STATE_PATH  "/tmp/art_scale_state.dat"
 #define CODE_PATH   "/tmp/art_scale_code.dat"
-#define INDEX_PATH  "/tmp/art_scale_index.dat"
 #define TRIE_PATH   "/tmp/art_scale_trie.dat"
 #define META_PATH   "/tmp/art_scale_meta.dat"
 
@@ -377,7 +376,6 @@ int main(int argc, char *argv[]) {
     // Clean up from prior runs
     unlink(STATE_PATH);
     unlink(CODE_PATH);
-    unlink(INDEX_PATH);
     unlink(TRIE_PATH);
     unlink(META_PATH);
 
@@ -624,7 +622,6 @@ int main(int argc, char *argv[]) {
     free(sim.value_versions);
     unlink(STATE_PATH);
     unlink(CODE_PATH);
-    unlink(INDEX_PATH);
     unlink(TRIE_PATH);
     unlink(META_PATH);
 

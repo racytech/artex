@@ -16,7 +16,6 @@
 #define VALUE_SIZE 4
 #define STATE_PATH "/tmp/test_ckpt_state.dat"
 #define CODE_PATH  "/tmp/test_ckpt_code.dat"
-#define INDEX_PATH "/tmp/test_ckpt_index.dat"
 #define TRIE_PATH  "/tmp/test_ckpt_trie.dat"
 #define META_PATH  "/tmp/test_ckpt_meta.dat"
 
@@ -45,12 +44,9 @@ static void make_value(uint8_t *buf, uint16_t *len, uint32_t i) {
 static void cleanup_files(void) {
     unlink(STATE_PATH);
     unlink(CODE_PATH);
-    unlink(INDEX_PATH);
     unlink(TRIE_PATH);
     unlink(META_PATH);
     char tmp[256];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", INDEX_PATH);
-    unlink(tmp);
     snprintf(tmp, sizeof(tmp), "%s.tmp", META_PATH);
     unlink(tmp);
 }

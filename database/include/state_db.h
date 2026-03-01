@@ -14,8 +14,8 @@
  *     - storage  (key=64): contract storage slots (addr_hash || slot_hash)
  *
  * Directory layout:
- *   {dir}/state.dat, code.dat, index.dat       — accounts
- *   {dir}/storage/state.dat, index.dat          — storage slots
+ *   {dir}/state.dat, code.dat, trie.dat, meta.dat   — accounts
+ *   {dir}/storage/state.dat, trie.dat, meta.dat      — storage slots
  *
  * Composite storage key: addr_hash[32] || slot_hash[32] = 64 bytes.
  * Sorted order groups all slots per account contiguously.

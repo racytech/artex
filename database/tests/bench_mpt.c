@@ -35,7 +35,6 @@
 #define STATS_INTERVAL  10
 
 #define STATE_PATH "/tmp/art_bench_mpt_state.dat"
-#define INDEX_PATH "/tmp/art_bench_mpt_index.dat"
 #define TRIE_PATH  "/tmp/art_bench_mpt_trie.dat"
 
 #define MASTER_SEED 0x4D50544245000000ULL   // "MPTBE\0\0\0"
@@ -223,7 +222,6 @@ int main(int argc, char *argv[]) {
 
     // Clean up
     unlink(STATE_PATH);
-    unlink(INDEX_PATH);
     unlink(TRIE_PATH);
 
     // Create data layer (no code store — focusing on state commitment)
@@ -435,7 +433,6 @@ int main(int argc, char *argv[]) {
     ih_destroy(ih2);
     dl_destroy(dl);
     unlink(STATE_PATH);
-    unlink(INDEX_PATH);
     unlink(TRIE_PATH);
 
     printf("============================================\n");

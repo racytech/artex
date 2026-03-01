@@ -62,7 +62,6 @@
 
 #define STATE_PATH  "/tmp/stress_dl_state.dat"
 #define CODE_PATH   "/tmp/stress_dl_code.dat"
-#define INDEX_PATH  "/tmp/stress_dl_index.dat"
 #define TRIE_PATH   "/tmp/stress_dl_trie.dat"
 #define META_PATH   "/tmp/stress_dl_meta.dat"
 
@@ -948,7 +947,6 @@ int main(int argc, char *argv[]) {
     // Clean up from prior runs
     unlink(STATE_PATH);
     unlink(CODE_PATH);
-    unlink(INDEX_PATH);
     unlink(TRIE_PATH);
     unlink(META_PATH);
 
@@ -977,7 +975,6 @@ int main(int argc, char *argv[]) {
     free(g_live_indices);
     unlink(STATE_PATH);
     unlink(CODE_PATH);
-    unlink(INDEX_PATH);
     unlink(TRIE_PATH);
     unlink(META_PATH);
 
