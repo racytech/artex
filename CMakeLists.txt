@@ -226,6 +226,12 @@ add_executable(test_stress_nibble_trie
 )
 target_link_libraries(test_stress_nibble_trie nibble_trie)
 
+# Benchmark: Nibble Trie vs Bitmap ART (scale comparison)
+add_executable(bench_nibble_trie
+    database/tests/bench_nibble_trie.c
+)
+target_link_libraries(bench_nibble_trie nibble_trie bitmap_art compact_art)
+
 #==============================================================================
 # Build Summary
 #==============================================================================
