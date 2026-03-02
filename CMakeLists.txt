@@ -74,6 +74,11 @@ add_library(intermediate_hashes STATIC
 )
 target_link_libraries(intermediate_hashes compact_art common)
 
+# Hash Store (zero-RAM file-backed hash table for 64B keys)
+add_library(hash_store STATIC
+    database/src/hash_store.c
+)
+
 #==============================================================================
 # Tests
 #==============================================================================
@@ -208,6 +213,18 @@ add_executable(bench_uthash_vs_art
 )
 target_link_libraries(bench_uthash_vs_art art_database)
 
+# Benchmark: dual compact_art RSS (accounts 32B + storage 64B)
+add_executable(bench_dual_index
+    database/tests/bench_dual_index.c
+)
+target_link_libraries(bench_dual_index compact_art)
+
+# Benchmark: hash_store vs compact_art (64B keys, zero-RAM comparison)
+add_executable(bench_hash_store
+    database/tests/bench_hash_store.c
+)
+target_link_libraries(bench_hash_store hash_store compact_art)
+
 #==============================================================================
 # Build Summary
 #==============================================================================
@@ -229,5 +246,6 @@ message(STATUS "  - state_db (account state + contract storage wrapper)")
 message(STATUS "  - account (compact variable-length account encoding)")
 message(STATUS "  - evm_state (typed in-memory EVM state interface)")
 message(STATUS "  - intermediate_hashes (MPT commitment via flat hash storage)")
+message(STATUS "  - hash_store (zero-RAM file-backed hash table for 64B keys)")
 message(STATUS "========================================")
 message(STATUS "")
