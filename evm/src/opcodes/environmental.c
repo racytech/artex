@@ -64,19 +64,24 @@ evm_status_t op_balance(evm_t *evm)
     address_t addr;
     address_from_uint256(&addr_value, &addr);
 
-    // Check if address is cold/warm and charge appropriate gas (Berlin+)
-    bool is_warm = evm_is_address_warm(evm, &addr);
-    uint64_t gas_cost = is_warm ? GAS_SLOAD_WARM : GAS_SLOAD_COLD;
-    
+    // Charge gas based on fork
+    uint64_t gas_cost;
+    if (evm->fork >= FORK_BERLIN) {
+        // EIP-2929: cold/warm access model
+        bool is_warm = evm_is_address_warm(evm, &addr);
+        gas_cost = is_warm ? GAS_WARM_ACCOUNT_ACCESS : GAS_COLD_ACCOUNT_ACCESS;
+        if (!is_warm) evm_mark_address_warm(evm, &addr);
+    } else if (evm->fork >= FORK_ISTANBUL) {
+        gas_cost = 700;  // EIP-1884
+    } else if (evm->fork >= FORK_TANGERINE_WHISTLE) {
+        gas_cost = GAS_BALANCE;  // 400 (EIP-150)
+    } else {
+        gas_cost = GAS_BALANCE_FRONTIER;  // 20 (pre-EIP-150)
+    }
+
     if (!evm_use_gas(evm, gas_cost))
     {
         return EVM_OUT_OF_GAS;
-    }
-    
-    // Mark address as warm for future accesses
-    if (!is_warm)
-    {
-        evm_mark_address_warm(evm, &addr);
     }
 
     // Get balance from state
@@ -264,7 +269,6 @@ evm_status_t op_calldatacopy(evm_t *evm)
 
     // Convert to uint64
     uint64_t dest_offset = uint256_to_uint64(&dest_offset_256);
-    uint64_t offset = uint256_to_uint64(&offset_256);
     uint64_t size = uint256_to_uint64(&size_256);
 
     // Calculate dynamic gas: base + copy cost + memory expansion
@@ -284,15 +288,26 @@ evm_status_t op_calldatacopy(evm_t *evm)
         return EVM_INVALID_MEMORY_ACCESS;
     }
 
-    // Copy data from calldata to memory
-    for (uint64_t i = 0; i < size; i++)
-    {
-        uint8_t byte = 0;
-        if (offset + i < evm->msg.input_size)
-        {
-            byte = evm->msg.input_data[offset + i];
+    // Check if offset is beyond calldata using 256-bit comparison.
+    // This prevents uint64 truncation from causing overflow in offset + i.
+    uint256_t input_size_256 = uint256_from_uint64(evm->msg.input_size);
+    if (!uint256_lt(&offset_256, &input_size_256)) {
+        // Offset >= input_size: all bytes are zero
+        for (uint64_t i = 0; i < size; i++) {
+            evm_memory_write_byte(evm->memory, dest_offset + i, 0);
         }
-        evm_memory_write_byte(evm->memory, dest_offset + i, byte);
+    } else {
+        // Offset < input_size: safe to convert to uint64
+        uint64_t offset = uint256_to_uint64(&offset_256);
+        for (uint64_t i = 0; i < size; i++)
+        {
+            uint8_t byte = 0;
+            if (offset + i < evm->msg.input_size)
+            {
+                byte = evm->msg.input_data[offset + i];
+            }
+            evm_memory_write_byte(evm->memory, dest_offset + i, byte);
+        }
     }
 
     return EVM_SUCCESS;
@@ -436,6 +451,10 @@ evm_status_t op_returndatasize(evm_t *evm)
     if (!evm)
         return EVM_INTERNAL_ERROR;
 
+    // EIP-211: RETURNDATASIZE introduced in Byzantium
+    if (evm->fork < FORK_BYZANTIUM)
+        return EVM_INVALID_OPCODE;
+
     if (!evm_use_gas(evm, GAS_BASE))
     {
         return EVM_OUT_OF_GAS;
@@ -460,6 +479,10 @@ evm_status_t op_returndatacopy(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
+
+    // EIP-211: RETURNDATACOPY introduced in Byzantium
+    if (evm->fork < FORK_BYZANTIUM)
+        return EVM_INVALID_OPCODE;
 
     // Pop arguments from stack
     uint256_t dest_offset_256, offset_256, size_256;
@@ -534,19 +557,21 @@ evm_status_t op_extcodesize(evm_t *evm)
     address_t addr;
     address_from_uint256(&address_u256, &addr);
 
-    // Check if address is cold/warm and charge appropriate gas (Berlin+)
-    bool is_warm = evm_is_address_warm(evm, &addr);
-    uint64_t gas_cost = is_warm ? GAS_SLOAD_WARM : GAS_SLOAD_COLD;
-    
+    // Charge gas based on fork
+    uint64_t gas_cost;
+    if (evm->fork >= FORK_BERLIN) {
+        bool is_warm = evm_is_address_warm(evm, &addr);
+        gas_cost = is_warm ? GAS_WARM_ACCOUNT_ACCESS : GAS_COLD_ACCOUNT_ACCESS;
+        if (!is_warm) evm_mark_address_warm(evm, &addr);
+    } else if (evm->fork >= FORK_TANGERINE_WHISTLE) {
+        gas_cost = GAS_EXTCODESIZE;  // 700 (EIP-150+)
+    } else {
+        gas_cost = GAS_EXTCODESIZE_FRONTIER;  // 20 (pre-EIP-150)
+    }
+
     if (!evm_use_gas(evm, gas_cost))
     {
         return EVM_OUT_OF_GAS;
-    }
-    
-    // Mark address as warm for future accesses
-    if (!is_warm)
-    {
-        evm_mark_address_warm(evm, &addr);
     }
 
     // Get code size from state
@@ -596,22 +621,24 @@ evm_status_t op_extcodecopy(evm_t *evm)
     address_t addr;
     address_from_uint256(&address_u256, &addr);
 
-    // Check if address is cold/warm and charge appropriate gas (Berlin+)
-    bool is_warm = evm_is_address_warm(evm, &addr);
-    uint64_t access_cost = is_warm ? GAS_SLOAD_WARM : GAS_SLOAD_COLD;
-    
+    // Charge gas based on fork
+    uint64_t access_cost;
+    if (evm->fork >= FORK_BERLIN) {
+        bool is_warm = evm_is_address_warm(evm, &addr);
+        access_cost = is_warm ? GAS_WARM_ACCOUNT_ACCESS : GAS_COLD_ACCOUNT_ACCESS;
+        if (!is_warm) evm_mark_address_warm(evm, &addr);
+    } else if (evm->fork >= FORK_TANGERINE_WHISTLE) {
+        access_cost = GAS_EXTCODECOPY;  // 700 (EIP-150+)
+    } else {
+        access_cost = GAS_EXTCODECOPY_FRONTIER;  // 20 (pre-EIP-150)
+    }
+
     // Calculate dynamic gas: base + copy cost + memory expansion
     uint64_t copy_gas = gas_copy_cost(size);
     uint64_t mem_gas = evm_memory_access_cost(evm->memory, dest_offset, size);
     if (!evm_use_gas(evm, access_cost + copy_gas + mem_gas))
     {
         return EVM_OUT_OF_GAS;
-    }
-    
-    // Mark address as warm for future accesses
-    if (!is_warm)
-    {
-        evm_mark_address_warm(evm, &addr);
     }
 
     // Expand memory if needed
@@ -671,19 +698,21 @@ evm_status_t op_extcodehash(evm_t *evm)
     address_t addr;
     address_from_uint256(&address_u256, &addr);
 
-    // Check if address is cold/warm and charge appropriate gas (Berlin+)
-    bool is_warm = evm_is_address_warm(evm, &addr);
-    uint64_t gas_cost = is_warm ? GAS_SLOAD_WARM : GAS_SLOAD_COLD;
-    
+    // Charge gas based on fork
+    uint64_t gas_cost;
+    if (evm->fork >= FORK_BERLIN) {
+        bool is_warm = evm_is_address_warm(evm, &addr);
+        gas_cost = is_warm ? GAS_WARM_ACCOUNT_ACCESS : GAS_COLD_ACCOUNT_ACCESS;
+        if (!is_warm) evm_mark_address_warm(evm, &addr);
+    } else if (evm->fork >= FORK_ISTANBUL) {
+        gas_cost = GAS_EXTCODEHASH;  // 700 (EIP-1884)
+    } else {
+        gas_cost = 400;  // Constantinople (EIP-1052)
+    }
+
     if (!evm_use_gas(evm, gas_cost))
     {
         return EVM_OUT_OF_GAS;
-    }
-    
-    // Mark address as warm for future accesses
-    if (!is_warm)
-    {
-        evm_mark_address_warm(evm, &addr);
     }
 
     // Get code hash from state

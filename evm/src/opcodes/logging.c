@@ -38,13 +38,13 @@ static evm_status_t op_log_common(evm_t *evm, uint8_t num_topics)
         return EVM_STATIC_CALL_VIOLATION;
     }
 
-    // Pop offset and size from stack
+    // Pop offset and size from stack (offset is on top per EVM spec)
     uint256_t offset_u256, size_u256;
-    if (!evm_stack_pop(evm->stack, &size_u256))
+    if (!evm_stack_pop(evm->stack, &offset_u256))
     {
         return EVM_STACK_UNDERFLOW;
     }
-    if (!evm_stack_pop(evm->stack, &offset_u256))
+    if (!evm_stack_pop(evm->stack, &size_u256))
     {
         return EVM_STACK_UNDERFLOW;
     }

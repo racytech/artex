@@ -390,6 +390,10 @@ evm_status_t op_shl(evm_t *evm)
         return EVM_INTERNAL_ERROR;
     }
 
+    // EIP-145: SHL introduced in Constantinople
+    if (evm->fork < FORK_CONSTANTINOPLE)
+        return EVM_INVALID_OPCODE;
+
     if (!evm_use_gas(evm, GAS_VERY_LOW))
     {
         return EVM_OUT_OF_GAS;
@@ -434,6 +438,9 @@ evm_status_t op_shr(evm_t *evm)
         return EVM_INTERNAL_ERROR;
     }
 
+    if (evm->fork < FORK_CONSTANTINOPLE)
+        return EVM_INVALID_OPCODE;
+
     if (!evm_use_gas(evm, GAS_VERY_LOW))
     {
         return EVM_OUT_OF_GAS;
@@ -477,6 +484,9 @@ evm_status_t op_sar(evm_t *evm)
     {
         return EVM_INTERNAL_ERROR;
     }
+
+    if (evm->fork < FORK_CONSTANTINOPLE)
+        return EVM_INVALID_OPCODE;
 
     if (!evm_use_gas(evm, GAS_VERY_LOW))
     {

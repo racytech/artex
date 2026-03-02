@@ -209,3 +209,23 @@ evm_status_t op_swap13(evm_t *evm) { return op_swap(evm, 13); }
 evm_status_t op_swap14(evm_t *evm) { return op_swap(evm, 14); }
 evm_status_t op_swap15(evm_t *evm) { return op_swap(evm, 15); }
 evm_status_t op_swap16(evm_t *evm) { return op_swap(evm, 16); }
+
+// PUSH0 (0x5f): Push zero onto stack (EIP-3855, Shanghai+)
+evm_status_t op_push0(evm_t *evm)
+{
+    if (!evm || !evm->stack)
+        return EVM_INTERNAL_ERROR;
+
+    // PUSH0 is only valid Shanghai+
+    if (evm->fork < FORK_SHANGHAI)
+        return EVM_INVALID_OPCODE;
+
+    if (!evm_use_gas(evm, GAS_BASE))
+        return EVM_OUT_OF_GAS;
+
+    uint256_t zero = UINT256_ZERO;
+    if (!evm_stack_push(evm->stack, &zero))
+        return EVM_STACK_OVERFLOW;
+
+    return EVM_SUCCESS;
+}

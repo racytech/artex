@@ -23,21 +23,20 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         .name = "test",
         .fork_blocks = {0}
     };
-    
+
     // If no fork specified, use sepolia config (all forks at block 0 up to latest)
     if (!fork_name) {
         return (chain_config_t *)chain_config_sepolia();
     }
-    
-    // Determine which fork this test is for
-    // Set all forks up to this one at block 0, rest at UINT64_MAX
-    test_config.fork_blocks.frontier = 0;
-    test_config.fork_blocks.homestead = 0;
-    test_config.fork_blocks.tangerine_whistle = 0;
-    test_config.fork_blocks.spurious_dragon = 0;
-    test_config.fork_blocks.byzantium = 0;
+
+    // Start with all forks disabled
+    test_config.fork_blocks.frontier = 0;  // Always active
+    test_config.fork_blocks.homestead = UINT64_MAX;
+    test_config.fork_blocks.tangerine_whistle = UINT64_MAX;
+    test_config.fork_blocks.spurious_dragon = UINT64_MAX;
+    test_config.fork_blocks.byzantium = UINT64_MAX;
     test_config.fork_blocks.constantinople = UINT64_MAX;
-    test_config.fork_blocks.petersburg = 0;
+    test_config.fork_blocks.petersburg = UINT64_MAX;
     test_config.fork_blocks.istanbul = UINT64_MAX;
     test_config.fork_blocks.muir_glacier = UINT64_MAX;
     test_config.fork_blocks.berlin = UINT64_MAX;
@@ -47,38 +46,111 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
     test_config.fork_blocks.paris = UINT64_MAX;
     test_config.fork_blocks.shanghai = UINT64_MAX;
     test_config.fork_blocks.cancun = UINT64_MAX;
-    
-    // Enable forks based on test fork name
+
+    // Enable forks cumulatively up to the target fork.
+    // Fork chronology: Frontier → Homestead → Tangerine Whistle → Spurious Dragon
+    //   → Byzantium → Constantinople/Petersburg → Istanbul → Berlin → London
+    //   → Paris → Shanghai → Cancun → Prague
     if (strcmp(fork_name, "Frontier") == 0) {
-        // Only Frontier active
-        test_config.fork_blocks.homestead = UINT64_MAX;
+        // Only Frontier active (already set above)
     } else if (strcmp(fork_name, "Homestead") == 0) {
         test_config.fork_blocks.homestead = 0;
+    } else if (strcmp(fork_name, "Byzantium") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+    } else if (strcmp(fork_name, "ConstantinopleFix") == 0 ||
+               strcmp(fork_name, "Constantinople") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
     } else if (strcmp(fork_name, "Istanbul") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
     } else if (strcmp(fork_name, "Berlin") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
         test_config.fork_blocks.berlin = 0;
     } else if (strcmp(fork_name, "London") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
         test_config.fork_blocks.berlin = 0;
         test_config.fork_blocks.london = 0;
+    } else if (strcmp(fork_name, "Paris") == 0 ||
+               strcmp(fork_name, "Merge") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.berlin = 0;
+        test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.paris = 0;
     } else if (strcmp(fork_name, "Shanghai") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
         test_config.fork_blocks.berlin = 0;
         test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.paris = 0;
         test_config.fork_blocks.shanghai = 0;
     } else if (strcmp(fork_name, "Cancun") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
         test_config.fork_blocks.berlin = 0;
         test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.paris = 0;
+        test_config.fork_blocks.shanghai = 0;
+        test_config.fork_blocks.cancun = 0;
+    } else if (strcmp(fork_name, "Prague") == 0) {
+        // Prague is post-Cancun; treat as Cancun for now (our latest supported fork)
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.berlin = 0;
+        test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.paris = 0;
         test_config.fork_blocks.shanghai = 0;
         test_config.fork_blocks.cancun = 0;
     } else {
         // Unknown fork, use sepolia (all forks active)
         return (chain_config_t *)chain_config_sepolia();
     }
-    
+
     return &test_config;
 }
 
@@ -250,12 +322,7 @@ bool test_runner_setup_state(evm_state_t *state,
     for (size_t i = 0; i < count; i++) {
         const test_account_t *acc = &accounts[i];
 
-        // Debug: Show what we're setting up
-        if (acc->code && acc->code_len > 0) {
-            printf("DEBUG: Setting up account with code: addr=0x");
-            for (int j = 0; j < 20; j++) printf("%02x", acc->address.bytes[j]);
-            printf(", code_len=%zu\n", acc->code_len);
-        }
+        // (Debug output removed)
 
         // Ensure account exists in state
         evm_state_create_account(state, &acc->address);

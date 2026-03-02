@@ -59,6 +59,13 @@ evm_status_t op_mstore8(evm_t *evm);
  */
 evm_status_t op_msize(evm_t *evm);
 
+/**
+ * MCOPY - Copy memory areas (EIP-5656, Cancun+)
+ * Stack: dst src size =>
+ * Gas: 3 + 3 * (size in words) + memory_expansion_cost
+ */
+evm_status_t op_mcopy(evm_t *evm);
+
 #ifdef __cplusplus
 }
 #endif

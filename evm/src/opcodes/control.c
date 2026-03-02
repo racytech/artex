@@ -346,6 +346,10 @@ evm_status_t op_revert(evm_t *evm)
     if (!evm)
         return EVM_INTERNAL_ERROR;
 
+    // EIP-140: REVERT introduced in Byzantium
+    if (evm->fork < FORK_BYZANTIUM)
+        return EVM_INVALID_OPCODE;
+
     // Pop offset and size from stack
     uint256_t offset_256, size_256;
     
@@ -453,34 +457,67 @@ evm_status_t op_selfdestruct(evm_t *evm)
     // Check if beneficiary exists for gas calculation
     bool beneficiary_exists = evm_state_exists(evm->state, &beneficiary_addr);
 
-    // Calculate gas cost
-    uint64_t gas_cost = 5000;  // Base cost
+    // Calculate gas cost - fork-dependent
+    uint64_t gas_cost = 0;
 
-    // Pre-EIP-3529: Add 25000 gas if creating new account
-    // For now, we'll use the simple pre-London rules
-    if (!beneficiary_exists && !uint256_is_zero(&balance))
+    if (evm->fork >= FORK_TANGERINE_WHISTLE)
     {
-        gas_cost += 25000;
+        gas_cost = 5000;  // EIP-150 base cost
+
+        // Berlin+ (EIP-2929): Add cold account access cost
+        if (evm->fork >= FORK_BERLIN)
+        {
+            bool is_warm = evm_is_address_warm(evm, &beneficiary_addr);
+            if (!is_warm)
+            {
+                gas_cost += GAS_COLD_ACCOUNT_ACCESS;  // 2600
+                evm_mark_address_warm(evm, &beneficiary_addr);
+            }
+        }
+
+        // EIP-150: Add new account creation cost if sending balance to non-existent account
+        if (!beneficiary_exists && !uint256_is_zero(&balance))
+        {
+            gas_cost += 25000;
+        }
     }
+    // Pre-TW: SELFDESTRUCT costs 0 gas
 
     if (!evm_use_gas(evm, gas_cost))
     {
         return EVM_OUT_OF_GAS;
     }
 
-    // Transfer balance to beneficiary (if non-zero)
+    // EIP-6780 (Cancun+): SELFDESTRUCT only deletes if created in same tx
+    bool created_in_tx = evm_state_is_created(evm->state, &evm->msg.recipient);
+    bool do_delete = (evm->fork < FORK_CANCUN) || created_in_tx;
+
+    // Gas refund: pre-EIP-3529 (pre-London) gives 24000 refund
+    // Only if this account hasn't already been scheduled for deletion in this tx
+    // Must check BEFORE marking self-destruct below
+    if (evm->fork < FORK_LONDON)
+    {
+        if (!evm_state_is_self_destructed(evm->state, &evm->msg.recipient))
+        {
+            evm->gas_refund += 24000;
+        }
+    }
+
+    // Transfer balance to beneficiary — always touch beneficiary even if balance is 0
+    evm_state_add_balance(evm->state, &beneficiary_addr, &balance);
+
+    // Zero out contract balance
     if (!uint256_is_zero(&balance))
     {
-        // Add contract balance to beneficiary
-        evm_state_add_balance(evm->state, &beneficiary_addr, &balance);
-
-        // Zero out contract balance before deletion
         uint256_t zero = uint256_from_uint64(0);
         evm_state_set_balance(evm->state, &evm->msg.recipient, &zero);
     }
 
-    // Mark contract for deletion
-    evm_state_self_destruct(evm->state, &evm->msg.recipient);
+    if (do_delete)
+    {
+        // Mark contract for deletion (pre-Cancun, or created in same tx)
+        evm_state_self_destruct(evm->state, &evm->msg.recipient);
+    }
 
     LOG_EVM_DEBUG("SELFDESTRUCT: contract deleted, balance transferred");
 

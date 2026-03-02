@@ -216,6 +216,10 @@ evm_status_t op_chainid(evm_t *evm)
     if (!evm)
         return EVM_INTERNAL_ERROR;
 
+    // EIP-1344: CHAINID introduced in Istanbul
+    if (evm->fork < FORK_ISTANBUL)
+        return EVM_INVALID_OPCODE;
+
     if (!evm_use_gas(evm, GAS_BASE))
     {
         return EVM_OUT_OF_GAS;
@@ -238,6 +242,10 @@ evm_status_t op_selfbalance(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
+
+    // EIP-1884: SELFBALANCE introduced in Istanbul
+    if (evm->fork < FORK_ISTANBUL)
+        return EVM_INVALID_OPCODE;
 
     if (!evm_use_gas(evm, GAS_LOW))
     {
@@ -265,6 +273,10 @@ evm_status_t op_basefee(evm_t *evm)
     if (!evm)
         return EVM_INTERNAL_ERROR;
 
+    // EIP-3198: BASEFEE introduced in London
+    if (evm->fork < FORK_LONDON)
+        return EVM_INVALID_OPCODE;
+
     if (!evm_use_gas(evm, GAS_BASE))
     {
         return EVM_OUT_OF_GAS;
@@ -274,6 +286,58 @@ evm_status_t op_basefee(evm_t *evm)
     {
         return EVM_STACK_OVERFLOW;
     }
+
+    return EVM_SUCCESS;
+}
+
+/**
+ * BLOBHASH - Get versioned hash at index (EIP-4844, Cancun+)
+ * Stack: index => hash
+ * Gas: 3
+ */
+evm_status_t op_blobhash(evm_t *evm)
+{
+    if (!evm || !evm->stack)
+        return EVM_INTERNAL_ERROR;
+
+    if (evm->fork < FORK_CANCUN)
+        return EVM_INVALID_OPCODE;
+
+    uint256_t index;
+    if (!evm_stack_pop(evm->stack, &index))
+        return EVM_STACK_UNDERFLOW;
+
+    if (!evm_use_gas(evm, GAS_VERY_LOW))
+        return EVM_OUT_OF_GAS;
+
+    // No blob transactions supported yet — push 0
+    uint256_t zero = UINT256_ZERO;
+    if (!evm_stack_push(evm->stack, &zero))
+        return EVM_STACK_OVERFLOW;
+
+    return EVM_SUCCESS;
+}
+
+/**
+ * BLOBBASEFEE - Get blob base fee (EIP-7516, Cancun+)
+ * Stack: => blob_base_fee
+ * Gas: 2
+ */
+evm_status_t op_blobbasefee(evm_t *evm)
+{
+    if (!evm || !evm->stack)
+        return EVM_INTERNAL_ERROR;
+
+    if (evm->fork < FORK_CANCUN)
+        return EVM_INVALID_OPCODE;
+
+    if (!evm_use_gas(evm, GAS_BASE))
+        return EVM_OUT_OF_GAS;
+
+    // Blob base fee — default to 1 (minimum) when not set
+    uint256_t blob_base_fee = uint256_from_uint64(1);
+    if (!evm_stack_push(evm->stack, &blob_base_fee))
+        return EVM_STACK_OVERFLOW;
 
     return EVM_SUCCESS;
 }

@@ -51,6 +51,20 @@ evm_status_t op_sload(evm_t *evm);
  */
 evm_status_t op_sstore(evm_t *evm);
 
+/**
+ * TLOAD - Load from transient storage (EIP-1153, Cancun+)
+ * Stack: key => value
+ * Gas: 100
+ */
+evm_status_t op_tload(evm_t *evm);
+
+/**
+ * TSTORE - Store to transient storage (EIP-1153, Cancun+)
+ * Stack: key value =>
+ * Gas: 100
+ */
+evm_status_t op_tstore(evm_t *evm);
+
 #ifdef __cplusplus
 }
 #endif

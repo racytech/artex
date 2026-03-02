@@ -505,14 +505,27 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     // Set up message context
     evm->msg = *msg;
     evm->gas_left = msg->gas;
+    evm->gas_refund = 0;  // Each frame starts with zero refund
     evm->pc = 0;
     evm->stopped = false;
     evm->status = EVM_SUCCESS;
 
+
+    //==========================================================================
+    // State Snapshot for Subcalls
+    //==========================================================================
+
+    // Subcalls need a state snapshot so we can revert on error/REVERT
+    uint32_t subcall_snapshot = 0;
+    if (is_subcall)
+    {
+        subcall_snapshot = evm_state_snapshot(evm->state);
+    }
+
     //==========================================================================
     // Value Transfer
     //==========================================================================
-    
+
     // Transfer value if non-zero (for CALL family, not CREATE - CREATE handles it separately)
     // Only transfer for internal calls (depth > 0) - top-level calls already transferred in transaction layer
     if (msg->depth > 0 && (msg->kind == EVM_CALL || msg->kind == EVM_CALLCODE) && !uint256_is_zero(&msg->value))
@@ -585,9 +598,19 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     *result = evm_interpret(evm);
     
     //==========================================================================
+    // Revert State on Subcall Failure
+    //==========================================================================
+
+    if (is_subcall && result->status != EVM_SUCCESS)
+    {
+        // Revert all state changes (value transfer, SSTORE, etc.)
+        evm_state_revert(evm->state, subcall_snapshot);
+    }
+
+    //==========================================================================
     // Restore Context for Subcalls
     //==========================================================================
-    
+
     if (is_subcall)
     {
         // Save subcall's return data before destroying its context

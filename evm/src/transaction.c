@@ -22,19 +22,29 @@
  * - Cost for contract creation (32000 gas if creating contract)
  * - Cost for access list entries (EIP-2930)
  */
-static uint64_t calculate_intrinsic_gas(const transaction_t *tx) {
+static uint64_t calculate_intrinsic_gas(const transaction_t *tx, evm_fork_t fork) {
     const uint64_t G_TRANSACTION = 21000;
     const uint64_t G_TX_DATA_ZERO = 4;
-    const uint64_t G_TX_DATA_NONZERO = 16;  // 68 for post-Istanbul
+    const uint64_t G_TX_DATA_NONZERO_ISTANBUL = 16;   // EIP-2028 (Istanbul+)
+    const uint64_t G_TX_DATA_NONZERO_LEGACY = 68;     // Pre-Istanbul
     const uint64_t G_TX_CREATE = 32000;
     const uint64_t G_ACCESS_LIST_ADDRESS = 2400;  // EIP-2930
     const uint64_t G_ACCESS_LIST_STORAGE_KEY = 1900;  // EIP-2930
 
+    uint64_t g_tx_data_nonzero = (fork >= FORK_ISTANBUL) ?
+        G_TX_DATA_NONZERO_ISTANBUL : G_TX_DATA_NONZERO_LEGACY;
+
     uint64_t gas = G_TRANSACTION;
 
-    // Add cost for contract creation
-    if (tx->is_create) {
+    // Add cost for contract creation (Homestead+, EIP-2)
+    if (tx->is_create && fork >= FORK_HOMESTEAD) {
         gas += G_TX_CREATE;
+
+        // EIP-3860 (Shanghai+): initcode word gas
+        if (fork >= FORK_SHANGHAI && tx->data_size > 0) {
+            uint64_t words = (tx->data_size + 31) / 32;
+            gas += 2 * words;  // INITCODE_WORD_GAS = 2
+        }
     }
 
     // Add cost for calldata
@@ -43,7 +53,7 @@ static uint64_t calculate_intrinsic_gas(const transaction_t *tx) {
             if (tx->data[i] == 0) {
                 gas += G_TX_DATA_ZERO;
             } else {
-                gas += G_TX_DATA_NONZERO;
+                gas += g_tx_data_nonzero;
             }
         }
     }
@@ -192,6 +202,11 @@ bool transaction_execute(
         return false;
     }
 
+    // Snapshot AFTER nonce increment and gas deduction, but BEFORE value transfer
+    // and contract creation. Per Ethereum spec, on EVM error/revert we revert
+    // value transfer and execution state, but keep nonce increment and gas deduction.
+    uint32_t exec_snapshot = evm_state_snapshot(state);
+
     // For contract creation, create empty account at contract address
     if (tx->is_create) {
         uint64_t existing_nonce = evm_state_get_nonce(state, &contract_address);
@@ -215,17 +230,12 @@ bool transaction_execute(
         evm_state_add_balance(state, &recipient, &tx->value);
     }
 
-    // Snapshot AFTER pre-execution changes (nonce, gas deduction, value transfer)
-    // On EVM error/revert, we revert to here (undoing execution state changes
-    // but keeping nonce increment and gas deduction)
-    uint32_t exec_snapshot = evm_state_snapshot(state);
-
     //==========================================================================
     // EVM Execution
     //==========================================================================
 
     // Calculate intrinsic gas
-    uint64_t intrinsic_gas = calculate_intrinsic_gas(tx);
+    uint64_t intrinsic_gas = calculate_intrinsic_gas(tx, evm->fork);
 
     // Check if transaction has enough gas for intrinsic cost
     if (tx->gas_limit < intrinsic_gas) {
@@ -336,8 +346,8 @@ bool transaction_execute(
     uint64_t gas_used = result->gas_used;
     uint64_t gas_refund = result->gas_refund;
 
-    // Apply refund (capped at gas_used / 2 per EIP-3529)
-    uint64_t max_refund = gas_used / 2;
+    // Apply refund cap: London+ (EIP-3529) = gas_used/5, pre-London = gas_used/2
+    uint64_t max_refund = (evm->fork >= FORK_LONDON) ? gas_used / 5 : gas_used / 2;
     if (gas_refund > max_refund) {
         gas_refund = max_refund;
     }
@@ -351,11 +361,20 @@ bool transaction_execute(
     // Refund unused gas to sender
     evm_state_add_balance(state, &tx->sender, &refund_amount);
 
-    // Pay coinbase (miner) for gas used (skip for state tests)
+    // Pay coinbase (miner) for gas used
     if (!env->skip_coinbase_payment) {
         uint64_t gas_paid = gas_used - gas_refund;
         uint256_t gas_paid_u256 = uint256_from_uint64(gas_paid);
-        uint256_t coinbase_payment = uint256_mul(&effective_gas_price, &gas_paid_u256);
+
+        // For London+ (EIP-1559): coinbase only gets priority fee (effective_gas_price - base_fee)
+        // Pre-London: coinbase gets full effective gas price
+        uint256_t coinbase_gas_price;
+        if (evm->fork >= FORK_LONDON) {
+            coinbase_gas_price = uint256_sub(&effective_gas_price, &env->base_fee);
+        } else {
+            coinbase_gas_price = effective_gas_price;
+        }
+        uint256_t coinbase_payment = uint256_mul(&coinbase_gas_price, &gas_paid_u256);
 
         evm_state_add_balance(state, &env->coinbase, &coinbase_payment);
     }

@@ -45,7 +45,8 @@ extern "C"
 #define GAS_MEMORY_QUAD    512  // Quadratic divisor for memory
 
 // Storage operations (pre-Berlin, simplified)
-#define GAS_SLOAD_LEGACY        200   // Legacy SLOAD cost (pre-Istanbul)
+#define GAS_SLOAD_FRONTIER      50    // SLOAD cost (Frontier/Homestead, pre-EIP-150)
+#define GAS_SLOAD_LEGACY        200   // SLOAD cost (Tangerine Whistle to Istanbul, EIP-150)
 #define GAS_SLOAD_ISTANBUL      800   // SLOAD cost (Istanbul to Berlin)
 #define GAS_SLOAD_COLD          2100  // Cold SLOAD (Berlin+, EIP-2929)
 #define GAS_SLOAD_WARM          100   // Warm SLOAD (Berlin+, EIP-2929)
@@ -61,9 +62,12 @@ extern "C"
 #define GAS_CALL_NEW_ACCOUNT   25000 // Cost for creating new account
 
 // Account operations
-#define GAS_BALANCE            400   // BALANCE cost (Berlin+, was 700 pre-Berlin for cold)
-#define GAS_EXTCODESIZE        700   // EXTCODESIZE cost (cold, pre-Berlin)
-#define GAS_EXTCODECOPY        700   // EXTCODECOPY base cost (cold, pre-Berlin)
+#define GAS_BALANCE_FRONTIER   20    // BALANCE cost (Frontier/Homestead, pre-EIP-150)
+#define GAS_BALANCE            400   // BALANCE cost (EIP-150 to Istanbul)
+#define GAS_EXTCODESIZE_FRONTIER 20  // EXTCODESIZE cost (Frontier/Homestead, pre-EIP-150)
+#define GAS_EXTCODESIZE        700   // EXTCODESIZE cost (EIP-150+, pre-Berlin)
+#define GAS_EXTCODECOPY_FRONTIER 20  // EXTCODECOPY base cost (Frontier/Homestead, pre-EIP-150)
+#define GAS_EXTCODECOPY        700   // EXTCODECOPY base cost (EIP-150+, pre-Berlin)
 #define GAS_EXTCODEHASH        700   // EXTCODEHASH cost (cold, pre-Berlin)
 
 // Cold/warm access (EIP-2929, Berlin+)

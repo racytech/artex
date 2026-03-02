@@ -8,6 +8,7 @@
 #include "evm_stack.h"
 #include "gas.h"
 #include "logger.h"
+#include <string.h>
 
 // MLOAD (0x51): Load word from memory
 evm_status_t op_mload(evm_t *evm)
@@ -153,6 +154,51 @@ evm_status_t op_msize(evm_t *evm)
     {
         return EVM_STACK_OVERFLOW;
     }
+
+    return EVM_SUCCESS;
+}
+
+// MCOPY (0x5e): Copy memory areas (EIP-5656, Cancun+)
+evm_status_t op_mcopy(evm_t *evm)
+{
+    if (!evm || !evm->stack || !evm->memory)
+        return EVM_INTERNAL_ERROR;
+
+    if (evm->fork < FORK_CANCUN)
+        return EVM_INVALID_OPCODE;
+
+    uint256_t dst_256, src_256, size_256;
+    if (!evm_stack_pop(evm->stack, &dst_256))
+        return EVM_STACK_UNDERFLOW;
+    if (!evm_stack_pop(evm->stack, &src_256))
+        return EVM_STACK_UNDERFLOW;
+    if (!evm_stack_pop(evm->stack, &size_256))
+        return EVM_STACK_UNDERFLOW;
+
+    uint64_t dst = uint256_to_uint64(&dst_256);
+    uint64_t src = uint256_to_uint64(&src_256);
+    uint64_t size = uint256_to_uint64(&size_256);
+
+    // Gas: 3 (base) + 3 * words (copy) + memory expansion
+    uint64_t copy_gas = gas_copy_cost(size);
+    // Memory expansion covers both src and dst regions
+    uint64_t max_end = (dst + size > src + size) ? dst + size : src + size;
+    uint64_t mem_gas = evm_memory_expansion_cost(evm->memory->size, max_end);
+    if (!evm_use_gas(evm, GAS_VERY_LOW + copy_gas + mem_gas))
+        return EVM_OUT_OF_GAS;
+
+    if (size == 0)
+        return EVM_SUCCESS;
+
+    // Expand memory to cover both regions
+    if (!evm_memory_expand(evm->memory, dst, size))
+        return EVM_INVALID_MEMORY_ACCESS;
+    if (!evm_memory_expand(evm->memory, src, size))
+        return EVM_INVALID_MEMORY_ACCESS;
+
+    // Copy with overlap support (like memmove)
+    uint8_t *mem = evm->memory->data;
+    memmove(mem + dst, mem + src, size);
 
     return EVM_SUCCESS;
 }

@@ -136,11 +136,7 @@ void address_to_uint256(const address_t *addr, void *uint256_ptr)
     if (!addr || !uint256_ptr)
         return;
 
-    // Clear the uint256_t first (zero out all 32 bytes)
-    memset(uint256_ptr, 0, 32);
-
-    // Copy address to lowest 20 bytes of uint256_t (right-aligned)
-    // In EVM, addresses are right-aligned when represented as 256-bit values
-    uint8_t *bytes = (uint8_t *)uint256_ptr;
-    memcpy(bytes, addr->bytes, ADDRESS_SIZE);
+    // Convert address (big-endian) to uint256 numeric value.
+    // Address occupies the lowest 160 bits of the 256-bit integer.
+    *(uint256_t *)uint256_ptr = uint256_from_bytes(addr->bytes, ADDRESS_SIZE);
 }

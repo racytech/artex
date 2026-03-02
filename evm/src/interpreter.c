@@ -81,26 +81,21 @@ evm_result_t evm_interpret(evm_t *evm)
 {
     if (!evm || !evm->code || !evm->stack || !evm->memory)
     {
-        printf("DEBUG INTERPRETER: NULL check failed - evm=%p, code=%p, stack=%p, memory=%p\n",
-               (void*)evm, evm ? (void*)evm->code : NULL, 
-               evm ? (void*)evm->stack : NULL, evm ? (void*)evm->memory : NULL);
         LOG_EVM_ERROR("Invalid EVM state");
         return evm_result_create(EVM_INTERNAL_ERROR, 0, 0, NULL, 0);
     }
 
+    if (0) { // Debug output disabled
     printf("DEBUG INTERPRETER: Starting execution\n");
-    fflush(stdout);
     printf("  Code size: %zu bytes\n", evm->code_size);
-    fflush(stdout);
     printf("  Gas available: %lu\n", evm->gas_left);
     printf("  PC: %zu\n", evm->pc);
     printf("  First 10 bytes: ");
-    fflush(stdout);
     for (size_t i = 0; i < 10 && i < evm->code_size; i++) {
         printf("%02x ", evm->code[i]);
     }
     printf("\n");
-    fflush(stdout);
+    } // end debug output
 
     // Computed goto dispatch table (GCC/Clang extension)
     static const void *dispatch_table[256] = {
@@ -186,8 +181,8 @@ evm_result_t evm_interpret(evm_t *evm)
         &&op_chainid,
         &&op_selfbalance,
         &&op_basefee,
-        &&op_invalid,
-        &&op_invalid,
+        &&op_blobhash,
+        &&op_blobbasefee,
         &&op_invalid,
         &&op_invalid,
         &&op_invalid,
@@ -207,10 +202,10 @@ evm_result_t evm_interpret(evm_t *evm)
         &&op_msize,
         &&op_gas,
         &&op_jumpdest,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
+        &&op_tload,
+        &&op_tstore,
+        &&op_mcopy,
+        &&op_push0,
 
         // 0x60-0x7f: Push Operations
         &&op_push1,
@@ -719,6 +714,18 @@ op_basefee:
         goto error;
     NEXT();
 
+op_blobhash:
+    status = op_blobhash(evm);
+    if (status != EVM_SUCCESS)
+        goto error;
+    NEXT();
+
+op_blobbasefee:
+    status = op_blobbasefee(evm);
+    if (status != EVM_SUCCESS)
+        goto error;
+    NEXT();
+
     //==========================================================================
     // 0x50-0x5f: Stack, Memory, Storage, and Flow Operations
     //==========================================================================
@@ -791,6 +798,30 @@ op_gas:
 
 op_jumpdest:
     status = op_jumpdest(evm);
+    if (status != EVM_SUCCESS)
+        goto error;
+    NEXT();
+
+op_tload:
+    status = op_tload(evm);
+    if (status != EVM_SUCCESS)
+        goto error;
+    NEXT();
+
+op_tstore:
+    status = op_tstore(evm);
+    if (status != EVM_SUCCESS)
+        goto error;
+    NEXT();
+
+op_mcopy:
+    status = op_mcopy(evm);
+    if (status != EVM_SUCCESS)
+        goto error;
+    NEXT();
+
+op_push0:
+    status = op_push0(evm);
     if (status != EVM_SUCCESS)
         goto error;
     NEXT();
@@ -1225,15 +1256,13 @@ op_invalid:
     //==========================================================================
 
 error:
-    printf("DEBUG INTERPRETER: Error exit at PC=%zu, status=%d\n", evm->pc, status);
-    fflush(stdout);
     LOG_EVM_ERROR("Execution error at PC=%lu: status=%d", evm->pc, status);
+    // Invalid opcode consumes all remaining gas
+    if (status == EVM_INVALID_OPCODE)
+        evm->gas_left = 0;
     // Fall through to done
 
 done:
-    printf("DEBUG INTERPRETER: Done - PC=%zu, status=%d, gas_left=%lu\n", 
-           evm->pc, status, evm->gas_left);
-    fflush(stdout);
     // Create result with output data
-    return evm_result_create(status, evm->gas_left, 0, evm->return_data, evm->return_data_size);
+    return evm_result_create(status, evm->gas_left, evm->gas_refund, evm->return_data, evm->return_data_size);
 }

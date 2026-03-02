@@ -91,6 +91,9 @@ void     evm_state_set_code(evm_state_t *es, const address_t *addr,
 
 uint256_t evm_state_get_storage(evm_state_t *es, const address_t *addr,
                                 const uint256_t *key);
+/** Get committed (original/pre-transaction) storage value. For EIP-2200. */
+uint256_t evm_state_get_committed_storage(evm_state_t *es, const address_t *addr,
+                                          const uint256_t *key);
 void      evm_state_set_storage(evm_state_t *es, const address_t *addr,
                                 const uint256_t *key, const uint256_t *value);
 
@@ -108,9 +111,19 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr);
 void evm_state_self_destruct(evm_state_t *es, const address_t *addr);
 bool evm_state_is_self_destructed(evm_state_t *es, const address_t *addr);
 
+/** EIP-6780: Check if account was created in current transaction. */
+bool evm_state_is_created(evm_state_t *es, const address_t *addr);
+
 // ============================================================================
 // Snapshot / Revert
 // ============================================================================
+
+/**
+ * Commit current state as the "original" state for EIP-2200.
+ * Call after pre-state setup, before transaction execution.
+ * Sets original = current for all cached storage slots and clears the journal.
+ */
+void evm_state_commit(evm_state_t *es);
 
 /** Take snapshot. Returns journal position for later revert. */
 uint32_t evm_state_snapshot(evm_state_t *es);
@@ -132,6 +145,15 @@ bool evm_state_warm_slot(evm_state_t *es, const address_t *addr,
 bool evm_state_is_address_warm(const evm_state_t *es, const address_t *addr);
 bool evm_state_is_slot_warm(const evm_state_t *es, const address_t *addr,
                             const uint256_t *key);
+
+// ============================================================================
+// Transient Storage (EIP-1153, Cancun+)
+// ============================================================================
+
+uint256_t evm_state_tload(evm_state_t *es, const address_t *addr,
+                           const uint256_t *key);
+void      evm_state_tstore(evm_state_t *es, const address_t *addr,
+                            const uint256_t *key, const uint256_t *value);
 
 // ============================================================================
 // Finalize
@@ -161,5 +183,11 @@ bool evm_state_finalize(evm_state_t *es);
  * Does NOT require finalize — reads directly from in-memory caches.
  */
 hash_t evm_state_compute_state_root(evm_state_t *es);
+
+/**
+ * Compute state root with explicit EIP-161 control.
+ * @param prune_empty  true = EIP-161+ (skip empty accounts), false = pre-EIP-161 (include touched empty)
+ */
+hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
 
 #endif // EVM_STATE_H

@@ -55,6 +55,7 @@ typedef enum {
     JOURNAL_SELF_DESTRUCT,
     JOURNAL_WARM_ADDR,
     JOURNAL_WARM_SLOT,
+    JOURNAL_TRANSIENT_STORAGE,
 } journal_type_t;
 
 typedef struct {
@@ -66,6 +67,16 @@ typedef struct {
         struct { hash_t old_hash; bool old_has_code; uint8_t *old_code; uint32_t old_code_size; } code;
         struct { uint256_t slot; uint256_t old_value; } storage;
         uint256_t slot;             // WARM_SLOT
+        struct {                    // JOURNAL_ACCOUNT_CREATE: saved pre-create state
+            account_t  old_account;
+            uint8_t   *old_code;
+            uint32_t   old_code_size;
+            bool       old_dirty;
+            bool       old_code_dirty;
+            bool       old_created;
+            bool       old_existed;
+            bool       old_self_destructed;
+        } create;
     } data;
 } journal_entry_t;
 
@@ -80,6 +91,7 @@ struct evm_state {
     uint32_t          journal_cap;
     mem_art_t         warm_addrs;   // key: addr[20], value: (none, 0 bytes)
     mem_art_t         warm_slots;   // key: skey[52], value: (none, 0 bytes)
+    mem_art_t         transient;    // key: skey[52], value: uint256_t (EIP-1153)
 };
 
 // ============================================================================
@@ -207,11 +219,13 @@ evm_state_t *evm_state_create(state_db_t *sdb) {
     if (!mem_art_init(&es->accounts) ||
         !mem_art_init(&es->storage) ||
         !mem_art_init(&es->warm_addrs) ||
-        !mem_art_init(&es->warm_slots)) {
+        !mem_art_init(&es->warm_slots) ||
+        !mem_art_init(&es->transient)) {
         mem_art_destroy(&es->accounts);
         mem_art_destroy(&es->storage);
         mem_art_destroy(&es->warm_addrs);
         mem_art_destroy(&es->warm_slots);
+        mem_art_destroy(&es->transient);
         free(es->journal);
         free(es);
         return NULL;
@@ -241,11 +255,14 @@ void evm_state_destroy(evm_state_t *es) {
     mem_art_destroy(&es->storage);
     mem_art_destroy(&es->warm_addrs);
     mem_art_destroy(&es->warm_slots);
+    mem_art_destroy(&es->transient);
 
     // Free any code pointers still owned by journal entries (not reverted)
     for (uint32_t i = 0; i < es->journal_len; i++) {
         if (es->journal[i].type == JOURNAL_CODE) {
             free(es->journal[i].data.code.old_code);
+        } else if (es->journal[i].type == JOURNAL_ACCOUNT_CREATE) {
+            free(es->journal[i].data.create.old_code);
         }
     }
 
@@ -523,6 +540,14 @@ uint256_t evm_state_get_storage(evm_state_t *es, const address_t *addr,
     return cs->current;
 }
 
+uint256_t evm_state_get_committed_storage(evm_state_t *es, const address_t *addr,
+                                          const uint256_t *key) {
+    if (!es || !addr || !key) return UINT256_ZERO_INIT;
+    cached_slot_t *cs = ensure_slot(es, addr, key);
+    if (!cs) return UINT256_ZERO_INIT;
+    return cs->original;
+}
+
 void evm_state_set_storage(evm_state_t *es, const address_t *addr,
                            const uint256_t *key, const uint256_t *value) {
     if (!es || !addr || !key || !value) return;
@@ -545,6 +570,52 @@ void evm_state_set_storage(evm_state_t *es, const address_t *addr,
 }
 
 // ============================================================================
+// Transient Storage (EIP-1153)
+// ============================================================================
+
+uint256_t evm_state_tload(evm_state_t *es, const address_t *addr,
+                           const uint256_t *key) {
+    if (!es || !addr || !key) return UINT256_ZERO_INIT;
+
+    uint8_t skey[SLOT_KEY_SIZE];
+    make_slot_key(addr, key, skey);
+
+    const uint256_t *val = (const uint256_t *)mem_art_get(
+        &es->transient, skey, SLOT_KEY_SIZE, NULL);
+    if (!val) return UINT256_ZERO_INIT;
+    return *val;
+}
+
+void evm_state_tstore(evm_state_t *es, const address_t *addr,
+                       const uint256_t *key, const uint256_t *value) {
+    if (!es || !addr || !key || !value) return;
+
+    uint8_t skey[SLOT_KEY_SIZE];
+    make_slot_key(addr, key, skey);
+
+    // Get old value for journal
+    uint256_t old_value = UINT256_ZERO_INIT;
+    const uint256_t *existing = (const uint256_t *)mem_art_get(
+        &es->transient, skey, SLOT_KEY_SIZE, NULL);
+    if (existing) old_value = *existing;
+
+    // Journal old value
+    journal_entry_t je = {
+        .type = JOURNAL_TRANSIENT_STORAGE,
+        .addr = *addr,
+        .data.storage = {
+            .slot = *key,
+            .old_value = old_value
+        }
+    };
+    journal_push(es, &je);
+
+    // Insert or update
+    mem_art_insert(&es->transient, skey, SLOT_KEY_SIZE,
+                   value, sizeof(uint256_t));
+}
+
+// ============================================================================
 // Account Creation
 // ============================================================================
 
@@ -553,17 +624,26 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
     cached_account_t *ca = ensure_account(es, addr);
     if (!ca) return;
 
-    // Journal the creation
+    // Journal the creation — save full pre-create state so revert is exact
     journal_entry_t je = {
         .type = JOURNAL_ACCOUNT_CREATE,
         .addr = *addr,
+        .data.create = {
+            .old_account        = ca->account,
+            .old_code           = ca->code,       // transfer ownership to journal
+            .old_code_size      = ca->code_size,
+            .old_dirty          = ca->dirty,
+            .old_code_dirty     = ca->code_dirty,
+            .old_created        = ca->created,
+            .old_existed        = ca->existed,
+            .old_self_destructed = ca->self_destructed,
+        },
     };
     journal_push(es, &je);
 
     // Reset account to empty
     ca->account = account_empty();
-    free(ca->code);
-    ca->code = NULL;
+    ca->code = NULL;          // ownership moved to journal entry
     ca->code_size = 0;
     ca->created = true;
     ca->dirty = true;
@@ -596,6 +676,51 @@ bool evm_state_is_self_destructed(evm_state_t *es, const address_t *addr) {
         &es->accounts, addr->bytes, ADDRESS_SIZE, NULL);
     if (!ca) return false;
     return ca->self_destructed;
+}
+
+bool evm_state_is_created(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return false;
+    const cached_account_t *ca = (const cached_account_t *)mem_art_get(
+        &es->accounts, addr->bytes, ADDRESS_SIZE, NULL);
+    if (!ca) return false;
+    return ca->created;
+}
+
+// ============================================================================
+// Commit (mark current state as "original" for EIP-2200)
+// ============================================================================
+
+static bool commit_slot_cb(const uint8_t *key, size_t key_len,
+                           const void *value, size_t value_len,
+                           void *user_data) {
+    (void)key; (void)key_len; (void)value_len; (void)user_data;
+    cached_slot_t *cs = (cached_slot_t *)(uintptr_t)value;  // safe: data is mutable
+    cs->original = cs->current;
+    cs->dirty = false;
+    return true;
+}
+
+static bool commit_account_cb(const uint8_t *key, size_t key_len,
+                               const void *value, size_t value_len,
+                               void *user_data) {
+    (void)key; (void)key_len; (void)value_len; (void)user_data;
+    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
+    ca->created = false;    // pre-state accounts are not "created in tx"
+    ca->existed = true;     // they existed before the transaction
+    ca->dirty = false;
+    ca->code_dirty = false;
+    ca->self_destructed = false;
+    return true;
+}
+
+void evm_state_commit(evm_state_t *es) {
+    if (!es) return;
+    // Set original = current for all cached storage slots
+    mem_art_foreach(&es->storage, commit_slot_cb, NULL);
+    // Mark all accounts as pre-existing (not created in tx)
+    mem_art_foreach(&es->accounts, commit_account_cb, NULL);
+    // Clear journal so pre-state setup can't be reverted
+    es->journal_len = 0;
 }
 
 // ============================================================================
@@ -660,10 +785,19 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
             cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
                 &es->accounts, je->addr.bytes, ADDRESS_SIZE, NULL);
             if (ca) {
-                ca->created = false;
-                // If it didn't exist before, it's back to not existing
-                // The account stays in cache but will be treated as non-existent
+                // Fully restore pre-create state
+                ca->account        = je->data.create.old_account;
+                free(ca->code);  // free any code set after creation
+                ca->code           = je->data.create.old_code;
+                ca->code_size      = je->data.create.old_code_size;
+                ca->dirty          = je->data.create.old_dirty;
+                ca->code_dirty     = je->data.create.old_code_dirty;
+                ca->created        = je->data.create.old_created;
+                ca->existed        = je->data.create.old_existed;
+                ca->self_destructed = je->data.create.old_self_destructed;
             }
+            // Ownership of old_code transferred back; clear journal pointer
+            je->data.create.old_code = NULL;
             break;
         }
         case JOURNAL_SELF_DESTRUCT: {
@@ -680,6 +814,17 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
             uint8_t skey[SLOT_KEY_SIZE];
             make_slot_key(&je->addr, &je->data.slot, skey);
             mem_art_delete(&es->warm_slots, skey, SLOT_KEY_SIZE);
+            break;
+        }
+        case JOURNAL_TRANSIENT_STORAGE: {
+            uint8_t skey[SLOT_KEY_SIZE];
+            make_slot_key(&je->addr, &je->data.storage.slot, skey);
+            if (uint256_is_zero(&je->data.storage.old_value)) {
+                mem_art_delete(&es->transient, skey, SLOT_KEY_SIZE);
+            } else {
+                mem_art_insert(&es->transient, skey, SLOT_KEY_SIZE,
+                               &je->data.storage.old_value, sizeof(uint256_t));
+            }
             break;
         }
         }
@@ -858,7 +1003,7 @@ bool evm_state_finalize(evm_state_t *es) {
 // Entry for sorting hashed storage slots
 typedef struct {
     uint8_t hashed_key[32];
-    uint8_t value[32];     // trimmed big-endian value
+    uint8_t value[33];     // RLP-encoded trimmed big-endian value (max 1+32)
     uint16_t value_len;
 } storage_entry_t;
 
@@ -903,12 +1048,26 @@ static bool collect_storage_cb(const uint8_t *key, size_t key_len,
     hash_t h = hash_keccak256(cs->key + ADDRESS_SIZE, 32);
     memcpy(e->hashed_key, h.bytes, 32);
 
-    // Trimmed big-endian value
-    uint256_to_bytes(&cs->current, e->value);
+    // Trimmed big-endian value, then RLP-encode it.
+    // Ethereum stores RLP(trimmed_value) in the storage trie, and ih_build
+    // wraps values with another rlp_encode_bytes in the leaf node.
+    uint8_t raw[32];
+    uint256_to_bytes(&cs->current, raw);
     uint8_t start = 0;
-    while (start < 31 && e->value[start] == 0) start++;
-    e->value_len = 32 - start;
-    if (start > 0) memmove(e->value, e->value + start, e->value_len);
+    while (start < 31 && raw[start] == 0) start++;
+    uint8_t trimmed_len = 32 - start;
+
+    // RLP-encode the trimmed value into e->value
+    if (trimmed_len == 1 && raw[start] < 0x80) {
+        // Single byte < 0x80: RLP is the byte itself
+        e->value[0] = raw[start];
+        e->value_len = 1;
+    } else {
+        // Multi-byte or single byte >= 0x80: prefix + bytes
+        e->value[0] = 0x80 + trimmed_len;
+        memcpy(e->value + 1, raw + start, trimmed_len);
+        e->value_len = 1 + trimmed_len;
+    }
 
     ctx->count++;
     return true;
@@ -967,6 +1126,7 @@ typedef struct {
     account_entry_t *entries;
     size_t count;
     size_t cap;
+    bool prune_empty;  // EIP-161+: skip empty touched accounts
 } account_collect_ctx_t;
 
 // Convert uint256 to trimmed big-endian bytes, return length (0 for zero)
@@ -986,14 +1146,36 @@ static bool collect_account_cb(const uint8_t *key, size_t key_len,
     account_collect_ctx_t *ctx = (account_collect_ctx_t *)user_data;
     const cached_account_t *ca = (const cached_account_t *)value;
 
+    // DEBUG: dump account info
+    {
+        fprintf(stderr, "DEBUG collect: 0x");
+        for (int i = 0; i < 20; i++) fprintf(stderr, "%02x", ca->addr.bytes[i]);
+        uint8_t bal_be[32];
+        uint256_to_bytes(&ca->account.balance, bal_be);
+        fprintf(stderr, " n=%lu code=%d sd=%d ex=%d cr=%d d=%d bal=0x",
+                (unsigned long)ca->account.nonce, ca->account.has_code,
+                ca->self_destructed, ca->existed, ca->created, ca->dirty);
+        int z = 0; while (z < 31 && bal_be[z] == 0) z++;
+        for (int i = z; i < 32; i++) fprintf(stderr, "%02x", bal_be[i]);
+        fprintf(stderr, "\n");
+    }
+
     // Skip self-destructed accounts
     if (ca->self_destructed) return true;
 
-    // Skip empty accounts that never existed (same logic as finalize_account_cb)
+    // Skip empty accounts based on EIP-161 rules
     bool is_empty = (ca->account.nonce == 0 &&
                      uint256_is_zero(&ca->account.balance) &&
                      !ca->account.has_code);
-    if (!ca->existed && !ca->created && is_empty) return true;
+    if (is_empty) {
+        if (ctx->prune_empty) {
+            // EIP-161+: skip ALL empty accounts (even touched/dirty ones)
+            return true;
+        } else {
+            // Pre-EIP-161: skip empty accounts that were never touched
+            if (!ca->existed && !ca->created && !ca->dirty) return true;
+        }
+    }
 
     // Grow array if needed
     if (ctx->count >= ctx->cap) {
@@ -1039,11 +1221,16 @@ static bool collect_account_cb(const uint8_t *key, size_t key_len,
 
     e->rlp_value = encoded.data;
     e->rlp_len = (uint16_t)encoded.len;
+
     ctx->count++;
     return true;
 }
 
 hash_t evm_state_compute_state_root(evm_state_t *es) {
+    return evm_state_compute_state_root_ex(es, true);
+}
+
+hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     if (!es) return HASH_EMPTY_STORAGE;
 
     if (mem_art_is_empty(&es->accounts)) return HASH_EMPTY_STORAGE;
@@ -1053,7 +1240,8 @@ hash_t evm_state_compute_state_root(evm_state_t *es) {
         .es = es,
         .entries = NULL,
         .count = 0,
-        .cap = 0
+        .cap = 0,
+        .prune_empty = prune_empty
     };
 
     mem_art_foreach(&es->accounts, collect_account_cb, &ctx);

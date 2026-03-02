@@ -4,6 +4,7 @@
 
 #include "test_runner.h"
 #include "transaction.h"
+#include "evm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,7 @@
 // Forward declaration from test_runner_core.c
 extern uint64_t get_time_microseconds(void);
 extern chain_config_t *create_test_chain_config(const char *fork_name);
+extern bool hash_equals(const hash_t *a, const hash_t *b);
 
 //==============================================================================
 // State Test Runner
@@ -85,19 +87,27 @@ bool test_runner_run_state_test(test_runner_t *runner,
         for (size_t cond_idx = 0; cond_idx < test->post[fork_idx].condition_count; cond_idx++) {
             const test_post_condition_t *post_cond = &test->post[fork_idx].conditions[cond_idx];
             
-            printf("\n===== TEST CASE %zu (fork=%s) =====\n", cond_idx, test_fork);
+            // (debug output removed)
             
             // Reset state for this test case
             test_runner_reset(runner);
-            
+
+            // Re-set chain config (test_runner_reset recreates EVM with default mainnet config)
+            if (runner->evm) {
+                runner->evm->chain_config = fork_config;
+            }
+
             // Setup pre-state
             if (!test_runner_setup_state(runner->state, test->pre_state, test->pre_state_count)) {
                 result->status = TEST_ERROR;
-                test_result_add_failure(result, "pre_state", NULL, NULL, 
+                test_result_add_failure(result, "pre_state", NULL, NULL,
                                       "Failed to setup pre-state");
                 goto cleanup;
             }
-            
+
+            // Commit pre-state as "original" for EIP-2200 storage tracking
+            evm_state_commit(runner->state);
+
             // Get transaction parameters for this test case
             uint256_t gas_limit = test->transaction.gas_limit_count > post_cond->gas_index ?
                 test->transaction.gas_limit[post_cond->gas_index] : uint256_from_uint64(0);
@@ -128,10 +138,7 @@ bool test_runner_run_state_test(test_runner_t *runner,
             // Convert gas_limit from uint256_t to uint64_t
             uint64_t gas = uint256_to_uint64(&gas_limit);
             
-            // Debug: Show transaction details
-            printf("DEBUG: Transaction to address: 0x");
-            for (int i = 0; i < 20; i++) printf("%02x", test->transaction.to.bytes[i]);
-            printf(", data_len=%zu, is_create=%d\n", data_len, test->transaction.is_create);
+            // (Debug output removed)
             
             // Determine transaction type based on available fields
             transaction_type_t tx_type = TX_TYPE_LEGACY;
@@ -243,9 +250,7 @@ bool test_runner_run_state_test(test_runner_t *runner,
                     continue; // Skip to next test case
                 }
                 
-                // Transaction failed as expected (either execution returned false or failed status)
-                printf("DEBUG: Transaction correctly failed with expected exception: %s\n", 
-                       post_cond->expect_exception);
+                // Transaction failed as expected
                 
                 if (tx_executed) {
                     transaction_result_free(&tx_result);
@@ -264,9 +269,6 @@ bool test_runner_run_state_test(test_runner_t *runner,
                 goto cleanup;
             }
             
-            printf("DEBUG: Transaction execution status=%d, gas_used=%lu\n", 
-                   tx_result.status, tx_result.gas_used);
-            
             // Free access list
             if (tx_access_list) free(tx_access_list);
             
@@ -276,10 +278,12 @@ bool test_runner_run_state_test(test_runner_t *runner,
             // reverted. The state root check below is the sole arbiter of correctness.
 
             transaction_result_free(&tx_result);
-            
+
             // Verify state root
-            hash_t actual_root;
-            if (!test_runner_verify_state_root(runner->state, &post_cond->state_root, &actual_root)) {
+            // EIP-161 (Spurious Dragon+): prune empty accounts from state trie
+            bool prune_empty = (runner->evm->fork >= FORK_SPURIOUS_DRAGON);
+            hash_t actual_root = evm_state_compute_state_root_ex(runner->state, prune_empty);
+            if (!hash_equals(&actual_root, &post_cond->state_root)) {
                 result->status = TEST_FAIL;
                 
                 char *expected_str = hash_to_hex_string(&post_cond->state_root);

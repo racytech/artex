@@ -97,6 +97,20 @@ evm_status_t op_selfbalance(evm_t *evm);
  */
 evm_status_t op_basefee(evm_t *evm);
 
+/**
+ * BLOBHASH - Get versioned hash at index (EIP-4844, Cancun+)
+ * Stack: index => hash
+ * Gas: 3
+ */
+evm_status_t op_blobhash(evm_t *evm);
+
+/**
+ * BLOBBASEFEE - Get blob base fee (EIP-7516, Cancun+)
+ * Stack: => blob_base_fee
+ * Gas: 2
+ */
+evm_status_t op_blobbasefee(evm_t *evm);
+
 #ifdef __cplusplus
 }
 #endif

@@ -114,6 +114,13 @@ evm_status_t op_pop(evm_t *evm);
 evm_status_t op_push(evm_t *evm, uint8_t n);
 
 /**
+ * PUSH0 - Push zero onto stack (EIP-3855, Shanghai+)
+ * Stack: => 0
+ * Gas: 2
+ */
+evm_status_t op_push0(evm_t *evm);
+
+/**
  * DUP - Duplicate Nth stack item
  * Stack: ... N => ... N N
  * Gas: 3
