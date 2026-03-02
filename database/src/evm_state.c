@@ -809,31 +809,99 @@ bool evm_state_finalize(evm_state_t *es) {
 
 // ============================================================================
 // State Root Computation
+//
+// TODO: Production architecture for incremental per-block state roots
+//
+// Current implementation computes state root from in-memory caches only.
+// This is correct when ALL state is in memory (genesis, EF test fixtures)
+// but wrong for production block processing where most state lives on disk.
+//
+// For production, we need:
+// 1. Persistent state mpt — one file, survives between blocks. Per block:
+//    mpt_put only dirty accounts, mpt_root gives O(dirty × depth) root.
+// 2. Persistent per-account storage tries — when an account's storage
+//    changes, update its storage mpt and recompute its storage root.
+//    Challenge: millions of contracts on mainnet = millions of mpt files.
+//    Possible solutions:
+//      a) Extend mpt to support 64-byte keys (addr_hash || slot_hash),
+//         then use a single shared storage mpt with prefix-based roots.
+//      b) Lazy per-account mpt files, only opened when storage is dirty.
+//      c) Add prefix iteration to state_db/hash_store so we can load
+//         all committed slots for a dirty account and rebuild its trie.
+// 3. Cache storage roots in account data — only recompute when storage
+//    is dirty. Most accounts are untouched per block.
+//
 // ============================================================================
 
 #define STORAGE_MPT_PATH "/tmp/evm_storage_mpt.dat"
 #define STATE_MPT_PATH   "/tmp/evm_state_mpt.dat"
 
-// --- Storage root: per-account ---
+// --- Storage root map: addr → hash_t, built in a single pass ---
 
 typedef struct {
-    const uint8_t *target_addr;  // 20-byte address to match
-    mpt_t         *mpt;
-    size_t         count;
-} storage_root_ctx_t;
+    address_t addr;
+    hash_t    storage_root;
+} storage_root_entry_t;
 
-static bool storage_root_cb(const uint8_t *key, size_t key_len,
-                             const void *value, size_t value_len,
-                             void *user_data) {
-    (void)key; (void)key_len; (void)value_len;
-    storage_root_ctx_t *ctx = (storage_root_ctx_t *)user_data;
-    const cached_slot_t *cs = (const cached_slot_t *)value;
+typedef struct {
+    storage_root_entry_t *entries;
+    size_t                count;
+    size_t                cap;
+} storage_root_map_t;
 
-    // Only collect slots for the target address
-    if (memcmp(cs->key, ctx->target_addr, ADDRESS_SIZE) != 0) return true;
+static hash_t *storage_root_map_get(storage_root_map_t *map,
+                                     const address_t *addr) {
+    for (size_t i = 0; i < map->count; i++) {
+        if (memcmp(map->entries[i].addr.bytes, addr->bytes, ADDRESS_SIZE) == 0)
+            return &map->entries[i].storage_root;
+    }
+    return NULL;
+}
+
+// Callback context for the single-pass storage scan
+typedef struct {
+    mpt_t            *mpt;
+    storage_root_map_t *map;
+    // Batching: current address being processed
+    address_t         cur_addr;
+    bool              has_cur;
+    size_t            cur_count;   // non-zero slots for current addr
+} storage_scan_ctx_t;
+
+// Flush the current address's storage root into the map
+static void storage_scan_flush(storage_scan_ctx_t *ctx) {
+    if (!ctx->has_cur) return;
+
+    hash_t root = (ctx->cur_count > 0) ? mpt_root(ctx->mpt) : HASH_EMPTY_STORAGE;
+
+    storage_root_map_t *map = ctx->map;
+    if (map->count >= map->cap) {
+        size_t new_cap = map->cap == 0 ? 32 : map->cap * 2;
+        map->entries = realloc(map->entries, new_cap * sizeof(storage_root_entry_t));
+        map->cap = new_cap;
+    }
+    map->entries[map->count].addr = ctx->cur_addr;
+    map->entries[map->count].storage_root = root;
+    map->count++;
+
+    ctx->has_cur = false;
+    ctx->cur_count = 0;
+}
+
+static void storage_scan_put_slot(storage_scan_ctx_t *ctx,
+                                   const cached_slot_t *cs) {
+    // New address? Flush previous and start fresh mpt
+    if (!ctx->has_cur ||
+        memcmp(ctx->cur_addr.bytes, cs->key, ADDRESS_SIZE) != 0) {
+        storage_scan_flush(ctx);
+        mpt_clear(ctx->mpt);
+        memcpy(ctx->cur_addr.bytes, cs->key, ADDRESS_SIZE);
+        ctx->has_cur = true;
+        ctx->cur_count = 0;
+    }
 
     // Skip zero-valued slots
-    if (uint256_is_zero(&cs->current)) return true;
+    if (uint256_is_zero(&cs->current)) return;
 
     // Hash the slot key: keccak256(slot_be[32])
     hash_t hk = hash_keccak256(cs->key + ADDRESS_SIZE, 32);
@@ -858,23 +926,33 @@ static bool storage_root_cb(const uint8_t *key, size_t key_len,
     }
 
     mpt_put(ctx->mpt, hk.bytes, rlp_val, rlp_len);
-    ctx->count++;
+    ctx->cur_count++;
+}
+
+static bool storage_scan_cb(const uint8_t *key, size_t key_len,
+                              const void *value, size_t value_len,
+                              void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    storage_scan_put_slot((storage_scan_ctx_t *)user_data,
+                           (const cached_slot_t *)value);
     return true;
 }
 
-static hash_t compute_storage_root(evm_state_t *es, const address_t *addr,
-                                    mpt_t *storage_mpt) {
-    mpt_clear(storage_mpt);
-
-    storage_root_ctx_t ctx = {
-        .target_addr = addr->bytes,
+// Build storage roots for ALL accounts in a single O(N) pass over storage
+static storage_root_map_t build_storage_roots(evm_state_t *es,
+                                               mpt_t *storage_mpt) {
+    storage_root_map_t map = {0};
+    storage_scan_ctx_t ctx = {
         .mpt = storage_mpt,
-        .count = 0,
+        .map = &map,
+        .has_cur = false,
+        .cur_count = 0,
     };
-    mem_art_foreach(&es->storage, storage_root_cb, &ctx);
 
-    if (ctx.count == 0) return HASH_EMPTY_STORAGE;
-    return mpt_root(storage_mpt);
+    mem_art_foreach(&es->storage, storage_scan_cb, &ctx);
+    storage_scan_flush(&ctx);  // flush last address
+
+    return map;
 }
 
 // --- Account trie ---
@@ -890,10 +968,9 @@ static size_t uint256_to_trimmed_be(const uint256_t *val, uint8_t out[32]) {
 }
 
 typedef struct {
-    evm_state_t *es;
-    mpt_t       *state_mpt;
-    mpt_t       *storage_mpt;
-    bool         prune_empty;
+    mpt_t              *state_mpt;
+    storage_root_map_t *storage_roots;
+    bool                prune_empty;
 } account_root_ctx_t;
 
 static bool account_root_cb(const uint8_t *key, size_t key_len,
@@ -915,9 +992,10 @@ static bool account_root_cb(const uint8_t *key, size_t key_len,
         if (!ca->existed && !ca->created && !ca->dirty) return true;
     }
 
-    // Compute storage root for this account
-    hash_t storage_root = compute_storage_root(ctx->es, &ca->addr,
-                                                ctx->storage_mpt);
+    // Look up pre-computed storage root
+    hash_t storage_root = HASH_EMPTY_STORAGE;
+    hash_t *sr = storage_root_map_get(ctx->storage_roots, &ca->addr);
+    if (sr) storage_root = *sr;
 
     // Code hash
     hash_t code_hash = ca->account.has_code ? ca->account.code_hash
@@ -966,10 +1044,13 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
         return HASH_EMPTY_STORAGE;
     }
 
+    // Phase 1: single pass over storage → per-account storage roots
+    storage_root_map_t sr_map = build_storage_roots(es, storage_mpt);
+
+    // Phase 2: iterate accounts, look up storage roots, build state trie
     account_root_ctx_t ctx = {
-        .es = es,
         .state_mpt = state_mpt,
-        .storage_mpt = storage_mpt,
+        .storage_roots = &sr_map,
         .prune_empty = prune_empty,
     };
     mem_art_foreach(&es->accounts, account_root_cb, &ctx);
@@ -984,6 +1065,7 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     mpt_close(state_mpt);
     unlink(STORAGE_MPT_PATH);
     unlink(STATE_MPT_PATH);
+    free(sr_map.entries);
 
     return root;
 }

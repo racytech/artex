@@ -217,6 +217,12 @@ add_executable(test_mpt
 target_link_libraries(test_mpt mpt common)
 add_test(NAME test_mpt COMMAND test_mpt)
 
+# Scale Test: MPT Trie (incremental blocks, mixed ops, persistence, dirty stress)
+add_executable(test_scale_mpt
+    database/tests/test_scale_mpt.c
+)
+target_link_libraries(test_scale_mpt mpt common)
+
 # Benchmark: mpt_trie per-block commitment
 add_executable(bench_mpt_trie
     database/tests/bench_mpt_trie.c
