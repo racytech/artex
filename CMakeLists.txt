@@ -66,16 +66,16 @@ add_library(evm_state STATIC
 )
 target_link_libraries(evm_state state_db account common art_database)
 
-# Intermediate Hashes (MPT commitment via flat hash storage)
-add_library(intermediate_hashes STATIC
-    database/src/intermediate_hashes.c
-)
-target_link_libraries(intermediate_hashes compact_art common)
-
 # Hash Store (zero-RAM file-backed hash table for 64B keys)
 add_library(hash_store STATIC
     database/src/hash_store.c
 )
+
+# MPT Trie (stripped-down nibble trie for MPT hash computation)
+add_library(mpt STATIC
+    database/src/mpt.c
+)
+target_link_libraries(mpt common)
 
 #==============================================================================
 # Tests
@@ -161,12 +161,6 @@ add_executable(test_scale_data_layer
 )
 target_link_libraries(test_scale_data_layer data_layer)
 
-# Benchmark: MPT commitment (state root computation at scale)
-add_executable(bench_mpt
-    database/tests/bench_mpt.c
-)
-target_link_libraries(bench_mpt data_layer intermediate_hashes common)
-
 # Test: State DB (account state + contract storage + checkpoint)
 add_executable(test_state_db
     database/tests/test_state_db.c
@@ -181,13 +175,6 @@ add_executable(test_evm_state
 target_link_libraries(test_evm_state evm_state)
 add_test(NAME test_evm_state COMMAND test_evm_state)
 
-# Test: Intermediate Hashes (MPT commitment)
-add_executable(test_intermediate_hashes
-    database/tests/test_intermediate_hashes.c
-)
-target_link_libraries(test_intermediate_hashes intermediate_hashes compact_art common)
-add_test(NAME test_intermediate_hashes COMMAND test_intermediate_hashes)
-
 # Test: Compact ART Iterator Seek (lower-bound)
 add_executable(test_compact_art_seek
     database/tests/test_compact_art_seek.c
@@ -199,7 +186,7 @@ add_test(NAME test_compact_art_seek COMMAND test_compact_art_seek)
 add_executable(test_mpt_cross_validation
     database/tests/test_mpt_cross_validation.c
 )
-target_link_libraries(test_mpt_cross_validation intermediate_hashes compact_art common)
+target_link_libraries(test_mpt_cross_validation mpt common)
 add_test(NAME test_mpt_cross_validation
     COMMAND test_mpt_cross_validation
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -223,6 +210,19 @@ add_executable(bench_hash_store
 )
 target_link_libraries(bench_hash_store hash_store compact_art)
 
+# Test: MPT Trie (correctness tests)
+add_executable(test_mpt
+    database/tests/test_mpt.c
+)
+target_link_libraries(test_mpt mpt common)
+add_test(NAME test_mpt COMMAND test_mpt)
+
+# Benchmark: mpt_trie per-block commitment
+add_executable(bench_mpt_trie
+    database/tests/bench_mpt_trie.c
+)
+target_link_libraries(bench_mpt_trie mpt common)
+
 #==============================================================================
 # Build Summary
 #==============================================================================
@@ -243,7 +243,7 @@ message(STATUS "  - data_layer (state store + code store + write buffer + merge)
 message(STATUS "  - state_db (account state + contract storage wrapper)")
 message(STATUS "  - account (compact variable-length account encoding)")
 message(STATUS "  - evm_state (typed in-memory EVM state interface)")
-message(STATUS "  - intermediate_hashes (MPT commitment via flat hash storage)")
+message(STATUS "  - mpt (persistent MPT trie for state root computation)")
 message(STATUS "  - hash_store (zero-RAM file-backed hash table for 64B keys)")
 message(STATUS "========================================")
 message(STATUS "")
