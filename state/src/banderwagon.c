@@ -245,6 +245,8 @@ static bool fp_sqrt(fp_t *out, const fp_t *a) {
         fp_mul(&t, &t, &c);  /* t = t * b^2   */
         fp_mul(&r, &r, &b);  /* r = r * b     */
     }
+
+    return false;  /* not a QR (exhausted iterations) */
 }
 
 /**
@@ -578,13 +580,19 @@ bool banderwagon_deserialize(banderwagon_point_t *out,
     fp_inv(&den_inv, &den);
     fp_mul(&y2, &num, &den_inv);
 
-    /* Compute sqrt — fails if not a QR */
+    /* Subgroup check: num = (1 - a*x^2) must be a non-zero QR.
+     * Note: sqrt(y^2) = sqrt(num/den) succeeds when both num and den
+     * are QNR (ratio is QR), but that gives a point outside the subgroup.
+     * So we explicitly check num is a QR. */
+    if (fp_is_zero(&num))
+        return false;
+    fp_t num_sqrt;
+    if (!fp_sqrt(&num_sqrt, &num))
+        return false;  /* num is QNR — point not in subgroup */
+
+    /* Compute sqrt(y^2) — must succeed since num is QR */
     fp_t y;
     if (!fp_sqrt(&y, &y2))
-        return false;
-
-    /* Subgroup check: num must be a non-zero QR (already verified by sqrt) */
-    if (fp_is_zero(&num))
         return false;
 
     /* Choose lexicographically largest Y */

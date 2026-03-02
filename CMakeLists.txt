@@ -103,6 +103,12 @@ add_library(banderwagon STATIC
 )
 target_link_libraries(banderwagon blst)
 
+# Pedersen commitment (CRS + vector commitment over banderwagon)
+add_library(pedersen STATIC
+    state/src/pedersen.c
+)
+target_link_libraries(pedersen banderwagon blst)
+
 #==============================================================================
 # Tests
 #==============================================================================
@@ -270,6 +276,13 @@ add_executable(test_banderwagon
 )
 target_link_libraries(test_banderwagon banderwagon)
 add_test(NAME test_banderwagon COMMAND test_banderwagon)
+
+# Test: Pedersen commitment (CRS generation + commit/update)
+add_executable(test_pedersen
+    state/tests/test_pedersen.c
+)
+target_link_libraries(test_pedersen pedersen)
+add_test(NAME test_pedersen COMMAND test_pedersen)
 
 #==============================================================================
 # Build Summary
