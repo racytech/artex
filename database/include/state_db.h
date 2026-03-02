@@ -27,11 +27,8 @@ typedef struct state_db state_db_t;
 
 typedef struct {
     uint64_t account_keys;       // committed account entries
-    uint64_t account_buffer;     // pending account buffer entries
     uint32_t code_count;         // code_store entries
     uint64_t storage_keys;       // committed storage entries
-    uint64_t storage_buffer;     // pending storage buffer entries
-    uint64_t total_merged;       // lifetime merged (both layers)
 } sdb_stats_t;
 
 // ============================================================================

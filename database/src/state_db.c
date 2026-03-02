@@ -236,11 +236,8 @@ sdb_stats_t sdb_stats(const state_db_t *sdb) {
     dl_stats_t st = dl_stats(sdb->storage);
 
     s.account_keys       = a.index_keys;
-    s.account_buffer     = a.buffer_entries;
     s.code_count         = a.code_count;
     s.storage_keys       = st.index_keys;
-    s.storage_buffer     = st.buffer_entries;
-    s.total_merged       = a.total_merged + st.total_merged;
 
     return s;
 }

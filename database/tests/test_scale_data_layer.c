@@ -435,7 +435,7 @@ int main(int argc, char *argv[]) {
     printf("  code deploys: %" PRIu64 "\n", sim.total_code_deploys);
     printf("  index keys:   %" PRIu64 "\n", final_stats.index_keys);
     printf("  code entries: %u\n", final_stats.code_count);
-    printf("  total merged: %" PRIu64 "\n", final_stats.total_merged);
+    printf("  index keys:   %" PRIu64 "\n", final_stats.index_keys);
     printf("  avg merge:    %.2fms\n",
            (sim.total_merge_time / sim.total_blocks) * 1000.0);
     printf("  time:         %.1fs\n", block_elapsed);

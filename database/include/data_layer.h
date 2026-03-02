@@ -25,8 +25,6 @@ typedef struct data_layer data_layer_t;
 
 typedef struct {
     uint64_t index_keys;      // hash_store count (committed entries)
-    uint64_t buffer_entries;   // write buffer size (pending entries)
-    uint64_t total_merged;     // lifetime merged entries
     uint32_t code_count;       // code_store entries
     uint64_t code_file_size;   // code.dat file size in bytes
 } dl_stats_t;

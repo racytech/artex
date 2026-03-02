@@ -124,7 +124,7 @@ static bool phase1(data_layer_t *dl, uint64_t seed, uint64_t num_keys,
     dl_stats_t st = dl_stats(dl);
     printf("  buffer writes: %" PRIu64 " keys in %.2fs (%.1f Kk/s)\n",
            num_keys, t1 - t0, num_keys / (t1 - t0) / 1000.0);
-    printf("  buffer size:   %" PRIu64 " entries\n", st.buffer_entries);
+    printf("  index keys:    %" PRIu64 "\n", st.index_keys);
     printf("  RSS:           %zu MB\n", get_rss_mb());
 
     // Merge
@@ -291,7 +291,7 @@ static bool phase3(data_layer_t *dl, uint64_t seed,
     printf("  updates:  %" PRIu64 "\n", num_updates);
     printf("  deletes:  %" PRIu64 "\n", num_deletes);
     printf("  inserts:  %" PRIu64 "\n", num_inserts);
-    printf("  buffer:   %" PRIu64 " entries in %.3fs\n", st.buffer_entries, t1 - t0);
+    printf("  writes:   in %.3fs\n", t1 - t0);
 
     // Merge
     dl_stats_t before = st;
@@ -447,7 +447,7 @@ static bool phase4(data_layer_t *dl, uint64_t seed,
     printf("  index keys:      %" PRIu64 "\n", st.index_keys);
     printf("  merge cycles:    %" PRIu64 "\n", num_cycles);
     printf("  avg merge time:  %.3fs\n", total_merge_time / num_cycles);
-    printf("  total merged:    %" PRIu64 "\n", st.total_merged);
+    printf("  index keys:      %" PRIu64 "\n", st.index_keys);
     printf("  RSS:             %zu MB\n", get_rss_mb());
     printf("  ============================================\n");
     printf("  Phase 4: PASS\n");
@@ -530,7 +530,7 @@ int main(int argc, char *argv[]) {
     printf("============================================\n");
     printf("total time:  %.1fs\n", t_end - t_start);
     printf("total keys:  %" PRIu64 "\n", st.index_keys);
-    printf("total merge: %" PRIu64 "\n", st.total_merged);
+    printf("total keys:  %" PRIu64 "\n", st.index_keys);
     printf("final RSS:   %zu MB\n", get_rss_mb());
     printf("============================================\n");
 

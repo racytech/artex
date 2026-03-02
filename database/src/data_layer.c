@@ -223,8 +223,6 @@ dl_stats_t dl_stats(const data_layer_t *dl) {
     dl_stats_t s = {0};
     if (!dl) return s;
     s.index_keys = hash_store_count(dl->store);
-    s.buffer_entries = 0;  // no buffer — writes go directly to hash_store
-    s.total_merged = 0;
     s.code_count = dl->code ? code_store_count(dl->code) : 0;
     s.code_file_size = dl->code ? code_store_file_size(dl->code) : 0;
     return s;

@@ -404,7 +404,8 @@ static void phase1_genesis(data_layer_t *dl, uint64_t n_accounts,
     printf("  merge: %" PRIu64 " entries in %.3fs\n", merged, t3 - t2);
 
     dl_stats_t st = dl_stats(dl);
-    ASSERT_MSG(st.buffer_entries == 0, "buffer not empty after merge");
+    ASSERT_MSG(st.index_keys == n_accounts + n_contracts,
+               "index_keys after genesis: got %" PRIu64, st.index_keys);
     ASSERT_MSG(st.index_keys == n_accounts + n_contracts,
                "index_keys mismatch: got %" PRIu64 " expected %" PRIu64,
                st.index_keys, n_accounts + n_contracts);
@@ -534,8 +535,8 @@ static void phase2_blocks(data_layer_t *dl, uint64_t num_blocks,
         cum_merge_time += (t1 - t0);
 
         dl_stats_t st = dl_stats(dl);
-        ASSERT_MSG(st.buffer_entries == 0,
-                   "buffer not empty after merge at block %" PRIu64, block_num);
+        ASSERT_MSG(st.index_keys > 0,
+                   "index empty at block %" PRIu64, block_num);
 
         // Spot-check 100 keys
         rng_t vrng = rng_create(MASTER_SEED ^ (block_num * 0x5650000000000000ULL));
@@ -880,7 +881,7 @@ static void phase5_final(data_layer_t *dl) {
     printf("  verified: %" PRIu64 " keys in %.1fs\n", verified, t1 - t0);
     printf("  state entries: %" PRIu64 "\n", verified - code_count);
     printf("  code entries:  %" PRIu64 "\n", code_count);
-    printf("  total merged:  %" PRIu64 "\n", st.total_merged);
+    printf("  index keys:    %" PRIu64 "\n", st.index_keys);
     printf("  RSS: %zu MB\n", get_rss_mb());
     printf("  determinism hash: 0x%016" PRIx64 "\n", hash);
     printf("  Phase 5: PASS\n");
