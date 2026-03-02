@@ -811,8 +811,7 @@ void hash_store_sync(hash_store_t *hs) {
         shard_t *sh = hs->shards[i];
         if (sh->header_dirty)
             shard_write_header(sh, hs->shard_cap, hs->slot_size);
-        // Durability deferred — msync/fdatasync commented out for now.
-        // msync(sh->map, sh->map_size, MS_SYNC);
+        msync(sh->map, sh->map_size, MS_SYNC);
     }
     write_meta(hs);
 }

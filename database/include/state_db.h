@@ -101,4 +101,33 @@ bool sdb_checkpoint(state_db_t *sdb);
 /** Get combined stats. */
 sdb_stats_t sdb_stats(const state_db_t *sdb);
 
+// ============================================================================
+// Block-Level Atomicity (Undo Log)
+// ============================================================================
+
+/**
+ * Begin a block. Subsequent sdb_put/sdb_delete/sdb_put_storage/sdb_delete_storage
+ * are buffered in memory. sdb_put_code is NOT buffered (content-addressed, idempotent).
+ * sdb_get/sdb_get_storage still read from hash_store (pre-block state).
+ * Returns false if a block is already active or on allocation failure.
+ */
+bool sdb_begin_block(state_db_t *sdb);
+
+/**
+ * Commit the current block atomically:
+ *   1. Read old values from hash_store for each pending write
+ *   2. Write undo entries to undo.log + fsync
+ *   3. Apply pending writes to hash_store
+ *   4. msync hash_stores (data durable)
+ *   5. Write COMMIT marker to undo.log + fsync
+ *   6. Delete undo.log
+ * Returns false on I/O error.
+ */
+bool sdb_commit_block(state_db_t *sdb);
+
+/**
+ * Abort the current block. Discards all pending writes without applying.
+ */
+void sdb_abort_block(state_db_t *sdb);
+
 #endif // STATE_DB_H

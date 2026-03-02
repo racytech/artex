@@ -4,6 +4,8 @@
 #include <string.h>
 #include <assert.h>
 #include <inttypes.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 // ============================================================================
 // Test infrastructure
@@ -525,6 +527,494 @@ static void test_mixed_blocks(void) {
 }
 
 // ============================================================================
+// Phase 5: Block-Level Undo Log
+// ============================================================================
+
+// Undo log constants (must match state_db.c)
+#define SDB_OP_ACCT_PUT  0x01
+#define SDB_OP_ACCT_DEL  0x02
+#define SDB_OP_STOR_PUT  0x03
+#define SDB_OP_STOR_DEL  0x04
+
+static void test_commit_block(void) {
+    int start = assertions;
+    printf("Phase 5a: Normal commit block\n");
+
+    cleanup();
+    state_db_t *sdb = sdb_create(TEST_DIR);
+    ASSERT(sdb != NULL);
+
+    // Insert baseline state (without block mode)
+    for (uint32_t i = 0; i < 10; i++) {
+        uint8_t key[32], val[4];
+        make_account_key(key, i);
+        make_value(val, i);
+        ASSERT(sdb_put(sdb, key, val, 4));
+    }
+    ASSERT(sdb_checkpoint(sdb));
+
+    // Begin block, make changes, commit
+    ASSERT(sdb_begin_block(sdb));
+
+    // Update existing accounts
+    for (uint32_t i = 0; i < 5; i++) {
+        uint8_t key[32], val[4];
+        make_account_key(key, i);
+        make_value(val, i + 100);
+        ASSERT(sdb_put(sdb, key, val, 4));
+    }
+
+    // Add new accounts
+    for (uint32_t i = 10; i < 15; i++) {
+        uint8_t key[32], val[4];
+        make_account_key(key, i);
+        make_value(val, i);
+        ASSERT(sdb_put(sdb, key, val, 4));
+    }
+
+    // Delete one account
+    {
+        uint8_t key[32];
+        make_account_key(key, 9);
+        ASSERT(sdb_delete(sdb, key));
+    }
+
+    // Add storage
+    {
+        uint8_t addr[32], slot[32], val[32];
+        make_addr(addr, 0);
+        make_slot(slot, 0);
+        make_storage_value(val, 999);
+        ASSERT(sdb_put_storage(sdb, addr, slot, val, 32));
+    }
+
+    ASSERT(sdb_commit_block(sdb));
+
+    // Verify committed state
+    for (uint32_t i = 0; i < 5; i++) {
+        uint8_t key[32], buf[4];
+        uint16_t len = 0;
+        make_account_key(key, i);
+        ASSERT(sdb_get(sdb, key, buf, &len));
+        ASSERT(len == 4);
+        ASSERT(read_value(buf) == i + 100);  // updated values
+    }
+    for (uint32_t i = 5; i < 9; i++) {
+        uint8_t key[32], buf[4];
+        uint16_t len = 0;
+        make_account_key(key, i);
+        ASSERT(sdb_get(sdb, key, buf, &len));
+        ASSERT(read_value(buf) == i);  // unchanged
+    }
+    {
+        uint8_t key[32], buf[4];
+        uint16_t len = 0;
+        make_account_key(key, 9);
+        ASSERT(!sdb_get(sdb, key, buf, &len));  // deleted
+    }
+    for (uint32_t i = 10; i < 15; i++) {
+        uint8_t key[32], buf[4];
+        uint16_t len = 0;
+        make_account_key(key, i);
+        ASSERT(sdb_get(sdb, key, buf, &len));
+        ASSERT(len == 4);
+        ASSERT(read_value(buf) == i);  // new accounts
+    }
+    {
+        uint8_t addr[32], slot[32], buf[32];
+        uint16_t len = 0;
+        make_addr(addr, 0);
+        make_slot(slot, 0);
+        ASSERT(sdb_get_storage(sdb, addr, slot, buf, &len));
+        ASSERT(len == 32);
+    }
+
+    // Verify undo.log was deleted
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/undo.log", TEST_DIR);
+        ASSERT(access(path, F_OK) != 0);
+    }
+
+    sdb_destroy(sdb);
+    printf("  PASS (%d assertions)\n\n", assertions - start);
+}
+
+static void test_abort_block(void) {
+    int start = assertions;
+    printf("Phase 5b: Abort block (discard pending writes)\n");
+
+    cleanup();
+    state_db_t *sdb = sdb_create(TEST_DIR);
+    ASSERT(sdb != NULL);
+
+    // Baseline
+    for (uint32_t i = 0; i < 10; i++) {
+        uint8_t key[32], val[4];
+        make_account_key(key, i);
+        make_value(val, i);
+        ASSERT(sdb_put(sdb, key, val, 4));
+    }
+    ASSERT(sdb_checkpoint(sdb));
+
+    // Begin block, make changes, abort
+    ASSERT(sdb_begin_block(sdb));
+    for (uint32_t i = 0; i < 10; i++) {
+        uint8_t key[32], val[4];
+        make_account_key(key, i);
+        make_value(val, i + 999);
+        ASSERT(sdb_put(sdb, key, val, 4));
+    }
+    sdb_abort_block(sdb);
+
+    // Verify original values unchanged
+    for (uint32_t i = 0; i < 10; i++) {
+        uint8_t key[32], buf[4];
+        uint16_t len = 0;
+        make_account_key(key, i);
+        ASSERT(sdb_get(sdb, key, buf, &len));
+        ASSERT(len == 4);
+        ASSERT(read_value(buf) == i);
+    }
+
+    sdb_destroy(sdb);
+    printf("  PASS (%d assertions)\n\n", assertions - start);
+}
+
+static void test_crash_recovery_uncommitted(void) {
+    int start = assertions;
+    printf("Phase 5c: Crash recovery (uncommitted block)\n");
+
+    cleanup();
+    state_db_t *sdb = sdb_create(TEST_DIR);
+    ASSERT(sdb != NULL);
+
+    // Baseline: 10 accounts with values 0..9
+    for (uint32_t i = 0; i < 10; i++) {
+        uint8_t key[32], val[4];
+        make_account_key(key, i);
+        make_value(val, i);
+        ASSERT(sdb_put(sdb, key, val, 4));
+    }
+    ASSERT(sdb_checkpoint(sdb));
+    sdb_destroy(sdb);
+
+    // Reopen, simulate crash: create undo log without COMMIT, corrupt hash_store
+    sdb = sdb_open(TEST_DIR);
+    ASSERT(sdb != NULL);
+
+    // Manually create an undo log that records the old state for account 0
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/undo.log", TEST_DIR);
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        ASSERT(fd >= 0);
+
+        // Header
+        uint8_t hdr[16] = {0};
+        memcpy(hdr, "UNDOLOG\0", 8);
+        ASSERT(write(fd, hdr, 16) == 16);
+
+        // Undo entry: account key 0, was present, old_val = encode(0)
+        uint8_t op = SDB_OP_ACCT_PUT;
+        ASSERT(write(fd, &op, 1) == 1);
+        uint8_t key[32];
+        make_account_key(key, 0);
+        ASSERT(write(fd, key, 32) == 32);
+        uint8_t present = 1;
+        ASSERT(write(fd, &present, 1) == 1);
+        uint8_t old_val[4];
+        make_value(old_val, 0);
+        uint8_t old_len = 4;
+        ASSERT(write(fd, &old_len, 1) == 1);
+        ASSERT(write(fd, old_val, 4) == 4);
+
+        // NO COMMIT marker
+        fsync(fd);
+        close(fd);
+    }
+
+    // Corrupt hash_store: overwrite account 0 with value 999
+    {
+        uint8_t key[32], val[4];
+        make_account_key(key, 0);
+        make_value(val, 999);
+        sdb_put(sdb, key, val, 4);  // direct write (no block mode)
+        sdb_checkpoint(sdb);
+    }
+
+    sdb_destroy(sdb);
+
+    // Reopen — recovery should detect undo log, replay it, restore old value
+    sdb = sdb_open(TEST_DIR);
+    ASSERT(sdb != NULL);
+
+    // Account 0 should have original value (0), not corrupted value (999)
+    {
+        uint8_t key[32], buf[4];
+        uint16_t len = 0;
+        make_account_key(key, 0);
+        ASSERT(sdb_get(sdb, key, buf, &len));
+        ASSERT(len == 4);
+        ASSERT(read_value(buf) == 0);
+    }
+
+    // Other accounts untouched
+    for (uint32_t i = 1; i < 10; i++) {
+        uint8_t key[32], buf[4];
+        uint16_t len = 0;
+        make_account_key(key, i);
+        ASSERT(sdb_get(sdb, key, buf, &len));
+        ASSERT(len == 4);
+        ASSERT(read_value(buf) == i);
+    }
+
+    // Undo log should be deleted after recovery
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/undo.log", TEST_DIR);
+        ASSERT(access(path, F_OK) != 0);
+    }
+
+    sdb_destroy(sdb);
+    printf("  PASS (%d assertions)\n\n", assertions - start);
+}
+
+static void test_crash_recovery_committed(void) {
+    int start = assertions;
+    printf("Phase 5d: Crash recovery (committed block — undo log is stale)\n");
+
+    cleanup();
+    state_db_t *sdb = sdb_create(TEST_DIR);
+    ASSERT(sdb != NULL);
+
+    // Baseline
+    for (uint32_t i = 0; i < 10; i++) {
+        uint8_t key[32], val[4];
+        make_account_key(key, i);
+        make_value(val, i);
+        ASSERT(sdb_put(sdb, key, val, 4));
+    }
+
+    // Commit a block normally
+    ASSERT(sdb_begin_block(sdb));
+    {
+        uint8_t key[32], val[4];
+        make_account_key(key, 0);
+        make_value(val, 100);
+        ASSERT(sdb_put(sdb, key, val, 4));
+    }
+    ASSERT(sdb_commit_block(sdb));
+    ASSERT(sdb_checkpoint(sdb));
+
+    // Manually leave behind a stale undo.log WITH commit marker
+    // (simulating crash after commit but before unlink)
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/undo.log", TEST_DIR);
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        ASSERT(fd >= 0);
+
+        // Header
+        uint8_t hdr[16] = {0};
+        memcpy(hdr, "UNDOLOG\0", 8);
+        ASSERT(write(fd, hdr, 16) == 16);
+
+        // One dummy undo entry (old value was 0 for account 0)
+        uint8_t op = SDB_OP_ACCT_PUT;
+        ASSERT(write(fd, &op, 1) == 1);
+        uint8_t key[32];
+        make_account_key(key, 0);
+        ASSERT(write(fd, key, 32) == 32);
+        uint8_t present = 1;
+        ASSERT(write(fd, &present, 1) == 1);
+        uint8_t old_val[4];
+        make_value(old_val, 0);
+        uint8_t old_len = 4;
+        ASSERT(write(fd, &old_len, 1) == 1);
+        ASSERT(write(fd, old_val, 4) == 4);
+
+        // COMMIT marker present
+        ASSERT(write(fd, "COMMIT\0\0", 8) == 8);
+        fsync(fd);
+        close(fd);
+    }
+
+    sdb_destroy(sdb);
+
+    // Reopen — should detect committed undo log and just delete it
+    sdb = sdb_open(TEST_DIR);
+    ASSERT(sdb != NULL);
+
+    // Account 0 should have committed value (100), NOT reverted to 0
+    {
+        uint8_t key[32], buf[4];
+        uint16_t len = 0;
+        make_account_key(key, 0);
+        ASSERT(sdb_get(sdb, key, buf, &len));
+        ASSERT(len == 4);
+        ASSERT(read_value(buf) == 100);
+    }
+
+    // Undo log cleaned up
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/undo.log", TEST_DIR);
+        ASSERT(access(path, F_OK) != 0);
+    }
+
+    sdb_destroy(sdb);
+    printf("  PASS (%d assertions)\n\n", assertions - start);
+}
+
+static void test_block_backward_compat(void) {
+    int start = assertions;
+    printf("Phase 5e: Backward compatibility (no block mode)\n");
+
+    cleanup();
+    state_db_t *sdb = sdb_create(TEST_DIR);
+    ASSERT(sdb != NULL);
+
+    // Writes without begin_block should go directly to hash_store
+    for (uint32_t i = 0; i < 10; i++) {
+        uint8_t key[32], val[4];
+        make_account_key(key, i);
+        make_value(val, i);
+        ASSERT(sdb_put(sdb, key, val, 4));
+    }
+
+    // Immediately readable
+    for (uint32_t i = 0; i < 10; i++) {
+        uint8_t key[32], buf[4];
+        uint16_t len = 0;
+        make_account_key(key, i);
+        ASSERT(sdb_get(sdb, key, buf, &len));
+        ASSERT(len == 4);
+        ASSERT(read_value(buf) == i);
+    }
+
+    sdb_destroy(sdb);
+    printf("  PASS (%d assertions)\n\n", assertions - start);
+}
+
+static void test_empty_block_commit(void) {
+    int start = assertions;
+    printf("Phase 5f: Empty block commit\n");
+
+    cleanup();
+    state_db_t *sdb = sdb_create(TEST_DIR);
+    ASSERT(sdb != NULL);
+
+    ASSERT(sdb_begin_block(sdb));
+    ASSERT(sdb_commit_block(sdb));
+
+    // No undo.log created
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/undo.log", TEST_DIR);
+        ASSERT(access(path, F_OK) != 0);
+    }
+
+    sdb_destroy(sdb);
+    printf("  PASS (%d assertions)\n\n", assertions - start);
+}
+
+static void test_storage_undo(void) {
+    int start = assertions;
+    printf("Phase 5g: Storage slot commit + verify\n");
+
+    cleanup();
+    state_db_t *sdb = sdb_create(TEST_DIR);
+    ASSERT(sdb != NULL);
+
+    // Baseline: 5 storage slots
+    uint8_t addr[32];
+    make_addr(addr, 0);
+    for (uint32_t i = 0; i < 5; i++) {
+        uint8_t slot[32], val[32];
+        make_slot(slot, i);
+        make_storage_value(val, i + 100);
+        ASSERT(sdb_put_storage(sdb, addr, slot, val, 32));
+    }
+    ASSERT(sdb_checkpoint(sdb));
+
+    // Begin block, modify and delete storage
+    ASSERT(sdb_begin_block(sdb));
+
+    // Update slot 0
+    {
+        uint8_t slot[32], val[32];
+        make_slot(slot, 0);
+        make_storage_value(val, 999);
+        ASSERT(sdb_put_storage(sdb, addr, slot, val, 32));
+    }
+
+    // Delete slot 4
+    {
+        uint8_t slot[32];
+        make_slot(slot, 4);
+        ASSERT(sdb_delete_storage(sdb, addr, slot));
+    }
+
+    // Add new slot 10
+    {
+        uint8_t slot[32], val[32];
+        make_slot(slot, 10);
+        make_storage_value(val, 777);
+        ASSERT(sdb_put_storage(sdb, addr, slot, val, 32));
+    }
+
+    ASSERT(sdb_commit_block(sdb));
+
+    // Verify updated slot 0
+    {
+        uint8_t slot[32], buf[32];
+        uint16_t len = 0;
+        make_slot(slot, 0);
+        ASSERT(sdb_get_storage(sdb, addr, slot, buf, &len));
+        ASSERT(len == 32);
+        uint8_t expected[32];
+        make_storage_value(expected, 999);
+        ASSERT(memcmp(buf, expected, 32) == 0);
+    }
+
+    // Verify deleted slot 4
+    {
+        uint8_t slot[32], buf[32];
+        uint16_t len = 0;
+        make_slot(slot, 4);
+        ASSERT(!sdb_get_storage(sdb, addr, slot, buf, &len));
+    }
+
+    // Verify unchanged slots 1-3
+    for (uint32_t i = 1; i < 4; i++) {
+        uint8_t slot[32], buf[32];
+        uint16_t len = 0;
+        make_slot(slot, i);
+        ASSERT(sdb_get_storage(sdb, addr, slot, buf, &len));
+        ASSERT(len == 32);
+        uint8_t expected[32];
+        make_storage_value(expected, i + 100);
+        ASSERT(memcmp(buf, expected, 32) == 0);
+    }
+
+    // Verify new slot 10
+    {
+        uint8_t slot[32], buf[32];
+        uint16_t len = 0;
+        make_slot(slot, 10);
+        ASSERT(sdb_get_storage(sdb, addr, slot, buf, &len));
+        ASSERT(len == 32);
+        uint8_t expected[32];
+        make_storage_value(expected, 777);
+        ASSERT(memcmp(buf, expected, 32) == 0);
+    }
+
+    sdb_destroy(sdb);
+    printf("  PASS (%d assertions)\n\n", assertions - start);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -535,6 +1025,13 @@ int main(void) {
     test_multi_account_storage();
     test_checkpoint_recovery();
     test_mixed_blocks();
+    test_commit_block();
+    test_abort_block();
+    test_crash_recovery_uncommitted();
+    test_crash_recovery_committed();
+    test_block_backward_compat();
+    test_empty_block_commit();
+    test_storage_undo();
 
     cleanup();
 
