@@ -115,6 +115,12 @@ add_library(verkle STATIC
 )
 target_link_libraries(verkle pedersen banderwagon)
 
+# Verkle key derivation (pedersen hash for address/storage → tree key mapping)
+add_library(verkle_key STATIC
+    state/src/verkle_key.c
+)
+target_link_libraries(verkle_key pedersen)
+
 #==============================================================================
 # Tests
 #==============================================================================
@@ -296,6 +302,13 @@ add_executable(test_verkle
 )
 target_link_libraries(test_verkle verkle)
 add_test(NAME test_verkle COMMAND test_verkle)
+
+# Test: Verkle key derivation (pedersen hash → tree key mapping)
+add_executable(test_verkle_key
+    state/tests/test_verkle_key.c
+)
+target_link_libraries(test_verkle_key verkle_key)
+add_test(NAME test_verkle_key COMMAND test_verkle_key)
 
 #==============================================================================
 # Build Summary
