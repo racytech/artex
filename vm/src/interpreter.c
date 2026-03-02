@@ -554,6 +554,7 @@ op_sar: {
     //==========================================================================
 
 op_keccak256: {
+    // TODO: Replace keccak256 with Pedersen hash for Verkle-native VM
     // KECCAK256(offset, size): hash memory region
     uint64_t offset, size;
     if (!to_u64(&stack[sp - 1], &offset)) goto out_of_gas;

@@ -59,6 +59,7 @@ const eof_opcode_info_t EOF_OPCODES[256] = {
     [0x1D] = { "SAR",          2, 1, 0, true, false },
 
     // 0x20: Keccak256
+    // TODO: Replace keccak256 with Pedersen hash for Verkle-native VM
     [0x20] = { "KECCAK256",    2, 1, 0, true, false },
 
     // 0x30-0x3f: Environmental (some removed in EOF)
