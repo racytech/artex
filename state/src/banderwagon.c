@@ -440,6 +440,10 @@ void banderwagon_scalar_mul(banderwagon_point_t *out,
 /**
  * Naive multi-scalar multiplication: out = sum(scalars[i] * points[i]).
  * Each scalar is 32 bytes little-endian.
+ *
+ * TODO: Replace with Pippenger's algorithm + precomputed tables for the
+ * 256 CRS points (5-10x speedup). If still insufficient, batch node
+ * updates to GPU via Icicle (CUDA MSM library with C API).
  */
 void banderwagon_msm(banderwagon_point_t *out,
                      const banderwagon_point_t *points,
