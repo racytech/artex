@@ -106,6 +106,7 @@ add_library(vm STATIC
     vm/src/vm.c
     vm/src/vm_memory.c
     vm/src/gas.c
+    vm/src/interpreter.c
 )
 target_include_directories(vm PUBLIC ${CMAKE_SOURCE_DIR}/vm/include)
 target_link_libraries(vm common)
@@ -248,6 +249,11 @@ target_link_libraries(bench_uthash_vs_art art_database)
 add_executable(test_eof vm/tests/test_eof_validation.c)
 target_link_libraries(test_eof vm common)
 add_test(NAME test_eof COMMAND test_eof)
+
+# Test: VM Interpreter (computed goto dispatch + opcode execution)
+add_executable(test_interpreter vm/tests/test_interpreter.c)
+target_link_libraries(test_interpreter vm common)
+add_test(NAME test_interpreter COMMAND test_interpreter)
 
 #==============================================================================
 # Integration Tests (Ethereum test vectors — cJSON required)

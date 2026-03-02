@@ -116,10 +116,8 @@ bool vm_execute(vm_t *vm, eof_container_t *container,
     vm->gas_left = msg->gas;
     vm->current_func = 0;
 
-    // Allocate operand stack from EOF function 0's max_stack_height
-    uint16_t max_stack = container->functions[0].max_stack_height;
-    if (max_stack == 0) max_stack = 1; // at least 1 slot
-    vm->stack = (uint256_t *)calloc(max_stack, sizeof(uint256_t));
+    // Allocate operand stack (full depth — EOF validation guarantees no overflow)
+    vm->stack = (uint256_t *)calloc(VM_MAX_STACK_DEPTH, sizeof(uint256_t));
     if (!vm->stack) {
         *result = vm_result_error(VM_INTERNAL_ERROR, 0);
         return false;
@@ -130,9 +128,21 @@ bool vm_execute(vm_t *vm, eof_container_t *container,
     vm->sp = 0;
     vm->rsp = 0;
 
-    // Phase 1 stub: return success immediately
-    // Phase 2 will call the interpreter loop here
-    *result = vm_result_success(vm->gas_left, NULL, 0);
+    // Run the interpreter
+    vm_status_t status = vm_interpret(vm);
+
+    // Build result from VM state
+    switch (status) {
+    case VM_SUCCESS:
+        *result = vm_result_success(vm->gas_left, vm->return_data, vm->return_data_size);
+        break;
+    case VM_REVERT:
+        *result = vm_result_revert(vm->gas_left, vm->return_data, vm->return_data_size);
+        break;
+    default:
+        *result = vm_result_error(status, vm->gas_left);
+        break;
+    }
     return true;
 }
 

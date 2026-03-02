@@ -206,9 +206,8 @@ void vm_set_tx_context(vm_t *vm, const vm_tx_context_t *tx);
 /**
  * Execute an EOF container with a given message.
  *
- * Allocates the operand stack from container->functions[0].max_stack_height,
+ * Allocates the operand stack (VM_MAX_STACK_DEPTH items),
  * sets up the execution context, and runs the interpreter.
- * Phase 1 stub: returns VM_SUCCESS immediately.
  *
  * @param vm        VM instance
  * @param container Validated EOF container (ownership NOT transferred)
@@ -218,6 +217,13 @@ void vm_set_tx_context(vm_t *vm, const vm_tx_context_t *tx);
  */
 bool vm_execute(vm_t *vm, eof_container_t *container,
                 const vm_message_t *msg, vm_result_t *result);
+
+/**
+ * Run the interpreter dispatch loop. Called by vm_execute().
+ * Assumes VM is fully initialized (stack, memory, container, gas).
+ * Returns the execution status (VM_SUCCESS, VM_REVERT, VM_OUT_OF_GAS, etc.).
+ */
+vm_status_t vm_interpret(vm_t *vm);
 
 //==============================================================================
 // Gas Operations
