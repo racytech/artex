@@ -503,15 +503,17 @@ evm_status_t op_selfdestruct(evm_t *evm)
         }
     }
 
-    // Transfer balance to beneficiary — always touch beneficiary even if balance is 0
-    evm_state_add_balance(evm->state, &beneficiary_addr, &balance);
-
-    // Zero out contract balance
+    // Zero out contract balance FIRST (before adding to beneficiary)
+    // This handles the self-send case (beneficiary == contract) correctly:
+    // zero contract, then add balance to beneficiary
     if (!uint256_is_zero(&balance))
     {
         uint256_t zero = uint256_from_uint64(0);
         evm_state_set_balance(evm->state, &evm->msg.recipient, &zero);
     }
+
+    // Transfer balance to beneficiary
+    evm_state_add_balance(evm->state, &beneficiary_addr, &balance);
 
     if (do_delete)
     {

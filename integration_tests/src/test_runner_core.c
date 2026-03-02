@@ -46,6 +46,8 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
     test_config.fork_blocks.paris = UINT64_MAX;
     test_config.fork_blocks.shanghai = UINT64_MAX;
     test_config.fork_blocks.cancun = UINT64_MAX;
+    test_config.fork_blocks.prague = UINT64_MAX;
+    test_config.fork_blocks.osaka = UINT64_MAX;
 
     // Enable forks cumulatively up to the target fork.
     // Fork chronology: Frontier → Homestead → Tangerine Whistle → Spurious Dragon
@@ -133,7 +135,6 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.shanghai = 0;
         test_config.fork_blocks.cancun = 0;
     } else if (strcmp(fork_name, "Prague") == 0) {
-        // Prague is post-Cancun; treat as Cancun for now (our latest supported fork)
         test_config.fork_blocks.homestead = 0;
         test_config.fork_blocks.tangerine_whistle = 0;
         test_config.fork_blocks.spurious_dragon = 0;
@@ -146,6 +147,22 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.paris = 0;
         test_config.fork_blocks.shanghai = 0;
         test_config.fork_blocks.cancun = 0;
+        test_config.fork_blocks.prague = 0;
+    } else if (strcmp(fork_name, "Osaka") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.berlin = 0;
+        test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.paris = 0;
+        test_config.fork_blocks.shanghai = 0;
+        test_config.fork_blocks.cancun = 0;
+        test_config.fork_blocks.prague = 0;
+        test_config.fork_blocks.osaka = 0;
     } else {
         // Unknown fork, use sepolia (all forks active)
         return (chain_config_t *)chain_config_sepolia();

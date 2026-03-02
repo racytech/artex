@@ -569,6 +569,31 @@ void evm_state_set_storage(evm_state_t *es, const address_t *addr,
     cs->dirty = true;
 }
 
+bool evm_state_has_storage(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return false;
+
+    // Scan the storage cache for any entry belonging to this address
+    mem_art_iterator_t *iter = mem_art_iterator_create(&es->storage);
+    if (!iter) return false;
+
+    bool found = false;
+    while (!mem_art_iterator_done(iter)) {
+        size_t klen;
+        const uint8_t *key = mem_art_iterator_key(iter, &klen);
+        if (key && klen == SLOT_KEY_SIZE && memcmp(key, addr->bytes, ADDRESS_SIZE) == 0) {
+            size_t vlen;
+            const cached_slot_t *cs = (const cached_slot_t *)mem_art_iterator_value(iter, &vlen);
+            if (cs && !uint256_is_zero(&cs->current)) {
+                found = true;
+                break;
+            }
+        }
+        mem_art_iterator_next(iter);
+    }
+    mem_art_iterator_destroy(iter);
+    return found;
+}
+
 // ============================================================================
 // Transient Storage (EIP-1153)
 // ============================================================================

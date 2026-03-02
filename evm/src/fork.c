@@ -28,6 +28,8 @@ static const char *fork_names[] = {
     [FORK_PARIS] = "Paris (The Merge)",
     [FORK_SHANGHAI] = "Shanghai",
     [FORK_CANCUN] = "Cancun",
+    [FORK_PRAGUE] = "Prague",
+    [FORK_OSAKA] = "Osaka",
     [FORK_LATEST] = "Latest",
 };
 
@@ -196,6 +198,8 @@ chain_config_t *chain_config_create(uint64_t chain_id, const char *name)
     config->fork_blocks.paris = UINT64_MAX;
     config->fork_blocks.shanghai = UINT64_MAX;
     config->fork_blocks.cancun = UINT64_MAX;
+    config->fork_blocks.prague = UINT64_MAX;
+    config->fork_blocks.osaka = UINT64_MAX;
 
     return config;
 }
@@ -223,6 +227,10 @@ evm_fork_t fork_get_active(uint64_t block_number, const chain_config_t *config)
     const fork_schedule_t *forks = &config->fork_blocks;
 
     // Check from newest to oldest fork
+    if (block_number >= forks->osaka)
+        return FORK_OSAKA;
+    if (block_number >= forks->prague)
+        return FORK_PRAGUE;
     if (block_number >= forks->cancun)
         return FORK_CANCUN;
     if (block_number >= forks->shanghai)
@@ -306,6 +314,10 @@ uint64_t fork_get_activation_block(const chain_config_t *config, evm_fork_t fork
         return forks->shanghai;
     case FORK_CANCUN:
         return forks->cancun;
+    case FORK_PRAGUE:
+        return forks->prague;
+    case FORK_OSAKA:
+        return forks->osaka;
     default:
         return UINT64_MAX;
     }

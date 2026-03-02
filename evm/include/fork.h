@@ -48,6 +48,8 @@ extern "C"
         FORK_PARIS,             // The Merge (EIP-3675, EIP-4399)
         FORK_SHANGHAI,          // EIP-3651, EIP-3855, EIP-3860, EIP-4895
         FORK_CANCUN,            // EIP-1153, EIP-4844, EIP-5656, EIP-6780, EIP-7516
+        FORK_PRAGUE,            // EIP-7623, EIP-7702, EIP-2935, EIP-7685
+        FORK_OSAKA,             // Future
         FORK_LATEST             // Always points to the latest fork
     } evm_fork_t;
 
@@ -76,6 +78,8 @@ extern "C"
         uint64_t paris; // The Merge
         uint64_t shanghai;
         uint64_t cancun;
+        uint64_t prague;
+        uint64_t osaka;
     } fork_schedule_t;
 
     /**

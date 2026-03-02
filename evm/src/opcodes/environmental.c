@@ -603,13 +603,13 @@ evm_status_t op_extcodecopy(evm_t *evm)
         return EVM_INTERNAL_ERROR;
     }
 
-    // Pop arguments from stack
-    uint256_t size_u256, offset_u256, dest_offset_u256, address_u256;
-    
-    if (!evm_stack_pop(evm->stack, &size_u256) ||
-        !evm_stack_pop(evm->stack, &offset_u256) ||
+    // Pop arguments from stack: addr, destOffset, offset, size
+    uint256_t address_u256, dest_offset_u256, offset_u256, size_u256;
+
+    if (!evm_stack_pop(evm->stack, &address_u256) ||
         !evm_stack_pop(evm->stack, &dest_offset_u256) ||
-        !evm_stack_pop(evm->stack, &address_u256))
+        !evm_stack_pop(evm->stack, &offset_u256) ||
+        !evm_stack_pop(evm->stack, &size_u256))
     {
         return EVM_STACK_UNDERFLOW;
     }

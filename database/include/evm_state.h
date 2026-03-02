@@ -97,6 +97,9 @@ uint256_t evm_state_get_committed_storage(evm_state_t *es, const address_t *addr
 void      evm_state_set_storage(evm_state_t *es, const address_t *addr,
                                 const uint256_t *key, const uint256_t *value);
 
+/** EIP-7610: Check if account has any non-zero storage (for CREATE collision detection). */
+bool evm_state_has_storage(evm_state_t *es, const address_t *addr);
+
 // ============================================================================
 // Account Creation (CREATE / CREATE2)
 // ============================================================================

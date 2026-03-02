@@ -142,10 +142,11 @@ static evm_status_t execute_create(evm_t *evm,
     // Collision Detection (EIP-7610)
     //==========================================================================
 
-    // Check if target address already has code or non-zero nonce
+    // EIP-7610: collision if target has code, non-zero nonce, or storage
     uint64_t target_nonce = evm_state_get_nonce(evm->state, contract_addr);
     uint32_t target_code_size = evm_state_get_code_size(evm->state, contract_addr);
-    if (target_nonce > 0 || target_code_size > 0)
+    bool target_has_storage = evm_state_has_storage(evm->state, contract_addr);
+    if (target_nonce > 0 || target_code_size > 0 || target_has_storage)
     {
         LOG_EVM_DEBUG("CREATE: Address collision detected");
         if (init_code) free(init_code);

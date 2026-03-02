@@ -141,10 +141,11 @@ bool test_runner_run_state_test(test_runner_t *runner,
             // (Debug output removed)
             
             // Determine transaction type based on available fields
+            // The presence of accessLists in the JSON indicates EIP-2930 (even if empty)
             transaction_type_t tx_type = TX_TYPE_LEGACY;
             if (!uint256_is_zero(&test->transaction.max_fee_per_gas)) {
                 tx_type = TX_TYPE_EIP1559;
-            } else if (access_list && access_list->entries_count > 0) {
+            } else if (access_list) {
                 tx_type = TX_TYPE_EIP2930;
             }
             

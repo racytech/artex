@@ -495,6 +495,12 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         {
             evm_mark_address_warm(evm, &msg->caller);
             evm_mark_address_warm(evm, &msg->recipient);
+
+            // EIP-3651 (Shanghai+): coinbase is warm from start of transaction
+            if (evm->fork >= FORK_SHANGHAI)
+            {
+                evm_mark_address_warm(evm, &evm->block.coinbase);
+            }
         }
     }
 

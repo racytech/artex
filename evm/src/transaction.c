@@ -70,6 +70,27 @@ static uint64_t calculate_intrinsic_gas(const transaction_t *tx, evm_fork_t fork
 }
 
 /**
+ * EIP-7623 (Prague+): Calculate floor data gas cost
+ * floor_gas = tokens_in_calldata * FLOOR_CALLDATA_COST + TX_BASE_COST
+ * tokens = zero_bytes * 1 + non_zero_bytes * 4
+ */
+static uint64_t calculate_floor_data_gas(const transaction_t *tx, evm_fork_t fork) {
+    if (fork < FORK_PRAGUE) return 0;
+
+    const uint64_t FLOOR_CALLDATA_COST = 10;
+    const uint64_t TX_BASE_COST = 21000;
+
+    uint64_t tokens = 0;
+    if (tx->data && tx->data_size > 0) {
+        for (size_t i = 0; i < tx->data_size; i++) {
+            tokens += (tx->data[i] == 0) ? 1 : 4;
+        }
+    }
+
+    return tokens * FLOOR_CALLDATA_COST + TX_BASE_COST;
+}
+
+/**
  * Calculate effective gas price based on transaction type
  */
 uint256_t transaction_effective_gas_price(
@@ -171,6 +192,26 @@ bool transaction_execute(
     };
     evm_set_block_env(evm, &block_env);
 
+    // Reject transaction types not supported by the current fork
+    if (tx->type == TX_TYPE_EIP2930 && evm->fork < FORK_BERLIN) {
+        LOG_EVM_ERROR("EIP-2930 type-1 tx not valid before Berlin");
+        return false;
+    }
+    if (tx->type == TX_TYPE_EIP1559 && evm->fork < FORK_LONDON) {
+        LOG_EVM_ERROR("EIP-1559 type-2 tx not valid before London");
+        return false;
+    }
+    if (tx->type == TX_TYPE_EIP4844 && evm->fork < FORK_CANCUN) {
+        LOG_EVM_ERROR("EIP-4844 type-3 tx not valid before Cancun");
+        return false;
+    }
+
+    // EIP-3860 (Shanghai+): Reject contract creation with initcode > MAX_INITCODE_SIZE
+    if (tx->is_create && evm->fork >= FORK_SHANGHAI && tx->data_size > 49152) {
+        LOG_EVM_ERROR("Initcode size %zu exceeds limit 49152", tx->data_size);
+        return false;
+    }
+
     // Calculate effective gas price
     uint256_t effective_gas_price = transaction_effective_gas_price(tx, env);
     uint256_t gas_limit_u256 = uint256_from_uint64(tx->gas_limit);
@@ -207,15 +248,54 @@ bool transaction_execute(
     // value transfer and execution state, but keep nonce increment and gas deduction.
     uint32_t exec_snapshot = evm_state_snapshot(state);
 
-    // For contract creation, create empty account at contract address
+    // For contract creation, check for collision and create account
+    bool collision = false;
     if (tx->is_create) {
+        // EIP-7610: collision if account has nonce, code, or storage
         uint64_t existing_nonce = evm_state_get_nonce(state, &contract_address);
-        if (existing_nonce > 0) {
-            LOG_EVM_ERROR("Contract address collision: nonce=%lu", existing_nonce);
-            evm_state_revert(state, snapshot);
-            return false;
+        uint32_t existing_code = evm_state_get_code_size(state, &contract_address);
+        bool has_storage = evm_state_has_storage(state, &contract_address);
+        if (existing_nonce > 0 || existing_code > 0 || has_storage) {
+            LOG_EVM_DEBUG("Contract address collision: nonce=%lu, code_size=%u, storage=%d",
+                         existing_nonce, existing_code, has_storage);
+            collision = true;
+        } else {
+            evm_state_create_account(state, &contract_address);
+
+            // EIP-161 (Spurious Dragon+): new contracts get nonce=1
+            if (evm->fork >= FORK_SPURIOUS_DRAGON) {
+                evm_state_set_nonce(state, &contract_address, 1);
+            }
         }
-        evm_state_create_account(state, &contract_address);
+    }
+
+    //==========================================================================
+    // EVM Execution
+    //==========================================================================
+
+    // Calculate intrinsic gas
+    uint64_t intrinsic_gas = calculate_intrinsic_gas(tx, evm->fork);
+
+    // EIP-7623 (Prague+): floor data gas
+    uint64_t floor_data_gas = calculate_floor_data_gas(tx, evm->fork);
+
+    // Check if transaction has enough gas for intrinsic cost
+    // EIP-7623: must also have enough for floor data gas
+    uint64_t min_gas_required = intrinsic_gas > floor_data_gas ? intrinsic_gas : floor_data_gas;
+    if (tx->gas_limit < min_gas_required) {
+        LOG_EVM_ERROR("Insufficient gas: limit=%lu, intrinsic=%lu, floor=%lu",
+                 tx->gas_limit, intrinsic_gas, floor_data_gas);
+        evm_state_revert(state, snapshot);
+        return false;
+    }
+
+    // Handle collision: revert execution state, consume all gas
+    if (collision) {
+        evm_state_revert(state, exec_snapshot);
+        result->status = EVM_INTERNAL_ERROR;
+        result->gas_used = tx->gas_limit;
+        result->gas_refund = 0;
+        goto post_execution;
     }
 
     // Transfer value (if any)
@@ -228,21 +308,6 @@ bool transaction_execute(
 
         address_t recipient = tx->is_create ? contract_address : tx->to;
         evm_state_add_balance(state, &recipient, &tx->value);
-    }
-
-    //==========================================================================
-    // EVM Execution
-    //==========================================================================
-
-    // Calculate intrinsic gas
-    uint64_t intrinsic_gas = calculate_intrinsic_gas(tx, evm->fork);
-
-    // Check if transaction has enough gas for intrinsic cost
-    if (tx->gas_limit < intrinsic_gas) {
-        LOG_EVM_ERROR("Insufficient gas: limit=%lu, intrinsic=%lu",
-                 tx->gas_limit, intrinsic_gas);
-        evm_state_revert(state, snapshot);
-        return false;
     }
 
     // Gas available for EVM execution
@@ -341,6 +406,7 @@ bool transaction_execute(
     //==========================================================================
     // Post-execution: Gas refunds and coinbase payment
     //==========================================================================
+post_execution:
 
     // Calculate actual gas cost
     uint64_t gas_used = result->gas_used;
@@ -350,6 +416,19 @@ bool transaction_execute(
     uint64_t max_refund = (evm->fork >= FORK_LONDON) ? gas_used / 5 : gas_used / 2;
     if (gas_refund > max_refund) {
         gas_refund = max_refund;
+    }
+
+    // EIP-7623 (Prague+): enforce floor data gas after refunds
+    // gas_used after refund = gas_used - gas_refund
+    // If that's less than floor_data_gas, clamp to floor_data_gas (and reduce refund accordingly)
+    if (floor_data_gas > 0) {
+        uint64_t gas_used_after_refund = gas_used - gas_refund;
+        if (gas_used_after_refund < floor_data_gas) {
+            // Clamp: effective gas_used_after_refund = floor_data_gas
+            // So gas_refund = gas_used - floor_data_gas (could be 0)
+            gas_refund = (gas_used > floor_data_gas) ? gas_used - floor_data_gas : 0;
+            gas_used = (gas_used > floor_data_gas) ? gas_used : floor_data_gas;
+        }
     }
 
     // Calculate gas to refund: unused gas + capped refund
