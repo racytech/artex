@@ -67,6 +67,7 @@ typedef struct {
         struct { hash_t old_hash; bool old_has_code; uint8_t *old_code; uint32_t old_code_size; } code;
         struct { uint256_t slot; uint256_t old_value; } storage;
         uint256_t slot;             // WARM_SLOT
+        bool old_self_destructed;   // JOURNAL_SELF_DESTRUCT
         struct {                    // JOURNAL_ACCOUNT_CREATE: saved pre-create state
             account_t  old_account;
             uint8_t   *old_code;
@@ -278,7 +279,6 @@ bool evm_state_exists(evm_state_t *es, const address_t *addr) {
     if (!es || !addr) return false;
     cached_account_t *ca = ensure_account(es, addr);
     if (!ca) return false;
-    if (ca->self_destructed) return false;
     return ca->existed || ca->created;
 }
 
@@ -666,8 +666,11 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
     };
     journal_push(es, &je);
 
-    // Reset account to empty
+    // Reset account: preserve existing balance per Ethereum spec.
+    // CREATE/CREATE2 preserves any pre-existing ether at the target address.
+    uint256_t existing_balance = ca->account.balance;
     ca->account = account_empty();
+    ca->account.balance = existing_balance;
     ca->code = NULL;          // ownership moved to journal entry
     ca->code_size = 0;
     ca->created = true;
@@ -688,6 +691,7 @@ void evm_state_self_destruct(evm_state_t *es, const address_t *addr) {
     journal_entry_t je = {
         .type = JOURNAL_SELF_DESTRUCT,
         .addr = *addr,
+        .data.old_self_destructed = ca->self_destructed,
     };
     journal_push(es, &je);
 
@@ -828,7 +832,7 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
         case JOURNAL_SELF_DESTRUCT: {
             cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
                 &es->accounts, je->addr.bytes, ADDRESS_SIZE, NULL);
-            if (ca) ca->self_destructed = false;
+            if (ca) ca->self_destructed = je->data.old_self_destructed;
             break;
         }
         case JOURNAL_WARM_ADDR: {

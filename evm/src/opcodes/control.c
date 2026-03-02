@@ -503,17 +503,14 @@ evm_status_t op_selfdestruct(evm_t *evm)
         }
     }
 
-    // Zero out contract balance FIRST (before adding to beneficiary)
-    // This handles the self-send case (beneficiary == contract) correctly:
-    // zero contract, then add balance to beneficiary
-    if (!uint256_is_zero(&balance))
-    {
-        uint256_t zero = uint256_from_uint64(0);
-        evm_state_set_balance(evm->state, &evm->msg.recipient, &zero);
-    }
-
-    // Transfer balance to beneficiary
+    // Transfer balance to beneficiary FIRST, then zero originator.
+    // Per the Ethereum spec: set(beneficiary, beneficiary_bal + originator_bal)
+    // then set(originator, 0). For self-send (beneficiary == originator),
+    // step 2 overwrites step 1, so balance ends up 0 (ether is burnt).
     evm_state_add_balance(evm->state, &beneficiary_addr, &balance);
+
+    uint256_t zero = uint256_from_uint64(0);
+    evm_state_set_balance(evm->state, &evm->msg.recipient, &zero);
 
     if (do_delete)
     {
