@@ -34,7 +34,7 @@
 #define NODE_POOL_MAX       (32ULL * 1024 * 1024 * 1024)
 
 #define LEAF_POOL_OFFSET    (DATA_OFFSET + NODE_POOL_MAX)
-#define LEAF_SLOT_SIZE      160
+#define LEAF_SLOT_SIZE      192
 #define LEAF_POOL_MAX       (32ULL * 1024 * 1024 * 1024)
 
 #define TOTAL_FILE_SIZE     (LEAF_POOL_OFFSET + LEAF_POOL_MAX)
@@ -105,10 +105,10 @@ typedef struct {
     uint8_t  vlen;                /* 1B: value length */
     uint8_t  value[MPT_MAX_VALUE]; /* 86B: raw value */
     uint8_t  dirty;               /* 1B: needs rehashing */
-    uint8_t  _pad[8];
+    uint8_t  _pad[6];
 } mpt_leaf_t;
 
-_Static_assert(sizeof(mpt_leaf_t) == LEAF_SLOT_SIZE, "leaf must be 160 bytes");
+_Static_assert(sizeof(mpt_leaf_t) == LEAF_SLOT_SIZE, "leaf must be 192 bytes");
 
 /* ========================================================================
  * Meta page
@@ -1043,6 +1043,20 @@ void mpt_close(mpt_t *m) {
     if (m->fd >= 0)
         close(m->fd);
     free(m);
+}
+
+/* ========================================================================
+ * Public API: Reset
+ * ======================================================================== */
+
+void mpt_clear(mpt_t *m) {
+    if (!m) return;
+    m->root = REF_NULL;
+    m->size = 0;
+    m->node_count = 1;  /* skip index 0 (NULL) */
+    m->leaf_count = 1;
+    m->root_dirty = true;
+    m->cached_root = hash_zero();
 }
 
 /* ========================================================================

@@ -214,7 +214,7 @@ int main(int argc, char *argv[]) {
     printf("  nodes:   %u  (%.1fMB)\n",
            mpt_nodes(m), (double)mpt_nodes(m) * 128 / 1e6);
     printf("  leaves:  %u  (%.1fMB)\n",
-           mpt_leaves(m), (double)mpt_leaves(m) * 160 / 1e6);
+           mpt_leaves(m), (double)mpt_leaves(m) * 192 / 1e6);
     printf("  RSS:     %zuMB\n", get_rss_mb());
     printf("  time:    %.1fs\n", elapsed);
     printf("============================================\n");

@@ -16,13 +16,13 @@
  * Node types (mirroring Ethereum MPT):
  *   Branch    — 16 children + cached hash (128B node pool slot)
  *   Extension — nibble path + child ref + cached hash (128B node pool slot)
- *   Leaf      — full key + value + cached hash (160B leaf pool slot)
+ *   Leaf      — full key + value + cached hash (192B leaf pool slot)
  *
  * File layout (single mmap'd file, sparse):
  *   [0, 4KB)           Meta A
  *   [4KB, 8KB)         Meta B
  *   [8KB, 32GB+8KB)    Node pool (128B slots, branches + extensions)
- *   [32GB+8KB, ...)    Leaf pool (160B slots)
+ *   [32GB+8KB, ...)    Leaf pool (192B slots)
  *
  * Keys are fixed 32 bytes (keccak256 hashes = 64 nibbles).
  * Values are variable up to MPT_MAX_VALUE bytes (stored in leaf for rehashing).
@@ -30,7 +30,7 @@
 
 #define MPT_KEY_SIZE     32
 #define MPT_NUM_NIBBLES  64
-#define MPT_MAX_VALUE    86   /* fits compact account encoding (max 74B) */
+#define MPT_MAX_VALUE    120  /* fits RLP([nonce, balance, storageRoot, codeHash]) */
 
 typedef struct mpt mpt_t;
 
@@ -38,6 +38,9 @@ typedef struct mpt mpt_t;
 mpt_t   *mpt_create(const char *path);
 mpt_t   *mpt_open(const char *path);
 void     mpt_close(mpt_t *m);
+
+/* Reset trie to empty (reuse without file I/O) */
+void     mpt_clear(mpt_t *m);
 
 /* Mutations (mark path dirty) */
 bool     mpt_put(mpt_t *m, const uint8_t key[MPT_KEY_SIZE],

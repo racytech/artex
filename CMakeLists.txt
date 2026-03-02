@@ -64,7 +64,7 @@ target_link_libraries(account common)
 add_library(evm_state STATIC
     database/src/evm_state.c
 )
-target_link_libraries(evm_state state_db account common art_database)
+target_link_libraries(evm_state state_db account common art_database mpt)
 
 # Hash Store (zero-RAM file-backed hash table for 64B keys)
 add_library(hash_store STATIC

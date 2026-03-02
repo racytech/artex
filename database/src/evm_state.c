@@ -1,11 +1,14 @@
 #include "../include/evm_state.h"
 #include "../include/account.h"
 #include "../include/mem_art.h"
+#include "../include/mpt.h"
 #include "../../common/include/keccak256.h"
+#include "../../common/include/rlp.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 
 // ============================================================================
 // Internal constants
@@ -802,4 +805,185 @@ bool evm_state_finalize(evm_state_t *es) {
     // Write dirty storage slots
     mem_art_foreach(&es->storage, finalize_storage_cb, &ctx);
     return ctx.ok;
+}
+
+// ============================================================================
+// State Root Computation
+// ============================================================================
+
+#define STORAGE_MPT_PATH "/tmp/evm_storage_mpt.dat"
+#define STATE_MPT_PATH   "/tmp/evm_state_mpt.dat"
+
+// --- Storage root: per-account ---
+
+typedef struct {
+    const uint8_t *target_addr;  // 20-byte address to match
+    mpt_t         *mpt;
+    size_t         count;
+} storage_root_ctx_t;
+
+static bool storage_root_cb(const uint8_t *key, size_t key_len,
+                             const void *value, size_t value_len,
+                             void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    storage_root_ctx_t *ctx = (storage_root_ctx_t *)user_data;
+    const cached_slot_t *cs = (const cached_slot_t *)value;
+
+    // Only collect slots for the target address
+    if (memcmp(cs->key, ctx->target_addr, ADDRESS_SIZE) != 0) return true;
+
+    // Skip zero-valued slots
+    if (uint256_is_zero(&cs->current)) return true;
+
+    // Hash the slot key: keccak256(slot_be[32])
+    hash_t hk = hash_keccak256(cs->key + ADDRESS_SIZE, 32);
+
+    // Trim leading zeros from big-endian value
+    uint8_t raw[32];
+    uint256_to_bytes(&cs->current, raw);
+    uint8_t start = 0;
+    while (start < 31 && raw[start] == 0) start++;
+    uint8_t trimmed_len = 32 - start;
+
+    // RLP-encode the trimmed value
+    uint8_t rlp_val[33];
+    uint8_t rlp_len;
+    if (trimmed_len == 1 && raw[start] < 0x80) {
+        rlp_val[0] = raw[start];
+        rlp_len = 1;
+    } else {
+        rlp_val[0] = 0x80 + trimmed_len;
+        memcpy(rlp_val + 1, raw + start, trimmed_len);
+        rlp_len = 1 + trimmed_len;
+    }
+
+    mpt_put(ctx->mpt, hk.bytes, rlp_val, rlp_len);
+    ctx->count++;
+    return true;
+}
+
+static hash_t compute_storage_root(evm_state_t *es, const address_t *addr,
+                                    mpt_t *storage_mpt) {
+    mpt_clear(storage_mpt);
+
+    storage_root_ctx_t ctx = {
+        .target_addr = addr->bytes,
+        .mpt = storage_mpt,
+        .count = 0,
+    };
+    mem_art_foreach(&es->storage, storage_root_cb, &ctx);
+
+    if (ctx.count == 0) return HASH_EMPTY_STORAGE;
+    return mpt_root(storage_mpt);
+}
+
+// --- Account trie ---
+
+// Convert uint256 to trimmed big-endian bytes, return length (0 for zero)
+static size_t uint256_to_trimmed_be(const uint256_t *val, uint8_t out[32]) {
+    uint256_to_bytes(val, out);
+    size_t start = 0;
+    while (start < 32 && out[start] == 0) start++;
+    size_t len = 32 - start;
+    if (start > 0 && len > 0) memmove(out, out + start, len);
+    return len;
+}
+
+typedef struct {
+    evm_state_t *es;
+    mpt_t       *state_mpt;
+    mpt_t       *storage_mpt;
+    bool         prune_empty;
+} account_root_ctx_t;
+
+static bool account_root_cb(const uint8_t *key, size_t key_len,
+                              const void *value, size_t value_len,
+                              void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    account_root_ctx_t *ctx = (account_root_ctx_t *)user_data;
+    const cached_account_t *ca = (const cached_account_t *)value;
+
+    // Skip self-destructed accounts
+    if (ca->self_destructed) return true;
+
+    // Skip empty accounts based on EIP-161 rules
+    bool is_empty = (ca->account.nonce == 0 &&
+                     uint256_is_zero(&ca->account.balance) &&
+                     !ca->account.has_code);
+    if (is_empty) {
+        if (ctx->prune_empty) return true;
+        if (!ca->existed && !ca->created && !ca->dirty) return true;
+    }
+
+    // Compute storage root for this account
+    hash_t storage_root = compute_storage_root(ctx->es, &ca->addr,
+                                                ctx->storage_mpt);
+
+    // Code hash
+    hash_t code_hash = ca->account.has_code ? ca->account.code_hash
+                                            : HASH_EMPTY_CODE;
+
+    // Build RLP([nonce, balance, storageRoot, codeHash])
+    rlp_item_t *list = rlp_list_new();
+    rlp_list_append(list, rlp_uint64(ca->account.nonce));
+
+    uint8_t bal_be[32];
+    size_t bal_len = uint256_to_trimmed_be(&ca->account.balance, bal_be);
+    rlp_list_append(list, rlp_string(bal_be, bal_len));
+    rlp_list_append(list, rlp_string(storage_root.bytes, 32));
+    rlp_list_append(list, rlp_string(code_hash.bytes, 32));
+
+    bytes_t encoded = rlp_encode(list);
+    rlp_item_free(list);
+
+    // Hash the address: keccak256(addr[20])
+    hash_t hk = hash_keccak256(ca->addr.bytes, ADDRESS_SIZE);
+
+    mpt_put(ctx->state_mpt, hk.bytes, encoded.data, (uint8_t)encoded.len);
+    free(encoded.data);
+    return true;
+}
+
+hash_t evm_state_compute_state_root(evm_state_t *es) {
+    return evm_state_compute_state_root_ex(es, true);
+}
+
+hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
+    if (!es) return HASH_EMPTY_STORAGE;
+    if (mem_art_is_empty(&es->accounts)) return HASH_EMPTY_STORAGE;
+
+    // Create temporary MPT instances
+    unlink(STORAGE_MPT_PATH);
+    unlink(STATE_MPT_PATH);
+
+    mpt_t *storage_mpt = mpt_create(STORAGE_MPT_PATH);
+    mpt_t *state_mpt = mpt_create(STATE_MPT_PATH);
+    if (!storage_mpt || !state_mpt) {
+        if (storage_mpt) mpt_close(storage_mpt);
+        if (state_mpt) mpt_close(state_mpt);
+        unlink(STORAGE_MPT_PATH);
+        unlink(STATE_MPT_PATH);
+        return HASH_EMPTY_STORAGE;
+    }
+
+    account_root_ctx_t ctx = {
+        .es = es,
+        .state_mpt = state_mpt,
+        .storage_mpt = storage_mpt,
+        .prune_empty = prune_empty,
+    };
+    mem_art_foreach(&es->accounts, account_root_cb, &ctx);
+
+    hash_t root;
+    if (mpt_size(state_mpt) == 0)
+        root = HASH_EMPTY_STORAGE;
+    else
+        root = mpt_root(state_mpt);
+
+    mpt_close(storage_mpt);
+    mpt_close(state_mpt);
+    unlink(STORAGE_MPT_PATH);
+    unlink(STATE_MPT_PATH);
+
+    return root;
 }
