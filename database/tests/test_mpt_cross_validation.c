@@ -1,4 +1,6 @@
 #include "mpt.h"
+#include "ih_hash_store.h"
+#include "intermediate_hashes.h"  /* ih_cursor_t */
 #include "hash.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -196,6 +198,240 @@ static void mpt_apply_dirty(mpt_t *m, const dirty_set_t *ds) {
 }
 
 // ============================================================================
+// IH Hash Store Helpers: merged state + cursor
+// ============================================================================
+
+#define IHS_DIR "/tmp/test_ihs_crossval"
+
+typedef struct {
+    uint8_t *keys;        /* count * 32, sorted */
+    uint8_t *val_buf;
+    size_t  *val_offsets;
+    size_t  *val_lens;
+    size_t   count;
+    size_t   val_used;
+    size_t   val_cap;
+    size_t   key_cap;
+} merged_state_t;
+
+static void merged_init(merged_state_t *ms) {
+    memset(ms, 0, sizeof(*ms));
+}
+
+static void merged_free(merged_state_t *ms) {
+    free(ms->keys);
+    free(ms->val_buf);
+    free(ms->val_offsets);
+    free(ms->val_lens);
+    memset(ms, 0, sizeof(*ms));
+}
+
+/* Build merged state from a kv_set (already sorted) */
+static void merged_from_kv(merged_state_t *ms, const kv_set_t *kv) {
+    merged_free(ms);
+    ms->count = kv->count;
+    ms->key_cap = kv->count > 0 ? kv->count : 8;
+    ms->keys = malloc(ms->key_cap * 32);
+    ms->val_offsets = malloc(ms->key_cap * sizeof(size_t));
+    ms->val_lens = malloc(ms->key_cap * sizeof(size_t));
+
+    /* Compute total value bytes */
+    size_t total = 0;
+    for (size_t i = 0; i < kv->count; i++)
+        total += kv->val_lens[i];
+
+    ms->val_cap = total > 0 ? total : 64;
+    ms->val_buf = malloc(ms->val_cap);
+    ms->val_used = 0;
+
+    for (size_t i = 0; i < kv->count; i++) {
+        memcpy(ms->keys + i * 32, kv->keys + i * 32, 32);
+        ms->val_offsets[i] = ms->val_used;
+        ms->val_lens[i] = kv->val_lens[i];
+        if (kv->val_lens[i] > 0) {
+            memcpy(ms->val_buf + ms->val_used,
+                   kv->values + kv->val_offsets[i], kv->val_lens[i]);
+            ms->val_used += kv->val_lens[i];
+        }
+    }
+}
+
+/* Binary search: find index of key or insertion point */
+static size_t merged_find(const merged_state_t *ms, const uint8_t *key) {
+    size_t lo = 0, hi = ms->count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (memcmp(ms->keys + mid * 32, key, 32) < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+/* Apply a dirty set to merged state (insert/update/delete) */
+static void merged_apply_dirty(merged_state_t *ms, const dirty_set_t *ds) {
+    for (uint32_t d = 0; d < ds->count; d++) {
+        const uint8_t *dk = ds->keys + d * 32;
+        size_t vlen = ds->vlens[d];
+        const uint8_t *val = ds->val_buf + ds->val_offsets[d];
+
+        size_t pos = merged_find(ms, dk);
+        bool exists = (pos < ms->count && memcmp(ms->keys + pos * 32, dk, 32) == 0);
+
+        if (vlen == 0) {
+            /* Delete */
+            if (exists) {
+                memmove(ms->keys + pos * 32, ms->keys + (pos + 1) * 32,
+                        (ms->count - pos - 1) * 32);
+                memmove(ms->val_offsets + pos, ms->val_offsets + (pos + 1),
+                        (ms->count - pos - 1) * sizeof(size_t));
+                memmove(ms->val_lens + pos, ms->val_lens + (pos + 1),
+                        (ms->count - pos - 1) * sizeof(size_t));
+                ms->count--;
+            }
+        } else if (exists) {
+            /* Update value in place (append to val_buf) */
+            if (ms->val_used + vlen > ms->val_cap) {
+                ms->val_cap = (ms->val_cap + vlen) * 2;
+                ms->val_buf = realloc(ms->val_buf, ms->val_cap);
+            }
+            ms->val_offsets[pos] = ms->val_used;
+            ms->val_lens[pos] = vlen;
+            memcpy(ms->val_buf + ms->val_used, val, vlen);
+            ms->val_used += vlen;
+        } else {
+            /* Insert at pos */
+            ms->count++;
+            if (ms->count > ms->key_cap) {
+                ms->key_cap *= 2;
+                ms->keys = realloc(ms->keys, ms->key_cap * 32);
+                ms->val_offsets = realloc(ms->val_offsets, ms->key_cap * sizeof(size_t));
+                ms->val_lens = realloc(ms->val_lens, ms->key_cap * sizeof(size_t));
+            }
+            memmove(ms->keys + (pos + 1) * 32, ms->keys + pos * 32,
+                    (ms->count - pos - 1) * 32);
+            memmove(ms->val_offsets + (pos + 1), ms->val_offsets + pos,
+                    (ms->count - pos - 1) * sizeof(size_t));
+            memmove(ms->val_lens + (pos + 1), ms->val_lens + pos,
+                    (ms->count - pos - 1) * sizeof(size_t));
+
+            memcpy(ms->keys + pos * 32, dk, 32);
+            if (ms->val_used + vlen > ms->val_cap) {
+                ms->val_cap = (ms->val_cap + vlen) * 2;
+                ms->val_buf = realloc(ms->val_buf, ms->val_cap);
+            }
+            ms->val_offsets[pos] = ms->val_used;
+            ms->val_lens[pos] = vlen;
+            memcpy(ms->val_buf + ms->val_used, val, vlen);
+            ms->val_used += vlen;
+        }
+    }
+}
+
+/* Cursor over merged state */
+typedef struct {
+    const merged_state_t *ms;
+    size_t pos;
+} merged_cursor_ctx_t;
+
+static bool mc_seek(void *ctx, const uint8_t *seek_key, size_t key_len) {
+    merged_cursor_ctx_t *mc = ctx;
+    (void)key_len;
+    mc->pos = merged_find(mc->ms, seek_key);
+    return mc->pos < mc->ms->count;
+}
+
+static bool mc_next(void *ctx) {
+    merged_cursor_ctx_t *mc = ctx;
+    if (mc->pos < mc->ms->count) mc->pos++;
+    return mc->pos < mc->ms->count;
+}
+
+static bool mc_valid(void *ctx) {
+    merged_cursor_ctx_t *mc = ctx;
+    return mc->pos < mc->ms->count;
+}
+
+static const uint8_t *mc_key(void *ctx, size_t *out_len) {
+    merged_cursor_ctx_t *mc = ctx;
+    if (mc->pos >= mc->ms->count) return NULL;
+    *out_len = 32;
+    return mc->ms->keys + mc->pos * 32;
+}
+
+static const uint8_t *mc_value(void *ctx, size_t *out_len) {
+    merged_cursor_ctx_t *mc = ctx;
+    if (mc->pos >= mc->ms->count) return NULL;
+    *out_len = mc->ms->val_lens[mc->pos];
+    return mc->ms->val_buf + mc->ms->val_offsets[mc->pos];
+}
+
+static ih_cursor_t make_merged_cursor(merged_cursor_ctx_t *mc) {
+    ih_cursor_t c;
+    c.ctx = mc;
+    c.seek = mc_seek;
+    c.next = mc_next;
+    c.valid = mc_valid;
+    c.key = mc_key;
+    c.value = mc_value;
+    return c;
+}
+
+/* Build pointer arrays for ihs_build */
+static void make_kv_ptrs(const kv_set_t *kv,
+                          const uint8_t **key_ptrs,
+                          const uint8_t **val_ptrs,
+                          uint16_t *vlens) {
+    for (size_t i = 0; i < kv->count; i++) {
+        key_ptrs[i] = kv->keys + i * 32;
+        val_ptrs[i] = kv->values + kv->val_offsets[i];
+        vlens[i] = (uint16_t)kv->val_lens[i];
+    }
+}
+
+/* Build dirty key/val pointer arrays for ih_update/ihs_update */
+static void make_dirty_ptrs(const dirty_set_t *ds,
+                             const uint8_t **key_ptrs,
+                             const uint8_t **val_ptrs,
+                             size_t *vlens) {
+    for (uint32_t i = 0; i < ds->count; i++) {
+        key_ptrs[i] = ds->keys + i * 32;
+        val_ptrs[i] = ds->val_buf + ds->val_offsets[i];
+        vlens[i] = ds->vlens[i];
+    }
+}
+
+/* Sort dirty pointer arrays by key (ih_update requires sorted dirty keys) */
+static void sort_dirty_ptrs(const uint8_t **key_ptrs,
+                             const uint8_t **val_ptrs,
+                             size_t *vlens,
+                             size_t count) {
+    /* Simple insertion sort — dirty sets are small */
+    for (size_t i = 1; i < count; i++) {
+        const uint8_t *tk = key_ptrs[i];
+        const uint8_t *tv = val_ptrs[i];
+        size_t tl = vlens[i];
+        size_t j = i;
+        while (j > 0 && memcmp(key_ptrs[j - 1], tk, 32) > 0) {
+            key_ptrs[j] = key_ptrs[j - 1];
+            val_ptrs[j] = val_ptrs[j - 1];
+            vlens[j] = vlens[j - 1];
+            j--;
+        }
+        key_ptrs[j] = tk;
+        val_ptrs[j] = tv;
+        vlens[j] = tl;
+    }
+}
+
+static void remove_dir(const char *dir) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+    (void)system(cmd);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -238,6 +474,30 @@ int main(void) {
             print_hash("got     ", &root);
             ASSERT(hash_equal(&root, &expected));
 
+            /* --- IH hash_store: build and compare --- */
+            remove_dir(IHS_DIR);
+            ihs_state_t *ihs = ihs_create(IHS_DIR);
+            ASSERT(ihs != NULL);
+
+            if (kv.count > 0) {
+                const uint8_t **kptrs = malloc(kv.count * sizeof(uint8_t *));
+                const uint8_t **vptrs = malloc(kv.count * sizeof(uint8_t *));
+                uint16_t *vlens = malloc(kv.count * sizeof(uint16_t));
+                make_kv_ptrs(&kv, kptrs, vptrs, vlens);
+
+                hash_t ihs_root_h = ihs_build(ihs, kptrs, vptrs, vlens, kv.count);
+                print_hash("ihs_root", &ihs_root_h);
+                ASSERT(hash_equal(&ihs_root_h, &expected));
+
+                free(kptrs); free(vptrs); free(vlens);
+            } else {
+                hash_t ihs_root_h = ihs_build(ihs, NULL, NULL, NULL, 0);
+                ASSERT(hash_equal(&ihs_root_h, &expected));
+            }
+
+            ihs_destroy(ihs);
+            remove_dir(IHS_DIR);
+
             mpt_close(m);
             unlink(MPT_PATH);
             free_kv_set(&kv);
@@ -274,6 +534,66 @@ int main(void) {
             print_hash("got     ", &update_root);
             ASSERT(hash_equal(&update_root, &expected_after));
 
+            /* --- IH: build initial, then update (both compact_art + hash_store) --- */
+            {
+                const uint8_t **kptrs = NULL, **vptrs = NULL;
+                uint16_t *vlens16 = NULL;
+                if (initial.count > 0) {
+                    kptrs = malloc(initial.count * sizeof(uint8_t *));
+                    vptrs = malloc(initial.count * sizeof(uint8_t *));
+                    vlens16 = malloc(initial.count * sizeof(uint16_t));
+                    make_kv_ptrs(&initial, kptrs, vptrs, vlens16);
+                }
+
+                /* compact_art IH */
+                ih_state_t *ih = ih_create();
+                ASSERT(ih != NULL);
+                hash_t ih_init = ih_build(ih, kptrs, vptrs, vlens16, initial.count);
+                ASSERT(hash_equal(&ih_init, &initial_root));
+
+                /* hash_store IH */
+                remove_dir(IHS_DIR);
+                ihs_state_t *ihs = ihs_create(IHS_DIR);
+                ASSERT(ihs != NULL);
+                hash_t ihs_init = ihs_build(ihs, kptrs, vptrs, vlens16, initial.count);
+                ASSERT(hash_equal(&ihs_init, &initial_root));
+
+                free(kptrs); free(vptrs); free(vlens16);
+
+                /* Build merged state (initial + dirty) for cursor */
+                merged_state_t ms;
+                merged_init(&ms);
+                merged_from_kv(&ms, &initial);
+                merged_apply_dirty(&ms, &ds);
+
+                /* Dirty pointer arrays */
+                const uint8_t **dkptrs = malloc(ds.count * sizeof(uint8_t *));
+                const uint8_t **dvptrs = malloc(ds.count * sizeof(uint8_t *));
+                size_t *dvlens = malloc(ds.count * sizeof(size_t));
+                make_dirty_ptrs(&ds, dkptrs, dvptrs, dvlens);
+                sort_dirty_ptrs(dkptrs, dvptrs, dvlens, ds.count);
+
+                /* compact_art ih_update */
+                merged_cursor_ctx_t mc1 = { .ms = &ms, .pos = 0 };
+                ih_cursor_t cur1 = make_merged_cursor(&mc1);
+                hash_t ih_upd = ih_update(ih, dkptrs, dvptrs, dvlens, ds.count, &cur1);
+                print_hash("ih_upd  ", &ih_upd);
+                ASSERT(hash_equal(&ih_upd, &expected_after));
+
+                /* hash_store ihs_update */
+                merged_cursor_ctx_t mc2 = { .ms = &ms, .pos = 0 };
+                ih_cursor_t cur2 = make_merged_cursor(&mc2);
+                hash_t ihs_upd = ihs_update(ihs, dkptrs, dvptrs, dvlens, ds.count, &cur2);
+                print_hash("ihs_upd ", &ihs_upd);
+                ASSERT(hash_equal(&ihs_upd, &expected_after));
+
+                free(dkptrs); free(dvptrs); free(dvlens);
+                merged_free(&ms);
+                ih_destroy(ih);
+                ihs_destroy(ihs);
+                remove_dir(IHS_DIR);
+            }
+
             mpt_close(m);
             unlink(MPT_PATH);
             free_dirty_set(&ds);
@@ -301,11 +621,35 @@ int main(void) {
             hash_t built_root = mpt_root(m);
             ASSERT(hash_equal(&built_root, &initial_root));
 
+            /* --- IH hash_store: build initial, then update each block --- */
+            remove_dir(IHS_DIR);
+            ihs_state_t *ihs = ihs_create(IHS_DIR);
+            ASSERT(ihs != NULL);
+
+            {
+                const uint8_t **kptrs = NULL, **vptrs = NULL;
+                uint16_t *vlens16 = NULL;
+                if (initial.count > 0) {
+                    kptrs = malloc(initial.count * sizeof(uint8_t *));
+                    vptrs = malloc(initial.count * sizeof(uint8_t *));
+                    vlens16 = malloc(initial.count * sizeof(uint16_t));
+                    make_kv_ptrs(&initial, kptrs, vptrs, vlens16);
+                }
+                hash_t ihs_init = ihs_build(ihs, kptrs, vptrs, vlens16, initial.count);
+                ASSERT(hash_equal(&ihs_init, &initial_root));
+                free(kptrs); free(vptrs); free(vlens16);
+            }
+
+            merged_state_t ms;
+            merged_init(&ms);
+            merged_from_kv(&ms, &initial);
+
             for (uint32_t blk = 0; blk < num_blocks; blk++) {
                 dirty_set_t ds = read_dirty_set(f);
                 hash_t expected;
                 read_hash(f, &expected);
 
+                /* MPT */
                 mpt_apply_dirty(m, &ds);
                 hash_t root = mpt_root(m);
 
@@ -313,11 +657,32 @@ int main(void) {
                        blk + 1, num_blocks, ds.count, mpt_size(m));
 
                 print_hash("expected", &expected);
-                print_hash("got     ", &root);
+                print_hash("mpt     ", &root);
                 ASSERT(hash_equal(&root, &expected));
 
+                /* IH hash_store: incremental update */
+                merged_apply_dirty(&ms, &ds);
+
+                const uint8_t **dkptrs = malloc(ds.count * sizeof(uint8_t *));
+                const uint8_t **dvptrs = malloc(ds.count * sizeof(uint8_t *));
+                size_t *dvlens = malloc(ds.count * sizeof(size_t));
+                make_dirty_ptrs(&ds, dkptrs, dvptrs, dvlens);
+                sort_dirty_ptrs(dkptrs, dvptrs, dvlens, ds.count);
+
+                merged_cursor_ctx_t mc_ctx = { .ms = &ms, .pos = 0 };
+                ih_cursor_t cursor = make_merged_cursor(&mc_ctx);
+
+                hash_t ihs_root_h = ihs_update(ihs, dkptrs, dvptrs, dvlens, ds.count, &cursor);
+                print_hash("ihs     ", &ihs_root_h);
+                ASSERT(hash_equal(&ihs_root_h, &expected));
+
+                free(dkptrs); free(dvptrs); free(dvlens);
                 free_dirty_set(&ds);
             }
+
+            merged_free(&ms);
+            ihs_destroy(ihs);
+            remove_dir(IHS_DIR);
 
             mpt_close(m);
             unlink(MPT_PATH);

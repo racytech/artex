@@ -77,6 +77,18 @@ add_library(mpt STATIC
 )
 target_link_libraries(mpt common)
 
+# Intermediate Hashes (Erigon-style MPT commitment via flat hash storage)
+add_library(intermediate_hashes STATIC
+    database/src/intermediate_hashes.c
+)
+target_link_libraries(intermediate_hashes compact_art common)
+
+# IH Hash Store (intermediate hashes backed by hash_store — zero-RAM, persistent)
+add_library(ih_hash_store STATIC
+    database/src/ih_hash_store.c
+)
+target_link_libraries(ih_hash_store hash_store common)
+
 #==============================================================================
 # Tests
 #==============================================================================
@@ -181,7 +193,7 @@ add_test(NAME test_compact_art_seek COMMAND test_compact_art_seek)
 add_executable(test_mpt_cross_validation
     database/tests/test_mpt_cross_validation.c
 )
-target_link_libraries(test_mpt_cross_validation mpt common)
+target_link_libraries(test_mpt_cross_validation mpt ih_hash_store intermediate_hashes common)
 add_test(NAME test_mpt_cross_validation
     COMMAND test_mpt_cross_validation
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -223,6 +235,20 @@ add_executable(bench_mpt_trie
     database/tests/bench_mpt_trie.c
 )
 target_link_libraries(bench_mpt_trie mpt common)
+
+# Test: Intermediate Hashes (ih_build + ih_update correctness)
+add_executable(test_intermediate_hashes
+    database/tests/test_intermediate_hashes.c
+)
+target_link_libraries(test_intermediate_hashes intermediate_hashes)
+add_test(NAME test_intermediate_hashes COMMAND test_intermediate_hashes)
+
+# Test: IH Hash Store (hash_store-backed intermediate hashes)
+add_executable(test_ih_hash_store
+    database/tests/test_ih_hash_store.c
+)
+target_link_libraries(test_ih_hash_store ih_hash_store intermediate_hashes)
+add_test(NAME test_ih_hash_store COMMAND test_ih_hash_store)
 
 #==============================================================================
 # Build Summary

@@ -119,6 +119,8 @@ typedef struct {
     uint32_t key_size;             /* was _reserved */
     uint32_t crc32c;
     uint32_t max_value;            /* was _pad */
+    uint32_t free_node_head;       /* head of node-pool free-list (0 = empty) */
+    uint32_t free_leaf_head;       /* head of leaf-pool free-list (0 = empty) */
 } mpt_meta_t;
 
 #define META_CRC_LEN  (offsetof(mpt_meta_t, crc32c))
@@ -136,6 +138,8 @@ struct mpt {
     uint64_t  size;
     uint32_t  node_count;
     uint32_t  leaf_count;
+    uint32_t  free_node_head;      /* first free node slot (0 = none) */
+    uint32_t  free_leaf_head;      /* first free leaf slot (0 = none) */
 
     uint64_t  generation;
     int       active_meta;         /* 0 or 1 */
@@ -234,7 +238,15 @@ static inline mpt_extension_t *ext_ptr(const mpt_t *m, ref_t ref) {
  * ======================================================================== */
 
 static ref_t alloc_branch(mpt_t *m) {
-    uint32_t idx = m->node_count;
+    uint32_t idx;
+    if (m->free_node_head != 0) {
+        idx = m->free_node_head;
+        uint8_t *slot = m->node_base + (size_t)idx * NODE_SLOT_SIZE;
+        memcpy(&m->free_node_head, slot, sizeof(uint32_t));
+        memset(slot, 0, NODE_SLOT_SIZE);
+        return MAKE_BRANCH(idx);
+    }
+    idx = m->node_count;
     if (idx > INDEX_MASK) return REF_NULL;
     if ((size_t)(idx + 1) * NODE_SLOT_SIZE > NODE_POOL_MAX) return REF_NULL;
     m->node_count++;
@@ -245,7 +257,15 @@ static ref_t alloc_branch(mpt_t *m) {
 }
 
 static ref_t alloc_extension(mpt_t *m) {
-    uint32_t idx = m->node_count;
+    uint32_t idx;
+    if (m->free_node_head != 0) {
+        idx = m->free_node_head;
+        uint8_t *slot = m->node_base + (size_t)idx * NODE_SLOT_SIZE;
+        memcpy(&m->free_node_head, slot, sizeof(uint32_t));
+        memset(slot, 0, NODE_SLOT_SIZE);
+        return MAKE_EXTENSION(idx);
+    }
+    idx = m->node_count;
     if (idx > INDEX_MASK) return REF_NULL;
     if ((size_t)(idx + 1) * NODE_SLOT_SIZE > NODE_POOL_MAX) return REF_NULL;
     m->node_count++;
@@ -257,7 +277,20 @@ static ref_t alloc_extension(mpt_t *m) {
 
 static ref_t alloc_leaf(mpt_t *m, const uint8_t *key,
                         const uint8_t *value, uint8_t vlen) {
-    uint32_t idx = m->leaf_count;
+    uint32_t idx;
+    if (m->free_leaf_head != 0) {
+        idx = m->free_leaf_head;
+        uint8_t *lf = m->leaf_base + (size_t)idx * LEAF_SLOT_SIZE;
+        memcpy(&m->free_leaf_head, lf, sizeof(uint32_t));
+        memset(lf, 0, LEAF_SLOT_SIZE);
+        memcpy(LF_KEY(m, lf), key, m->key_size);
+        LF_VLEN(m, lf) = vlen;
+        if (vlen > 0 && value)
+            memcpy(LF_VALUE(m, lf), value, vlen);
+        LF_DIRTY(m, lf) = 1;
+        return MAKE_LEAF(idx);
+    }
+    idx = m->leaf_count;
     if (idx > INDEX_MASK) return REF_NULL;
     if ((size_t)(idx + 1) * LEAF_SLOT_SIZE > LEAF_POOL_MAX) return REF_NULL;
     m->leaf_count++;
@@ -269,6 +302,27 @@ static ref_t alloc_leaf(mpt_t *m, const uint8_t *key,
         memcpy(LF_VALUE(m, lf), value, vlen);
     LF_DIRTY(m, lf) = 1;
     return MAKE_LEAF(idx);
+}
+
+/* ========================================================================
+ * Free-list: push freed slot onto front of list
+ *
+ * First 4 bytes of freed slot store the next-free index.
+ * Head index 0 means "end of list" (index 0 is the NULL sentinel).
+ * ======================================================================== */
+
+static void free_node(mpt_t *m, uint32_t idx) {
+    uint8_t *slot = m->node_base + (size_t)idx * NODE_SLOT_SIZE;
+    uint32_t old_head = m->free_node_head;
+    memcpy(slot, &old_head, sizeof(uint32_t));
+    m->free_node_head = idx;
+}
+
+static void free_leaf(mpt_t *m, uint32_t idx) {
+    uint8_t *slot = m->leaf_base + (size_t)idx * LEAF_SLOT_SIZE;
+    uint32_t old_head = m->free_leaf_head;
+    memcpy(slot, &old_head, sizeof(uint32_t));
+    m->free_leaf_head = idx;
 }
 
 /* ========================================================================
@@ -377,6 +431,9 @@ static ref_t do_insert(mpt_t *m, ref_t ref, const uint8_t *key,
         memcpy(saved_key, LF_KEY(m, lf), m->key_size);
         memcpy(saved_val, LF_VALUE(m, lf), saved_vlen);
 
+        /* Free the original leaf — data is saved above */
+        free_leaf(m, REF_INDEX(ref));
+
         int diff = depth;
         while (diff < (int)m->num_nibbles &&
                key_nibble(key, diff) == key_nibble(saved_key, diff))
@@ -437,6 +494,9 @@ static ref_t do_insert(mpt_t *m, ref_t ref, const uint8_t *key,
         memcpy(saved_nibbles, ext->nibbles, 59);
         int saved_skip = skip;
         ref_t saved_child = ext->child;
+
+        /* Free the original extension — data is saved above */
+        free_node(m, REF_INDEX(ref));
 
         /* New leaf */
         ref_t new_leaf = alloc_leaf(m, key, value, vlen);
@@ -499,6 +559,7 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
         uint8_t *lf = leaf_raw(m, ref);
         if (memcmp(LF_KEY(m, lf), key, m->key_size) == 0) {
             *deleted = true;
+            free_leaf(m, REF_INDEX(ref));
             return REF_NULL;
         }
         *deleted = false;
@@ -521,12 +582,15 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
         ref_t new_child = do_delete(m, old_child, key, depth + skip, deleted);
         if (!*deleted) return ref;
 
-        if (new_child == REF_NULL)
+        if (new_child == REF_NULL) {
+            free_node(m, REF_INDEX(ref));
             return REF_NULL;
+        }
 
         /* Child became leaf -- drop extension, leaf moves up in depth */
         if (IS_LEAF(new_child)) {
             LF_DIRTY(m, leaf_raw(m, new_child)) = 1;
+            free_node(m, REF_INDEX(ref));
             return new_child;
         }
 
@@ -542,6 +606,10 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
             ref_t child_child = child_ext->child;
             uint8_t child_nibs[59];
             memcpy(child_nibs, child_ext->nibbles, 59);
+
+            /* Free both old extensions — data saved above */
+            free_node(m, REF_INDEX(ref));
+            free_node(m, REF_INDEX(new_child));
 
             int total = our_skip + child_skip;
             uint8_t merged[64];
@@ -585,8 +653,10 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
         }
     }
 
-    if (remaining == 0)
+    if (remaining == 0) {
+        free_node(m, REF_INDEX(ref));
         return REF_NULL;
+    }
 
     if (remaining == 1) {
         ref_t sole = b->children[last_nib];
@@ -594,6 +664,7 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
         /* Leaf floats up -- depth changes, cached hash is stale */
         if (IS_LEAF(sole)) {
             LF_DIRTY(m, leaf_raw(m, sole)) = 1;
+            free_node(m, REF_INDEX(ref));
             return sole;
         }
 
@@ -605,6 +676,10 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
             uint8_t child_nibs[59];
             memcpy(child_nibs, ce->nibbles, 59);
 
+            /* Free branch and child extension — data saved above */
+            free_node(m, REF_INDEX(ref));
+            free_node(m, REF_INDEX(sole));
+
             int total = 1 + child_skip;
             uint8_t merged[64];
             memset(merged, 0, sizeof(merged));
@@ -615,6 +690,7 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
         }
 
         /* Branch child -- wrap in 1-nibble extension */
+        free_node(m, REF_INDEX(ref));
         return make_ext_single(m, (uint8_t)last_nib, sole);
     }
 
@@ -956,6 +1032,8 @@ static mpt_t *mpt_create_internal(const char *path, uint32_t key_size,
     m->size = 0;
     m->node_count = 1;  /* skip index 0 (NULL) */
     m->leaf_count = 1;
+    m->free_node_head = 0;
+    m->free_leaf_head = 0;
     m->generation = 0;
     m->active_meta = 0;
     m->root_dirty = true;
@@ -1057,6 +1135,8 @@ mpt_t *mpt_open(const char *path) {
     m->size = meta->size;
     m->node_count = meta->node_count;
     m->leaf_count = meta->leaf_count;
+    m->free_node_head = meta->free_node_head;
+    m->free_leaf_head = meta->free_leaf_head;
     m->generation = meta->generation;
     m->active_meta = active;
     m->root_dirty = false;  /* assume committed state has valid hashes */
@@ -1096,6 +1176,8 @@ void mpt_clear(mpt_t *m) {
     m->size = 0;
     m->node_count = 1;  /* skip index 0 (NULL) */
     m->leaf_count = 1;
+    m->free_node_head = 0;
+    m->free_leaf_head = 0;
     m->root_dirty = true;
     m->cached_root = hash_zero();
 }
@@ -1322,6 +1404,8 @@ bool mpt_commit(mpt_t *m) {
     meta.leaf_count = m->leaf_count;
     meta.key_size = m->key_size;
     meta.max_value = m->max_value;
+    meta.free_node_head = m->free_node_head;
+    meta.free_leaf_head = m->free_leaf_head;
     meta.crc32c = compute_crc32c(&meta, META_CRC_LEN);
 
     if (!meta_write(m->fd, inactive, &meta))
