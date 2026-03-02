@@ -109,6 +109,12 @@ add_library(pedersen STATIC
 )
 target_link_libraries(pedersen banderwagon blst)
 
+# Verkle tree (in-memory width-256 trie with Pedersen commitments)
+add_library(verkle STATIC
+    state/src/verkle.c
+)
+target_link_libraries(verkle pedersen banderwagon)
+
 #==============================================================================
 # Tests
 #==============================================================================
@@ -283,6 +289,13 @@ add_executable(test_pedersen
 )
 target_link_libraries(test_pedersen pedersen)
 add_test(NAME test_pedersen COMMAND test_pedersen)
+
+# Test: Verkle tree (in-memory trie with Pedersen commitments)
+add_executable(test_verkle
+    state/tests/test_verkle.c
+)
+target_link_libraries(test_verkle verkle)
+add_test(NAME test_verkle COMMAND test_verkle)
 
 #==============================================================================
 # Build Summary
