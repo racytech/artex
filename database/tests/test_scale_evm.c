@@ -444,8 +444,10 @@ int main(int argc, char *argv[]) {
         total.reverts        += bc.reverts;
         total.selfdestructs  += bc.selfdestructs;
 
-        // Progress
-        if ((block + 1) % progress_interval == 0 || block == total_blocks - 1) {
+        // Progress (also print at checkpoint boundaries so they always have context)
+        if ((block + 1) % progress_interval == 0 ||
+            (block + 1) % commit_interval == 0 ||
+            block == total_blocks - 1) {
             sdb_stats_t stats = sdb_stats(sdb);
             printf("block %6u | exec %5.1fms | root %6.1fms | commit %5.1fms | "
                    "accts %7" PRIu64 " | stor %8" PRIu64 " | "
