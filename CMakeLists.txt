@@ -100,6 +100,16 @@ add_library(evm STATIC
 target_include_directories(evm PUBLIC ${CMAKE_SOURCE_DIR}/evm/include)
 target_link_libraries(evm evm_state common)
 
+# VM Library (EOF-native, Verkle-targeted)
+add_library(vm STATIC
+    vm/src/eof.c
+    vm/src/vm.c
+    vm/src/vm_memory.c
+    vm/src/gas.c
+)
+target_include_directories(vm PUBLIC ${CMAKE_SOURCE_DIR}/vm/include)
+target_link_libraries(vm common)
+
 #==============================================================================
 # Tests
 #==============================================================================
@@ -234,6 +244,11 @@ add_executable(bench_uthash_vs_art
 )
 target_link_libraries(bench_uthash_vs_art art_database)
 
+# Test: EOF Validation (EOF container parsing + code validation)
+add_executable(test_eof vm/tests/test_eof_validation.c)
+target_link_libraries(test_eof vm common)
+add_test(NAME test_eof COMMAND test_eof)
+
 #==============================================================================
 # Integration Tests (Ethereum test vectors — cJSON required)
 #==============================================================================
@@ -306,5 +321,6 @@ message(STATUS "  - state_db (account state + contract storage wrapper)")
 message(STATUS "  - account (compact variable-length account encoding)")
 message(STATUS "  - evm_state (typed in-memory EVM state interface)")
 message(STATUS "  - intermediate_hashes (MPT commitment via flat hash storage)")
+message(STATUS "  - vm (EOF-native VM for Verkle state)")
 message(STATUS "========================================")
 message(STATUS "")

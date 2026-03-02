@@ -144,5 +144,8 @@ failure.txt
 
 reference/
 
+# EVM (legacy — separate branch)
+evm/
+
 # Old checklist
 todo-checklist-old.md
