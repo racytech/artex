@@ -164,6 +164,12 @@ add_executable(test_evm_state
 target_link_libraries(test_evm_state evm_state)
 add_test(NAME test_evm_state COMMAND test_evm_state)
 
+# Scale Test: Full-stack EVM (evm_state → sdb → hash_store)
+add_executable(test_scale_evm
+    database/tests/test_scale_evm.c
+)
+target_link_libraries(test_scale_evm evm_state)
+
 # Test: Compact ART Iterator Seek (lower-bound)
 add_executable(test_compact_art_seek
     database/tests/test_compact_art_seek.c
