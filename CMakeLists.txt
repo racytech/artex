@@ -121,6 +121,12 @@ add_library(verkle_key STATIC
 )
 target_link_libraries(verkle_key pedersen)
 
+# Verkle state (typed account/storage interface over verkle tree)
+add_library(verkle_state STATIC
+    state/src/verkle_state.c
+)
+target_link_libraries(verkle_state verkle verkle_key)
+
 #==============================================================================
 # Tests
 #==============================================================================
@@ -309,6 +315,13 @@ add_executable(test_verkle_key
 )
 target_link_libraries(test_verkle_key verkle_key)
 add_test(NAME test_verkle_key COMMAND test_verkle_key)
+
+# Test: Verkle state (typed account/storage interface)
+add_executable(test_verkle_state
+    state/tests/test_verkle_state.c
+)
+target_link_libraries(test_verkle_state verkle_state)
+add_test(NAME test_verkle_state COMMAND test_verkle_state)
 
 #==============================================================================
 # Build Summary

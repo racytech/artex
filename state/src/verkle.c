@@ -191,15 +191,89 @@ bool verkle_get(const verkle_tree_t *vt,
 }
 
 /* =========================================================================
- * verkle_set
+ * Incremental Commitment Updates
  * ========================================================================= */
 
 /**
- * Recompute commitment for a node and all its ancestors.
- * path[] and path_indices[] track the walk from root to leaf.
+ * Incrementally update a leaf's C1/C2 and leaf commitment after a single
+ * value change. O(1) — two pedersen_update calls for C1/C2, one for leaf.
+ *
+ * Returns the old leaf commitment (needed for propagating to parent).
+ */
+static banderwagon_point_t incremental_update_leaf(
+    verkle_leaf_t *leaf, uint8_t suffix,
+    const uint8_t old_value[32], const uint8_t new_value[32])
+{
+    banderwagon_point_t old_leaf_commit = leaf->commitment;
+
+    /* Determine which half: C1 (suffix < 128) or C2 (suffix >= 128) */
+    banderwagon_point_t *cx = (suffix < 128) ? &leaf->c1 : &leaf->c2;
+    banderwagon_point_t old_cx = *cx;
+    int rel = (suffix < 128) ? suffix : suffix - 128;
+
+    /* Compute deltas for lower and upper 16-byte halves */
+    uint8_t old_lo[32] = {0}, new_lo[32] = {0};
+    uint8_t old_hi[32] = {0}, new_hi[32] = {0};
+    memcpy(old_lo, old_value, 16);
+    memcpy(new_lo, new_value, 16);
+    memcpy(old_hi, old_value + 16, 16);
+    memcpy(new_hi, new_value + 16, 16);
+
+    uint8_t delta_lo[32], delta_hi[32];
+    pedersen_scalar_diff(delta_lo, new_lo, old_lo);
+    pedersen_scalar_diff(delta_hi, new_hi, old_hi);
+
+    /* Update C1 or C2 */
+    pedersen_update(cx, cx, 2 * rel, delta_lo);
+    pedersen_update(cx, cx, 2 * rel + 1, delta_hi);
+
+    /* Update leaf commitment: slot 2 for C1, slot 3 for C2 */
+    int cx_slot = (suffix < 128) ? 2 : 3;
+    uint8_t old_cx_field[32], new_cx_field[32], delta_cx[32];
+    banderwagon_map_to_field(old_cx_field, &old_cx);
+    banderwagon_map_to_field(new_cx_field, cx);
+    pedersen_scalar_diff(delta_cx, new_cx_field, old_cx_field);
+    pedersen_update(&leaf->commitment, &leaf->commitment, cx_slot, delta_cx);
+
+    return old_leaf_commit;
+}
+
+/**
+ * Propagate commitment delta from a changed child up through internal
+ * ancestors. O(1) per level — one pedersen_update call per internal node.
+ */
+static void incremental_propagate_internals(
+    verkle_node_t **path, int *path_indices, int path_len,
+    const banderwagon_point_t *old_child_commit,
+    const banderwagon_point_t *new_child_commit)
+{
+    banderwagon_point_t old_c = *old_child_commit;
+    banderwagon_point_t new_c = *new_child_commit;
+
+    for (int i = path_len - 1; i >= 0; i--) {
+        verkle_node_t *node = path[i];
+        int child_idx = path_indices[i];
+
+        uint8_t old_field[32], new_field[32], delta[32];
+        banderwagon_map_to_field(old_field, &old_c);
+        banderwagon_map_to_field(new_field, &new_c);
+        pedersen_scalar_diff(delta, new_field, old_field);
+
+        banderwagon_point_t old_node_commit = node->internal.commitment;
+        pedersen_update(&node->internal.commitment,
+                        &node->internal.commitment,
+                        child_idx, delta);
+
+        old_c = old_node_commit;
+        new_c = node->internal.commitment;
+    }
+}
+
+/**
+ * Full recompute of commitments from leaf up to root.
+ * Used for new nodes (splits) where there's no old commitment to delta from.
  */
 static void recompute_commitments(verkle_node_t **path, int path_len) {
-    /* Recompute from leaf up to root */
     for (int i = path_len - 1; i >= 0; i--) {
         verkle_node_t *n = path[i];
         if (n->type == VERKLE_LEAF) {
@@ -219,8 +293,9 @@ bool verkle_set(verkle_tree_t *vt,
     const uint8_t *stem = key;
     uint8_t suffix = key[31];
 
-    /* Track path for commitment recomputation */
+    /* Track path for commitment updates */
     verkle_node_t *path[VERKLE_STEM_LEN + 1];
+    int path_indices[VERKLE_STEM_LEN + 1];
     int path_len = 0;
 
     /* Empty tree: create a leaf as root */
@@ -241,16 +316,29 @@ bool verkle_set(verkle_tree_t *vt,
         verkle_node_t *node = *slot;
 
         if (node->type == VERKLE_LEAF) {
-            /* Same stem: update value in this leaf */
+            /* Same stem: update value in this leaf — INCREMENTAL */
             if (memcmp(node->leaf.stem, stem, VERKLE_STEM_LEN) == 0) {
+                /* Save old value (zeros if suffix not yet set) */
+                uint8_t old_value[32];
+                memcpy(old_value, node->leaf.values[suffix], 32);
+
+                /* Update value */
                 memcpy(node->leaf.values[suffix], value, VERKLE_VALUE_LEN);
                 node->leaf.has_value[suffix] = true;
-                path[path_len++] = node;
-                recompute_commitments(path, path_len);
+
+                /* Incremental leaf update */
+                banderwagon_point_t old_leaf_commit =
+                    incremental_update_leaf(&node->leaf, suffix,
+                                            old_value, value);
+
+                /* Propagate up through internal ancestors */
+                incremental_propagate_internals(
+                    path, path_indices, path_len,
+                    &old_leaf_commit, &node->leaf.commitment);
                 return true;
             }
 
-            /* Different stem: need to split */
+            /* Different stem: need to split — FULL RECOMPUTE for new nodes */
             verkle_node_t *existing_leaf = node;
             const uint8_t *existing_stem = existing_leaf->leaf.stem;
 
@@ -260,7 +348,9 @@ bool verkle_set(verkle_tree_t *vt,
                 verkle_node_t *internal = new_internal();
                 if (!internal) return false;
                 *slot = internal;
-                path[path_len++] = internal;
+                path[path_len] = internal;
+                path_indices[path_len] = stem[depth];
+                path_len++;
                 slot = &internal->internal.children[stem[depth]];
                 depth++;
             }
@@ -270,7 +360,9 @@ bool verkle_set(verkle_tree_t *vt,
                 verkle_node_t *internal = new_internal();
                 if (!internal) return false;
                 *slot = internal;
-                path[path_len++] = internal;
+                path[path_len] = internal;
+                path_indices[path_len] = -1; /* not used for recompute */
+                path_len++;
 
                 /* Place existing leaf */
                 internal->internal.children[existing_stem[depth]] = existing_leaf;
@@ -282,33 +374,40 @@ bool verkle_set(verkle_tree_t *vt,
                 new_lf->leaf.has_value[suffix] = true;
                 internal->internal.children[stem[depth]] = new_lf;
 
-                /* Recompute: new leaf, then existing leaf (unchanged but
-                 * needs commitment if not yet computed), then ancestors */
+                /* Full recompute for new leaf and all new internals */
                 compute_leaf_commitment(&new_lf->leaf);
                 /* existing leaf commitment is already computed */
                 recompute_commitments(path, path_len);
                 return true;
             }
 
-            /* Stems match fully (shouldn't happen — same stem case handled above) */
+            /* Stems match fully (shouldn't happen) */
             return false;
         }
 
-        /* Internal node: descend */
-        path[path_len++] = node;
+        /* Internal node: descend — track child index */
+        path[path_len] = node;
+        path_indices[path_len] = stem[depth];
+        path_len++;
         slot = &node->internal.children[stem[depth]];
         depth++;
     }
 
-    /* Reached a NULL child slot: create new leaf */
+    /* Reached a NULL child slot: create new leaf — INCREMENTAL for ancestors */
     verkle_node_t *new_lf = new_leaf(stem);
     if (!new_lf) return false;
     memcpy(new_lf->leaf.values[suffix], value, VERKLE_VALUE_LEN);
     new_lf->leaf.has_value[suffix] = true;
     *slot = new_lf;
 
+    /* Full compute for the new leaf (no old commitment) */
     compute_leaf_commitment(&new_lf->leaf);
-    recompute_commitments(path, path_len);
+
+    /* Incremental propagation: old child was NULL (identity commitment) */
+    banderwagon_point_t old_child = BANDERWAGON_IDENTITY;
+    incremental_propagate_internals(
+        path, path_indices, path_len,
+        &old_child, &new_lf->leaf.commitment);
     return true;
 }
 
