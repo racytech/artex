@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 // ============================================================================
 // Internal constants
@@ -21,11 +22,12 @@
 #define MAX_PATH           512
 #define MAX_VALUE_SIZE     86    // max(account=86, storage=54)
 
-// Undo log constants
-#define UNDO_MAGIC         "UNDOLOG\0"
-#define COMMIT_MAGIC       "COMMIT\0\0"
-#define UNDO_HEADER_SIZE   16
-#define COMMIT_MARKER_SIZE 8
+// Undo log constants (v2: append-only, multi-block)
+#define UNDO_MAGIC         "UNDOLOG2"   // 8 bytes (v2 format)
+#define UNDO_HEADER_SIZE   16           // magic(8) + reserved(8)
+#define BLOCK_BEGIN_TAG    0xBB         // BLOCK_BEGIN marker
+#define BLOCK_COMMIT_TAG   0xBC         // BLOCK_COMMIT marker
+#define BLOCK_MARKER_SIZE  5            // tag(1) + block_seq(4)
 #define UNDO_FILENAME      "undo.log"
 #define PENDING_INIT_CAP   256
 
@@ -59,6 +61,9 @@ struct state_db {
     sdb_pending_write_t  *pending;
     uint32_t              pending_count;
     uint32_t              pending_cap;
+    // Deferred checkpoint: undo log persists across blocks
+    int                   undo_fd;          // -1 = not open
+    uint32_t              undo_block_count; // sequential counter for markers
 };
 
 // ============================================================================
@@ -140,17 +145,13 @@ static bool sdb_recover_undo(state_db_t *sdb) {
     // Read header
     uint8_t hdr[UNDO_HEADER_SIZE];
     if (read(fd, hdr, UNDO_HEADER_SIZE) != UNDO_HEADER_SIZE) {
-        close(fd);
-        unlink(path);
-        return true;
+        close(fd); unlink(path); return true;
     }
     if (memcmp(hdr, UNDO_MAGIC, 8) != 0) {
-        close(fd);
-        unlink(path);
-        return true;
+        close(fd); unlink(path); return true;
     }
 
-    // Read all entries into array, check for COMMIT marker
+    // Read all undo entries across all blocks
     typedef struct {
         uint8_t  op;
         uint8_t  key[64];
@@ -163,35 +164,25 @@ static bool sdb_recover_undo(state_db_t *sdb) {
     undo_entry_t *entries = NULL;
     uint32_t entry_count = 0;
     uint32_t entry_cap = 0;
-    bool committed = false;
 
     for (;;) {
-        uint8_t op;
-        ssize_t n = read(fd, &op, 1);
+        uint8_t tag;
+        ssize_t n = read(fd, &tag, 1);
         if (n <= 0) break;  // EOF
 
-        // Check if this is a COMMIT marker
-        if (op == 'C') {
-            uint8_t rest[7];
-            if (read(fd, rest, 7) == 7) {
-                uint8_t full[8];
-                full[0] = op;
-                memcpy(full + 1, rest, 7);
-                if (memcmp(full, COMMIT_MAGIC, 8) == 0) {
-                    committed = true;
-                    break;
-                }
-            }
-            break;  // Malformed — treat as uncommitted
+        // Block markers: skip the 4-byte block_seq
+        if (tag == BLOCK_BEGIN_TAG || tag == BLOCK_COMMIT_TAG) {
+            uint32_t seq;
+            if (read(fd, &seq, 4) != 4) break;
+            continue;
         }
 
-        // Parse entry
-        uint8_t klen = key_len_for_op(op);
-        if (klen == 0) break;  // Unknown op
+        // Parse undo entry
+        uint8_t klen = key_len_for_op(tag);
+        if (klen == 0) break;  // Unknown byte — stop parsing
 
-        // Grow array
         if (entry_count >= entry_cap) {
-            uint32_t new_cap = entry_cap == 0 ? 64 : entry_cap * 2;
+            uint32_t new_cap = entry_cap == 0 ? 256 : entry_cap * 2;
             undo_entry_t *new_arr = realloc(entries, new_cap * sizeof(undo_entry_t));
             if (!new_arr) break;
             entries = new_arr;
@@ -200,7 +191,7 @@ static bool sdb_recover_undo(state_db_t *sdb) {
 
         undo_entry_t *e = &entries[entry_count];
         memset(e, 0, sizeof(*e));
-        e->op = op;
+        e->op = tag;
         e->klen = klen;
 
         if (read(fd, e->key, klen) != klen) break;
@@ -221,29 +212,23 @@ static bool sdb_recover_undo(state_db_t *sdb) {
 
     close(fd);
 
-    if (committed) {
-        // Block was committed — undo log is stale, delete it
-        free(entries);
-        unlink(path);
-        return true;
-    }
-
-    // Uncommitted block — replay undo entries in reverse order
+    // Roll back ALL entries in reverse order.
+    // This restores hash_store to the state at the last sdb_checkpoint.
+    // Both committed and uncommitted blocks are rolled back because
+    // without msync, committed data may not be durable on disk.
     for (uint32_t i = entry_count; i > 0; i--) {
         undo_entry_t *e = &entries[i - 1];
         data_layer_t *dl = (e->op == SDB_OP_ACCT_PUT || e->op == SDB_OP_ACCT_DEL)
                            ? sdb->accounts : sdb->storage;
 
         if (e->present) {
-            // Key existed before block — restore old value
             dl_put(dl, e->key, e->old_val, e->old_len);
         } else {
-            // Key did not exist before block — delete it
             dl_delete(dl, e->key);
         }
     }
 
-    // Sync restored state
+    // Sync restored state to disk
     dl_checkpoint(sdb->accounts);
     dl_checkpoint(sdb->storage);
 
@@ -276,6 +261,8 @@ state_db_t *sdb_create(const char *dir) {
         free(sdb);
         return NULL;
     }
+
+    sdb->undo_fd = -1;
 
     sdb->accounts = dl_create(acct_dir, code_path,
                                ACCOUNT_KEY_SIZE, ACCOUNT_SLOT_SIZE,
@@ -311,6 +298,7 @@ state_db_t *sdb_open(const char *dir) {
     if (!sdb) return NULL;
     memset(sdb, 0, sizeof(*sdb));
 
+    sdb->undo_fd = -1;
     sdb->dir = strdup(dir);
     if (!sdb->dir) {
         free(sdb);
@@ -346,6 +334,7 @@ state_db_t *sdb_open(const char *dir) {
 
 void sdb_destroy(state_db_t *sdb) {
     if (!sdb) return;
+    if (sdb->undo_fd >= 0) close(sdb->undo_fd);
     free(sdb->pending);
     dl_destroy(sdb->accounts);
     dl_destroy(sdb->storage);
@@ -450,10 +439,55 @@ uint64_t sdb_merge(state_db_t *sdb) {
     return a + s;
 }
 
+// --- Parallel checkpoint helpers ---
+
+typedef struct {
+    hash_store_t *store;
+} ckpt_hs_arg_t;
+
+typedef struct {
+    code_store_t *code;
+} ckpt_code_arg_t;
+
+static void *ckpt_hash_store_thread(void *arg) {
+    ckpt_hs_arg_t *a = (ckpt_hs_arg_t *)arg;
+    if (a->store) hash_store_sync(a->store);
+    return NULL;
+}
+
+static void *ckpt_code_store_thread(void *arg) {
+    ckpt_code_arg_t *a = (ckpt_code_arg_t *)arg;
+    if (a->code) code_store_sync(a->code);
+    return NULL;
+}
+
 bool sdb_checkpoint(state_db_t *sdb) {
     if (!sdb) return false;
-    if (!dl_checkpoint(sdb->accounts)) return false;
-    if (!dl_checkpoint(sdb->storage)) return false;
+
+    // Parallel flush: accounts hash_store, storage hash_store, code_store
+    ckpt_hs_arg_t   acct_arg = { dl_get_hash_store(sdb->accounts) };
+    ckpt_hs_arg_t   stor_arg = { dl_get_hash_store(sdb->storage) };
+    ckpt_code_arg_t code_arg = { dl_get_code_store(sdb->accounts) };
+
+    pthread_t t_acct, t_stor, t_code;
+    pthread_create(&t_acct, NULL, ckpt_hash_store_thread, &acct_arg);
+    pthread_create(&t_stor, NULL, ckpt_hash_store_thread, &stor_arg);
+    pthread_create(&t_code, NULL, ckpt_code_store_thread, &code_arg);
+
+    pthread_join(t_acct, NULL);
+    pthread_join(t_stor, NULL);
+    pthread_join(t_code, NULL);
+
+    // Clean undo log — all data is now durable
+    if (sdb->undo_fd >= 0) {
+        close(sdb->undo_fd);
+        sdb->undo_fd = -1;
+    }
+    char path[MAX_PATH];
+    undo_log_path(sdb, path, sizeof(path));
+    unlink(path);
+    sdb->undo_block_count = 0;
+
     return true;
 }
 
@@ -490,7 +524,6 @@ bool sdb_commit_block(state_db_t *sdb) {
     for (uint32_t i = sdb->pending_count; i > 0; i--) {
         if (skip[i - 1]) continue;
         uint8_t kl_i = key_len_for_op(sdb->pending[i - 1].op);
-        // Check if same layer (acct vs stor) by comparing key lengths
         for (uint32_t j = 0; j < i - 1; j++) {
             if (skip[j]) continue;
             uint8_t kl_j = key_len_for_op(sdb->pending[j].op);
@@ -501,20 +534,33 @@ bool sdb_commit_block(state_db_t *sdb) {
         }
     }
 
-    // --- Step 1: Open undo log file ---
-    char path[MAX_PATH];
-    undo_log_path(sdb, path, sizeof(path));
+    // --- Step 1: Ensure undo log is open with header ---
+    if (sdb->undo_fd < 0) {
+        char path[MAX_PATH];
+        undo_log_path(sdb, path, sizeof(path));
+        sdb->undo_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (sdb->undo_fd < 0) { free(skip); return false; }
 
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) { free(skip); return false; }
+        // Write file header
+        uint8_t hdr[UNDO_HEADER_SIZE];
+        memset(hdr, 0, UNDO_HEADER_SIZE);
+        memcpy(hdr, UNDO_MAGIC, 8);
+        if (write(sdb->undo_fd, hdr, UNDO_HEADER_SIZE) != UNDO_HEADER_SIZE)
+            goto fail;
+        sdb->undo_block_count = 0;
+    }
 
-    // Write header
-    uint8_t hdr[UNDO_HEADER_SIZE];
-    memset(hdr, 0, UNDO_HEADER_SIZE);
-    memcpy(hdr, UNDO_MAGIC, 8);
-    if (write(fd, hdr, UNDO_HEADER_SIZE) != UNDO_HEADER_SIZE) goto fail;
+    // --- Step 2: Write BLOCK_BEGIN marker ---
+    {
+        uint8_t marker[BLOCK_MARKER_SIZE];
+        marker[0] = BLOCK_BEGIN_TAG;
+        uint32_t seq = sdb->undo_block_count;
+        memcpy(marker + 1, &seq, 4);
+        if (write(sdb->undo_fd, marker, BLOCK_MARKER_SIZE) != BLOCK_MARKER_SIZE)
+            goto fail;
+    }
 
-    // --- Step 2: For each unique pending write, read old value and write undo entry ---
+    // --- Step 3: Write undo entries (old values from hash_store) ---
     for (uint32_t i = 0; i < sdb->pending_count; i++) {
         if (skip[i]) continue;
 
@@ -522,33 +568,29 @@ bool sdb_commit_block(state_db_t *sdb) {
         uint8_t klen = key_len_for_op(pw->op);
         data_layer_t *dl = layer_for_op(sdb, pw->op);
 
-        // Write op
-        if (write(fd, &pw->op, 1) != 1) goto fail;
+        if (write(sdb->undo_fd, &pw->op, 1) != 1) goto fail;
+        if (write(sdb->undo_fd, pw->key, klen) != klen) goto fail;
 
-        // Write key
-        if (write(fd, pw->key, klen) != klen) goto fail;
-
-        // Read old value from hash_store
         uint8_t old_val[MAX_VALUE_SIZE];
         uint16_t old_len = 0;
         bool present = dl_get(dl, pw->key, old_val, &old_len);
 
         uint8_t present_byte = present ? 1 : 0;
-        if (write(fd, &present_byte, 1) != 1) goto fail;
+        if (write(sdb->undo_fd, &present_byte, 1) != 1) goto fail;
 
         if (present) {
             uint8_t len8 = (uint8_t)old_len;
-            if (write(fd, &len8, 1) != 1) goto fail;
+            if (write(sdb->undo_fd, &len8, 1) != 1) goto fail;
             if (old_len > 0) {
-                if (write(fd, old_val, old_len) != (ssize_t)old_len) goto fail;
+                if (write(sdb->undo_fd, old_val, old_len) != (ssize_t)old_len) goto fail;
             }
         }
     }
 
-    // fsync undo log — undo is now durable
-    if (fsync(fd) != 0) goto fail;
+    // --- Step 4: fsync undo log — undo is durable before we touch mmap ---
+    if (fsync(sdb->undo_fd) != 0) goto fail;
 
-    // --- Step 3: Apply all pending writes to hash_store ---
+    // --- Step 5: Apply all pending writes to hash_store mmap (NO msync) ---
     for (uint32_t i = 0; i < sdb->pending_count; i++) {
         sdb_pending_write_t *pw = &sdb->pending[i];
         data_layer_t *dl = layer_for_op(sdb, pw->op);
@@ -565,38 +607,39 @@ bool sdb_commit_block(state_db_t *sdb) {
         }
     }
 
-    // --- Step 4: msync hash_stores (make writes durable) ---
-    dl_checkpoint(sdb->accounts);
-    dl_checkpoint(sdb->storage);
-
-    // --- Step 5: Write COMMIT marker + fsync ---
+    // --- Step 6: Write BLOCK_COMMIT marker + fsync ---
     {
-        uint8_t commit[COMMIT_MARKER_SIZE];
-        memcpy(commit, COMMIT_MAGIC, COMMIT_MARKER_SIZE);
-        if (write(fd, commit, COMMIT_MARKER_SIZE) != COMMIT_MARKER_SIZE) goto fail_applied;
-        if (fsync(fd) != 0) goto fail_applied;
+        uint8_t marker[BLOCK_MARKER_SIZE];
+        marker[0] = BLOCK_COMMIT_TAG;
+        uint32_t seq = sdb->undo_block_count;
+        memcpy(marker + 1, &seq, 4);
+        if (write(sdb->undo_fd, marker, BLOCK_MARKER_SIZE) != BLOCK_MARKER_SIZE)
+            goto fail_applied;
+        if (fsync(sdb->undo_fd) != 0) goto fail_applied;
     }
-    close(fd);
 
-    // --- Step 6: Delete undo log ---
-    unlink(path);
-
-    // Clean up
+    // NO dl_checkpoint, NO close, NO unlink — deferred to sdb_checkpoint
     free(skip);
     sdb->pending_count = 0;
+    sdb->undo_block_count++;
     sdb->block_active = false;
     return true;
 
 fail:
-    close(fd);
-    unlink(path);
+    // Nothing applied to hash_store yet — close and remove undo log
+    close(sdb->undo_fd);
+    sdb->undo_fd = -1;
+    {
+        char path[MAX_PATH];
+        undo_log_path(sdb, path, sizeof(path));
+        unlink(path);
+    }
     free(skip);
     return false;
 
 fail_applied:
     // Writes partially applied. Undo log is durable.
-    // On next sdb_open, recovery will replay undo.
-    close(fd);
+    // On next sdb_open, recovery will roll back all blocks.
     free(skip);
     sdb->pending_count = 0;
     sdb->block_active = false;

@@ -52,7 +52,7 @@ target_link_libraries(data_layer hash_store)
 add_library(state_db STATIC
     database/src/state_db.c
 )
-target_link_libraries(state_db data_layer)
+target_link_libraries(state_db data_layer pthread)
 
 # Account Encoding (shared module — compact variable-length account serialization)
 add_library(account STATIC

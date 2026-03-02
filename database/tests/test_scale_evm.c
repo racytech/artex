@@ -29,6 +29,7 @@
 
 #include "evm_state.h"
 #include "state_db.h"
+#include "mpt.h"
 #include "../../common/include/uint256.h"
 #include "../../common/include/hash.h"
 #include "../../common/include/address.h"
@@ -186,6 +187,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Open MPTs externally — kept open across blocks for deferred checkpoint
+    mpt_t *state_mpt = mpt_create(STATE_MPT_PATH);
+    if (!state_mpt) {
+        fprintf(stderr, "FAIL: mpt_create state\n");
+        return 1;
+    }
+    mpt_t *storage_mpt = mpt_create_ex(STORAGE_MPT_PATH, 64, 33);
+    if (!storage_mpt) {
+        fprintf(stderr, "FAIL: mpt_create storage\n");
+        return 1;
+    }
+
     // Latency arrays
     double *exec_ms   = malloc(total_blocks * sizeof(double));
     double *root_ms   = malloc(total_blocks * sizeof(double));
@@ -240,10 +253,10 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        // 2. Create evm_state for this block (persistent MPT for incremental roots)
-        evm_state_t *es = evm_state_create(sdb, STATE_MPT_PATH, STORAGE_MPT_PATH);
+        // 2. Create evm_state with external MPTs (deferred checkpoint — no mpt_commit per block)
+        evm_state_t *es = evm_state_create_ex(sdb, state_mpt, storage_mpt);
         if (!es) {
-            fprintf(stderr, "FAIL: evm_state_create at block %u\n", block);
+            fprintf(stderr, "FAIL: evm_state_create_ex at block %u\n", block);
             return 1;
         }
 
@@ -418,7 +431,7 @@ int main(int argc, char *argv[]) {
         // 6. Destroy evm_state
         evm_state_destroy(es);
 
-        // 7. Commit block (undo log → apply → msync → commit)
+        // 7. Commit block (undo log → apply to mmap, no msync — deferred to checkpoint)
         if (!sdb_commit_block(sdb)) {
             fprintf(stderr, "FAIL: sdb_commit_block at block %u\n", block);
             return 1;
@@ -459,9 +472,11 @@ int main(int argc, char *argv[]) {
             fflush(stdout);
         }
 
-        // Checkpoint
+        // Checkpoint: commit MPTs + parallel flush hash_stores + clean undo log
         if ((block + 1) % commit_interval == 0) {
             double t0 = now_sec();
+            mpt_commit(state_mpt);
+            mpt_commit(storage_mpt);
             sdb_checkpoint(sdb);
             double t1 = now_sec();
             printf("  CHECKPOINT at block %u: %.1fms\n", block + 1, (t1 - t0) * 1000.0);
@@ -518,7 +533,7 @@ int main(int argc, char *argv[]) {
     printf("    p95:  %6.2f\n", root_ms[(uint64_t)total_blocks * 95 / 100]);
     printf("    p99:  %6.2f\n", root_ms[(uint64_t)total_blocks * 99 / 100]);
     printf("    max:  %6.2f\n", root_ms[total_blocks - 1]);
-    printf("  commit latency (ms): [finalize + undo log + hash_store + msync]\n");
+    printf("  commit latency (ms): [finalize + undo log + apply (no msync)]\n");
     printf("    min:  %6.2f\n", commit_ms[0]);
     printf("    p50:  %6.2f\n", commit_ms[total_blocks / 2]);
     printf("    p95:  %6.2f\n", commit_ms[(uint64_t)total_blocks * 95 / 100]);
@@ -530,6 +545,13 @@ int main(int argc, char *argv[]) {
     printf("  code entries:     %u\n", final_stats.code_count);
     printf("  RSS:              %zu MB\n", get_rss_mb());
     printf("============================================================\n");
+
+    // Final checkpoint: commit MPTs and flush all data
+    mpt_commit(state_mpt);
+    mpt_commit(storage_mpt);
+    sdb_checkpoint(sdb);
+    mpt_close(state_mpt);
+    mpt_close(storage_mpt);
 
     free(exec_ms);
     free(root_ms);

@@ -629,7 +629,10 @@ static void test_commit_block(void) {
         ASSERT(len == 32);
     }
 
-    // Verify undo.log was deleted
+    // Undo log persists until checkpoint (deferred commit)
+    ASSERT(sdb_checkpoint(sdb));
+
+    // Verify undo.log was deleted after checkpoint
     {
         char path[512];
         snprintf(path, sizeof(path), "%s/undo.log", TEST_DIR);
@@ -699,21 +702,35 @@ static void test_crash_recovery_uncommitted(void) {
     ASSERT(sdb_checkpoint(sdb));
     sdb_destroy(sdb);
 
-    // Reopen, simulate crash: create undo log without COMMIT, corrupt hash_store
+    // Reopen, corrupt hash_store, flush, then plant undo.log
     sdb = sdb_open(TEST_DIR);
     ASSERT(sdb != NULL);
 
-    // Manually create an undo log that records the old state for account 0
+    // Corrupt hash_store: overwrite account 0 with value 999, then flush
+    {
+        uint8_t key[32], val[4];
+        make_account_key(key, 0);
+        make_value(val, 999);
+        sdb_put(sdb, key, val, 4);  // direct write (no block mode)
+        sdb_checkpoint(sdb);         // flush corruption to disk
+    }
+
+    // Now plant a v2 undo log (uncommitted block: BLOCK_BEGIN, no BLOCK_COMMIT)
+    // Simulates crash: undo was being written, corruption in mmap, no commit marker
     {
         char path[512];
         snprintf(path, sizeof(path), "%s/undo.log", TEST_DIR);
         int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         ASSERT(fd >= 0);
 
-        // Header
+        // Header (v2)
         uint8_t hdr[16] = {0};
-        memcpy(hdr, "UNDOLOG\0", 8);
+        memcpy(hdr, "UNDOLOG2", 8);
         ASSERT(write(fd, hdr, 16) == 16);
+
+        // BLOCK_BEGIN marker: tag(0xBB) + seq(0)
+        uint8_t bb[5] = {0xBB, 0, 0, 0, 0};
+        ASSERT(write(fd, bb, 5) == 5);
 
         // Undo entry: account key 0, was present, old_val = encode(0)
         uint8_t op = SDB_OP_ACCT_PUT;
@@ -729,18 +746,9 @@ static void test_crash_recovery_uncommitted(void) {
         ASSERT(write(fd, &old_len, 1) == 1);
         ASSERT(write(fd, old_val, 4) == 4);
 
-        // NO COMMIT marker
+        // NO BLOCK_COMMIT marker — simulates crash mid-block
         fsync(fd);
         close(fd);
-    }
-
-    // Corrupt hash_store: overwrite account 0 with value 999
-    {
-        uint8_t key[32], val[4];
-        make_account_key(key, 0);
-        make_value(val, 999);
-        sdb_put(sdb, key, val, 4);  // direct write (no block mode)
-        sdb_checkpoint(sdb);
     }
 
     sdb_destroy(sdb);
@@ -782,13 +790,13 @@ static void test_crash_recovery_uncommitted(void) {
 
 static void test_crash_recovery_committed(void) {
     int start = assertions;
-    printf("Phase 5d: Crash recovery (committed block — undo log is stale)\n");
+    printf("Phase 5d: Crash recovery (committed block — rolled back to checkpoint)\n");
 
     cleanup();
     state_db_t *sdb = sdb_create(TEST_DIR);
     ASSERT(sdb != NULL);
 
-    // Baseline
+    // Baseline: 10 accounts with values 0..9
     for (uint32_t i = 0; i < 10; i++) {
         uint8_t key[32], val[4];
         make_account_key(key, i);
@@ -796,7 +804,7 @@ static void test_crash_recovery_committed(void) {
         ASSERT(sdb_put(sdb, key, val, 4));
     }
 
-    // Commit a block normally
+    // Commit a block normally (account 0 → 100)
     ASSERT(sdb_begin_block(sdb));
     {
         uint8_t key[32], val[4];
@@ -807,20 +815,26 @@ static void test_crash_recovery_committed(void) {
     ASSERT(sdb_commit_block(sdb));
     ASSERT(sdb_checkpoint(sdb));
 
-    // Manually leave behind a stale undo.log WITH commit marker
-    // (simulating crash after commit but before unlink)
+    // Manually leave behind a v2 undo.log WITH BLOCK_COMMIT marker.
+    // This simulates: checkpoint happened, then another block was committed
+    // (writing to mmap without msync), then crash before next checkpoint.
+    // Recovery must roll back ALL entries to restore checkpoint state.
     {
         char path[512];
         snprintf(path, sizeof(path), "%s/undo.log", TEST_DIR);
         int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         ASSERT(fd >= 0);
 
-        // Header
+        // Header (v2)
         uint8_t hdr[16] = {0};
-        memcpy(hdr, "UNDOLOG\0", 8);
+        memcpy(hdr, "UNDOLOG2", 8);
         ASSERT(write(fd, hdr, 16) == 16);
 
-        // One dummy undo entry (old value was 0 for account 0)
+        // BLOCK_BEGIN marker: tag(0xBB) + seq(0)
+        uint8_t bb[5] = {0xBB, 0, 0, 0, 0};
+        ASSERT(write(fd, bb, 5) == 5);
+
+        // Undo entry: account 0, old value was 100 (checkpoint state)
         uint8_t op = SDB_OP_ACCT_PUT;
         ASSERT(write(fd, &op, 1) == 1);
         uint8_t key[32];
@@ -829,24 +843,36 @@ static void test_crash_recovery_committed(void) {
         uint8_t present = 1;
         ASSERT(write(fd, &present, 1) == 1);
         uint8_t old_val[4];
-        make_value(old_val, 0);
+        make_value(old_val, 100);  // checkpoint value
         uint8_t old_len = 4;
         ASSERT(write(fd, &old_len, 1) == 1);
         ASSERT(write(fd, old_val, 4) == 4);
 
-        // COMMIT marker present
-        ASSERT(write(fd, "COMMIT\0\0", 8) == 8);
+        // BLOCK_COMMIT marker: tag(0xBC) + seq(0)
+        uint8_t bc[5] = {0xBC, 0, 0, 0, 0};
+        ASSERT(write(fd, bc, 5) == 5);
+
         fsync(fd);
         close(fd);
     }
 
+    // Simulate the committed-but-not-checkpointed write to hash_store
+    // (in real crash, mmap pages may or may not have been flushed)
+    {
+        uint8_t key[32], val[4];
+        make_account_key(key, 0);
+        make_value(val, 200);  // post-block value in mmap
+        sdb_put(sdb, key, val, 4);
+    }
+
     sdb_destroy(sdb);
 
-    // Reopen — should detect committed undo log and just delete it
+    // Reopen — recovery rolls back ALL entries (committed or not)
+    // This restores hash_store to last checkpoint state
     sdb = sdb_open(TEST_DIR);
     ASSERT(sdb != NULL);
 
-    // Account 0 should have committed value (100), NOT reverted to 0
+    // Account 0 should be rolled back to checkpoint value (100)
     {
         uint8_t key[32], buf[4];
         uint16_t len = 0;
@@ -854,6 +880,16 @@ static void test_crash_recovery_committed(void) {
         ASSERT(sdb_get(sdb, key, buf, &len));
         ASSERT(len == 4);
         ASSERT(read_value(buf) == 100);
+    }
+
+    // Other accounts untouched
+    for (uint32_t i = 1; i < 10; i++) {
+        uint8_t key[32], buf[4];
+        uint16_t len = 0;
+        make_account_key(key, i);
+        ASSERT(sdb_get(sdb, key, buf, &len));
+        ASSERT(len == 4);
+        ASSERT(read_value(buf) == i);
     }
 
     // Undo log cleaned up

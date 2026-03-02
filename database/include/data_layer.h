@@ -130,6 +130,19 @@ uint64_t dl_merge(data_layer_t *dl);
 bool dl_checkpoint(data_layer_t *dl);
 
 // ============================================================================
+// Internal Handle Access (for parallel checkpoint)
+// ============================================================================
+
+#include "hash_store.h"
+#include "code_store.h"
+
+/** Get hash_store handle (for parallel sync). */
+hash_store_t *dl_get_hash_store(data_layer_t *dl);
+
+/** Get code_store handle (may return NULL). */
+code_store_t *dl_get_code_store(data_layer_t *dl);
+
+// ============================================================================
 // Diagnostics
 // ============================================================================
 

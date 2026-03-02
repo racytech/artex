@@ -206,6 +206,18 @@ uint32_t dl_code_length(data_layer_t *dl, const uint8_t *key) {
 }
 
 // ============================================================================
+// Internal Handle Access
+// ============================================================================
+
+hash_store_t *dl_get_hash_store(data_layer_t *dl) {
+    return dl ? dl->store : NULL;
+}
+
+code_store_t *dl_get_code_store(data_layer_t *dl) {
+    return dl ? dl->code : NULL;
+}
+
+// ============================================================================
 // Checkpoint / Recovery
 // ============================================================================
 

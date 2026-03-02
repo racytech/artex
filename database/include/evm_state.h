@@ -7,6 +7,7 @@
 #include "../../common/include/address.h"
 #include "../../common/include/hash.h"
 #include "state_db.h"
+#include "mpt.h"
 
 /**
  * EVM State — Typed, in-memory state interface above state_db.
@@ -47,6 +48,16 @@ typedef struct evm_state evm_state_t;
  */
 evm_state_t *evm_state_create(state_db_t *sdb, const char *state_mpt_path,
                                const char *storage_mpt_path);
+
+/**
+ * Create EVM state with externally-owned MPT handles.
+ * The caller is responsible for mpt_commit() and mpt_close().
+ * evm_state_destroy() will NOT close these MPTs.
+ * evm_state_finalize() will NOT call mpt_commit() on them.
+ */
+evm_state_t *evm_state_create_ex(state_db_t *sdb,
+                                  mpt_t *state_mpt,
+                                  mpt_t *storage_mpt);
 
 /** Destroy EVM state and free all in-memory caches. */
 void evm_state_destroy(evm_state_t *es);

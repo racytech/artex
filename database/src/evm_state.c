@@ -85,6 +85,8 @@ struct evm_state {
     char             *state_mpt_path;
     mpt_t            *storage_mpt;  // persistent shared storage trie, 64-byte keys (NULL = ephemeral)
     char             *storage_mpt_path;
+    bool              owns_state_mpt;   // true = opened internally, close on destroy
+    bool              owns_storage_mpt; // false = externally owned, caller manages
 };
 
 // ============================================================================
@@ -195,8 +197,9 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
 // Lifecycle
 // ============================================================================
 
-evm_state_t *evm_state_create(state_db_t *sdb, const char *state_mpt_path,
-                               const char *storage_mpt_path) {
+evm_state_t *evm_state_create_ex(state_db_t *sdb,
+                                  mpt_t *state_mpt,
+                                  mpt_t *storage_mpt) {
     if (!sdb) return NULL;
 
     evm_state_t *es = calloc(1, sizeof(evm_state_t));
@@ -223,37 +226,48 @@ evm_state_t *evm_state_create(state_db_t *sdb, const char *state_mpt_path,
         return NULL;
     }
 
-    // Open or create persistent state MPT if path given
+    // Externally-owned MPT handles (caller manages commit/close)
+    es->state_mpt = state_mpt;
+    es->storage_mpt = storage_mpt;
+    es->owns_state_mpt = false;
+    es->owns_storage_mpt = false;
+
+    return es;
+}
+
+evm_state_t *evm_state_create(state_db_t *sdb, const char *state_mpt_path,
+                               const char *storage_mpt_path) {
+    // Open or create persistent MPTs
+    mpt_t *state_mpt = NULL;
+    mpt_t *storage_mpt = NULL;
+
     if (state_mpt_path) {
-        es->state_mpt_path = strdup(state_mpt_path);
-        if (!es->state_mpt_path) {
-            evm_state_destroy(es);
-            return NULL;
-        }
-        es->state_mpt = mpt_open(state_mpt_path);
-        if (!es->state_mpt)
-            es->state_mpt = mpt_create(state_mpt_path);
-        if (!es->state_mpt) {
-            evm_state_destroy(es);
+        state_mpt = mpt_open(state_mpt_path);
+        if (!state_mpt) state_mpt = mpt_create(state_mpt_path);
+        if (!state_mpt) return NULL;
+    }
+
+    if (storage_mpt_path) {
+        storage_mpt = mpt_open(storage_mpt_path);
+        if (!storage_mpt) storage_mpt = mpt_create_ex(storage_mpt_path, 64, 33);
+        if (!storage_mpt) {
+            if (state_mpt) mpt_close(state_mpt);
             return NULL;
         }
     }
 
-    // Open or create persistent storage MPT (64-byte keys, max_value=33)
-    if (storage_mpt_path) {
-        es->storage_mpt_path = strdup(storage_mpt_path);
-        if (!es->storage_mpt_path) {
-            evm_state_destroy(es);
-            return NULL;
-        }
-        es->storage_mpt = mpt_open(storage_mpt_path);
-        if (!es->storage_mpt)
-            es->storage_mpt = mpt_create_ex(storage_mpt_path, 64, 33);
-        if (!es->storage_mpt) {
-            evm_state_destroy(es);
-            return NULL;
-        }
+    evm_state_t *es = evm_state_create_ex(sdb, state_mpt, storage_mpt);
+    if (!es) {
+        if (state_mpt) mpt_close(state_mpt);
+        if (storage_mpt) mpt_close(storage_mpt);
+        return NULL;
     }
+
+    // Path-based creation owns the handles
+    es->owns_state_mpt = (state_mpt != NULL);
+    es->owns_storage_mpt = (storage_mpt != NULL);
+    if (state_mpt_path) es->state_mpt_path = strdup(state_mpt_path);
+    if (storage_mpt_path) es->storage_mpt_path = strdup(storage_mpt_path);
 
     return es;
 }
@@ -287,10 +301,10 @@ void evm_state_destroy(evm_state_t *es) {
         }
     }
 
-    // Close persistent MPTs (files survive for next block)
-    if (es->state_mpt) mpt_close(es->state_mpt);
+    // Close persistent MPTs only if we own them (path-based creation)
+    if (es->owns_state_mpt && es->state_mpt) mpt_close(es->state_mpt);
     free(es->state_mpt_path);
-    if (es->storage_mpt) mpt_close(es->storage_mpt);
+    if (es->owns_storage_mpt && es->storage_mpt) mpt_close(es->storage_mpt);
     free(es->storage_mpt_path);
 
     free(es->journal);
@@ -849,10 +863,11 @@ bool evm_state_finalize(evm_state_t *es) {
     mem_art_foreach(&es->storage, finalize_storage_cb, &ctx);
     if (!ctx.ok) return false;
 
-    // Commit persistent MPT meta pages
-    if (es->state_mpt)
+    // Commit persistent MPT meta pages (only if we own them;
+    // externally-owned MPTs are committed by the caller at checkpoint)
+    if (es->owns_state_mpt && es->state_mpt)
         mpt_commit(es->state_mpt);
-    if (es->storage_mpt)
+    if (es->owns_storage_mpt && es->storage_mpt)
         mpt_commit(es->storage_mpt);
 
     return true;
