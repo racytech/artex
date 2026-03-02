@@ -527,6 +527,256 @@ static void test_dirty_flag_stress(int num_rounds) {
 }
 
 /* ========================================================================
+ * Phase 7: Shared Storage MPT (64-byte keys + subtree roots)
+ *
+ * Simulates realistic Ethereum storage at mainnet scale:
+ *   - Single 64-byte key mpt: keccak(addr)[32] || keccak(slot)[32]
+ *   - Per block: new accounts, SSTORE ops, slot deletions
+ *   - Per-account storage roots via mpt_subtree_root
+ *   - Persistence across commits/reopens
+ *
+ * Realistic proportions (mainnet-inspired):
+ *   - 20 new accounts/block × 10 initial slots each
+ *   - 2000 dirty slots/block across ~100 existing accounts
+ *   - 100 slot deletions/block
+ * ======================================================================== */
+
+#define STORAGE_MPT_PATH       "/tmp/test_scale_storage_mpt.dat"
+
+/* Per-block workload */
+#define NEW_ACCOUNTS_PER_BLOCK  20
+#define INITIAL_SLOTS           10
+#define DIRTY_SLOTS_PER_BLOCK   2000
+#define DELETE_SLOTS_PER_BLOCK  100
+
+/* Account tracking (addr_hash = first 32 bytes of 64-byte key) */
+typedef struct {
+    uint8_t addr_hash[32];
+    uint32_t slot_count;       /* total non-zero slots for this account */
+    hash_t   last_root;        /* last computed subtree root */
+    bool     dirty_this_block;
+} tracked_account_t;
+
+static void gen_addr_hash(uint8_t out[32], uint64_t account_id) {
+    rng_t rng = rng_create(MASTER_SEED ^ (account_id * 0xACC0017FULL));
+    for (int i = 0; i < 32; i += 8) {
+        uint64_t r = rng_next(&rng);
+        memcpy(out + i, &r, 8);
+    }
+}
+
+static void gen_slot_hash(uint8_t out[32], uint64_t slot_id) {
+    rng_t rng = rng_create(MASTER_SEED ^ (slot_id * 0x570BA6E00ULL));
+    for (int i = 0; i < 32; i += 8) {
+        uint64_t r = rng_next(&rng);
+        memcpy(out + i, &r, 8);
+    }
+}
+
+/* RLP-encode a small integer as storage value */
+static uint8_t rlp_storage_value(uint64_t val, uint8_t out[33]) {
+    if (val < 0x80) {
+        out[0] = (uint8_t)val;
+        return (val == 0) ? 0 : 1;  /* 0 means "delete" in our protocol */
+    }
+    uint8_t be[8];
+    int len = 0;
+    for (int i = 7; i >= 0; i--) {
+        be[i] = (uint8_t)(val & 0xFF);
+        val >>= 8;
+    }
+    int start = 0;
+    while (start < 7 && be[start] == 0) start++;
+    len = 8 - start;
+    out[0] = (uint8_t)(0x80 + len);
+    memcpy(out + 1, be + start, len);
+    return (uint8_t)(1 + len);
+}
+
+static void test_storage_mpt_at_scale(int num_blocks) {
+    printf("\n=== Phase 7: Shared Storage MPT (%d blocks) ===\n", num_blocks);
+    printf("  per block: +%d accounts × %d slots, %d dirty, %d deletes\n",
+           NEW_ACCOUNTS_PER_BLOCK, INITIAL_SLOTS,
+           DIRTY_SLOTS_PER_BLOCK, DELETE_SLOTS_PER_BLOCK);
+    unlink(STORAGE_MPT_PATH);
+
+    mpt_t *m = mpt_create_ex(STORAGE_MPT_PATH, 64, 33);
+    ASSERT(m != NULL, "mpt_create_ex failed");
+
+    /* Dynamic account list */
+    uint32_t acct_cap = 2048;
+    uint32_t acct_count = 0;
+    tracked_account_t *accounts = calloc(acct_cap, sizeof(tracked_account_t));
+    ASSERT(accounts != NULL, "alloc failed");
+
+    /* Global slot ID counter (unique across all accounts) */
+    uint64_t next_slot_id = 0;
+    uint64_t next_account_id = 0;
+
+    rng_t block_rng = rng_create(MASTER_SEED ^ 0x5707A6E5CA1EULL);
+
+    printf("  %-7s | %-9s | %-8s | %-9s | %-9s | %-9s | %s\n",
+           "block", "accounts", "slots", "put(ms)", "roots(ms)", "total(ms)", "RSS");
+    printf("  --------+-----------+----------+-----------+-----------+-----------+-----\n");
+
+    for (int blk = 0; blk < num_blocks; blk++) {
+        double t_block_start = now_sec();
+
+        /* Clear dirty flags */
+        for (uint32_t i = 0; i < acct_count; i++)
+            accounts[i].dirty_this_block = false;
+
+        /* --- Create new accounts with initial storage --- */
+        for (int a = 0; a < NEW_ACCOUNTS_PER_BLOCK; a++) {
+            if (acct_count >= acct_cap) {
+                acct_cap *= 2;
+                accounts = realloc(accounts, acct_cap * sizeof(tracked_account_t));
+                ASSERT(accounts != NULL, "realloc failed");
+            }
+
+            tracked_account_t *acct = &accounts[acct_count];
+            memset(acct, 0, sizeof(*acct));
+            gen_addr_hash(acct->addr_hash, next_account_id++);
+            acct->dirty_this_block = true;
+
+            for (int s = 0; s < INITIAL_SLOTS; s++) {
+                uint8_t key64[64];
+                memcpy(key64, acct->addr_hash, 32);
+                gen_slot_hash(key64 + 32, next_slot_id++);
+
+                uint8_t rlp_val[33];
+                uint64_t val = 1000 + next_slot_id;
+                uint8_t rlp_len = rlp_storage_value(val, rlp_val);
+                mpt_put(m, key64, rlp_val, rlp_len);
+                acct->slot_count++;
+            }
+
+            acct_count++;
+        }
+
+        /* --- Update existing storage slots (SSTORE) --- */
+        int dirty_ops = DIRTY_SLOTS_PER_BLOCK;
+        if ((int)acct_count < dirty_ops) dirty_ops = (int)acct_count;
+
+        for (int i = 0; i < dirty_ops; i++) {
+            /* Pick a random existing account */
+            uint32_t idx = (uint32_t)(rng_next(&block_rng) % acct_count);
+            tracked_account_t *acct = &accounts[idx];
+            acct->dirty_this_block = true;
+
+            /* New slot or update existing (mostly updates) */
+            uint8_t key64[64];
+            memcpy(key64, acct->addr_hash, 32);
+
+            if (rng_next(&block_rng) % 4 == 0) {
+                /* 25%: new slot */
+                gen_slot_hash(key64 + 32, next_slot_id++);
+                acct->slot_count++;
+            } else {
+                /* 75%: update existing slot (deterministic from acct + random) */
+                uint64_t slot_seed = (uint64_t)idx * 1000 + (rng_next(&block_rng) % 50);
+                gen_slot_hash(key64 + 32, slot_seed);
+            }
+
+            uint8_t rlp_val[33];
+            uint64_t val = (uint64_t)(blk + 1) * 10000 + i;
+            uint8_t rlp_len = rlp_storage_value(val, rlp_val);
+            mpt_put(m, key64, rlp_val, rlp_len);
+        }
+
+        /* --- Delete some storage slots (SSTORE zero) --- */
+        int deletes = DELETE_SLOTS_PER_BLOCK;
+        if ((int)acct_count < deletes) deletes = (int)acct_count / 2;
+
+        for (int i = 0; i < deletes; i++) {
+            uint32_t idx = (uint32_t)(rng_next(&block_rng) % acct_count);
+            tracked_account_t *acct = &accounts[idx];
+            acct->dirty_this_block = true;
+
+            /* Pick an existing slot to delete */
+            uint8_t key64[64];
+            memcpy(key64, acct->addr_hash, 32);
+            uint64_t slot_seed = (uint64_t)idx * 1000 + (rng_next(&block_rng) % 30);
+            gen_slot_hash(key64 + 32, slot_seed);
+            mpt_delete(m, key64);
+        }
+
+        double t_put_done = now_sec();
+
+        /* --- Compute subtree roots for dirty accounts --- */
+        int roots_computed = 0;
+        for (uint32_t i = 0; i < acct_count; i++) {
+            if (!accounts[i].dirty_this_block) continue;
+
+            hash_t root = mpt_subtree_root(m, accounts[i].addr_hash, 64);
+
+            /* If account was dirty, root should differ from last (most of the time) */
+            /* Note: not always true — a delete-then-reinsert could produce same root */
+
+            accounts[i].last_root = root;
+            roots_computed++;
+        }
+
+        double t_roots_done = now_sec();
+
+        /* --- Verify clean accounts unchanged --- */
+        /* Spot-check a few clean accounts */
+        int clean_checks = 0;
+        for (uint32_t i = 0; i < acct_count && clean_checks < 20; i++) {
+            if (accounts[i].dirty_this_block) continue;
+            if (hash_is_zero(&accounts[i].last_root)) continue;
+
+            hash_t root = mpt_subtree_root(m, accounts[i].addr_hash, 64);
+            CHECK(hash_equal(&root, &accounts[i].last_root),
+                  "clean account %u root changed at block %d", i, blk);
+            clean_checks++;
+        }
+
+        double t_end = now_sec();
+
+        if (blk < 3 || (blk + 1) % 10 == 0 || blk == num_blocks - 1) {
+            printf("  %5d   | %7u   | %6" PRIu64 "   | %7.2f   | %7.2f   | %7.2f   | %zuMB\n",
+                   blk + 1,
+                   acct_count,
+                   mpt_size(m),
+                   (t_put_done - t_block_start) * 1000.0,
+                   (t_roots_done - t_put_done) * 1000.0,
+                   (t_end - t_block_start) * 1000.0,
+                   get_rss_mb());
+        }
+    }
+
+    /* --- Persistence: commit, reopen, verify subtree roots --- */
+    printf("  committing...\n");
+    CHECK(mpt_commit(m), "commit failed");
+    uint64_t final_size = mpt_size(m);
+    mpt_close(m);
+
+    m = mpt_open(STORAGE_MPT_PATH);
+    CHECK(m != NULL, "reopen failed");
+    CHECK(mpt_size(m) == final_size,
+          "size after reopen: %" PRIu64 " vs %" PRIu64, mpt_size(m), final_size);
+
+    /* Spot-check 50 random account subtree roots survive reopen */
+    int verify_count = (acct_count < 50) ? (int)acct_count : 50;
+    rng_t verify_rng = rng_create(MASTER_SEED ^ 0xBEEFCAFEULL);
+    for (int i = 0; i < verify_count; i++) {
+        uint32_t idx = (uint32_t)(rng_next(&verify_rng) % acct_count);
+        if (hash_is_zero(&accounts[idx].last_root)) continue;
+
+        hash_t root = mpt_subtree_root(m, accounts[idx].addr_hash, 64);
+        CHECK(hash_equal(&root, &accounts[idx].last_root),
+              "account %u subtree root changed after reopen", idx);
+    }
+    printf("  %d subtree roots survived reopen OK\n", verify_count);
+
+    mpt_close(m);
+    unlink(STORAGE_MPT_PATH);
+    free(accounts);
+    printf("  PASS\n");
+}
+
+/* ========================================================================
  * Main
  * ======================================================================== */
 
@@ -540,7 +790,7 @@ int main(int argc, char *argv[]) {
     printf("============================================\n");
     printf("  MPT Trie Scale Test\n");
     printf("============================================\n");
-    printf("  blocks: %d (~%dK keys)\n", num_blocks,
+    printf("  blocks: %d (~%dK state keys)\n", num_blocks,
            num_blocks * KEYS_PER_BLOCK / 1000);
 
     double t0 = now_sec();
@@ -551,6 +801,7 @@ int main(int argc, char *argv[]) {
     test_delete_cycle(10000);
     test_order_independence(10000);
     test_dirty_flag_stress(200);
+    test_storage_mpt_at_scale(num_blocks);
 
     double elapsed = now_sec() - t0;
 

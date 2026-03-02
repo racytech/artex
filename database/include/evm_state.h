@@ -36,12 +36,17 @@ typedef struct evm_state evm_state_t;
 
 /**
  * Create EVM state over an existing state_db. sdb is NOT owned.
- * @param state_mpt_path  Path for persistent state MPT file, or NULL for
- *                        ephemeral mode (rebuilds trie from scratch each call).
- *                        When set, the MPT survives between blocks — only dirty
- *                        accounts are re-inserted per compute_state_root call.
+ * @param state_mpt_path    Path for persistent state MPT file, or NULL for
+ *                          ephemeral mode (rebuilds trie from scratch each call).
+ *                          When set, the MPT survives between blocks — only dirty
+ *                          accounts are re-inserted per compute_state_root call.
+ * @param storage_mpt_path  Path for persistent shared storage MPT (64-byte keys:
+ *                          keccak(addr)[32] || keccak(slot)[32]), or NULL for
+ *                          ephemeral mode. When set, only dirty slots are updated
+ *                          per block; per-account storage roots use mpt_subtree_root.
  */
-evm_state_t *evm_state_create(state_db_t *sdb, const char *state_mpt_path);
+evm_state_t *evm_state_create(state_db_t *sdb, const char *state_mpt_path,
+                               const char *storage_mpt_path);
 
 /** Destroy EVM state and free all in-memory caches. */
 void evm_state_destroy(evm_state_t *es);

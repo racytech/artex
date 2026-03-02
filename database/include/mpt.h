@@ -24,8 +24,8 @@
  *   [8KB, 32GB+8KB)    Node pool (128B slots, branches + extensions)
  *   [32GB+8KB, ...)    Leaf pool (192B slots)
  *
- * Keys are fixed 32 bytes (keccak256 hashes = 64 nibbles).
- * Values are variable up to MPT_MAX_VALUE bytes (stored in leaf for rehashing).
+ * Default keys are 32 bytes (64 nibbles). Use mpt_create_ex for other sizes.
+ * Values are variable up to max_value bytes (stored in leaf for rehashing).
  */
 
 #define MPT_KEY_SIZE     32
@@ -36,6 +36,7 @@ typedef struct mpt mpt_t;
 
 /* Lifecycle */
 mpt_t   *mpt_create(const char *path);
+mpt_t   *mpt_create_ex(const char *path, uint32_t key_size, uint32_t max_value);
 mpt_t   *mpt_open(const char *path);
 void     mpt_close(mpt_t *m);
 
@@ -43,12 +44,20 @@ void     mpt_close(mpt_t *m);
 void     mpt_clear(mpt_t *m);
 
 /* Mutations (mark path dirty) */
-bool     mpt_put(mpt_t *m, const uint8_t key[MPT_KEY_SIZE],
+bool     mpt_put(mpt_t *m, const uint8_t *key,
                  const uint8_t *value, uint8_t vlen);
-bool     mpt_delete(mpt_t *m, const uint8_t key[MPT_KEY_SIZE]);
+bool     mpt_delete(mpt_t *m, const uint8_t *key);
+
+/* Lookup */
+bool     mpt_get(mpt_t *m, const uint8_t *key,
+                 uint8_t *value_out, uint8_t *vlen_out);
 
 /* Root hash (walks dirty nodes bottom-up, caches result) */
 hash_t   mpt_root(mpt_t *m);
+
+/* Subtree root hash — navigate trie by prefix nibbles, compute hash */
+hash_t   mpt_subtree_root(mpt_t *m, const uint8_t *prefix_key,
+                          uint32_t prefix_nibbles);
 
 /* Persistence (fdatasync + dual meta page) */
 bool     mpt_commit(mpt_t *m);

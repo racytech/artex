@@ -15,10 +15,12 @@
  *
  * Two pools in a single sparse file:
  *   Node pool: 128B slots (branches + extensions)
- *   Leaf pool: 160B slots (key + hash + value)
+ *   Leaf pool: 192B slots (key + hash + value)
  *
  * Each node caches its keccak256 hash. Dirty flags propagate from
  * modified leaves to root. mpt_root() walks only dirty nodes.
+ *
+ * Leaf dimensions are runtime-configurable (key_size, max_value).
  */
 
 /* ========================================================================
@@ -41,7 +43,12 @@
 
 #define META_MAGIC          0x4D50545F54524945ULL  /* "MPT_TRIE" */
 
-#define MAX_EXT_NIBBLES     118  /* 59 bytes × 2 nibbles/byte */
+#define MAX_EXT_NIBBLES     118  /* 59 bytes x 2 nibbles/byte */
+
+/* Compile-time maximums for stack arrays */
+#define MAX_KEY_SIZE        64
+#define MAX_NUM_NIBBLES     128
+#define MAX_VALUE_SIZE      120
 
 /* ========================================================================
  * Ref encoding (32-bit)
@@ -98,18 +105,6 @@ typedef union {
 _Static_assert(sizeof(mpt_branch_t) == 128, "branch must be 128 bytes");
 _Static_assert(sizeof(mpt_extension_t) == 128, "extension must be 128 bytes");
 
-/* Leaf node (160B leaf pool slot) */
-typedef struct {
-    uint8_t  key[MPT_KEY_SIZE];    /* 32B: full key */
-    uint8_t  hash[32];            /* 32B: cached keccak256 */
-    uint8_t  vlen;                /* 1B: value length */
-    uint8_t  value[MPT_MAX_VALUE]; /* 86B: raw value */
-    uint8_t  dirty;               /* 1B: needs rehashing */
-    uint8_t  _pad[6];
-} mpt_leaf_t;
-
-_Static_assert(sizeof(mpt_leaf_t) == LEAF_SLOT_SIZE, "leaf must be 192 bytes");
-
 /* ========================================================================
  * Meta page
  * ======================================================================== */
@@ -121,9 +116,9 @@ typedef struct {
     uint32_t root;                 /* root ref */
     uint32_t node_count;
     uint32_t leaf_count;
-    uint32_t _reserved;
+    uint32_t key_size;             /* was _reserved */
     uint32_t crc32c;
-    uint32_t _pad;
+    uint32_t max_value;            /* was _pad */
 } mpt_meta_t;
 
 #define META_CRC_LEN  (offsetof(mpt_meta_t, crc32c))
@@ -147,7 +142,33 @@ struct mpt {
 
     bool      root_dirty;          /* root hash needs recomputation */
     hash_t    cached_root;         /* last computed root hash */
+
+    /* Configurable dimensions */
+    uint32_t  key_size;            /* 32 or 64 */
+    uint32_t  num_nibbles;         /* key_size * 2 */
+    uint32_t  max_value;           /* max value bytes per leaf */
 };
+
+/* ========================================================================
+ * Leaf access — runtime field offsets via accessor macros
+ *
+ * Leaf layout (192 bytes, runtime field offsets):
+ *   [0 .. key_size)                          key
+ *   [key_size .. key_size+32)                hash (32B)
+ *   [key_size+32]                            vlen (1B)
+ *   [key_size+33 .. key_size+33+max_value)   value
+ *   [key_size+33+max_value]                  dirty (1B)
+ * ======================================================================== */
+
+static inline uint8_t *leaf_raw(const mpt_t *m, ref_t ref) {
+    return m->leaf_base + (size_t)REF_INDEX(ref) * LEAF_SLOT_SIZE;
+}
+
+#define LF_KEY(m, r)    (r)
+#define LF_HASH(m, r)   ((r) + (m)->key_size)
+#define LF_VLEN(m, r)   (*((r) + (m)->key_size + 32))
+#define LF_VALUE(m, r)  ((r) + (m)->key_size + 33)
+#define LF_DIRTY(m, r)  (*((r) + (m)->key_size + 33 + (m)->max_value))
 
 /* ========================================================================
  * CRC32C (hardware SSE4.2)
@@ -187,8 +208,8 @@ static inline void set_nibble(uint8_t *data, int i, uint8_t val) {
         data[byte_idx] = (data[byte_idx] & 0x0F) | ((val & 0x0F) << 4);
 }
 
-static void key_to_nibbles(const uint8_t *key, uint8_t *nibbles) {
-    for (int i = 0; i < MPT_KEY_SIZE; i++) {
+static void key_to_nibbles(const mpt_t *m, const uint8_t *key, uint8_t *nibbles) {
+    for (uint32_t i = 0; i < m->key_size; i++) {
         nibbles[i * 2]     = (key[i] >> 4) & 0x0F;
         nibbles[i * 2 + 1] = key[i] & 0x0F;
     }
@@ -206,11 +227,6 @@ static inline mpt_branch_t *branch_ptr(const mpt_t *m, ref_t ref) {
 static inline mpt_extension_t *ext_ptr(const mpt_t *m, ref_t ref) {
     return &((node_slot_t *)(m->node_base +
              (size_t)REF_INDEX(ref) * NODE_SLOT_SIZE))->ext;
-}
-
-static inline mpt_leaf_t *leaf_ptr(const mpt_t *m, ref_t ref) {
-    return (mpt_leaf_t *)(m->leaf_base +
-            (size_t)REF_INDEX(ref) * LEAF_SLOT_SIZE);
 }
 
 /* ========================================================================
@@ -245,14 +261,13 @@ static ref_t alloc_leaf(mpt_t *m, const uint8_t *key,
     if (idx > INDEX_MASK) return REF_NULL;
     if ((size_t)(idx + 1) * LEAF_SLOT_SIZE > LEAF_POOL_MAX) return REF_NULL;
     m->leaf_count++;
-    mpt_leaf_t *l = (mpt_leaf_t *)(m->leaf_base +
-                     (size_t)idx * LEAF_SLOT_SIZE);
-    memset(l, 0, LEAF_SLOT_SIZE);
-    memcpy(l->key, key, MPT_KEY_SIZE);
-    l->vlen = vlen;
+    uint8_t *lf = m->leaf_base + (size_t)idx * LEAF_SLOT_SIZE;
+    memset(lf, 0, LEAF_SLOT_SIZE);
+    memcpy(LF_KEY(m, lf), key, m->key_size);
+    LF_VLEN(m, lf) = vlen;
     if (vlen > 0 && value)
-        memcpy(l->value, value, vlen);
-    l->dirty = 1;
+        memcpy(LF_VALUE(m, lf), value, vlen);
+    LF_DIRTY(m, lf) = 1;
     return MAKE_LEAF(idx);
 }
 
@@ -260,7 +275,7 @@ static ref_t alloc_leaf(mpt_t *m, const uint8_t *key,
  * Extension construction helpers
  * ======================================================================== */
 
-/* Build extension from key nibbles at key[depth..depth+count-1] → child */
+/* Build extension from key nibbles at key[depth..depth+count-1] -> child */
 static ref_t make_ext_from_key(mpt_t *m, const uint8_t *key,
                                int depth, int count, ref_t child) {
     if (count == 0) return child;
@@ -326,7 +341,7 @@ static ref_t make_ext_single(mpt_t *m, uint8_t nib, ref_t child) {
 }
 
 /* ========================================================================
- * Insert (recursive, no COW — all nodes mutable)
+ * Insert (recursive, no COW -- all nodes mutable)
  * ======================================================================== */
 
 static ref_t do_insert(mpt_t *m, ref_t ref, const uint8_t *key,
@@ -340,30 +355,30 @@ static ref_t do_insert(mpt_t *m, ref_t ref, const uint8_t *key,
 
     /* Case 2: leaf */
     if (IS_LEAF(ref)) {
-        mpt_leaf_t *l = leaf_ptr(m, ref);
+        uint8_t *lf = leaf_raw(m, ref);
 
-        if (memcmp(l->key, key, MPT_KEY_SIZE) == 0) {
+        if (memcmp(LF_KEY(m, lf), key, m->key_size) == 0) {
             /* Update existing */
             *inserted = false;
-            l->vlen = vlen;
+            LF_VLEN(m, lf) = vlen;
             if (vlen > 0 && value)
-                memcpy(l->value, value, vlen);
+                memcpy(LF_VALUE(m, lf), value, vlen);
             else
-                memset(l->value, 0, MPT_MAX_VALUE);
-            l->dirty = 1;
+                memset(LF_VALUE(m, lf), 0, m->max_value);
+            LF_DIRTY(m, lf) = 1;
             return ref;
         }
 
-        /* Different key — find diverging nibble */
+        /* Different key -- find diverging nibble */
         *inserted = true;
-        uint8_t saved_key[MPT_KEY_SIZE];
-        uint8_t saved_val[MPT_MAX_VALUE];
-        uint8_t saved_vlen = l->vlen;
-        memcpy(saved_key, l->key, MPT_KEY_SIZE);
-        memcpy(saved_val, l->value, saved_vlen);
+        uint8_t saved_key[MAX_KEY_SIZE];
+        uint8_t saved_val[MAX_VALUE_SIZE];
+        uint8_t saved_vlen = LF_VLEN(m, lf);
+        memcpy(saved_key, LF_KEY(m, lf), m->key_size);
+        memcpy(saved_val, LF_VALUE(m, lf), saved_vlen);
 
         int diff = depth;
-        while (diff < MPT_NUM_NIBBLES &&
+        while (diff < (int)m->num_nibbles &&
                key_nibble(key, diff) == key_nibble(saved_key, diff))
             diff++;
 
@@ -403,7 +418,7 @@ static ref_t do_insert(mpt_t *m, ref_t ref, const uint8_t *key,
             match++;
 
         if (match == skip) {
-            /* Full match — recurse into child */
+            /* Full match -- recurse into child */
             ref_t old_child = ext->child;
             ref_t new_child = do_insert(m, old_child, key,
                                         depth + skip, value, vlen, inserted);
@@ -414,7 +429,7 @@ static ref_t do_insert(mpt_t *m, ref_t ref, const uint8_t *key,
             return ref;
         }
 
-        /* Partial match — split extension */
+        /* Partial match -- split extension */
         *inserted = true;
 
         /* Save extension data before allocs */
@@ -481,8 +496,8 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
 
     /* Leaf */
     if (IS_LEAF(ref)) {
-        mpt_leaf_t *l = leaf_ptr(m, ref);
-        if (memcmp(l->key, key, MPT_KEY_SIZE) == 0) {
+        uint8_t *lf = leaf_raw(m, ref);
+        if (memcmp(LF_KEY(m, lf), key, m->key_size) == 0) {
             *deleted = true;
             return REF_NULL;
         }
@@ -509,13 +524,13 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
         if (new_child == REF_NULL)
             return REF_NULL;
 
-        /* Child became leaf — drop extension, leaf moves up in depth */
+        /* Child became leaf -- drop extension, leaf moves up in depth */
         if (IS_LEAF(new_child)) {
-            leaf_ptr(m, new_child)->dirty = 1;
+            LF_DIRTY(m, leaf_raw(m, new_child)) = 1;
             return new_child;
         }
 
-        /* Child became extension — merge */
+        /* Child became extension -- merge */
         if (IS_EXTENSION(new_child)) {
             ext = ext_ptr(m, ref);
             uint8_t our_nibs[59];
@@ -529,7 +544,7 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
             memcpy(child_nibs, child_ext->nibbles, 59);
 
             int total = our_skip + child_skip;
-            uint8_t merged[MPT_NUM_NIBBLES / 2];
+            uint8_t merged[64];
             memset(merged, 0, sizeof(merged));
             for (int i = 0; i < our_skip; i++)
                 set_nibble(merged, i, key_nibble(our_nibs, i));
@@ -538,7 +553,7 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
             return make_ext_from_buf(m, merged, 0, total, child_child);
         }
 
-        /* Child still a branch — update extension */
+        /* Child still a branch -- update extension */
         ext_ptr(m, ref)->child = new_child;
         ext_ptr(m, ref)->dirty = 1;
         return ref;
@@ -576,13 +591,13 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
     if (remaining == 1) {
         ref_t sole = b->children[last_nib];
 
-        /* Leaf floats up — depth changes, cached hash is stale */
+        /* Leaf floats up -- depth changes, cached hash is stale */
         if (IS_LEAF(sole)) {
-            leaf_ptr(m, sole)->dirty = 1;
+            LF_DIRTY(m, leaf_raw(m, sole)) = 1;
             return sole;
         }
 
-        /* Extension — prepend nibble */
+        /* Extension -- prepend nibble */
         if (IS_EXTENSION(sole)) {
             mpt_extension_t *ce = ext_ptr(m, sole);
             int child_skip = ce->skip_len;
@@ -591,7 +606,7 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
             memcpy(child_nibs, ce->nibbles, 59);
 
             int total = 1 + child_skip;
-            uint8_t merged[MPT_NUM_NIBBLES / 2];
+            uint8_t merged[64];
             memset(merged, 0, sizeof(merged));
             set_nibble(merged, 0, (uint8_t)last_nib);
             for (int i = 0; i < child_skip; i++)
@@ -599,7 +614,7 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
             return make_ext_from_buf(m, merged, 0, total, child_child);
         }
 
-        /* Branch child — wrap in 1-nibble extension */
+        /* Branch child -- wrap in 1-nibble extension */
         return make_ext_single(m, (uint8_t)last_nib, sole);
     }
 
@@ -609,7 +624,7 @@ static ref_t do_delete(mpt_t *m, ref_t ref, const uint8_t *key,
 }
 
 /* ========================================================================
- * MPT Hash Computation — Ethereum-compatible RLP + Keccak256
+ * MPT Hash Computation -- Ethereum-compatible RLP + Keccak256
  * ======================================================================== */
 
 /* node_ref: 32-byte hash or inline RLP (< 32 bytes) */
@@ -718,21 +733,21 @@ static node_ref_t recompute(mpt_t *m, ref_t ref, int depth, bool force_hash);
 /* Hash a leaf node */
 static node_ref_t hash_leaf_node(mpt_t *m, ref_t ref, int depth,
                                  bool force_hash) {
-    mpt_leaf_t *l = leaf_ptr(m, ref);
-    if (!l->dirty) {
+    uint8_t *lf = leaf_raw(m, ref);
+    if (!LF_DIRTY(m, lf)) {
         node_ref_t r;
-        memcpy(r.data, l->hash, 32);
+        memcpy(r.data, LF_HASH(m, lf), 32);
         r.len = 32;
         return r;
     }
 
     /* remaining path nibbles */
-    uint8_t nibbles[MPT_NUM_NIBBLES];
-    key_to_nibbles(l->key, nibbles);
-    size_t remaining = MPT_NUM_NIBBLES - depth;
+    uint8_t nibbles[MAX_NUM_NIBBLES];
+    key_to_nibbles(m, LF_KEY(m, lf), nibbles);
+    size_t remaining = m->num_nibbles - depth;
 
     /* hex-prefix encode */
-    uint8_t hp[33];
+    uint8_t hp[65];
     size_t hp_len;
     hex_prefix_encode(nibbles + depth, remaining, true, hp, &hp_len);
 
@@ -740,7 +755,7 @@ static node_ref_t hash_leaf_node(mpt_t *m, ref_t ref, int depth,
     uint8_t payload[256];
     size_t pos = 0;
     pos += rlp_encode_string(hp, hp_len, payload + pos);
-    pos += rlp_encode_string(l->value, l->vlen, payload + pos);
+    pos += rlp_encode_string(LF_VALUE(m, lf), LF_VLEN(m, lf), payload + pos);
 
     /* Wrap in list */
     uint8_t encoded[270];
@@ -752,8 +767,8 @@ static node_ref_t hash_leaf_node(mpt_t *m, ref_t ref, int depth,
 
     /* Cache hash */
     if (result.len == 32)
-        memcpy(l->hash, result.data, 32);
-    l->dirty = 0;
+        memcpy(LF_HASH(m, lf), result.data, 32);
+    LF_DIRTY(m, lf) = 0;
     return result;
 }
 
@@ -897,7 +912,8 @@ static bool meta_write(int fd, int page, const mpt_meta_t *meta) {
  * Public API: Lifecycle
  * ======================================================================== */
 
-mpt_t *mpt_create(const char *path) {
+static mpt_t *mpt_create_internal(const char *path, uint32_t key_size,
+                                   uint32_t max_value) {
     if (!path) return NULL;
 
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -944,6 +960,9 @@ mpt_t *mpt_create(const char *path) {
     m->active_meta = 0;
     m->root_dirty = true;
     m->cached_root = hash_zero();
+    m->key_size = key_size;
+    m->num_nibbles = key_size * 2;
+    m->max_value = max_value;
 
     /* Write initial meta */
     mpt_meta_t meta = {0};
@@ -953,12 +972,24 @@ mpt_t *mpt_create(const char *path) {
     meta.root = REF_NULL;
     meta.node_count = 1;
     meta.leaf_count = 1;
+    meta.key_size = key_size;
+    meta.max_value = max_value;
     meta.crc32c = compute_crc32c(&meta, META_CRC_LEN);
     meta_write(fd, 0, &meta);
     meta_write(fd, 1, &meta);
     fdatasync(fd);
 
     return m;
+}
+
+mpt_t *mpt_create(const char *path) {
+    return mpt_create_internal(path, MPT_KEY_SIZE, MPT_MAX_VALUE);
+}
+
+mpt_t *mpt_create_ex(const char *path, uint32_t key_size, uint32_t max_value) {
+    if (key_size == 0 || key_size > 64) return NULL;
+    if (key_size + max_value + 34 > LEAF_SLOT_SIZE) return NULL;
+    return mpt_create_internal(path, key_size, max_value);
 }
 
 mpt_t *mpt_open(const char *path) {
@@ -1031,6 +1062,16 @@ mpt_t *mpt_open(const char *path) {
     m->root_dirty = false;  /* assume committed state has valid hashes */
     m->cached_root = hash_zero();
 
+    /* Read key_size and max_value from meta; default for old files */
+    if (meta->key_size == 0) {
+        m->key_size = 32;
+        m->max_value = 120;
+    } else {
+        m->key_size = meta->key_size;
+        m->max_value = meta->max_value;
+    }
+    m->num_nibbles = m->key_size * 2;
+
     return m;
 }
 
@@ -1063,9 +1104,9 @@ void mpt_clear(mpt_t *m) {
  * Public API: Mutations
  * ======================================================================== */
 
-bool mpt_put(mpt_t *m, const uint8_t key[MPT_KEY_SIZE],
+bool mpt_put(mpt_t *m, const uint8_t *key,
              const uint8_t *value, uint8_t vlen) {
-    if (!m || !key || vlen > MPT_MAX_VALUE) return false;
+    if (!m || !key || vlen > m->max_value) return false;
     bool inserted = false;
     m->root = do_insert(m, m->root, key, 0, value, vlen, &inserted);
     if (inserted) m->size++;
@@ -1073,7 +1114,7 @@ bool mpt_put(mpt_t *m, const uint8_t key[MPT_KEY_SIZE],
     return true;
 }
 
-bool mpt_delete(mpt_t *m, const uint8_t key[MPT_KEY_SIZE]) {
+bool mpt_delete(mpt_t *m, const uint8_t *key) {
     if (!m || !key) return false;
     bool deleted = false;
     m->root = do_delete(m, m->root, key, 0, &deleted);
@@ -1082,6 +1123,44 @@ bool mpt_delete(mpt_t *m, const uint8_t key[MPT_KEY_SIZE]) {
         m->root_dirty = true;
     }
     return deleted;
+}
+
+/* ========================================================================
+ * Public API: Lookup
+ * ======================================================================== */
+
+bool mpt_get(mpt_t *m, const uint8_t *key, uint8_t *value_out,
+             uint8_t *vlen_out) {
+    if (!m || !key) return false;
+    ref_t ref = m->root;
+    int depth = 0;
+    while (ref != REF_NULL) {
+        if (IS_LEAF(ref)) {
+            uint8_t *lf = leaf_raw(m, ref);
+            if (memcmp(LF_KEY(m, lf), key, m->key_size) == 0) {
+                if (vlen_out) *vlen_out = LF_VLEN(m, lf);
+                if (value_out) memcpy(value_out, LF_VALUE(m, lf), LF_VLEN(m, lf));
+                return true;
+            }
+            return false;
+        }
+        if (IS_BRANCH(ref)) {
+            uint8_t nib = key_nibble(key, depth);
+            ref = branch_ptr(m, ref)->children[nib];
+            depth++;
+        } else if (IS_EXTENSION(ref)) {
+            mpt_extension_t *ext = ext_ptr(m, ref);
+            for (int i = 0; i < ext->skip_len; i++) {
+                if (key_nibble(ext->nibbles, i) != key_nibble(key, depth + i))
+                    return false;
+            }
+            depth += ext->skip_len;
+            ref = ext->child;
+        } else {
+            return false;
+        }
+    }
+    return false;
 }
 
 /* ========================================================================
@@ -1105,7 +1184,7 @@ hash_t mpt_root(mpt_t *m) {
 
     /* Read hash from root node */
     if (IS_LEAF(m->root))
-        memcpy(m->cached_root.bytes, leaf_ptr(m, m->root)->hash, 32);
+        memcpy(m->cached_root.bytes, LF_HASH(m, leaf_raw(m, m->root)), 32);
     else if (IS_BRANCH(m->root))
         memcpy(m->cached_root.bytes, branch_ptr(m, m->root)->hash, 32);
     else if (IS_EXTENSION(m->root))
@@ -1113,6 +1192,111 @@ hash_t mpt_root(mpt_t *m) {
 
     m->root_dirty = false;
     return m->cached_root;
+}
+
+/* ========================================================================
+ * Public API: Subtree Root Hash
+ * ======================================================================== */
+
+hash_t mpt_subtree_root(mpt_t *m, const uint8_t *prefix_key,
+                        uint32_t prefix_nibbles) {
+    if (!m || !prefix_key || m->root == REF_NULL) {
+        uint8_t empty = 0x80;
+        return hash_keccak256(&empty, 1);
+    }
+
+    ref_t ref = m->root;
+    int depth = 0;
+
+    while (depth < (int)prefix_nibbles && ref != REF_NULL) {
+        if (IS_LEAF(ref)) {
+            /* Leaf extends past prefix -- check if prefix matches */
+            uint8_t *lf = leaf_raw(m, ref);
+            for (int i = depth; i < (int)prefix_nibbles; i++) {
+                if (key_nibble(LF_KEY(m, lf), i) != key_nibble(prefix_key, i)) {
+                    /* Prefix doesn't match -- empty subtree */
+                    uint8_t empty = 0x80;
+                    return hash_keccak256(&empty, 1);
+                }
+            }
+            /* Leaf is the only entry in this subtree */
+            /* Compute its hash at the prefix depth */
+            node_ref_t nref = recompute(m, ref, prefix_nibbles, true);
+            hash_t result;
+            memcpy(result.bytes, nref.data, 32);
+            return result;
+        }
+        if (IS_BRANCH(ref)) {
+            uint8_t nib = key_nibble(prefix_key, depth);
+            ref = branch_ptr(m, ref)->children[nib];
+            depth++;
+        } else if (IS_EXTENSION(ref)) {
+            mpt_extension_t *ext = ext_ptr(m, ref);
+            int skip = ext->skip_len;
+            int remaining_prefix = (int)prefix_nibbles - depth;
+
+            /* Check matching nibbles */
+            int check = (skip < remaining_prefix) ? skip : remaining_prefix;
+            for (int i = 0; i < check; i++) {
+                if (key_nibble(ext->nibbles, i) != key_nibble(prefix_key, depth + i)) {
+                    uint8_t empty = 0x80;
+                    return hash_keccak256(&empty, 1);
+                }
+            }
+
+            if (skip <= remaining_prefix) {
+                /* Extension fully consumed by prefix -- continue */
+                depth += skip;
+                ref = ext->child;
+            } else {
+                /* Extension spans prefix boundary */
+                /* Subtree root = hash of (tail extension -> child) */
+                int tail_len = skip - remaining_prefix;
+
+                /* Compute child hash first */
+                node_ref_t child_ref = recompute(m, ext_ptr(m, ref)->child,
+                                                  depth + skip, false);
+
+                /* Build tail extension nibbles */
+                ext = ext_ptr(m, ref);  /* re-resolve */
+                uint8_t tail_nibs[MAX_EXT_NIBBLES];
+                for (int i = 0; i < tail_len; i++)
+                    tail_nibs[i] = key_nibble(ext->nibbles, remaining_prefix + i);
+
+                /* hex-prefix encode (is_leaf = false for extension) */
+                uint8_t hp[60];
+                size_t hp_len;
+                hex_prefix_encode(tail_nibs, tail_len, false, hp, &hp_len);
+
+                /* Build [hp_rlp, child_ref] list */
+                uint8_t payload[128];
+                size_t pos = 0;
+                pos += rlp_encode_string(hp, hp_len, payload + pos);
+                pos += append_child_ref(payload + pos, &child_ref);
+
+                uint8_t encoded[140];
+                size_t hdr = rlp_list_header(pos, encoded);
+                memcpy(encoded + hdr, payload, pos);
+                size_t total = hdr + pos;
+
+                hash_t result = hash_keccak256(encoded, total);
+                return result;
+            }
+        } else {
+            break;
+        }
+    }
+
+    if (ref == REF_NULL) {
+        uint8_t empty = 0x80;
+        return hash_keccak256(&empty, 1);
+    }
+
+    /* At prefix boundary -- compute subtree root */
+    node_ref_t nref = recompute(m, ref, depth, true);
+    hash_t result;
+    memcpy(result.bytes, nref.data, 32);
+    return result;
 }
 
 /* ========================================================================
@@ -1136,6 +1320,8 @@ bool mpt_commit(mpt_t *m) {
     meta.root = m->root;
     meta.node_count = m->node_count;
     meta.leaf_count = m->leaf_count;
+    meta.key_size = m->key_size;
+    meta.max_value = m->max_value;
     meta.crc32c = compute_crc32c(&meta, META_CRC_LEN);
 
     if (!meta_write(m->fd, inactive, &meta))

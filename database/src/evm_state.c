@@ -83,6 +83,8 @@ struct evm_state {
     mem_art_t         warm_slots;   // key: skey[52], value: (none, 0 bytes)
     mpt_t            *state_mpt;    // persistent state trie (NULL = ephemeral)
     char             *state_mpt_path;
+    mpt_t            *storage_mpt;  // persistent shared storage trie, 64-byte keys (NULL = ephemeral)
+    char             *storage_mpt_path;
 };
 
 // ============================================================================
@@ -193,7 +195,8 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
 // Lifecycle
 // ============================================================================
 
-evm_state_t *evm_state_create(state_db_t *sdb, const char *state_mpt_path) {
+evm_state_t *evm_state_create(state_db_t *sdb, const char *state_mpt_path,
+                               const char *storage_mpt_path) {
     if (!sdb) return NULL;
 
     evm_state_t *es = calloc(1, sizeof(evm_state_t));
@@ -227,11 +230,26 @@ evm_state_t *evm_state_create(state_db_t *sdb, const char *state_mpt_path) {
             evm_state_destroy(es);
             return NULL;
         }
-        // Try open existing, fall back to create
         es->state_mpt = mpt_open(state_mpt_path);
         if (!es->state_mpt)
             es->state_mpt = mpt_create(state_mpt_path);
         if (!es->state_mpt) {
+            evm_state_destroy(es);
+            return NULL;
+        }
+    }
+
+    // Open or create persistent storage MPT (64-byte keys, max_value=33)
+    if (storage_mpt_path) {
+        es->storage_mpt_path = strdup(storage_mpt_path);
+        if (!es->storage_mpt_path) {
+            evm_state_destroy(es);
+            return NULL;
+        }
+        es->storage_mpt = mpt_open(storage_mpt_path);
+        if (!es->storage_mpt)
+            es->storage_mpt = mpt_create_ex(storage_mpt_path, 64, 33);
+        if (!es->storage_mpt) {
             evm_state_destroy(es);
             return NULL;
         }
@@ -269,9 +287,11 @@ void evm_state_destroy(evm_state_t *es) {
         }
     }
 
-    // Close persistent state MPT (file survives for next block)
+    // Close persistent MPTs (files survive for next block)
     if (es->state_mpt) mpt_close(es->state_mpt);
     free(es->state_mpt_path);
+    if (es->storage_mpt) mpt_close(es->storage_mpt);
+    free(es->storage_mpt_path);
 
     free(es->journal);
     free(es);
@@ -829,43 +849,76 @@ bool evm_state_finalize(evm_state_t *es) {
     mem_art_foreach(&es->storage, finalize_storage_cb, &ctx);
     if (!ctx.ok) return false;
 
-    // Commit persistent state MPT meta page
+    // Commit persistent MPT meta pages
     if (es->state_mpt)
         mpt_commit(es->state_mpt);
+    if (es->storage_mpt)
+        mpt_commit(es->storage_mpt);
 
     return true;
 }
 
 // ============================================================================
 // State Root Computation
-//
-// TODO: Production architecture for incremental per-block state roots
-//
-// Current implementation computes state root from in-memory caches only.
-// This is correct when ALL state is in memory (genesis, EF test fixtures)
-// but wrong for production block processing where most state lives on disk.
-//
-// For production, we need:
-// 1. Persistent state mpt — one file, survives between blocks. Per block:
-//    mpt_put only dirty accounts, mpt_root gives O(dirty × depth) root.
-// 2. Persistent per-account storage tries — when an account's storage
-//    changes, update its storage mpt and recompute its storage root.
-//    Challenge: millions of contracts on mainnet = millions of mpt files.
-//    Possible solutions:
-//      a) Extend mpt to support 64-byte keys (addr_hash || slot_hash),
-//         then use a single shared storage mpt with prefix-based roots.
-//      b) Lazy per-account mpt files, only opened when storage is dirty.
-//      c) Add prefix iteration to state_db/hash_store so we can load
-//         all committed slots for a dirty account and rebuild its trie.
-// 3. Cache storage roots in account data — only recompute when storage
-//    is dirty. Most accounts are untouched per block.
-//
 // ============================================================================
 
-#define STORAGE_MPT_PATH "/tmp/evm_storage_mpt.dat"
-#define STATE_MPT_PATH   "/tmp/evm_state_mpt.dat"
+#define EPHEMERAL_STORAGE_MPT_PATH "/tmp/evm_storage_mpt.dat"
+#define EPHEMERAL_STATE_MPT_PATH   "/tmp/evm_state_mpt.dat"
 
-// --- Storage root map: addr → hash_t, built in a single pass ---
+// --- RLP-encode a storage value (trimmed big-endian uint256) ---
+
+static uint8_t rlp_encode_storage_value(const uint256_t *val,
+                                         uint8_t out[33]) {
+    uint8_t raw[32];
+    uint256_to_bytes(val, raw);
+    uint8_t start = 0;
+    while (start < 31 && raw[start] == 0) start++;
+    uint8_t trimmed_len = 32 - start;
+
+    if (trimmed_len == 1 && raw[start] < 0x80) {
+        out[0] = raw[start];
+        return 1;
+    }
+    out[0] = 0x80 + trimmed_len;
+    memcpy(out + 1, raw + start, trimmed_len);
+    return 1 + trimmed_len;
+}
+
+// --- Persistent storage mpt: update dirty slots ---
+
+typedef struct {
+    mpt_t *storage_mpt;
+} persistent_storage_ctx_t;
+
+static bool update_persistent_storage_cb(const uint8_t *key, size_t key_len,
+                                          const void *value, size_t value_len,
+                                          void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    persistent_storage_ctx_t *ctx = (persistent_storage_ctx_t *)user_data;
+    const cached_slot_t *cs = (const cached_slot_t *)value;
+
+    if (!cs->dirty) return true;
+
+    // Build 64-byte key: keccak(addr) || keccak(slot)
+    address_t addr = address_from_bytes(cs->key);
+    uint8_t key64[64];
+    hash_t ah = hash_keccak256(addr.bytes, ADDRESS_SIZE);
+    memcpy(key64, ah.bytes, 32);
+    hash_t sh = hash_keccak256(cs->key + ADDRESS_SIZE, 32);
+    memcpy(key64 + 32, sh.bytes, 32);
+
+    if (uint256_is_zero(&cs->current)) {
+        mpt_delete(ctx->storage_mpt, key64);
+    } else {
+        uint8_t rlp_val[33];
+        uint8_t rlp_len = rlp_encode_storage_value(&cs->current, rlp_val);
+        mpt_put(ctx->storage_mpt, key64, rlp_val, rlp_len);
+    }
+
+    return true;
+}
+
+// --- Ephemeral storage root map: addr → hash_t, built in a single pass ---
 
 typedef struct {
     address_t addr;
@@ -887,17 +940,15 @@ static hash_t *storage_root_map_get(storage_root_map_t *map,
     return NULL;
 }
 
-// Callback context for the single-pass storage scan
+// Callback context for the single-pass storage scan (ephemeral mode)
 typedef struct {
     mpt_t            *mpt;
     storage_root_map_t *map;
-    // Batching: current address being processed
     address_t         cur_addr;
     bool              has_cur;
-    size_t            cur_count;   // non-zero slots for current addr
+    size_t            cur_count;
 } storage_scan_ctx_t;
 
-// Flush the current address's storage root into the map
 static void storage_scan_flush(storage_scan_ctx_t *ctx) {
     if (!ctx->has_cur) return;
 
@@ -919,7 +970,6 @@ static void storage_scan_flush(storage_scan_ctx_t *ctx) {
 
 static void storage_scan_put_slot(storage_scan_ctx_t *ctx,
                                    const cached_slot_t *cs) {
-    // New address? Flush previous and start fresh mpt
     if (!ctx->has_cur ||
         memcmp(ctx->cur_addr.bytes, cs->key, ADDRESS_SIZE) != 0) {
         storage_scan_flush(ctx);
@@ -929,30 +979,12 @@ static void storage_scan_put_slot(storage_scan_ctx_t *ctx,
         ctx->cur_count = 0;
     }
 
-    // Skip zero-valued slots
     if (uint256_is_zero(&cs->current)) return;
 
-    // Hash the slot key: keccak256(slot_be[32])
     hash_t hk = hash_keccak256(cs->key + ADDRESS_SIZE, 32);
 
-    // Trim leading zeros from big-endian value
-    uint8_t raw[32];
-    uint256_to_bytes(&cs->current, raw);
-    uint8_t start = 0;
-    while (start < 31 && raw[start] == 0) start++;
-    uint8_t trimmed_len = 32 - start;
-
-    // RLP-encode the trimmed value
     uint8_t rlp_val[33];
-    uint8_t rlp_len;
-    if (trimmed_len == 1 && raw[start] < 0x80) {
-        rlp_val[0] = raw[start];
-        rlp_len = 1;
-    } else {
-        rlp_val[0] = 0x80 + trimmed_len;
-        memcpy(rlp_val + 1, raw + start, trimmed_len);
-        rlp_len = 1 + trimmed_len;
-    }
+    uint8_t rlp_len = rlp_encode_storage_value(&cs->current, rlp_val);
 
     mpt_put(ctx->mpt, hk.bytes, rlp_val, rlp_len);
     ctx->cur_count++;
@@ -967,7 +999,6 @@ static bool storage_scan_cb(const uint8_t *key, size_t key_len,
     return true;
 }
 
-// Build storage roots for ALL accounts in a single O(N) pass over storage
 static storage_root_map_t build_storage_roots(evm_state_t *es,
                                                mpt_t *storage_mpt) {
     storage_root_map_t map = {0};
@@ -979,14 +1010,13 @@ static storage_root_map_t build_storage_roots(evm_state_t *es,
     };
 
     mem_art_foreach(&es->storage, storage_scan_cb, &ctx);
-    storage_scan_flush(&ctx);  // flush last address
+    storage_scan_flush(&ctx);
 
     return map;
 }
 
 // --- Account trie ---
 
-// Convert uint256 to trimmed big-endian bytes, return length (0 for zero)
 static size_t uint256_to_trimmed_be(const uint256_t *val, uint8_t out[32]) {
     uint256_to_bytes(val, out);
     size_t start = 0;
@@ -998,12 +1028,12 @@ static size_t uint256_to_trimmed_be(const uint256_t *val, uint8_t out[32]) {
 
 typedef struct {
     mpt_t              *state_mpt;
-    storage_root_map_t *storage_roots;
+    mpt_t              *storage_mpt;       // persistent shared storage trie (NULL = use map)
+    storage_root_map_t *storage_roots;     // ephemeral storage root map (NULL if using storage_mpt)
     bool                prune_empty;
-    bool                incremental;   // only process dirty/created accounts
+    bool                incremental;
 } account_root_ctx_t;
 
-// Encode account into state mpt: keccak256(addr) → RLP([nonce, bal, storageRoot, codeHash])
 static void account_mpt_put(mpt_t *state_mpt,
                               const cached_account_t *ca,
                               const hash_t *storage_root) {
@@ -1055,7 +1085,6 @@ static bool account_root_cb(const uint8_t *key, size_t key_len,
                      !ca->account.has_code);
     if (is_empty) {
         if (ctx->prune_empty) {
-            // In incremental mode, must delete from mpt if previously existed
             if (ctx->incremental && (ca->existed || ca->created)) {
                 hash_t hk = hash_keccak256(ca->addr.bytes, ADDRESS_SIZE);
                 mpt_delete(ctx->state_mpt, hk.bytes);
@@ -1065,10 +1094,18 @@ static bool account_root_cb(const uint8_t *key, size_t key_len,
         if (!ca->existed && !ca->created && !ca->dirty) return true;
     }
 
-    // Look up pre-computed storage root
+    // Compute storage root
     hash_t storage_root = HASH_EMPTY_STORAGE;
-    hash_t *sr = storage_root_map_get(ctx->storage_roots, &ca->addr);
-    if (sr) storage_root = *sr;
+    if (ctx->storage_mpt) {
+        // Persistent mode: subtree root from shared storage mpt
+        uint8_t addr_hash[32];
+        hash_t ah = hash_keccak256(ca->addr.bytes, ADDRESS_SIZE);
+        memcpy(addr_hash, ah.bytes, 32);
+        storage_root = mpt_subtree_root(ctx->storage_mpt, addr_hash, 64);
+    } else if (ctx->storage_roots) {
+        hash_t *sr = storage_root_map_get(ctx->storage_roots, &ca->addr);
+        if (sr) storage_root = *sr;
+    }
 
     account_mpt_put(ctx->state_mpt, ca, &storage_root);
     return true;
@@ -1082,20 +1119,42 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     if (!es) return HASH_EMPTY_STORAGE;
     if (mem_art_is_empty(&es->accounts)) return HASH_EMPTY_STORAGE;
 
-    // Storage roots are always built ephemerally from evm_state cache
-    unlink(STORAGE_MPT_PATH);
-    mpt_t *storage_mpt = mpt_create(STORAGE_MPT_PATH);
+    // --- Persistent mode (both state_mpt and storage_mpt present) ---
+    if (es->state_mpt && es->storage_mpt) {
+        // Phase 1: update persistent storage mpt with dirty slots
+        persistent_storage_ctx_t sctx = { .storage_mpt = es->storage_mpt };
+        mem_art_foreach(&es->storage, update_persistent_storage_cb, &sctx);
+
+        // Phase 2: update state mpt with dirty accounts (storage roots via subtree)
+        account_root_ctx_t ctx = {
+            .state_mpt = es->state_mpt,
+            .storage_mpt = es->storage_mpt,
+            .storage_roots = NULL,
+            .prune_empty = prune_empty,
+            .incremental = true,
+        };
+        mem_art_foreach(&es->accounts, account_root_cb, &ctx);
+
+        if (mpt_size(es->state_mpt) == 0)
+            return HASH_EMPTY_STORAGE;
+        return mpt_root(es->state_mpt);
+    }
+
+    // --- Semi-persistent mode (state_mpt only, ephemeral storage) ---
+    // Build storage roots ephemerally
+    unlink(EPHEMERAL_STORAGE_MPT_PATH);
+    mpt_t *storage_mpt = mpt_create(EPHEMERAL_STORAGE_MPT_PATH);
     if (!storage_mpt) return HASH_EMPTY_STORAGE;
 
     storage_root_map_t sr_map = build_storage_roots(es, storage_mpt);
 
     mpt_close(storage_mpt);
-    unlink(STORAGE_MPT_PATH);
+    unlink(EPHEMERAL_STORAGE_MPT_PATH);
 
-    // --- Persistent mode: use es->state_mpt, only dirty accounts ---
     if (es->state_mpt) {
         account_root_ctx_t ctx = {
             .state_mpt = es->state_mpt,
+            .storage_mpt = NULL,
             .storage_roots = &sr_map,
             .prune_empty = prune_empty,
             .incremental = true,
@@ -1108,9 +1167,9 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
         return mpt_root(es->state_mpt);
     }
 
-    // --- Ephemeral mode: rebuild from scratch ---
-    unlink(STATE_MPT_PATH);
-    mpt_t *state_mpt = mpt_create(STATE_MPT_PATH);
+    // --- Fully ephemeral mode: rebuild from scratch ---
+    unlink(EPHEMERAL_STATE_MPT_PATH);
+    mpt_t *state_mpt = mpt_create(EPHEMERAL_STATE_MPT_PATH);
     if (!state_mpt) {
         free(sr_map.entries);
         return HASH_EMPTY_STORAGE;
@@ -1118,6 +1177,7 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
 
     account_root_ctx_t ctx = {
         .state_mpt = state_mpt,
+        .storage_mpt = NULL,
         .storage_roots = &sr_map,
         .prune_empty = prune_empty,
         .incremental = false,
@@ -1131,7 +1191,7 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
         root = mpt_root(state_mpt);
 
     mpt_close(state_mpt);
-    unlink(STATE_MPT_PATH);
+    unlink(EPHEMERAL_STATE_MPT_PATH);
     free(sr_map.entries);
 
     return root;
