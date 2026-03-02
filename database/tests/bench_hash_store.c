@@ -38,7 +38,9 @@
 #define MASTER_SEED      0x48534254455354ULL  // "HSBTEST"
 #define HASH_STORE_DIR   "/tmp/bench_hash_store"
 
-// Shard capacity: 16M slots = 1GB per shard
+// Slot size: 128B (10B overhead + 64B key + 54B value)
+#define SLOT_SIZE        128
+// Shard capacity: 16M slots = 2GB per shard
 #define SHARD_CAP        (1ULL << 24)
 
 // ============================================================================
@@ -146,7 +148,7 @@ static void bench_hash_store(uint64_t target_keys) {
     cleanup_dir(HASH_STORE_DIR);
     double t0 = now_sec();
 
-    hash_store_t *hs = hash_store_create(HASH_STORE_DIR, SHARD_CAP);
+    hash_store_t *hs = hash_store_create(HASH_STORE_DIR, SHARD_CAP, KEY_SIZE, SLOT_SIZE);
     ASSERT_MSG(hs, "hash_store_create failed");
 
     double t_create = now_sec() - t0;
@@ -368,7 +370,7 @@ int main(int argc, char *argv[]) {
     printf("  key size:   %d bytes\n", KEY_SIZE);
     printf("  value size: %d bytes\n", VALUE_SIZE);
     printf("  shard cap:  %"PRIu64" slots (%"PRIu64" MB/shard)\n",
-           (uint64_t)SHARD_CAP, (uint64_t)SHARD_CAP * 64 / (1024*1024));
+           (uint64_t)SHARD_CAP, (uint64_t)SHARD_CAP * SLOT_SIZE / (1024*1024));
     printf("  ops/block:  %d-%d (70/20/10 ins/upd/del)\n", OPS_MIN, OPS_MAX);
     printf("  seed:       0x%016"PRIx64"\n", (uint64_t)MASTER_SEED);
     printf("============================================\n");

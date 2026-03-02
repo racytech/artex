@@ -79,6 +79,26 @@ code_store_t *code_store_open(const char *path) {
     if (fstat(cs->fd, &st) == 0 && st.st_size > 0) {
         cs->file_size = (uint64_t)st.st_size;
     }
+
+    // Scan file to rebuild entries array: each entry is [4B len LE][bytecode]
+    uint64_t pos = 0;
+    while (pos + 4 <= cs->file_size) {
+        uint32_t len = 0;
+        ssize_t r = pread(cs->fd, &len, 4, (off_t)pos);
+        if (r != 4) break;
+        if (pos + 4 + len > cs->file_size) break;
+
+        if (cs->count >= cs->cap) {
+            cs->cap *= 2;
+            code_entry_t *tmp = realloc(cs->entries, cs->cap * sizeof(code_entry_t));
+            if (!tmp) break;
+            cs->entries = tmp;
+        }
+        cs->entries[cs->count] = (code_entry_t){ .offset = pos, .length = len };
+        cs->count++;
+        pos += 4 + len;
+    }
+
     return cs;
 }
 
@@ -100,19 +120,18 @@ uint32_t code_store_append(code_store_t *cs, const void *bytecode, uint32_t len)
         cs->entries = realloc(cs->entries, cs->cap * sizeof(code_entry_t));
     }
 
-    // Append bytecode to file
+    // Write [4B length LE][bytecode] to file
     uint64_t offset = cs->file_size;
-    ssize_t w = pwrite(cs->fd, bytecode, len, (off_t)offset);
-    if (w != (ssize_t)len) {
-        // Write failed — don't add entry
-        return UINT32_MAX;
-    }
+    ssize_t w = pwrite(cs->fd, &len, 4, (off_t)offset);
+    if (w != 4) return UINT32_MAX;
+    w = pwrite(cs->fd, bytecode, len, (off_t)(offset + 4));
+    if (w != (ssize_t)len) return UINT32_MAX;
 
     // Record entry
     uint32_t index = cs->count;
     cs->entries[index] = (code_entry_t){ .offset = offset, .length = len };
     cs->count++;
-    cs->file_size += len;
+    cs->file_size += 4 + len;
 
     return index;
 }
@@ -133,7 +152,8 @@ bool code_store_read(code_store_t *cs, uint32_t index,
     code_entry_t *e = &cs->entries[index];
     if (buf_len < e->length) return false;
 
-    ssize_t r = pread(cs->fd, out, e->length, (off_t)e->offset);
+    // Data starts after 4-byte length prefix
+    ssize_t r = pread(cs->fd, out, e->length, (off_t)(e->offset + 4));
     return r == (ssize_t)e->length;
 }
 

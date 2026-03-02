@@ -16,7 +16,6 @@
  */
 
 #include "../include/data_layer.h"
-#include "../include/state_store.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -305,7 +304,6 @@ static bool phase3(data_layer_t *dl, uint64_t seed,
            merged, t3 - t2, merged / (t3 - t2) / 1000.0);
     printf("  index keys: %" PRIu64 " (was %" PRIu64 ")\n",
            st.index_keys, before.index_keys);
-    printf("  free slots: %u\n", st.free_slots);
     printf("  RSS: %zu MB\n", get_rss_mb());
 
     // Verify updates
@@ -450,7 +448,6 @@ static bool phase4(data_layer_t *dl, uint64_t seed,
     printf("  merge cycles:    %" PRIu64 "\n", num_cycles);
     printf("  avg merge time:  %.3fs\n", total_merge_time / num_cycles);
     printf("  total merged:    %" PRIu64 "\n", st.total_merged);
-    printf("  free slots:      %u\n", st.free_slots);
     printf("  RSS:             %zu MB\n", get_rss_mb());
     printf("  ============================================\n");
     printf("  Phase 4: PASS\n");
@@ -475,17 +472,16 @@ int main(int argc, char *argv[]) {
 
     uint64_t total_keys = scale_millions * 1000000ULL;
     uint64_t seed = 0x0000000069a11ab9ULL;
-    const char *state_path = "/tmp/art_dl_test_state.dat";
+    const char *state_dir = "/tmp/art_dl_test_state";
 
     printf("============================================\n");
     printf("Data Layer Module Test\n");
     printf("============================================\n");
     printf("scale:      %" PRIu64 "M keys\n", scale_millions);
     printf("value size: %d bytes\n", VALUE_LEN);
-    printf("slot size:  %d bytes\n", STATE_STORE_SLOT_SIZE);
     printf("RSS:        %zu MB\n", get_rss_mb());
 
-    data_layer_t *dl = dl_create(state_path, NULL, KEY_SIZE, 4);
+    data_layer_t *dl = dl_create(state_dir, NULL, KEY_SIZE, 128, (1ULL << 20));
     if (!dl) {
         fprintf(stderr, "FAIL: dl_create\n");
         return 1;
@@ -502,27 +498,27 @@ int main(int argc, char *argv[]) {
 
     if (!phase1(dl, seed, phase1_keys, &next_key)) {
         dl_destroy(dl);
-        unlink(state_path);
+        { char cmd[256]; snprintf(cmd, sizeof(cmd), "rm -rf %s", state_dir); system(cmd); };
         return 1;
     }
 
     st = dl_stats(dl);
     if (!phase2(dl, seed, st.index_keys, &next_key)) {
         dl_destroy(dl);
-        unlink(state_path);
+        { char cmd[256]; snprintf(cmd, sizeof(cmd), "rm -rf %s", state_dir); system(cmd); };
         return 1;
     }
 
     st = dl_stats(dl);
     if (!phase3(dl, seed, st.index_keys, &next_key)) {
         dl_destroy(dl);
-        unlink(state_path);
+        { char cmd[256]; snprintf(cmd, sizeof(cmd), "rm -rf %s", state_dir); system(cmd); };
         return 1;
     }
 
     if (!phase4(dl, seed, total_keys, &next_key)) {
         dl_destroy(dl);
-        unlink(state_path);
+        { char cmd[256]; snprintf(cmd, sizeof(cmd), "rm -rf %s", state_dir); system(cmd); };
         return 1;
     }
 
@@ -539,6 +535,6 @@ int main(int argc, char *argv[]) {
     printf("============================================\n");
 
     dl_destroy(dl);
-    unlink(state_path);
+    { char cmd[256]; snprintf(cmd, sizeof(cmd), "rm -rf %s", state_dir); system(cmd); };
     return 0;
 }

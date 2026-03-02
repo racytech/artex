@@ -1,9 +1,7 @@
 #include "../include/data_layer.h"
-#include "../include/state_store.h"
+#include "../include/hash_store.h"
 #include "../include/code_store.h"
-#include "../include/compact_art.h"
 #include "../include/mem_art.h"
-#include "../include/checkpoint.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -12,59 +10,92 @@
 // Internal constants
 // ============================================================================
 
+// Buffer flag bytes (in write buffer values)
 #define BUF_FLAG_WRITE     0x01
 #define BUF_FLAG_TOMBSTONE 0x02
-#define CODE_REF_BIT       0x80000000u
+
+// Code ref size: 4 byte code_store index
+#define CODE_REF_SIZE   4
+
+// Max buffer value size (type prefix + actual value)
+// Actual limit depends on hash_store max_value at runtime
+#define BUF_MAX_VALUE   256
 
 // ============================================================================
 // Opaque struct
 // ============================================================================
 
 struct data_layer {
-    compact_art_t index;
-    state_store_t *store;
+    hash_store_t *store;
     code_store_t *code;
-    mem_art_t buffer;
-    uint32_t key_size;
-    uint64_t total_merged;
+    mem_art_t     buffer;
+    uint32_t      key_size;
+    uint32_t      max_value;  // hash_store max_value (slot_size - 10 - key_size)
+    uint64_t      total_merged;
 };
 
 // ============================================================================
 // Lifecycle
 // ============================================================================
 
-data_layer_t *dl_create(const char *state_path, const char *code_path,
-                         uint32_t key_size, uint32_t value_size) {
+data_layer_t *dl_create(const char *dir, const char *code_path,
+                         uint32_t key_size, uint32_t slot_size,
+                         uint64_t shard_capacity) {
     data_layer_t *dl = malloc(sizeof(data_layer_t));
     if (!dl) return NULL;
     memset(dl, 0, sizeof(*dl));
     dl->key_size = key_size;
 
-    if (!compact_art_init(&dl->index, key_size, value_size)) {
-        free(dl);
-        return NULL;
-    }
-
-    dl->store = state_store_create(state_path);
+    dl->store = hash_store_create(dir, shard_capacity, key_size, slot_size);
     if (!dl->store) {
-        compact_art_destroy(&dl->index);
         free(dl);
         return NULL;
     }
+    dl->max_value = hash_store_max_value(dl->store);
 
     if (code_path) {
         dl->code = code_store_create(code_path);
         if (!dl->code) {
-            compact_art_destroy(&dl->index);
-            state_store_destroy(dl->store);
+            hash_store_destroy(dl->store);
             free(dl);
             return NULL;
         }
     }
 
     if (!mem_art_init(&dl->buffer)) {
-        compact_art_destroy(&dl->index);
-        state_store_destroy(dl->store);
+        hash_store_destroy(dl->store);
+        if (dl->code) code_store_destroy(dl->code);
+        free(dl);
+        return NULL;
+    }
+
+    return dl;
+}
+
+data_layer_t *dl_open(const char *dir, const char *code_path) {
+    data_layer_t *dl = malloc(sizeof(data_layer_t));
+    if (!dl) return NULL;
+    memset(dl, 0, sizeof(*dl));
+
+    dl->store = hash_store_open(dir);
+    if (!dl->store) {
+        free(dl);
+        return NULL;
+    }
+    dl->key_size = hash_store_key_size(dl->store);
+    dl->max_value = hash_store_max_value(dl->store);
+
+    if (code_path) {
+        dl->code = code_store_open(code_path);
+        if (!dl->code) {
+            hash_store_destroy(dl->store);
+            free(dl);
+            return NULL;
+        }
+    }
+
+    if (!mem_art_init(&dl->buffer)) {
+        hash_store_destroy(dl->store);
         if (dl->code) code_store_destroy(dl->code);
         free(dl);
         return NULL;
@@ -75,8 +106,7 @@ data_layer_t *dl_create(const char *state_path, const char *code_path,
 
 void dl_destroy(data_layer_t *dl) {
     if (!dl) return;
-    compact_art_destroy(&dl->index);
-    state_store_destroy(dl->store);
+    hash_store_destroy(dl->store);
     if (dl->code) code_store_destroy(dl->code);
     mem_art_destroy(&dl->buffer);
     free(dl);
@@ -88,19 +118,24 @@ void dl_destroy(data_layer_t *dl) {
 
 bool dl_put(data_layer_t *dl, const uint8_t *key,
             const void *value, uint16_t len) {
-    uint8_t buf[1 + STATE_STORE_MAX_VALUE];
+    if (!dl || !key || !value) return false;
+    // Buffer format: [1B flag][value bytes]
+    uint8_t buf[BUF_MAX_VALUE];
     buf[0] = BUF_FLAG_WRITE;
     memcpy(buf + 1, value, len);
     return mem_art_insert(&dl->buffer, key, dl->key_size, buf, 1 + len);
 }
 
 bool dl_delete(data_layer_t *dl, const uint8_t *key) {
+    if (!dl || !key) return false;
     uint8_t tombstone = BUF_FLAG_TOMBSTONE;
     return mem_art_insert(&dl->buffer, key, dl->key_size, &tombstone, 1);
 }
 
 bool dl_get(data_layer_t *dl, const uint8_t *key,
             void *out_value, uint16_t *out_len) {
+    if (!dl || !key) return false;
+
     // 1. Check write buffer
     size_t vlen = 0;
     const void *bval = mem_art_get(&dl->buffer, key, dl->key_size, &vlen);
@@ -116,14 +151,15 @@ bool dl_get(data_layer_t *dl, const uint8_t *key,
         return false;
     }
 
-    // 2. Check index → disk
-    const void *ref = compact_art_get(&dl->index, key);
-    if (!ref) return false;
+    // 2. Check hash_store directly (raw value, no type prefix)
+    uint8_t val_buf[BUF_MAX_VALUE];
+    uint8_t val_len = 0;
+    if (!hash_store_get(dl->store, key, val_buf, &val_len))
+        return false;
 
-    uint32_t slot;
-    memcpy(&slot, ref, 4);
-    if (slot & CODE_REF_BIT) return false;  // code ref, not state
-    return state_store_read(dl->store, slot, out_value, out_len);
+    if (out_len) *out_len = val_len;
+    if (out_value) memcpy(out_value, val_buf, val_len);
+    return true;
 }
 
 // ============================================================================
@@ -131,6 +167,7 @@ bool dl_get(data_layer_t *dl, const uint8_t *key,
 // ============================================================================
 
 uint64_t dl_merge(data_layer_t *dl) {
+    if (!dl) return 0;
     uint64_t count = 0;
 
     mem_art_iterator_t *iter = mem_art_iterator_create(&dl->buffer);
@@ -145,44 +182,18 @@ uint64_t dl_merge(data_layer_t *dl) {
         uint8_t flag = *(const uint8_t *)val;
 
         if (flag == BUF_FLAG_TOMBSTONE) {
-            const void *ref = compact_art_get(&dl->index, key);
-            if (ref) {
-                uint32_t slot;
-                memcpy(&slot, ref, 4);
-                if (!(slot & CODE_REF_BIT)) {
-                    // Only free state_store slots, not code entries
-                    state_store_free(dl->store, slot);
-                }
-                compact_art_delete(&dl->index, key);
-            }
+            hash_store_delete(dl->store, key);
         } else if (flag == BUF_FLAG_WRITE && vlen > 1) {
             const uint8_t *data = (const uint8_t *)val + 1;
             uint16_t data_len = (uint16_t)(vlen - 1);
-
-            const void *ref = compact_art_get(&dl->index, key);
-            if (ref) {
-                // Update: rewrite same slot
-                uint32_t slot;
-                memcpy(&slot, ref, 4);
-                state_store_write(dl->store, slot, data, data_len);
-            } else {
-                // Insert: allocate new slot
-                uint32_t slot = state_store_alloc(dl->store);
-                state_store_write(dl->store, slot, data, data_len);
-                compact_art_insert(&dl->index, key, &slot);
-            }
+            hash_store_put(dl->store, key, data, data_len);
         }
         count++;
     }
 
     mem_art_iterator_destroy(iter);
 
-    // No explicit sync here — the kernel writeback daemon flushes dirty
-    // pages in the background (~5s interval). By checkpoint time (128+
-    // blocks later), most pages are already on disk. The blocking
-    // fdatasync in dl_checkpoint() handles the rest.
-
-    // Clear buffer
+    // Clear buffer for next block
     mem_art_destroy(&dl->buffer);
     mem_art_init(&dl->buffer);
 
@@ -194,35 +205,52 @@ uint64_t dl_merge(data_layer_t *dl) {
 // Code Operations
 // ============================================================================
 
+// Code entries use a modified key to avoid colliding with state entries:
+// XOR last byte with 0xFF. Fingerprint (first 8 bytes) stays the same,
+// so the entry routes to the same shard. Full-key comparison in the slot
+// ensures no false matches.
+static void make_code_key(uint8_t *out, const uint8_t *key, uint32_t key_size) {
+    memcpy(out, key, key_size);
+    out[key_size - 1] ^= 0xFF;
+}
+
 bool dl_put_code(data_layer_t *dl, const uint8_t *key,
                  const void *bytecode, uint32_t len) {
     if (!dl || !dl->code) return false;
 
-    // Dedup: if key already in index, skip
-    const void *existing = compact_art_get(&dl->index, key);
-    if (existing) return true;
+    uint8_t ckey[64];  // max key_size
+    make_code_key(ckey, key, dl->key_size);
+
+    // Dedup: if code key already in hash_store, skip
+    if (hash_store_contains(dl->store, ckey)) return true;
 
     // Append to code.dat
     uint32_t index = code_store_append(dl->code, bytecode, len);
     if (index == UINT32_MAX) return false;
 
-    // Insert into compact_art with bit 31 set
-    uint32_t ref = index | CODE_REF_BIT;
-    return compact_art_insert(&dl->index, key, &ref);
+    // Store code ref in hash_store: [uint32_t index]
+    uint8_t ref_buf[4];
+    memcpy(ref_buf, &index, 4);
+    return hash_store_put(dl->store, ckey, ref_buf, 4);
 }
 
 bool dl_get_code(data_layer_t *dl, const uint8_t *key,
                  void *out, uint32_t *out_len) {
     if (!dl || !dl->code) return false;
 
-    const void *ref_ptr = compact_art_get(&dl->index, key);
-    if (!ref_ptr) return false;
+    uint8_t ckey[64];
+    make_code_key(ckey, key, dl->key_size);
 
-    uint32_t ref;
-    memcpy(&ref, ref_ptr, 4);
-    if (!(ref & CODE_REF_BIT)) return false;  // state ref, not code
+    uint8_t val_buf[4];
+    uint8_t val_len = 0;
+    if (!hash_store_get(dl->store, ckey, val_buf, &val_len))
+        return false;
 
-    uint32_t index = ref & ~CODE_REF_BIT;
+    if (val_len < 4) return false;
+
+    uint32_t index;
+    memcpy(&index, val_buf, 4);
+
     uint32_t length = code_store_length(dl->code, index);
     if (length == 0) return false;
 
@@ -234,195 +262,30 @@ bool dl_get_code(data_layer_t *dl, const uint8_t *key,
 uint32_t dl_code_length(data_layer_t *dl, const uint8_t *key) {
     if (!dl || !dl->code) return 0;
 
-    const void *ref_ptr = compact_art_get(&dl->index, key);
-    if (!ref_ptr) return 0;
+    uint8_t ckey[64];
+    make_code_key(ckey, key, dl->key_size);
 
-    uint32_t ref;
-    memcpy(&ref, ref_ptr, 4);
-    if (!(ref & CODE_REF_BIT)) return 0;
+    uint8_t val_buf[4];
+    uint8_t val_len = 0;
+    if (!hash_store_get(dl->store, ckey, val_buf, &val_len))
+        return 0;
 
-    return code_store_length(dl->code, ref & ~CODE_REF_BIT);
+    if (val_len < 4) return 0;
+
+    uint32_t index;
+    memcpy(&index, val_buf, 4);
+    return code_store_length(dl->code, index);
 }
 
 // ============================================================================
 // Checkpoint / Recovery
 // ============================================================================
 
-bool dl_checkpoint(data_layer_t *dl, const char *index_path,
-                   uint64_t block_number) {
+bool dl_checkpoint(data_layer_t *dl) {
     if (!dl) return false;
-    // Merge kicks off async writeback each block, so most pages are already
-    // on disk. This blocking fdatasync ensures everything is durable before
-    // the checkpoint commit (rename) makes the new index reachable.
-    state_store_sync(dl->store);
+    hash_store_sync(dl->store);
     if (dl->code) code_store_sync(dl->code);
-    return checkpoint_write(index_path, block_number,
-                            &dl->index, dl->store, dl->code);
-}
-
-data_layer_t *dl_open(const char *state_path, const char *code_path,
-                       const char *index_path,
-                       uint32_t key_size, uint32_t value_size,
-                       uint64_t *out_block_number) {
-    data_layer_t *dl = malloc(sizeof(data_layer_t));
-    if (!dl) return NULL;
-    memset(dl, 0, sizeof(*dl));
-    dl->key_size = key_size;
-
-    if (!compact_art_init(&dl->index, key_size, value_size)) {
-        free(dl);
-        return NULL;
-    }
-
-    dl->store = state_store_open(state_path);
-    if (!dl->store) {
-        compact_art_destroy(&dl->index);
-        free(dl);
-        return NULL;
-    }
-
-    if (code_path) {
-        dl->code = code_store_open(code_path);
-        if (!dl->code) {
-            compact_art_destroy(&dl->index);
-            state_store_destroy(dl->store);
-            free(dl);
-            return NULL;
-        }
-    }
-
-    if (!checkpoint_load(index_path, out_block_number,
-                         &dl->index, dl->store, dl->code)) {
-        compact_art_destroy(&dl->index);
-        state_store_destroy(dl->store);
-        if (dl->code) code_store_destroy(dl->code);
-        free(dl);
-        return NULL;
-    }
-
-    if (!mem_art_init(&dl->buffer)) {
-        compact_art_destroy(&dl->index);
-        state_store_destroy(dl->store);
-        if (dl->code) code_store_destroy(dl->code);
-        free(dl);
-        return NULL;
-    }
-
-    return dl;
-}
-
-// ============================================================================
-// Cursor (ih_cursor_t adapter over compact_art + state_store)
-// ============================================================================
-
-struct dl_cursor {
-    compact_art_iterator_t *iter;
-    state_store_t *store;
-    uint32_t key_size;
-    uint8_t value_buf[STATE_STORE_MAX_VALUE];
-    uint16_t value_len;
-    bool has_value;
-    bool seek_pending;  // after seek, first next() must skip the seek leaf
-};
-
-// Load value from current iterator position into cursor buffer.
-static bool dl_cursor_load_value(dl_cursor_t *cur) {
-    cur->has_value = false;
-    const void *ref_ptr = compact_art_iterator_value(cur->iter);
-    if (!ref_ptr) return false;
-
-    uint32_t slot;
-    memcpy(&slot, ref_ptr, 4);
-    if (slot & CODE_REF_BIT) return false;  // skip code refs
-
-    if (!state_store_read(cur->store, slot, cur->value_buf, &cur->value_len))
-        return false;
-
-    cur->has_value = true;
     return true;
-}
-
-static bool dl_cursor_seek_fn(void *ctx, const uint8_t *key, size_t key_len) {
-    dl_cursor_t *cur = ctx;
-    (void)key_len;
-    if (!compact_art_iterator_seek(cur->iter, key))
-        return false;
-    // compact_art_iterator_seek positions at the entry and sets internal
-    // key/value, but the entry is still on the iterator stack. The first
-    // compact_art_iterator_next() call will re-read this same entry (popping
-    // the leaf) rather than advancing. We mark seek_pending so that our
-    // next_fn consumes this leaf before actually advancing.
-    dl_cursor_load_value(cur);
-    cur->seek_pending = true;
-    return true;
-}
-
-static bool dl_cursor_next_fn(void *ctx) {
-    dl_cursor_t *cur = ctx;
-    if (cur->seek_pending) {
-        // Consume the seek leaf from the iterator stack (re-reads same entry)
-        compact_art_iterator_next(cur->iter);
-        cur->seek_pending = false;
-    }
-    if (!compact_art_iterator_next(cur->iter))
-        return false;
-    dl_cursor_load_value(cur);
-    return true;
-}
-
-static bool dl_cursor_valid_fn(void *ctx) {
-    dl_cursor_t *cur = ctx;
-    return !compact_art_iterator_done(cur->iter);
-}
-
-static const uint8_t *dl_cursor_key_fn(void *ctx, size_t *out_len) {
-    dl_cursor_t *cur = ctx;
-    if (compact_art_iterator_done(cur->iter)) return NULL;
-    *out_len = cur->key_size;
-    return compact_art_iterator_key(cur->iter);
-}
-
-static const uint8_t *dl_cursor_value_fn(void *ctx, size_t *out_len) {
-    dl_cursor_t *cur = ctx;
-    if (!cur->has_value) {
-        *out_len = 0;
-        return NULL;
-    }
-    *out_len = cur->value_len;
-    return cur->value_buf;
-}
-
-dl_cursor_t *dl_cursor_create(data_layer_t *dl) {
-    if (!dl) return NULL;
-    dl_cursor_t *cur = malloc(sizeof(dl_cursor_t));
-    if (!cur) return NULL;
-    memset(cur, 0, sizeof(*cur));
-
-    cur->iter = compact_art_iterator_create(&dl->index);
-    if (!cur->iter) {
-        free(cur);
-        return NULL;
-    }
-    cur->store = dl->store;
-    cur->key_size = dl->key_size;
-    return cur;
-}
-
-void dl_cursor_destroy(dl_cursor_t *cursor) {
-    if (!cursor) return;
-    compact_art_iterator_destroy(cursor->iter);
-    free(cursor);
-}
-
-ih_cursor_t dl_cursor_as_ih(dl_cursor_t *cursor) {
-    ih_cursor_t c;
-    c.ctx = cursor;
-    c.seek = dl_cursor_seek_fn;
-    c.next = dl_cursor_next_fn;
-    c.valid = dl_cursor_valid_fn;
-    c.key = dl_cursor_key_fn;
-    c.value = dl_cursor_value_fn;
-    return c;
 }
 
 // ============================================================================
@@ -491,7 +354,6 @@ bool dl_extract_dirty(data_layer_t *dl, dl_dirty_set_t *out) {
 
 fail:
     mem_art_iterator_destroy(iter);
-    // Free everything allocated so far
     for (size_t i = 0; i < count; i++) {
         free(out->keys[i]);
         free(out->values[i]);
@@ -520,10 +382,9 @@ void dl_dirty_set_free(dl_dirty_set_t *ds) {
 dl_stats_t dl_stats(const data_layer_t *dl) {
     dl_stats_t s = {0};
     if (!dl) return s;
-    s.index_keys = compact_art_size(&dl->index);
+    s.index_keys = hash_store_count(dl->store);
     s.buffer_entries = mem_art_size(&dl->buffer);
     s.total_merged = dl->total_merged;
-    s.free_slots = state_store_free_count(dl->store);
     s.code_count = dl->code ? code_store_count(dl->code) : 0;
     s.code_file_size = dl->code ? code_store_file_size(dl->code) : 0;
     return s;

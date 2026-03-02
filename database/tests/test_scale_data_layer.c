@@ -42,9 +42,8 @@
 #define CHECKPOINT_INTERVAL 128
 #define STATS_INTERVAL      128
 
-#define STATE_PATH  "/tmp/art_scale_state.dat"
+#define STATE_DIR   "/tmp/art_scale_state"
 #define CODE_PATH   "/tmp/art_scale_code.dat"
-#define INDEX_PATH  "/tmp/art_scale_index.dat"
 
 #define MASTER_SEED 0x5343414C45544553ULL
 
@@ -373,12 +372,11 @@ int main(int argc, char *argv[]) {
     printf("============================================\n\n");
 
     // Clean up from prior runs
-    unlink(STATE_PATH);
+    { char cmd[256]; snprintf(cmd, sizeof(cmd), "rm -rf %s", STATE_DIR); system(cmd); }
     unlink(CODE_PATH);
-    unlink(INDEX_PATH);
 
     // Create data layer
-    data_layer_t *dl = dl_create(STATE_PATH, CODE_PATH, KEY_SIZE, 4);
+    data_layer_t *dl = dl_create(STATE_DIR, CODE_PATH, KEY_SIZE, 128, (1ULL << 20));
     ASSERT_MSG(dl != NULL, "dl_create failed");
 
     // Init simulation state
@@ -407,7 +405,7 @@ int main(int argc, char *argv[]) {
             double total_elapsed = now - t_start;
 
             dl_stats_t st = dl_stats(dl);
-            size_t state_mb = get_file_size_path(STATE_PATH) / (1024 * 1024);
+            size_t state_mb = 0;  // hash_store uses directory, skip file size
             size_t code_mb = get_file_size_path(CODE_PATH) / (1024 * 1024);
 
             double avg_merge_ms = (sim.total_merge_time / sim.total_blocks) * 1000.0;
@@ -438,7 +436,6 @@ int main(int argc, char *argv[]) {
     printf("  index keys:   %" PRIu64 "\n", final_stats.index_keys);
     printf("  code entries: %u\n", final_stats.code_count);
     printf("  total merged: %" PRIu64 "\n", final_stats.total_merged);
-    printf("  free slots:   %u\n", final_stats.free_slots);
     printf("  avg merge:    %.2fms\n",
            (sim.total_merge_time / sim.total_blocks) * 1000.0);
     printf("  time:         %.1fs\n", block_elapsed);
@@ -454,18 +451,15 @@ int main(int argc, char *argv[]) {
     uint64_t ckpt_index_keys = final_stats.index_keys;
     uint32_t ckpt_code_count = final_stats.code_count;
 
-    // Need a final checkpoint if the last block wasn't one
-    if (sim.last_checkpoint_block != sim.total_blocks) {
-        printf("  writing final checkpoint at block %" PRIu64 "...\n",
-               sim.total_blocks);
-        bool ok = dl_checkpoint(dl, INDEX_PATH, sim.total_blocks);
-        ASSERT_MSG(ok, "final checkpoint failed");
-        sim.last_checkpoint_block = sim.total_blocks;
-        // Refresh stats after checkpoint
-        final_stats = dl_stats(dl);
-        ckpt_index_keys = final_stats.index_keys;
-        ckpt_code_count = final_stats.code_count;
-    }
+    // Write final checkpoint (sync hash_store)
+    printf("  writing final checkpoint at block %" PRIu64 "...\n",
+           sim.total_blocks);
+    bool ok = dl_checkpoint(dl);
+    ASSERT_MSG(ok, "final checkpoint failed");
+    // Refresh stats after checkpoint
+    final_stats = dl_stats(dl);
+    ckpt_index_keys = final_stats.index_keys;
+    ckpt_code_count = final_stats.code_count;
 
     // Destroy
     dl_destroy(dl);
@@ -473,15 +467,10 @@ int main(int argc, char *argv[]) {
 
     // Recover
     double t_recover_start = now_sec();
-    uint64_t recovered_block = 0;
-    dl = dl_open(STATE_PATH, CODE_PATH, INDEX_PATH,
-                 KEY_SIZE, 4, &recovered_block);
+    dl = dl_open(STATE_DIR, CODE_PATH);
     double t_recover_end = now_sec();
 
     ASSERT_MSG(dl != NULL, "dl_open failed");
-    ASSERT_MSG(recovered_block == sim.last_checkpoint_block,
-               "recovered block %" PRIu64 " != expected %" PRIu64,
-               recovered_block, sim.last_checkpoint_block);
 
     dl_stats_t recovered_stats = dl_stats(dl);
     ASSERT_MSG(recovered_stats.index_keys == ckpt_index_keys,
@@ -492,7 +481,6 @@ int main(int argc, char *argv[]) {
                recovered_stats.code_count, ckpt_code_count);
 
     printf("  dl_open:        %.3fs\n", t_recover_end - t_recover_start);
-    printf("  recovered blk:  %" PRIu64 "\n", recovered_block);
     printf("  index_keys:     %" PRIu64 " (expected %" PRIu64 ")\n",
            recovered_stats.index_keys, ckpt_index_keys);
     printf("  code_count:     %u (expected %u)\n",
@@ -618,9 +606,8 @@ int main(int argc, char *argv[]) {
     bitset_destroy(&sim.state_live);
     free(sim.value_lens);
     free(sim.value_versions);
-    unlink(STATE_PATH);
+    { char cmd[256]; snprintf(cmd, sizeof(cmd), "rm -rf %s", STATE_DIR); system(cmd); }
     unlink(CODE_PATH);
-    unlink(INDEX_PATH);
 
     printf("============================================\n");
     printf("  ALL PHASES PASSED\n");

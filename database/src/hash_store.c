@@ -13,42 +13,43 @@
 // Constants
 // ============================================================================
 
-#define SHARD_MAGIC     "HASHSTR1"
-#define META_MAGIC      "HSHMETA1"
+#define SHARD_MAGIC     "HASHSTR2"   // v2: configurable sizes
+#define META_MAGIC      "HSHMTA02"   // v2: includes key_size, slot_size
 #define META_FILENAME   "meta.dat"
-#define SLOT_SIZE       HASH_STORE_SLOT_SIZE    // 64
 #define HEADER_SIZE     HASH_STORE_HEADER_SIZE  // 64
-#define FINGERPRINT_LEN 8
-#define MAX_VALUE_LEN   HASH_STORE_MAX_VALUE    // 32
 #define MAX_PATH_LEN    512
 
-// Slot offsets within 64-byte slot
+// Slot offsets within variable-size slot
 #define SLOT_OFF_FINGERPRINT  0
 #define SLOT_OFF_FLAGS        8
 #define SLOT_OFF_VALUE_LEN    9
 #define SLOT_OFF_VALUE        10
 
-// Meta header size
-#define META_HDR_SIZE  32
+// Meta header size (expanded for key_size + slot_size)
+#define META_HDR_SIZE  40
+
+// Max slot size supported (for stack buffers)
+#define MAX_SLOT_SIZE  256
 
 // ============================================================================
 // Internal types
 // ============================================================================
 
-// Per-shard file header (same as original single-file format)
+// Per-shard file header
 typedef struct {
-    uint8_t magic[8];
+    uint8_t  magic[8];
     uint64_t capacity;
     uint64_t count;
     uint64_t tombstones;
-    uint8_t reserved[32];
+    uint32_t slot_size;     // stored for validation
+    uint8_t  reserved[28];
 } shard_header_t;
 
 // Shard runtime state
 typedef struct {
     int      fd;
     uint8_t *map;           // mmap'd region
-    size_t   map_size;      // HEADER_SIZE + shard_cap * SLOT_SIZE
+    size_t   map_size;      // HEADER_SIZE + shard_cap * slot_size
     uint32_t id;            // shard file number (shard_NNNN.dat)
     uint32_t local_depth;   // how many top bits this shard covers
     uint64_t count;         // occupied entries
@@ -62,6 +63,10 @@ struct hash_store {
     uint32_t  global_depth; // number of routing bits
     uint64_t  shard_cap;    // fixed slots per shard (power of 2)
 
+    uint32_t  key_size;     // fixed key length in bytes
+    uint32_t  slot_size;    // bytes per slot
+    uint32_t  max_value;    // slot_size - 10 - key_size
+
     shard_t **shards;       // unique shard array (owned pointers)
     uint32_t  num_shards;
     uint32_t  shards_alloc; // allocated capacity of shards array
@@ -72,12 +77,13 @@ struct hash_store {
     uint32_t  next_shard_id; // monotonic counter for naming new shards
 };
 
-// Slot data for I/O
+// Slot data for I/O (stack-allocated with max possible data)
+// Layout on disk: [8B fp][1B flags][1B vlen][key_size B key][vlen B value]
 typedef struct {
     uint64_t fingerprint;
     uint8_t  flags;
     uint8_t  value_len;
-    uint8_t  value[MAX_VALUE_LEN];
+    uint8_t  data[MAX_SLOT_SIZE - 10]; // [key][value] combined
 } slot_t;
 
 // ============================================================================
@@ -137,25 +143,30 @@ static bool mmap_shard(shard_t *sh, size_t size) {
 // Shard Header I/O (direct memory access via mmap)
 // ============================================================================
 
-static bool shard_write_header(shard_t *sh, uint64_t capacity) {
+static bool shard_write_header(shard_t *sh, uint64_t capacity,
+                                uint32_t slot_size) {
     shard_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     memcpy(hdr.magic, SHARD_MAGIC, 8);
     hdr.capacity = capacity;
     hdr.count = sh->count;
     hdr.tombstones = sh->tombstones;
+    hdr.slot_size = slot_size;
 
     memcpy(sh->map, &hdr, HEADER_SIZE);
     sh->header_dirty = false;
     return true;
 }
 
-static bool shard_read_header(shard_t *sh, uint64_t expected_cap) {
+static bool shard_read_header(shard_t *sh, uint64_t expected_cap,
+                               uint32_t expected_slot_size) {
     shard_header_t hdr;
     memcpy(&hdr, sh->map, HEADER_SIZE);
     if (memcmp(hdr.magic, SHARD_MAGIC, 8) != 0)
         return false;
     if (hdr.capacity != expected_cap)
+        return false;
+    if (hdr.slot_size != expected_slot_size)
         return false;
 
     sh->count = hdr.count;
@@ -167,38 +178,45 @@ static bool shard_read_header(shard_t *sh, uint64_t expected_cap) {
 // Slot I/O (direct pointer arithmetic via mmap)
 // ============================================================================
 
-static inline uint8_t *slot_ptr(uint8_t *map, uint64_t idx) {
-    return map + HEADER_SIZE + idx * SLOT_SIZE;
+static inline uint8_t *slot_ptr(const hash_store_t *hs, uint8_t *map,
+                                 uint64_t idx) {
+    return map + HEADER_SIZE + idx * hs->slot_size;
 }
 
-static void read_slot(uint8_t *map, uint64_t idx, slot_t *out) {
-    const uint8_t *p = slot_ptr(map, idx);
+static void read_slot(const hash_store_t *hs, uint8_t *map, uint64_t idx,
+                       slot_t *out) {
+    const uint8_t *p = slot_ptr(hs, map, idx);
 
     memcpy(&out->fingerprint, p + SLOT_OFF_FINGERPRINT, 8);
     out->flags = p[SLOT_OFF_FLAGS];
     out->value_len = p[SLOT_OFF_VALUE_LEN];
-    if (out->value_len > MAX_VALUE_LEN) out->value_len = MAX_VALUE_LEN;
-    memcpy(out->value, p + SLOT_OFF_VALUE, out->value_len);
+    if (out->value_len > hs->max_value) out->value_len = hs->max_value;
+    // Read key + value combined
+    memcpy(out->data, p + SLOT_OFF_VALUE, hs->key_size + out->value_len);
 }
 
-static void write_slot(uint8_t *map, uint64_t idx, const slot_t *s) {
-    uint8_t *p = slot_ptr(map, idx);
+static void write_slot(const hash_store_t *hs, uint8_t *map, uint64_t idx,
+                        const slot_t *s) {
+    uint8_t *p = slot_ptr(hs, map, idx);
 
-    memset(p, 0, SLOT_SIZE);
+    memset(p, 0, hs->slot_size);
     memcpy(p + SLOT_OFF_FINGERPRINT, &s->fingerprint, 8);
     p[SLOT_OFF_FLAGS] = s->flags;
     p[SLOT_OFF_VALUE_LEN] = s->value_len;
-    memcpy(p + SLOT_OFF_VALUE, s->value, s->value_len);
+    // Write key + value combined
+    memcpy(p + SLOT_OFF_VALUE, s->data, hs->key_size + s->value_len);
 }
 
-static inline void write_slot_flags(uint8_t *map, uint64_t idx, uint8_t flags) {
-    slot_ptr(map, idx)[SLOT_OFF_FLAGS] = flags;
+static inline void write_slot_flags(const hash_store_t *hs, uint8_t *map,
+                                     uint64_t idx, uint8_t flags) {
+    slot_ptr(hs, map, idx)[SLOT_OFF_FLAGS] = flags;
 }
 
 // Read fingerprint + flags for probing
-static inline void read_slot_probe(uint8_t *map, uint64_t idx,
+static inline void read_slot_probe(const hash_store_t *hs, uint8_t *map,
+                                    uint64_t idx,
                                     uint64_t *out_fp, uint8_t *out_flags) {
-    const uint8_t *p = slot_ptr(map, idx);
+    const uint8_t *p = slot_ptr(hs, map, idx);
     memcpy(out_fp, p, 8);
     *out_flags = p[8];
 }
@@ -218,7 +236,7 @@ static bool write_meta(hash_store_t *hs) {
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return false;
 
-    // Header: 32 bytes
+    // Header: 40 bytes
     uint8_t hdr[META_HDR_SIZE];
     memset(hdr, 0, META_HDR_SIZE);
     memcpy(hdr + 0,  META_MAGIC, 8);
@@ -226,6 +244,8 @@ static bool write_meta(hash_store_t *hs) {
     memcpy(hdr + 12, &hs->next_shard_id, 4);
     memcpy(hdr + 16, &hs->shard_cap, 8);
     memcpy(hdr + 24, &hs->num_shards, 4);
+    memcpy(hdr + 28, &hs->key_size, 4);
+    memcpy(hdr + 32, &hs->slot_size, 4);
     if (write(fd, hdr, META_HDR_SIZE) != META_HDR_SIZE) goto fail;
 
     // Shard table: num_shards × 12 bytes
@@ -246,8 +266,6 @@ static bool write_meta(hash_store_t *hs) {
         if (write(fd, &si, 4) != 4) goto fail;
     }
 
-    // Durability deferred — fdatasync commented out for now.
-    // fdatasync(fd);
     close(fd);
     return rename(tmp, path) == 0;
 
@@ -273,7 +291,15 @@ static bool read_meta(hash_store_t *hs) {
     memcpy(&hs->next_shard_id, hdr + 12, 4);
     memcpy(&hs->shard_cap, hdr + 16, 8);
     memcpy(&hs->num_shards, hdr + 24, 4);
+    memcpy(&hs->key_size, hdr + 28, 4);
+    memcpy(&hs->slot_size, hdr + 32, 4);
 
+    if (hs->key_size < 8 ||
+        hs->slot_size < 10 + hs->key_size + 1 ||
+        hs->slot_size > MAX_SLOT_SIZE)
+        goto fail;
+
+    hs->max_value = hs->slot_size - 10 - hs->key_size;
     hs->dir_size = 1u << hs->global_depth;
 
     // Read shard table, open and mmap each shard file
@@ -281,7 +307,7 @@ static bool read_meta(hash_store_t *hs) {
     hs->shards = calloc(hs->shards_alloc, sizeof(shard_t *));
     if (!hs->shards) goto fail;
 
-    size_t shard_file_size = HEADER_SIZE + hs->shard_cap * SLOT_SIZE;
+    size_t shard_file_size = HEADER_SIZE + hs->shard_cap * hs->slot_size;
 
     for (uint32_t i = 0; i < hs->num_shards; i++) {
         uint8_t entry[12];
@@ -301,7 +327,7 @@ static bool read_meta(hash_store_t *hs) {
             close(sh->fd); free(sh); goto fail;
         }
 
-        if (!shard_read_header(sh, hs->shard_cap)) {
+        if (!shard_read_header(sh, hs->shard_cap, hs->slot_size)) {
             munmap(sh->map, sh->map_size);
             close(sh->fd); free(sh); goto fail;
         }
@@ -341,7 +367,7 @@ static shard_t *create_shard(hash_store_t *hs, uint32_t local_depth) {
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return NULL;
 
-    size_t file_size = HEADER_SIZE + hs->shard_cap * SLOT_SIZE;
+    size_t file_size = HEADER_SIZE + hs->shard_cap * hs->slot_size;
     if (ftruncate(fd, (off_t)file_size) != 0) {
         close(fd);
         unlink(path);
@@ -365,7 +391,7 @@ static shard_t *create_shard(hash_store_t *hs, uint32_t local_depth) {
         return NULL;
     }
 
-    if (!shard_write_header(sh, hs->shard_cap)) {
+    if (!shard_write_header(sh, hs->shard_cap, hs->slot_size)) {
         munmap(sh->map, sh->map_size);
         close(fd);
         unlink(path);
@@ -394,29 +420,29 @@ static shard_t *create_shard(hash_store_t *hs, uint32_t local_depth) {
 // Insert into shard (no split check — caller handles that)
 // ============================================================================
 
-static bool insert_into_shard(shard_t *sh, uint64_t shard_cap,
-                              uint64_t fp, const uint8_t *value, uint8_t vlen) {
-    uint64_t mask = shard_cap - 1;
+static bool insert_into_shard(const hash_store_t *hs, shard_t *sh,
+                              uint64_t fp, const uint8_t *key,
+                              const uint8_t *value, uint8_t vlen) {
+    uint64_t mask = hs->shard_cap - 1;
     uint64_t idx = fp & mask;
     uint64_t first_tombstone = UINT64_MAX;
 
     for (;;) {
         uint64_t slot_fp;
         uint8_t flags;
-        read_slot_probe(sh->map, idx, &slot_fp, &flags);
+        read_slot_probe(hs, sh->map, idx, &slot_fp, &flags);
 
         if (flags == HASH_STORE_FLAG_EMPTY) {
             if (first_tombstone != UINT64_MAX) {
                 idx = first_tombstone;
                 sh->tombstones--;
             }
-            slot_t s = {
-                .fingerprint = fp,
-                .flags = HASH_STORE_FLAG_OCCUPIED,
-                .value_len = vlen
-            };
-            memcpy(s.value, value, vlen);
-            write_slot(sh->map, idx, &s);
+            slot_t s = { .fingerprint = fp,
+                         .flags = HASH_STORE_FLAG_OCCUPIED,
+                         .value_len = vlen };
+            memcpy(s.data, key, hs->key_size);
+            memcpy(s.data + hs->key_size, value, vlen);
+            write_slot(hs, sh->map, idx, &s);
             sh->count++;
             sh->header_dirty = true;
             return true;
@@ -429,16 +455,19 @@ static bool insert_into_shard(shard_t *sh, uint64_t shard_cap,
             continue;
         }
 
-        // Occupied — check if same key (update)
+        // Occupied — check if same key (update via full key compare)
         if (slot_fp == fp) {
-            slot_t s = {
-                .fingerprint = fp,
-                .flags = HASH_STORE_FLAG_OCCUPIED,
-                .value_len = vlen
-            };
-            memcpy(s.value, value, vlen);
-            write_slot(sh->map, idx, &s);
-            return true;
+            // Compare full key to handle fingerprint collisions
+            const uint8_t *p = slot_ptr(hs, sh->map, idx);
+            if (memcmp(p + SLOT_OFF_VALUE, key, hs->key_size) == 0) {
+                slot_t s = { .fingerprint = fp,
+                             .flags = HASH_STORE_FLAG_OCCUPIED,
+                             .value_len = vlen };
+                memcpy(s.data, key, hs->key_size);
+                memcpy(s.data + hs->key_size, value, vlen);
+                write_slot(hs, sh->map, idx, &s);
+                return true;
+            }
         }
 
         idx = (idx + 1) & mask;
@@ -482,7 +511,7 @@ static bool split_shard(hash_store_t *hs, shard_t *old_shard) {
     // Step 3: Scan old shard, redistribute entries
     for (uint64_t i = 0; i < hs->shard_cap; i++) {
         slot_t s;
-        read_slot(old_shard->map, i, &s);
+        read_slot(hs, old_shard->map, i, &s);
         if (s.flags != HASH_STORE_FLAG_OCCUPIED) continue;
 
         // Check bit at position new_depth from MSB
@@ -494,15 +523,16 @@ static bool split_shard(hash_store_t *hs, shard_t *old_shard) {
         }
 
         shard_t *target = (bit == 0) ? sh_a : sh_b;
-        if (!insert_into_shard(target, hs->shard_cap,
-                               s.fingerprint, s.value, s.value_len)) {
+        if (!insert_into_shard(hs, target,
+                               s.fingerprint, s.data,
+                               s.data + hs->key_size, s.value_len)) {
             return false;
         }
     }
 
     // Write headers for new shards
-    shard_write_header(sh_a, hs->shard_cap);
-    shard_write_header(sh_b, hs->shard_cap);
+    shard_write_header(sh_a, hs->shard_cap, hs->slot_size);
+    shard_write_header(sh_b, hs->shard_cap, hs->slot_size);
 
     // Step 4: Update directory entries
     for (uint32_t i = 0; i < hs->dir_size; i++) {
@@ -536,8 +566,11 @@ static bool split_shard(hash_store_t *hs, shard_t *old_shard) {
 // Lifecycle
 // ============================================================================
 
-hash_store_t *hash_store_create(const char *dir, uint64_t shard_capacity) {
+hash_store_t *hash_store_create(const char *dir, uint64_t shard_capacity,
+                                 uint32_t key_size, uint32_t slot_size) {
     if (!dir || shard_capacity == 0) return NULL;
+    if (key_size < 8) return NULL;
+    if (slot_size < 10 + key_size + 1 || slot_size > MAX_SLOT_SIZE) return NULL;
 
     if (!is_power_of_2(shard_capacity))
         shard_capacity = next_power_of_2(shard_capacity);
@@ -552,6 +585,9 @@ hash_store_t *hash_store_create(const char *dir, uint64_t shard_capacity) {
 
     hs->global_depth = 0;
     hs->shard_cap = shard_capacity;
+    hs->key_size = key_size;
+    hs->slot_size = slot_size;
+    hs->max_value = slot_size - 10 - key_size;
     hs->dir_size = 1;
     hs->next_shard_id = 0;
     hs->num_shards = 0;
@@ -607,7 +643,7 @@ void hash_store_destroy(hash_store_t *hs) {
     for (uint32_t i = 0; i < hs->num_shards; i++) {
         shard_t *sh = hs->shards[i];
         if (sh->header_dirty)
-            shard_write_header(sh, hs->shard_cap);
+            shard_write_header(sh, hs->shard_cap, hs->slot_size);
         munmap(sh->map, sh->map_size);
         close(sh->fd);
         free(sh);
@@ -627,7 +663,7 @@ void hash_store_destroy(hash_store_t *hs) {
 
 bool hash_store_put(hash_store_t *hs, const uint8_t *key,
                     const void *value, uint8_t len) {
-    if (!hs || !key || !value || len > MAX_VALUE_LEN) return false;
+    if (!hs || !key || !value || len > hs->max_value) return false;
 
     uint64_t fp = extract_fingerprint(key);
     uint32_t di = dir_index_for(hs, fp);
@@ -641,7 +677,7 @@ bool hash_store_put(hash_store_t *hs, const uint8_t *key,
         sh = hs->directory[di];
     }
 
-    return insert_into_shard(sh, hs->shard_cap, fp, value, len);
+    return insert_into_shard(hs, sh, fp, key, value, len);
 }
 
 bool hash_store_get(const hash_store_t *hs, const uint8_t *key,
@@ -658,17 +694,24 @@ bool hash_store_get(const hash_store_t *hs, const uint8_t *key,
     for (;;) {
         uint64_t slot_fp;
         uint8_t flags;
-        read_slot_probe(sh->map, idx, &slot_fp, &flags);
+        read_slot_probe(hs, sh->map, idx, &slot_fp, &flags);
 
         if (flags == HASH_STORE_FLAG_EMPTY)
             return false;
 
         if (flags == HASH_STORE_FLAG_OCCUPIED && slot_fp == fp) {
-            slot_t s;
-            read_slot(sh->map, idx, &s);
-            if (out_value) memcpy(out_value, s.value, s.value_len);
-            if (out_len) *out_len = s.value_len;
-            return true;
+            // Compare full key
+            const uint8_t *p = slot_ptr(hs, sh->map, idx);
+            if (memcmp(p + SLOT_OFF_VALUE, key, hs->key_size) == 0) {
+                if (out_value || out_len) {
+                    slot_t s;
+                    read_slot(hs, sh->map, idx, &s);
+                    if (out_value) memcpy(out_value, s.data + hs->key_size,
+                                          s.value_len);
+                    if (out_len) *out_len = s.value_len;
+                }
+                return true;
+            }
         }
 
         idx = (idx + 1) & mask;
@@ -692,17 +735,21 @@ bool hash_store_delete(hash_store_t *hs, const uint8_t *key) {
     for (;;) {
         uint64_t slot_fp;
         uint8_t flags;
-        read_slot_probe(sh->map, idx, &slot_fp, &flags);
+        read_slot_probe(hs, sh->map, idx, &slot_fp, &flags);
 
         if (flags == HASH_STORE_FLAG_EMPTY)
             return false;
 
         if (flags == HASH_STORE_FLAG_OCCUPIED && slot_fp == fp) {
-            write_slot_flags(sh->map, idx, HASH_STORE_FLAG_TOMBSTONE);
-            sh->count--;
-            sh->tombstones++;
-            sh->header_dirty = true;
-            return true;
+            // Compare full key
+            const uint8_t *p = slot_ptr(hs, sh->map, idx);
+            if (memcmp(p + SLOT_OFF_VALUE, key, hs->key_size) == 0) {
+                write_slot_flags(hs, sh->map, idx, HASH_STORE_FLAG_TOMBSTONE);
+                sh->count--;
+                sh->tombstones++;
+                sh->header_dirty = true;
+                return true;
+            }
         }
 
         idx = (idx + 1) & mask;
@@ -742,6 +789,18 @@ uint32_t hash_store_global_depth(const hash_store_t *hs) {
     return hs ? hs->global_depth : 0;
 }
 
+uint32_t hash_store_key_size(const hash_store_t *hs) {
+    return hs ? hs->key_size : 0;
+}
+
+uint32_t hash_store_slot_size(const hash_store_t *hs) {
+    return hs ? hs->slot_size : 0;
+}
+
+uint32_t hash_store_max_value(const hash_store_t *hs) {
+    return hs ? hs->max_value : 0;
+}
+
 // ============================================================================
 // Durability
 // ============================================================================
@@ -751,7 +810,7 @@ void hash_store_sync(hash_store_t *hs) {
     for (uint32_t i = 0; i < hs->num_shards; i++) {
         shard_t *sh = hs->shards[i];
         if (sh->header_dirty)
-            shard_write_header(sh, hs->shard_cap);
+            shard_write_header(sh, hs->shard_cap, hs->slot_size);
         // Durability deferred — msync/fdatasync commented out for now.
         // msync(sh->map, sh->map_size, MS_SYNC);
     }

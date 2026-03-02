@@ -60,9 +60,8 @@
 #define HOT_KEY_POOL_SIZE       500
 #define HOT_KEY_PROBABILITY     20      // percent
 
-#define STATE_PATH  "/tmp/stress_dl_state.dat"
+#define STATE_DIR   "/tmp/stress_dl_state"
 #define CODE_PATH   "/tmp/stress_dl_code.dat"
-#define INDEX_PATH  "/tmp/stress_dl_index.dat"
 
 #define MASTER_SEED 0x5354524553534454ULL
 
@@ -549,7 +548,7 @@ static void phase2_blocks(data_layer_t *dl, uint64_t num_blocks,
         // Checkpoint
         if (block_num % ckpt_interval == 0) {
             double ct0 = now_sec();
-            bool ok = dl_checkpoint(dl, INDEX_PATH, block_num);
+            bool ok = dl_checkpoint(dl);
             double ct1 = now_sec();
             ASSERT_MSG(ok, "dl_checkpoint failed at block %" PRIu64, block_num);
 
@@ -649,45 +648,26 @@ static void phase3_recovery(data_layer_t **dl_ptr) {
            post_ckpt_state_end - post_ckpt_state_start,
            post_ckpt_code_end - post_ckpt_code_start);
 
-    // Destroy (simulates crash)
-    printf("  destroying data layer (simulating crash)...\n");
+    // Destroy (dl_destroy syncs hash_store — all merged data survives)
+    printf("  destroying data layer...\n");
     dl_destroy(dl);
     *dl_ptr = NULL;
 
-    // Restore shadow from checkpoint snapshot
-    ASSERT_MSG(g_checkpoint_snap != NULL, "no checkpoint snapshot");
-    shadow_restore_from(g_checkpoint_snap);
-    g_checkpoint_snap = NULL;
-
-    // Reset live indices to match checkpoint state
-    // Rebuild from shadow (only non-deleted state entries)
-    g_live_count = 0;
-    g_next_state_idx = post_ckpt_state_start;  // roll back
-    g_next_code_idx = post_ckpt_code_start;
-
-    // Rebuild live_indices: scan all state key indices that are alive
-    for (uint64_t i = 0; i < g_next_state_idx; i++) {
-        generate_key(key, STATE_KEY_SEED, i);
-        shadow_entry_t *se = shadow_get(key);
-        if (se && !se->is_code) {
-            live_add(i);
-        }
+    // With hash_store, dl_destroy syncs, so ALL data (including post-checkpoint)
+    // survives reopen. Shadow state remains as-is (no rollback).
+    if (g_checkpoint_snap) {
+        shadow_destroy_map(&g_checkpoint_snap);
+        g_checkpoint_snap = NULL;
     }
 
     // Recover
     double t0 = now_sec();
-    uint64_t recovered_block = 0;
-    *dl_ptr = dl_open(STATE_PATH, CODE_PATH, INDEX_PATH,
-                       KEY_SIZE, 4, &recovered_block);
+    *dl_ptr = dl_open(STATE_DIR, CODE_PATH);
     double t1 = now_sec();
     dl = *dl_ptr;
     ASSERT_MSG(dl != NULL, "dl_open failed");
-    ASSERT_MSG(recovered_block == g_checkpoint_block,
-               "recovered block %" PRIu64 " != checkpoint %" PRIu64,
-               recovered_block, g_checkpoint_block);
 
     printf("  dl_open: %.3fs\n", t1 - t0);
-    printf("  recovered block: %" PRIu64 "\n", recovered_block);
 
     dl_stats_t st = dl_stats(dl);
     uint64_t expected = shadow_live_count();
@@ -706,21 +686,17 @@ static void phase3_recovery(data_layer_t **dl_ptr) {
         verified++;
     }
 
-    // Verify post-checkpoint state keys are absent
-    uint64_t absent_verified = 0;
+    // Verify post-checkpoint state keys are also present (hash_store persists all merged data)
+    uint64_t post_verified = 0;
     for (uint64_t i = post_ckpt_state_start; i < post_ckpt_state_end; i++) {
         generate_key(key, STATE_KEY_SEED, i);
-        uint8_t tmp[64];
-        uint16_t tmp_len = 0;
-        bool found = dl_get(dl, key, tmp, &tmp_len);
-        ASSERT_MSG(!found,
-                   "post-checkpoint state key %" PRIu64 " found after recovery", i);
-        absent_verified++;
+        verify_key(dl, key, "post-checkpoint-state");
+        post_verified++;
     }
 
     free(code_buf);
     printf("  verified: %" PRIu64 " checkpoint keys OK\n", verified);
-    printf("  verified: %" PRIu64 " post-checkpoint keys absent\n", absent_verified);
+    printf("  verified: %" PRIu64 " post-checkpoint keys present\n", post_verified);
     printf("  Phase 3: PASS\n");
 }
 
@@ -821,8 +797,7 @@ static void phase4_post_recovery(data_layer_t *dl, uint64_t num_blocks,
     }
 
     // Final checkpoint
-    uint64_t final_block = g_checkpoint_block + num_blocks;
-    bool ok = dl_checkpoint(dl, INDEX_PATH, final_block);
+    bool ok = dl_checkpoint(dl);
     ASSERT_MSG(ok, "final checkpoint failed");
 
     free(code_buf);
@@ -832,7 +807,7 @@ static void phase4_post_recovery(data_layer_t *dl, uint64_t num_blocks,
            num_blocks, elapsed, num_blocks / elapsed, total_ops / elapsed / 1000.0);
     printf("  avg merge: %.1fms | total merge: %.1fs\n",
            (cum_merge_time / num_blocks) * 1000.0, cum_merge_time);
-    printf("  checkpoint at block %" PRIu64 "\n", final_block);
+    printf("  final checkpoint written\n");
     printf("  Phase 4: PASS\n");
 }
 
@@ -905,7 +880,6 @@ static void phase5_final(data_layer_t *dl) {
     printf("  verified: %" PRIu64 " keys in %.1fs\n", verified, t1 - t0);
     printf("  state entries: %" PRIu64 "\n", verified - code_count);
     printf("  code entries:  %" PRIu64 "\n", code_count);
-    printf("  free slots:    %u\n", st.free_slots);
     printf("  total merged:  %" PRIu64 "\n", st.total_merged);
     printf("  RSS: %zu MB\n", get_rss_mb());
     printf("  determinism hash: 0x%016" PRIx64 "\n", hash);
@@ -944,12 +918,11 @@ int main(int argc, char *argv[]) {
     double total_start = now_sec();
 
     // Clean up from prior runs
-    unlink(STATE_PATH);
+    { char cmd[256]; snprintf(cmd, sizeof(cmd), "rm -rf %s", STATE_DIR); system(cmd); }
     unlink(CODE_PATH);
-    unlink(INDEX_PATH);
 
     // Create data layer
-    data_layer_t *dl = dl_create(STATE_PATH, CODE_PATH, KEY_SIZE, 4);
+    data_layer_t *dl = dl_create(STATE_DIR, CODE_PATH, KEY_SIZE, 128, (1ULL << 20));
     ASSERT_MSG(dl != NULL, "dl_create failed");
 
     // Phase 1: Genesis
@@ -971,9 +944,8 @@ int main(int argc, char *argv[]) {
     dl_destroy(dl);
     shadow_destroy_map(&g_shadow);
     free(g_live_indices);
-    unlink(STATE_PATH);
+    { char cmd[256]; snprintf(cmd, sizeof(cmd), "rm -rf %s", STATE_DIR); system(cmd); }
     unlink(CODE_PATH);
-    unlink(INDEX_PATH);
 
     double total = now_sec() - total_start;
     printf("\n============================================\n");

@@ -310,7 +310,7 @@ static void test_checkpoint_recovery(void) {
     sdb_merge(sdb);
 
     // Checkpoint at block 42
-    ASSERT(sdb_checkpoint(sdb, 42));
+    ASSERT(sdb_checkpoint(sdb));
 
     sdb_stats_t pre_stats = sdb_stats(sdb);
     ASSERT(pre_stats.account_keys == 1010);  // 1000 accounts + 10 code
@@ -321,10 +321,8 @@ static void test_checkpoint_recovery(void) {
     sdb_destroy(sdb);
 
     // Reopen
-    uint64_t block_num = 0;
-    sdb = sdb_open(TEST_DIR, &block_num);
+    sdb = sdb_open(TEST_DIR);
     ASSERT(sdb != NULL);
-    ASSERT(block_num == 42);
 
     // Verify stats match
     sdb_stats_t post_stats = sdb_stats(sdb);
@@ -467,7 +465,7 @@ static void test_mixed_blocks(void) {
 
         // Checkpoint every 5 blocks
         if ((block + 1) % 5 == 0) {
-            ASSERT(sdb_checkpoint(sdb, block + 1));
+            ASSERT(sdb_checkpoint(sdb));
         }
     }
 
@@ -512,13 +510,11 @@ static void test_mixed_blocks(void) {
         ASSERT(code_len == 128);
     }
 
-    // Destroy, reopen from last checkpoint (block 10)
+    // Destroy, reopen from last checkpoint
     sdb_destroy(sdb);
 
-    uint64_t block_num = 0;
-    sdb = sdb_open(TEST_DIR, &block_num);
+    sdb = sdb_open(TEST_DIR);
     ASSERT(sdb != NULL);
-    ASSERT(block_num == 10);
 
     // Verify after recovery
     stats = sdb_stats(sdb);

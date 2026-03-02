@@ -1,12 +1,11 @@
 #include "../include/data_layer.h"
-#include "../include/checkpoint.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <time.h>
 #include <unistd.h>
-#include <fcntl.h>
 
 // ============================================================================
 // Test config
@@ -14,21 +13,47 @@
 
 #define KEY_SIZE   32
 #define VALUE_SIZE 4
-#define STATE_PATH "/tmp/test_ckpt_state.dat"
+#define STATE_DIR  "/tmp/test_ckpt_state"
 #define CODE_PATH  "/tmp/test_ckpt_code.dat"
-#define INDEX_PATH "/tmp/test_ckpt_index.dat"
+
+#define SLOT_SIZE      128
+#define SHARD_CAPACITY (1ULL << 20)
+
+// ============================================================================
+// RNG (SplitMix64) — same as test_data_layer
+// ============================================================================
+
+typedef struct { uint64_t state; } rng_t;
+
+static inline uint64_t rng_next(rng_t *rng) {
+    uint64_t z = (rng->state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+static inline rng_t rng_create(uint64_t seed) {
+    rng_t r = { .state = seed };
+    rng_next(&r);
+    return r;
+}
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
+#define KEY_SEED 0xC4EC901A75EED00DULL
+
 static void make_key(uint8_t key[KEY_SIZE], uint32_t i) {
-    memset(key, 0, KEY_SIZE);
-    // Store i in last 4 bytes (big-endian for sorted order)
-    key[KEY_SIZE - 4] = (uint8_t)(i >> 24);
-    key[KEY_SIZE - 3] = (uint8_t)(i >> 16);
-    key[KEY_SIZE - 2] = (uint8_t)(i >> 8);
-    key[KEY_SIZE - 1] = (uint8_t)(i);
+    rng_t rng = rng_create(KEY_SEED ^ ((uint64_t)i * 0x517cc1b727220a95ULL));
+    uint64_t r0 = rng_next(&rng);
+    uint64_t r1 = rng_next(&rng);
+    uint64_t r2 = rng_next(&rng);
+    uint64_t r3 = rng_next(&rng);
+    memcpy(key,      &r0, 8);
+    memcpy(key + 8,  &r1, 8);
+    memcpy(key + 16, &r2, 8);
+    memcpy(key + 24, &r3, 8);
 }
 
 static void make_value(uint8_t *buf, uint16_t *len, uint32_t i) {
@@ -41,12 +66,10 @@ static void make_value(uint8_t *buf, uint16_t *len, uint32_t i) {
 }
 
 static void cleanup_files(void) {
-    unlink(STATE_PATH);
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", STATE_DIR);
+    system(cmd);
     unlink(CODE_PATH);
-    unlink(INDEX_PATH);
-    char tmp[256];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", INDEX_PATH);
-    unlink(tmp);
 }
 
 static double now_sec(void) {
@@ -66,7 +89,7 @@ static int test_checkpoint_reload(void) {
     const uint32_t N = 100000;
 
     // Create and populate
-    data_layer_t *dl = dl_create(STATE_PATH, CODE_PATH, KEY_SIZE, VALUE_SIZE);
+    data_layer_t *dl = dl_create(STATE_DIR, CODE_PATH, KEY_SIZE, SLOT_SIZE, SHARD_CAPACITY);
     if (!dl) { printf("FAIL: dl_create\n"); return 1; }
 
     double t0 = now_sec();
@@ -90,7 +113,7 @@ static int test_checkpoint_reload(void) {
 
     // Checkpoint
     t0 = now_sec();
-    if (!dl_checkpoint(dl, INDEX_PATH, 42)) {
+    if (!dl_checkpoint(dl)) {
         printf("FAIL: dl_checkpoint\n");
         dl_destroy(dl);
         return 1;
@@ -102,19 +125,11 @@ static int test_checkpoint_reload(void) {
     dl_destroy(dl);
 
     // Reload
-    uint64_t block_num = 0;
     t0 = now_sec();
-    dl = dl_open(STATE_PATH, CODE_PATH, INDEX_PATH,
-                 KEY_SIZE, VALUE_SIZE, &block_num);
+    dl = dl_open(STATE_DIR, CODE_PATH);
     t1 = now_sec();
     if (!dl) { printf("FAIL: dl_open\n"); return 1; }
     printf("  Reload: %.3f s\n", t1 - t0);
-
-    if (block_num != 42) {
-        printf("FAIL: block_number = %lu, expected 42\n", block_num);
-        dl_destroy(dl);
-        return 1;
-    }
 
     dl_stats_t s2 = dl_stats(dl);
     if (s2.index_keys != s1.index_keys) {
@@ -162,7 +177,7 @@ static int test_code_entries_survive(void) {
     printf("\n=== Phase 2: Code Entries Survive ===\n");
     cleanup_files();
 
-    data_layer_t *dl = dl_create(STATE_PATH, CODE_PATH, KEY_SIZE, VALUE_SIZE);
+    data_layer_t *dl = dl_create(STATE_DIR, CODE_PATH, KEY_SIZE, SLOT_SIZE, SHARD_CAPACITY);
     if (!dl) { printf("FAIL: dl_create\n"); return 1; }
 
     // Store code entries
@@ -203,16 +218,14 @@ static int test_code_entries_survive(void) {
            s1.index_keys, s1.code_count);
 
     // Checkpoint + destroy + reload
-    if (!dl_checkpoint(dl, INDEX_PATH, 99)) {
+    if (!dl_checkpoint(dl)) {
         printf("FAIL: dl_checkpoint\n");
         dl_destroy(dl);
         return 1;
     }
     dl_destroy(dl);
 
-    uint64_t block_num = 0;
-    dl = dl_open(STATE_PATH, CODE_PATH, INDEX_PATH,
-                 KEY_SIZE, VALUE_SIZE, &block_num);
+    dl = dl_open(STATE_DIR, CODE_PATH);
     if (!dl) { printf("FAIL: dl_open\n"); return 1; }
 
     dl_stats_t s2 = dl_stats(dl);
@@ -281,14 +294,14 @@ static int test_code_entries_survive(void) {
 }
 
 // ============================================================================
-// Phase 3: Free List Survives
+// Phase 3: Delete + Reopen Survives
 // ============================================================================
 
-static int test_free_list_survives(void) {
-    printf("\n=== Phase 3: Free List Survives ===\n");
+static int test_delete_survives(void) {
+    printf("\n=== Phase 3: Delete + Reopen Survives ===\n");
     cleanup_files();
 
-    data_layer_t *dl = dl_create(STATE_PATH, CODE_PATH, KEY_SIZE, VALUE_SIZE);
+    data_layer_t *dl = dl_create(STATE_DIR, CODE_PATH, KEY_SIZE, SLOT_SIZE, SHARD_CAPACITY);
     if (!dl) { printf("FAIL: dl_create\n"); return 1; }
 
     // Insert 10K keys
@@ -303,7 +316,7 @@ static int test_free_list_survives(void) {
     }
     dl_merge(dl);
 
-    // Delete 5000 keys → creates free slots
+    // Delete 5000 keys
     for (uint32_t i = 0; i < 5000; i++) {
         uint8_t key[KEY_SIZE];
         make_key(key, i);
@@ -312,38 +325,21 @@ static int test_free_list_survives(void) {
     dl_merge(dl);
 
     dl_stats_t s1 = dl_stats(dl);
-    printf("  Before: index=%lu, free_slots=%u\n",
-           s1.index_keys, s1.free_slots);
-
-    if (s1.free_slots != 5000) {
-        printf("FAIL: expected 5000 free slots, got %u\n", s1.free_slots);
-        dl_destroy(dl);
-        return 1;
-    }
+    printf("  Before: index=%lu\n", s1.index_keys);
 
     // Checkpoint + destroy + reload
-    if (!dl_checkpoint(dl, INDEX_PATH, 50)) {
+    if (!dl_checkpoint(dl)) {
         printf("FAIL: dl_checkpoint\n");
         dl_destroy(dl);
         return 1;
     }
     dl_destroy(dl);
 
-    uint64_t block_num = 0;
-    dl = dl_open(STATE_PATH, CODE_PATH, INDEX_PATH,
-                 KEY_SIZE, VALUE_SIZE, &block_num);
+    dl = dl_open(STATE_DIR, CODE_PATH);
     if (!dl) { printf("FAIL: dl_open\n"); return 1; }
 
     dl_stats_t s2 = dl_stats(dl);
-    printf("  After:  index=%lu, free_slots=%u\n",
-           s2.index_keys, s2.free_slots);
-
-    if (s2.free_slots != s1.free_slots) {
-        printf("FAIL: free_slots = %u, expected %u\n",
-               s2.free_slots, s1.free_slots);
-        dl_destroy(dl);
-        return 1;
-    }
+    printf("  After:  index=%lu\n", s2.index_keys);
 
     if (s2.index_keys != s1.index_keys) {
         printf("FAIL: index_keys = %lu, expected %lu\n",
@@ -352,7 +348,42 @@ static int test_free_list_survives(void) {
         return 1;
     }
 
-    // Insert new keys → should reuse free slots
+    // Deleted keys should not be found
+    uint32_t missing = 0;
+    for (uint32_t i = 0; i < 5000; i++) {
+        uint8_t key[KEY_SIZE];
+        make_key(key, i);
+        uint8_t got[62];
+        uint16_t got_len = 0;
+        if (!dl_get(dl, key, got, &got_len)) {
+            missing++;
+        }
+    }
+
+    if (missing != 5000) {
+        printf("FAIL: expected 5000 deleted keys absent, got %u\n", missing);
+        dl_destroy(dl);
+        return 1;
+    }
+
+    // Remaining keys (5000-9999) should be found
+    for (uint32_t i = 5000; i < N; i++) {
+        uint8_t key[KEY_SIZE];
+        uint8_t expected[4];
+        uint16_t expected_len;
+        make_key(key, i);
+        make_value(expected, &expected_len, i);
+
+        uint8_t got[62];
+        uint16_t got_len = 0;
+        if (!dl_get(dl, key, got, &got_len)) {
+            printf("FAIL: key %u should exist after reload\n", i);
+            dl_destroy(dl);
+            return 1;
+        }
+    }
+
+    // Insert new keys → should work after reopen
     for (uint32_t i = 0; i < 3000; i++) {
         uint8_t key[KEY_SIZE];
         uint8_t val[4];
@@ -364,16 +395,7 @@ static int test_free_list_survives(void) {
     dl_merge(dl);
 
     dl_stats_t s3 = dl_stats(dl);
-    printf("  After reuse: index=%lu, free_slots=%u\n",
-           s3.index_keys, s3.free_slots);
-
-    // Should have 5000 - 3000 = 2000 free slots remaining
-    if (s3.free_slots != 2000) {
-        printf("FAIL: expected 2000 free slots after reuse, got %u\n",
-               s3.free_slots);
-        dl_destroy(dl);
-        return 1;
-    }
+    printf("  After new inserts: index=%lu\n", s3.index_keys);
 
     dl_destroy(dl);
     printf("  PASS\n");
@@ -388,10 +410,10 @@ static int test_multiple_checkpoints(void) {
     printf("\n=== Phase 4: Multiple Checkpoints ===\n");
     cleanup_files();
 
-    data_layer_t *dl = dl_create(STATE_PATH, CODE_PATH, KEY_SIZE, VALUE_SIZE);
+    data_layer_t *dl = dl_create(STATE_DIR, CODE_PATH, KEY_SIZE, SLOT_SIZE, SHARD_CAPACITY);
     if (!dl) { printf("FAIL: dl_create\n"); return 1; }
 
-    // Block 100: insert 50K keys
+    // Insert 50K keys + checkpoint
     for (uint32_t i = 0; i < 50000; i++) {
         uint8_t key[KEY_SIZE];
         uint8_t val[4];
@@ -402,14 +424,14 @@ static int test_multiple_checkpoints(void) {
     }
     dl_merge(dl);
 
-    if (!dl_checkpoint(dl, INDEX_PATH, 100)) {
-        printf("FAIL: checkpoint at block 100\n");
+    if (!dl_checkpoint(dl)) {
+        printf("FAIL: first checkpoint\n");
         dl_destroy(dl);
         return 1;
     }
-    printf("  Checkpoint at block 100: 50K keys\n");
+    printf("  First checkpoint: 50K keys\n");
 
-    // Block 200: insert 50K more
+    // Insert 50K more + checkpoint
     for (uint32_t i = 50000; i < 100000; i++) {
         uint8_t key[KEY_SIZE];
         uint8_t val[4];
@@ -420,26 +442,18 @@ static int test_multiple_checkpoints(void) {
     }
     dl_merge(dl);
 
-    if (!dl_checkpoint(dl, INDEX_PATH, 200)) {
-        printf("FAIL: checkpoint at block 200\n");
+    if (!dl_checkpoint(dl)) {
+        printf("FAIL: second checkpoint\n");
         dl_destroy(dl);
         return 1;
     }
-    printf("  Checkpoint at block 200: 100K keys\n");
+    printf("  Second checkpoint: 100K keys\n");
 
     dl_destroy(dl);
 
-    // Reload from latest (block 200)
-    uint64_t block_num = 0;
-    dl = dl_open(STATE_PATH, CODE_PATH, INDEX_PATH,
-                 KEY_SIZE, VALUE_SIZE, &block_num);
+    // Reload
+    dl = dl_open(STATE_DIR, CODE_PATH);
     if (!dl) { printf("FAIL: dl_open\n"); return 1; }
-
-    if (block_num != 200) {
-        printf("FAIL: block_number = %lu, expected 200\n", block_num);
-        dl_destroy(dl);
-        return 1;
-    }
 
     dl_stats_t s = dl_stats(dl);
     if (s.index_keys != 100000) {
@@ -461,24 +475,24 @@ static int test_multiple_checkpoints(void) {
         }
     }
 
-    printf("  Verified: 100K keys from block 200 checkpoint\n");
+    printf("  Verified: 100K keys after multiple checkpoints\n");
     dl_destroy(dl);
     printf("  PASS\n");
     return 0;
 }
 
 // ============================================================================
-// Phase 5: Crash Simulation
+// Phase 5: Data Survives Destroy+Reopen (without explicit checkpoint)
 // ============================================================================
 
-static int test_crash_simulation(void) {
-    printf("\n=== Phase 5: Crash Simulation ===\n");
+static int test_data_survives_reopen(void) {
+    printf("\n=== Phase 5: Data Survives Destroy+Reopen ===\n");
     cleanup_files();
 
-    data_layer_t *dl = dl_create(STATE_PATH, CODE_PATH, KEY_SIZE, VALUE_SIZE);
+    data_layer_t *dl = dl_create(STATE_DIR, CODE_PATH, KEY_SIZE, SLOT_SIZE, SHARD_CAPACITY);
     if (!dl) { printf("FAIL: dl_create\n"); return 1; }
 
-    // Block 100: insert 10K keys + checkpoint
+    // Insert 10K keys + checkpoint
     const uint32_t N1 = 10000;
     for (uint32_t i = 0; i < N1; i++) {
         uint8_t key[KEY_SIZE];
@@ -490,14 +504,14 @@ static int test_crash_simulation(void) {
     }
     dl_merge(dl);
 
-    if (!dl_checkpoint(dl, INDEX_PATH, 100)) {
-        printf("FAIL: checkpoint at block 100\n");
+    if (!dl_checkpoint(dl)) {
+        printf("FAIL: checkpoint\n");
         dl_destroy(dl);
         return 1;
     }
-    printf("  Checkpoint at block 100: %u keys\n", N1);
+    printf("  Checkpoint: %u keys\n", N1);
 
-    // Block 101-110: insert 5K more + merge (NO checkpoint)
+    // Insert 5K more + merge (NO explicit checkpoint)
     const uint32_t N2 = 5000;
     for (uint32_t i = N1; i < N1 + N2; i++) {
         uint8_t key[KEY_SIZE];
@@ -510,153 +524,57 @@ static int test_crash_simulation(void) {
     dl_merge(dl);
     printf("  Post-checkpoint merges: %u more keys (no checkpoint)\n", N2);
 
-    // "Crash": destroy without checkpoint
+    // Destroy (dl_destroy syncs hash_store, so data should survive)
     dl_destroy(dl);
-    printf("  Simulated crash\n");
+    printf("  Destroyed data layer\n");
 
-    // Recovery: open from block 100 checkpoint
-    uint64_t block_num = 0;
-    dl = dl_open(STATE_PATH, CODE_PATH, INDEX_PATH,
-                 KEY_SIZE, VALUE_SIZE, &block_num);
+    // Reopen
+    dl = dl_open(STATE_DIR, CODE_PATH);
     if (!dl) { printf("FAIL: dl_open\n"); return 1; }
 
-    if (block_num != 100) {
-        printf("FAIL: block_number = %lu, expected 100\n", block_num);
-        dl_destroy(dl);
-        return 1;
-    }
-
     dl_stats_t s = dl_stats(dl);
-    printf("  Recovered: index_keys=%lu (expected %u)\n",
-           s.index_keys, N1);
+    printf("  Reopened: index_keys=%lu\n", s.index_keys);
 
-    if (s.index_keys != N1) {
-        printf("FAIL: index_keys = %lu, expected %u\n", s.index_keys, N1);
+    // With hash_store, merged data is on disk via mmap, so all N1+N2 keys
+    // should be present after reopen (dl_destroy syncs).
+    uint64_t expected = N1 + N2;
+    if (s.index_keys != expected) {
+        printf("FAIL: index_keys = %lu, expected %lu\n",
+               s.index_keys, expected);
         dl_destroy(dl);
         return 1;
     }
 
-    // Block 100 keys should exist
-    for (uint32_t i = 0; i < N1; i++) {
+    // All keys should exist
+    for (uint32_t i = 0; i < N1 + N2; i++) {
         uint8_t key[KEY_SIZE];
         make_key(key, i);
         uint8_t got[62];
         uint16_t got_len = 0;
         if (!dl_get(dl, key, got, &got_len)) {
-            printf("FAIL: block-100 key %u not found\n", i);
+            printf("FAIL: key %u not found\n", i);
             dl_destroy(dl);
             return 1;
         }
     }
 
-    // Post-checkpoint keys should NOT exist in index
-    // (they were in state.dat but index doesn't know about them)
-    uint32_t missing = 0;
-    for (uint32_t i = N1; i < N1 + N2; i++) {
-        uint8_t key[KEY_SIZE];
-        make_key(key, i);
-        uint8_t got[62];
-        uint16_t got_len = 0;
-        if (!dl_get(dl, key, got, &got_len)) {
-            missing++;
-        }
-    }
-
-    printf("  Post-checkpoint keys missing: %u/%u (expected all)\n",
-           missing, N2);
-    if (missing != N2) {
-        printf("FAIL: expected %u missing, got %u\n", N2, missing);
-        dl_destroy(dl);
-        return 1;
-    }
-
+    printf("  Verified: %lu keys present after destroy+reopen\n", expected);
     dl_destroy(dl);
     printf("  PASS\n");
     return 0;
 }
 
 // ============================================================================
-// Phase 6: CRC Integrity
-// ============================================================================
-
-static int test_crc_integrity(void) {
-    printf("\n=== Phase 6: CRC Integrity ===\n");
-    cleanup_files();
-
-    data_layer_t *dl = dl_create(STATE_PATH, CODE_PATH, KEY_SIZE, VALUE_SIZE);
-    if (!dl) { printf("FAIL: dl_create\n"); return 1; }
-
-    // Insert some data
-    for (uint32_t i = 0; i < 1000; i++) {
-        uint8_t key[KEY_SIZE];
-        uint8_t val[4];
-        uint16_t vlen;
-        make_key(key, i);
-        make_value(val, &vlen, i);
-        dl_put(dl, key, val, vlen);
-    }
-    dl_merge(dl);
-
-    if (!dl_checkpoint(dl, INDEX_PATH, 10)) {
-        printf("FAIL: dl_checkpoint\n");
-        dl_destroy(dl);
-        return 1;
-    }
-    dl_destroy(dl);
-
-    // Verify good checkpoint loads
-    uint64_t block_num = 0;
-    dl = dl_open(STATE_PATH, CODE_PATH, INDEX_PATH,
-                 KEY_SIZE, VALUE_SIZE, &block_num);
-    if (!dl) { printf("FAIL: good checkpoint failed to load\n"); return 1; }
-    dl_destroy(dl);
-    printf("  Good checkpoint loads: OK\n");
-
-    // Corrupt one byte in the data section (after header)
-    int fd = open(INDEX_PATH, O_RDWR);
-    if (fd < 0) { printf("FAIL: open index.dat\n"); return 1; }
-
-    uint8_t byte;
-    // Corrupt at offset 4096 + 10 (inside first entry)
-    if (pread(fd, &byte, 1, 4096 + 10) != 1) {
-        printf("FAIL: pread corruption byte\n");
-        close(fd);
-        return 1;
-    }
-    byte ^= 0xFF;  // flip all bits
-    if (pwrite(fd, &byte, 1, 4096 + 10) != 1) {
-        printf("FAIL: pwrite corruption byte\n");
-        close(fd);
-        return 1;
-    }
-    close(fd);
-
-    // Attempt to load corrupted checkpoint — should fail
-    // Need fresh state_store and code_store for the attempt
-    dl = dl_open(STATE_PATH, CODE_PATH, INDEX_PATH,
-                 KEY_SIZE, VALUE_SIZE, &block_num);
-    if (dl) {
-        printf("FAIL: corrupted checkpoint should not load\n");
-        dl_destroy(dl);
-        return 1;
-    }
-    printf("  Corrupted checkpoint rejected: OK\n");
-
-    printf("  PASS\n");
-    return 0;
-}
-
-// ============================================================================
-// Phase 7: Scale (1M keys)
+// Phase 6: Scale (1M keys)
 // ============================================================================
 
 static int test_scale_1m(void) {
-    printf("\n=== Phase 7: Scale (1M keys) ===\n");
+    printf("\n=== Phase 6: Scale (1M keys) ===\n");
     cleanup_files();
 
     const uint32_t N = 1000000;
 
-    data_layer_t *dl = dl_create(STATE_PATH, CODE_PATH, KEY_SIZE, VALUE_SIZE);
+    data_layer_t *dl = dl_create(STATE_DIR, CODE_PATH, KEY_SIZE, SLOT_SIZE, SHARD_CAPACITY);
     if (!dl) { printf("FAIL: dl_create\n"); return 1; }
 
     // Insert 1M keys in batches of 5K (like real blocks)
@@ -681,7 +599,7 @@ static int test_scale_1m(void) {
 
     // Checkpoint
     t0 = now_sec();
-    if (!dl_checkpoint(dl, INDEX_PATH, 1000)) {
+    if (!dl_checkpoint(dl)) {
         printf("FAIL: dl_checkpoint\n");
         dl_destroy(dl);
         return 1;
@@ -693,10 +611,8 @@ static int test_scale_1m(void) {
     dl_destroy(dl);
 
     // Reload
-    uint64_t block_num = 0;
     t0 = now_sec();
-    dl = dl_open(STATE_PATH, CODE_PATH, INDEX_PATH,
-                 KEY_SIZE, VALUE_SIZE, &block_num);
+    dl = dl_open(STATE_DIR, CODE_PATH);
     t1 = now_sec();
     if (!dl) { printf("FAIL: dl_open\n"); return 1; }
     printf("  Reload: %.3f s\n", t1 - t0);
@@ -734,7 +650,7 @@ static int test_scale_1m(void) {
     }
 
     printf("  Spot-checked: %u keys correct\n", verified);
-    printf("  index.dat covers %lu keys\n", s2.index_keys);
+    printf("  hash_store covers %lu keys\n", s2.index_keys);
     dl_destroy(dl);
     printf("  PASS\n");
     return 0;
@@ -750,10 +666,9 @@ int main(void) {
     int failures = 0;
     failures += test_checkpoint_reload();
     failures += test_code_entries_survive();
-    failures += test_free_list_survives();
+    failures += test_delete_survives();
     failures += test_multiple_checkpoints();
-    failures += test_crash_simulation();
-    failures += test_crc_integrity();
+    failures += test_data_survives_reopen();
     failures += test_scale_1m();
 
     cleanup_files();

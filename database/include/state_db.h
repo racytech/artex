@@ -9,16 +9,16 @@
  * State DB — Unified wrapper for account state + contract storage.
  *
  * Architecture:
- *   Two independent data_layer_t instances:
- *     - accounts (key=32): account state + contract code
- *     - storage  (key=64): contract storage slots (addr_hash || slot_hash)
+ *   Two independent data_layer_t instances (hash_store-backed):
+ *     - accounts (key=32, slot=128): account state + contract code
+ *     - storage  (key=64, slot=64):  contract storage slots (addr_hash || slot_hash)
  *
  * Directory layout:
- *   {dir}/state.dat, code.dat, index.dat       — accounts
- *   {dir}/storage/state.dat, index.dat          — storage slots
+ *   {dir}/accounts/  — hash_store shard files for account state + code refs
+ *   {dir}/code.dat   — contract bytecode (append-only)
+ *   {dir}/storage/   — hash_store shard files for storage slots
  *
  * Composite storage key: addr_hash[32] || slot_hash[32] = 64 bytes.
- * Sorted order groups all slots per account contiguously.
  *
  * Opaque handle — struct defined in state_db.c.
  */
@@ -28,11 +28,9 @@ typedef struct state_db state_db_t;
 typedef struct {
     uint64_t account_keys;       // committed account entries
     uint64_t account_buffer;     // pending account buffer entries
-    uint32_t account_free_slots;
     uint32_t code_count;         // code_store entries
     uint64_t storage_keys;       // committed storage entries
     uint64_t storage_buffer;     // pending storage buffer entries
-    uint32_t storage_free_slots;
     uint64_t total_merged;       // lifetime merged (both layers)
 } sdb_stats_t;
 
@@ -47,11 +45,10 @@ typedef struct {
 state_db_t *sdb_create(const char *dir);
 
 /**
- * Open from existing checkpoints (recovery path).
- * Both layers must have matching block numbers.
- * Returns NULL on failure or block number mismatch.
+ * Open from existing hash_store directories (recovery path).
+ * Returns NULL on failure.
  */
-state_db_t *sdb_open(const char *dir, uint64_t *out_block_number);
+state_db_t *sdb_open(const char *dir);
 
 /**
  * Destroy the state DB and free all resources.
@@ -101,8 +98,8 @@ bool sdb_delete_storage(state_db_t *sdb,
 /** Merge both layers. Returns total entries processed. */
 uint64_t sdb_merge(state_db_t *sdb);
 
-/** Checkpoint both layers at the given block number. */
-bool sdb_checkpoint(state_db_t *sdb, uint64_t block_number);
+/** Sync both hash_stores to disk. */
+bool sdb_checkpoint(state_db_t *sdb);
 
 /** Get combined stats. */
 sdb_stats_t sdb_stats(const state_db_t *sdb);

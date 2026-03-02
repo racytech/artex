@@ -41,14 +41,12 @@ add_library(common STATIC
     common/src/address.c
 )
 
-# Data Layer (state store + code store + checkpoint + write buffer + index merge)
+# Data Layer (hash_store + code store + write buffer + merge)
 add_library(data_layer STATIC
-    database/src/state_store.c
     database/src/code_store.c
-    database/src/checkpoint.c
     database/src/data_layer.c
 )
-target_link_libraries(data_layer compact_art art_database)
+target_link_libraries(data_layer hash_store art_database)
 
 # State DB (account state + contract storage — dual data_layer wrapper)
 add_library(state_db STATIC

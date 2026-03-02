@@ -15,7 +15,6 @@
  */
 
 #include "../include/data_layer.h"
-#include "../include/state_store.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -481,7 +480,7 @@ int main(int argc, char *argv[]) {
     }
 
     uint64_t seed = 0xC0DE5700EC0DE500ULL;
-    const char *state_path = "/tmp/art_cs_test_state.dat";
+    const char *state_dir = "/tmp/art_cs_test_state";
     const char *code_path = "/tmp/art_cs_test_code.dat";
 
     printf("============================================\n");
@@ -490,7 +489,7 @@ int main(int argc, char *argv[]) {
     printf("scale:  %" PRIu64 "K code entries (phase 5)\n", scale_thousands);
     printf("RSS:    %zu MB\n", get_rss_mb());
 
-    data_layer_t *dl = dl_create(state_path, code_path, KEY_SIZE, 4);
+    data_layer_t *dl = dl_create(state_dir, code_path, KEY_SIZE, 128, (1ULL << 20));
     if (!dl) {
         fprintf(stderr, "FAIL: dl_create\n");
         return 1;
@@ -520,7 +519,7 @@ int main(int argc, char *argv[]) {
 
 cleanup:
     dl_destroy(dl);
-    unlink(state_path);
+    { char cmd[256]; snprintf(cmd, sizeof(cmd), "rm -rf %s", state_dir); system(cmd); }
     unlink(code_path);
     return result;
 }
