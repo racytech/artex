@@ -14,7 +14,9 @@ set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG")
 include_directories(
     ${CMAKE_SOURCE_DIR}/database/include
     ${CMAKE_SOURCE_DIR}/common/include
+    ${CMAKE_SOURCE_DIR}/state/include
     ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_SOURCE_DIR}/third_party/blst/bindings
 )
 
 #==============================================================================
@@ -88,6 +90,18 @@ add_library(ih_hash_store STATIC
     database/src/ih_hash_store.c
 )
 target_link_libraries(ih_hash_store hash_store common)
+
+# blst (BLS12-381 field arithmetic — pre-built static library)
+add_library(blst STATIC IMPORTED)
+set_target_properties(blst PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/third_party/blst/libblst.a
+)
+
+# Banderwagon curve arithmetic (twisted Edwards over blst_fr)
+add_library(banderwagon STATIC
+    state/src/banderwagon.c
+)
+target_link_libraries(banderwagon blst)
 
 #==============================================================================
 # Tests
@@ -249,6 +263,13 @@ add_executable(test_ih_hash_store
 )
 target_link_libraries(test_ih_hash_store ih_hash_store intermediate_hashes)
 add_test(NAME test_ih_hash_store COMMAND test_ih_hash_store)
+
+# Test: Banderwagon curve arithmetic (twisted Edwards + blst)
+add_executable(test_banderwagon
+    state/tests/test_banderwagon.c
+)
+target_link_libraries(test_banderwagon banderwagon)
+add_test(NAME test_banderwagon COMMAND test_banderwagon)
 
 #==============================================================================
 # Build Summary
