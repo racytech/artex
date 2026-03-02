@@ -124,6 +124,7 @@ __archive/
 
 # Test fixtures
 integration_tests/fixtures/
+vm/tests/fixtures/
 
 # Root directory test/benchmark files
 /*.c

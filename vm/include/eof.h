@@ -117,6 +117,10 @@ typedef struct {
     uint32_t       code_size;
 } eof_func_t;
 
+// Container kind (determined by parent's EOFCREATE/RETURNCONTRACT references)
+#define EOF_CONTAINER_RUNTIME   0
+#define EOF_CONTAINER_INITCODE  1
+
 /** Parsed EOF container. */
 typedef struct eof_container {
     uint8_t                  version;
@@ -126,6 +130,8 @@ typedef struct eof_container {
     uint32_t                 data_size;
     uint16_t                 num_containers;
     struct eof_container   **containers;      // nested containers (for EOFCREATE)
+    uint32_t                *sub_offsets;     // byte offsets of sub-containers in raw[]
+    uint16_t                *sub_sizes;       // declared sizes of sub-containers
     uint8_t                 *raw;             // owned copy of full bytecode
     size_t                   raw_size;
 } eof_container_t;
@@ -155,9 +161,19 @@ typedef enum {
 /**
  * Validate raw EOF bytecode. On success, returns EOF_VALID and writes
  * a heap-allocated container to *out. On failure, *out is NULL.
+ * Assumes runtime container kind (suitable for CALL targets).
  */
 eof_validation_error_t eof_validate(const uint8_t *bytecode, size_t len,
                                      eof_container_t **out);
+
+/**
+ * Validate raw EOF bytecode with explicit container kind.
+ * container_kind: EOF_CONTAINER_RUNTIME (0) or EOF_CONTAINER_INITCODE (1).
+ * Use initcode for deploy transactions (CREATE/EOFCREATE targets).
+ */
+eof_validation_error_t eof_validate_kind(const uint8_t *bytecode, size_t len,
+                                          int container_kind,
+                                          eof_container_t **out);
 
 /** Free a parsed container (recursive for nested containers). */
 void eof_container_free(eof_container_t *c);

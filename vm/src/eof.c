@@ -104,7 +104,7 @@ const eof_opcode_info_t EOF_OPCODES[256] = {
     // 0x58 PC             — removed in EOF
     [0x59] = { "MSIZE",        0, 1, 0, true, false },
     // 0x5A GAS            — removed in EOF
-    // 0x5B JUMPDEST       — removed in EOF
+    [0x5B] = { "NOP",          0, 0, 0, true, false },  // JUMPDEST repurposed as NOP in EOF
     [0x5C] = { "TLOAD",        1, 1, 0, true, false },
     [0x5D] = { "TSTORE",       2, 0, 0, true, false },
     [0x5E] = { "MCOPY",        3, 0, 0, true, false },
@@ -298,14 +298,27 @@ static bool visit_successor(int current_offset, int next_offset,
 // Phase A: Header Parsing
 //==============================================================================
 
+/** Internal validation with depth and container kind tracking. */
+static eof_validation_error_t eof_validate_internal(const uint8_t *bytecode,
+                                                     size_t len,
+                                                     int depth,
+                                                     int container_kind,
+                                                     eof_container_t **out);
+
 /**
  * Parse the EOF header and populate an eof_container_t.
  * Does NOT validate code sections (that's Phase B).
+ * depth=0 for top-level, >0 for nested sub-containers.
  */
 static eof_validation_error_t eof_parse_header(const uint8_t *code, size_t len,
+                                                int depth,
                                                 eof_container_t *c)
 {
     if (len < 14)
+        return EOF_INVALID_HEADER;
+
+    // Container size limit (EIP-3540: max 49152 bytes)
+    if (len > 49152)
         return EOF_INVALID_HEADER;
 
     // Magic
@@ -465,11 +478,13 @@ static eof_validation_error_t eof_parse_header(const uint8_t *code, size_t len,
         pos += code_sizes[i];
     }
 
-    // --- Parse nested containers (shallow — recursive validation done later) ---
+    // --- Record sub-container positions (deferred validation in eof_validate_internal) ---
     c->num_containers = num_containers;
     if (num_containers > 0) {
         c->containers = (eof_container_t **)calloc(num_containers, sizeof(eof_container_t *));
-        if (!c->containers) {
+        c->sub_offsets = (uint32_t *)calloc(num_containers, sizeof(uint32_t));
+        c->sub_sizes = (uint16_t *)malloc(num_containers * sizeof(uint16_t));
+        if (!c->containers || !c->sub_offsets || !c->sub_sizes) {
             free(code_sizes); free(container_sizes);
             return EOF_INVALID_HEADER;
         }
@@ -478,28 +493,32 @@ static eof_validation_error_t eof_parse_header(const uint8_t *code, size_t len,
                 free(code_sizes); free(container_sizes);
                 return EOF_INVALID_HEADER;
             }
-
-            eof_container_t *sub = NULL;
-            eof_validation_error_t err = eof_validate(&code[pos], container_sizes[i], &sub);
-            if (err != EOF_VALID) {
-                free(code_sizes); free(container_sizes);
-                return EOF_INVALID_CONTAINER;
-            }
-            c->containers[i] = sub;
+            c->sub_offsets[i] = (uint32_t)pos;
+            c->sub_sizes[i] = container_sizes[i];
             pos += container_sizes[i];
         }
     }
 
     // --- Data section ---
     c->data = (pos < len) ? &code[pos] : NULL;
-    // Actual data present may be >= data_size (for top-level) or exactly data_size
     c->data_size = data_size;
 
-    // Validate body size: remaining bytes should match data section
-    size_t remaining = len - pos;
-    if (remaining < data_size) {
-        // Truncated data section — allowed for sub-containers but for now
-        // we accept it (runtime can deal with partial data)
+    // --- Body size validation ---
+    // pos is now at the start of the data body.
+    // Verify total consumed bytes + declared data_size matches container length.
+    if (depth == 0) {
+        // Top-level: exact match required (no truncation, no trailing bytes)
+        if (pos + data_size != len) {
+            free(code_sizes); free(container_sizes);
+            return EOF_INVALID_HEADER;
+        }
+    } else {
+        // Sub-container: trailing bytes are never allowed.
+        // Truncated data is allowed (initcode may have data filled at deploy time).
+        if (pos + data_size < len) {
+            free(code_sizes); free(container_sizes);
+            return EOF_INVALID_HEADER;
+        }
     }
 
     free(code_sizes);
@@ -632,13 +651,20 @@ static eof_validation_error_t validate_rjump_destinations(const uint8_t *code,
 
 /**
  * Validate instructions in a code section: check opcodes are valid,
- * function indices are in bounds, and last instruction is terminating.
+ * function indices are in bounds, last instruction is terminating,
+ * returning flag matches declaration, and container kind rules.
  */
 static eof_validation_error_t validate_instructions(const uint8_t *code,
                                                      uint32_t code_size,
+                                                     uint16_t func_idx,
+                                                     int container_kind,
                                                      const eof_container_t *c)
 {
     if (code_size == 0) return EOF_INVALID_HEADER;
+
+    const eof_func_t *func = &c->functions[func_idx];
+    bool expected_returning = (func->outputs != EOF_NON_RETURNING);
+    bool is_returning = false;
 
     uint8_t last_op = 0;
     for (uint32_t pos = 0; pos < code_size; ) {
@@ -659,7 +685,7 @@ static eof_validation_error_t validate_instructions(const uint8_t *code,
         if (pos + 1 + imm_size > code_size)
             return EOF_TRUNCATED_INSTRUCTION;
 
-        // Validate CALLF/JUMPF function index
+        // Validate CALLF/JUMPF function index and track returning status
         if (op == OP_CALLF || op == OP_JUMPF) {
             uint16_t fid = read_u16(&code[pos + 1]);
             if (fid >= c->num_functions)
@@ -668,6 +694,28 @@ static eof_validation_error_t validate_instructions(const uint8_t *code,
             // CALLF to non-returning function is invalid
             if (op == OP_CALLF && c->functions[fid].outputs == EOF_NON_RETURNING)
                 return EOF_INVALID_FUNCTION_INDEX;
+
+            // JUMPF to returning function → this section is returning
+            if (op == OP_JUMPF &&
+                c->functions[fid].outputs != EOF_NON_RETURNING) {
+                is_returning = true;
+            }
+        }
+
+        // RETF is a returning path
+        if (op == OP_RETF) {
+            is_returning = true;
+        }
+
+        // Container kind checks
+        if (container_kind == EOF_CONTAINER_INITCODE) {
+            // Initcode may NOT contain RETURN or STOP
+            if (op == OP_RETURN || op == OP_STOP)
+                return EOF_INVALID_CONTAINER;
+        } else if (container_kind == EOF_CONTAINER_RUNTIME) {
+            // Runtime may NOT contain RETURNCONTRACT
+            if (op == OP_RETURNCONTRACT)
+                return EOF_INVALID_CONTAINER;
         }
 
         // Validate EOFCREATE/RETURNCONTRACT container index
@@ -690,6 +738,10 @@ static eof_validation_error_t validate_instructions(const uint8_t *code,
 
     // Last instruction must be terminating
     if (!is_terminating(last_op) && last_op != OP_RJUMP)
+        return EOF_INVALID_TERMINATION;
+
+    // Returning flag must match declaration
+    if (is_returning != expected_returning)
         return EOF_INVALID_TERMINATION;
 
     return EOF_VALID;
@@ -772,6 +824,11 @@ static eof_validation_error_t validate_stack(const uint8_t *code,
             if (target->outputs == EOF_NON_RETURNING) {
                 stack_required = target->inputs;
             } else {
+                // JUMPF to returning: target outputs must be <= current outputs
+                if (this_outputs < (int)target->outputs) {
+                    free(heights);
+                    return EOF_STACK_HEIGHT_MISMATCH;
+                }
                 // Returning JUMPF: current stack must match
                 stack_required = this_outputs + (int)target->inputs - (int)target->outputs;
                 if (cur.max > stack_required) {
@@ -894,11 +951,108 @@ static eof_validation_error_t validate_stack(const uint8_t *code,
 }
 
 //==============================================================================
+// Phase C: Unreachable code section detection
+//==============================================================================
+
+/**
+ * Check that all code sections are reachable from section 0 via CALLF/JUMPF.
+ * Uses BFS starting from section 0, scanning each section for CALLF/JUMPF
+ * operands to discover reachable sections.
+ */
+static eof_validation_error_t check_reachable_sections(const eof_container_t *c)
+{
+    if (c->num_functions <= 1) return EOF_VALID;
+
+    bool *visited = (bool *)calloc(c->num_functions, sizeof(bool));
+    if (!visited) return EOF_INVALID_HEADER;
+
+    uint16_t *queue = (uint16_t *)malloc(c->num_functions * sizeof(uint16_t));
+    if (!queue) { free(visited); return EOF_INVALID_HEADER; }
+
+    int front = 0, back = 0;
+    visited[0] = true;
+    queue[back++] = 0;
+
+    while (front < back) {
+        uint16_t sec = queue[front++];
+        const uint8_t *code = c->functions[sec].code;
+        uint32_t code_size = c->functions[sec].code_size;
+
+        for (uint32_t pos = 0; pos < code_size; ) {
+            uint8_t op = code[pos];
+            const eof_opcode_info_t *info = &EOF_OPCODES[op];
+
+            uint32_t imm_size = info->imm_size;
+            if (op == OP_RJUMPV) {
+                imm_size = 1 + ((uint32_t)code[pos + 1] + 1) * 2;
+            }
+
+            if (op == OP_CALLF || op == OP_JUMPF) {
+                uint16_t fid = read_u16(&code[pos + 1]);
+                if (fid < c->num_functions && !visited[fid]) {
+                    visited[fid] = true;
+                    queue[back++] = fid;
+                }
+            }
+
+            pos += 1 + imm_size;
+        }
+    }
+
+    bool all_reachable = true;
+    for (uint16_t i = 0; i < c->num_functions; i++) {
+        if (!visited[i]) { all_reachable = false; break; }
+    }
+
+    free(visited);
+    free(queue);
+
+    return all_reachable ? EOF_VALID : EOF_UNREACHABLE_CODE;
+}
+
+//==============================================================================
 // Public API
 //==============================================================================
 
-eof_validation_error_t eof_validate(const uint8_t *bytecode, size_t len,
-                                     eof_container_t **out)
+/**
+ * Collect sub-container references from all code sections.
+ * Returns arrays of which containers are referenced by EOFCREATE and RETURNCONTRACT.
+ */
+static void collect_container_refs(const eof_container_t *c,
+                                    bool *eofcreate_refs,
+                                    bool *returncontract_refs)
+{
+    for (uint16_t s = 0; s < c->num_functions; s++) {
+        const uint8_t *code = c->functions[s].code;
+        uint32_t code_size = c->functions[s].code_size;
+
+        for (uint32_t pos = 0; pos < code_size; ) {
+            uint8_t op = code[pos];
+            const eof_opcode_info_t *info = &EOF_OPCODES[op];
+
+            uint32_t imm_size = info->imm_size;
+            if (op == OP_RJUMPV) {
+                imm_size = 1 + ((uint32_t)code[pos + 1] + 1) * 2;
+            }
+
+            if (op == OP_EOFCREATE) {
+                uint8_t idx = code[pos + 1];
+                if (idx < c->num_containers) eofcreate_refs[idx] = true;
+            } else if (op == OP_RETURNCONTRACT) {
+                uint8_t idx = code[pos + 1];
+                if (idx < c->num_containers) returncontract_refs[idx] = true;
+            }
+
+            pos += 1 + imm_size;
+        }
+    }
+}
+
+static eof_validation_error_t eof_validate_internal(const uint8_t *bytecode,
+                                                     size_t len,
+                                                     int depth,
+                                                     int container_kind,
+                                                     eof_container_t **out)
 {
     if (!bytecode || len == 0 || !out) {
         if (out) *out = NULL;
@@ -917,11 +1071,21 @@ eof_validation_error_t eof_validate(const uint8_t *bytecode, size_t len,
     memcpy(c->raw, bytecode, len);
     c->raw_size = len;
 
-    // Phase A: Parse header
-    eof_validation_error_t err = eof_parse_header(c->raw, len, c);
+    // Phase A: Parse header (with body size validation, no sub-container validation)
+    eof_validation_error_t err = eof_parse_header(c->raw, len, depth, c);
     if (err != EOF_VALID) {
         eof_container_free(c);
         return err;
+    }
+
+    // Initcode sub-containers must NOT have truncated data section.
+    // eof_parse_header allows truncation for depth>0, so check here.
+    if (depth > 0 && container_kind == EOF_CONTAINER_INITCODE && c->data_size > 0) {
+        size_t data_body_start = c->data ? (size_t)(c->data - c->raw) : len;
+        if (data_body_start + c->data_size > len) {
+            eof_container_free(c);
+            return EOF_INVALID_CONTAINER;  // EOFCREATE_WITH_TRUNCATED_CONTAINER
+        }
     }
 
     // Phase B: Validate each code section
@@ -936,8 +1100,9 @@ eof_validation_error_t eof_validate(const uint8_t *bytecode, size_t len,
             return err;
         }
 
-        // B.2: Validate instructions (opcodes, function indices, termination)
-        err = validate_instructions(code, code_size, c);
+        // B.2: Validate instructions (opcodes, function indices, termination,
+        //      returning flag, container kind rules)
+        err = validate_instructions(code, code_size, i, container_kind, c);
         if (err != EOF_VALID) {
             eof_container_free(c);
             return err;
@@ -951,8 +1116,75 @@ eof_validation_error_t eof_validate(const uint8_t *bytecode, size_t len,
         }
     }
 
+    // Phase C: Check all code sections are reachable from section 0
+    err = check_reachable_sections(c);
+    if (err != EOF_VALID) {
+        eof_container_free(c);
+        return err;
+    }
+
+    // Phase D: Validate sub-containers (with container kind from EOFCREATE/RETURNCONTRACT refs)
+    if (c->num_containers > 0) {
+        bool *eofcreate_refs = (bool *)calloc(c->num_containers, sizeof(bool));
+        bool *returncontract_refs = (bool *)calloc(c->num_containers, sizeof(bool));
+        if (!eofcreate_refs || !returncontract_refs) {
+            free(eofcreate_refs); free(returncontract_refs);
+            eof_container_free(c);
+            return EOF_INVALID_HEADER;
+        }
+
+        collect_container_refs(c, eofcreate_refs, returncontract_refs);
+
+        for (uint16_t i = 0; i < c->num_containers; i++) {
+            // Check orphan (not referenced by either) or ambiguous (referenced by both)
+            if (eofcreate_refs[i] && returncontract_refs[i]) {
+                free(eofcreate_refs); free(returncontract_refs);
+                eof_container_free(c);
+                return EOF_INVALID_CONTAINER;  // AMBIGUOUS_CONTAINER_KIND
+            }
+            if (!eofcreate_refs[i] && !returncontract_refs[i]) {
+                free(eofcreate_refs); free(returncontract_refs);
+                eof_container_free(c);
+                return EOF_INVALID_CONTAINER;  // ORPHAN_SUBCONTAINER
+            }
+
+            // Determine sub-container kind
+            int sub_kind = eofcreate_refs[i]
+                           ? EOF_CONTAINER_INITCODE
+                           : EOF_CONTAINER_RUNTIME;
+
+            // Validate sub-container recursively (initcode truncation checked inside)
+            eof_container_t *sub = NULL;
+            err = eof_validate_internal(
+                c->raw + c->sub_offsets[i], c->sub_sizes[i],
+                depth + 1, sub_kind, &sub);
+            if (err != EOF_VALID) {
+                free(eofcreate_refs); free(returncontract_refs);
+                eof_container_free(c);
+                return err;
+            }
+            c->containers[i] = sub;
+        }
+
+        free(eofcreate_refs);
+        free(returncontract_refs);
+    }
+
     *out = c;
     return EOF_VALID;
+}
+
+eof_validation_error_t eof_validate(const uint8_t *bytecode, size_t len,
+                                     eof_container_t **out)
+{
+    return eof_validate_internal(bytecode, len, 0, EOF_CONTAINER_RUNTIME, out);
+}
+
+eof_validation_error_t eof_validate_kind(const uint8_t *bytecode, size_t len,
+                                          int container_kind,
+                                          eof_container_t **out)
+{
+    return eof_validate_internal(bytecode, len, 0, container_kind, out);
 }
 
 void eof_container_free(eof_container_t *c)
@@ -967,6 +1199,8 @@ void eof_container_free(eof_container_t *c)
         free(c->containers);
     }
 
+    free(c->sub_offsets);
+    free(c->sub_sizes);
     free(c->functions);
     free(c->raw);
     free(c);
