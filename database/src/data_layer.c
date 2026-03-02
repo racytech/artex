@@ -102,7 +102,8 @@ bool dl_put(data_layer_t *dl, const uint8_t *key,
 
 bool dl_delete(data_layer_t *dl, const uint8_t *key) {
     if (!dl || !key) return false;
-    return hash_store_delete(dl->store, key);
+    hash_store_delete(dl->store, key);
+    return true;  // no-op if key absent (matches old buffer semantics)
 }
 
 bool dl_get(data_layer_t *dl, const uint8_t *key,
