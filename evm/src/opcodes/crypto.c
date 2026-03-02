@@ -51,11 +51,9 @@ evm_status_t op_keccak256(evm_t *evm)
     if (size == 0)
     {
         hash_t empty_hash = hash_keccak256(NULL, 0);
-        
-        // Convert hash to uint256
-        uint256_t hash_value;
-        memset(&hash_value, 0, sizeof(uint256_t));
-        memcpy(&hash_value, empty_hash.bytes, HASH_SIZE);
+
+        // Convert hash (big-endian) to uint256
+        uint256_t hash_value = uint256_from_bytes(empty_hash.bytes, HASH_SIZE);
 
         if (!evm_stack_push(evm->stack, &hash_value))
         {
@@ -92,10 +90,8 @@ evm_status_t op_keccak256(evm_t *evm)
     hash_t hash = hash_keccak256(data, size);
     free(data);
 
-    // Convert hash to uint256 and push to stack
-    uint256_t hash_value;
-    memset(&hash_value, 0, sizeof(uint256_t));
-    memcpy(&hash_value, hash.bytes, HASH_SIZE);
+    // Convert hash (big-endian) to uint256
+    uint256_t hash_value = uint256_from_bytes(hash.bytes, HASH_SIZE);
 
     if (!evm_stack_push(evm->stack, &hash_value))
     {

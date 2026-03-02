@@ -286,7 +286,7 @@ bool test_runner_run_state_test(test_runner_t *runner,
             hash_t actual_root = evm_state_compute_state_root_ex(runner->state, prune_empty);
             if (!hash_equals(&actual_root, &post_cond->state_root)) {
                 result->status = TEST_FAIL;
-                
+
                 char *expected_str = hash_to_hex_string(&post_cond->state_root);
                 char *actual_str = hash_to_hex_string(&actual_root);
                 

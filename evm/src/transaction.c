@@ -212,6 +212,64 @@ bool transaction_execute(
         return false;
     }
 
+    // Transaction gas limit must not exceed block gas limit
+    if (tx->gas_limit > env->gas_limit) {
+        LOG_EVM_ERROR("Transaction gas limit %lu exceeds block gas limit %lu",
+                      tx->gas_limit, env->gas_limit);
+        return false;
+    }
+
+    // EIP-1559 validations
+    if (tx->type == TX_TYPE_EIP1559 || tx->type == TX_TYPE_EIP4844) {
+        // max_priority_fee_per_gas must not exceed max_fee_per_gas
+        if (uint256_gt(&tx->max_priority_fee_per_gas, &tx->max_fee_per_gas)) {
+            LOG_EVM_ERROR("max_priority_fee_per_gas exceeds max_fee_per_gas");
+            return false;
+        }
+        // max_fee_per_gas must be >= block base_fee
+        if (uint256_lt(&tx->max_fee_per_gas, &env->base_fee)) {
+            LOG_EVM_ERROR("max_fee_per_gas below block base_fee");
+            return false;
+        }
+    }
+
+    // Post-London: legacy/EIP-2930 gas_price must be >= base_fee
+    if (evm->fork >= FORK_LONDON &&
+        (tx->type == TX_TYPE_LEGACY || tx->type == TX_TYPE_EIP2930)) {
+        if (uint256_lt(&tx->gas_price, &env->base_fee)) {
+            LOG_EVM_ERROR("gas_price below block base_fee");
+            return false;
+        }
+    }
+
+    // Balance check: sender must have enough for maximum gas cost + value
+    // EIP-1559: use max_fee_per_gas (not effective_gas_price) for balance check
+    {
+        uint256_t max_gas_price;
+        if (tx->type == TX_TYPE_EIP1559 || tx->type == TX_TYPE_EIP4844) {
+            max_gas_price = tx->max_fee_per_gas;
+        } else {
+            max_gas_price = tx->gas_price;
+        }
+        uint256_t gl = uint256_from_uint64(tx->gas_limit);
+        uint256_t max_gas_cost = uint256_mul(&max_gas_price, &gl);
+        uint256_t total_cost = uint256_add(&max_gas_cost, &tx->value);
+        uint256_t sender_balance = evm_state_get_balance(state, &tx->sender);
+        if (uint256_lt(&sender_balance, &total_cost)) {
+            LOG_EVM_ERROR("Insufficient sender balance for max gas cost + value");
+            return false;
+        }
+    }
+
+    // Reject transaction if sender nonce is at max (overflow protection)
+    {
+        uint64_t sender_nonce = evm_state_get_nonce(state, &tx->sender);
+        if (sender_nonce == UINT64_MAX) {
+            LOG_EVM_ERROR("Sender nonce at maximum, cannot increment");
+            return false;
+        }
+    }
+
     // Calculate effective gas price
     uint256_t effective_gas_price = transaction_effective_gas_price(tx, env);
     uint256_t gas_limit_u256 = uint256_from_uint64(tx->gas_limit);

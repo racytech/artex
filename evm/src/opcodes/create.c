@@ -291,6 +291,18 @@ static evm_status_t execute_create(evm_t *evm,
         if (init_result.output_data) {
             free(init_result.output_data);
         }
+
+        // CREATE return data handling:
+        // - Success: return_data = empty (deployed code is NOT return data)
+        // - REVERT: return_data = revert data from initcode (keep it)
+        // - Other error (OOG etc.): return_data = empty
+        if (init_result.status != EVM_REVERT) {
+            if (evm->return_data) {
+                free(evm->return_data);
+                evm->return_data = NULL;
+            }
+            evm->return_data_size = 0;
+        }
     }
     else
     {

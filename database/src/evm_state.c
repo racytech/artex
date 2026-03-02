@@ -1171,20 +1171,6 @@ static bool collect_account_cb(const uint8_t *key, size_t key_len,
     account_collect_ctx_t *ctx = (account_collect_ctx_t *)user_data;
     const cached_account_t *ca = (const cached_account_t *)value;
 
-    // DEBUG: dump account info
-    {
-        fprintf(stderr, "DEBUG collect: 0x");
-        for (int i = 0; i < 20; i++) fprintf(stderr, "%02x", ca->addr.bytes[i]);
-        uint8_t bal_be[32];
-        uint256_to_bytes(&ca->account.balance, bal_be);
-        fprintf(stderr, " n=%lu code=%d sd=%d ex=%d cr=%d d=%d bal=0x",
-                (unsigned long)ca->account.nonce, ca->account.has_code,
-                ca->self_destructed, ca->existed, ca->created, ca->dirty);
-        int z = 0; while (z < 31 && bal_be[z] == 0) z++;
-        for (int i = z; i < 32; i++) fprintf(stderr, "%02x", bal_be[i]);
-        fprintf(stderr, "\n");
-    }
-
     // Skip self-destructed accounts
     if (ca->self_destructed) return true;
 
@@ -1305,3 +1291,4 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
 
     return root;
 }
+

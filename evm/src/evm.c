@@ -546,7 +546,11 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         // For CREATE, the input_data IS the init code
         evm->code = msg->input_data;
         evm->code_size = msg->input_size;
-        
+
+        // Calldata is empty for CREATE operations (initcode is code, not calldata)
+        evm->msg.input_data = NULL;
+        evm->msg.input_size = 0;
+
         LOG_EVM_DEBUG("CREATE: Running init code (%zu bytes)", evm->code_size);
     }
     else
