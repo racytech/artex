@@ -34,8 +34,14 @@ typedef struct evm_state evm_state_t;
 // Lifecycle
 // ============================================================================
 
-/** Create EVM state over an existing state_db. sdb is NOT owned. */
-evm_state_t *evm_state_create(state_db_t *sdb);
+/**
+ * Create EVM state over an existing state_db. sdb is NOT owned.
+ * @param state_mpt_path  Path for persistent state MPT file, or NULL for
+ *                        ephemeral mode (rebuilds trie from scratch each call).
+ *                        When set, the MPT survives between blocks — only dirty
+ *                        accounts are re-inserted per compute_state_root call.
+ */
+evm_state_t *evm_state_create(state_db_t *sdb, const char *state_mpt_path);
 
 /** Destroy EVM state and free all in-memory caches. */
 void evm_state_destroy(evm_state_t *es);
@@ -151,11 +157,14 @@ bool evm_state_finalize(evm_state_t *es);
 /**
  * Compute Ethereum MPT state root from current in-memory state.
  *
- * Builds the full MPT over keccak256(address) → RLP([nonce, balance, storageRoot, codeHash]).
- * Storage roots are computed per-account from keccak256(slot) → RLP(trimmed_uint256).
- * Uses mpt trie for root computation.
+ * Persistent mode (state_mpt_path was set at create):
+ *   Only dirty/created accounts are inserted into the persistent MPT.
+ *   mpt_root walks only dirty paths — O(dirty × depth).
  *
- * Does NOT require finalize — reads directly from in-memory caches.
+ * Ephemeral mode (state_mpt_path was NULL):
+ *   Rebuilds the entire state trie from scratch each call.
+ *
+ * Storage roots are always computed per-account from evm_state cache (ephemeral).
  */
 hash_t evm_state_compute_state_root(evm_state_t *es);
 

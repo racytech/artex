@@ -1,13 +1,14 @@
 /*
  * EVM State Test Suite
  *
- * 6 phases:
+ * 7 phases:
  *   1. Account operations (nonce, balance)
  *   2. Storage operations
  *   3. Snapshot & revert
  *   4. Code operations
  *   5. Self-destruct
  *   6. Access lists (EIP-2929)
+ *   7. Persistent state root (incremental mpt)
  */
 
 #include "../include/evm_state.h"
@@ -71,7 +72,7 @@ static void test_account_ops(void) {
     state_db_t *sdb = sdb_create(TEST_DIR);
     ASSERT(sdb != NULL, "sdb_create failed");
 
-    evm_state_t *es = evm_state_create(sdb);
+    evm_state_t *es = evm_state_create(sdb, NULL);
     ASSERT(es != NULL, "evm_state_create failed");
 
     // Set nonce and balance on 10 accounts
@@ -187,7 +188,7 @@ static void test_storage_ops(void) {
     state_db_t *sdb = sdb_create(TEST_DIR);
     ASSERT(sdb != NULL, "sdb_create failed");
 
-    evm_state_t *es = evm_state_create(sdb);
+    evm_state_t *es = evm_state_create(sdb, NULL);
     ASSERT(es != NULL, "evm_state_create failed");
 
     // Set 100 storage slots across 5 accounts (20 each)
@@ -281,7 +282,7 @@ static void test_snapshot_revert(void) {
     state_db_t *sdb = sdb_create(TEST_DIR);
     ASSERT(sdb != NULL, "sdb_create failed");
 
-    evm_state_t *es = evm_state_create(sdb);
+    evm_state_t *es = evm_state_create(sdb, NULL);
     ASSERT(es != NULL, "evm_state_create failed");
 
     address_t addr_a = make_addr(0xAA);
@@ -365,7 +366,7 @@ static void test_code_ops(void) {
     state_db_t *sdb = sdb_create(TEST_DIR);
     ASSERT(sdb != NULL, "sdb_create failed");
 
-    evm_state_t *es = evm_state_create(sdb);
+    evm_state_t *es = evm_state_create(sdb, NULL);
     ASSERT(es != NULL, "evm_state_create failed");
 
     address_t addr = make_addr(0xCC);
@@ -453,7 +454,7 @@ static void test_self_destruct(void) {
     state_db_t *sdb = sdb_create(TEST_DIR);
     ASSERT(sdb != NULL, "sdb_create failed");
 
-    evm_state_t *es = evm_state_create(sdb);
+    evm_state_t *es = evm_state_create(sdb, NULL);
     ASSERT(es != NULL, "evm_state_create failed");
 
     address_t addr = make_addr(0xDD);
@@ -522,7 +523,7 @@ static void test_access_lists(void) {
     state_db_t *sdb = sdb_create(TEST_DIR);
     ASSERT(sdb != NULL, "sdb_create failed");
 
-    evm_state_t *es = evm_state_create(sdb);
+    evm_state_t *es = evm_state_create(sdb, NULL);
     ASSERT(es != NULL, "evm_state_create failed");
 
     address_t addr = make_addr(0xAA);
@@ -581,6 +582,114 @@ static void test_access_lists(void) {
 }
 
 // ============================================================================
+// Phase 7: Persistent State Root (Incremental MPT)
+// ============================================================================
+
+#define STATE_MPT_PATH "/tmp/test_evm_state_mpt.dat"
+
+static void test_persistent_state_root(void) {
+    printf("\n--- Phase 7: Persistent State Root ---\n");
+
+    cleanup_dir(TEST_DIR);
+    unlink(STATE_MPT_PATH);
+
+    state_db_t *sdb = sdb_create(TEST_DIR);
+    ASSERT(sdb != NULL, "sdb_create failed");
+
+    // --- Block 1: set up 5 accounts with storage, compute first root ---
+    evm_state_t *es = evm_state_create(sdb, STATE_MPT_PATH);
+    ASSERT(es != NULL, "evm_state_create failed");
+
+    for (uint8_t i = 0; i < 5; i++) {
+        address_t addr = make_addr(i);
+        evm_state_set_nonce(es, &addr, (uint64_t)(i + 1));
+        uint256_t bal = make_u256((uint64_t)(i + 1) * 1000);
+        evm_state_set_balance(es, &addr, &bal);
+
+        // 3 storage slots per account
+        for (uint8_t s = 0; s < 3; s++) {
+            uint256_t key = make_u256(s);
+            uint256_t val = make_u256((uint64_t)(i + 1) * 100 + s);
+            evm_state_set_storage(es, &addr, &key, &val);
+        }
+    }
+
+    hash_t root1 = evm_state_compute_state_root(es);
+    ASSERT(!hash_is_zero(&root1), "root1 should not be zero");
+    ASSERT(!hash_equal(&root1, &HASH_EMPTY_STORAGE), "root1 should not be empty trie");
+    printf("  block 1 root:              OK\n");
+
+    // Finalize block 1 (commits mpt meta page + writes to state_db)
+    ASSERT(evm_state_finalize(es), "finalize block 1 failed");
+    sdb_merge(sdb);
+    evm_state_destroy(es);
+
+    // --- Block 2: modify 1 account, compute incremental root ---
+    es = evm_state_create(sdb, STATE_MPT_PATH);
+    ASSERT(es != NULL, "evm_state_create block 2 failed");
+
+    {
+        address_t addr = make_addr(0);
+        evm_state_set_nonce(es, &addr, 99);
+    }
+
+    hash_t root2 = evm_state_compute_state_root(es);
+    ASSERT(!hash_is_zero(&root2), "root2 should not be zero");
+    ASSERT(!hash_equal(&root2, &root1), "root2 should differ from root1");
+    printf("  block 2 incremental root:  OK\n");
+
+    ASSERT(evm_state_finalize(es), "finalize block 2 failed");
+    sdb_merge(sdb);
+    evm_state_destroy(es);
+
+    // --- Block 3: modify storage, verify root changes again ---
+    es = evm_state_create(sdb, STATE_MPT_PATH);
+    ASSERT(es != NULL, "evm_state_create block 3 failed");
+
+    {
+        address_t addr = make_addr(1);
+        uint256_t key = make_u256(0);
+        uint256_t val = make_u256(999999);
+        evm_state_set_storage(es, &addr, &key, &val);
+        // Mark account dirty so it gets re-inserted with new storage root
+        evm_state_set_nonce(es, &addr, 2);
+    }
+
+    hash_t root3 = evm_state_compute_state_root(es);
+    ASSERT(!hash_equal(&root3, &root2), "root3 should differ from root2");
+    printf("  block 3 storage change:    OK\n");
+
+    ASSERT(evm_state_finalize(es), "finalize block 3 failed");
+    sdb_merge(sdb);
+    evm_state_destroy(es);
+
+    // --- Verify: reopen mpt, load same state, root must match ---
+    es = evm_state_create(sdb, STATE_MPT_PATH);
+    ASSERT(es != NULL, "evm_state_create verify failed");
+
+    // Load all 5 accounts + their storage to populate cache
+    for (uint8_t i = 0; i < 5; i++) {
+        address_t addr = make_addr(i);
+        (void)evm_state_get_nonce(es, &addr);
+        for (uint8_t s = 0; s < 3; s++) {
+            uint256_t key = make_u256(s);
+            (void)evm_state_get_storage(es, &addr, &key);
+        }
+    }
+
+    // No changes made — root should come from persistent mpt directly
+    hash_t root_verify = evm_state_compute_state_root(es);
+    ASSERT(hash_equal(&root_verify, &root3),
+           "reopen root should match block 3 root");
+    printf("  reopen + verify root:      OK\n");
+
+    evm_state_destroy(es);
+    sdb_destroy(sdb);
+    cleanup_dir(TEST_DIR);
+    unlink(STATE_MPT_PATH);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -595,6 +704,7 @@ int main(void) {
     test_code_ops();
     test_self_destruct();
     test_access_lists();
+    test_persistent_state_root();
 
     cleanup_dir(TEST_DIR);
 

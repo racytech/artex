@@ -81,6 +81,8 @@ struct evm_state {
     uint32_t          journal_cap;
     mem_art_t         warm_addrs;   // key: addr[20], value: (none, 0 bytes)
     mem_art_t         warm_slots;   // key: skey[52], value: (none, 0 bytes)
+    mpt_t            *state_mpt;    // persistent state trie (NULL = ephemeral)
+    char             *state_mpt_path;
 };
 
 // ============================================================================
@@ -191,7 +193,7 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
 // Lifecycle
 // ============================================================================
 
-evm_state_t *evm_state_create(state_db_t *sdb) {
+evm_state_t *evm_state_create(state_db_t *sdb, const char *state_mpt_path) {
     if (!sdb) return NULL;
 
     evm_state_t *es = calloc(1, sizeof(evm_state_t));
@@ -216,6 +218,23 @@ evm_state_t *evm_state_create(state_db_t *sdb) {
         free(es->journal);
         free(es);
         return NULL;
+    }
+
+    // Open or create persistent state MPT if path given
+    if (state_mpt_path) {
+        es->state_mpt_path = strdup(state_mpt_path);
+        if (!es->state_mpt_path) {
+            evm_state_destroy(es);
+            return NULL;
+        }
+        // Try open existing, fall back to create
+        es->state_mpt = mpt_open(state_mpt_path);
+        if (!es->state_mpt)
+            es->state_mpt = mpt_create(state_mpt_path);
+        if (!es->state_mpt) {
+            evm_state_destroy(es);
+            return NULL;
+        }
     }
 
     return es;
@@ -249,6 +268,10 @@ void evm_state_destroy(evm_state_t *es) {
             free(es->journal[i].data.code.old_code);
         }
     }
+
+    // Close persistent state MPT (file survives for next block)
+    if (es->state_mpt) mpt_close(es->state_mpt);
+    free(es->state_mpt_path);
 
     free(es->journal);
     free(es);
@@ -804,7 +827,13 @@ bool evm_state_finalize(evm_state_t *es) {
 
     // Write dirty storage slots
     mem_art_foreach(&es->storage, finalize_storage_cb, &ctx);
-    return ctx.ok;
+    if (!ctx.ok) return false;
+
+    // Commit persistent state MPT meta page
+    if (es->state_mpt)
+        mpt_commit(es->state_mpt);
+
+    return true;
 }
 
 // ============================================================================
@@ -971,7 +1000,32 @@ typedef struct {
     mpt_t              *state_mpt;
     storage_root_map_t *storage_roots;
     bool                prune_empty;
+    bool                incremental;   // only process dirty/created accounts
 } account_root_ctx_t;
+
+// Encode account into state mpt: keccak256(addr) → RLP([nonce, bal, storageRoot, codeHash])
+static void account_mpt_put(mpt_t *state_mpt,
+                              const cached_account_t *ca,
+                              const hash_t *storage_root) {
+    hash_t code_hash = ca->account.has_code ? ca->account.code_hash
+                                            : HASH_EMPTY_CODE;
+
+    rlp_item_t *list = rlp_list_new();
+    rlp_list_append(list, rlp_uint64(ca->account.nonce));
+
+    uint8_t bal_be[32];
+    size_t bal_len = uint256_to_trimmed_be(&ca->account.balance, bal_be);
+    rlp_list_append(list, rlp_string(bal_be, bal_len));
+    rlp_list_append(list, rlp_string(storage_root->bytes, 32));
+    rlp_list_append(list, rlp_string(code_hash.bytes, 32));
+
+    bytes_t encoded = rlp_encode(list);
+    rlp_item_free(list);
+
+    hash_t hk = hash_keccak256(ca->addr.bytes, ADDRESS_SIZE);
+    mpt_put(state_mpt, hk.bytes, encoded.data, (uint8_t)encoded.len);
+    free(encoded.data);
+}
 
 static bool account_root_cb(const uint8_t *key, size_t key_len,
                               const void *value, size_t value_len,
@@ -980,15 +1034,34 @@ static bool account_root_cb(const uint8_t *key, size_t key_len,
     account_root_ctx_t *ctx = (account_root_ctx_t *)user_data;
     const cached_account_t *ca = (const cached_account_t *)value;
 
-    // Skip self-destructed accounts
-    if (ca->self_destructed) return true;
+    // In incremental mode, only process accounts that changed this block
+    if (ctx->incremental) {
+        if (!ca->dirty && !ca->created && !ca->code_dirty && !ca->self_destructed)
+            return true;
+    }
+
+    // Self-destructed: delete from persistent mpt
+    if (ca->self_destructed) {
+        if (ctx->incremental) {
+            hash_t hk = hash_keccak256(ca->addr.bytes, ADDRESS_SIZE);
+            mpt_delete(ctx->state_mpt, hk.bytes);
+        }
+        return true;
+    }
 
     // Skip empty accounts based on EIP-161 rules
     bool is_empty = (ca->account.nonce == 0 &&
                      uint256_is_zero(&ca->account.balance) &&
                      !ca->account.has_code);
     if (is_empty) {
-        if (ctx->prune_empty) return true;
+        if (ctx->prune_empty) {
+            // In incremental mode, must delete from mpt if previously existed
+            if (ctx->incremental && (ca->existed || ca->created)) {
+                hash_t hk = hash_keccak256(ca->addr.bytes, ADDRESS_SIZE);
+                mpt_delete(ctx->state_mpt, hk.bytes);
+            }
+            return true;
+        }
         if (!ca->existed && !ca->created && !ca->dirty) return true;
     }
 
@@ -997,28 +1070,7 @@ static bool account_root_cb(const uint8_t *key, size_t key_len,
     hash_t *sr = storage_root_map_get(ctx->storage_roots, &ca->addr);
     if (sr) storage_root = *sr;
 
-    // Code hash
-    hash_t code_hash = ca->account.has_code ? ca->account.code_hash
-                                            : HASH_EMPTY_CODE;
-
-    // Build RLP([nonce, balance, storageRoot, codeHash])
-    rlp_item_t *list = rlp_list_new();
-    rlp_list_append(list, rlp_uint64(ca->account.nonce));
-
-    uint8_t bal_be[32];
-    size_t bal_len = uint256_to_trimmed_be(&ca->account.balance, bal_be);
-    rlp_list_append(list, rlp_string(bal_be, bal_len));
-    rlp_list_append(list, rlp_string(storage_root.bytes, 32));
-    rlp_list_append(list, rlp_string(code_hash.bytes, 32));
-
-    bytes_t encoded = rlp_encode(list);
-    rlp_item_free(list);
-
-    // Hash the address: keccak256(addr[20])
-    hash_t hk = hash_keccak256(ca->addr.bytes, ADDRESS_SIZE);
-
-    mpt_put(ctx->state_mpt, hk.bytes, encoded.data, (uint8_t)encoded.len);
-    free(encoded.data);
+    account_mpt_put(ctx->state_mpt, ca, &storage_root);
     return true;
 }
 
@@ -1030,28 +1082,45 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     if (!es) return HASH_EMPTY_STORAGE;
     if (mem_art_is_empty(&es->accounts)) return HASH_EMPTY_STORAGE;
 
-    // Create temporary MPT instances
+    // Storage roots are always built ephemerally from evm_state cache
     unlink(STORAGE_MPT_PATH);
-    unlink(STATE_MPT_PATH);
-
     mpt_t *storage_mpt = mpt_create(STORAGE_MPT_PATH);
+    if (!storage_mpt) return HASH_EMPTY_STORAGE;
+
+    storage_root_map_t sr_map = build_storage_roots(es, storage_mpt);
+
+    mpt_close(storage_mpt);
+    unlink(STORAGE_MPT_PATH);
+
+    // --- Persistent mode: use es->state_mpt, only dirty accounts ---
+    if (es->state_mpt) {
+        account_root_ctx_t ctx = {
+            .state_mpt = es->state_mpt,
+            .storage_roots = &sr_map,
+            .prune_empty = prune_empty,
+            .incremental = true,
+        };
+        mem_art_foreach(&es->accounts, account_root_cb, &ctx);
+        free(sr_map.entries);
+
+        if (mpt_size(es->state_mpt) == 0)
+            return HASH_EMPTY_STORAGE;
+        return mpt_root(es->state_mpt);
+    }
+
+    // --- Ephemeral mode: rebuild from scratch ---
+    unlink(STATE_MPT_PATH);
     mpt_t *state_mpt = mpt_create(STATE_MPT_PATH);
-    if (!storage_mpt || !state_mpt) {
-        if (storage_mpt) mpt_close(storage_mpt);
-        if (state_mpt) mpt_close(state_mpt);
-        unlink(STORAGE_MPT_PATH);
-        unlink(STATE_MPT_PATH);
+    if (!state_mpt) {
+        free(sr_map.entries);
         return HASH_EMPTY_STORAGE;
     }
 
-    // Phase 1: single pass over storage → per-account storage roots
-    storage_root_map_t sr_map = build_storage_roots(es, storage_mpt);
-
-    // Phase 2: iterate accounts, look up storage roots, build state trie
     account_root_ctx_t ctx = {
         .state_mpt = state_mpt,
         .storage_roots = &sr_map,
         .prune_empty = prune_empty,
+        .incremental = false,
     };
     mem_art_foreach(&es->accounts, account_root_cb, &ctx);
 
@@ -1061,9 +1130,7 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     else
         root = mpt_root(state_mpt);
 
-    mpt_close(storage_mpt);
     mpt_close(state_mpt);
-    unlink(STORAGE_MPT_PATH);
     unlink(STATE_MPT_PATH);
     free(sr_map.entries);
 
