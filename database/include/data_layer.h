@@ -6,23 +6,17 @@
 #include <stdbool.h>
 
 /**
- * Data Layer — Write buffer + hash_store + code.dat.
+ * Data Layer — hash_store + code.dat.
  *
  * Architecture:
- *   dl_put/dl_delete  → write buffer (mem_art, in-memory)
- *   dl_merge          → flush buffer to hash_store (mmap'd, already on disk)
- *   dl_get            → buffer → hash_store (direct, no indirection)
- *   dl_put_code       → direct to code.dat + hash_store (bypasses buffer)
- *   dl_get_code       → hash_store → code.dat (read path)
+ *   dl_put/dl_delete  → hash_store directly (mmap'd, zero-copy)
+ *   dl_get            → hash_store (single lookup)
+ *   dl_put_code       → code.dat + hash_store
+ *   dl_get_code       → hash_store → code.dat
+ *   dl_merge          → no-op (kept for API compat, writes are immediate)
  *
- * Hash store value encoding:
- *   byte 0 = 0x00 → state entry, bytes 1..len = actual value
- *   byte 0 = 0x01 → code entry, bytes 1..5 = code_store index (uint32_t)
- *
- * Replaces compact_art (100 B/key RAM) + state_store (state.dat) with
- * hash_store (zero RAM, values inline in mmap'd slots).
- * Checkpoint = hash_store_sync (data already on disk).
- * Recovery = hash_store_open (no index.dat rebuild).
+ * hash_store: zero-RAM mmap'd hash table. Writes land directly in
+ * memory-mapped slots — no intermediate buffer or copy needed.
  *
  * Opaque handle — struct defined in data_layer.c.
  */
@@ -73,19 +67,19 @@ void dl_destroy(data_layer_t *dl);
 // ============================================================================
 
 /**
- * Write a key-value pair to the buffer (memory only).
- * len must be <= hash_store max_value - 1 (1 byte reserved for type prefix).
+ * Write a key-value pair directly to hash_store.
+ * len must be <= hash_store max_value.
  */
 bool dl_put(data_layer_t *dl, const uint8_t *key,
             const void *value, uint16_t len);
 
 /**
- * Mark a key as deleted in the buffer (tombstone).
+ * Delete a key from hash_store (tombstone).
  */
 bool dl_delete(data_layer_t *dl, const uint8_t *key);
 
 /**
- * Read a key. Checks buffer first, then hash_store.
+ * Read a key from hash_store.
  * Returns false if not found or deleted.
  */
 bool dl_get(data_layer_t *dl, const uint8_t *key,
@@ -121,8 +115,8 @@ uint32_t dl_code_length(data_layer_t *dl, const uint8_t *key);
 // ============================================================================
 
 /**
- * Flush write buffer to hash_store. Call after each block.
- * Returns number of entries processed.
+ * No-op — writes go directly to hash_store. Kept for API compatibility.
+ * Always returns 0.
  */
 uint64_t dl_merge(data_layer_t *dl);
 
@@ -136,29 +130,6 @@ uint64_t dl_merge(data_layer_t *dl);
  * Returns false on failure.
  */
 bool dl_checkpoint(data_layer_t *dl);
-
-// ============================================================================
-// Dirty Key Extraction (for MPT commitment — pre-merge)
-// ============================================================================
-
-typedef struct {
-    uint8_t  **keys;        // sorted keys (owned)
-    uint8_t  **values;      // value bytes; NULL for deletes (owned)
-    size_t    *value_lens;  // value lengths; 0 for deletes
-    size_t     count;
-} dl_dirty_set_t;
-
-/**
- * Extract sorted dirty keys + values from write buffer.
- * Must be called BEFORE dl_merge() (merge clears the buffer).
- * Returns false on allocation failure or empty buffer.
- */
-bool dl_extract_dirty(data_layer_t *dl, dl_dirty_set_t *out);
-
-/**
- * Free all memory owned by a dirty set.
- */
-void dl_dirty_set_free(dl_dirty_set_t *ds);
 
 // ============================================================================
 // Diagnostics

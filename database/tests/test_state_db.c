@@ -114,9 +114,8 @@ static void test_basic_crud(void) {
         ASSERT(sdb_put_storage(sdb, addr0, slot, val, 32));
     }
 
-    // Merge
-    uint64_t merged = sdb_merge(sdb);
-    ASSERT(merged == 200);
+    // Merge (no-op — writes go directly to hash_store)
+    sdb_merge(sdb);
 
     // Verify all accounts
     for (uint32_t i = 0; i < 100; i++) {
