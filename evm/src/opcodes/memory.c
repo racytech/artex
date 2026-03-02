@@ -175,6 +175,22 @@ evm_status_t op_mcopy(evm_t *evm)
     if (!evm_stack_pop(evm->stack, &size_256))
         return EVM_STACK_UNDERFLOW;
 
+    // EIP-5656: zero-length copy is a no-op (no memory expansion)
+    if (uint256_is_zero(&size_256)) {
+        if (!evm_use_gas(evm, GAS_VERY_LOW))
+            return EVM_OUT_OF_GAS;
+        return EVM_SUCCESS;
+    }
+
+    // Any value > UINT32_MAX is guaranteed OOG for memory operations
+    // (gas cost would exceed any block gas limit). Check using uint256 high bits.
+    uint256_t mem_limit = uint256_from_uint64(0x200000000ULL); // ~8GB, well beyond any gas limit
+    if (uint256_gt(&size_256, &mem_limit) ||
+        uint256_gt(&dst_256, &mem_limit) ||
+        uint256_gt(&src_256, &mem_limit)) {
+        return EVM_OUT_OF_GAS;
+    }
+
     uint64_t dst = uint256_to_uint64(&dst_256);
     uint64_t src = uint256_to_uint64(&src_256);
     uint64_t size = uint256_to_uint64(&size_256);
@@ -182,13 +198,12 @@ evm_status_t op_mcopy(evm_t *evm)
     // Gas: 3 (base) + 3 * words (copy) + memory expansion
     uint64_t copy_gas = gas_copy_cost(size);
     // Memory expansion covers both src and dst regions
-    uint64_t max_end = (dst + size > src + size) ? dst + size : src + size;
+    uint64_t dst_end = dst + size;
+    uint64_t src_end = src + size;
+    uint64_t max_end = (dst_end > src_end) ? dst_end : src_end;
     uint64_t mem_gas = evm_memory_expansion_cost(evm->memory->size, max_end);
     if (!evm_use_gas(evm, GAS_VERY_LOW + copy_gas + mem_gas))
         return EVM_OUT_OF_GAS;
-
-    if (size == 0)
-        return EVM_SUCCESS;
 
     // Expand memory to cover both regions
     if (!evm_memory_expand(evm->memory, dst, size))
