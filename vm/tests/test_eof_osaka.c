@@ -272,7 +272,7 @@ static void process_file(const char *path, stats_t *global, bool verbose,
             cJSON *results = cJSON_GetObjectItemCaseSensitive(vector, "results");
             if (!results) continue;
 
-            cJSON *osaka = cJSON_GetObjectItemCaseSensitive(results, "Osaka");
+            cJSON *osaka = cJSON_GetObjectItemCaseSensitive(results, "EOFv1");
             if (!osaka) continue;
 
             cJSON *result_json = cJSON_GetObjectItemCaseSensitive(osaka, "result");

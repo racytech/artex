@@ -23,6 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Epilogue: MSTORE at 0, RETURN 32 bytes (8 bytes)
+#define RET32  0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xF3
+
 static int tests_run = 0;
 static int tests_passed = 0;
 
@@ -74,7 +77,7 @@ static uint8_t *build_eof(uint8_t inputs, uint8_t outputs,
     buf[pos++] = 0x02; buf[pos++] = 0x00; buf[pos++] = 0x01;  // code: 1 section
     buf[pos++] = (uint8_t)(code_size >> 8);
     buf[pos++] = (uint8_t)(code_size & 0xFF);
-    buf[pos++] = 0x04;                                          // data section
+    buf[pos++] = 0xFF;                                          // data section
     buf[pos++] = (uint8_t)(data_size >> 8);
     buf[pos++] = (uint8_t)(data_size & 0xFF);
     buf[pos++] = 0x00;                                          // terminator
@@ -129,7 +132,7 @@ static uint8_t *build_eof_two_funcs(
     buf[pos++] = (uint8_t)(code0_size & 0xFF);
     buf[pos++] = (uint8_t)(code1_size >> 8);
     buf[pos++] = (uint8_t)(code1_size & 0xFF);
-    buf[pos++] = 0x04; buf[pos++] = 0x00; buf[pos++] = 0x00;  // data: 0
+    buf[pos++] = 0xFF; buf[pos++] = 0x00; buf[pos++] = 0x00;  // data: 0
     buf[pos++] = 0x00;                                          // terminator
 
     buf[pos++] = in0; buf[pos++] = out0;
@@ -184,6 +187,108 @@ static void exec_free(exec_t *e)
     if (e->vm) vm_destroy(e->vm);
     if (e->container) eof_container_free(e->container);
     vm_result_free(&e->result);
+}
+
+//==============================================================================
+// Mock Host (Phase 3: storage, balance, transient, logs)
+//==============================================================================
+
+typedef struct {
+    uint256_t storage[16];
+    uint256_t transient[16];
+    uint256_t balance;
+    bool      log_called;
+    uint8_t   log_topic_count;
+    uint256_t log_topics[4];
+    uint8_t   log_data[256];
+    size_t    log_data_size;
+} mock_host_t;
+
+static uint256_t mock_sload(void *ctx, const address_t *addr, const uint256_t *key) {
+    (void)addr;
+    mock_host_t *h = (mock_host_t *)ctx;
+    uint64_t idx = (uint64_t)key->low;
+    return (idx < 16) ? h->storage[idx] : UINT256_ZERO;
+}
+
+static vm_sstore_result_t mock_sstore(void *ctx, const address_t *addr,
+                                       const uint256_t *key, const uint256_t *value) {
+    (void)addr;
+    mock_host_t *h = (mock_host_t *)ctx;
+    uint64_t idx = (uint64_t)key->low;
+    vm_sstore_result_t result = { UINT256_ZERO, UINT256_ZERO };
+    if (idx < 16) {
+        result.current = h->storage[idx];
+        result.original = h->storage[idx];
+        h->storage[idx] = *value;
+    }
+    return result;
+}
+
+static uint256_t mock_balance(void *ctx, const address_t *addr) {
+    (void)addr;
+    return ((mock_host_t *)ctx)->balance;
+}
+
+static uint256_t mock_tload(void *ctx, const address_t *addr, const uint256_t *key) {
+    (void)addr;
+    mock_host_t *h = (mock_host_t *)ctx;
+    uint64_t idx = (uint64_t)key->low;
+    return (idx < 16) ? h->transient[idx] : UINT256_ZERO;
+}
+
+static void mock_tstore(void *ctx, const address_t *addr,
+                          const uint256_t *key, const uint256_t *value) {
+    (void)addr;
+    mock_host_t *h = (mock_host_t *)ctx;
+    uint64_t idx = (uint64_t)key->low;
+    if (idx < 16) h->transient[idx] = *value;
+}
+
+static void mock_emit_log(void *ctx, const address_t *addr,
+                            const uint256_t *topics, uint8_t n_topics,
+                            const uint8_t *data, size_t data_size) {
+    (void)addr;
+    mock_host_t *h = (mock_host_t *)ctx;
+    h->log_called = true;
+    h->log_topic_count = n_topics;
+    for (int i = 0; i < n_topics && i < 4; i++)
+        h->log_topics[i] = topics[i];
+    if (data && data_size <= sizeof(h->log_data)) {
+        memcpy(h->log_data, data, data_size);
+        h->log_data_size = data_size;
+    }
+}
+
+static const vm_host_iface_t MOCK_HOST = {
+    .sload     = mock_sload,
+    .sstore    = mock_sstore,
+    .balance   = mock_balance,
+    .tload     = mock_tload,
+    .tstore    = mock_tstore,
+    .emit_log  = mock_emit_log,
+};
+
+/** Extended execution helper with message, block, tx, and host. */
+static bool exec_eof_with(const uint8_t *eof_bytes, size_t eof_len,
+                           const vm_message_t *msg,
+                           const vm_block_env_t *block,
+                           const vm_tx_context_t *tx,
+                           const vm_host_iface_t *host, void *host_ctx,
+                           exec_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    eof_validation_error_t verr = eof_validate(eof_bytes, eof_len, &out->container);
+    if (verr != EOF_VALID) {
+        fprintf(stderr, "    EOF validation failed: %s\n", eof_error_string(verr));
+        return false;
+    }
+    out->vm = vm_create();
+    if (!out->vm) return false;
+    if (block) vm_set_block_env(out->vm, block);
+    if (tx)    vm_set_tx_context(out->vm, tx);
+    if (host)  vm_set_host(out->vm, host, host_ctx);
+    return vm_execute(out->vm, out->container, msg, &out->result);
 }
 
 //==============================================================================
@@ -990,7 +1095,7 @@ static void test_callf_retf(void)
     size_t len;
     uint8_t *eof = build_eof_two_funcs(
         0, 0x80, 2, code0, sizeof(code0),
-        2, 1, 2, code1, sizeof(code1),
+        2, 1, 0, code1, sizeof(code1),  // msh=0: increase = abs(2) - inputs(2)
         &len);
     ASSERT(eof, "build");
 
@@ -1349,6 +1454,529 @@ static void test_fibonacci(void)
 }
 
 //==============================================================================
+// Tests: Phase 3 — Environmental
+//==============================================================================
+
+static void test_address(void)
+{
+    TEST("ADDRESS: returns executing account address");
+    uint8_t code[] = { 0x30, RET32 };
+
+    address_t recipient = address_zero();
+    recipient.bytes[19] = 0x42;
+    vm_message_t msg = { .kind = VM_CALL, .gas = 100000, .recipient = recipient };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, NULL, NULL, NULL, NULL, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 0x42, "address = 0x42");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_caller(void)
+{
+    TEST("CALLER: returns msg.caller");
+    uint8_t code[] = { 0x33, RET32 };
+
+    address_t caller = address_zero();
+    caller.bytes[19] = 0xBB;
+    vm_message_t msg = { .kind = VM_CALL, .gas = 100000, .caller = caller };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, NULL, NULL, NULL, NULL, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 0xBB, "caller = 0xBB");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_callvalue(void)
+{
+    TEST("CALLVALUE: returns msg.value");
+    uint8_t code[] = { 0x34, RET32 };
+
+    vm_message_t msg = {
+        .kind = VM_CALL, .gas = 100000,
+        .value = uint256_from_uint64(1000),
+    };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, NULL, NULL, NULL, NULL, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 1000, "callvalue = 1000");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_calldataload(void)
+{
+    TEST("CALLDATALOAD: reads 32 bytes from calldata");
+    // PUSH1 0, CALLDATALOAD, RET32
+    uint8_t code[] = { 0x60, 0x00, 0x35, RET32 };
+
+    uint8_t calldata[32];
+    memset(calldata, 0, 32);
+    calldata[31] = 99;
+
+    vm_message_t msg = {
+        .kind = VM_CALL, .gas = 100000,
+        .input_data = calldata, .input_size = 32,
+    };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, NULL, NULL, NULL, NULL, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 99, "calldataload = 99");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_calldatasize(void)
+{
+    TEST("CALLDATASIZE: returns calldata length");
+    uint8_t code[] = { 0x36, RET32 };
+
+    uint8_t calldata[45] = {0};
+    vm_message_t msg = {
+        .kind = VM_CALL, .gas = 100000,
+        .input_data = calldata, .input_size = 45,
+    };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, NULL, NULL, NULL, NULL, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 45, "calldatasize = 45");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_calldatacopy(void)
+{
+    TEST("CALLDATACOPY: copies calldata to memory");
+    // Push: size(third), offset(second), dest(top) → CALLDATACOPY
+    uint8_t code[] = {
+        0x60, 0x20,   // PUSH1 32 (size)
+        0x60, 0x00,   // PUSH1 0  (data offset)
+        0x60, 0x00,   // PUSH1 0  (dest offset)
+        0x37,         // CALLDATACOPY
+        0x60, 0x20, 0x60, 0x00, 0xF3,  // RETURN 32 from 0
+    };
+
+    uint8_t calldata[32];
+    memset(calldata, 0, 32);
+    calldata[31] = 0x77;
+
+    vm_message_t msg = {
+        .kind = VM_CALL, .gas = 100000,
+        .input_data = calldata, .input_size = 32,
+    };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 3, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, NULL, NULL, NULL, NULL, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 0x77, "calldatacopy copied correctly");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_origin_gasprice(void)
+{
+    TEST("ORIGIN/GASPRICE: tx context reads");
+    // ORIGIN, RET32
+    uint8_t code[] = { 0x32, RET32 };
+
+    address_t origin = address_zero();
+    origin.bytes[19] = 0xCC;
+
+    vm_message_t msg = { .kind = VM_CALL, .gas = 100000 };
+    vm_tx_context_t tx = {
+        .origin = origin,
+        .gas_price = uint256_from_uint64(50),
+    };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, NULL, &tx, NULL, NULL, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 0xCC, "origin = 0xCC");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_returndatasize(void)
+{
+    TEST("RETURNDATASIZE: returns 0 (no prior call)");
+    uint8_t code[] = { 0x3D, RET32 };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof(eof, len, 100000, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_is_zero(&val), "returndatasize = 0");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+//==============================================================================
+// Tests: Phase 3 — Block Info
+//==============================================================================
+
+static void test_block_number(void)
+{
+    TEST("NUMBER: returns block.number");
+    uint8_t code[] = { 0x43, RET32 };
+
+    vm_block_env_t block = {0};
+    block.number = 12345;
+    vm_message_t msg = { .kind = VM_CALL, .gas = 100000 };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, &block, NULL, NULL, NULL, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 12345, "number = 12345");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_coinbase(void)
+{
+    TEST("COINBASE: returns block.coinbase");
+    uint8_t code[] = { 0x41, RET32 };
+
+    vm_block_env_t block = {0};
+    block.coinbase.bytes[19] = 0xEE;
+    vm_message_t msg = { .kind = VM_CALL, .gas = 100000 };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, &block, NULL, NULL, NULL, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 0xEE, "coinbase = 0xEE");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_prevrandao(void)
+{
+    TEST("PREVRANDAO: returns block.difficulty");
+    uint8_t code[] = { 0x44, RET32 };
+
+    vm_block_env_t block = {0};
+    block.difficulty = uint256_from_uint64(0xDEADBEEF);
+    vm_message_t msg = { .kind = VM_CALL, .gas = 100000 };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, &block, NULL, NULL, NULL, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 0xDEADBEEF, "prevrandao");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_blockhash(void)
+{
+    TEST("BLOCKHASH: returns recent block hash");
+    // PUSH1 99, BLOCKHASH, RET32
+    uint8_t code[] = { 0x60, 99, 0x40, RET32 };
+
+    vm_block_env_t block = {0};
+    block.number = 100;
+    memset(block.block_hash[99].bytes, 0, 32);
+    block.block_hash[99].bytes[31] = 0xAA;
+
+    vm_message_t msg = { .kind = VM_CALL, .gas = 100000 };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, &block, NULL, NULL, NULL, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 0xAA, "blockhash = 0xAA");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_chainid(void)
+{
+    TEST("CHAINID: returns block.chain_id");
+    uint8_t code[] = { 0x46, RET32 };
+
+    vm_block_env_t block = {0};
+    block.chain_id = uint256_from_uint64(1);
+    vm_message_t msg = { .kind = VM_CALL, .gas = 100000 };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, &block, NULL, NULL, NULL, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 1, "chainid = 1");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_basefee(void)
+{
+    TEST("BASEFEE: returns block.base_fee");
+    uint8_t code[] = { 0x48, RET32 };
+
+    vm_block_env_t block = {0};
+    block.base_fee = uint256_from_uint64(30000000000ULL);
+    vm_message_t msg = { .kind = VM_CALL, .gas = 100000 };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, &block, NULL, NULL, NULL, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 30000000000ULL, "basefee");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+//==============================================================================
+// Tests: Phase 3 — Storage
+//==============================================================================
+
+static void test_sload_sstore(void)
+{
+    TEST("SLOAD/SSTORE: store then load from persistent storage");
+    // PUSH1 42 (value), PUSH1 0 (key), SSTORE
+    // PUSH1 0 (key), SLOAD, RET32
+    uint8_t code[] = {
+        0x60, 42,     // PUSH1 42 (value)
+        0x60, 0x00,   // PUSH1 0 (key)
+        0x55,         // SSTORE
+        0x60, 0x00,   // PUSH1 0 (key)
+        0x54,         // SLOAD
+        RET32,
+    };
+
+    mock_host_t host_state = {0};
+    vm_message_t msg = { .kind = VM_CALL, .gas = 100000 };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, NULL, NULL, &MOCK_HOST, &host_state, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 42, "sload after sstore = 42");
+    ASSERT(uint256_to_uint64(&host_state.storage[0]) == 42, "host storage[0] = 42");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_tload_tstore(void)
+{
+    TEST("TLOAD/TSTORE: transient storage write and read");
+    // PUSH1 99 (value), PUSH1 1 (key), TSTORE
+    // PUSH1 1 (key), TLOAD, RET32
+    uint8_t code[] = {
+        0x60, 99,     // PUSH1 99 (value)
+        0x60, 0x01,   // PUSH1 1 (key)
+        0x5D,         // TSTORE
+        0x60, 0x01,   // PUSH1 1 (key)
+        0x5C,         // TLOAD
+        RET32,
+    };
+
+    mock_host_t host_state = {0};
+    vm_message_t msg = { .kind = VM_CALL, .gas = 100000 };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, NULL, NULL, &MOCK_HOST, &host_state, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 99, "tload after tstore = 99");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_selfbalance(void)
+{
+    TEST("SELFBALANCE: returns balance of executing account");
+    uint8_t code[] = { 0x47, RET32 };
+
+    mock_host_t host_state = {0};
+    host_state.balance = uint256_from_uint64(1000000);
+    vm_message_t msg = { .kind = VM_CALL, .gas = 100000 };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, NULL, NULL, &MOCK_HOST, &host_state, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    uint256_t val = uint256_from_bytes(e.result.output_data, 32);
+    ASSERT(uint256_to_uint64(&val) == 1000000, "selfbalance = 1000000");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+//==============================================================================
+// Tests: Phase 3 — Logging
+//==============================================================================
+
+static void test_log1(void)
+{
+    TEST("LOG1: emits log with topic and data");
+    // Store 42 at mem[0], then LOG1(offset=0, size=32, topic=0xABCD)
+    uint8_t code[] = {
+        0x60, 42,             // PUSH1 42
+        0x60, 0x00,           // PUSH1 0
+        0x52,                 // MSTORE at 0
+        0x61, 0xAB, 0xCD,    // PUSH2 0xABCD (topic)
+        0x60, 0x20,           // PUSH1 32 (size)
+        0x60, 0x00,           // PUSH1 0 (offset)
+        0xA1,                 // LOG1
+        0x00,                 // STOP
+    };
+
+    mock_host_t host_state = {0};
+    vm_message_t msg = { .kind = VM_CALL, .gas = 100000 };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 3, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, NULL, NULL, &MOCK_HOST, &host_state, &e), "exec");
+    ASSERT(e.result.status == VM_SUCCESS, "status");
+    ASSERT(host_state.log_called, "log emitted");
+    ASSERT(host_state.log_topic_count == 1, "1 topic");
+    ASSERT(uint256_to_uint64(&host_state.log_topics[0]) == 0xABCD, "topic = 0xABCD");
+    ASSERT(host_state.log_data_size == 32, "data size = 32");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+//==============================================================================
+// Tests: Phase 3 — Static Call Violations
+//==============================================================================
+
+static void test_static_sstore(void)
+{
+    TEST("SSTORE in static context: violation");
+    uint8_t code[] = {
+        0x60, 42,     // PUSH1 42 (value)
+        0x60, 0x00,   // PUSH1 0 (key)
+        0x55,         // SSTORE
+        0x00,         // STOP
+    };
+
+    mock_host_t host_state = {0};
+    vm_message_t msg = {
+        .kind = VM_STATICCALL, .gas = 100000, .is_static = true,
+    };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, NULL, NULL, &MOCK_HOST, &host_state, &e), "exec");
+    ASSERT(e.result.status == VM_STATIC_CALL_VIOLATION, "static violation on SSTORE");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+static void test_static_log(void)
+{
+    TEST("LOG0 in static context: violation");
+    uint8_t code[] = {
+        0x60, 0x00,   // PUSH1 0 (size)
+        0x60, 0x00,   // PUSH1 0 (offset)
+        0xA0,         // LOG0
+        0x00,         // STOP
+    };
+
+    mock_host_t host_state = {0};
+    vm_message_t msg = {
+        .kind = VM_STATICCALL, .gas = 100000, .is_static = true,
+    };
+
+    size_t len;
+    uint8_t *eof = build_eof_simple(0, 0x80, 2, code, sizeof(code), &len);
+    ASSERT(eof, "build");
+
+    exec_t e;
+    ASSERT(exec_eof_with(eof, len, &msg, NULL, NULL, &MOCK_HOST, &host_state, &e), "exec");
+    ASSERT(e.result.status == VM_STATIC_CALL_VIOLATION, "static violation on LOG0");
+
+    exec_free(&e); free(eof); PASS();
+}
+
+//==============================================================================
 // Main
 //==============================================================================
 
@@ -1408,6 +2036,36 @@ int main(void)
 
     // Complex
     test_fibonacci();
+
+    // Phase 3: Environmental
+    test_address();
+    test_caller();
+    test_callvalue();
+    test_calldataload();
+    test_calldatasize();
+    test_calldatacopy();
+    test_origin_gasprice();
+    test_returndatasize();
+
+    // Phase 3: Block Info
+    test_block_number();
+    test_coinbase();
+    test_prevrandao();
+    test_blockhash();
+    test_chainid();
+    test_basefee();
+
+    // Phase 3: Storage & Balance
+    test_sload_sstore();
+    test_tload_tstore();
+    test_selfbalance();
+
+    // Phase 3: Logging
+    test_log1();
+
+    // Phase 3: Static Call Violations
+    test_static_sstore();
+    test_static_log();
 
     // Summary
     printf("\n=== Results: %d/%d passed ===\n\n", tests_passed, tests_run);

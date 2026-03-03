@@ -13,9 +13,10 @@
  * The hot path is just: gas check → compute → dispatch.
  * No runtime safety checks needed in the inner loop.
  *
- * Phase 2 implements all "pure" opcodes (arithmetic, comparison, bitwise,
- * stack, control flow, memory, data, crypto). State-dependent opcodes
- * (SLOAD/SSTORE, BALANCE, EXTCALL, etc.) are stubbed for Phase 3/4.
+ * Phase 2: arithmetic, comparison, bitwise, stack, control flow, memory,
+ *          data access, crypto.
+ * Phase 3: environmental, block info, storage, transient storage, logging.
+ * Phase 4: EXTCALL, EXTDELEGATECALL, EXTSTATICCALL, EOFCREATE (stubbed).
  */
 
 #include "vm.h"
@@ -133,42 +134,43 @@ vm_status_t vm_interpret(vm_t *vm)
         // 0x20: Keccak256
         [0x20] = &&op_keccak256,
 
-        // 0x30-0x3F: Environmental (Phase 3/4 — stub)
-        [0x30] = &&op_unimplemented,  // ADDRESS
-        [0x32] = &&op_unimplemented,  // ORIGIN
-        [0x33] = &&op_unimplemented,  // CALLER
-        [0x34] = &&op_unimplemented,  // CALLVALUE
-        [0x35] = &&op_unimplemented,  // CALLDATALOAD
-        [0x36] = &&op_unimplemented,  // CALLDATASIZE
-        [0x37] = &&op_unimplemented,  // CALLDATACOPY
-        [0x3A] = &&op_unimplemented,  // GASPRICE
-        [0x3D] = &&op_unimplemented,  // RETURNDATASIZE
-        [0x3E] = &&op_unimplemented,  // RETURNDATACOPY
+        // 0x30-0x3F: Environmental
+        [0x30] = &&op_address,
+        [0x31] = &&op_balance,
+        [0x32] = &&op_origin,
+        [0x33] = &&op_caller,
+        [0x34] = &&op_callvalue,
+        [0x35] = &&op_calldataload,
+        [0x36] = &&op_calldatasize,
+        [0x37] = &&op_calldatacopy,
+        [0x3A] = &&op_gasprice,
+        [0x3D] = &&op_returndatasize,
+        [0x3E] = &&op_returndatacopy,
 
-        // 0x40-0x4A: Block Info (Phase 3/4 — stub)
-        [0x40] = &&op_unimplemented,  // BLOCKHASH
-        [0x41] = &&op_unimplemented,  // COINBASE
-        [0x42] = &&op_unimplemented,  // TIMESTAMP
-        [0x43] = &&op_unimplemented,  // NUMBER
-        [0x44] = &&op_unimplemented,  // PREVRANDAO
-        [0x45] = &&op_unimplemented,  // GASLIMIT
-        [0x46] = &&op_unimplemented,  // CHAINID
-        [0x47] = &&op_unimplemented,  // SELFBALANCE
-        [0x48] = &&op_unimplemented,  // BASEFEE
-        [0x49] = &&op_unimplemented,  // BLOBHASH
-        [0x4A] = &&op_unimplemented,  // BLOBBASEFEE
+        // 0x40-0x4A: Block Info
+        [0x40] = &&op_blockhash,
+        [0x41] = &&op_coinbase,
+        [0x42] = &&op_timestamp,
+        [0x43] = &&op_number,
+        [0x44] = &&op_prevrandao,
+        [0x45] = &&op_gaslimit,
+        [0x46] = &&op_chainid,
+        [0x47] = &&op_selfbalance,
+        [0x48] = &&op_basefee,
+        [0x49] = &&op_blobhash,
+        [0x4A] = &&op_blobbasefee,
 
         // 0x50-0x5F: Stack, Memory, Flow
         [0x50] = &&op_pop,
         [0x51] = &&op_mload,
         [0x52] = &&op_mstore,
         [0x53] = &&op_mstore8,
-        [0x54] = &&op_unimplemented,  // SLOAD
-        [0x55] = &&op_unimplemented,  // SSTORE
+        [0x54] = &&op_sload,
+        [0x55] = &&op_sstore,
         [0x59] = &&op_msize,
         [0x5B] = &&op_nop,
-        [0x5C] = &&op_unimplemented,  // TLOAD
-        [0x5D] = &&op_unimplemented,  // TSTORE
+        [0x5C] = &&op_tload,
+        [0x5D] = &&op_tstore,
         [0x5E] = &&op_mcopy,
         [0x5F] = &&op_push0,
 
@@ -210,12 +212,12 @@ vm_status_t vm_interpret(vm_t *vm)
         [0x9C] = &&op_swap13,  [0x9D] = &&op_swap14,
         [0x9E] = &&op_swap15,  [0x9F] = &&op_swap16,
 
-        // 0xA0-0xA4: LOG0-LOG4 (Phase 3/4 — stub)
-        [0xA0] = &&op_unimplemented,
-        [0xA1] = &&op_unimplemented,
-        [0xA2] = &&op_unimplemented,
-        [0xA3] = &&op_unimplemented,
-        [0xA4] = &&op_unimplemented,
+        // 0xA0-0xA4: LOG0-LOG4
+        [0xA0] = &&op_log0,
+        [0xA1] = &&op_log1,
+        [0xA2] = &&op_log2,
+        [0xA3] = &&op_log3,
+        [0xA4] = &&op_log4,
 
         // 0xD0-0xD3: Data Section
         [0xD0] = &&op_dataload,
@@ -234,17 +236,17 @@ vm_status_t vm_interpret(vm_t *vm)
         [0xE7] = &&op_swapn,
         [0xE8] = &&op_exchange,
 
-        // 0xEC, 0xEE: Create (Phase 3/4 — stub)
+        // 0xEC, 0xEE: Create (Phase 4 — stub)
         [0xEC] = &&op_unimplemented,  // EOFCREATE
         [0xEE] = &&op_unimplemented,  // RETURNCONTRACT
 
         // 0xF3: RETURN
         [0xF3] = &&op_return,
 
-        // 0xF7: RETURNDATALOAD (Phase 3/4 — stub)
-        [0xF7] = &&op_unimplemented,
+        // 0xF7: RETURNDATALOAD
+        [0xF7] = &&op_returndataload,
 
-        // 0xF8-0xFB: Calls (Phase 3/4 — stub)
+        // 0xF8-0xFB: Calls (Phase 4 — stub)
         [0xF8] = &&op_unimplemented,  // EXTCALL
         [0xF9] = &&op_unimplemented,  // EXTDELEGATECALL
         [0xFB] = &&op_unimplemented,  // EXTSTATICCALL
@@ -590,6 +592,362 @@ op_keccak256: {
 
     stack[sp] = uint256_from_bytes(hash, 32);
     sp++;
+    DISPATCH();
+}
+
+    //==========================================================================
+    // Environmental (0x30-0x3F)
+    //==========================================================================
+
+op_address:
+    // ADDRESS (0x30): push executing account address
+    USE_GAS(VM_GAS_BASE);
+    address_to_uint256(&vm->msg.recipient, &stack[sp]);
+    sp++;
+    DISPATCH();
+
+op_balance: {
+    // BALANCE (0x31): pop address, push its balance
+    USE_GAS(VM_GAS_WARM_ACCESS);
+    if (!vm->host || !vm->host->balance) goto no_host;
+    address_t addr;
+    address_from_uint256(&stack[sp - 1], &addr);
+    stack[sp - 1] = vm->host->balance(vm->host_ctx, &addr);
+    DISPATCH();
+}
+
+op_origin:
+    // ORIGIN (0x32): push transaction origin
+    USE_GAS(VM_GAS_BASE);
+    address_to_uint256(&vm->tx.origin, &stack[sp]);
+    sp++;
+    DISPATCH();
+
+op_caller:
+    // CALLER (0x33): push caller address
+    USE_GAS(VM_GAS_BASE);
+    address_to_uint256(&vm->msg.caller, &stack[sp]);
+    sp++;
+    DISPATCH();
+
+op_callvalue:
+    // CALLVALUE (0x34): push msg.value
+    USE_GAS(VM_GAS_BASE);
+    stack[sp] = vm->msg.value;
+    sp++;
+    DISPATCH();
+
+op_calldataload: {
+    // CALLDATALOAD (0x35): load 32 bytes from calldata, zero-pad OOB
+    USE_GAS(VM_GAS_VERY_LOW);
+    uint64_t offset;
+    bool fits = to_u64(&stack[sp - 1], &offset);
+
+    uint8_t buf[32] = {0};
+    if (fits) {
+        const uint8_t *input = vm->msg.input_data;
+        size_t input_size = vm->msg.input_size;
+        for (int i = 0; i < 32; i++) {
+            uint64_t di = offset + (uint64_t)i;
+            if (di < input_size && input)
+                buf[i] = input[di];
+        }
+    }
+    stack[sp - 1] = uint256_from_bytes(buf, 32);
+    DISPATCH();
+}
+
+op_calldatasize:
+    // CALLDATASIZE (0x36): push calldata length
+    USE_GAS(VM_GAS_BASE);
+    stack[sp] = uint256_from_uint64(vm->msg.input_size);
+    sp++;
+    DISPATCH();
+
+op_calldatacopy: {
+    // CALLDATACOPY (0x37): copy calldata to memory, zero-pad OOB
+    uint64_t dest_off, src_off, size;
+    if (!to_u64(&stack[sp - 1], &dest_off)) goto out_of_gas;
+    if (!to_u64(&stack[sp - 2], &src_off))  goto out_of_gas;
+    if (!to_u64(&stack[sp - 3], &size))     goto out_of_gas;
+    sp -= 3;
+
+    uint64_t copy_cost = vm_gas_copy_cost(size);
+    uint64_t exp_cost = 0;
+    if (size > 0) {
+        if (dest_off > UINT64_MAX - size) goto out_of_gas;
+        exp_cost = vm_memory_access_cost(memory, dest_off, size);
+    }
+    USE_GAS(safe_add_gas(VM_GAS_VERY_LOW, safe_add_gas(copy_cost, exp_cost)));
+
+    if (size > 0) {
+        vm_memory_expand(memory, dest_off, size);
+        uint8_t *dst = &memory->data[dest_off];
+        const uint8_t *input = vm->msg.input_data;
+        size_t input_size = vm->msg.input_size;
+        for (uint64_t i = 0; i < size; i++) {
+            uint64_t si = src_off + i;
+            dst[i] = (si < input_size && input) ? input[si] : 0;
+        }
+    }
+    DISPATCH();
+}
+
+op_gasprice:
+    // GASPRICE (0x3A): push tx gas price
+    USE_GAS(VM_GAS_BASE);
+    stack[sp] = vm->tx.gas_price;
+    sp++;
+    DISPATCH();
+
+op_returndatasize:
+    // RETURNDATASIZE (0x3D): push return data buffer size
+    USE_GAS(VM_GAS_BASE);
+    stack[sp] = uint256_from_uint64(vm->return_data_size);
+    sp++;
+    DISPATCH();
+
+op_returndatacopy: {
+    // RETURNDATACOPY (0x3E): copy return data to memory (OOB = error)
+    uint64_t dest_off, src_off, size;
+    if (!to_u64(&stack[sp - 1], &dest_off)) goto out_of_gas;
+    if (!to_u64(&stack[sp - 2], &src_off))  goto out_of_gas;
+    if (!to_u64(&stack[sp - 3], &size))     goto out_of_gas;
+    sp -= 3;
+
+    // OOB check (unlike CALLDATACOPY, this reverts)
+    if (src_off + size > vm->return_data_size || src_off + size < src_off)
+        goto out_of_gas;
+
+    uint64_t copy_cost = vm_gas_copy_cost(size);
+    uint64_t exp_cost = 0;
+    if (size > 0) {
+        if (dest_off > UINT64_MAX - size) goto out_of_gas;
+        exp_cost = vm_memory_access_cost(memory, dest_off, size);
+    }
+    USE_GAS(safe_add_gas(VM_GAS_VERY_LOW, safe_add_gas(copy_cost, exp_cost)));
+
+    if (size > 0) {
+        vm_memory_expand(memory, dest_off, size);
+        memcpy(&memory->data[dest_off], &vm->return_data[src_off], size);
+    }
+    DISPATCH();
+}
+
+op_returndataload: {
+    // RETURNDATALOAD (0xF7): load 32 bytes from return data, zero-pad OOB
+    USE_GAS(VM_GAS_VERY_LOW);
+    uint64_t offset;
+    bool fits = to_u64(&stack[sp - 1], &offset);
+
+    uint8_t buf[32] = {0};
+    if (fits && vm->return_data) {
+        size_t rd_size = vm->return_data_size;
+        for (int i = 0; i < 32; i++) {
+            uint64_t di = offset + (uint64_t)i;
+            if (di < rd_size)
+                buf[i] = vm->return_data[di];
+        }
+    }
+    stack[sp - 1] = uint256_from_bytes(buf, 32);
+    DISPATCH();
+}
+
+    //==========================================================================
+    // Block Info (0x40-0x4A)
+    //==========================================================================
+
+op_blockhash: {
+    // BLOCKHASH (0x40): get hash of recent block
+    USE_GAS(VM_GAS_BLOCKHASH);
+    uint64_t num;
+    if (!to_u64(&stack[sp - 1], &num)) {
+        stack[sp - 1] = UINT256_ZERO;
+        DISPATCH();
+    }
+    uint64_t current = vm->block.number;
+    if (num >= current || current - num > 256) {
+        stack[sp - 1] = UINT256_ZERO;
+    } else {
+        uint64_t idx = num % 256;
+        stack[sp - 1] = uint256_from_bytes(vm->block.block_hash[idx].bytes, 32);
+    }
+    DISPATCH();
+}
+
+op_coinbase:
+    USE_GAS(VM_GAS_BASE);
+    address_to_uint256(&vm->block.coinbase, &stack[sp]);
+    sp++;
+    DISPATCH();
+
+op_timestamp:
+    USE_GAS(VM_GAS_BASE);
+    stack[sp] = uint256_from_uint64(vm->block.timestamp);
+    sp++;
+    DISPATCH();
+
+op_number:
+    USE_GAS(VM_GAS_BASE);
+    stack[sp] = uint256_from_uint64(vm->block.number);
+    sp++;
+    DISPATCH();
+
+op_prevrandao:
+    USE_GAS(VM_GAS_BASE);
+    stack[sp] = vm->block.difficulty;
+    sp++;
+    DISPATCH();
+
+op_gaslimit:
+    USE_GAS(VM_GAS_BASE);
+    stack[sp] = uint256_from_uint64(vm->block.gas_limit);
+    sp++;
+    DISPATCH();
+
+op_chainid:
+    USE_GAS(VM_GAS_BASE);
+    stack[sp] = vm->block.chain_id;
+    sp++;
+    DISPATCH();
+
+op_selfbalance:
+    // SELFBALANCE (0x47): push balance of executing account
+    USE_GAS(VM_GAS_SELFBALANCE);
+    if (!vm->host || !vm->host->balance) goto no_host;
+    stack[sp] = vm->host->balance(vm->host_ctx, &vm->msg.recipient);
+    sp++;
+    DISPATCH();
+
+op_basefee:
+    USE_GAS(VM_GAS_BASE);
+    stack[sp] = vm->block.base_fee;
+    sp++;
+    DISPATCH();
+
+op_blobhash: {
+    // BLOBHASH (0x49): get versioned hash of blob at index
+    USE_GAS(VM_GAS_VERY_LOW);
+    uint64_t idx;
+    if (!to_u64(&stack[sp - 1], &idx) ||
+        idx >= vm->tx.num_blob_hashes || !vm->tx.blob_hashes) {
+        stack[sp - 1] = UINT256_ZERO;
+    } else {
+        stack[sp - 1] = uint256_from_bytes(vm->tx.blob_hashes[idx].bytes, 32);
+    }
+    DISPATCH();
+}
+
+op_blobbasefee:
+    USE_GAS(VM_GAS_BASE);
+    stack[sp] = vm->block.blob_base_fee;
+    sp++;
+    DISPATCH();
+
+    //==========================================================================
+    // Storage (0x54-0x55)
+    //==========================================================================
+
+op_sload: {
+    // SLOAD (0x54): load from persistent storage
+    USE_GAS(VM_GAS_WARM_ACCESS);
+    if (!vm->host || !vm->host->sload) goto no_host;
+    stack[sp - 1] = vm->host->sload(vm->host_ctx, &vm->msg.recipient, &stack[sp - 1]);
+    DISPATCH();
+}
+
+op_sstore: {
+    // SSTORE (0x55): write to persistent storage
+    if (vm->msg.is_static) goto static_violation;
+    if (!vm->host || !vm->host->sstore) goto no_host;
+
+    // EIP-2200 sentry: must have more than 2300 gas
+    if (gas_left <= 2300) goto out_of_gas;
+
+    uint256_t key = stack[sp - 1];
+    uint256_t value = stack[sp - 2];
+    sp -= 2;
+
+    // Write and get pre-write values for gas calculation
+    vm_sstore_result_t info = vm->host->sstore(vm->host_ctx, &vm->msg.recipient,
+                                                &key, &value);
+
+    int64_t refund_delta = 0;
+    uint64_t cost = vm_gas_sstore_cost(&value, &info.current, &info.original,
+                                        &refund_delta);
+    USE_GAS(cost);
+
+    // Apply refund delta
+    if (refund_delta > 0) {
+        vm->gas_refund += (uint64_t)refund_delta;
+    } else if (refund_delta < 0) {
+        uint64_t abs_delta = (uint64_t)(-refund_delta);
+        vm->gas_refund = (vm->gas_refund >= abs_delta)
+                           ? vm->gas_refund - abs_delta : 0;
+    }
+    DISPATCH();
+}
+
+    //==========================================================================
+    // Transient Storage (0x5C-0x5D)
+    //==========================================================================
+
+op_tload: {
+    // TLOAD (0x5C): load from transient storage
+    USE_GAS(VM_GAS_TLOAD);
+    if (!vm->host || !vm->host->tload) goto no_host;
+    stack[sp - 1] = vm->host->tload(vm->host_ctx, &vm->msg.recipient, &stack[sp - 1]);
+    DISPATCH();
+}
+
+op_tstore: {
+    // TSTORE (0x5D): write to transient storage
+    if (vm->msg.is_static) goto static_violation;
+    USE_GAS(VM_GAS_TSTORE);
+    if (!vm->host || !vm->host->tstore) goto no_host;
+    vm->host->tstore(vm->host_ctx, &vm->msg.recipient, &stack[sp - 1], &stack[sp - 2]);
+    sp -= 2;
+    DISPATCH();
+}
+
+    //==========================================================================
+    // Logging (0xA0-0xA4)
+    //==========================================================================
+
+op_log0: n = 0; goto do_log;
+op_log1: n = 1; goto do_log;
+op_log2: n = 2; goto do_log;
+op_log3: n = 3; goto do_log;
+op_log4: n = 4; goto do_log;
+
+do_log: {
+    if (vm->msg.is_static) goto static_violation;
+    if (!vm->host || !vm->host->emit_log) goto no_host;
+
+    uint64_t offset, size;
+    if (!to_u64(&stack[sp - 1], &offset)) goto out_of_gas;
+    if (!to_u64(&stack[sp - 2], &size))   goto out_of_gas;
+
+    // Collect topics from stack (below offset and size)
+    uint256_t topics[4];
+    for (uint32_t i = 0; i < n; i++)
+        topics[i] = stack[sp - 3 - i];
+    sp -= 2 + n;
+
+    uint64_t log_gas = vm_gas_log_cost((uint8_t)n, size);
+    uint64_t exp_cost = 0;
+    if (size > 0) {
+        if (offset > UINT64_MAX - size) goto out_of_gas;
+        exp_cost = vm_memory_access_cost(memory, offset, size);
+    }
+    USE_GAS(safe_add_gas(log_gas, exp_cost));
+
+    if (size > 0)
+        vm_memory_expand(memory, offset, size);
+
+    const uint8_t *data = (size > 0) ? &memory->data[offset] : NULL;
+    vm->host->emit_log(vm->host_ctx, &vm->msg.recipient,
+                        topics, (uint8_t)n, data, size);
     DISPATCH();
 }
 
@@ -1006,7 +1364,7 @@ op_datacopy: {
     //==========================================================================
 
 op_unimplemented:
-    // Phase 3/4 opcode — not yet implemented
+    // Phase 4 opcode — not yet implemented (EXTCALL, EOFCREATE, RETURNCONTRACT)
     vm->status = VM_INTERNAL_ERROR;
     goto done;
 
@@ -1019,6 +1377,15 @@ op_invalid:
     //==========================================================================
     // Exit Paths
     //==========================================================================
+
+static_violation:
+    gas_left = 0;
+    vm->status = VM_STATIC_CALL_VIOLATION;
+    goto done;
+
+no_host:
+    vm->status = VM_INTERNAL_ERROR;
+    goto done;
 
 out_of_gas:
     gas_left = 0;

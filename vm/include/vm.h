@@ -81,6 +81,42 @@ typedef enum {
 } vm_call_type_t;
 
 //==============================================================================
+// Host Interface (State Access)
+//==============================================================================
+
+/** SSTORE result — pre-write state for gas calculation. */
+typedef struct {
+    uint256_t current;   // value before this write
+    uint256_t original;  // value at start of transaction
+} vm_sstore_result_t;
+
+/**
+ * Host interface — connects VM to state layer.
+ *
+ * Function pointers must be non-NULL for opcodes that use them.
+ * If an opcode calls a NULL host function, VM returns VM_INTERNAL_ERROR.
+ */
+typedef struct {
+    // Persistent storage
+    uint256_t (*sload)(void *ctx, const address_t *addr, const uint256_t *key);
+    vm_sstore_result_t (*sstore)(void *ctx, const address_t *addr,
+                                  const uint256_t *key, const uint256_t *value);
+
+    // Account balance
+    uint256_t (*balance)(void *ctx, const address_t *addr);
+
+    // Transient storage (EIP-1153, per-transaction lifetime)
+    uint256_t (*tload)(void *ctx, const address_t *addr, const uint256_t *key);
+    void (*tstore)(void *ctx, const address_t *addr,
+                   const uint256_t *key, const uint256_t *value);
+
+    // Log emission
+    void (*emit_log)(void *ctx, const address_t *addr,
+                     const uint256_t *topics, uint8_t n_topics,
+                     const uint8_t *data, size_t data_size);
+} vm_host_iface_t;
+
+//==============================================================================
 // Message (Call Context)
 //==============================================================================
 
@@ -113,6 +149,7 @@ typedef struct {
     address_t coinbase;
     uint256_t base_fee;
     uint256_t chain_id;
+    uint256_t blob_base_fee;    // EIP-4844
     hash_t    block_hash[256];  // recent block hashes
 } vm_block_env_t;
 
@@ -121,8 +158,10 @@ typedef struct {
 //==============================================================================
 
 typedef struct {
-    address_t origin;
-    uint256_t gas_price;
+    address_t    origin;
+    uint256_t    gas_price;
+    const hash_t *blob_hashes;       // versioned blob hashes (EIP-4844, not owned)
+    uint16_t      num_blob_hashes;
 } vm_tx_context_t;
 
 //==============================================================================
@@ -140,8 +179,9 @@ typedef struct {
 //==============================================================================
 
 typedef struct vm {
-    // State (opaque — Phase 3 will define the interface)
-    void *state;
+    // Host interface (state access — storage, balance, logs)
+    const vm_host_iface_t *host;
+    void                  *host_ctx;
 
     // Execution context
     vm_message_t  msg;
@@ -198,6 +238,7 @@ void vm_reset(vm_t *vm);
 
 void vm_set_block_env(vm_t *vm, const vm_block_env_t *block);
 void vm_set_tx_context(vm_t *vm, const vm_tx_context_t *tx);
+void vm_set_host(vm_t *vm, const vm_host_iface_t *host, void *ctx);
 
 //==============================================================================
 // Execution

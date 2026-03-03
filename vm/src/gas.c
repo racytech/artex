@@ -3,6 +3,7 @@
  */
 
 #include "gas.h"
+#include "uint256.h"
 
 uint64_t vm_gas_to_word_size(uint64_t size)
 {
@@ -62,4 +63,42 @@ uint64_t vm_gas_exp_cost(uint8_t exponent_bytes)
 uint64_t vm_gas_max_call_gas(uint64_t gas_left)
 {
     return gas_left - (gas_left / 64);
+}
+
+uint64_t vm_gas_sstore_cost(const uint256_t *value, const uint256_t *current,
+                             const uint256_t *original, int64_t *refund_delta)
+{
+    *refund_delta = 0;
+
+    // No-op: value == current
+    if (uint256_is_equal(value, current))
+        return VM_GAS_WARM_ACCESS;  // 100
+
+    if (uint256_is_equal(current, original)) {
+        // First modification in this transaction
+        if (uint256_is_zero(original))
+            return VM_GAS_SSTORE_SET;     // 20000: 0 → non-zero
+
+        if (uint256_is_zero(value))
+            *refund_delta = (int64_t)VM_GAS_SSTORE_CLEAR_REFUND;  // 4800
+        return VM_GAS_SSTORE_RESET;       // 5000: non-zero → different
+    }
+
+    // Already modified in this tx (current != original)
+    if (!uint256_is_zero(original)) {
+        if (uint256_is_zero(current))
+            *refund_delta -= (int64_t)VM_GAS_SSTORE_CLEAR_REFUND;   // undo previous clear refund
+        else if (uint256_is_zero(value))
+            *refund_delta += (int64_t)VM_GAS_SSTORE_CLEAR_REFUND;   // earn clear refund
+    }
+
+    if (uint256_is_equal(value, original)) {
+        // Restoring to original value
+        if (uint256_is_zero(original))
+            *refund_delta += (int64_t)(VM_GAS_SSTORE_SET - VM_GAS_WARM_ACCESS);    // 19900
+        else
+            *refund_delta += (int64_t)(VM_GAS_SSTORE_RESET - VM_GAS_WARM_ACCESS);  // 4900
+    }
+
+    return VM_GAS_WARM_ACCESS;  // 100: re-modification
 }

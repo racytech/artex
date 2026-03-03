@@ -94,6 +94,13 @@ void vm_set_tx_context(vm_t *vm, const vm_tx_context_t *tx)
     vm->tx = *tx;
 }
 
+void vm_set_host(vm_t *vm, const vm_host_iface_t *host, void *ctx)
+{
+    if (!vm) return;
+    vm->host = host;
+    vm->host_ctx = ctx;
+}
+
 //==============================================================================
 // Execution
 //==============================================================================

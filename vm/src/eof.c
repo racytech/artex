@@ -208,8 +208,9 @@ const eof_opcode_info_t EOF_OPCODES[256] = {
     [0xE7] = { "SWAPN",        0, 0, 1, true, false },  // stack effects handled dynamically
     [0xE8] = { "EXCHANGE",     0, 0, 1, true, false },  // stack effects handled dynamically
 
-    // 0xEC, 0xEE: Create / return container
+    // 0xEC-0xEE: Create / return container
     [0xEC] = { "EOFCREATE",    4, 1, 1, true, false },
+    [0xED] = { "TXCREATE",     5, 1, 1, true, true  },
     [0xEE] = { "RETURNCONTRACT", 2, 0, 1, true, true },
 
     // 0xF3: RETURN
@@ -241,6 +242,13 @@ const eof_opcode_info_t EOF_OPCODES[256] = {
 static inline uint16_t read_u16(const uint8_t *p)
 {
     return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+}
+
+/** Read big-endian uint32 from buffer. */
+static inline uint32_t read_u32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+         | ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
 }
 
 /** Read big-endian int16 from buffer (for RJUMP offsets). */
@@ -373,7 +381,7 @@ static eof_validation_error_t eof_parse_header(const uint8_t *code, size_t len,
 
     // --- Optional container section header ---
     uint16_t num_containers = 0;
-    uint16_t *container_sizes = NULL;
+    uint32_t *container_sizes = NULL;
 
     if (pos < len && code[pos] == EOF_KIND_CONTAINER) {
         pos++;
@@ -386,16 +394,16 @@ static eof_validation_error_t eof_parse_header(const uint8_t *code, size_t len,
             return EOF_INVALID_HEADER;
         }
 
-        container_sizes = (uint16_t *)calloc(num_containers, sizeof(uint16_t));
+        container_sizes = (uint32_t *)calloc(num_containers, sizeof(uint32_t));
         if (!container_sizes) { free(code_sizes); return EOF_INVALID_HEADER; }
 
         for (uint16_t i = 0; i < num_containers; i++) {
-            if (pos + 2 > len) {
+            if (pos + 4 > len) {
                 free(code_sizes); free(container_sizes);
                 return EOF_INVALID_HEADER;
             }
-            container_sizes[i] = read_u16(&code[pos]);
-            pos += 2;
+            container_sizes[i] = read_u32(&code[pos]);
+            pos += 4;
             if (container_sizes[i] == 0) {
                 free(code_sizes); free(container_sizes);
                 return EOF_INVALID_HEADER;
@@ -484,7 +492,7 @@ static eof_validation_error_t eof_parse_header(const uint8_t *code, size_t len,
     if (num_containers > 0) {
         c->containers = (eof_container_t **)calloc(num_containers, sizeof(eof_container_t *));
         c->sub_offsets = (uint32_t *)calloc(num_containers, sizeof(uint32_t));
-        c->sub_sizes = (uint16_t *)malloc(num_containers * sizeof(uint16_t));
+        c->sub_sizes = (uint32_t *)malloc(num_containers * sizeof(uint32_t));
         if (!c->containers || !c->sub_offsets || !c->sub_sizes) {
             free(code_sizes); free(container_sizes);
             return EOF_INVALID_HEADER;
@@ -808,8 +816,8 @@ static eof_validation_error_t validate_stack(const uint8_t *code,
             stack_required = callee->inputs;
             stack_change = (int)callee->outputs - (int)callee->inputs;
 
-            // Check CALLF stack overflow
-            if (cur.max + (int)callee->max_stack_height - stack_required > 1024) {
+            // Check CALLF stack overflow (max_stack_height = increase, not absolute)
+            if (cur.max + (int)callee->max_stack_height > 1024) {
                 free(heights);
                 return EOF_STACK_OVERFLOW;
             }
@@ -817,7 +825,7 @@ static eof_validation_error_t validate_stack(const uint8_t *code,
             uint16_t fid = read_u16(&code[pos + 1]);
             const eof_func_t *target = &c->functions[fid];
 
-            if (cur.max + (int)target->max_stack_height - (int)target->inputs > 1024) {
+            if (cur.max + (int)target->max_stack_height > 1024) {
                 free(heights);
                 return EOF_STACK_OVERFLOW;
             }
@@ -941,8 +949,9 @@ static eof_validation_error_t validate_stack(const uint8_t *code,
         pos += 1 + imm_size;
     }
 
-    // Verify declared max_stack_height matches computed
-    if (max_height != (int)func->max_stack_height) {
+    // Verify declared max_stack_increase matches computed
+    // v3.0.0: type section stores increase (delta from inputs), not absolute height
+    if (max_height != (int)func->max_stack_height + (int)func->inputs) {
         free(heights);
         return EOF_STACK_HEIGHT_MISMATCH;
     }

@@ -95,8 +95,8 @@ static uint8_t *build_eof1_single(uint8_t inputs, uint8_t outputs,
     buf[pos++] = (uint8_t)(code_size >> 8);
     buf[pos++] = (uint8_t)(code_size & 0xFF);
 
-    // Data section header: kind=4, size=0
-    buf[pos++] = 0x04;
+    // Data section header: kind=0xFF, size=0
+    buf[pos++] = 0xFF;
     buf[pos++] = 0x00;
     buf[pos++] = 0x00;
 
@@ -152,8 +152,8 @@ static uint8_t *build_eof1_two_funcs(uint8_t in0, uint8_t out0, uint16_t msh0,
     buf[pos++] = (uint8_t)(code1_size >> 8);
     buf[pos++] = (uint8_t)(code1_size & 0xFF);
 
-    // Data section: kind=4, size=0
-    buf[pos++] = 0x04;
+    // Data section: kind=0xFF, size=0
+    buf[pos++] = 0xFF;
     buf[pos++] = 0x00;
     buf[pos++] = 0x00;
 
@@ -251,7 +251,7 @@ static void test_invalid_magic(void)
 
     uint8_t bad[] = { 0xEF, 0x01, 0x01, 0x01, 0x00, 0x04,
                       0x02, 0x00, 0x01, 0x00, 0x01,
-                      0x04, 0x00, 0x00,
+                      0xFF, 0x00, 0x00,
                       0x00,
                       0x00, 0x80, 0x00, 0x00,
                       0x00 };
@@ -270,7 +270,7 @@ static void test_invalid_version(void)
 
     uint8_t bad[] = { 0xEF, 0x00, 0x02, 0x01, 0x00, 0x04,
                       0x02, 0x00, 0x01, 0x00, 0x01,
-                      0x04, 0x00, 0x00,
+                      0xFF, 0x00, 0x00,
                       0x00,
                       0x00, 0x80, 0x00, 0x00,
                       0x00 };

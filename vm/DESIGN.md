@@ -672,9 +672,136 @@ vm/
 
 ---
 
-## 10. Implementation Order
+## 10. EOF-Enabled Optimization Opportunities
 
-Phase 1 — Foundation:
+EOF's deploy-time validation gives the VM a complete static picture of every
+contract before execution begins. In legacy EVM, nothing can be analyzed until
+you run it. With EOF, you can analyze everything at deploy time and build
+execution plans. Five concrete optimizations follow.
+
+### 10.1 Verkle Witness Prefetching
+
+Static analysis of an EOF container can identify which storage keys and account
+fields a function *will* touch on a given code path. The VM can pre-fetch Verkle
+proofs and tree nodes before execution begins, turning serial state lookups into
+a single batched I/O operation.
+
+```
+Deploy-time analysis:
+  code section 0 → SLOAD key X, SLOAD key Y, BALANCE addr Z
+  code section 1 → SSTORE key W (via CALLF from section 0)
+
+Before executing:
+  prefetch(stem(addr, X), stem(addr, Y), stem(Z, balance), stem(addr, W))
+```
+
+The static CFG lets us build a conservative over-approximation of accessed keys.
+For conditional branches (RJUMPI), both sides' accesses are included. The cost
+of over-fetching is low (unused proofs are discarded), while the latency
+reduction from batching is significant.
+
+### 10.2 Transaction-Level Parallelism
+
+With the full CFG and data flow known, static analysis can compute a
+conservative set of state keys each contract may access (read-set and
+write-set). The block builder or executor can then:
+
+1. Analyze each transaction's target contract(s)
+2. Build per-transaction read/write sets (addresses, storage slots)
+3. Schedule non-conflicting transactions for parallel execution
+4. Serialize only those with overlapping write-sets
+
+```
+tx1: contract A reads  [slot 1, 2],  writes [slot 3]
+tx2: contract B reads  [slot 5],     writes [slot 6]
+tx3: contract A reads  [slot 3],     writes [slot 7]
+
+→ tx1 and tx2 execute in parallel (no overlap)
+→ tx3 waits for tx1 (reads slot 3 which tx1 writes)
+```
+
+This is impractical with legacy EVM because the access set is unknowable until
+execution. EOF makes it statically derivable (with over-approximation for
+branches and dynamic storage keys).
+
+### 10.3 JIT Compilation
+
+EOF provides exactly the guarantees a JIT compiler needs:
+
+- **Static stack heights** at every instruction → direct register/local mapping
+- **No dynamic jumps** → the CFG is known, basic blocks are fixed
+- **Structured functions** (CALLF/RETF) → standard calling conventions
+- **No JUMPDEST scanning** → code can be compiled section-by-section
+- **Max stack height declared** → stack frame size known at compile time
+
+A straightforward compilation pipeline:
+
+```
+EOF bytecode
+  → basic block identification (from RJUMP/RJUMPI/RJUMPV targets)
+  → SSA conversion (stack → virtual registers)
+  → native code generation (x86-64 / aarch64)
+  → cache compiled code per code_hash
+```
+
+Hot contracts (DEX routers, token transfers) would execute at near-native speed
+after the first invocation. Cold contracts fall back to the interpreter.
+
+### 10.4 Speculative State Access
+
+At conditional branches (RJUMPI, RJUMPV), the static CFG reveals both paths'
+state accesses. The VM can speculatively initiate state reads for both sides
+while the branch condition is being computed:
+
+```
+instruction stream:
+  SLOAD key_A        ← both paths need this
+  PUSH condition
+  RJUMPI +offset
+    SLOAD key_B      ← taken path
+    ...
+  else:
+    SLOAD key_C      ← fallthrough path
+    ...
+
+At RJUMPI: speculatively prefetch both key_B and key_C.
+One fetch will be wasted, but the other saves a full tree traversal.
+```
+
+For Verkle trees where each traversal involves IPA proof verification, the
+latency savings from speculative prefetching compound across nested branches.
+
+### 10.5 Batched Verkle Operations
+
+Instead of paying the full tree-traversal cost for each state access
+individually, the VM can batch all accesses within a basic block (or even an
+entire function call) into a single tree operation:
+
+```
+Without batching (sequential):
+  SLOAD key_1  →  traverse tree  →  result_1
+  SLOAD key_2  →  traverse tree  →  result_2
+  SLOAD key_3  →  traverse tree  →  result_3
+  Total: 3 × tree traversal latency
+
+With batching (parallel):
+  Collect {key_1, key_2, key_3} from static analysis
+  →  single multi-get on tree  →  {result_1, result_2, result_3}
+  Total: 1 × tree traversal latency (amortized)
+```
+
+This applies to both reads (SLOAD, BALANCE) and witness charging. The witness
+manager can pre-warm all stems for a function in a single pass rather than
+charging one-by-one as execution hits each opcode.
+
+Combined with 10.1 (prefetching), the VM can overlap tree I/O with computation:
+execute arithmetic while the next batch of state accesses is in flight.
+
+---
+
+## 11. Implementation Order
+
+Phase 1 — Foundation (complete):
   1. `eof.c` — EOF parsing and validation (most critical, everything depends on it)
   2. `vm.h` / `vm.c` — core types, context creation, lifecycle
   3. `vm_memory.c` — linear memory (same as EVM, can reuse)

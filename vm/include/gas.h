@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "uint256.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -107,6 +108,9 @@ extern "C" {
 
 #define VM_GAS_BLOCKHASH      20     // BLOCKHASH
 #define VM_GAS_SELFBALANCE     5     // SELFBALANCE
+#define VM_GAS_WARM_ACCESS   100     // EIP-2929 warm storage/account access
+#define VM_GAS_TLOAD         100     // Transient load (EIP-1153)
+#define VM_GAS_TSTORE        100     // Transient store (EIP-1153)
 
 #define VM_MEMORY_WORD_SIZE   32     // Word size in bytes
 
@@ -149,6 +153,14 @@ uint64_t vm_gas_to_word_size(uint64_t size);
  * 63/64 rule for gas forwarding in calls (EIP-150).
  */
 uint64_t vm_gas_max_call_gas(uint64_t gas_left);
+
+/**
+ * Calculate SSTORE gas cost (EIP-2200 + EIP-3529 simplified model).
+ * Returns the gas cost and writes the refund delta to *refund_delta.
+ * The refund delta can be negative (undoing a previous clear refund).
+ */
+uint64_t vm_gas_sstore_cost(const uint256_t *value, const uint256_t *current,
+                             const uint256_t *original, int64_t *refund_delta);
 
 #ifdef __cplusplus
 }

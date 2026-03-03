@@ -40,7 +40,7 @@ extern "C" {
 #define EOF_KIND_TYPE       0x01
 #define EOF_KIND_CODE       0x02
 #define EOF_KIND_CONTAINER  0x03
-#define EOF_KIND_DATA       0x04
+#define EOF_KIND_DATA       0xFF
 #define EOF_TERMINATOR      0x00
 
 // Function outputs marker for non-returning functions (entry point)
@@ -76,6 +76,7 @@ extern "C" {
 
 // Create / return container
 #define OP_EOFCREATE      0xEC
+#define OP_TXCREATE       0xED
 #define OP_RETURNCONTRACT 0xEE
 
 // Calls (new EOF style)
@@ -131,7 +132,7 @@ typedef struct eof_container {
     uint16_t                 num_containers;
     struct eof_container   **containers;      // nested containers (for EOFCREATE)
     uint32_t                *sub_offsets;     // byte offsets of sub-containers in raw[]
-    uint16_t                *sub_sizes;       // declared sizes of sub-containers
+    uint32_t                *sub_sizes;       // declared sizes of sub-containers
     uint8_t                 *raw;             // owned copy of full bytecode
     size_t                   raw_size;
 } eof_container_t;
