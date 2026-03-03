@@ -367,6 +367,12 @@ add_executable(test_verkle_journal
 target_link_libraries(test_verkle_journal verkle_journal verkle_state)
 add_test(NAME test_verkle_journal COMMAND test_verkle_journal)
 
+# Benchmark: Verkle state scale (block simulation)
+add_executable(bench_verkle_state
+    state/tests/bench_verkle_state.c
+)
+target_link_libraries(bench_verkle_state verkle_journal verkle_state verkle_snapshot)
+
 #==============================================================================
 # Build Summary
 #==============================================================================

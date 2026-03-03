@@ -259,6 +259,10 @@ bool verkle_journal_enable_fwd(verkle_journal_t *j, const char *path,
 {
     if (!j || !path) return false;
 
+    /* Copy path first — caller may pass j->fwd_path which we're about to free */
+    char *new_path = strdup(path);
+    if (!new_path) return false;
+
     /* Close previous if any */
     if (j->fwd_fd >= 0) {
         close(j->fwd_fd);
@@ -267,17 +271,17 @@ bool verkle_journal_enable_fwd(verkle_journal_t *j, const char *path,
     free(j->fwd_path);
     j->fwd_path = NULL;
 
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return false;
+    int fd = open(new_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { free(new_path); return false; }
 
     /* Write header */
     uint32_t version = FWD_VERSION;
-    if (!fwd_write_all(fd, FWD_MAGIC, 8)) { close(fd); return false; }
-    if (!fwd_write_all(fd, &version, 4)) { close(fd); return false; }
-    if (!fwd_write_all(fd, &snapshot_block, 4)) { close(fd); return false; }
+    if (!fwd_write_all(fd, FWD_MAGIC, 8)) { close(fd); free(new_path); return false; }
+    if (!fwd_write_all(fd, &version, 4)) { close(fd); free(new_path); return false; }
+    if (!fwd_write_all(fd, &snapshot_block, 4)) { close(fd); free(new_path); return false; }
 
     j->fwd_fd = fd;
-    j->fwd_path = strdup(path);
+    j->fwd_path = new_path;
     return true;
 }
 
