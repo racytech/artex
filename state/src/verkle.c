@@ -412,6 +412,117 @@ bool verkle_set(verkle_tree_t *vt,
 }
 
 /* =========================================================================
+ * Unset (clear has_value for a suffix)
+ * ========================================================================= */
+
+bool verkle_unset(verkle_tree_t *vt, const uint8_t key[VERKLE_KEY_LEN])
+{
+    if (!vt || !vt->root) return false;
+
+    const uint8_t *stem = key;
+    uint8_t suffix = key[31];
+
+    /* Track path for commitment propagation + structural changes */
+    verkle_node_t *path[VERKLE_STEM_LEN + 1];
+    int path_indices[VERKLE_STEM_LEN + 1];
+    int path_len = 0;
+
+    verkle_node_t **slot = &vt->root;
+    int depth = 0;
+
+    while (*slot) {
+        verkle_node_t *node = *slot;
+
+        if (node->type == VERKLE_LEAF) {
+            if (memcmp(node->leaf.stem, stem, VERKLE_STEM_LEN) != 0)
+                return false;
+            if (!node->leaf.has_value[suffix])
+                return false;
+
+            /* Check if this is the last value in the leaf */
+            bool is_last = true;
+            for (int i = 0; i < VERKLE_WIDTH; i++) {
+                if (i != suffix && node->leaf.has_value[i]) {
+                    is_last = false;
+                    break;
+                }
+            }
+
+            if (!is_last) {
+                /* Normal unset: clear value, incremental commitment update */
+                uint8_t old_value[32];
+                memcpy(old_value, node->leaf.values[suffix], 32);
+                node->leaf.has_value[suffix] = false;
+                memset(node->leaf.values[suffix], 0, 32);
+
+                uint8_t zeros[32] = {0};
+                banderwagon_point_t old_leaf_commit =
+                    incremental_update_leaf(&node->leaf, suffix,
+                                            old_value, zeros);
+                incremental_propagate_internals(
+                    path, path_indices, path_len,
+                    &old_leaf_commit, &node->leaf.commitment);
+                return true;
+            }
+
+            /* Last value: remove leaf and collapse tree structure */
+            *slot = NULL;
+            free(node);
+
+            /* Walk up, collapsing empty/single-child internals */
+            for (int i = path_len - 1; i >= 0; i--) {
+                verkle_node_t *parent = path[i];
+                int child_count = 0;
+                int single_idx = -1;
+
+                for (int c = 0; c < VERKLE_WIDTH; c++) {
+                    if (parent->internal.children[c]) {
+                        child_count++;
+                        single_idx = c;
+                    }
+                }
+
+                if (child_count == 0) {
+                    /* Empty internal: remove from its parent */
+                    if (i == 0)
+                        vt->root = NULL;
+                    else
+                        path[i - 1]->internal.children[path_indices[i - 1]] = NULL;
+                    free(parent);
+                } else if (child_count == 1) {
+                    /* Single child: collapse — replace this internal
+                     * with the single remaining child */
+                    verkle_node_t *child = parent->internal.children[single_idx];
+                    if (i == 0)
+                        vt->root = child;
+                    else
+                        path[i - 1]->internal.children[path_indices[i - 1]] = child;
+                    parent->internal.children[single_idx] = NULL;
+                    free(parent);
+                } else {
+                    /* 2+ children: recompute this node and all ancestors */
+                    compute_internal_commitment(&parent->internal);
+                    for (int k = i - 1; k >= 0; k--) {
+                        compute_internal_commitment(&path[k]->internal);
+                    }
+                    return true;
+                }
+            }
+            return true;
+        }
+
+        /* Internal node: descend */
+        path[path_len] = node;
+        path_indices[path_len] = stem[depth];
+        path_len++;
+        slot = &node->internal.children[stem[depth]];
+        depth++;
+    }
+
+    return false;
+}
+
+/* =========================================================================
  * Commitment Queries
  * ========================================================================= */
 

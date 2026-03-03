@@ -144,6 +144,12 @@ add_library(verkle_snapshot STATIC
 )
 target_link_libraries(verkle_snapshot verkle banderwagon)
 
+# Verkle journal (block revert + crash recovery + background checkpoint)
+add_library(verkle_journal STATIC
+    state/src/verkle_journal.c
+)
+target_link_libraries(verkle_journal verkle verkle_snapshot banderwagon)
+
 #==============================================================================
 # Tests
 #==============================================================================
@@ -353,6 +359,13 @@ add_executable(test_verkle_snapshot
 )
 target_link_libraries(test_verkle_snapshot verkle_snapshot verkle_state)
 add_test(NAME test_verkle_snapshot COMMAND test_verkle_snapshot)
+
+# Test: Verkle journal (block revert + crash recovery + checkpoint)
+add_executable(test_verkle_journal
+    state/tests/test_verkle_journal.c
+)
+target_link_libraries(test_verkle_journal verkle_journal verkle_state)
+add_test(NAME test_verkle_journal COMMAND test_verkle_journal)
 
 #==============================================================================
 # Build Summary

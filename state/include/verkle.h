@@ -91,6 +91,12 @@ bool verkle_get(const verkle_tree_t *vt,
                 const uint8_t key[VERKLE_KEY_LEN],
                 uint8_t value[VERKLE_VALUE_LEN]);
 
+/** Clear a key's value (set has_value to false).
+ *  Returns true if the key existed and was cleared.
+ *  Incrementally updates commitments. Does not remove nodes. */
+bool verkle_unset(verkle_tree_t *vt,
+                  const uint8_t key[VERKLE_KEY_LEN]);
+
 /* =========================================================================
  * Commitment
  * ========================================================================= */
