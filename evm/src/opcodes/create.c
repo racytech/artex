@@ -139,17 +139,32 @@ static evm_status_t execute_create(evm_t *evm,
     evm_state_set_nonce(evm->state, &evm->msg.recipient, sender_nonce + 1);
 
     //==========================================================================
-    // Collision Detection (EIP-7610)
+    // Collision Detection
     //==========================================================================
 
-    // EIP-7610: collision if target has code, non-zero nonce, or storage
+    // EIP-684: collision if target has non-zero nonce or code
+    // EIP-7610 (Prague+): also collision if target has non-empty storage
     uint64_t target_nonce = evm_state_get_nonce(evm->state, contract_addr);
     uint32_t target_code_size = evm_state_get_code_size(evm->state, contract_addr);
-    bool target_has_storage = evm_state_has_storage(evm->state, contract_addr);
-    if (target_nonce > 0 || target_code_size > 0 || target_has_storage)
+    bool collision = (target_nonce > 0 || target_code_size > 0);
+    if (!collision && evm->fork >= FORK_PRAGUE)
+    {
+        collision = evm_state_has_storage(evm->state, contract_addr);
+    }
+    if (collision)
     {
         LOG_EVM_DEBUG("CREATE: Address collision detected");
         if (init_code) free(init_code);
+        // Consume forwarded gas (collision consumes all gas that would be forwarded)
+        if (evm->fork >= FORK_TANGERINE_WHISTLE)
+        {
+            uint64_t gas_forwarded = gas_max_call_gas(evm->gas_left);
+            evm->gas_left -= gas_forwarded;
+        }
+        else
+        {
+            evm->gas_left = 0;
+        }
         uint256_t zero = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &zero))
             return EVM_STACK_OVERFLOW;

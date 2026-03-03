@@ -309,14 +309,18 @@ bool transaction_execute(
     // For contract creation, check for collision and create account
     bool collision = false;
     if (tx->is_create) {
-        // EIP-7610: collision if account has nonce, code, or storage
+        // EIP-684: collision if account has nonce or code
+        // EIP-7610 (Prague+): also collision if account has non-empty storage
         uint64_t existing_nonce = evm_state_get_nonce(state, &contract_address);
         uint32_t existing_code = evm_state_get_code_size(state, &contract_address);
-        bool has_storage = evm_state_has_storage(state, &contract_address);
-        if (existing_nonce > 0 || existing_code > 0 || has_storage) {
-            LOG_EVM_DEBUG("Contract address collision: nonce=%lu, code_size=%u, storage=%d",
-                         existing_nonce, existing_code, has_storage);
-            collision = true;
+        collision = (existing_nonce > 0 || existing_code > 0);
+        if (!collision && evm->fork >= FORK_PRAGUE) {
+            collision = evm_state_has_storage(state, &contract_address);
+        }
+        if (collision) {
+            LOG_EVM_DEBUG("Contract address collision: nonce=%lu, code_size=%u",
+                         existing_nonce, existing_code);
+            // collision remains true
         } else {
             evm_state_create_account(state, &contract_address);
 
