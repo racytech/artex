@@ -96,9 +96,10 @@ add_library(evm STATIC
     evm/src/opcodes/control.c
     evm/src/opcodes/block.c
     evm/src/opcodes/create.c
+    evm/src/precompile.c
 )
 target_include_directories(evm PUBLIC ${CMAKE_SOURCE_DIR}/evm/include)
-target_link_libraries(evm evm_state common)
+target_link_libraries(evm evm_state common ssl crypto secp256k1)
 
 #==============================================================================
 # Tests

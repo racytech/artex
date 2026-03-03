@@ -4,6 +4,7 @@
 
 #include "evm.h"
 #include "interpreter.h"
+#include "precompile.h"
 #include "fork.h"
 #include "evm_stack.h"
 #include "evm_memory.h"
@@ -496,6 +497,21 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
             evm_mark_address_warm(evm, &msg->caller);
             evm_mark_address_warm(evm, &msg->recipient);
 
+            // EIP-2929: precompile addresses are always warm
+            // Determine the highest active precompile for this fork
+            uint8_t max_precompile = 4; // Frontier: 0x01-0x04
+            if (evm->fork >= FORK_BYZANTIUM) max_precompile = 8;  // + MODEXP, BN256
+            if (evm->fork >= FORK_ISTANBUL)  max_precompile = 9;  // + BLAKE2F
+            if (evm->fork >= FORK_CANCUN)    max_precompile = 10; // + POINT_EVAL
+            if (evm->fork >= FORK_PRAGUE)    max_precompile = 19; // + BLS12-381
+
+            for (uint8_t i = 1; i <= max_precompile; i++)
+            {
+                address_t precompile_addr = {0};
+                precompile_addr.bytes[19] = i;
+                evm_mark_address_warm(evm, &precompile_addr);
+            }
+
             // EIP-3651 (Shanghai+): coinbase is warm from start of transaction
             if (evm->fork >= FORK_SHANGHAI)
             {
@@ -552,6 +568,66 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         evm->msg.input_size = 0;
 
         LOG_EVM_DEBUG("CREATE: Running init code (%zu bytes)", evm->code_size);
+    }
+    else if (is_precompile(&msg->code_addr, evm->fork))
+    {
+        // Execute precompile directly — no bytecode interpretation needed
+        uint64_t gas_remaining = evm->gas_left;
+        uint8_t *pc_output = NULL;
+        size_t pc_output_size = 0;
+
+        evm_status_t pc_status = precompile_execute(
+            &msg->code_addr,
+            msg->input_data, msg->input_size,
+            &gas_remaining,
+            &pc_output, &pc_output_size,
+            evm->fork);
+
+        // Revert state on precompile failure (subcalls only)
+        if (is_subcall && pc_status != EVM_SUCCESS)
+            evm_state_revert(evm->state, subcall_snapshot);
+
+        // Build result
+        if (pc_status == EVM_SUCCESS)
+            *result = evm_result_success(gas_remaining, pc_output, pc_output_size);
+        else if (pc_status == EVM_REVERT)
+            *result = evm_result_revert(gas_remaining, pc_output, pc_output_size);
+        else
+            *result = evm_result_error(pc_status, 0);
+
+        if (pc_output) free(pc_output);
+
+        // Cleanup subcall context and set return data on parent
+        if (is_subcall)
+        {
+            evm_stack_destroy(evm->stack);
+            evm_memory_destroy(evm->memory);
+            evm_restore_context(evm, &saved_context);
+
+            // Update parent's return data so RETURNDATASIZE/RETURNDATACOPY work
+            if (evm->return_data)
+                free(evm->return_data);
+            if (result->output_size > 0 && result->output_data)
+            {
+                evm->return_data = malloc(result->output_size);
+                if (evm->return_data)
+                {
+                    memcpy(evm->return_data, result->output_data, result->output_size);
+                    evm->return_data_size = result->output_size;
+                }
+                else
+                {
+                    evm->return_data_size = 0;
+                }
+            }
+            else
+            {
+                evm->return_data = NULL;
+                evm->return_data_size = 0;
+            }
+        }
+
+        return true;
     }
     else
     {
