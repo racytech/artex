@@ -409,19 +409,17 @@ evm_status_t op_shl(evm_t *evm)
     evm_stack_pop(evm->stack, &shift);
     evm_stack_pop(evm->stack, &value);
 
-    uint64_t shift_amount = uint256_to_uint64(&shift);
-    
+    // If shift has any high bits set, amount is >= 256
     uint256_t result;
-    if (shift_amount >= 256)
+    if (shift.high || (uint64_t)(shift.low >> 64) || uint256_to_uint64(&shift) >= 256)
     {
-        // Shift by 256 or more results in 0
         result = UINT256_ZERO;
     }
     else
     {
-        result = uint256_shl(&value, shift_amount);
+        result = uint256_shl(&value, (unsigned int)uint256_to_uint64(&shift));
     }
-    
+
     if (!evm_stack_push(evm->stack, &result))
     {
         return EVM_STACK_OVERFLOW;
@@ -456,19 +454,16 @@ evm_status_t op_shr(evm_t *evm)
     evm_stack_pop(evm->stack, &shift);
     evm_stack_pop(evm->stack, &value);
 
-    uint64_t shift_amount = uint256_to_uint64(&shift);
-    
     uint256_t result;
-    if (shift_amount >= 256)
+    if (shift.high || (uint64_t)(shift.low >> 64) || uint256_to_uint64(&shift) >= 256)
     {
-        // Shift by 256 or more results in 0
         result = UINT256_ZERO;
     }
     else
     {
-        result = uint256_shr(&value, shift_amount);
+        result = uint256_shr(&value, (unsigned int)uint256_to_uint64(&shift));
     }
-    
+
     if (!evm_stack_push(evm->stack, &result))
     {
         return EVM_STACK_OVERFLOW;
@@ -503,25 +498,16 @@ evm_status_t op_sar(evm_t *evm)
     evm_stack_pop(evm->stack, &shift);
     evm_stack_pop(evm->stack, &value);
 
-    uint64_t shift_amount = uint256_to_uint64(&shift);
-    
     uint256_t result;
-    if (shift_amount >= 256)
+    if (shift.high || (uint64_t)(shift.low >> 64) || uint256_to_uint64(&shift) >= 256)
     {
         // For arithmetic shift, preserve sign
         bool is_negative = (value.high >> 127) & 1;
-        if (is_negative)
-        {
-            result = UINT256_MAX; // All 1s for negative
-        }
-        else
-        {
-            result = UINT256_ZERO;
-        }
+        result = is_negative ? UINT256_MAX : UINT256_ZERO;
     }
     else
     {
-        result = uint256_sar(&value, shift_amount);
+        result = uint256_sar(&value, (unsigned int)uint256_to_uint64(&shift));
     }
     
     if (!evm_stack_push(evm->stack, &result))
