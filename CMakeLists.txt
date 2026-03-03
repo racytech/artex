@@ -392,6 +392,12 @@ add_executable(test_stress_verkle_flat
 )
 target_link_libraries(test_stress_verkle_flat verkle_flat verkle verkle_commit_store)
 
+# Benchmark: Verkle flat scale (disk-backed block simulation)
+add_executable(bench_verkle_flat
+    state/tests/bench_verkle_flat.c
+)
+target_link_libraries(bench_verkle_flat verkle_state)
+
 #==============================================================================
 # Build Summary
 #==============================================================================
