@@ -147,6 +147,56 @@ void verkle_state_set_code_size(verkle_state_t *vs,
 }
 
 /* =========================================================================
+ * Code
+ * ========================================================================= */
+
+bool verkle_state_set_code(verkle_state_t *vs,
+                           const uint8_t addr[20],
+                           const uint8_t *bytecode,
+                           uint64_t len)
+{
+    verkle_state_set_code_size(vs, addr, len);
+
+    uint32_t num_chunks = (uint32_t)((len + 31) / 32);
+    for (uint32_t i = 0; i < num_chunks; i++) {
+        uint8_t key[32], value[32];
+        memset(value, 0, 32);
+        uint64_t offset = (uint64_t)i * 32;
+        uint64_t remaining = len - offset;
+        uint64_t copy_len = remaining < 32 ? remaining : 32;
+        memcpy(value, bytecode + offset, copy_len);
+        verkle_code_chunk_key(key, addr, i);
+        if (!verkle_set(vs->tree, key, value))
+            return false;
+    }
+    return true;
+}
+
+uint64_t verkle_state_get_code(verkle_state_t *vs,
+                               const uint8_t addr[20],
+                               uint8_t *out,
+                               uint64_t max_len)
+{
+    uint64_t code_size = verkle_state_get_code_size(vs, addr);
+    if (code_size == 0) return 0;
+
+    uint64_t read_len = code_size < max_len ? code_size : max_len;
+    uint32_t num_chunks = (uint32_t)((read_len + 31) / 32);
+
+    for (uint32_t i = 0; i < num_chunks; i++) {
+        uint8_t key[32], value[32];
+        verkle_code_chunk_key(key, addr, i);
+        if (!verkle_get(vs->tree, key, value))
+            break;
+        uint64_t offset = (uint64_t)i * 32;
+        uint64_t remaining = read_len - offset;
+        uint64_t copy_len = remaining < 32 ? remaining : 32;
+        memcpy(out + offset, value, copy_len);
+    }
+    return read_len;
+}
+
+/* =========================================================================
  * Storage
  * ========================================================================= */
 

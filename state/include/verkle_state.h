@@ -86,6 +86,25 @@ void     verkle_state_set_code_size(verkle_state_t *vs,
                                     uint64_t size);
 
 /* =========================================================================
+ * Code (bytecode split into 32-byte chunks, domain 3)
+ * ========================================================================= */
+
+/** Store contract bytecode (splits into 32-byte chunks, sets code_size).
+ *  Does NOT set code_hash — caller must set it separately.
+ *  Returns false on error. */
+bool verkle_state_set_code(verkle_state_t *vs,
+                           const uint8_t addr[20],
+                           const uint8_t *bytecode,
+                           uint64_t len);
+
+/** Read contract bytecode into `out` (max `max_len` bytes).
+ *  Returns actual code length (0 if no code). */
+uint64_t verkle_state_get_code(verkle_state_t *vs,
+                               const uint8_t addr[20],
+                               uint8_t *out,
+                               uint64_t max_len);
+
+/* =========================================================================
  * Storage (raw 32-byte values, slot is uint256 LE)
  * ========================================================================= */
 

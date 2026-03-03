@@ -1,4 +1,5 @@
 #include "verkle_state.h"
+#include "verkle_key.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -425,6 +426,188 @@ static void test_end_to_end(void) {
 }
 
 /* =========================================================================
+ * Phase 13: Code Round-Trip (Small)
+ * ========================================================================= */
+
+static void test_code_small(void) {
+    printf("Phase 13: Code round-trip (small, 50 bytes)\n");
+
+    verkle_state_t *vs = verkle_state_create();
+    uint8_t addr[20] = {0xA1};
+
+    /* 50-byte bytecode (not aligned to 32) */
+    uint8_t code[50];
+    for (int i = 0; i < 50; i++) code[i] = (uint8_t)(i + 1);
+
+    bool ok = verkle_state_set_code(vs, addr, code, 50);
+    ASSERT(ok, "set_code succeeds");
+
+    ASSERT(verkle_state_get_code_size(vs, addr) == 50,
+           "code_size set to 50");
+
+    uint8_t got[50];
+    memset(got, 0, 50);
+    uint64_t len = verkle_state_get_code(vs, addr, got, 50);
+    ASSERT(len == 50, "get_code returns 50");
+    ASSERT(memcmp(got, code, 50) == 0, "code bytes match exactly");
+
+    verkle_state_destroy(vs);
+    printf("  OK\n\n");
+}
+
+/* =========================================================================
+ * Phase 14: Code Round-Trip (Aligned)
+ * ========================================================================= */
+
+static void test_code_aligned(void) {
+    printf("Phase 14: Code round-trip (aligned, 64 bytes = 2 chunks)\n");
+
+    verkle_state_t *vs = verkle_state_create();
+    uint8_t addr[20] = {0xA2};
+
+    uint8_t code[64];
+    for (int i = 0; i < 64; i++) code[i] = (uint8_t)(0xFF - i);
+
+    verkle_state_set_code(vs, addr, code, 64);
+
+    uint8_t got[64];
+    uint64_t len = verkle_state_get_code(vs, addr, got, 64);
+    ASSERT(len == 64, "get_code returns 64");
+    ASSERT(memcmp(got, code, 64) == 0, "aligned code round-trips");
+
+    verkle_state_destroy(vs);
+    printf("  OK\n\n");
+}
+
+/* =========================================================================
+ * Phase 15: Code Round-Trip (Large)
+ * ========================================================================= */
+
+static void test_code_large(void) {
+    printf("Phase 15: Code round-trip (large, 1000 bytes)\n");
+
+    verkle_state_t *vs = verkle_state_create();
+    uint8_t addr[20] = {0xA3};
+
+    uint8_t code[1000];
+    for (int i = 0; i < 1000; i++) code[i] = (uint8_t)(i * 7 + 3);
+
+    verkle_state_set_code(vs, addr, code, 1000);
+
+    ASSERT(verkle_state_get_code_size(vs, addr) == 1000,
+           "code_size set to 1000");
+
+    /* Read full */
+    uint8_t got[1000];
+    memset(got, 0, 1000);
+    uint64_t len = verkle_state_get_code(vs, addr, got, 1000);
+    ASSERT(len == 1000, "get_code returns 1000");
+    ASSERT(memcmp(got, code, 1000) == 0, "1000 bytes match");
+
+    /* Read partial (max_len < code_size) */
+    uint8_t partial[100];
+    len = verkle_state_get_code(vs, addr, partial, 100);
+    ASSERT(len == 100, "partial read returns 100");
+    ASSERT(memcmp(partial, code, 100) == 0, "partial bytes match");
+
+    verkle_state_destroy(vs);
+    printf("  OK\n\n");
+}
+
+/* =========================================================================
+ * Phase 16: Code + Header Integration
+ * ========================================================================= */
+
+static void test_code_header_integration(void) {
+    printf("Phase 16: Code + header integration\n");
+
+    verkle_state_t *vs = verkle_state_create();
+    uint8_t addr[20] = {0xA4};
+
+    /* Set some header fields first */
+    verkle_state_set_nonce(vs, addr, 42);
+    uint8_t bal[32] = {0}; bal[0] = 100;
+    verkle_state_set_balance(vs, addr, bal);
+
+    /* Set code */
+    uint8_t code[80];
+    for (int i = 0; i < 80; i++) code[i] = (uint8_t)i;
+    verkle_state_set_code(vs, addr, code, 80);
+
+    /* code_size should be set */
+    ASSERT(verkle_state_get_code_size(vs, addr) == 80,
+           "code_size reflects set_code");
+
+    /* code_hash should NOT be set (caller's responsibility) */
+    uint8_t hash[32], zero[32] = {0};
+    verkle_state_get_code_hash(vs, addr, hash);
+    ASSERT(memcmp(hash, zero, 32) == 0,
+           "code_hash not set by set_code");
+
+    /* Other header fields unaffected */
+    ASSERT(verkle_state_get_nonce(vs, addr) == 42,
+           "nonce unaffected by set_code");
+    uint8_t got_bal[32];
+    verkle_state_get_balance(vs, addr, got_bal);
+    ASSERT(memcmp(got_bal, bal, 32) == 0,
+           "balance unaffected by set_code");
+
+    /* Code still readable */
+    uint8_t got[80];
+    uint64_t len = verkle_state_get_code(vs, addr, got, 80);
+    ASSERT(len == 80, "code readable after header ops");
+    ASSERT(memcmp(got, code, 80) == 0, "code bytes intact");
+
+    verkle_state_destroy(vs);
+    printf("  OK\n\n");
+}
+
+/* =========================================================================
+ * Phase 17: Code Key Domain Separation
+ * ========================================================================= */
+
+static void test_code_domain_separation(void) {
+    printf("Phase 17: Code key domain separation\n");
+
+    uint8_t addr[20] = {0xA5};
+
+    /* Code chunk 0 key (domain 3) */
+    uint8_t code_key[32];
+    verkle_code_chunk_key(code_key, addr, 0);
+
+    /* Storage slot 0 key (domain 2) */
+    uint8_t storage_key[32];
+    uint8_t slot[32] = {0};
+    verkle_storage_key(storage_key, addr, slot);
+
+    /* Account header key (domain 2, tree_index=0) */
+    uint8_t header_key[32];
+    verkle_account_version_key(header_key, addr);
+
+    /* All stems must differ (different domains / tree_indices) */
+    ASSERT(memcmp(code_key, storage_key, 31) != 0,
+           "code stem differs from storage stem");
+    ASSERT(memcmp(code_key, header_key, 31) != 0,
+           "code stem differs from header stem");
+
+    /* Two code chunks in the same group share a stem */
+    uint8_t code_key2[32];
+    verkle_code_chunk_key(code_key2, addr, 1);
+    ASSERT(memcmp(code_key, code_key2, 31) == 0,
+           "chunks 0 and 1 share stem (same group)");
+    ASSERT(code_key[31] != code_key2[31],
+           "chunks 0 and 1 differ in suffix");
+
+    /* Chunk 256 is in a different group → different stem */
+    uint8_t code_key256[32];
+    verkle_code_chunk_key(code_key256, addr, 256);
+    ASSERT(memcmp(code_key, code_key256, 31) != 0,
+           "chunk 0 and chunk 256 have different stems");
+
+    printf("  OK\n\n");
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -443,6 +626,11 @@ int main(void) {
     test_existence();
     test_root_changes();
     test_end_to_end();
+    test_code_small();
+    test_code_aligned();
+    test_code_large();
+    test_code_header_integration();
+    test_code_domain_separation();
 
     printf("=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);

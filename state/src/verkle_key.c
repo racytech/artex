@@ -6,23 +6,17 @@
  * Core Derivation
  * ========================================================================= */
 
-void verkle_derive_stem(uint8_t stem[31],
-                        const uint8_t address[20],
-                        const uint8_t tree_index[32])
+static void derive_stem_with_domain(uint8_t stem[31],
+                                     const uint8_t address[20],
+                                     const uint8_t tree_index[32],
+                                     uint8_t domain)
 {
     uint8_t scalars[4][32];
     memset(scalars, 0, sizeof(scalars));
 
-    /* scalar[0]: domain separator = 2 */
-    scalars[0][0] = VERKLE_KEY_DOMAIN;
-
-    /* scalar[1]: address (20 bytes LE, zero-padded to 32) */
+    scalars[0][0] = domain;
     memcpy(scalars[1], address, 20);
-
-    /* scalar[2]: tree_index lower 16 bytes */
     memcpy(scalars[2], tree_index, 16);
-
-    /* scalar[3]: tree_index upper 16 bytes */
     memcpy(scalars[3], tree_index + 16, 16);
 
     banderwagon_point_t commitment;
@@ -31,6 +25,13 @@ void verkle_derive_stem(uint8_t stem[31],
     uint8_t field[32];
     banderwagon_map_to_field(field, &commitment);
     memcpy(stem, field, 31);
+}
+
+void verkle_derive_stem(uint8_t stem[31],
+                        const uint8_t address[20],
+                        const uint8_t tree_index[32])
+{
+    derive_stem_with_domain(stem, address, tree_index, VERKLE_KEY_DOMAIN);
 }
 
 void verkle_derive_key(uint8_t key[32],
@@ -100,4 +101,24 @@ void verkle_storage_key(uint8_t key[32],
     }
 
     verkle_derive_key(key, address, tree_index, sub_index);
+}
+
+/* =========================================================================
+ * Code Chunk Convenience
+ * ========================================================================= */
+
+void verkle_code_chunk_key(uint8_t key[32],
+                           const uint8_t address[20],
+                           uint32_t chunk_id)
+{
+    uint8_t tree_index[32];
+    memset(tree_index, 0, 32);
+
+    uint32_t group = chunk_id / 256;
+    memcpy(tree_index, &group, sizeof(group));  /* LE */
+
+    uint8_t sub_index = (uint8_t)(chunk_id % 256);
+
+    derive_stem_with_domain(key, address, tree_index, VERKLE_CODE_DOMAIN);
+    key[31] = sub_index;
 }

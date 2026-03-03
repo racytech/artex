@@ -27,8 +27,11 @@ extern "C" {
  * Account Layout Constants
  * ========================================================================= */
 
-/** Domain separator for key derivation (leaf commitment uses 1). */
+/** Domain separator for state key derivation (leaf commitment uses 1). */
 #define VERKLE_KEY_DOMAIN          2
+
+/** Domain separator for code key derivation (separate from state). */
+#define VERKLE_CODE_DOMAIN         3
 
 /** Account header fields (tree_index = 0). */
 #define VERKLE_VERSION_SUFFIX      0
@@ -102,6 +105,25 @@ void verkle_account_code_size_key(uint8_t key[32], const uint8_t address[20]);
 void verkle_storage_key(uint8_t key[32],
                         const uint8_t address[20],
                         const uint8_t slot[32]);
+
+/* =========================================================================
+ * Code Chunk Convenience
+ * ========================================================================= */
+
+/**
+ * Derive key for code chunk #chunk_id.
+ *
+ * Uses domain separator 3 (separate from state domain 2).
+ * Mapping: tree_index = chunk_id / 256, sub_index = chunk_id % 256.
+ * Each group of 256 chunks shares a stem (one leaf node, 8192 bytes of code).
+ *
+ * @param key       Output: 32-byte key
+ * @param address   20-byte address
+ * @param chunk_id  Code chunk index (0-based)
+ */
+void verkle_code_chunk_key(uint8_t key[32],
+                           const uint8_t address[20],
+                           uint32_t chunk_id);
 
 #ifdef __cplusplus
 }
