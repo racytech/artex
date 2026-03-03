@@ -2,6 +2,8 @@
 #include "verkle_key.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 
 /* =========================================================================
  * Test Infrastructure
@@ -608,6 +610,165 @@ static void test_code_domain_separation(void) {
 }
 
 /* =========================================================================
+ * Phase 18: Flat Backend — Cross-Validation
+ * ========================================================================= */
+
+#define FLAT_VAL_DIR  "/tmp/test_vs_flat_val"
+#define FLAT_COMM_DIR "/tmp/test_vs_flat_comm"
+
+static void cleanup_flat_dirs(void) {
+    system("rm -rf " FLAT_VAL_DIR " " FLAT_COMM_DIR);
+}
+
+static void test_flat_backend(void) {
+    printf("Phase 18: Flat backend cross-validation\n");
+
+    cleanup_flat_dirs();
+    mkdir(FLAT_VAL_DIR, 0755);
+    mkdir(FLAT_COMM_DIR, 0755);
+
+    /* --- Block 1: set up account fields --- */
+    verkle_state_t *vs = verkle_state_create_flat(FLAT_VAL_DIR, FLAT_COMM_DIR, 1024);
+    ASSERT(vs != NULL, "flat create returns non-NULL");
+    ASSERT(verkle_state_get_tree(vs) == NULL, "flat: get_tree returns NULL");
+    ASSERT(verkle_state_get_flat(vs) != NULL, "flat: get_flat returns non-NULL");
+
+    verkle_state_begin_block(vs, 1);
+
+    uint8_t addr[20] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+                         0x11, 0x22, 0x33, 0x44, 0x55,
+                         0x66, 0x77, 0x88, 0x99, 0x00,
+                         0xAB, 0xCD, 0xEF, 0x01, 0x23};
+
+    verkle_state_set_version(vs, addr, 1);
+    verkle_state_set_nonce(vs, addr, 7);
+
+    uint8_t balance[32] = {0};
+    balance[0] = 0x00; balance[1] = 0xE1; balance[2] = 0xF5; balance[3] = 0x05;
+    verkle_state_set_balance(vs, addr, balance);
+
+    uint8_t code_hash[32];
+    for (int i = 0; i < 32; i++) code_hash[i] = (uint8_t)(0xC0 + i);
+    verkle_state_set_code_hash(vs, addr, code_hash);
+
+    verkle_state_set_code_size(vs, addr, 1024);
+
+    uint8_t slot0[32] = {0};
+    uint8_t val0[32] = {0}; val0[0] = 0xFF;
+    verkle_state_set_storage(vs, addr, slot0, val0);
+
+    uint8_t slot1[32] = {0}; slot1[0] = 1;
+    uint8_t val1[32] = {0}; val1[0] = 0xAB;
+    verkle_state_set_storage(vs, addr, slot1, val1);
+
+    verkle_state_commit_block(vs);
+
+    /* Verify reads */
+    ASSERT(verkle_state_get_version(vs, addr) == 1, "flat: version=1");
+    ASSERT(verkle_state_get_nonce(vs, addr) == 7, "flat: nonce=7");
+
+    uint8_t got_bal[32];
+    verkle_state_get_balance(vs, addr, got_bal);
+    ASSERT(memcmp(got_bal, balance, 32) == 0, "flat: balance matches");
+
+    uint8_t got_ch[32];
+    verkle_state_get_code_hash(vs, addr, got_ch);
+    ASSERT(memcmp(got_ch, code_hash, 32) == 0, "flat: code hash matches");
+
+    ASSERT(verkle_state_get_code_size(vs, addr) == 1024, "flat: code_size=1024");
+
+    uint8_t got_s[32];
+    verkle_state_get_storage(vs, addr, slot0, got_s);
+    ASSERT(memcmp(got_s, val0, 32) == 0, "flat: storage slot 0");
+
+    verkle_state_get_storage(vs, addr, slot1, got_s);
+    ASSERT(memcmp(got_s, val1, 32) == 0, "flat: storage slot 1");
+
+    ASSERT(verkle_state_exists(vs, addr), "flat: account exists");
+
+    uint8_t addr2[20] = {0x60};
+    ASSERT(!verkle_state_exists(vs, addr2), "flat: non-existent account");
+
+    /* Root should be non-zero */
+    uint8_t root[32], zero[32] = {0};
+    verkle_state_root_hash(vs, root);
+    ASSERT(memcmp(root, zero, 32) != 0, "flat: root non-zero");
+
+    /* --- Block 2: update and verify root changes --- */
+    verkle_state_begin_block(vs, 2);
+    verkle_state_set_nonce(vs, addr, 8);
+    verkle_state_commit_block(vs);
+
+    uint8_t root2[32];
+    verkle_state_root_hash(vs, root2);
+    ASSERT(memcmp(root, root2, 32) != 0, "flat: root changes after update");
+    ASSERT(verkle_state_get_nonce(vs, addr) == 8, "flat: nonce=8 after update");
+
+    /* --- Revert block 2 --- */
+    verkle_state_revert_block(vs);
+    uint8_t root3[32];
+    verkle_state_root_hash(vs, root3);
+    ASSERT(memcmp(root, root3, 32) == 0, "flat: root restored after revert");
+    ASSERT(verkle_state_get_nonce(vs, addr) == 7, "flat: nonce=7 after revert");
+
+    verkle_state_destroy(vs);
+    cleanup_flat_dirs();
+    printf("  OK\n\n");
+}
+
+/* =========================================================================
+ * Phase 19: Flat Backend — Cross-Validate Root Against Tree
+ * ========================================================================= */
+
+static void test_flat_tree_root_match(void) {
+    printf("Phase 19: Flat vs tree root hash match\n");
+
+    cleanup_flat_dirs();
+    mkdir(FLAT_VAL_DIR, 0755);
+    mkdir(FLAT_COMM_DIR, 0755);
+
+    /* Build identical state in both backends */
+    verkle_state_t *tree_vs = verkle_state_create();
+    verkle_state_t *flat_vs = verkle_state_create_flat(FLAT_VAL_DIR, FLAT_COMM_DIR, 1024);
+
+    verkle_state_begin_block(flat_vs, 1);
+
+    uint8_t addr1[20] = {0x01, 0x02, 0x03};
+    uint8_t addr2[20] = {0x10, 0x20, 0x30};
+
+    /* Account 1: nonce + balance */
+    verkle_state_set_nonce(tree_vs, addr1, 42);
+    verkle_state_set_nonce(flat_vs, addr1, 42);
+
+    uint8_t bal[32] = {0}; bal[0] = 100;
+    verkle_state_set_balance(tree_vs, addr1, bal);
+    verkle_state_set_balance(flat_vs, addr1, bal);
+
+    /* Account 2: version + storage */
+    verkle_state_set_version(tree_vs, addr2, 1);
+    verkle_state_set_version(flat_vs, addr2, 1);
+
+    uint8_t slot[32] = {0};
+    uint8_t sval[32] = {0}; sval[0] = 77;
+    verkle_state_set_storage(tree_vs, addr2, slot, sval);
+    verkle_state_set_storage(flat_vs, addr2, slot, sval);
+
+    verkle_state_commit_block(flat_vs);
+
+    /* Compare roots */
+    uint8_t tree_root[32], flat_root[32];
+    verkle_state_root_hash(tree_vs, tree_root);
+    verkle_state_root_hash(flat_vs, flat_root);
+    ASSERT(memcmp(tree_root, flat_root, 32) == 0,
+           "tree and flat roots match for same state");
+
+    verkle_state_destroy(tree_vs);
+    verkle_state_destroy(flat_vs);
+    cleanup_flat_dirs();
+    printf("  OK\n\n");
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -631,6 +792,8 @@ int main(void) {
     test_code_large();
     test_code_header_integration();
     test_code_domain_separation();
+    test_flat_backend();
+    test_flat_tree_root_match();
 
     printf("=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);

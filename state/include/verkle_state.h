@@ -2,6 +2,7 @@
 #define VERKLE_STATE_H
 
 #include "verkle.h"
+#include "verkle_flat.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -16,22 +17,67 @@ extern "C" {
  * map to raw 32-byte key-value operations in the verkle tree via
  * Pedersen hash key derivation.
  *
- * This is the interface the execution layer calls.
+ * Backend-agnostic: works with either in-memory tree or disk-backed flat
+ * updater. The typed API is identical regardless of backend.
  */
 
+typedef enum {
+    VS_BACKEND_TREE,
+    VS_BACKEND_FLAT,
+} vs_backend_type_t;
+
 typedef struct {
-    verkle_tree_t *tree;   /* owned */
+    vs_backend_type_t type;
+    union {
+        verkle_tree_t *tree;   /* owned, for VS_BACKEND_TREE */
+        verkle_flat_t *flat;   /* owned, for VS_BACKEND_FLAT */
+    };
 } verkle_state_t;
 
 /* =========================================================================
  * Lifecycle
  * ========================================================================= */
 
-/** Create an empty verkle state. */
+/** Create an empty verkle state (in-memory tree backend). */
 verkle_state_t *verkle_state_create(void);
 
-/** Destroy state and free tree. */
+/** Create a flat-backed verkle state (new stores). */
+verkle_state_t *verkle_state_create_flat(const char *value_dir,
+                                          const char *commit_dir,
+                                          uint64_t shard_capacity);
+
+/** Open an existing flat-backed verkle state. */
+verkle_state_t *verkle_state_open_flat(const char *value_dir,
+                                        const char *commit_dir);
+
+/** Destroy state and free backend. */
 void verkle_state_destroy(verkle_state_t *vs);
+
+/* =========================================================================
+ * Backend Accessors
+ * ========================================================================= */
+
+/** Get the underlying tree (NULL if flat backend). */
+verkle_tree_t *verkle_state_get_tree(verkle_state_t *vs);
+
+/** Get the underlying flat updater (NULL if tree backend). */
+verkle_flat_t *verkle_state_get_flat(verkle_state_t *vs);
+
+/* =========================================================================
+ * Block Operations (flat backend; no-op for tree backend)
+ * ========================================================================= */
+
+/** Begin a new block. Required before set() for flat backend. */
+bool verkle_state_begin_block(verkle_state_t *vs, uint64_t block_number);
+
+/** Commit the current block (flat: groups + incremental update). */
+bool verkle_state_commit_block(verkle_state_t *vs);
+
+/** Revert the current/most recent block. */
+bool verkle_state_revert_block(verkle_state_t *vs);
+
+/** Flush flat stores to disk. No-op for tree backend. */
+void verkle_state_sync(verkle_state_t *vs);
 
 /* =========================================================================
  * Version (uint8 → 32-byte LE slot)

@@ -42,10 +42,13 @@
   - Commitments preserved on load — no recomputation needed
   - Format: 16B header ("VRKLSNAP" + version) + recursive node encoding
 
-- [ ] **Flat commitment updater** — process sorted changes without full tree in memory
-  - Group block's changes by stem, look up old commits from store, compute deltas
-  - No tree traversal needed: sorted key processing + point lookups into hash_store
-  - See VERKLE_TREE.md "Tree vs Flat Storage" section
+- [x] **Flat commitment updater** — disk-backed commitment updates, O(block) RAM
+  - `verkle_flat.h/c` — replaces in-memory tree for block execution (~2.2 TB → O(block_changes))
+  - Value store (hash_store, key=32B, value=32B) + existing commitment store
+  - Per-block: group by stem, incremental leaf update via pedersen_update, bottom-up internal propagation
+  - New leaves: full MSM from scratch; existing leaves: O(1) incremental per suffix
+  - Undo log for both values and commitments — block revert restores full state
+  - Cross-validated against in-memory tree (9 test phases, 44 assertions)
 
 - [x] **State journal** — block revert + crash recovery + background checkpoint
   - `verkle_journal.h/c` — in-memory undo journal (records old values, replays in reverse)

@@ -125,7 +125,7 @@ target_link_libraries(verkle_key pedersen)
 add_library(verkle_state STATIC
     state/src/verkle_state.c
 )
-target_link_libraries(verkle_state verkle verkle_key)
+target_link_libraries(verkle_state verkle verkle_key verkle_flat)
 
 # State hash store (self-contained copy for state/ independence from database/)
 add_library(state_hash_store STATIC
@@ -385,6 +385,12 @@ add_executable(test_verkle_flat
 )
 target_link_libraries(test_verkle_flat verkle_flat verkle)
 add_test(NAME test_verkle_flat COMMAND test_verkle_flat)
+
+# Stress Test: Verkle flat updater (cross-validated, fail-fast)
+add_executable(test_stress_verkle_flat
+    state/tests/test_stress_verkle_flat.c
+)
+target_link_libraries(test_stress_verkle_flat verkle_flat verkle verkle_commit_store)
 
 #==============================================================================
 # Build Summary
