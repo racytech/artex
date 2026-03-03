@@ -1,5 +1,6 @@
 #include "banderwagon.h"
 #include <string.h>
+#include <stdlib.h>
 
 /* =========================================================================
  * Byte Constants (used during lazy initialization)
@@ -440,12 +441,45 @@ void banderwagon_scalar_mul(banderwagon_point_t *out,
 }
 
 /**
- * Naive multi-scalar multiplication: out = sum(scalars[i] * points[i]).
+ * Extract `num_bits` bits from a 32-byte LE scalar starting at `bit_start`.
+ */
+static unsigned int extract_scalar_bits(const uint8_t scalar[32],
+                                        int bit_start, int num_bits)
+{
+    unsigned int result = 0;
+    for (int b = 0; b < num_bits; b++) {
+        int pos = bit_start + b;
+        if (pos >= 256) break;
+        if (scalar[pos >> 3] & (1u << (pos & 7)))
+            result |= (1u << b);
+    }
+    return result;
+}
+
+/**
+ * Check if a 32-byte scalar is all zeros.
+ */
+static bool scalar_is_zero(const uint8_t s[32]) {
+    uint64_t acc = 0;
+    for (int i = 0; i < 4; i++)
+        acc |= ((const uint64_t *)s)[i];
+    return acc == 0;
+}
+
+/**
+ * Multi-scalar multiplication: out = sum(scalars[i] * points[i]).
  * Each scalar is 32 bytes little-endian.
  *
- * TODO: Replace with Pippenger's algorithm + precomputed tables for the
- * 256 CRS points (5-10x speedup). If still insufficient, batch node
- * updates to GPU via Icicle (CUDA MSM library with C API).
+ * Uses Pippenger's bucket method for large inputs (~5-10x faster than naive
+ * for 256 points). Falls back to naive for small counts.
+ *
+ * Algorithm (MSB-to-LSB Horner evaluation):
+ *   1. Choose window size c ≈ log2(n)
+ *   2. For each window w from highest to 0:
+ *      a. result <<= c  (c doublings)
+ *      b. Distribute points into 2^c-1 buckets by scalar window bits
+ *      c. Compute weighted bucket sum via running-sum technique
+ *      d. result += window_sum
  */
 void banderwagon_msm(banderwagon_point_t *out,
                      const banderwagon_point_t *points,
@@ -453,14 +487,92 @@ void banderwagon_msm(banderwagon_point_t *out,
                      size_t count)
 {
     ensure_init();
-
     *out = BANDERWAGON_IDENTITY;
 
+    if (count == 0) return;
+
+    /* Pre-filter non-zero scalars to skip empty slots (common in sparse leaves) */
+    size_t *nz = malloc(count * sizeof(size_t));
+    if (!nz) return;  /* OOM fallback: identity */
+    size_t nz_count = 0;
+
     for (size_t i = 0; i < count; i++) {
-        banderwagon_point_t tmp;
-        banderwagon_scalar_mul(&tmp, &points[i], scalars[i]);
-        banderwagon_add(out, out, &tmp);
+        if (!scalar_is_zero(scalars[i]))
+            nz[nz_count++] = i;
     }
+
+    if (nz_count == 0) {
+        free(nz);
+        return;  /* all scalars zero → identity */
+    }
+
+    /* For very small non-zero count, use naive scalar_mul */
+    if (nz_count <= 4) {
+        for (size_t k = 0; k < nz_count; k++) {
+            size_t i = nz[k];
+            banderwagon_point_t tmp;
+            banderwagon_scalar_mul(&tmp, &points[i], scalars[i]);
+            banderwagon_add(out, out, &tmp);
+        }
+        free(nz);
+        return;
+    }
+
+    /* Choose window size: c ≈ floor(log2(nz_count)), capped at 16 */
+    int c = 1;
+    while ((1UL << (c + 1)) <= nz_count && c < 16) c++;
+
+    int num_buckets = (1 << c) - 1;
+    int num_windows = (253 + c - 1) / c;
+
+    banderwagon_point_t *buckets = malloc((size_t)num_buckets *
+                                          sizeof(banderwagon_point_t));
+    if (!buckets) {
+        /* OOM fallback: naive */
+        for (size_t k = 0; k < nz_count; k++) {
+            size_t i = nz[k];
+            banderwagon_point_t tmp;
+            banderwagon_scalar_mul(&tmp, &points[i], scalars[i]);
+            banderwagon_add(out, out, &tmp);
+        }
+        free(nz);
+        return;
+    }
+
+    /* Process windows from MSB to LSB (Horner evaluation) */
+    for (int w = num_windows - 1; w >= 0; w--) {
+        /* Shift accumulator left by c bits */
+        for (int d = 0; d < c; d++)
+            banderwagon_double(out, out);
+
+        /* Clear buckets to identity */
+        for (int j = 0; j < num_buckets; j++)
+            buckets[j] = BANDERWAGON_IDENTITY;
+
+        /* Distribute points into buckets based on window bits */
+        int bit_start = w * c;
+        for (size_t k = 0; k < nz_count; k++) {
+            size_t i = nz[k];
+            unsigned int idx = extract_scalar_bits(scalars[i], bit_start, c);
+            if (idx == 0) continue;
+            banderwagon_add(&buckets[idx - 1], &buckets[idx - 1], &points[i]);
+        }
+
+        /* Running-sum technique to compute weighted bucket sum:
+         * window_sum = 1*bucket[0] + 2*bucket[1] + ... + num_buckets*bucket[num_buckets-1]
+         */
+        banderwagon_point_t running = BANDERWAGON_IDENTITY;
+        banderwagon_point_t window_sum = BANDERWAGON_IDENTITY;
+        for (int j = num_buckets - 1; j >= 0; j--) {
+            banderwagon_add(&running, &running, &buckets[j]);
+            banderwagon_add(&window_sum, &window_sum, &running);
+        }
+
+        banderwagon_add(out, out, &window_sum);
+    }
+
+    free(buckets);
+    free(nz);
 }
 
 /* =========================================================================
