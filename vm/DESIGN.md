@@ -1,5 +1,36 @@
 # VM Design — EOF-Native Virtual Machine on Verkle State
 
+## TODO — Current Status & Next Steps
+
+**Completed:**
+- Phase 1: EOF parsing/validation (100% v3.0.0 test vectors, 4956/4956)
+- Phase 2: Computed goto interpreter (~115 opcodes: arithmetic, comparison,
+  bitwise, stack, control flow, memory, data, crypto)
+- Phase 3: Host interface + state opcodes (environmental, block info,
+  storage, transient storage, logging — 32 opcodes, 53 interpreter tests)
+- EOF v3.0.0 spec update (data kind 0xFF, 4-byte container sizes,
+  max_stack_increase semantics, TXCREATE opcode)
+
+**Phase 4 — Calls & Creation (blocked on verkle state layer):**
+- [ ] EXTCALL (0xF8) — call another contract (recursive VM execution)
+- [ ] EXTDELEGATECALL (0xF9) — delegatecall (caller's storage context)
+- [ ] EXTSTATICCALL (0xFB) — static call (read-only)
+- [ ] EOFCREATE (0xEC) — deploy new contract from sub-container
+- [ ] RETURNCONTRACT (0xEE) — return from initcode, deploy runtime
+- Requires extending host interface: get_code(addr), create_account(),
+  transfer_value(), recursive vm_execute()
+
+**Testing — can do now, no state layer needed:**
+- [ ] Add edge-case interpreter tests (overflow, boundary values, gas
+  exhaustion mid-operation, large memory expansion, RJUMPV edge cases)
+- [ ] Build libFuzzer/AFL harness for interpreter (random valid EOF →
+  run → check for crashes/UB/ASAN violations)
+- [ ] Port evmone standalone execution tests (opcode result verification
+  with minimal state mocking via exec_eof_with())
+- [ ] Execution-spec-tests state_test fixtures (needs verkle state wired up)
+
+---
+
 ## Overview
 
 A stack-based virtual machine designed from scratch for a Verkle-native blockchain.
