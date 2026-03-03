@@ -138,6 +138,12 @@ add_library(verkle_commit_store STATIC
 )
 target_link_libraries(verkle_commit_store verkle banderwagon state_hash_store)
 
+# Verkle snapshot (binary tree serialization/deserialization)
+add_library(verkle_snapshot STATIC
+    state/src/verkle_snapshot.c
+)
+target_link_libraries(verkle_snapshot verkle banderwagon)
+
 #==============================================================================
 # Tests
 #==============================================================================
@@ -340,6 +346,13 @@ add_executable(test_verkle_commit_store
 )
 target_link_libraries(test_verkle_commit_store verkle_commit_store verkle)
 add_test(NAME test_verkle_commit_store COMMAND test_verkle_commit_store)
+
+# Test: Verkle snapshot (binary tree serialization/deserialization)
+add_executable(test_verkle_snapshot
+    state/tests/test_verkle_snapshot.c
+)
+target_link_libraries(test_verkle_snapshot verkle_snapshot verkle_state)
+add_test(NAME test_verkle_snapshot COMMAND test_verkle_snapshot)
 
 #==============================================================================
 # Build Summary
