@@ -150,6 +150,12 @@ add_library(verkle_journal STATIC
 )
 target_link_libraries(verkle_journal verkle verkle_snapshot banderwagon)
 
+# Verkle flat updater (disk-backed commitment updates, O(block) RAM)
+add_library(verkle_flat STATIC
+    state/src/verkle_flat.c
+)
+target_link_libraries(verkle_flat verkle_commit_store state_hash_store pedersen banderwagon)
+
 #==============================================================================
 # Tests
 #==============================================================================
@@ -372,6 +378,13 @@ add_executable(bench_verkle_state
     state/tests/bench_verkle_state.c
 )
 target_link_libraries(bench_verkle_state verkle_journal verkle_state verkle_snapshot)
+
+# Test: Verkle flat updater (disk-backed commitment updates)
+add_executable(test_verkle_flat
+    state/tests/test_verkle_flat.c
+)
+target_link_libraries(test_verkle_flat verkle_flat verkle)
+add_test(NAME test_verkle_flat COMMAND test_verkle_flat)
 
 #==============================================================================
 # Build Summary
