@@ -4,6 +4,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <sys/stat.h>
 
 /* =========================================================================
  * Constants
@@ -17,6 +19,9 @@
 #define VF_VALUE_LEN        32
 #define VF_WIDTH            256
 #define VF_MAX_DEPTH        31    /* max internal depth (0..30) */
+
+#define VF_STORE_COMMIT  0
+#define VF_STORE_SLOT    1
 
 /* =========================================================================
  * Dynamic Array Helpers
@@ -33,7 +38,7 @@
 } while(0)
 
 /* =========================================================================
- * Commit Store Key Builders (mirrors verkle_commit_store.c internals)
+ * Key Builders
  * ========================================================================= */
 
 static void make_leaf_cs_key(uint8_t key[32], const uint8_t stem[31]) {
@@ -49,8 +54,18 @@ static void make_internal_cs_key(uint8_t key[32], int depth,
         memcpy(key + 1, path_prefix, depth);
 }
 
+/* Slot store key: [depth+1 || path[0..depth-1] || slot || zeros] */
+static void make_slot_key(uint8_t key[32], int depth,
+                           const uint8_t *path, uint8_t slot) {
+    memset(key, 0, 32);
+    key[0] = (uint8_t)(depth + 1);
+    if (depth > 0 && path)
+        memcpy(key + 1, path, depth);
+    key[depth + 1] = slot;
+}
+
 /* =========================================================================
- * Commitment Undo Helpers
+ * Undo Helpers
  * ========================================================================= */
 
 static bool record_leaf_undo(verkle_flat_t *vf, const uint8_t stem[31],
@@ -62,6 +77,7 @@ static bool record_leaf_undo(verkle_flat_t *vf, const uint8_t stem[31],
     ENSURE_CAP(vf->commit_undos, vf->cu_count, vf->cu_cap, vf_commit_undo_t);
     vf_commit_undo_t *u = &vf->commit_undos[vf->cu_count++];
     make_leaf_cs_key(u->cs_key, stem);
+    u->store_id = VF_STORE_COMMIT;
     if (existed) {
         banderwagon_serialize(u->old_data, c1);
         banderwagon_serialize(u->old_data + 32, c2);
@@ -81,6 +97,7 @@ static bool record_internal_undo(verkle_flat_t *vf, int depth,
     ENSURE_CAP(vf->commit_undos, vf->cu_count, vf->cu_cap, vf_commit_undo_t);
     vf_commit_undo_t *u = &vf->commit_undos[vf->cu_count++];
     make_internal_cs_key(u->cs_key, depth, path_prefix);
+    u->store_id = VF_STORE_COMMIT;
     if (existed) {
         banderwagon_serialize(u->old_data, commit);
         u->data_len = 32;
@@ -88,6 +105,63 @@ static bool record_internal_undo(verkle_flat_t *vf, int depth,
         u->data_len = 0;
     }
     return true;
+}
+
+static bool record_slot_undo(verkle_flat_t *vf, int depth,
+                              const uint8_t *path, uint8_t slot,
+                              bool existed, const uint8_t old_stem[31])
+{
+    ENSURE_CAP(vf->commit_undos, vf->cu_count, vf->cu_cap, vf_commit_undo_t);
+    vf_commit_undo_t *u = &vf->commit_undos[vf->cu_count++];
+    make_slot_key(u->cs_key, depth, path, slot);
+    u->store_id = VF_STORE_SLOT;
+    if (existed) {
+        memset(u->old_data, 0, 32);
+        memcpy(u->old_data, old_stem, 31);
+        u->data_len = 32;
+    } else {
+        u->data_len = 0;
+    }
+    return true;
+}
+
+/* =========================================================================
+ * Slot Store Helpers
+ * ========================================================================= */
+
+static bool slot_get(const verkle_flat_t *vf, int depth,
+                      const uint8_t *path, uint8_t slot,
+                      uint8_t out_stem[31])
+{
+    if (!vf->slot_store) return false;
+    uint8_t key[32], val[32];
+    make_slot_key(key, depth, path, slot);
+    uint8_t len;
+    if (!hash_store_get(vf->slot_store, key, val, &len))
+        return false;
+    memcpy(out_stem, val, 31);
+    return true;
+}
+
+static void slot_put(verkle_flat_t *vf, int depth,
+                      const uint8_t *path, uint8_t slot,
+                      const uint8_t stem[31])
+{
+    if (!vf->slot_store) return;
+    uint8_t key[32], val[32];
+    make_slot_key(key, depth, path, slot);
+    memset(val, 0, 32);
+    memcpy(val, stem, 31);
+    hash_store_put(vf->slot_store, key, val, 32);
+}
+
+static void slot_delete(verkle_flat_t *vf, int depth,
+                         const uint8_t *path, uint8_t slot)
+{
+    if (!vf->slot_store) return;
+    uint8_t key[32];
+    make_slot_key(key, depth, path, slot);
+    hash_store_delete(vf->slot_store, key);
 }
 
 /* =========================================================================
@@ -99,6 +173,34 @@ static verkle_flat_t *alloc_handle(void) {
     if (!vf) return NULL;
     pedersen_init();
     return vf;
+}
+
+static bool create_slot_store(verkle_flat_t *vf, const char *commit_dir,
+                               uint64_t shard_capacity)
+{
+    char slot_dir[512];
+    snprintf(slot_dir, sizeof(slot_dir), "%s/slots", commit_dir);
+    mkdir(slot_dir, 0755);
+    vf->slot_store = hash_store_create(slot_dir, shard_capacity,
+                                        VF_VALUE_KEY_SIZE, VF_VALUE_SLOT_SIZE);
+    return vf->slot_store != NULL;
+}
+
+static bool open_slot_store(verkle_flat_t *vf, const char *commit_dir)
+{
+    char slot_dir[512];
+    snprintf(slot_dir, sizeof(slot_dir), "%s/slots", commit_dir);
+    /* If directory doesn't exist yet, create it (migration from old format) */
+    struct stat st;
+    if (stat(slot_dir, &st) != 0) {
+        mkdir(slot_dir, 0755);
+        /* Create empty store — will be populated as new leaves are inserted */
+        vf->slot_store = hash_store_create(slot_dir, 1 << 20,
+                                            VF_VALUE_KEY_SIZE, VF_VALUE_SLOT_SIZE);
+    } else {
+        vf->slot_store = hash_store_open(slot_dir);
+    }
+    return vf->slot_store != NULL;
 }
 
 verkle_flat_t *verkle_flat_create(const char *value_dir,
@@ -118,6 +220,14 @@ verkle_flat_t *verkle_flat_create(const char *value_dir,
         free(vf);
         return NULL;
     }
+
+    if (!create_slot_store(vf, commit_dir, shard_capacity)) {
+        vcs_destroy(vf->commit_store);
+        hash_store_destroy(vf->value_store);
+        free(vf);
+        return NULL;
+    }
+
     return vf;
 }
 
@@ -136,6 +246,14 @@ verkle_flat_t *verkle_flat_open(const char *value_dir,
         free(vf);
         return NULL;
     }
+
+    if (!open_slot_store(vf, commit_dir)) {
+        vcs_destroy(vf->commit_store);
+        hash_store_destroy(vf->value_store);
+        free(vf);
+        return NULL;
+    }
+
     return vf;
 }
 
@@ -143,6 +261,7 @@ void verkle_flat_destroy(verkle_flat_t *vf) {
     if (!vf) return;
     if (vf->value_store)  hash_store_destroy(vf->value_store);
     if (vf->commit_store) vcs_destroy(vf->commit_store);
+    if (vf->slot_store)   hash_store_destroy(vf->slot_store);
     free(vf->changes);
     free(vf->undos);
     free(vf->commit_undos);
@@ -252,7 +371,8 @@ static int cmp_changes(const void *a, const void *b) {
                   ((const vf_change_t *)b)->key, 32);
 }
 
-/* Find attach depth: deepest internal node along this stem's path */
+/* Find attach depth: deepest internal node along this stem's path.
+ * Returns 0 if no internals exist at all (root is depth 0). */
 static int find_attach_depth(const verkle_flat_t *vf, const uint8_t stem[31]) {
     banderwagon_point_t dummy;
     int d = 0;
@@ -261,10 +381,120 @@ static int find_attach_depth(const verkle_flat_t *vf, const uint8_t stem[31]) {
             break;
         d++;
     }
-    return d;  /* 0 means no internals exist at all */
+    return d;
 }
 
-/* Process a single stem group: update leaf commitments */
+/* Find effective attach depth: handles gaps where split_leaf created deeper
+ * internals within this block but propagation hasn't created the root yet.
+ * Returns the depth of the parent internal for a new leaf at this stem. */
+static int find_effective_attach_depth(const verkle_flat_t *vf,
+                                        const uint8_t stem[31])
+{
+    int d = find_attach_depth(vf, stem);
+    int attach = (d > 0) ? d - 1 : 0;
+
+    /* Probe deeper: a prior split in this block may have created internals
+     * beyond where find_attach_depth stopped (gap at root during block). */
+    banderwagon_point_t dummy;
+    int probe = attach + 1;
+    while (probe <= 30 &&
+           vcs_get_internal(vf->commit_store, probe,
+                             (probe > 0) ? stem : NULL, &dummy))
+        probe++;
+    if (probe > attach + 1)
+        attach = probe - 1;
+
+    return attach;
+}
+
+/* =========================================================================
+ * Leaf Splitting — Create intermediate internals for colliding stems
+ * ========================================================================= */
+
+/**
+ * Split a leaf collision: two different stems share a slot at attach_depth.
+ *
+ * Creates intermediate internal nodes from attach_depth+1 to diverge_depth,
+ * each containing only the existing leaf's commitment chain.
+ *
+ * Returns:
+ *   out_diverge_depth — where the stems first differ
+ *   out_chain_top     — commitment of new internal at attach_depth+1
+ *   out_existing_commit — the existing leaf's commitment (for prop entry)
+ */
+static bool split_leaf(verkle_flat_t *vf,
+                        const uint8_t existing_stem[31],
+                        const uint8_t new_stem[31],
+                        int attach_depth,
+                        int *out_diverge_depth,
+                        banderwagon_point_t *out_chain_top,
+                        banderwagon_point_t *out_existing_commit)
+{
+    /* Find divergence depth */
+    int div = attach_depth + 1;
+    while (div < VF_STEM_LEN && existing_stem[div] == new_stem[div])
+        div++;
+    if (div >= VF_STEM_LEN) return false; /* stems fully match — shouldn't happen */
+
+    /* Read existing leaf commitment */
+    banderwagon_point_t c1, c2, leaf_commit;
+    if (!vcs_get_leaf(vf->commit_store, existing_stem, &c1, &c2, &leaf_commit))
+        return false;  /* existing leaf must exist */
+    *out_existing_commit = leaf_commit;
+
+    /* Delete old slot entry (existing leaf at attach_depth) */
+    uint8_t old_occupant[31];
+    bool had_slot = slot_get(vf, attach_depth,
+                              (attach_depth > 0) ? new_stem : NULL,
+                              new_stem[attach_depth], old_occupant);
+    if (!record_slot_undo(vf, attach_depth,
+                           (attach_depth > 0) ? new_stem : NULL,
+                           new_stem[attach_depth], had_slot, old_occupant))
+        return false;
+    slot_delete(vf, attach_depth,
+                (attach_depth > 0) ? new_stem : NULL,
+                new_stem[attach_depth]);
+
+    /* Build chain bottom-up: from div down to attach_depth + 1 */
+    banderwagon_point_t child_commit = leaf_commit;
+
+    for (int d = div; d >= attach_depth + 1; d--) {
+        uint8_t child_slot = existing_stem[d];
+
+        /* Create internal with single child */
+        banderwagon_point_t internal = BANDERWAGON_IDENTITY;
+        uint8_t field[32];
+        banderwagon_map_to_field(field, &child_commit);
+        pedersen_update(&internal, &BANDERWAGON_IDENTITY, child_slot, field);
+
+        /* Record undo (didn't exist before) */
+        if (!record_internal_undo(vf, d, (d > 0) ? new_stem : NULL, false, NULL))
+            return false;
+
+        /* Write to commit store */
+        vcs_put_internal(vf->commit_store, d,
+                          (d > 0) ? new_stem : NULL, &internal);
+
+        child_commit = internal;
+    }
+
+    *out_chain_top = child_commit;
+    *out_diverge_depth = div;
+
+    /* Record slot entry for existing leaf at its new position (diverge_depth) */
+    if (!record_slot_undo(vf, div, (div > 0) ? existing_stem : NULL,
+                           existing_stem[div], false, NULL))
+        return false;
+    slot_put(vf, div, (div > 0) ? existing_stem : NULL,
+             existing_stem[div], existing_stem);
+
+    return true;
+}
+
+/* =========================================================================
+ * Process Stem — Update leaf commitments
+ * ========================================================================= */
+
 static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
                           banderwagon_point_t *out_old_leaf,
                           banderwagon_point_t *out_new_leaf)
@@ -396,7 +626,10 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
     return true;
 }
 
-/* Bottom-up propagation of commitment deltas through internal nodes */
+/* =========================================================================
+ * Bottom-Up Propagation
+ * ========================================================================= */
+
 static bool propagate_internals(verkle_flat_t *vf,
                                  prop_entry_t *entries, int num_entries)
 {
@@ -444,10 +677,8 @@ static bool propagate_internals(verkle_flat_t *vf,
             banderwagon_point_t old_internal = internal_commit;
 
             /* Apply all deltas for this group */
-            /* Find all entries with same (depth, path) */
             for (int j = i; j < num_entries; j++) {
                 if (entries[j].depth != max_depth) continue;
-                /* Check path match */
                 if (max_depth > 0 &&
                     memcmp(entries[j].path, entries[i].path, max_depth) != 0)
                     continue;
@@ -501,7 +732,6 @@ static bool propagate_internals(verkle_flat_t *vf,
         }
 
         /* Merge parents into entries array */
-        /* We need enough space — reallocate if needed */
         if (new_count + parent_count > 0) {
             prop_entry_t *merged = realloc(entries,
                 (new_count + parent_count + 64) * sizeof(prop_entry_t));
@@ -520,6 +750,10 @@ static bool propagate_internals(verkle_flat_t *vf,
     free(entries);
     return true;
 }
+
+/* =========================================================================
+ * Commit Block
+ * ========================================================================= */
 
 bool verkle_flat_commit_block(verkle_flat_t *vf) {
     if (!vf || !vf->block_active) return false;
@@ -542,10 +776,8 @@ bool verkle_flat_commit_block(verkle_flat_t *vf) {
     int group_cap = 0;
 
     for (uint32_t i = start; i < vf->change_count; ) {
-        /* Start new stem group */
         const uint8_t *stem = vf->changes[i].key;
 
-        /* Grow groups array */
         if (group_count >= group_cap) {
             int new_cap = group_cap ? group_cap * 2 : 256;
             stem_group_t *tmp = realloc(groups, new_cap * sizeof(stem_group_t));
@@ -558,13 +790,11 @@ bool verkle_flat_commit_block(verkle_flat_t *vf) {
         memcpy(sg->stem, stem, VF_STEM_LEN);
         sg->suffix_count = 0;
 
-        /* Collect all changes for this stem */
         while (i < vf->change_count &&
                memcmp(vf->changes[i].key, stem, VF_STEM_LEN) == 0)
         {
             uint8_t suffix = vf->changes[i].key[31];
 
-            /* Dedup: if this suffix already in group, overwrite (last wins) */
             bool dup = false;
             for (int j = 0; j < sg->suffix_count; j++) {
                 if (sg->suffixes[j] == suffix) {
@@ -582,31 +812,108 @@ bool verkle_flat_commit_block(verkle_flat_t *vf) {
         }
     }
 
-    /* Step 3: Process each stem group → leaf updates */
-    /* Allocate propagation entries (one per stem) */
-    prop_entry_t *prop = malloc((group_count + 64) * sizeof(prop_entry_t));
+    /* Step 3: Process each stem group → leaf updates + collision handling */
+    /* Extra space for split propagation entries (2 per split) */
+    int prop_cap = group_count * 2 + 64;
+    prop_entry_t *prop = malloc(prop_cap * sizeof(prop_entry_t));
     if (!prop) { free(groups); return false; }
     int prop_count = 0;
 
     for (int g = 0; g < group_count; g++) {
         banderwagon_point_t old_leaf, new_leaf;
+
+        /* Check if leaf already exists (Case A handled inside process_stem) */
+        banderwagon_point_t dummy_c1, dummy_c2, dummy_lc;
+        bool leaf_exists = vcs_get_leaf(vf->commit_store, groups[g].stem,
+                                         &dummy_c1, &dummy_c2, &dummy_lc);
+
+        /* Find effective attach depth (handles in-block split gaps) */
+        int attach_depth = find_effective_attach_depth(vf, groups[g].stem);
+        bool did_split = false;
+
+        if (!leaf_exists) {
+            /* New leaf — check for collision at attach_depth */
+            uint8_t occupant_stem[31];
+            if (slot_get(vf, attach_depth,
+                         (attach_depth > 0) ? groups[g].stem : NULL,
+                         groups[g].stem[attach_depth],
+                         occupant_stem))
+            {
+                /* Collision! Different stem occupies this slot */
+                int diverge_depth;
+                banderwagon_point_t chain_top_commit, existing_leaf_commit;
+                if (!split_leaf(vf, occupant_stem, groups[g].stem,
+                                attach_depth, &diverge_depth,
+                                &chain_top_commit, &existing_leaf_commit))
+                {
+                    free(groups); free(prop);
+                    return false;
+                }
+                did_split = true;
+
+                /* Grow prop array if needed */
+                if (prop_count + 2 >= prop_cap) {
+                    prop_cap = prop_cap * 2 + 64;
+                    prop_entry_t *tmp = realloc(prop, prop_cap * sizeof(prop_entry_t));
+                    if (!tmp) { free(groups); return false; }
+                    prop = tmp;
+                }
+
+                /* Prop entry 1: at attach_depth, replace leaf with chain top */
+                prop_entry_t *pe1 = &prop[prop_count++];
+                pe1->depth = attach_depth;
+                if (attach_depth > 0)
+                    memcpy(pe1->path, groups[g].stem, attach_depth);
+                pe1->child_idx = groups[g].stem[attach_depth];
+                pe1->old_child = existing_leaf_commit;
+                pe1->new_child = chain_top_commit;
+
+                /* Update attach_depth for the new leaf */
+                attach_depth = diverge_depth;
+            }
+        }
+
+        /* Process the stem group (Case A or Case B) */
         if (!process_stem(vf, &groups[g], &old_leaf, &new_leaf)) {
-            free(groups);
-            free(prop);
+            free(groups); free(prop);
             return false;
         }
 
-        /* Find attach depth */
-        int d = find_attach_depth(vf, groups[g].stem);
-        int attach_depth = (d > 0) ? d - 1 : 0;
-        uint8_t child_idx = groups[g].stem[attach_depth];
+        /* Record slot entry for new leaves */
+        if (!leaf_exists) {
+            uint8_t old_slot_stem[31];
+            bool had = slot_get(vf, attach_depth,
+                                 (attach_depth > 0) ? groups[g].stem : NULL,
+                                 groups[g].stem[attach_depth],
+                                 old_slot_stem);
+            if (!record_slot_undo(vf, attach_depth,
+                                   (attach_depth > 0) ? groups[g].stem : NULL,
+                                   groups[g].stem[attach_depth],
+                                   had, old_slot_stem))
+            {
+                free(groups); free(prop);
+                return false;
+            }
+            slot_put(vf, attach_depth,
+                     (attach_depth > 0) ? groups[g].stem : NULL,
+                     groups[g].stem[attach_depth], groups[g].stem);
+        }
 
+        /* Grow prop array if needed */
+        if (prop_count + 1 >= prop_cap) {
+            prop_cap = prop_cap * 2 + 64;
+            prop_entry_t *tmp = realloc(prop, prop_cap * sizeof(prop_entry_t));
+            if (!tmp) { free(groups); return false; }
+            prop = tmp;
+        }
+
+        /* Prop entry for this leaf */
         prop_entry_t *pe = &prop[prop_count++];
         pe->depth = attach_depth;
         if (attach_depth > 0)
             memcpy(pe->path, groups[g].stem, attach_depth);
-        pe->child_idx = child_idx;
-        pe->old_child = old_leaf;
+        pe->child_idx = groups[g].stem[attach_depth];
+        pe->old_child = did_split ? BANDERWAGON_IDENTITY : old_leaf;
         pe->new_child = new_leaf;
     }
 
@@ -614,7 +921,6 @@ bool verkle_flat_commit_block(verkle_flat_t *vf) {
 
     /* Step 4: Bottom-up propagation */
     if (!propagate_internals(vf, prop, prop_count)) {
-        /* prop is freed inside propagate_internals */
         return false;
     }
 
@@ -641,16 +947,16 @@ bool verkle_flat_revert_block(verkle_flat_t *vf) {
         }
     }
 
-    /* Restore commitments in reverse */
+    /* Restore commitments + slots in reverse */
     for (uint32_t i = vf->cu_count; i > blk->commit_undo_start; i--) {
         vf_commit_undo_t *cu = &vf->commit_undos[i - 1];
+        hash_store_t *store = (cu->store_id == VF_STORE_SLOT)
+                                ? vf->slot_store
+                                : vf->commit_store->store;
         if (cu->data_len == 0) {
-            /* Entry didn't exist before — delete it */
-            hash_store_delete(vf->commit_store->store, cu->cs_key);
+            hash_store_delete(store, cu->cs_key);
         } else {
-            /* Restore old data */
-            hash_store_put(vf->commit_store->store, cu->cs_key,
-                            cu->old_data, cu->data_len);
+            hash_store_put(store, cu->cs_key, cu->old_data, cu->data_len);
         }
     }
 
@@ -670,7 +976,6 @@ bool verkle_flat_revert_block(verkle_flat_t *vf) {
 void verkle_flat_trim(verkle_flat_t *vf, uint64_t up_to_block) {
     if (!vf) return;
 
-    /* Find first block to keep */
     uint32_t keep = 0;
     for (uint32_t i = 0; i < vf->block_count; i++) {
         if (vf->blocks[i].block_number > up_to_block) {
@@ -698,7 +1003,6 @@ void verkle_flat_trim(verkle_flat_t *vf, uint64_t up_to_block) {
         cu_start = vf->cu_count;
     }
 
-    /* Shift arrays */
     uint32_t ch_remain = vf->change_count - ch_start;
     if (ch_remain > 0) memmove(vf->changes, vf->changes + ch_start, ch_remain * sizeof(vf_change_t));
     vf->change_count = ch_remain;
@@ -711,7 +1015,6 @@ void verkle_flat_trim(verkle_flat_t *vf, uint64_t up_to_block) {
     if (cu_remain > 0) memmove(vf->commit_undos, vf->commit_undos + cu_start, cu_remain * sizeof(vf_commit_undo_t));
     vf->cu_count = cu_remain;
 
-    /* Shift blocks */
     uint32_t blk_remain = vf->block_count - keep;
     if (blk_remain > 0) {
         memmove(vf->blocks, vf->blocks + keep, blk_remain * sizeof(vf_block_t));
@@ -736,7 +1039,6 @@ void verkle_flat_root_hash(const verkle_flat_t *vf, uint8_t out[32]) {
     if (vcs_get_internal(vf->commit_store, 0, NULL, &root)) {
         banderwagon_serialize(out, &root);
     }
-    /* If no root internal, hash is all zeros (empty state) */
 }
 
 /* =========================================================================
@@ -747,4 +1049,5 @@ void verkle_flat_sync(verkle_flat_t *vf) {
     if (!vf) return;
     hash_store_sync(vf->value_store);
     vcs_sync(vf->commit_store);
+    if (vf->slot_store) hash_store_sync(vf->slot_store);
 }

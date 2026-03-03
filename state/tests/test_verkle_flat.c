@@ -534,6 +534,307 @@ static void test_scale(void) {
 }
 
 /* =========================================================================
+ * Phase 10: Leaf splitting — two stems share first byte (diverge at depth 1)
+ * ========================================================================= */
+
+static void test_split_basic(void) {
+    printf("Phase 10: Leaf split — two stems diverge at depth 1\n");
+    cleanup();
+
+    verkle_tree_t *vt = verkle_create();
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+
+    /* Stem A: [0x11, 0x22, 0xAA, ...] */
+    uint8_t stemA[31]; memset(stemA, 0xAA, 31); stemA[0] = 0x11; stemA[1] = 0x22;
+    /* Stem B: [0x11, 0x33, 0xBB, ...] */
+    uint8_t stemB[31]; memset(stemB, 0xBB, 31); stemB[0] = 0x11; stemB[1] = 0x33;
+    /* Stem C: [0xFF, ...] — independent, no collision */
+    uint8_t stemC[31]; memset(stemC, 0xFF, 31);
+
+    uint8_t keyA[32], keyB[32], keyC[32];
+    uint8_t valA[32], valB[32], valC[32];
+    memcpy(keyA, stemA, 31); keyA[31] = 0; memset(valA, 0x01, 32);
+    memcpy(keyB, stemB, 31); keyB[31] = 0; memset(valB, 0x02, 32);
+    memcpy(keyC, stemC, 31); keyC[31] = 0; memset(valC, 0x03, 32);
+
+    /* All three in one block */
+    verkle_set(vt, keyA, valA);
+    verkle_set(vt, keyB, valB);
+    verkle_set(vt, keyC, valC);
+
+    verkle_flat_begin_block(vf, 1);
+    verkle_flat_set(vf, keyA, valA);
+    verkle_flat_set(vf, keyB, valB);
+    verkle_flat_set(vf, keyC, valC);
+    ASSERT(verkle_flat_commit_block(vf), "commit with split");
+
+    ASSERT(roots_match(vf, vt), "root matches after split (depth 1)");
+
+    /* Values readable */
+    uint8_t got[32];
+    ASSERT(verkle_flat_get(vf, keyA, got) && memcmp(got, valA, 32) == 0, "value A");
+    ASSERT(verkle_flat_get(vf, keyB, got) && memcmp(got, valB, 32) == 0, "value B");
+    ASSERT(verkle_flat_get(vf, keyC, got) && memcmp(got, valC, 32) == 0, "value C");
+
+    verkle_flat_destroy(vf);
+    verkle_destroy(vt);
+    printf("  OK\n\n");
+    cleanup();
+}
+
+/* =========================================================================
+ * Phase 11: Leaf splitting — deeper divergence (share 3 prefix bytes)
+ * ========================================================================= */
+
+static void test_split_deep(void) {
+    printf("Phase 11: Leaf split — deeper divergence (3 shared bytes)\n");
+    cleanup();
+
+    verkle_tree_t *vt = verkle_create();
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+
+    /* Stem A: [0x11, 0x22, 0x33, 0xAA, ...] */
+    uint8_t stemA[31]; memset(stemA, 0xAA, 31);
+    stemA[0] = 0x11; stemA[1] = 0x22; stemA[2] = 0x33;
+    /* Stem B: [0x11, 0x22, 0x33, 0xBB, ...] — diverge at depth 3 */
+    uint8_t stemB[31]; memset(stemB, 0xBB, 31);
+    stemB[0] = 0x11; stemB[1] = 0x22; stemB[2] = 0x33;
+    /* Anchor stem to force internal root */
+    uint8_t stemZ[31]; memset(stemZ, 0x00, 31);
+
+    uint8_t keyA[32], keyB[32], keyZ[32];
+    uint8_t valA[32], valB[32], valZ[32];
+    memcpy(keyA, stemA, 31); keyA[31] = 5;  memset(valA, 0x41, 32);
+    memcpy(keyB, stemB, 31); keyB[31] = 10; memset(valB, 0x42, 32);
+    memcpy(keyZ, stemZ, 31); keyZ[31] = 0;  memset(valZ, 0x99, 32);
+
+    verkle_set(vt, keyZ, valZ);
+    verkle_set(vt, keyA, valA);
+    verkle_set(vt, keyB, valB);
+
+    verkle_flat_begin_block(vf, 1);
+    verkle_flat_set(vf, keyZ, valZ);
+    verkle_flat_set(vf, keyA, valA);
+    verkle_flat_set(vf, keyB, valB);
+    ASSERT(verkle_flat_commit_block(vf), "commit deep split");
+
+    ASSERT(roots_match(vf, vt), "root matches after deep split (depth 3)");
+
+    verkle_flat_destroy(vf);
+    verkle_destroy(vt);
+    printf("  OK\n\n");
+    cleanup();
+}
+
+/* =========================================================================
+ * Phase 12: Split across blocks — block 1 creates leaf, block 2 adds collider
+ * ========================================================================= */
+
+static void test_split_across_blocks(void) {
+    printf("Phase 12: Split across blocks\n");
+    cleanup();
+
+    verkle_tree_t *vt = verkle_create();
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+
+    /* Stem A: [0x55, 0xAA, ...] */
+    uint8_t stemA[31]; memset(stemA, 0xAA, 31); stemA[0] = 0x55;
+    /* Stem B: [0x55, 0xBB, ...] — collides with A at depth 0 */
+    uint8_t stemB[31]; memset(stemB, 0xBB, 31); stemB[0] = 0x55;
+    /* Anchor */
+    uint8_t stemZ[31]; memset(stemZ, 0x00, 31);
+
+    uint8_t keyA[32], keyB[32], keyZ[32];
+    uint8_t valA[32], valB[32], valZ[32];
+    memcpy(keyA, stemA, 31); keyA[31] = 0; memset(valA, 0x11, 32);
+    memcpy(keyB, stemB, 31); keyB[31] = 0; memset(valB, 0x22, 32);
+    memcpy(keyZ, stemZ, 31); keyZ[31] = 0; memset(valZ, 0x77, 32);
+
+    /* Block 1: create A and Z */
+    verkle_set(vt, keyZ, valZ);
+    verkle_set(vt, keyA, valA);
+
+    verkle_flat_begin_block(vf, 1);
+    verkle_flat_set(vf, keyZ, valZ);
+    verkle_flat_set(vf, keyA, valA);
+    verkle_flat_commit_block(vf);
+    ASSERT(roots_match(vf, vt), "block 1 root matches");
+
+    /* Block 2: add B (collides with A) */
+    verkle_set(vt, keyB, valB);
+
+    verkle_flat_begin_block(vf, 2);
+    verkle_flat_set(vf, keyB, valB);
+    ASSERT(verkle_flat_commit_block(vf), "commit split block 2");
+
+    ASSERT(roots_match(vf, vt), "root matches after cross-block split");
+
+    verkle_flat_destroy(vf);
+    verkle_destroy(vt);
+    printf("  OK\n\n");
+    cleanup();
+}
+
+/* =========================================================================
+ * Phase 13: Split + revert — verify undo restores pre-split state
+ * ========================================================================= */
+
+static void test_split_revert(void) {
+    printf("Phase 13: Split + revert\n");
+    cleanup();
+
+    verkle_tree_t *vt = verkle_create();
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+
+    uint8_t stemA[31]; memset(stemA, 0xAA, 31); stemA[0] = 0x55;
+    uint8_t stemZ[31]; memset(stemZ, 0x00, 31);
+
+    uint8_t keyA[32], keyZ[32];
+    uint8_t valA[32], valZ[32];
+    memcpy(keyA, stemA, 31); keyA[31] = 0; memset(valA, 0x11, 32);
+    memcpy(keyZ, stemZ, 31); keyZ[31] = 0; memset(valZ, 0x77, 32);
+
+    /* Block 1: create A and Z */
+    verkle_set(vt, keyZ, valZ);
+    verkle_set(vt, keyA, valA);
+
+    verkle_flat_begin_block(vf, 1);
+    verkle_flat_set(vf, keyZ, valZ);
+    verkle_flat_set(vf, keyA, valA);
+    verkle_flat_commit_block(vf);
+
+    uint8_t root_after_b1[32];
+    verkle_flat_root_hash(vf, root_after_b1);
+
+    /* Block 2: add collider B */
+    uint8_t stemB[31]; memset(stemB, 0xBB, 31); stemB[0] = 0x55;
+    uint8_t keyB[32], valB[32];
+    memcpy(keyB, stemB, 31); keyB[31] = 0; memset(valB, 0x22, 32);
+
+    verkle_flat_begin_block(vf, 2);
+    verkle_flat_set(vf, keyB, valB);
+    verkle_flat_commit_block(vf);
+
+    /* Root should differ */
+    uint8_t root_after_b2[32];
+    verkle_flat_root_hash(vf, root_after_b2);
+    ASSERT(memcmp(root_after_b1, root_after_b2, 32) != 0, "split changed root");
+
+    /* Revert block 2 */
+    ASSERT(verkle_flat_revert_block(vf), "revert split block");
+
+    uint8_t root_after_revert[32];
+    verkle_flat_root_hash(vf, root_after_revert);
+    ASSERT(memcmp(root_after_b1, root_after_revert, 32) == 0,
+           "root restored after split revert");
+
+    /* B should be gone, A should remain */
+    uint8_t got[32];
+    ASSERT(verkle_flat_get(vf, keyA, got) && memcmp(got, valA, 32) == 0,
+           "A preserved after revert");
+    ASSERT(!verkle_flat_get(vf, keyB, got), "B gone after revert");
+
+    verkle_flat_destroy(vf);
+    verkle_destroy(vt);
+    printf("  OK\n\n");
+    cleanup();
+}
+
+/* =========================================================================
+ * Phase 14: Triple collision — three stems sharing prefix
+ * ========================================================================= */
+
+static void test_triple_collision(void) {
+    printf("Phase 14: Triple collision — three stems share prefix\n");
+    cleanup();
+
+    verkle_tree_t *vt = verkle_create();
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+
+    /* All three share byte 0 = 0x44 */
+    uint8_t stemA[31]; memset(stemA, 0xAA, 31); stemA[0] = 0x44; stemA[1] = 0x11;
+    uint8_t stemB[31]; memset(stemB, 0xBB, 31); stemB[0] = 0x44; stemB[1] = 0x22;
+    uint8_t stemC[31]; memset(stemC, 0xCC, 31); stemC[0] = 0x44; stemC[1] = 0x33;
+    uint8_t stemZ[31]; memset(stemZ, 0x00, 31); /* anchor */
+
+    uint8_t keyA[32], keyB[32], keyC[32], keyZ[32];
+    uint8_t valA[32], valB[32], valC[32], valZ[32];
+    memcpy(keyA, stemA, 31); keyA[31] = 0; memset(valA, 0x01, 32);
+    memcpy(keyB, stemB, 31); keyB[31] = 0; memset(valB, 0x02, 32);
+    memcpy(keyC, stemC, 31); keyC[31] = 0; memset(valC, 0x03, 32);
+    memcpy(keyZ, stemZ, 31); keyZ[31] = 0; memset(valZ, 0x99, 32);
+
+    /* All in one block */
+    verkle_set(vt, keyZ, valZ);
+    verkle_set(vt, keyA, valA);
+    verkle_set(vt, keyB, valB);
+    verkle_set(vt, keyC, valC);
+
+    verkle_flat_begin_block(vf, 1);
+    verkle_flat_set(vf, keyZ, valZ);
+    verkle_flat_set(vf, keyA, valA);
+    verkle_flat_set(vf, keyB, valB);
+    verkle_flat_set(vf, keyC, valC);
+    ASSERT(verkle_flat_commit_block(vf), "commit triple collision");
+
+    ASSERT(roots_match(vf, vt), "root matches (triple collision)");
+
+    verkle_flat_destroy(vf);
+    verkle_destroy(vt);
+    printf("  OK\n\n");
+    cleanup();
+}
+
+/* =========================================================================
+ * Phase 15: Split + update existing — block 2 adds collider AND updates original
+ * ========================================================================= */
+
+static void test_split_and_update(void) {
+    printf("Phase 15: Split + update existing leaf in same block\n");
+    cleanup();
+
+    verkle_tree_t *vt = verkle_create();
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+
+    uint8_t stemA[31]; memset(stemA, 0xAA, 31); stemA[0] = 0x55;
+    uint8_t stemB[31]; memset(stemB, 0xBB, 31); stemB[0] = 0x55;
+    uint8_t stemZ[31]; memset(stemZ, 0x00, 31);
+
+    uint8_t keyA[32], keyB[32], keyZ[32];
+    uint8_t valA[32], valB[32], valZ[32];
+    memcpy(keyA, stemA, 31); keyA[31] = 0; memset(valA, 0x11, 32);
+    memcpy(keyB, stemB, 31); keyB[31] = 0; memset(valB, 0x22, 32);
+    memcpy(keyZ, stemZ, 31); keyZ[31] = 0; memset(valZ, 0x77, 32);
+
+    /* Block 1: A and Z */
+    verkle_set(vt, keyZ, valZ);
+    verkle_set(vt, keyA, valA);
+
+    verkle_flat_begin_block(vf, 1);
+    verkle_flat_set(vf, keyZ, valZ);
+    verkle_flat_set(vf, keyA, valA);
+    verkle_flat_commit_block(vf);
+    ASSERT(roots_match(vf, vt), "block 1 root");
+
+    /* Block 2: update A AND add collider B */
+    uint8_t valA2[32]; memset(valA2, 0xEE, 32);
+    verkle_set(vt, keyA, valA2);
+    verkle_set(vt, keyB, valB);
+
+    verkle_flat_begin_block(vf, 2);
+    verkle_flat_set(vf, keyA, valA2);
+    verkle_flat_set(vf, keyB, valB);
+    ASSERT(verkle_flat_commit_block(vf), "commit split+update");
+
+    ASSERT(roots_match(vf, vt), "root matches (split + update)");
+
+    verkle_flat_destroy(vf);
+    verkle_destroy(vt);
+    printf("  OK\n\n");
+    cleanup();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -550,6 +851,12 @@ int main(void) {
     test_persistence();
     test_dedup();
     test_scale();
+    test_split_basic();
+    test_split_deep();
+    test_split_across_blocks();
+    test_split_revert();
+    test_triple_collision();
+    test_split_and_update();
 
     printf("=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);

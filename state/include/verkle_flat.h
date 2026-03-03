@@ -20,6 +20,7 @@ extern "C" {
  * Two disk-backed stores:
  *   - Value store:      hash_store (key=32B, value=32B) — all state values
  *   - Commitment store: verkle_commit_store — leaf (C1,C2,commit) + internal
+ *   - Slot store:       hash_store — maps (depth,path,slot) → occupant stem
  *
  * Per-block flow:
  *   1. begin_block()
@@ -45,11 +46,12 @@ typedef struct {
     bool    had_value;
 } vf_undo_t;
 
-/** Commitment undo entry — records old commitment store data for revert. */
+/** Commitment undo entry — records old commitment/slot store data for revert. */
 typedef struct {
-    uint8_t  cs_key[32];      /* commit store key (leaf or internal format) */
-    uint8_t  old_data[96];    /* max: 96 bytes for leaf, 32 for internal */
-    uint8_t  data_len;        /* 0 = didn't exist, 96 = leaf, 32 = internal */
+    uint8_t  cs_key[32];      /* store key (commit or slot format) */
+    uint8_t  old_data[96];    /* max: 96 bytes for leaf, 32 for internal/slot */
+    uint8_t  data_len;        /* 0 = didn't exist, 96 = leaf, 32 = internal/slot */
+    uint8_t  store_id;        /* 0 = commit_store, 1 = slot_store */
 } vf_commit_undo_t;
 
 /** Block marker — tracks array offsets for revert. */
@@ -65,6 +67,7 @@ typedef struct {
     /* Stores (owned) */
     hash_store_t            *value_store;
     verkle_commit_store_t   *commit_store;
+    hash_store_t            *slot_store;    /* (depth,path,slot) → occupant stem */
 
     /* Current block changes */
     vf_change_t  *changes;

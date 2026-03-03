@@ -1,5 +1,41 @@
 # Verkle State — TODO
 
+## Priority — Ethereum Replay (MPT → Verkle)
+
+- [ ] **P0: Full Ethereum state replay** — replay all blocks, build verkle state
+  - In-memory tree path: verkle_state → verkle_journal → verkle_snapshot
+  - Feed EVM execution results (state changes) into verkle_state per block
+  - Checkpoint periodically via verkle_journal (snapshot + forward journal)
+  - Goal: compute verkle state root for every Ethereum block
+
+- [ ] **P1: Tree → flat migration** — switch to flat backend when tree outgrows RAM
+  - Walk the in-memory tree, export all values + commitments to flat stores
+  - Continue replay from that point using flat backend (O(block) RAM)
+  - Trigger: when RSS exceeds threshold (e.g. tree at ~2.2 TB for full state)
+
+- [ ] **P2: Leaf splitting in flat updater** — handle stem collisions at same internal depth
+  - When a new stem maps to a slot already occupied by a different leaf, must create
+    intermediate internal nodes to separate them (same logic as verkle.c tree insertion)
+  - Required before flat backend can process arbitrary blocks
+  - Affects: `verkle_flat.c` → `process_stem()` / `find_attach_depth()`
+
+## Later — Post-Replay
+
+- [ ] **Unified block execution pipeline** — single entry point for both backends
+  - Currently caller must know which path to use and call the right APIs
+  - Consider: block executor abstraction that wraps both
+
+- [ ] **Hash store compaction / GC** — reclaim space from deleted entries
+  - hash_store grows forever (tombstones on delete, never reclaimed)
+  - Matters for long-running nodes after replay is complete
+
+- [ ] **IPA proofs** — inner product argument over banderwagon
+  - Generate multipoint opening proofs against the tree
+  - Verify proofs (stateless client path)
+  - Required primitives: transcript (Fiat-Shamir), IPA prover/verifier, multiproof aggregation
+
+- [ ] **Thread safety** — concurrent read access during block execution
+
 ## Done
 
 - [x] **Banderwagon curve** — twisted Edwards arithmetic over blst_fr
@@ -18,8 +54,11 @@
   - Account header (tree_index=0): version/balance/nonce/code_hash/code_size at suffixes 0-4
   - Storage: tree_index = (slot >> 8) + 1, sub_index = slot & 0xFF
 
-- [x] **Verkle state** — typed account/storage interface over verkle tree
-  - `verkle_state.h/c` — get/set version, nonce, balance, code_hash, code_size, storage
+- [x] **Verkle state** — backend-agnostic typed account/storage interface
+  - `verkle_state.h/c` — tagged union (tree/flat), get/set version, nonce, balance, code_hash, code_size, storage
+  - Constructors: `create` (tree), `create_flat` / `open_flat` (disk-backed)
+  - Block ops: `begin_block`, `commit_block`, `revert_block`, `sync`
+  - Backend accessors: `get_tree`, `get_flat`
 
 - [x] **Commitment store** — hash_store-backed persistence for commitment points
   - `verkle_commit_store.h/c` — persist/load leaf (C1,C2,commit) and internal commitments
@@ -30,11 +69,6 @@
   - `verkle_code_chunk_key()` in `verkle_key.h/c` — tree_index = chunk_id/256, sub_index = chunk_id%256
   - `verkle_state_set_code()` / `verkle_state_get_code()` in `verkle_state.h/c`
   - Code hash is caller's responsibility (no keccak dependency)
-
-- [ ] **IPA proofs** — inner product argument over banderwagon
-  - Generate multipoint opening proofs against the tree
-  - Verify proofs (stateless client path)
-  - Required primitives: transcript (Fiat-Shamir), IPA prover/verifier, multiproof aggregation
 
 - [x] **Tree snapshot** — binary serialization/deserialization of entire verkle tree
   - `verkle_snapshot.h/c` — save/load full tree (structure + values + commitments) to binary file
@@ -57,9 +91,8 @@
   - Background checkpoint: `fork()` for consistent CoW snapshot, parent continues executing
   - Recovery: load last snapshot + replay forward journal
 
-- [x] **Benchmarking** — verkle state scale test (block execution simulation)
-  - `bench_verkle_state.c` — parameterized: accounts_K, blocks, checkpoint_interval
+- [x] **Benchmarking** — verkle state scale tests (tree + flat)
+  - `bench_verkle_state.c` — in-memory tree path: verkle_state → verkle_journal → verkle_snapshot
+  - `bench_verkle_flat.c` — disk-backed flat path: verkle_state → verkle_flat → hash_stores
   - Realistic op mix per block (~500 ops): balance 40%, nonce 20%, storage 25%, new account 10%, code deploy 5%
-  - Full stack: verkle_state → verkle_journal → verkle_snapshot (checkpoint + recovery)
-  - Metrics: per-block exec/commit latency, RSS, snapshot/journal sizes, latency percentiles (p50/p95/p99)
-  - Recovery verification: snapshot load + journal replay + root hash comparison
+  - Metrics: exec/commit latency percentiles, peak RSS, disk usage, persistence round-trip
