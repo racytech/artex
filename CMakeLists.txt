@@ -127,6 +127,17 @@ add_library(verkle_state STATIC
 )
 target_link_libraries(verkle_state verkle verkle_key)
 
+# State hash store (self-contained copy for state/ independence from database/)
+add_library(state_hash_store STATIC
+    state/src/hash_store.c
+)
+
+# Verkle commitment store (hash_store-backed commitment persistence)
+add_library(verkle_commit_store STATIC
+    state/src/verkle_commit_store.c
+)
+target_link_libraries(verkle_commit_store verkle banderwagon state_hash_store)
+
 #==============================================================================
 # Tests
 #==============================================================================
@@ -322,6 +333,13 @@ add_executable(test_verkle_state
 )
 target_link_libraries(test_verkle_state verkle_state)
 add_test(NAME test_verkle_state COMMAND test_verkle_state)
+
+# Test: Verkle commitment store (hash_store-backed persistence)
+add_executable(test_verkle_commit_store
+    state/tests/test_verkle_commit_store.c
+)
+target_link_libraries(test_verkle_commit_store verkle_commit_store verkle)
+add_test(NAME test_verkle_commit_store COMMAND test_verkle_commit_store)
 
 #==============================================================================
 # Build Summary
