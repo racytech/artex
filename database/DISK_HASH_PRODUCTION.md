@@ -19,7 +19,7 @@
 
 ---
 
-## 1. Crash Safety
+## 1. Crash Safety (DONE)
 
 ### Analysis
 
@@ -86,7 +86,7 @@ Acceptable — this only runs after unclean shutdown.
 
 ---
 
-## 2. Thread Safety
+## 2. Thread Safety (DONE)
 
 ### Access Pattern
 
@@ -225,13 +225,13 @@ These are explicitly out of scope to keep the implementation simple:
 
 ## 7. Implementation Priority
 
-| # | Feature | Complexity | Impact |
-|---|---------|-----------|--------|
-| 1 | Crash safety | Medium | Correctness after power loss |
-| 2 | Thread safety | Low | Concurrent reads during block execution |
-| 3 | I/O robustness | Low | Reliability under I/O pressure |
-| 4 | Iterator | Low | Enables recovery + migration |
-| 5 | Stats | Trivial | Monitoring / debugging |
+| # | Feature | Complexity | Impact | Status |
+|---|---------|-----------|--------|--------|
+| 1 | Crash safety | Medium | Correctness after power loss | DONE |
+| 2 | Thread safety | Low | Concurrent reads during block execution | DONE |
+| 3 | I/O robustness | Low | Reliability under I/O pressure | |
+| 4 | Iterator | Low | Enables recovery + migration | |
+| 5 | Stats | Trivial | Monitoring / debugging | |
 
 ---
 
@@ -241,8 +241,8 @@ These are explicitly out of scope to keep the implementation simple:
 - `test_disk_hash` — 12 unit tests (CRUD, batch, tombstone, persistence, overflow, scale)
 - `test_stress_disk_hash` — 6-phase stress test at configurable scale (default 1M)
 
-### New tests needed
-- **Multi-threaded stress**: 1 writer thread + N reader threads, shared disk_hash,
-  fail-fast on any data corruption or crash
-- **Crash simulation**: fork child → mutate aggressively → kill -9 → parent reopens
-  → verify recovery produces consistent state (correct count, no corrupt entries)
+### New tests (DONE)
+- `test_crash_disk_hash` — 4 scenarios × N rounds: fork + kill -9 + recovery,
+  baseline key survival verification across all scenarios
+- `test_mt_disk_hash` — 1 writer thread + N reader threads, safe-range integrity,
+  hot-range consistency checks, fail-fast on any corruption

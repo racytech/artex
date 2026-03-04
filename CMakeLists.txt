@@ -43,6 +43,12 @@ add_library(disk_hash STATIC
 )
 target_link_libraries(disk_hash pthread)
 
+# Code Store (content-addressed, append-only, deduplicated)
+add_library(code_store STATIC
+    database/src/code_store.c
+)
+target_link_libraries(code_store disk_hash pthread)
+
 #==============================================================================
 # Libraries — Verkle State
 #==============================================================================
@@ -199,6 +205,13 @@ add_executable(test_mt_disk_hash
     database/tests/test_mt_disk_hash.c
 )
 target_link_libraries(test_mt_disk_hash disk_hash pthread)
+
+# Test: Code Store (content-addressed bytecode storage)
+add_executable(test_code_store
+    database/tests/test_code_store.c
+)
+target_link_libraries(test_code_store code_store)
+add_test(NAME test_code_store COMMAND test_code_store)
 
 #==============================================================================
 # Tests — Verkle State
