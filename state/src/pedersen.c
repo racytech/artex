@@ -7,6 +7,7 @@
  * ========================================================================= */
 
 static banderwagon_point_t CRS[PEDERSEN_WIDTH];
+static banderwagon_precomp_msm_t CRS_PRECOMP;
 static bool ped_initialized = false;
 
 static const char CRS_SEED[] = "eth_verkle_oct_2021";
@@ -58,6 +59,9 @@ void pedersen_init(void) {
         }
     }
 
+    /* Build precomputed MSM tables for fixed CRS points */
+    banderwagon_precomp_msm_init(&CRS_PRECOMP, CRS, PEDERSEN_WIDTH);
+
     ped_initialized = true;
 }
 
@@ -75,7 +79,7 @@ void pedersen_commit(banderwagon_point_t *out,
                      size_t count)
 {
     ensure_init();
-    banderwagon_msm(out, CRS, scalars, count);
+    banderwagon_precomp_msm(out, &CRS_PRECOMP, scalars, count);
 }
 
 void pedersen_update(banderwagon_point_t *out,
@@ -95,8 +99,8 @@ void pedersen_update(banderwagon_point_t *out,
         return;
     }
 
-    banderwagon_point_t tmp;
-    banderwagon_scalar_mul(&tmp, &CRS[index], delta);
+    banderwagon_point_t tmp = BANDERWAGON_IDENTITY;
+    banderwagon_precomp_scalar_mul(&tmp, &CRS_PRECOMP.points[index], delta);
     banderwagon_add(out, old_commitment, &tmp);
 }
 

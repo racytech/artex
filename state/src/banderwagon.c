@@ -576,6 +576,213 @@ void banderwagon_msm(banderwagon_point_t *out,
 }
 
 /* =========================================================================
+ * Mixed Addition (extended + normalized, Z_q = 1)
+ * ========================================================================= */
+
+/**
+ * Add extended point p + normalized point q (where q has Z=1).
+ * Same formula as banderwagon_add but with D = Z1 (saves 1 fp_mul).
+ *
+ *   A = X1*X2, B = Y1*Y2, C = T1*d*T2, D = Z1
+ *   E = (X1+Y1)*(X2+Y2) - A - B
+ *   F = D - C, G = D + C, H = B - a*A
+ *   X3 = E*F, Y3 = G*H, T3 = E*H, Z3 = F*G
+ */
+void banderwagon_add_mixed(banderwagon_point_t *out,
+                           const banderwagon_point_t *p,
+                           const banderwagon_point_norm_t *q)
+{
+    fp_t A, B, C, D, E, F, G, H;
+    fp_t tmp1, tmp2;
+
+    fp_mul(&A, &p->X, &q->X);                     /* A = X1*X2        */
+    fp_mul(&B, &p->Y, &q->Y);                     /* B = Y1*Y2        */
+    fp_mul(&C, &p->T, &q->T);
+    fp_mul(&C, &C, &BANDERSNATCH_D);               /* C = T1*d*T2      */
+    D = p->Z;                                      /* D = Z1 (Z2 = 1)  */
+
+    fp_add(&tmp1, &p->X, &p->Y);                  /* tmp1 = X1+Y1     */
+    fp_add(&tmp2, &q->X, &q->Y);                  /* tmp2 = X2+Y2     */
+    fp_mul(&E, &tmp1, &tmp2);                      /* E = (X1+Y1)(X2+Y2) */
+    fp_sub(&E, &E, &A);
+    fp_sub(&E, &E, &B);                            /* E = E - A - B    */
+
+    fp_sub(&F, &D, &C);                            /* F = D - C        */
+    fp_add(&G, &D, &C);                            /* G = D + C        */
+
+    /* H = B - a*A.  Since a = -5, a*A = -5A, so H = B + 5A. */
+    fp_mul(&tmp1, &A, &BANDERSNATCH_A);            /* tmp1 = a*A       */
+    fp_sub(&H, &B, &tmp1);                         /* H = B - a*A      */
+
+    fp_mul(&out->X, &E, &F);                      /* X3 = E*F         */
+    fp_mul(&out->Y, &G, &H);                      /* Y3 = G*H         */
+    fp_mul(&out->T, &E, &H);                      /* T3 = E*H         */
+    fp_mul(&out->Z, &F, &G);                      /* Z3 = F*G         */
+}
+
+/* =========================================================================
+ * Precomputed Fixed-Base MSM
+ * ========================================================================= */
+
+/**
+ * Batch-normalize an array of extended points to Z=1 using Montgomery's trick.
+ * Only 1 fp_inv for the entire batch.
+ */
+static void batch_normalize(banderwagon_point_norm_t *out,
+                            const banderwagon_point_t *points,
+                            size_t n)
+{
+    if (n == 0) return;
+
+    /* Accumulate products of Z coordinates */
+    fp_t *products = malloc(n * sizeof(fp_t));
+    products[0] = points[0].Z;
+    for (size_t i = 1; i < n; i++)
+        fp_mul(&products[i], &products[i - 1], &points[i].Z);
+
+    /* Single inversion of the accumulated product */
+    fp_t inv;
+    fp_inv(&inv, &products[n - 1]);
+
+    /* Walk backwards to recover individual Z inverses.
+     * For each point: X_norm = X/Z, Y_norm = Y/Z, T_norm = X_norm * Y_norm */
+    for (size_t i = n - 1; ; i--) {
+        fp_t z_inv;
+        if (i > 0) {
+            fp_mul(&z_inv, &inv, &products[i - 1]);
+            fp_mul(&inv, &inv, &points[i].Z);
+        } else {
+            z_inv = inv;
+        }
+
+        fp_mul(&out[i].X, &points[i].X, &z_inv);
+        fp_mul(&out[i].Y, &points[i].Y, &z_inv);
+        fp_mul(&out[i].T, &out[i].X, &out[i].Y);
+
+        if (i == 0) break;
+    }
+
+    free(products);
+}
+
+/**
+ * Build precomputed table for one base point.
+ *
+ * For each of 32 windows (w=8 bits):
+ *   table[w][k] = (k+1) * G_shifted,  k = 0..127
+ *   where G_shifted = G * 2^(w*8)
+ *
+ * All entries are normalized (Z=1) for mixed addition.
+ */
+static void precomp_build_point(banderwagon_precomp_point_t *pp,
+                                const banderwagon_point_t *base)
+{
+    banderwagon_point_t shifted = *base;
+    banderwagon_point_t tmp[PRECOMP_TABLE_SIZE];
+
+    for (int w = 0; w < PRECOMP_NUM_WINDOWS; w++) {
+        /* Build multiples: tmp[0] = 1*shifted, tmp[k] = (k+1)*shifted */
+        tmp[0] = shifted;
+        for (int k = 1; k < PRECOMP_TABLE_SIZE; k++)
+            banderwagon_add(&tmp[k], &tmp[k - 1], &shifted);
+
+        /* Batch-normalize to Z=1 */
+        batch_normalize(pp->windows[w], tmp, PRECOMP_TABLE_SIZE);
+
+        /* Advance shifted by 2^8 (8 doublings) */
+        for (int d = 0; d < PRECOMP_WINDOW_BITS; d++)
+            banderwagon_double(&shifted, &shifted);
+    }
+}
+
+void banderwagon_precomp_msm_init(banderwagon_precomp_msm_t *msm,
+                                   const banderwagon_point_t *bases,
+                                   size_t count)
+{
+    msm->count = count;
+    msm->points = malloc(count * sizeof(banderwagon_precomp_point_t));
+
+    for (size_t i = 0; i < count; i++)
+        precomp_build_point(&msm->points[i], &bases[i]);
+}
+
+void banderwagon_precomp_msm_free(banderwagon_precomp_msm_t *msm)
+{
+    if (msm->points) {
+        free(msm->points);
+        msm->points = NULL;
+    }
+    msm->count = 0;
+}
+
+/**
+ * Negate a normalized point: -(X, Y, T) = (-X, Y, -T)
+ */
+static void negate_norm(banderwagon_point_norm_t *out,
+                        const banderwagon_point_norm_t *p)
+{
+    fp_neg(&out->X, &p->X);
+    out->Y = p->Y;
+    fp_neg(&out->T, &p->T);
+}
+
+/**
+ * Accumulate scalar * base into acc using precomputed windowed table.
+ *
+ * Uses sign trick: for each 8-bit window value v:
+ *   if v == 0: skip
+ *   if v < 128: acc += table[w][v-1]
+ *   if v >= 128: acc -= table[w][256-v-1], carry 1 to next window
+ */
+void banderwagon_precomp_scalar_mul(banderwagon_point_t *acc,
+                                     const banderwagon_precomp_point_t *pp,
+                                     const uint8_t scalar[32])
+{
+    int carry = 0;
+
+    for (int w = 0; w < PRECOMP_NUM_WINDOWS; w++) {
+        int val = (w < 32) ? (int)scalar[w] + carry : carry;
+        carry = 0;
+
+        if (val == 0) continue;
+
+        if (val == 256) {
+            /* Full overflow: 256 = 0 in this window, carry 1 to next */
+            carry = 1;
+            continue;
+        }
+
+        if (val > 128) {
+            val = 256 - val;
+            carry = 1;
+            banderwagon_point_norm_t neg;
+            negate_norm(&neg, &pp->windows[w][val - 1]);
+            banderwagon_add_mixed(acc, acc, &neg);
+        } else if (val == 128) {
+            /* Exactly 128: use table[w][127] directly (no sign trick needed) */
+            banderwagon_add_mixed(acc, acc, &pp->windows[w][127]);
+        } else {
+            banderwagon_add_mixed(acc, acc, &pp->windows[w][val - 1]);
+        }
+    }
+}
+
+void banderwagon_precomp_msm(banderwagon_point_t *out,
+                              const banderwagon_precomp_msm_t *msm,
+                              const uint8_t (*scalars)[32],
+                              size_t count)
+{
+    ensure_init();
+    *out = BANDERWAGON_IDENTITY;
+
+    size_t n = (count < msm->count) ? count : msm->count;
+    for (size_t i = 0; i < n; i++) {
+        if (scalar_is_zero(scalars[i])) continue;
+        banderwagon_precomp_scalar_mul(out, &msm->points[i], scalars[i]);
+    }
+}
+
+/* =========================================================================
  * Identity and Equality
  * ========================================================================= */
 

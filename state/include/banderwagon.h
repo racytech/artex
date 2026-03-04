@@ -43,6 +43,14 @@ typedef struct {
     fp_t X, Y, Z, T;
 } banderwagon_point_t;
 
+/**
+ * Normalized point (Z=1) for cheaper mixed addition.
+ * Only stores X, Y, T since Z is implicitly 1.
+ */
+typedef struct {
+    fp_t X, Y, T;
+} banderwagon_point_norm_t;
+
 /* =========================================================================
  * Constants
  * ========================================================================= */
@@ -148,6 +156,54 @@ bool banderwagon_deserialize(banderwagon_point_t *out,
 
 /** Check that point lies on the Bandersnatch curve. */
 bool banderwagon_is_on_curve(const banderwagon_point_t *p);
+
+/* =========================================================================
+ * Mixed Addition (extended + normalized)
+ * ========================================================================= */
+
+/** Add extended point p + normalized point q (Z_q = 1).
+ *  Saves 1 fp_mul vs full banderwagon_add. */
+void banderwagon_add_mixed(banderwagon_point_t *out,
+                           const banderwagon_point_t *p,
+                           const banderwagon_point_norm_t *q);
+
+/* =========================================================================
+ * Precomputed Fixed-Base MSM
+ * ========================================================================= */
+
+#define PRECOMP_WINDOW_BITS  8
+#define PRECOMP_NUM_WINDOWS  32    /* ceil(253 / 8) */
+#define PRECOMP_TABLE_SIZE   128   /* 2^(w-1) entries per window */
+
+/** Precomputed table for one fixed base point. */
+typedef struct {
+    banderwagon_point_norm_t windows[PRECOMP_NUM_WINDOWS][PRECOMP_TABLE_SIZE];
+} banderwagon_precomp_point_t;
+
+/** Precomputed MSM handle for N fixed base points. */
+typedef struct {
+    banderwagon_precomp_point_t *points;
+    size_t count;
+} banderwagon_precomp_msm_t;
+
+/** Build precomputed tables from base points (one-time, ~96 MB for 256 points). */
+void banderwagon_precomp_msm_init(banderwagon_precomp_msm_t *msm,
+                                   const banderwagon_point_t *bases,
+                                   size_t count);
+
+/** Free precomputed tables. */
+void banderwagon_precomp_msm_free(banderwagon_precomp_msm_t *msm);
+
+/** MSM using precomputed tables: out = sum(scalars[i] * bases[i]). */
+void banderwagon_precomp_msm(banderwagon_point_t *out,
+                              const banderwagon_precomp_msm_t *msm,
+                              const uint8_t (*scalars)[32],
+                              size_t count);
+
+/** Accumulate scalar * base_i into acc using precomputed table. */
+void banderwagon_precomp_scalar_mul(banderwagon_point_t *acc,
+                                     const banderwagon_precomp_point_t *pp,
+                                     const uint8_t scalar[32]);
 
 #ifdef __cplusplus
 }

@@ -55,6 +55,8 @@ static void split_values_to_scalars(uint8_t (*out)[32],
         if (!has[i]) continue;
         /* slot 2*i   = lower 16 bytes (bytes 0..15) as LE scalar */
         memcpy(out[2 * i], values[i], 16);
+        /* EIP-6800 leaf marker: add 2^128 to mark value as present */
+        out[2 * i][16] = 1;
         /* slot 2*i+1 = upper 16 bytes (bytes 16..31) as LE scalar */
         memcpy(out[2 * i + 1], values[i] + 16, 16);
     }
@@ -202,7 +204,8 @@ bool verkle_get(const verkle_tree_t *vt,
  */
 static banderwagon_point_t incremental_update_leaf(
     verkle_leaf_t *leaf, uint8_t suffix,
-    const uint8_t old_value[32], const uint8_t new_value[32])
+    const uint8_t old_value[32], const uint8_t new_value[32],
+    bool old_present, bool new_present)
 {
     banderwagon_point_t old_leaf_commit = leaf->commitment;
 
@@ -216,6 +219,9 @@ static banderwagon_point_t incremental_update_leaf(
     uint8_t old_hi[32] = {0}, new_hi[32] = {0};
     memcpy(old_lo, old_value, 16);
     memcpy(new_lo, new_value, 16);
+    /* EIP-6800 leaf marker: 2^128 for present values */
+    if (new_present) new_lo[16] = 1;
+    if (old_present) old_lo[16] = 1;
     memcpy(old_hi, old_value + 16, 16);
     memcpy(new_hi, new_value + 16, 16);
 
@@ -321,6 +327,7 @@ bool verkle_set(verkle_tree_t *vt,
                 /* Save old value (zeros if suffix not yet set) */
                 uint8_t old_value[32];
                 memcpy(old_value, node->leaf.values[suffix], 32);
+                bool had_value = node->leaf.has_value[suffix];
 
                 /* Update value */
                 memcpy(node->leaf.values[suffix], value, VERKLE_VALUE_LEN);
@@ -329,7 +336,8 @@ bool verkle_set(verkle_tree_t *vt,
                 /* Incremental leaf update */
                 banderwagon_point_t old_leaf_commit =
                     incremental_update_leaf(&node->leaf, suffix,
-                                            old_value, value);
+                                            old_value, value,
+                                            had_value, true);
 
                 /* Propagate up through internal ancestors */
                 incremental_propagate_internals(
@@ -458,7 +466,8 @@ bool verkle_unset(verkle_tree_t *vt, const uint8_t key[VERKLE_KEY_LEN])
                 uint8_t zeros[32] = {0};
                 banderwagon_point_t old_leaf_commit =
                     incremental_update_leaf(&node->leaf, suffix,
-                                            old_value, zeros);
+                                            old_value, zeros,
+                                            true, false);
                 incremental_propagate_internals(
                     path, path_indices, path_len,
                     &old_leaf_commit, &node->leaf.commitment);

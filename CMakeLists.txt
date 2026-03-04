@@ -398,6 +398,16 @@ add_executable(bench_verkle_flat
 )
 target_link_libraries(bench_verkle_flat verkle_state)
 
+# Test: Verkle cross-validation (go-verkle reference vectors)
+add_executable(test_verkle_cross_validation
+    state/tests/test_verkle_cross_validation.c
+)
+target_link_libraries(test_verkle_cross_validation verkle_flat verkle)
+add_test(NAME test_verkle_cross_validation
+    COMMAND test_verkle_cross_validation
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
 #==============================================================================
 # Build Summary
 #==============================================================================

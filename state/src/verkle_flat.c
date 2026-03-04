@@ -526,11 +526,13 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             uint8_t len;
             hash_store_get(vf->value_store, full_key, old_value, &len);
 
-            /* Split into lo/hi 16-byte halves */
+            /* Split into lo/hi 16-byte halves with EIP-6800 leaf marker */
             uint8_t old_lo[32] = {0}, new_lo[32] = {0};
             uint8_t old_hi[32] = {0}, new_hi[32] = {0};
             memcpy(old_lo, old_value, 16);
             memcpy(new_lo, new_value, 16);
+            new_lo[16] = 1;  /* EIP-6800 leaf marker */
+            if (len > 0) old_lo[16] = 1;  /* marker was present in old commitment */
             memcpy(old_hi, old_value + 16, 16);
             memcpy(new_hi, new_value + 16, 16);
 
@@ -592,10 +594,12 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             if (suffix < 128) {
                 int rel = suffix;
                 memcpy(scalars_c1[2 * rel], val, 16);
+                scalars_c1[2 * rel][16] = 1;  /* EIP-6800 leaf marker */
                 memcpy(scalars_c1[2 * rel + 1], val + 16, 16);
             } else {
                 int rel = suffix - 128;
                 memcpy(scalars_c2[2 * rel], val, 16);
+                scalars_c2[2 * rel][16] = 1;  /* EIP-6800 leaf marker */
                 memcpy(scalars_c2[2 * rel + 1], val + 16, 16);
             }
 
