@@ -130,7 +130,7 @@ static void run_build_scenario(FILE *fp, const char *name) {
 
     /* --- Test 2: Flat updater --- */
     cleanup();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 4096);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
     verkle_flat_begin_block(vf, 1);
     for (uint32_t i = 0; i < num_keys; i++)
         verkle_flat_set(vf, keys[i], vals[i]);
@@ -193,7 +193,7 @@ static void run_multiblock_scenario(FILE *fp, const char *name) {
 
     /* --- Test initial state with flat --- */
     cleanup();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 4096);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
     verkle_flat_begin_block(vf, 0);
     for (uint32_t i = 0; i < num_initial; i++)
         verkle_flat_set(vf, keys[i], vals[i]);

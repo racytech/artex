@@ -450,7 +450,7 @@ int main(int argc, char **argv) {
     rng_t rng = { .state = MASTER_SEED };
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 4096);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
     ASSERT_MSG(vf, "flat create failed");
 
     double t_start = now_sec();

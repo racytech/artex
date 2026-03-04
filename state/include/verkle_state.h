@@ -43,8 +43,7 @@ verkle_state_t *verkle_state_create(void);
 
 /** Create a flat-backed verkle state (new stores). */
 verkle_state_t *verkle_state_create_flat(const char *value_dir,
-                                          const char *commit_dir,
-                                          uint64_t shard_capacity);
+                                          const char *commit_dir);
 
 /** Open an existing flat-backed verkle state. */
 verkle_state_t *verkle_state_open_flat(const char *value_dir,

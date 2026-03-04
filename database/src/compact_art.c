@@ -789,6 +789,16 @@ static compact_ref_t insert_recursive(compact_art_t *tree, compact_ref_t ref,
                 size_t keep = (size_t)new_partial_len < avail
                               ? (size_t)new_partial_len : avail;
                 memmove(partial, partial + shift, keep);
+                // If new prefix is longer than shifted bytes, fill remainder from leaf
+                if ((size_t)new_partial_len > avail) {
+                    if (!leaf_k) {
+                        compact_ref_t min_leaf = find_minimum_leaf(tree, ref);
+                        leaf_k = leaf_key(tree, min_leaf);
+                    }
+                    size_t fill = COMPACT_MAX_PREFIX - keep;
+                    memcpy(partial + keep,
+                           leaf_k + depth + prefix_len + 1 + keep, fill);
+                }
             } else {
                 // All stored bytes consumed — repopulate from leaf
                 if (!leaf_k) {

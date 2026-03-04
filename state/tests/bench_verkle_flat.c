@@ -183,7 +183,8 @@ int main(int argc, char **argv)
     printf("--- Phase 1: Prefill %u accounts ---\n", target_accounts);
     double t_prefill_start = now_sec();
 
-    verkle_state_t *vs = verkle_state_create_flat(VAL_DIR, COMM_DIR, shard_cap);
+    (void)shard_cap;  /* no longer needed — art_store auto-sizes */
+    verkle_state_t *vs = verkle_state_create_flat(VAL_DIR, COMM_DIR);
     if (!vs) { fprintf(stderr, "Failed to create flat state\n"); return 1; }
 
     /* Store addresses for later use */

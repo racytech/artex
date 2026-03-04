@@ -1,15 +1,16 @@
 #include "verkle_commit_store.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <sys/stat.h>
 
 /* =========================================================================
  * Constants
  * ========================================================================= */
 
-#define VCS_KEY_SIZE    32
-#define VCS_SLOT_SIZE   144   /* max_value = 144 - 10 - 32 = 102, fits 96B leaf */
-#define VCS_LEAF_VALUE_LEN   96   /* 3 × 32-byte serialized points */
-#define VCS_INTERNAL_VALUE_LEN 32 /* 1 × 32-byte serialized point */
+#define VCS_KEY_SIZE            32
+#define VCS_LEAF_RECORD_SIZE    96   /* 3 × 32-byte serialized points */
+#define VCS_INTERNAL_RECORD_SIZE 32  /* 1 × 32-byte serialized point */
 
 /* =========================================================================
  * Key Encoding
@@ -36,19 +37,46 @@ static void make_internal_key(uint8_t key[32], int depth,
 }
 
 /* =========================================================================
+ * Path Helpers
+ * ========================================================================= */
+
+static void make_leaf_path(char *buf, size_t buf_size, const char *dir) {
+    snprintf(buf, buf_size, "%s/leaves.art", dir);
+}
+
+static void make_internal_path(char *buf, size_t buf_size, const char *dir) {
+    snprintf(buf, buf_size, "%s/internals.art", dir);
+}
+
+/* =========================================================================
  * Lifecycle
  * ========================================================================= */
 
-verkle_commit_store_t *vcs_create(const char *dir, uint64_t shard_capacity) {
+verkle_commit_store_t *vcs_create(const char *dir) {
     verkle_commit_store_t *cs = calloc(1, sizeof(verkle_commit_store_t));
     if (!cs) return NULL;
 
-    cs->store = hash_store_create(dir, shard_capacity,
-                                   VCS_KEY_SIZE, VCS_SLOT_SIZE);
-    if (!cs->store) {
+    mkdir(dir, 0755);
+
+    char leaf_path[512], internal_path[512];
+    make_leaf_path(leaf_path, sizeof(leaf_path), dir);
+    make_internal_path(internal_path, sizeof(internal_path), dir);
+
+    cs->leaf_store = art_store_create(leaf_path, VCS_KEY_SIZE,
+                                       VCS_LEAF_RECORD_SIZE);
+    if (!cs->leaf_store) {
         free(cs);
         return NULL;
     }
+
+    cs->internal_store = art_store_create(internal_path, VCS_KEY_SIZE,
+                                           VCS_INTERNAL_RECORD_SIZE);
+    if (!cs->internal_store) {
+        art_store_destroy(cs->leaf_store);
+        free(cs);
+        return NULL;
+    }
+
     return cs;
 }
 
@@ -56,17 +84,30 @@ verkle_commit_store_t *vcs_open(const char *dir) {
     verkle_commit_store_t *cs = calloc(1, sizeof(verkle_commit_store_t));
     if (!cs) return NULL;
 
-    cs->store = hash_store_open(dir);
-    if (!cs->store) {
+    char leaf_path[512], internal_path[512];
+    make_leaf_path(leaf_path, sizeof(leaf_path), dir);
+    make_internal_path(internal_path, sizeof(internal_path), dir);
+
+    cs->leaf_store = art_store_open(leaf_path);
+    if (!cs->leaf_store) {
         free(cs);
         return NULL;
     }
+
+    cs->internal_store = art_store_open(internal_path);
+    if (!cs->internal_store) {
+        art_store_destroy(cs->leaf_store);
+        free(cs);
+        return NULL;
+    }
+
     return cs;
 }
 
 void vcs_destroy(verkle_commit_store_t *cs) {
     if (!cs) return;
-    if (cs->store) hash_store_destroy(cs->store);
+    if (cs->leaf_store) art_store_destroy(cs->leaf_store);
+    if (cs->internal_store) art_store_destroy(cs->internal_store);
     free(cs);
 }
 
@@ -83,12 +124,12 @@ bool vcs_put_leaf(verkle_commit_store_t *cs,
     uint8_t key[32];
     make_leaf_key(key, stem);
 
-    uint8_t buf[VCS_LEAF_VALUE_LEN];
+    uint8_t buf[VCS_LEAF_RECORD_SIZE];
     banderwagon_serialize(buf,      c1);
     banderwagon_serialize(buf + 32, c2);
     banderwagon_serialize(buf + 64, commitment);
 
-    return hash_store_put(cs->store, key, buf, VCS_LEAF_VALUE_LEN);
+    return art_store_put(cs->leaf_store, key, buf);
 }
 
 bool vcs_get_leaf(const verkle_commit_store_t *cs,
@@ -100,11 +141,8 @@ bool vcs_get_leaf(const verkle_commit_store_t *cs,
     uint8_t key[32];
     make_leaf_key(key, stem);
 
-    uint8_t buf[VCS_LEAF_VALUE_LEN];
-    uint8_t len;
-    if (!hash_store_get(cs->store, key, buf, &len))
-        return false;
-    if (len != VCS_LEAF_VALUE_LEN)
+    uint8_t buf[VCS_LEAF_RECORD_SIZE];
+    if (!art_store_get(cs->leaf_store, key, buf))
         return false;
 
     if (!banderwagon_deserialize(c1, buf))
@@ -129,10 +167,10 @@ bool vcs_put_internal(verkle_commit_store_t *cs,
     uint8_t key[32];
     make_internal_key(key, depth, path_prefix);
 
-    uint8_t buf[VCS_INTERNAL_VALUE_LEN];
+    uint8_t buf[VCS_INTERNAL_RECORD_SIZE];
     banderwagon_serialize(buf, commitment);
 
-    return hash_store_put(cs->store, key, buf, VCS_INTERNAL_VALUE_LEN);
+    return art_store_put(cs->internal_store, key, buf);
 }
 
 bool vcs_get_internal(const verkle_commit_store_t *cs,
@@ -143,11 +181,8 @@ bool vcs_get_internal(const verkle_commit_store_t *cs,
     uint8_t key[32];
     make_internal_key(key, depth, path_prefix);
 
-    uint8_t buf[VCS_INTERNAL_VALUE_LEN];
-    uint8_t len;
-    if (!hash_store_get(cs->store, key, buf, &len))
-        return false;
-    if (len != VCS_INTERNAL_VALUE_LEN)
+    uint8_t buf[VCS_INTERNAL_RECORD_SIZE];
+    if (!art_store_get(cs->internal_store, key, buf))
         return false;
 
     return banderwagon_deserialize(commitment, buf);
@@ -199,5 +234,7 @@ bool vcs_flush_tree(verkle_commit_store_t *cs, const verkle_tree_t *vt) {
  * ========================================================================= */
 
 void vcs_sync(verkle_commit_store_t *cs) {
-    if (cs && cs->store) hash_store_sync(cs->store);
+    if (!cs) return;
+    if (cs->leaf_store) art_store_sync(cs->leaf_store);
+    if (cs->internal_store) art_store_sync(cs->internal_store);
 }

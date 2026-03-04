@@ -65,7 +65,7 @@ static void test_single_key(void) {
     cleanup();
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
     ASSERT(vf != NULL, "flat create");
 
     /* Need 2+ stems so tree creates an internal root (flat always does) */
@@ -112,7 +112,7 @@ static void test_same_stem(void) {
     cleanup();
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
 
     /* Need 2+ stems for internal root */
     uint8_t stem[31];
@@ -166,7 +166,7 @@ static void test_multiple_stems(void) {
     cleanup();
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
 
     verkle_flat_begin_block(vf, 1);
 
@@ -199,7 +199,7 @@ static void test_two_blocks(void) {
     cleanup();
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
 
     /* Block 1: create 5 stems */
     verkle_flat_begin_block(vf, 1);
@@ -257,7 +257,7 @@ static void test_revert(void) {
     cleanup();
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
 
     /* Block 1: initial state */
     verkle_flat_begin_block(vf, 1);
@@ -338,7 +338,7 @@ static void test_trim(void) {
     printf("Phase 6: Multi-block + trim\n");
     cleanup();
 
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
 
     /* Create 5 blocks */
     for (int b = 1; b <= 5; b++) {
@@ -384,7 +384,7 @@ static void test_persistence(void) {
 
     /* Create, set, commit, sync */
     {
-        verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+        verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
         verkle_flat_begin_block(vf, 1);
         verkle_flat_set(vf, key, val);
         verkle_flat_commit_block(vf);
@@ -422,7 +422,7 @@ static void test_dedup(void) {
     cleanup();
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
 
     uint8_t key[32];
     memset(key, 0x55, 31);
@@ -470,7 +470,7 @@ static void test_scale(void) {
     cleanup();
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 4096);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
     rng_t rng = { .state = 12345 };
 
     /* Track all keys for later updates */
@@ -542,7 +542,7 @@ static void test_split_basic(void) {
     cleanup();
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
 
     /* Stem A: [0x11, 0x22, 0xAA, ...] */
     uint8_t stemA[31]; memset(stemA, 0xAA, 31); stemA[0] = 0x11; stemA[1] = 0x22;
@@ -591,7 +591,7 @@ static void test_split_deep(void) {
     cleanup();
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
 
     /* Stem A: [0x11, 0x22, 0x33, 0xAA, ...] */
     uint8_t stemA[31]; memset(stemA, 0xAA, 31);
@@ -635,7 +635,7 @@ static void test_split_across_blocks(void) {
     cleanup();
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
 
     /* Stem A: [0x55, 0xAA, ...] */
     uint8_t stemA[31]; memset(stemA, 0xAA, 31); stemA[0] = 0x55;
@@ -684,7 +684,7 @@ static void test_split_revert(void) {
     cleanup();
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
 
     uint8_t stemA[31]; memset(stemA, 0xAA, 31); stemA[0] = 0x55;
     uint8_t stemZ[31]; memset(stemZ, 0x00, 31);
@@ -749,7 +749,7 @@ static void test_triple_collision(void) {
     cleanup();
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
 
     /* All three share byte 0 = 0x44 */
     uint8_t stemA[31]; memset(stemA, 0xAA, 31); stemA[0] = 0x44; stemA[1] = 0x11;
@@ -794,7 +794,7 @@ static void test_split_and_update(void) {
     cleanup();
 
     verkle_tree_t *vt = verkle_create();
-    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR, 1024);
+    verkle_flat_t *vf = verkle_flat_create(VAL_DIR, COMM_DIR);
 
     uint8_t stemA[31]; memset(stemA, 0xAA, 31); stemA[0] = 0x55;
     uint8_t stemB[31]; memset(stemB, 0xBB, 31); stemB[0] = 0x55;

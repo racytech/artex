@@ -2,7 +2,7 @@
 #define VERKLE_FLAT_H
 
 #include "verkle_commit_store.h"
-#include "hash_store.h"
+#include "art_store.h"
 #include "banderwagon.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -17,10 +17,10 @@ extern "C" {
  * Replaces the in-memory verkle tree for block execution.
  * RAM usage: O(block_changes) instead of O(total_state).
  *
- * Two disk-backed stores:
- *   - Value store:      hash_store (key=32B, value=32B) — all state values
+ * Disk-backed stores (all art_store):
+ *   - Value store:      art_store (key=32B, record=32B) — all state values
  *   - Commitment store: verkle_commit_store — leaf (C1,C2,commit) + internal
- *   - Slot store:       hash_store — maps (depth,path,slot) → occupant stem
+ *   - Slot store:       art_store — maps (depth,path,slot) → occupant stem
  *
  * Per-block flow:
  *   1. begin_block()
@@ -51,7 +51,7 @@ typedef struct {
     uint8_t  cs_key[32];      /* store key (commit or slot format) */
     uint8_t  old_data[96];    /* max: 96 bytes for leaf, 32 for internal/slot */
     uint8_t  data_len;        /* 0 = didn't exist, 96 = leaf, 32 = internal/slot */
-    uint8_t  store_id;        /* 0 = commit_store, 1 = slot_store */
+    uint8_t  store_id;        /* 0 = leaf, 1 = internal, 2 = slot */
 } vf_commit_undo_t;
 
 /** Block marker — tracks array offsets for revert. */
@@ -65,9 +65,9 @@ typedef struct {
 /** Main handle. */
 typedef struct {
     /* Stores (owned) */
-    hash_store_t            *value_store;
+    art_store_t             *value_store;
     verkle_commit_store_t   *commit_store;
-    hash_store_t            *slot_store;    /* (depth,path,slot) → occupant stem */
+    art_store_t             *slot_store;    /* (depth,path,slot) → occupant stem */
 
     /* Current block changes */
     vf_change_t  *changes;
@@ -97,8 +97,7 @@ typedef struct {
 
 /** Create a new flat updater with fresh stores. */
 verkle_flat_t *verkle_flat_create(const char *value_dir,
-                                  const char *commit_dir,
-                                  uint64_t shard_capacity);
+                                  const char *commit_dir);
 
 /** Open existing flat updater from persisted stores. */
 verkle_flat_t *verkle_flat_open(const char *value_dir,
@@ -149,7 +148,7 @@ void verkle_flat_root_hash(const verkle_flat_t *vf, uint8_t out[32]);
  * Durability
  * ========================================================================= */
 
-/** Flush both stores to disk. */
+/** Flush all stores to disk. */
 void verkle_flat_sync(verkle_flat_t *vf);
 
 #ifdef __cplusplus

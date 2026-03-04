@@ -34,7 +34,7 @@ static void test_lifecycle(void) {
     printf("Phase 1: Create/destroy\n");
     cleanup();
 
-    verkle_commit_store_t *cs = vcs_create(TEST_DIR, 1024);
+    verkle_commit_store_t *cs = vcs_create(TEST_DIR);
     ASSERT(cs != NULL, "vcs_create returns non-NULL");
 
     vcs_destroy(cs);
@@ -68,7 +68,7 @@ static void test_leaf_round_trip(void) {
     banderwagon_point_t commit_orig = vt->root->leaf.commitment;
 
     /* Store and retrieve */
-    verkle_commit_store_t *cs = vcs_create(TEST_DIR, 1024);
+    verkle_commit_store_t *cs = vcs_create(TEST_DIR);
     ASSERT(cs != NULL, "store created");
 
     uint8_t stem[31];
@@ -119,7 +119,7 @@ static void test_internal_round_trip(void) {
     ASSERT(!banderwagon_is_identity(&root_commit), "root commitment non-identity");
 
     /* Store and retrieve at different depths */
-    verkle_commit_store_t *cs = vcs_create(TEST_DIR, 1024);
+    verkle_commit_store_t *cs = vcs_create(TEST_DIR);
     ASSERT(cs != NULL, "store created");
 
     /* Depth 0 (root) */
@@ -164,7 +164,7 @@ static void test_get_nonexistent(void) {
     printf("Phase 4: Get non-existent entries\n");
     cleanup();
 
-    verkle_commit_store_t *cs = vcs_create(TEST_DIR, 1024);
+    verkle_commit_store_t *cs = vcs_create(TEST_DIR);
     ASSERT(cs != NULL, "store created");
 
     uint8_t stem[31];
@@ -222,7 +222,7 @@ static void test_overwrite(void) {
            "different values produce different commitments");
 
     /* Store first version */
-    verkle_commit_store_t *cs = vcs_create(TEST_DIR, 1024);
+    verkle_commit_store_t *cs = vcs_create(TEST_DIR);
     vcs_put_leaf(cs, stem, &c1_v1, &c2_v1, &cm_v1);
 
     /* Overwrite with second version */
@@ -265,7 +265,7 @@ static void test_flush_tree(void) {
     verkle_set(vt, key3, val);
 
     /* Flush all commitments */
-    verkle_commit_store_t *cs = vcs_create(TEST_DIR, 1024);
+    verkle_commit_store_t *cs = vcs_create(TEST_DIR);
     ASSERT(cs != NULL, "store created");
 
     bool ok = vcs_flush_tree(cs, vt);
@@ -380,7 +380,7 @@ static void test_persistence(void) {
     ASSERT(leaf_idx == 2, "found 2 leaves");
 
     /* Flush, sync, and close */
-    verkle_commit_store_t *cs = vcs_create(TEST_DIR, 1024);
+    verkle_commit_store_t *cs = vcs_create(TEST_DIR);
     ASSERT(cs != NULL, "store created");
 
     bool ok = vcs_flush_tree(cs, vt);
@@ -444,7 +444,7 @@ static void test_root_node(void) {
     ASSERT(vt->root->type == VERKLE_LEAF, "root is a leaf");
 
     /* Store the leaf commitment via put_leaf */
-    verkle_commit_store_t *cs = vcs_create(TEST_DIR, 1024);
+    verkle_commit_store_t *cs = vcs_create(TEST_DIR);
 
     bool ok = vcs_flush_tree(cs, vt);
     ASSERT(ok, "flush single-leaf tree succeeds");

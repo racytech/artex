@@ -12,7 +12,9 @@
  * ========================================================================= */
 
 #define VF_VALUE_KEY_SIZE   32
-#define VF_VALUE_SLOT_SIZE  74    /* 10 + 32(key) + 32(value) */
+#define VF_VALUE_RECORD_SIZE 32
+#define VF_SLOT_KEY_SIZE    32
+#define VF_SLOT_RECORD_SIZE 32
 #define VF_INITIAL_CAP      4096
 #define VF_STEM_LEN         31
 #define VF_KEY_LEN          32
@@ -20,8 +22,9 @@
 #define VF_WIDTH            256
 #define VF_MAX_DEPTH        31    /* max internal depth (0..30) */
 
-#define VF_STORE_COMMIT  0
-#define VF_STORE_SLOT    1
+#define VF_STORE_LEAF     0
+#define VF_STORE_INTERNAL 1
+#define VF_STORE_SLOT     2
 
 /* =========================================================================
  * Dynamic Array Helpers
@@ -77,7 +80,7 @@ static bool record_leaf_undo(verkle_flat_t *vf, const uint8_t stem[31],
     ENSURE_CAP(vf->commit_undos, vf->cu_count, vf->cu_cap, vf_commit_undo_t);
     vf_commit_undo_t *u = &vf->commit_undos[vf->cu_count++];
     make_leaf_cs_key(u->cs_key, stem);
-    u->store_id = VF_STORE_COMMIT;
+    u->store_id = VF_STORE_LEAF;
     if (existed) {
         banderwagon_serialize(u->old_data, c1);
         banderwagon_serialize(u->old_data + 32, c2);
@@ -97,7 +100,7 @@ static bool record_internal_undo(verkle_flat_t *vf, int depth,
     ENSURE_CAP(vf->commit_undos, vf->cu_count, vf->cu_cap, vf_commit_undo_t);
     vf_commit_undo_t *u = &vf->commit_undos[vf->cu_count++];
     make_internal_cs_key(u->cs_key, depth, path_prefix);
-    u->store_id = VF_STORE_COMMIT;
+    u->store_id = VF_STORE_INTERNAL;
     if (existed) {
         banderwagon_serialize(u->old_data, commit);
         u->data_len = 32;
@@ -136,8 +139,7 @@ static bool slot_get(const verkle_flat_t *vf, int depth,
     if (!vf->slot_store) return false;
     uint8_t key[32], val[32];
     make_slot_key(key, depth, path, slot);
-    uint8_t len;
-    if (!hash_store_get(vf->slot_store, key, val, &len))
+    if (!art_store_get(vf->slot_store, key, val))
         return false;
     memcpy(out_stem, val, 31);
     return true;
@@ -152,7 +154,7 @@ static void slot_put(verkle_flat_t *vf, int depth,
     make_slot_key(key, depth, path, slot);
     memset(val, 0, 32);
     memcpy(val, stem, 31);
-    hash_store_put(vf->slot_store, key, val, 32);
+    art_store_put(vf->slot_store, key, val);
 }
 
 static void slot_delete(verkle_flat_t *vf, int depth,
@@ -161,7 +163,7 @@ static void slot_delete(verkle_flat_t *vf, int depth,
     if (!vf->slot_store) return;
     uint8_t key[32];
     make_slot_key(key, depth, path, slot);
-    hash_store_delete(vf->slot_store, key);
+    art_store_delete(vf->slot_store, key);
 }
 
 /* =========================================================================
@@ -175,55 +177,54 @@ static verkle_flat_t *alloc_handle(void) {
     return vf;
 }
 
-static bool create_slot_store(verkle_flat_t *vf, const char *commit_dir,
-                               uint64_t shard_capacity)
+static bool create_slot_store(verkle_flat_t *vf, const char *commit_dir)
 {
-    char slot_dir[512];
-    snprintf(slot_dir, sizeof(slot_dir), "%s/slots", commit_dir);
-    mkdir(slot_dir, 0755);
-    vf->slot_store = hash_store_create(slot_dir, shard_capacity,
-                                        VF_VALUE_KEY_SIZE, VF_VALUE_SLOT_SIZE);
+    char slot_path[512];
+    snprintf(slot_path, sizeof(slot_path), "%s/slots.art", commit_dir);
+    vf->slot_store = art_store_create(slot_path, VF_SLOT_KEY_SIZE,
+                                       VF_SLOT_RECORD_SIZE);
     return vf->slot_store != NULL;
 }
 
 static bool open_slot_store(verkle_flat_t *vf, const char *commit_dir)
 {
-    char slot_dir[512];
-    snprintf(slot_dir, sizeof(slot_dir), "%s/slots", commit_dir);
-    /* If directory doesn't exist yet, create it (migration from old format) */
+    char slot_path[512];
+    snprintf(slot_path, sizeof(slot_path), "%s/slots.art", commit_dir);
+    /* If file doesn't exist yet, create it (migration from old format) */
     struct stat st;
-    if (stat(slot_dir, &st) != 0) {
-        mkdir(slot_dir, 0755);
-        /* Create empty store — will be populated as new leaves are inserted */
-        vf->slot_store = hash_store_create(slot_dir, 1 << 20,
-                                            VF_VALUE_KEY_SIZE, VF_VALUE_SLOT_SIZE);
+    if (stat(slot_path, &st) != 0) {
+        vf->slot_store = art_store_create(slot_path, VF_SLOT_KEY_SIZE,
+                                           VF_SLOT_RECORD_SIZE);
     } else {
-        vf->slot_store = hash_store_open(slot_dir);
+        vf->slot_store = art_store_open(slot_path);
     }
     return vf->slot_store != NULL;
 }
 
 verkle_flat_t *verkle_flat_create(const char *value_dir,
-                                  const char *commit_dir,
-                                  uint64_t shard_capacity)
+                                  const char *commit_dir)
 {
     verkle_flat_t *vf = alloc_handle();
     if (!vf) return NULL;
 
-    vf->value_store = hash_store_create(value_dir, shard_capacity,
-                                         VF_VALUE_KEY_SIZE, VF_VALUE_SLOT_SIZE);
+    mkdir(value_dir, 0755);
+
+    char value_path[512];
+    snprintf(value_path, sizeof(value_path), "%s/values.art", value_dir);
+    vf->value_store = art_store_create(value_path, VF_VALUE_KEY_SIZE,
+                                        VF_VALUE_RECORD_SIZE);
     if (!vf->value_store) { free(vf); return NULL; }
 
-    vf->commit_store = vcs_create(commit_dir, shard_capacity);
+    vf->commit_store = vcs_create(commit_dir);
     if (!vf->commit_store) {
-        hash_store_destroy(vf->value_store);
+        art_store_destroy(vf->value_store);
         free(vf);
         return NULL;
     }
 
-    if (!create_slot_store(vf, commit_dir, shard_capacity)) {
+    if (!create_slot_store(vf, commit_dir)) {
         vcs_destroy(vf->commit_store);
-        hash_store_destroy(vf->value_store);
+        art_store_destroy(vf->value_store);
         free(vf);
         return NULL;
     }
@@ -237,19 +238,21 @@ verkle_flat_t *verkle_flat_open(const char *value_dir,
     verkle_flat_t *vf = alloc_handle();
     if (!vf) return NULL;
 
-    vf->value_store = hash_store_open(value_dir);
+    char value_path[512];
+    snprintf(value_path, sizeof(value_path), "%s/values.art", value_dir);
+    vf->value_store = art_store_open(value_path);
     if (!vf->value_store) { free(vf); return NULL; }
 
     vf->commit_store = vcs_open(commit_dir);
     if (!vf->commit_store) {
-        hash_store_destroy(vf->value_store);
+        art_store_destroy(vf->value_store);
         free(vf);
         return NULL;
     }
 
     if (!open_slot_store(vf, commit_dir)) {
         vcs_destroy(vf->commit_store);
-        hash_store_destroy(vf->value_store);
+        art_store_destroy(vf->value_store);
         free(vf);
         return NULL;
     }
@@ -259,9 +262,9 @@ verkle_flat_t *verkle_flat_open(const char *value_dir,
 
 void verkle_flat_destroy(verkle_flat_t *vf) {
     if (!vf) return;
-    if (vf->value_store)  hash_store_destroy(vf->value_store);
+    if (vf->value_store)  art_store_destroy(vf->value_store);
     if (vf->commit_store) vcs_destroy(vf->commit_store);
-    if (vf->slot_store)   hash_store_destroy(vf->slot_store);
+    if (vf->slot_store)   art_store_destroy(vf->slot_store);
     free(vf->changes);
     free(vf->undos);
     free(vf->commit_undos);
@@ -308,8 +311,7 @@ bool verkle_flat_set(verkle_flat_t *vf,
         }
     }
     if (!found) {
-        uint8_t len;
-        if (hash_store_get(vf->value_store, key, undo->old_value, &len)) {
+        if (art_store_get(vf->value_store, key, undo->old_value)) {
             found = true;
         }
     }
@@ -340,8 +342,7 @@ bool verkle_flat_get(const verkle_flat_t *vf,
     }
 
     /* Fall through to value store */
-    uint8_t len;
-    return hash_store_get(vf->value_store, key, value, &len);
+    return art_store_get(vf->value_store, key, value);
 }
 
 /* =========================================================================
@@ -523,8 +524,7 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             uint8_t full_key[32];
             memcpy(full_key, sg->stem, 31);
             full_key[31] = suffix;
-            uint8_t len;
-            hash_store_get(vf->value_store, full_key, old_value, &len);
+            bool had_old = art_store_get(vf->value_store, full_key, old_value);
 
             /* Split into lo/hi 16-byte halves with EIP-6800 leaf marker */
             uint8_t old_lo[32] = {0}, new_lo[32] = {0};
@@ -532,7 +532,7 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             memcpy(old_lo, old_value, 16);
             memcpy(new_lo, new_value, 16);
             new_lo[16] = 1;  /* EIP-6800 leaf marker */
-            if (len > 0) old_lo[16] = 1;  /* marker was present in old commitment */
+            if (had_old) old_lo[16] = 1;  /* marker was present in old commitment */
             memcpy(old_hi, old_value + 16, 16);
             memcpy(new_hi, new_value + 16, 16);
 
@@ -554,7 +554,7 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             }
 
             /* Write new value to value store */
-            hash_store_put(vf->value_store, full_key, new_value, 32);
+            art_store_put(vf->value_store, full_key, new_value);
         }
 
         /* Update leaf commitment for C1 change */
@@ -607,7 +607,7 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             uint8_t full_key[32];
             memcpy(full_key, sg->stem, 31);
             full_key[31] = suffix;
-            hash_store_put(vf->value_store, full_key, val, 32);
+            art_store_put(vf->value_store, full_key, val);
         }
 
         /* Compute C1, C2 via full MSM */
@@ -945,22 +945,26 @@ bool verkle_flat_revert_block(verkle_flat_t *vf) {
     for (uint32_t i = vf->undo_count; i > blk->undo_start; i--) {
         vf_undo_t *u = &vf->undos[i - 1];
         if (u->had_value) {
-            hash_store_put(vf->value_store, u->key, u->old_value, 32);
+            art_store_put(vf->value_store, u->key, u->old_value);
         } else {
-            hash_store_delete(vf->value_store, u->key);
+            art_store_delete(vf->value_store, u->key);
         }
     }
 
     /* Restore commitments + slots in reverse */
     for (uint32_t i = vf->cu_count; i > blk->commit_undo_start; i--) {
         vf_commit_undo_t *cu = &vf->commit_undos[i - 1];
-        hash_store_t *store = (cu->store_id == VF_STORE_SLOT)
-                                ? vf->slot_store
-                                : vf->commit_store->store;
+        art_store_t *store;
+        switch (cu->store_id) {
+            case VF_STORE_LEAF:     store = vf->commit_store->leaf_store; break;
+            case VF_STORE_INTERNAL: store = vf->commit_store->internal_store; break;
+            case VF_STORE_SLOT:     store = vf->slot_store; break;
+            default: continue;
+        }
         if (cu->data_len == 0) {
-            hash_store_delete(store, cu->cs_key);
+            art_store_delete(store, cu->cs_key);
         } else {
-            hash_store_put(store, cu->cs_key, cu->old_data, cu->data_len);
+            art_store_put(store, cu->cs_key, cu->old_data);
         }
     }
 
@@ -1051,7 +1055,7 @@ void verkle_flat_root_hash(const verkle_flat_t *vf, uint8_t out[32]) {
 
 void verkle_flat_sync(verkle_flat_t *vf) {
     if (!vf) return;
-    hash_store_sync(vf->value_store);
+    art_store_sync(vf->value_store);
     vcs_sync(vf->commit_store);
-    if (vf->slot_store) hash_store_sync(vf->slot_store);
+    if (vf->slot_store) art_store_sync(vf->slot_store);
 }

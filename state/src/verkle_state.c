@@ -47,13 +47,12 @@ verkle_state_t *verkle_state_create(void) {
 }
 
 verkle_state_t *verkle_state_create_flat(const char *value_dir,
-                                          const char *commit_dir,
-                                          uint64_t shard_capacity)
+                                          const char *commit_dir)
 {
     verkle_state_t *vs = calloc(1, sizeof(verkle_state_t));
     if (!vs) return NULL;
     vs->type = VS_BACKEND_FLAT;
-    vs->flat = verkle_flat_create(value_dir, commit_dir, shard_capacity);
+    vs->flat = verkle_flat_create(value_dir, commit_dir);
     if (!vs->flat) { free(vs); return NULL; }
     return vs;
 }

@@ -628,7 +628,7 @@ static void test_flat_backend(void) {
     mkdir(FLAT_COMM_DIR, 0755);
 
     /* --- Block 1: set up account fields --- */
-    verkle_state_t *vs = verkle_state_create_flat(FLAT_VAL_DIR, FLAT_COMM_DIR, 1024);
+    verkle_state_t *vs = verkle_state_create_flat(FLAT_VAL_DIR, FLAT_COMM_DIR);
     ASSERT(vs != NULL, "flat create returns non-NULL");
     ASSERT(verkle_state_get_tree(vs) == NULL, "flat: get_tree returns NULL");
     ASSERT(verkle_state_get_flat(vs) != NULL, "flat: get_flat returns non-NULL");
@@ -729,7 +729,7 @@ static void test_flat_tree_root_match(void) {
 
     /* Build identical state in both backends */
     verkle_state_t *tree_vs = verkle_state_create();
-    verkle_state_t *flat_vs = verkle_state_create_flat(FLAT_VAL_DIR, FLAT_COMM_DIR, 1024);
+    verkle_state_t *flat_vs = verkle_state_create_flat(FLAT_VAL_DIR, FLAT_COMM_DIR);
 
     verkle_state_begin_block(flat_vs, 1);
 
