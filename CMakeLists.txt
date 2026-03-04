@@ -37,6 +37,11 @@ add_library(art_store STATIC
 )
 target_link_libraries(art_store compact_art)
 
+# Disk Hash (zero-RAM disk-backed hash table, pread/pwrite)
+add_library(disk_hash STATIC
+    database/src/disk_hash.c
+)
+
 #==============================================================================
 # Libraries — Verkle State
 #==============================================================================
@@ -157,11 +162,30 @@ add_executable(bench_dual_index
 )
 target_link_libraries(bench_dual_index compact_art)
 
+# Benchmark: art_store scale (RAM + disk + throughput at mainnet scale)
+add_executable(bench_art_store_scale
+    database/tests/bench_art_store_scale.c
+)
+target_link_libraries(bench_art_store_scale art_store)
+
 # Stress Test: ART Store (correctness + persistence at scale)
 add_executable(test_stress_art_store
     database/tests/test_stress_art_store.c
 )
 target_link_libraries(test_stress_art_store art_store)
+
+# Test: Disk Hash (zero-RAM disk-backed hash table)
+add_executable(test_disk_hash
+    database/tests/test_disk_hash.c
+)
+target_link_libraries(test_disk_hash disk_hash)
+add_test(NAME test_disk_hash COMMAND test_disk_hash)
+
+# Stress Test: Disk Hash (correctness at scale, fail-fast)
+add_executable(test_stress_disk_hash
+    database/tests/test_stress_disk_hash.c
+)
+target_link_libraries(test_stress_disk_hash disk_hash)
 
 #==============================================================================
 # Tests — Verkle State
