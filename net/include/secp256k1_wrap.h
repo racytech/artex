@@ -42,9 +42,6 @@ bool secp256k1_wrap_pubkey_create(uint8_t pub[64], const uint8_t priv[32]);
 /**
  * Compute ECDH shared secret (raw X coordinate).
  *
- * Discv5 uses the raw 32-byte X coordinate of the shared point,
- * NOT the SHA256 hash that libsecp256k1 returns by default.
- *
  * @param shared  Output: 32-byte shared secret (X coordinate)
  * @param priv    32-byte private key
  * @param pub     64-byte uncompressed public key (x || y, no prefix)
@@ -53,6 +50,21 @@ bool secp256k1_wrap_pubkey_create(uint8_t pub[64], const uint8_t priv[32]);
 bool secp256k1_wrap_ecdh(uint8_t shared[32],
                          const uint8_t priv[32],
                          const uint8_t pub[64]);
+
+/**
+ * Compute ECDH shared secret (compressed point).
+ *
+ * Discv5 key derivation uses the 33-byte compressed representation
+ * of the ECDH shared point as the HKDF salt.
+ *
+ * @param shared  Output: 33-byte compressed point (02/03 prefix + X)
+ * @param priv    32-byte private key
+ * @param pub     64-byte uncompressed public key (x || y, no prefix)
+ * @return        true on success
+ */
+bool secp256k1_wrap_ecdh_compressed(uint8_t shared[33],
+                                     const uint8_t priv[32],
+                                     const uint8_t pub[64]);
 
 /**
  * Sign a 32-byte message hash (recoverable ECDSA).
@@ -79,6 +91,18 @@ bool secp256k1_wrap_sign(uint8_t sig[64], int *recid,
 bool secp256k1_wrap_recover(uint8_t pub[64],
                             const uint8_t sig[64], int recid,
                             const uint8_t hash[32]);
+
+/**
+ * Verify an ECDSA signature against a known public key.
+ *
+ * @param sig     64-byte compact signature (r || s)
+ * @param hash    32-byte message hash
+ * @param pub     64-byte uncompressed public key (x || y, no prefix)
+ * @return        true if signature is valid
+ */
+bool secp256k1_wrap_verify(const uint8_t sig[64],
+                            const uint8_t hash[32],
+                            const uint8_t pub[64]);
 
 /**
  * Compress a public key (64 bytes → 33 bytes).

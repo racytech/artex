@@ -390,6 +390,35 @@ add_library(ssz STATIC
     net/src/ssz.c
 )
 
+# ENR — Ethereum Node Record (EIP-778)
+add_library(enr STATIC
+    net/src/enr.c
+)
+target_link_libraries(enr rlp hash secp256k1_wrap)
+
+# Discv5 Packet Codec (wire protocol encoding/decoding)
+add_library(discv5_codec STATIC
+    net/src/discv5_codec.c
+)
+target_link_libraries(discv5_codec hkdf aes secp256k1_wrap blst)
+
+# Discv5 Session Management (handshake state + LRU cache)
+add_library(discv5_session STATIC
+    net/src/discv5_session.c
+)
+target_link_libraries(discv5_session discv5_codec secp256k1_wrap blst)
+
+# Discv5 Kademlia Routing Table (256 k-buckets, XOR distance)
+add_library(discv5_table STATIC
+    net/src/discv5_table.c
+)
+
+# Discv5 Protocol Engine (full protocol: codec + sessions + table + UDP)
+add_library(discv5 STATIC
+    net/src/discv5.c
+)
+target_link_libraries(discv5 discv5_codec discv5_session discv5_table enr rlp hash secp256k1_wrap hkdf aes blst bytes)
+
 #==============================================================================
 # Tests — Networking
 #==============================================================================
@@ -425,6 +454,41 @@ add_executable(test_ssz
 )
 target_link_libraries(test_ssz ssz)
 add_test(NAME test_ssz COMMAND test_ssz)
+
+# Test: ENR (Ethereum Node Record — EIP-778)
+add_executable(test_enr
+    net/tests/test_enr.c
+)
+target_link_libraries(test_enr enr)
+add_test(NAME test_enr COMMAND test_enr)
+
+# Test: Discv5 Packet Codec (wire protocol test vectors)
+add_executable(test_discv5_codec
+    net/tests/test_discv5_codec.c
+)
+target_link_libraries(test_discv5_codec discv5_codec enr)
+add_test(NAME test_discv5_codec COMMAND test_discv5_codec)
+
+# Test: Discv5 Session Management (handshake state + LRU cache)
+add_executable(test_discv5_session
+    net/tests/test_discv5_session.c
+)
+target_link_libraries(test_discv5_session discv5_session)
+add_test(NAME test_discv5_session COMMAND test_discv5_session)
+
+# Test: Discv5 Kademlia Routing Table
+add_executable(test_discv5_table
+    net/tests/test_discv5_table.c
+)
+target_link_libraries(test_discv5_table discv5_table)
+add_test(NAME test_discv5_table COMMAND test_discv5_table)
+
+# Test: Discv5 Protocol Engine
+add_executable(test_discv5
+    net/tests/test_discv5.c
+)
+target_link_libraries(test_discv5 discv5)
+add_test(NAME test_discv5 COMMAND test_discv5)
 
 #==============================================================================
 # Build Summary

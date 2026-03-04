@@ -81,6 +81,32 @@ bool secp256k1_wrap_ecdh(uint8_t shared[32],
     return secp256k1_ecdh(g_ctx, shared, &pk, priv, ecdh_hash_raw_x, NULL) == 1;
 }
 
+/* Custom hash function that returns the compressed point (02/03 prefix + X) */
+static int ecdh_hash_compressed(unsigned char *output,
+                                 const unsigned char *x32,
+                                 const unsigned char *y32,
+                                 void *data) {
+    (void)data;
+    /* Prefix: 0x02 if y is even, 0x03 if y is odd */
+    output[0] = (y32[31] & 1) ? 0x03 : 0x02;
+    memcpy(output + 1, x32, 32);
+    return 1;
+}
+
+bool secp256k1_wrap_ecdh_compressed(uint8_t shared[33],
+                                     const uint8_t priv[32],
+                                     const uint8_t pub[64]) {
+    uint8_t buf[65];
+    buf[0] = 0x04;
+    memcpy(buf + 1, pub, 64);
+
+    secp256k1_pubkey pk;
+    if (!secp256k1_ec_pubkey_parse(g_ctx, &pk, buf, 65))
+        return false;
+
+    return secp256k1_ecdh(g_ctx, shared, &pk, priv, ecdh_hash_compressed, NULL) == 1;
+}
+
 /* =========================================================================
  * ECDSA sign (recoverable)
  * ========================================================================= */
@@ -117,6 +143,31 @@ bool secp256k1_wrap_recover(uint8_t pub[64],
                                   &pk, SECP256K1_EC_UNCOMPRESSED);
     memcpy(pub, buf + 1, 64);
     return true;
+}
+
+/* =========================================================================
+ * ECDSA verify
+ * ========================================================================= */
+
+bool secp256k1_wrap_verify(const uint8_t sig[64],
+                            const uint8_t hash[32],
+                            const uint8_t pub[64]) {
+    secp256k1_ecdsa_signature esig;
+    if (!secp256k1_ecdsa_signature_parse_compact(g_ctx, &esig, sig))
+        return false;
+
+    /* Normalize to low-S form (required by secp256k1_ecdsa_verify) */
+    secp256k1_ecdsa_signature_normalize(g_ctx, &esig, &esig);
+
+    uint8_t buf[65];
+    buf[0] = 0x04;
+    memcpy(buf + 1, pub, 64);
+
+    secp256k1_pubkey pk;
+    if (!secp256k1_ec_pubkey_parse(g_ctx, &pk, buf, 65))
+        return false;
+
+    return secp256k1_ecdsa_verify(g_ctx, &esig, hash, &pk) == 1;
 }
 
 /* =========================================================================
