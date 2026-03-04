@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <pthread.h>
 
 /* =========================================================================
  * Constants
@@ -45,8 +46,9 @@ typedef struct __attribute__((packed)) {
     uint64_t entry_count;
     uint64_t overflow_count;
     uint32_t slots_per_bucket;
-    /* 44 bytes used, pad to 64 */
-    uint8_t  reserved[20];
+    uint8_t  dirty;             /* 1 = unclean shutdown possible */
+    /* 45 bytes used, pad to 64 */
+    uint8_t  reserved[19];
 } disk_hash_header_t;
 
 _Static_assert(sizeof(disk_hash_header_t) == 64,
@@ -78,6 +80,8 @@ struct disk_hash {
     uint64_t  bucket_count;
     uint64_t  entry_count;
     uint64_t  overflow_count;
+    bool      dirty;                /* true = header needs recovery on open */
+    pthread_rwlock_t rwlock;
 };
 
 /* =========================================================================
@@ -150,6 +154,7 @@ static void write_header(disk_hash_t *dh) {
     hdr.entry_count      = dh->entry_count;
     hdr.overflow_count   = dh->overflow_count;
     hdr.slots_per_bucket = dh->slots_per_bucket;
+    hdr.dirty            = dh->dirty ? 1 : 0;
     memcpy(page, &hdr, sizeof(hdr));
 
     (void)pwrite(dh->fd, page, PAGE_SIZE, 0);
@@ -163,17 +168,60 @@ static bool read_header(int fd, disk_hash_header_t *hdr) {
     return true;
 }
 
-/** Allocate a new overflow bucket.  Returns its absolute bucket ID. */
+/** Allocate a new overflow bucket ID.  Returns its absolute bucket ID.
+ *  Caller is responsible for writing the data page before linking. */
 static uint64_t alloc_overflow(disk_hash_t *dh) {
     uint64_t new_id = dh->bucket_count + dh->overflow_count;
     dh->overflow_count++;
-
-    /* Write a zeroed page so the bucket is properly initialized */
-    uint8_t empty[PAGE_SIZE];
-    memset(empty, 0, PAGE_SIZE);
-    (void)pwrite(dh->fd, empty, PAGE_SIZE, (off_t)bucket_offset(new_id));
-
     return new_id;
+}
+
+/* =========================================================================
+ * Crash safety — dirty flag + recovery
+ * ========================================================================= */
+
+/** Mark table as dirty on first mutation after open/sync.
+ *  Writes header once per clean→dirty transition. */
+static void mark_dirty(disk_hash_t *dh) {
+    if (dh->dirty) return;
+    dh->dirty = true;
+    write_header(dh);
+}
+
+/** Recovery scan after unclean shutdown.
+ *  Derives overflow_count from file size, counts occupied slots for
+ *  entry_count. Clears dirty flag and writes corrected header. */
+static bool recover(disk_hash_t *dh) {
+    /* Derive total pages from file size */
+    off_t file_size = lseek(dh->fd, 0, SEEK_END);
+    if (file_size < (off_t)PAGE_SIZE) return false;
+
+    uint64_t total_pages = ((uint64_t)file_size - PAGE_SIZE) / PAGE_SIZE;
+    if (total_pages > dh->bucket_count)
+        dh->overflow_count = total_pages - dh->bucket_count;
+    else
+        dh->overflow_count = 0;
+
+    /* Count occupied slots across all bucket pages */
+    uint64_t count = 0;
+    uint8_t page[PAGE_SIZE];
+
+    for (uint64_t bid = 0; bid < total_pages; bid++) {
+        if (!read_bucket(dh->fd, bid, page)) continue;
+        for (uint32_t i = 0; i < dh->slots_per_bucket; i++) {
+            const uint8_t *s = slot_ptr_const(page, dh->slot_size, i);
+            if (s[0] == SLOT_OCCUPIED)
+                count++;
+        }
+    }
+
+    dh->entry_count = count;
+
+    /* Clear dirty flag and persist corrected header */
+    dh->dirty = false;
+    write_header(dh);
+    fsync(dh->fd);
+    return true;
 }
 
 /* =========================================================================
@@ -216,6 +264,8 @@ disk_hash_t *disk_hash_create(const char *path, uint32_t key_size,
     dh->bucket_count     = bucket_count;
     dh->entry_count      = 0;
     dh->overflow_count   = 0;
+    dh->dirty            = false;
+    pthread_rwlock_init(&dh->rwlock, NULL);
 
     write_header(dh);
     return dh;
@@ -253,12 +303,24 @@ disk_hash_t *disk_hash_open(const char *path) {
     dh->bucket_count     = hdr.bucket_count;
     dh->entry_count      = hdr.entry_count;
     dh->overflow_count   = hdr.overflow_count;
+    dh->dirty            = (hdr.dirty != 0);
+    pthread_rwlock_init(&dh->rwlock, NULL);
+
+    /* Unclean shutdown: recover entry_count and overflow_count from disk */
+    if (dh->dirty) {
+        if (!recover(dh)) {
+            close(fd);
+            free(dh);
+            return NULL;
+        }
+    }
 
     return dh;
 }
 
 void disk_hash_destroy(disk_hash_t *dh) {
     if (!dh) return;
+    pthread_rwlock_destroy(&dh->rwlock);
     close(dh->fd);
     free(dh);
 }
@@ -335,9 +397,9 @@ static scan_result_t scan_chain(const disk_hash_t *dh, uint64_t start_bucket,
  * Single Operations
  * ========================================================================= */
 
-bool disk_hash_get(const disk_hash_t *dh, const uint8_t *key, void *out) {
-    if (!dh || !key) return false;
+/* --- Unlocked internals (caller holds appropriate lock) --- */
 
+static bool get_unlocked(const disk_hash_t *dh, const uint8_t *key, void *out) {
     uint64_t bid = hash_key(key) % dh->bucket_count;
     uint8_t page[PAGE_SIZE];
 
@@ -350,9 +412,8 @@ bool disk_hash_get(const disk_hash_t *dh, const uint8_t *key, void *out) {
     return true;
 }
 
-bool disk_hash_put(disk_hash_t *dh, const uint8_t *key, const void *record) {
-    if (!dh || !key || !record) return false;
-
+static bool put_unlocked(disk_hash_t *dh, const uint8_t *key, const void *record) {
+    mark_dirty(dh);
     uint64_t bid = hash_key(key) % dh->bucket_count;
     uint8_t page[PAGE_SIZE];
 
@@ -386,18 +447,15 @@ bool disk_hash_put(disk_hash_t *dh, const uint8_t *key, const void *record) {
         return true;
     }
 
-    /* No free slot in chain — allocate overflow bucket */
+    /* No free slot in chain — allocate overflow bucket.
+     * Crash-safe write order: data page FIRST, then parent link.
+     * Crash after data but before link = orphaned page (harmless 4KB waste).
+     * Crash after link = correct state. */
     uint64_t new_id = alloc_overflow(dh);
 
-    /* Link from last bucket in chain */
-    read_bucket(dh->fd, r.last_bucket_id, page);
-    bucket_header_t *bh = (bucket_header_t *)page;
-    bh->overflow_id = (uint32_t)new_id;
-    write_bucket(dh->fd, r.last_bucket_id, page);
-
-    /* Write entry into new overflow bucket */
+    /* Step 1: Write data into new overflow bucket */
     memset(page, 0, PAGE_SIZE);
-    bh = (bucket_header_t *)page;
+    bucket_header_t *bh = (bucket_header_t *)page;
     bh->count = 1;
     uint8_t *s = slot_ptr(page, dh->slot_size, 0);
     s[0] = SLOT_OCCUPIED;
@@ -407,13 +465,20 @@ bool disk_hash_put(disk_hash_t *dh, const uint8_t *key, const void *record) {
     if (!write_bucket(dh->fd, new_id, page))
         return false;
 
+    /* Step 2: Link from last bucket in chain */
+    if (!read_bucket(dh->fd, r.last_bucket_id, page))
+        return false;
+    bh = (bucket_header_t *)page;
+    bh->overflow_id = (uint32_t)new_id;
+    if (!write_bucket(dh->fd, r.last_bucket_id, page))
+        return false;
+
     dh->entry_count++;
     return true;
 }
 
-bool disk_hash_delete(disk_hash_t *dh, const uint8_t *key) {
-    if (!dh || !key) return false;
-
+static bool delete_unlocked(disk_hash_t *dh, const uint8_t *key) {
+    mark_dirty(dh);
     uint64_t bid = hash_key(key) % dh->bucket_count;
     uint8_t page[PAGE_SIZE];
 
@@ -435,13 +500,39 @@ bool disk_hash_delete(disk_hash_t *dh, const uint8_t *key) {
     return true;
 }
 
+/* --- Public API (locked) --- */
+
+bool disk_hash_get(const disk_hash_t *dh, const uint8_t *key, void *out) {
+    if (!dh || !key) return false;
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&dh->rwlock);
+    bool ok = get_unlocked(dh, key, out);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&dh->rwlock);
+    return ok;
+}
+
+bool disk_hash_put(disk_hash_t *dh, const uint8_t *key, const void *record) {
+    if (!dh || !key || !record) return false;
+    pthread_rwlock_wrlock(&dh->rwlock);
+    bool ok = put_unlocked(dh, key, record);
+    pthread_rwlock_unlock(&dh->rwlock);
+    return ok;
+}
+
+bool disk_hash_delete(disk_hash_t *dh, const uint8_t *key) {
+    if (!dh || !key) return false;
+    pthread_rwlock_wrlock(&dh->rwlock);
+    bool ok = delete_unlocked(dh, key);
+    pthread_rwlock_unlock(&dh->rwlock);
+    return ok;
+}
+
 bool disk_hash_contains(const disk_hash_t *dh, const uint8_t *key) {
     if (!dh || !key) return false;
-
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&dh->rwlock);
     uint64_t bid = hash_key(key) % dh->bucket_count;
     uint8_t page[PAGE_SIZE];
-
     scan_result_t r = scan_chain(dh, bid, key, page);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&dh->rwlock);
     return r.found;
 }
 
@@ -470,8 +561,10 @@ uint32_t disk_hash_batch_get(const disk_hash_t *dh,
     /* Initialize found[] */
     if (found) memset(found, 0, count * sizeof(bool));
 
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&dh->rwlock);
+
     batch_entry_t *entries = malloc(count * sizeof(batch_entry_t));
-    if (!entries) return 0;
+    if (!entries) { pthread_rwlock_unlock((pthread_rwlock_t *)&dh->rwlock); return 0; }
 
     for (uint32_t i = 0; i < count; i++) {
         entries[i].idx       = i;
@@ -530,6 +623,7 @@ uint32_t disk_hash_batch_get(const disk_hash_t *dh,
     }
 
     free(entries);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&dh->rwlock);
     return found_count;
 }
 
@@ -538,8 +632,10 @@ bool disk_hash_batch_put(disk_hash_t *dh,
                           uint32_t count) {
     if (!dh || !keys || !records || count == 0) return false;
 
+    pthread_rwlock_wrlock(&dh->rwlock);
+
     batch_entry_t *entries = malloc(count * sizeof(batch_entry_t));
-    if (!entries) return false;
+    if (!entries) { pthread_rwlock_unlock(&dh->rwlock); return false; }
 
     for (uint32_t i = 0; i < count; i++) {
         entries[i].idx       = i;
@@ -559,23 +655,20 @@ bool disk_hash_batch_put(disk_hash_t *dh,
         uint32_t gend = gi;
         while (gend < count && entries[gend].bucket_id == bid) gend++;
 
-        /* Process each entry in this group via single-item put path.
-         * We could optimize further (read bucket once, apply all puts),
-         * but the chain-walking logic is complex enough that correctness
-         * matters more. The sequential access pattern (sorted by bucket)
-         * already provides the main I/O win. */
+        /* Process each entry in this group via unlocked put path. */
         for (uint32_t g = gi; g < gend && ok; g++) {
             uint32_t orig = entries[g].idx;
             const uint8_t *k = keys + (uint64_t)orig * dh->key_size;
             const uint8_t *r = (const uint8_t *)records +
                                (uint64_t)orig * dh->record_size;
-            ok = disk_hash_put(dh, k, r);
+            ok = put_unlocked(dh, k, r);
         }
 
         gi = gend;
     }
 
     free(entries);
+    pthread_rwlock_unlock(&dh->rwlock);
     return ok;
 }
 
@@ -597,6 +690,9 @@ uint64_t disk_hash_capacity(const disk_hash_t *dh) {
 
 void disk_hash_sync(disk_hash_t *dh) {
     if (!dh) return;
+    pthread_rwlock_wrlock(&dh->rwlock);
+    dh->dirty = false;
     write_header(dh);
     fsync(dh->fd);
+    pthread_rwlock_unlock(&dh->rwlock);
 }

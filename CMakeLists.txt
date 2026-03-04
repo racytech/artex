@@ -41,6 +41,7 @@ target_link_libraries(art_store compact_art)
 add_library(disk_hash STATIC
     database/src/disk_hash.c
 )
+target_link_libraries(disk_hash pthread)
 
 #==============================================================================
 # Libraries — Verkle State
@@ -186,6 +187,18 @@ add_executable(test_stress_disk_hash
     database/tests/test_stress_disk_hash.c
 )
 target_link_libraries(test_stress_disk_hash disk_hash)
+
+# Crash Simulation Test: Disk Hash (fork + kill -9 + recovery)
+add_executable(test_crash_disk_hash
+    database/tests/test_crash_disk_hash.c
+)
+target_link_libraries(test_crash_disk_hash disk_hash)
+
+# Multi-Threaded Stress Test: Disk Hash (1 writer + N readers)
+add_executable(test_mt_disk_hash
+    database/tests/test_mt_disk_hash.c
+)
+target_link_libraries(test_mt_disk_hash disk_hash pthread)
 
 #==============================================================================
 # Tests — Verkle State
