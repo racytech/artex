@@ -14,6 +14,8 @@ set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG")
 include_directories(
     ${CMAKE_SOURCE_DIR}/database/include
     ${CMAKE_SOURCE_DIR}/state/include
+    ${CMAKE_SOURCE_DIR}/common/include
+    ${CMAKE_SOURCE_DIR}/net/include
     ${CMAKE_SOURCE_DIR}/third_party/blst/bindings
 )
 
@@ -307,6 +309,110 @@ add_test(NAME test_verkle_cross_validation
     COMMAND test_verkle_cross_validation
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
+
+#==============================================================================
+# Libraries — Common
+#==============================================================================
+
+# Keccak-256 hash (Ethereum variant)
+add_library(keccak256 STATIC
+    common/src/keccak256.c
+)
+
+# Dynamic byte array
+add_library(bytes STATIC
+    common/src/bytes.c
+)
+
+# Hash utilities (keccak256 wrapper)
+add_library(hash STATIC
+    common/src/hash.c
+)
+target_link_libraries(hash keccak256)
+
+# RLP encoder/decoder
+add_library(rlp STATIC
+    common/src/rlp.c
+)
+target_link_libraries(rlp bytes)
+
+#==============================================================================
+# Tests — Common
+#==============================================================================
+
+# Test: Hash (keccak256 wrapper)
+add_executable(test_hash
+    common/tests/test_hash.c
+)
+target_link_libraries(test_hash hash bytes)
+add_test(NAME test_hash COMMAND test_hash)
+
+# Test: RLP encoder/decoder
+add_executable(test_rlp
+    common/tests/test_rlp.c
+)
+target_link_libraries(test_rlp rlp bytes)
+add_test(NAME test_rlp COMMAND test_rlp)
+
+#==============================================================================
+# Libraries — Networking / Portal
+#==============================================================================
+
+# HKDF-SHA256 (RFC 5869 key derivation, uses BLST for SHA-256)
+add_library(hkdf STATIC
+    net/src/hkdf.c
+)
+target_link_libraries(hkdf blst)
+
+# AES-128 CTR + GCM (AES-NI intrinsics)
+add_library(aes STATIC
+    net/src/aes.c
+)
+target_compile_options(aes PRIVATE -maes)
+
+# secp256k1 (ECDSA, ECDH — pre-built static library)
+add_library(secp256k1 STATIC IMPORTED)
+set_target_properties(secp256k1 PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/third_party/secp256k1/build/lib/libsecp256k1.a
+)
+
+# secp256k1 wrapper (thin C wrapper over libsecp256k1)
+add_library(secp256k1_wrap STATIC
+    net/src/secp256k1_wrap.c
+)
+target_include_directories(secp256k1_wrap PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/secp256k1/include
+)
+target_link_libraries(secp256k1_wrap secp256k1)
+
+#==============================================================================
+# Tests — Networking
+#==============================================================================
+
+# Test: HKDF-SHA256 (RFC 5869 + Discv5 key derivation vectors)
+add_executable(test_hkdf
+    net/tests/test_hkdf.c
+)
+target_link_libraries(test_hkdf hkdf)
+add_test(NAME test_hkdf COMMAND test_hkdf)
+
+# Test: AES-128 CTR + GCM (NIST + Discv5 vectors)
+add_executable(test_aes
+    net/tests/test_aes.c
+)
+target_link_libraries(test_aes aes)
+target_compile_options(test_aes PRIVATE -maes)
+add_test(NAME test_aes COMMAND test_aes)
+
+# Test: secp256k1 wrapper (ECDSA, ECDH, key operations)
+add_executable(test_secp256k1_wrap
+    net/tests/test_secp256k1_wrap.c
+)
+target_include_directories(test_secp256k1_wrap PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/secp256k1/include
+)
+target_link_libraries(test_secp256k1_wrap secp256k1_wrap)
+add_test(NAME test_secp256k1_wrap COMMAND test_secp256k1_wrap)
 
 #==============================================================================
 # Build Summary
