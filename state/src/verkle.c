@@ -102,11 +102,12 @@ static void compute_leaf_commitment(verkle_leaf_t *leaf) {
     /* slot 1: stem as 31-byte LE scalar (fits in 248 bits) */
     memcpy(scalars[1], leaf->stem, VERKLE_STEM_LEN);
 
-    /* slot 2: map_to_field(C1) */
-    banderwagon_map_to_field(scalars[2], &leaf->c1);
-
-    /* slot 3: map_to_field(C2) */
-    banderwagon_map_to_field(scalars[3], &leaf->c2);
+    /* slots 2-3: batch map_to_field(C1, C2) */
+    const banderwagon_point_t *cx_pts[2] = { &leaf->c1, &leaf->c2 };
+    uint8_t cx_mapped[2][32];
+    banderwagon_batch_map_to_field(cx_mapped, cx_pts, 2);
+    memcpy(scalars[2], cx_mapped[0], 32);
+    memcpy(scalars[3], cx_mapped[1], 32);
 
     pedersen_commit(&leaf->commitment, scalars, 4);
 }
@@ -133,10 +134,24 @@ static void compute_internal_commitment(verkle_internal_t *node) {
     uint8_t scalars[256][32];
     memset(scalars, 0, sizeof(scalars));
 
+    /* Collect non-null children for batch map_to_field */
+    const banderwagon_point_t *pts[256];
+    size_t idx[256];
+    size_t count = 0;
+
     for (int i = 0; i < VERKLE_WIDTH; i++) {
-        if (node->children[i])
-            banderwagon_map_to_field(scalars[i],
-                                     node_commitment(node->children[i]));
+        if (node->children[i]) {
+            pts[count] = node_commitment(node->children[i]);
+            idx[count] = i;
+            count++;
+        }
+    }
+
+    if (count > 0) {
+        uint8_t mapped[256][32];
+        banderwagon_batch_map_to_field(mapped, pts, count);
+        for (size_t k = 0; k < count; k++)
+            memcpy(scalars[idx[k]], mapped[k], 32);
     }
 
     pedersen_commit(&node->commitment, scalars, 256);
@@ -236,8 +251,11 @@ static banderwagon_point_t incremental_update_leaf(
     /* Update leaf commitment: slot 2 for C1, slot 3 for C2 */
     int cx_slot = (suffix < 128) ? 2 : 3;
     uint8_t old_cx_field[32], new_cx_field[32], delta_cx[32];
-    banderwagon_map_to_field(old_cx_field, &old_cx);
-    banderwagon_map_to_field(new_cx_field, cx);
+    const banderwagon_point_t *cx_pair[2] = { &old_cx, cx };
+    uint8_t cx_fields[2][32];
+    banderwagon_batch_map_to_field(cx_fields, cx_pair, 2);
+    memcpy(old_cx_field, cx_fields[0], 32);
+    memcpy(new_cx_field, cx_fields[1], 32);
     pedersen_scalar_diff(delta_cx, new_cx_field, old_cx_field);
     pedersen_update(&leaf->commitment, &leaf->commitment, cx_slot, delta_cx);
 
@@ -261,8 +279,11 @@ static void incremental_propagate_internals(
         int child_idx = path_indices[i];
 
         uint8_t old_field[32], new_field[32], delta[32];
-        banderwagon_map_to_field(old_field, &old_c);
-        banderwagon_map_to_field(new_field, &new_c);
+        const banderwagon_point_t *pair[2] = { &old_c, &new_c };
+        uint8_t fields[2][32];
+        banderwagon_batch_map_to_field(fields, pair, 2);
+        memcpy(old_field, fields[0], 32);
+        memcpy(new_field, fields[1], 32);
         pedersen_scalar_diff(delta, new_field, old_field);
 
         banderwagon_point_t old_node_commit = node->internal.commitment;

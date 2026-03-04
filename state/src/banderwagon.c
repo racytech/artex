@@ -988,3 +988,97 @@ void banderwagon_map_to_field(uint8_t out[32],
 
     memcpy(out, val, 32);
 }
+
+/**
+ * Reduce an Fp element mod Fr (Bandersnatch scalar field order).
+ * Result written as 32-byte little-endian.
+ */
+static void reduce_fp_mod_r(uint8_t out[32], const fp_t *t) {
+    uint8_t t_bytes[32];
+    fp_to_bytes_le(t_bytes, t);
+
+    uint64_t val[4];
+    memcpy(val, t_bytes, 32);
+
+    uint64_t r[4];
+    memcpy(r, FR_MODULUS, 32);
+
+    for (int iter = 0; iter < 4; iter++) {
+        bool ge = false;
+        bool determined = false;
+        for (int i = 3; i >= 0; i--) {
+            if (val[i] > r[i]) { ge = true; determined = true; break; }
+            if (val[i] < r[i]) { ge = false; determined = true; break; }
+        }
+        if (!determined) ge = true;
+        if (!ge) break;
+
+        uint64_t borrow = 0;
+        for (int i = 0; i < 4; i++) {
+            uint64_t sub = r[i] + borrow;
+            borrow = (sub < r[i]) || (val[i] < sub) ? 1 : 0;
+            val[i] -= sub;
+        }
+    }
+
+    memcpy(out, val, 32);
+}
+
+void banderwagon_batch_map_to_field(uint8_t (*out)[32],
+                                     const banderwagon_point_t **points,
+                                     size_t n)
+{
+    ensure_init();
+
+    if (n == 0) return;
+    if (n == 1) {
+        banderwagon_map_to_field(out[0], points[0]);
+        return;
+    }
+
+    /* Separate identity points from valid ones */
+    size_t valid[256];
+    size_t nv = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        if (banderwagon_is_identity(points[i]))
+            memset(out[i], 0, 32);
+        else
+            valid[nv++] = i;
+    }
+
+    if (nv == 0) return;
+    if (nv == 1) {
+        banderwagon_map_to_field(out[valid[0]], points[valid[0]]);
+        return;
+    }
+
+    /* Montgomery batch inversion: 1 fp_inv + 3(nv-1) fp_mul
+     * instead of nv fp_inv calls. */
+    fp_t products[256];
+    products[0] = points[valid[0]]->Y;
+    for (size_t k = 1; k < nv; k++)
+        fp_mul(&products[k], &products[k - 1], &points[valid[k]]->Y);
+
+    /* Single inversion of the accumulated product */
+    fp_t inv;
+    fp_inv(&inv, &products[nv - 1]);
+
+    /* Walk backwards to recover individual Y inverses */
+    for (size_t k = nv - 1; ; k--) {
+        fp_t y_inv;
+        if (k > 0) {
+            fp_mul(&y_inv, &inv, &products[k - 1]);
+            fp_mul(&inv, &inv, &points[valid[k]]->Y);
+        } else {
+            y_inv = inv;
+        }
+
+        /* t = X * Y^{-1} */
+        fp_t t;
+        fp_mul(&t, &points[valid[k]]->X, &y_inv);
+        reduce_fp_mod_r(out[valid[k]], &t);
+
+        if (k == 0) break;
+    }
+}

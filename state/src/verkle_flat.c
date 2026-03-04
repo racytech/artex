@@ -557,20 +557,30 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             art_store_put(vf->value_store, full_key, new_value);
         }
 
-        /* Update leaf commitment for C1 change */
-        if (c1_changed) {
-            uint8_t old_f[32], new_f[32], delta[32];
-            banderwagon_map_to_field(old_f, &old_c1);
-            banderwagon_map_to_field(new_f, &c1);
-            pedersen_scalar_diff(delta, new_f, old_f);
+        /* Update leaf commitment for C1/C2 changes (batch inversions) */
+        if (c1_changed && c2_changed) {
+            const banderwagon_point_t *pts[4] = {
+                &old_c1, &c1, &old_c2, &c2 };
+            uint8_t f[4][32];
+            banderwagon_batch_map_to_field(f, pts, 4);
+            uint8_t delta[32];
+            pedersen_scalar_diff(delta, f[1], f[0]);
             pedersen_update(&leaf_commit, &leaf_commit, 2, delta);
-        }
-        /* Update leaf commitment for C2 change */
-        if (c2_changed) {
-            uint8_t old_f[32], new_f[32], delta[32];
-            banderwagon_map_to_field(old_f, &old_c2);
-            banderwagon_map_to_field(new_f, &c2);
-            pedersen_scalar_diff(delta, new_f, old_f);
+            pedersen_scalar_diff(delta, f[3], f[2]);
+            pedersen_update(&leaf_commit, &leaf_commit, 3, delta);
+        } else if (c1_changed) {
+            const banderwagon_point_t *pts[2] = { &old_c1, &c1 };
+            uint8_t f[2][32];
+            banderwagon_batch_map_to_field(f, pts, 2);
+            uint8_t delta[32];
+            pedersen_scalar_diff(delta, f[1], f[0]);
+            pedersen_update(&leaf_commit, &leaf_commit, 2, delta);
+        } else if (c2_changed) {
+            const banderwagon_point_t *pts[2] = { &old_c2, &c2 };
+            uint8_t f[2][32];
+            banderwagon_batch_map_to_field(f, pts, 2);
+            uint8_t delta[32];
+            pedersen_scalar_diff(delta, f[1], f[0]);
             pedersen_update(&leaf_commit, &leaf_commit, 3, delta);
         }
 
@@ -619,8 +629,11 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
         memset(leaf_scalars, 0, sizeof(leaf_scalars));
         leaf_scalars[0][0] = 1;  /* marker */
         memcpy(leaf_scalars[1], sg->stem, VF_STEM_LEN);
-        banderwagon_map_to_field(leaf_scalars[2], &c1);
-        banderwagon_map_to_field(leaf_scalars[3], &c2);
+        const banderwagon_point_t *cx_pts[2] = { &c1, &c2 };
+        uint8_t cx_f[2][32];
+        banderwagon_batch_map_to_field(cx_f, cx_pts, 2);
+        memcpy(leaf_scalars[2], cx_f[0], 32);
+        memcpy(leaf_scalars[3], cx_f[1], 32);
         pedersen_commit(&leaf_commit, leaf_scalars, 4);
 
         vcs_put_leaf(vf->commit_store, sg->stem, &c1, &c2, &leaf_commit);
@@ -688,8 +701,12 @@ static bool propagate_internals(verkle_flat_t *vf,
                     continue;
 
                 uint8_t old_f[32], new_f[32], delta[32];
-                banderwagon_map_to_field(old_f, &entries[j].old_child);
-                banderwagon_map_to_field(new_f, &entries[j].new_child);
+                const banderwagon_point_t *pair[2] = {
+                    &entries[j].old_child, &entries[j].new_child };
+                uint8_t pf[2][32];
+                banderwagon_batch_map_to_field(pf, pair, 2);
+                memcpy(old_f, pf[0], 32);
+                memcpy(new_f, pf[1], 32);
                 pedersen_scalar_diff(delta, new_f, old_f);
                 pedersen_update(&internal_commit, &internal_commit,
                                 entries[j].child_idx, delta);

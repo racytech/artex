@@ -141,6 +141,15 @@ void banderwagon_map_to_field(uint8_t out[32],
                               const banderwagon_point_t *p);
 
 /**
+ * Batch map_to_field using Montgomery's batch inversion trick.
+ * Replaces n fp_inv calls with 1 fp_inv + 3(n-1) fp_mul.
+ * out[i] = map_to_field(points[i]) for i in [0, n).
+ */
+void banderwagon_batch_map_to_field(uint8_t (*out)[32],
+                                     const banderwagon_point_t **points,
+                                     size_t n);
+
+/**
  * Serialize point to 32 bytes (compressed).
  * Format: sign(Y) * X in big-endian.
  */
