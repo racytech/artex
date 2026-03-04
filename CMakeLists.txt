@@ -385,6 +385,11 @@ target_include_directories(secp256k1_wrap PRIVATE
 )
 target_link_libraries(secp256k1_wrap secp256k1)
 
+# SSZ — Simple Serialize (Portal Network subset)
+add_library(ssz STATIC
+    net/src/ssz.c
+)
+
 #==============================================================================
 # Tests — Networking
 #==============================================================================
@@ -413,6 +418,13 @@ target_include_directories(test_secp256k1_wrap PRIVATE
 )
 target_link_libraries(test_secp256k1_wrap secp256k1_wrap)
 add_test(NAME test_secp256k1_wrap COMMAND test_secp256k1_wrap)
+
+# Test: SSZ (Portal Network subset)
+add_executable(test_ssz
+    net/tests/test_ssz.c
+)
+target_link_libraries(test_ssz ssz)
+add_test(NAME test_ssz COMMAND test_ssz)
 
 #==============================================================================
 # Build Summary
