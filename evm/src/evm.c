@@ -472,8 +472,9 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         return false;
     }
 
-    // Check call depth limit (Ethereum allows max 1024 depth)
-    if (msg->depth >= 1024)
+    // Check call depth limit (Ethereum allows depth 0-1024, rejects 1025+)
+    // Reference: process_message() uses "depth > STACK_DEPTH_LIMIT" where limit=1024
+    if (msg->depth > 1024)
     {
         LOG_EVM_ERROR("Call depth limit exceeded (depth=%d, max=1024)", msg->depth);
         *result = evm_result_error(EVM_CALL_DEPTH_EXCEEDED, msg->gas);

@@ -131,7 +131,7 @@ static evm_status_t prepare_call(
                 evm_mark_address_warm(evm, &delegate_target);
                 delegation_gas_cost = 2600;  // GAS_COLD_ACCOUNT_ACCESS
             } else {
-                delegation_gas_cost = 100;   // GAS_WARM_ACCESS
+                delegation_gas_cost = 100;   // GAS_WARM_ACCESS for delegation target
             }
         }
     }

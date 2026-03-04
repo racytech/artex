@@ -209,6 +209,13 @@ evm_status_t op_sstore(evm_t *evm)
         return EVM_STACK_UNDERFLOW;
     }
 
+    // EIP-2200 (Istanbul+): SSTORE sentry — prevent reentrancy via SSTORE
+    // when gas is too low. "If gasleft is less than or equal to 2300, fail."
+    if (evm->fork >= FORK_ISTANBUL && evm->gas_left <= GAS_CALL_STIPEND)
+    {
+        return EVM_OUT_OF_GAS;
+    }
+
     uint256_t key, value;
     evm_stack_pop(evm->stack, &key);
     evm_stack_pop(evm->stack, &value);

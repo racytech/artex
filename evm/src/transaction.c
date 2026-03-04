@@ -496,11 +496,15 @@ bool transaction_execute(
             address_t zero_addr = {0};
             if (memcmp(signer, &zero_addr, sizeof(address_t)) == 0) continue;
 
-            // 4. Mark signer as warm BEFORE validation checks (EIP-2929)
+            // 4. Nonce overflow check: skip if nonce >= 2^64-1
+            //    Per spec: this check comes BEFORE warming the signer
+            if (auth->nonce >= UINT64_MAX) continue;
+
+            // 5. Mark signer as warm (EIP-2929)
             //    Per spec: warming happens even if subsequent checks fail
             evm_mark_address_warm(evm, signer);
 
-            // 5. Check signer doesn't already have non-delegated code
+            // 6. Check signer doesn't already have non-delegated code
             uint32_t signer_code_len = 0;
             const uint8_t *signer_code = evm_state_get_code_ptr(state, signer, &signer_code_len);
             if (signer_code && signer_code_len > 0) {
@@ -510,9 +514,6 @@ bool transaction_execute(
                     continue;
                 }
             }
-
-            // 6. Nonce overflow check: skip if nonce >= 2^64-1
-            if (auth->nonce >= UINT64_MAX) continue;
 
             // 7. Check nonce match
             uint64_t signer_nonce = evm_state_get_nonce(state, signer);
@@ -739,8 +740,7 @@ bool transaction_execute(
     // Post-execution: Gas refunds and coinbase payment
     //==========================================================================
 post_execution:
-
-    // Calculate actual gas cost
+// Calculate actual gas cost
     uint64_t gas_used = result->gas_used;
     uint64_t gas_refund = result->gas_refund + auth_gas_refund;
 
