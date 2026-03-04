@@ -33,6 +33,12 @@ add_library(compact_art STATIC
     database/src/compact_art.c
 )
 
+# ART Store (compact_art-indexed persistent record store)
+add_library(art_store STATIC
+    database/src/art_store.c
+)
+target_link_libraries(art_store compact_art)
+
 # Common Utilities (keccak256, hash, rlp, bytes, uint256, address)
 add_library(common STATIC
     common/src/keccak256.c
@@ -186,6 +192,12 @@ add_executable(test_stress_compact_art
     database/tests/test_stress_compact_art.c
 )
 target_link_libraries(test_stress_compact_art compact_art)
+
+# Stress Test: ART Store (correctness + persistence at scale)
+add_executable(test_stress_art_store
+    database/tests/test_stress_art_store.c
+)
+target_link_libraries(test_stress_art_store art_store)
 
 # Benchmark: compact_art vs mem_art (memory comparison)
 add_executable(bench_compact_art_index
@@ -423,6 +435,7 @@ message(STATUS "")
 message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
 message(STATUS "  - compact_art (space-efficient index ART)")
+message(STATUS "  - art_store (ART-indexed persistent record store)")
 message(STATUS "  - common (keccak256, hash, rlp, bytes)")
 message(STATUS "  - data_layer (state store + code store + write buffer + merge)")
 message(STATUS "  - state_db (account state + contract storage wrapper)")
