@@ -618,6 +618,122 @@ func main() {
 		})
 	}
 
+	// 21. Large build: 5000 random keys
+	{
+		var kvs []kv
+		for i := uint64(0); i < 5000; i++ {
+			kvs = append(kvs, kv{makeKey(200000 + i), makeValue(i)})
+		}
+		scenarios = append(scenarios, scenario{
+			name:    "5000 random keys",
+			typ:     0,
+			initial: kvs,
+		})
+	}
+
+	// 22. Large build: 10000 random keys
+	{
+		var kvs []kv
+		for i := uint64(0); i < 10000; i++ {
+			kvs = append(kvs, kv{makeKey(300000 + i), makeValue(i)})
+		}
+		scenarios = append(scenarios, scenario{
+			name:    "10000 random keys",
+			typ:     0,
+			initial: kvs,
+		})
+	}
+
+	// 23. Large multiblock: 5000 initial + 20 blocks of 100 ops
+	{
+		var initial []kv
+		for i := uint64(0); i < 5000; i++ {
+			initial = append(initial, kv{makeKey(400000 + i), makeValue(i)})
+		}
+		var blocks [][]kv
+		nextID := uint64(500000)
+		for b := 0; b < 20; b++ {
+			var ops []kv
+			// 60 new keys
+			for j := 0; j < 60; j++ {
+				ops = append(ops, kv{makeKey(nextID), makeValue(nextID)})
+				nextID++
+			}
+			// 40 updates to existing
+			for j := 0; j < 40; j++ {
+				idx := uint64(400000 + uint64(b*40+j))
+				ops = append(ops, kv{makeKey(idx), makeValue(nextID)})
+				nextID++
+			}
+			blocks = append(blocks, ops)
+		}
+		scenarios = append(scenarios, scenario{
+			name:    "5000 keys + 20 blocks",
+			typ:     1,
+			initial: initial,
+			blocks:  blocks,
+		})
+	}
+
+	// 24. Large build: 20000 random keys
+	{
+		var kvs []kv
+		for i := uint64(0); i < 20000; i++ {
+			kvs = append(kvs, kv{makeKey(600000 + i), makeValue(i)})
+		}
+		scenarios = append(scenarios, scenario{
+			name:    "20000 random keys",
+			typ:     0,
+			initial: kvs,
+		})
+	}
+
+	// 25. Dense stems: 200 stems × 2 suffixes each (verkle account pattern)
+	{
+		var kvs []kv
+		for i := 0; i < 200; i++ {
+			stem := makeKey(uint64(700000 + i))[:31]
+			kvs = append(kvs, kv{makeStemKey(stem, 0), makeValue(uint64(i*2))})
+			kvs = append(kvs, kv{makeStemKey(stem, 1), makeValue(uint64(i*2 + 1))})
+		}
+		scenarios = append(scenarios, scenario{
+			name:    "200 stems x2 suffixes",
+			typ:     0,
+			initial: kvs,
+		})
+	}
+
+	// 26. Large multiblock: 10000 initial + 10 blocks of 200 ops
+	{
+		var initial []kv
+		for i := uint64(0); i < 10000; i++ {
+			initial = append(initial, kv{makeKey(800000 + i), makeValue(i)})
+		}
+		var blocks [][]kv
+		nextID := uint64(900000)
+		for b := 0; b < 10; b++ {
+			var ops []kv
+			// 120 new keys
+			for j := 0; j < 120; j++ {
+				ops = append(ops, kv{makeKey(nextID), makeValue(nextID)})
+				nextID++
+			}
+			// 80 updates
+			for j := 0; j < 80; j++ {
+				idx := uint64(800000 + uint64(b*80+j))
+				ops = append(ops, kv{makeKey(idx), makeValue(nextID)})
+				nextID++
+			}
+			blocks = append(blocks, ops)
+		}
+		scenarios = append(scenarios, scenario{
+			name:    "10000 keys + 10 blocks",
+			typ:     1,
+			initial: initial,
+			blocks:  blocks,
+		})
+	}
+
 	// =====================================================================
 	// Write binary file
 	// =====================================================================

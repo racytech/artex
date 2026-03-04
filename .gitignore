@@ -150,3 +150,8 @@ todo-checklist-old.md
 
 # State TODO (local tracking)
 state/TODO.md
+
+# Generated test vectors
+state/tests/verkle_vectors.bin
+state/tests/gen_verkle_vectors/gen_verkle_vectors
+state/tests/gen_verkle_vectors/go.sum
