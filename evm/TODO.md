@@ -2,22 +2,22 @@
 
 ## Current Status (evm-dev-0)
 
-**Total state tests: 15,590 across 11 forks**
+**Total non-static state tests: 15,590 across 11 forks**
 
 | Fork | Passed | Total | Rate | Failures | Notes |
 |------|--------|-------|------|----------|-------|
-| frontier | 5,625 | 5,625 | **100%** | 0 | |
+| frontier | 5,621 | 5,625 | **99.9%** | 4 | Prague precompile absence (0x12) |
 | homestead | 82 | 82 | **100%** | 0 | |
-| byzantium | 402 | 405 | **99.3%** | 3 | BN256 EC precompiles(3) |
+| byzantium | 378 | 405 | **93.3%** | 27 | BN256 EC ADD/MUL (0x06, 0x07) |
 | constantinople | 192 | 192 | **100%** | 0 | |
 | istanbul | 841 | 841 | **100%** | 0 | |
 | berlin | 2,957 | 2,957 | **100%** | 0 | |
 | london | 11 | 11 | **100%** | 0 | |
 | paris | 180 | 180 | **100%** | 0 | |
 | shanghai | 288 | 288 | **100%** | 0 | |
-| cancun | 2,925 | 2,990 | **97.8%** | 65 | KZG point evaluation(65) |
-| prague | 831 | 2,019 | 41.2% | 1,188 | BLS12-381(585), 7702(523), calldata gas blocked(80) |
-| **TOTAL** | **14,334** | **15,590** | **92.0%** | **1,256** | |
+| cancun | 2,493 | 2,990 | **83.4%** | 497 | KZG point evaluation (0x0a) |
+| prague | 1,431 | 2,019 | **70.9%** | 588 | BLS12-381(585), BN256 EIP-7702(3) |
+| **TOTAL** | **14,474** | **15,590** | **92.8%** | **1,116** | |
 
 ### Completed Fixes
 
@@ -37,33 +37,31 @@
 - [x] **BLAKE2F**: Precompile (0x09) (Istanbul 100%)
 - [x] **EIP-4844**: Blob TX type 3 — parsing, gas, BLOBHASH, BLOBBASEFEE, fake_exponential
 - [x] **EIP-7623**: Calldata gas floor (Prague)
+- [x] **EIP-7702**: Set code TX type 4 — authorization processing, delegation resolution, CALL/EXTCODE* delegation, intrinsic gas, auth refund (545/548)
+- [x] **EIP-2200**: SSTORE sentry check (gas_left <= 2300 guard)
+- [x] **Call depth**: Fix off-by-one (allow depth 1024)
 
-## Remaining Failure Breakdown
+## Remaining Failures — All Precompiles
 
-### 1. Missing Precompiles — 653 failures
+Every remaining non-static failure is a missing precompile crypto implementation.
 
-| Precompile | Address | Failures | Fork | Crypto dependency |
-|------------|---------|----------|------|-------------------|
-| BN256 ADD/MUL/PAIRING | 0x06-0x08 | 3 | byzantium | bn256 curve lib (3-5 day project) |
-| KZG Point Evaluation | 0x0a | 65 | cancun | KZG commitment lib |
-| BLS12-381 | 0x0b-0x12 | 585 | prague | blst library |
+| Precompile | Address | Failures | Forks Affected | Crypto dependency |
+|------------|---------|----------|----------------|-------------------|
+| BN256 ADD | 0x06 | ~15 | byzantium+ | bn256 curve lib |
+| BN256 MUL | 0x07 | ~15 | byzantium+ | bn256 curve lib |
+| BN256 PAIRING | 0x08 | — | byzantium+ | bn256 curve lib |
+| KZG Point Evaluation | 0x0a | 497 | cancun+ | c-kzg-4844 library |
+| BLS12-381 (9 precompiles) | 0x0b–0x13 | 585 | prague | blst library |
 
-### 2. Missing EIP-7702 Set Code TX — 523 failures
+**Note**: Frontier 4 failures are Prague-fork precompile absence tests (address 0x12).
 
-Prague-only. Type 4 transaction parsing, authorization lists.
+## Next Steps (ordered by impact)
 
-### 3. EIP-7623 Blocked by Missing TX Types — 80 failures
-
-Prague EIP-7623 calldata gas tests blocked by missing EIP-7702/blob TX support.
-
-## Next Steps (ordered by impact / effort)
-
-| Step | What | Remaining Failures | Effort |
-|------|------|--------------------|--------|
-| 1 | BN256 precompiles (0x06-0x08) | 3 | Large — 3-5 day EC math project |
-| 2 | KZG point evaluation (0x0a) | 65 | Large — needs KZG library |
-| 3 | EIP-7702 set code TX | 523+80 | Large — new TX type |
-| 4 | BLS12-381 precompiles (EIP-2537) | 585 | Large — needs blst |
+| Step | What | Fixes | Effort |
+|------|------|-------|--------|
+| 1 | KZG point evaluation (0x0a) | ~497 | Medium — c-kzg-4844 library integration |
+| 2 | BLS12-381 precompiles (0x0b-0x13) | ~585 | Large — blst library, 9 precompile impls |
+| 3 | BN256 precompiles (0x06-0x08) | ~30 | Medium — bn256 curve library |
 
 ## External Dependencies
 
@@ -72,6 +70,6 @@ Prague EIP-7623 calldata gas tests blocked by missing EIP-7702/blob TX support.
 | OpenSSL | SHA-256, RIPEMD-160 | `apt install libssl-dev` | **Installed** |
 | libsecp256k1 | ECRECOVER | `apt install libsecp256k1-dev` | **Installed** |
 | mini-gmp | MODEXP | vendored in evm/vendor/ | **Installed** |
-| bn256 / mcl | BN256 precompiles | port from go-ethereum | Needed |
 | c-kzg-4844 | KZG point evaluation | vendored | Needed |
 | blst | BLS12-381 | vendored | Needed |
+| bn256 / mcl | BN256 precompiles | port from go-ethereum | Needed |
