@@ -46,7 +46,8 @@ static evm_status_t prepare_call(
     uint64_t ret_size,
     bool allow_value,
     bool can_create_account,
-    uint64_t *gas_forwarded)
+    uint64_t *gas_forwarded,
+    bool *graceful_failure)
 {
     bool has_value = !uint256_is_zero(value);
 
@@ -121,14 +122,28 @@ static evm_status_t prepare_call(
     if (is_cold)
         evm_mark_address_warm(evm, target_addr);
 
+    // EIP-7702: If target has delegation designator, charge cold/warm for delegation target
+    uint64_t delegation_gas_cost = 0;
+    if (evm->fork >= FORK_PRAGUE) {
+        address_t delegate_target;
+        if (evm_resolve_delegation(evm->state, target_addr, &delegate_target)) {
+            if (!evm_is_address_warm(evm, &delegate_target)) {
+                evm_mark_address_warm(evm, &delegate_target);
+                delegation_gas_cost = 2600;  // GAS_COLD_ACCOUNT_ACCESS
+            } else {
+                delegation_gas_cost = 100;   // GAS_WARM_ACCESS
+            }
+        }
+    }
+
     // Calculate CALL gas overhead (cold/warm + value_transfer + account_creation)
     uint64_t call_cost = gas_call_cost(evm->fork, is_cold, has_value, account_exists);
 
     // Calculate stipend (bonus gas for value transfers)
     uint64_t stipend = has_value ? gas_call_stipend(value) : 0;
 
-    // Deduct call overhead
-    if (!evm_use_gas(evm, call_cost))
+    // Deduct call overhead + delegation gas
+    if (!evm_use_gas(evm, call_cost + delegation_gas_cost))
         return EVM_OUT_OF_GAS;
 
     //==========================================================================
@@ -138,10 +153,12 @@ static evm_status_t prepare_call(
     // Per the Yellow Paper: when a CALL fails gracefully (depth or balance),
     // the child never executes but would have returned all gas including the
     // stipend. So the caller gains the stipend: μ'_g = μ_g - c_EXTRA + G_STIPEND
+    *graceful_failure = false;
     if (evm->msg.depth >= 1024)
     {
         evm->gas_left += stipend;
         *gas_forwarded = 0;
+        *graceful_failure = true;
         return EVM_SUCCESS;
     }
 
@@ -149,6 +166,7 @@ static evm_status_t prepare_call(
     {
         evm->gas_left += stipend;
         *gas_forwarded = 0;
+        *graceful_failure = true;
         return EVM_SUCCESS;
     }
 
@@ -222,16 +240,18 @@ evm_status_t op_call(evm_t *evm)
     uint64_t ret_offset_u64 = uint256_to_uint64(&ret_offset);
 
     uint64_t gas_forwarded;
+    bool graceful_failure;
     evm_status_t status = prepare_call(evm, &target_addr, &value, &gas,
                                        args_offset_u64, args_size_u64,
                                        ret_offset_u64, ret_size_u64,
-                                       true, true, &gas_forwarded);
+                                       true, true, &gas_forwarded,
+                                       &graceful_failure);
 
     if (status != EVM_SUCCESS)
         return status;
 
-    // If gas_forwarded is 0, call failed gracefully (depth/balance check)
-    if (gas_forwarded == 0)
+    // If graceful failure (depth/balance check), push 0 and return
+    if (graceful_failure)
     {
         uint256_t result = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &result))
@@ -341,18 +361,20 @@ evm_status_t op_callcode(evm_t *evm)
     // Prepare call (memory expansion, gas calculation, checks)
     // CALLCODE allows value transfer but cannot create new accounts
     uint64_t gas_forwarded;
+    bool graceful_failure;
     evm_status_t status = prepare_call(evm, &target_addr, &value, &gas,
                                        args_offset_u64, args_size_u64,
                                        ret_offset_u64, ret_size_u64,
-                                       true, false, &gas_forwarded);
+                                       true, false, &gas_forwarded,
+                                       &graceful_failure);
 
     if (status != EVM_SUCCESS)
     {
         return status;
     }
 
-    // If gas_forwarded is 0, call failed gracefully (depth/balance check)
-    if (gas_forwarded == 0)
+    // If graceful failure (depth/balance check), push 0 and return
+    if (graceful_failure)
     {
         uint256_t result = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &result))
@@ -487,19 +509,20 @@ evm_status_t op_delegatecall(evm_t *evm)
     // Prepare call (memory expansion, gas calculation, checks)
     // DELEGATECALL does NOT allow value transfer and cannot create accounts
     uint64_t gas_forwarded;
+    bool graceful_failure;
     evm_status_t status = prepare_call(evm, &target_addr, &zero_value, &gas,
                                        args_offset_u64, args_size_u64,
                                        ret_offset_u64, ret_size_u64,
-                                       false, false, &gas_forwarded);
+                                       false, false, &gas_forwarded,
+                                       &graceful_failure);
 
     if (status != EVM_SUCCESS)
     {
         return status;
     }
 
-    // If gas_forwarded is 0, call failed gracefully (depth check)
-    // Note: Balance check won't fail since value is always 0
-    if (gas_forwarded == 0)
+    // If graceful failure (depth check), push 0 and return
+    if (graceful_failure)
     {
         uint256_t result = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &result))
@@ -633,18 +656,20 @@ evm_status_t op_staticcall(evm_t *evm)
 
     // STATICCALL does NOT allow value transfer and cannot create accounts
     uint64_t gas_forwarded;
+    bool graceful_failure;
     evm_status_t status = prepare_call(evm, &target_addr, &zero_value, &gas,
                                        args_offset_u64, args_size_u64,
                                        ret_offset_u64, ret_size_u64,
-                                       false, false, &gas_forwarded);
-    
+                                       false, false, &gas_forwarded,
+                                       &graceful_failure);
+
     if (status != EVM_SUCCESS)
     {
         return status;
     }
 
-    // If gas_forwarded is 0, call failed gracefully (depth check)
-    if (gas_forwarded == 0)
+    // If graceful failure (depth check), push 0 and return
+    if (graceful_failure)
     {
         uint256_t result = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &result))

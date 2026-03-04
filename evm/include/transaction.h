@@ -31,8 +31,22 @@ typedef enum {
     TX_TYPE_LEGACY = 0,      // Pre-EIP-2718 transaction
     TX_TYPE_EIP2930 = 1,     // EIP-2930: Optional access lists
     TX_TYPE_EIP1559 = 2,     // EIP-1559: Fee market change
-    TX_TYPE_EIP4844 = 3      // EIP-4844: Blob transactions
+    TX_TYPE_EIP4844 = 3,     // EIP-4844: Blob transactions
+    TX_TYPE_EIP7702 = 4      // EIP-7702: Set code transactions
 } transaction_type_t;
+
+/**
+ * Authorization tuple (EIP-7702)
+ */
+typedef struct {
+    uint256_t chain_id;
+    address_t address;       // Delegate target
+    uint64_t nonce;
+    uint8_t y_parity;
+    uint256_t r;
+    uint256_t s;
+    address_t signer;        // Recovered signer (pre-computed in tests)
+} authorization_t;
 
 /**
  * Access list entry (EIP-2930)
@@ -73,6 +87,10 @@ typedef struct {
     uint256_t max_fee_per_blob_gas;
     const hash_t *blob_versioned_hashes;
     size_t blob_versioned_hashes_count;
+
+    // EIP-7702 Authorization list
+    authorization_t *authorization_list;
+    size_t authorization_list_count;
 
     // Flags
     bool is_create;            // True if this is a contract creation

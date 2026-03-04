@@ -336,6 +336,23 @@ bool evm_is_storage_warm(const evm_t *evm, const address_t *addr, const uint256_
 void evm_mark_storage_warm(evm_t *evm, const address_t *addr, const uint256_t *key);
 
 //==============================================================================
+// EIP-7702 Delegation Resolution
+//==============================================================================
+
+/**
+ * Check if an account has a delegation designator (EIP-7702)
+ *
+ * If the account's code is exactly 23 bytes starting with 0xef0100,
+ * extracts the 20-byte target address.
+ *
+ * @param state State instance
+ * @param addr Address to check
+ * @param target_addr Output: delegation target address (if delegated)
+ * @return true if account is delegated, false otherwise
+ */
+bool evm_resolve_delegation(evm_state_t *state, const address_t *addr, address_t *target_addr);
+
+//==============================================================================
 // Result Helpers
 //==============================================================================
 

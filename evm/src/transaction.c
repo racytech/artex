@@ -66,6 +66,12 @@ static uint64_t calculate_intrinsic_gas(const transaction_t *tx, evm_fork_t fork
         }
     }
 
+    // EIP-7702: authorization list cost (PER_AUTH_BASE_COST per tuple)
+    if (tx->authorization_list && tx->authorization_list_count > 0) {
+        const uint64_t PER_AUTH_BASE_COST = 25000;
+        gas += tx->authorization_list_count * PER_AUTH_BASE_COST;
+    }
+
     return gas;
 }
 
@@ -149,7 +155,8 @@ uint256_t transaction_effective_gas_price(
             return tx->gas_price;
 
         case TX_TYPE_EIP1559:
-        case TX_TYPE_EIP4844: {
+        case TX_TYPE_EIP4844:
+        case TX_TYPE_EIP7702: {
             // min(max_fee_per_gas, base_fee + max_priority_fee_per_gas)
             uint256_t base_plus_priority = uint256_add(&env->base_fee, &tx->max_priority_fee_per_gas);
             return uint256_lt(&tx->max_fee_per_gas, &base_plus_priority)
@@ -249,6 +256,24 @@ bool transaction_execute(
         LOG_EVM_ERROR("EIP-4844 type-3 tx not valid before Cancun");
         return false;
     }
+    if (tx->type == TX_TYPE_EIP7702 && evm->fork < FORK_PRAGUE) {
+        LOG_EVM_ERROR("EIP-7702 type-4 tx not valid before Prague");
+        return false;
+    }
+
+    // EIP-7702 type-4 transaction validations
+    if (tx->type == TX_TYPE_EIP7702) {
+        // Must have non-empty authorization list
+        if (!tx->authorization_list || tx->authorization_list_count == 0) {
+            LOG_EVM_ERROR("EIP-7702: empty authorization list");
+            return false;
+        }
+        // Cannot be contract creation
+        if (tx->is_create) {
+            LOG_EVM_ERROR("EIP-7702: type-4 tx cannot be contract creation");
+            return false;
+        }
+    }
 
     // EIP-4844 blob transaction validations
     if (tx->type == TX_TYPE_EIP4844) {
@@ -297,7 +322,7 @@ bool transaction_execute(
     }
 
     // EIP-1559 validations
-    if (tx->type == TX_TYPE_EIP1559 || tx->type == TX_TYPE_EIP4844) {
+    if (tx->type == TX_TYPE_EIP1559 || tx->type == TX_TYPE_EIP4844 || tx->type == TX_TYPE_EIP7702) {
         // max_priority_fee_per_gas must not exceed max_fee_per_gas
         if (uint256_gt(&tx->max_priority_fee_per_gas, &tx->max_fee_per_gas)) {
             LOG_EVM_ERROR("max_priority_fee_per_gas exceeds max_fee_per_gas");
@@ -323,7 +348,7 @@ bool transaction_execute(
     // EIP-1559: use max_fee_per_gas (not effective_gas_price) for balance check
     {
         uint256_t max_gas_price;
-        if (tx->type == TX_TYPE_EIP1559 || tx->type == TX_TYPE_EIP4844) {
+        if (tx->type == TX_TYPE_EIP1559 || tx->type == TX_TYPE_EIP4844 || tx->type == TX_TYPE_EIP7702) {
             max_gas_price = tx->max_fee_per_gas;
         } else {
             max_gas_price = tx->gas_price;
@@ -353,6 +378,26 @@ bool transaction_execute(
         if (sender_nonce == UINT64_MAX) {
             LOG_EVM_ERROR("Sender nonce at maximum, cannot increment");
             return false;
+        }
+    }
+
+    // EIP-3607: Reject transactions from senders with code
+    // EIP-7702: Senders with delegation designator (0xef0100...) are still EOAs
+    {
+        uint32_t sender_code_len = evm_state_get_code_size(state, &tx->sender);
+        if (sender_code_len > 0) {
+            // Check if it's a delegation designator (allowed)
+            bool is_delegation = false;
+            if (sender_code_len == 23) {
+                uint32_t cl = 0;
+                const uint8_t *sc = evm_state_get_code_ptr(state, &tx->sender, &cl);
+                if (sc && cl == 23 && sc[0] == 0xef && sc[1] == 0x01 && sc[2] == 0x00)
+                    is_delegation = true;
+            }
+            if (!is_delegation) {
+                LOG_EVM_ERROR("EIP-3607: sender has code (not an EOA)");
+                return false;
+            }
         }
     }
 
@@ -404,6 +449,105 @@ bool transaction_execute(
             LOG_EVM_ERROR("Failed to deduct blob gas cost from sender");
             evm_state_revert(state, snapshot);
             return false;
+        }
+    }
+
+    // EIP-7702: Process authorization list BEFORE exec_snapshot
+    // Authorizations persist even if the transaction reverts.
+    uint64_t auth_gas_refund = 0;
+    if (tx->type == TX_TYPE_EIP7702 && tx->authorization_list && tx->authorization_list_count > 0) {
+        const uint64_t PER_EMPTY_ACCOUNT_COST = 25000;
+        const uint64_t PER_AUTH_BASE_COST_REFUND = 12500;
+        uint64_t chain_id = evm->chain_config ? evm->chain_config->chain_id : 1;
+
+        for (size_t i = 0; i < tx->authorization_list_count; i++) {
+            const authorization_t *auth = &tx->authorization_list[i];
+
+            // 1. Chain ID check: must be 0 (wildcard) or match current chain
+            uint64_t auth_chain = uint256_to_uint64(&auth->chain_id);
+            if (auth_chain != 0 && auth_chain != chain_id) continue;
+
+            // 2. Validate signature r,s ranges per EIP-7702 spec
+            //    r must be in (0, SECP256K1N), s must be in (0, SECP256K1N/2]
+            {
+                static const uint8_t secp256k1n_bytes[32] = {
+                    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+                    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
+                    0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,
+                    0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41
+                };
+                static const uint8_t secp256k1n_half_bytes[32] = {
+                    0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+                    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+                    0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,
+                    0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
+                };
+                uint256_t secp256k1n = uint256_from_bytes(secp256k1n_bytes, 32);
+                uint256_t secp256k1n_half = uint256_from_bytes(secp256k1n_half_bytes, 32);
+                if (uint256_is_zero(&auth->r) || !uint256_lt(&auth->r, &secp256k1n))
+                    continue;
+                if (uint256_is_zero(&auth->s) || uint256_gt(&auth->s, &secp256k1n_half))
+                    continue;
+            }
+
+            // 3. Use pre-computed signer from test fixtures
+            //    Invalid signature → signer is zero address → skip tuple
+            const address_t *signer = &auth->signer;
+            address_t zero_addr = {0};
+            if (memcmp(signer, &zero_addr, sizeof(address_t)) == 0) continue;
+
+            // 4. Mark signer as warm BEFORE validation checks (EIP-2929)
+            //    Per spec: warming happens even if subsequent checks fail
+            evm_mark_address_warm(evm, signer);
+
+            // 5. Check signer doesn't already have non-delegated code
+            uint32_t signer_code_len = 0;
+            const uint8_t *signer_code = evm_state_get_code_ptr(state, signer, &signer_code_len);
+            if (signer_code && signer_code_len > 0) {
+                // Allow if existing code is a delegation designator
+                if (signer_code_len != 23 ||
+                    signer_code[0] != 0xef || signer_code[1] != 0x01 || signer_code[2] != 0x00) {
+                    continue;
+                }
+            }
+
+            // 6. Nonce overflow check: skip if nonce >= 2^64-1
+            if (auth->nonce >= UINT64_MAX) continue;
+
+            // 7. Check nonce match
+            uint64_t signer_nonce = evm_state_get_nonce(state, signer);
+            if (signer_nonce != auth->nonce) continue;
+
+            // 8. EIP-7702 gas refund: if authority already exists, refund the
+            //    "new account creation" overhead (PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST)
+            if (!evm_state_is_empty(state, signer)) {
+                auth_gas_refund += PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST_REFUND;
+            }
+
+            // 9. Increment signer nonce
+            evm_state_set_nonce(state, signer, signer_nonce + 1);
+
+            // 10. Set delegation code or clear it
+            if (memcmp(&auth->address, &zero_addr, sizeof(address_t)) == 0) {
+                // Clear delegation: set empty code
+                evm_state_set_code(state, signer, NULL, 0);
+            } else {
+                // Set delegation designator: 0xef0100 || address (23 bytes)
+                uint8_t designator[23];
+                designator[0] = 0xef;
+                designator[1] = 0x01;
+                designator[2] = 0x00;
+                memcpy(&designator[3], auth->address.bytes, 20);
+                evm_state_set_code(state, signer, designator, 23);
+            }
+        }
+    }
+
+    // EIP-7702: If tx destination has a delegation designator, warm the target
+    if (tx->type == TX_TYPE_EIP7702 && !tx->is_create) {
+        address_t delegate_target;
+        if (evm_resolve_delegation(state, &tx->to, &delegate_target)) {
+            evm_mark_address_warm(evm, &delegate_target);
         }
     }
 
@@ -528,29 +672,49 @@ bool transaction_execute(
         // Handle contract creation on success
         if (tx->is_create) {
             if (evm_result.output_data && evm_result.output_size > 0) {
-                // Charge deployment gas (200 gas per byte)
-                const uint64_t G_CODE_DEPOSIT = 200;
-                uint64_t deployment_gas = evm_result.output_size * G_CODE_DEPOSIT;
-
-                // Check if enough gas left for deployment
-                if (evm_result.gas_left < deployment_gas) {
-                    LOG_EVM_DEBUG("Insufficient gas for code deployment");
+                // EIP-170 (Spurious Dragon+): max code size check
+                if (evm->fork >= FORK_SPURIOUS_DRAGON &&
+                    evm_result.output_size > 24576) {
                     evm_state_revert(state, exec_snapshot);
                     result->status = EVM_OUT_OF_GAS;
                     result->gas_used = tx->gas_limit;
                     result->gas_refund = 0;
                     result->contract_created = false;
-                } else {
-                    // Deduct deployment gas
-                    result->gas_used += deployment_gas;
+                }
+                // EIP-3541 (London+): reject code starting with 0xEF
+                else if (evm->fork >= FORK_LONDON &&
+                         evm_result.output_data[0] == 0xEF) {
+                    evm_state_revert(state, exec_snapshot);
+                    result->status = EVM_OUT_OF_GAS;
+                    result->gas_used = tx->gas_limit;
+                    result->gas_refund = 0;
+                    result->contract_created = false;
+                }
+                else {
+                    // Charge deployment gas (200 gas per byte)
+                    const uint64_t G_CODE_DEPOSIT = 200;
+                    uint64_t deployment_gas = evm_result.output_size * G_CODE_DEPOSIT;
 
-                    // Store contract code
-                    evm_state_set_code(state, &contract_address,
-                                      evm_result.output_data,
-                                      (uint32_t)evm_result.output_size);
+                    // Check if enough gas left for deployment
+                    if (evm_result.gas_left < deployment_gas) {
+                        LOG_EVM_DEBUG("Insufficient gas for code deployment");
+                        evm_state_revert(state, exec_snapshot);
+                        result->status = EVM_OUT_OF_GAS;
+                        result->gas_used = tx->gas_limit;
+                        result->gas_refund = 0;
+                        result->contract_created = false;
+                    } else {
+                        // Deduct deployment gas
+                        result->gas_used += deployment_gas;
 
-                    result->contract_address = contract_address;
-                    result->contract_created = true;
+                        // Store contract code
+                        evm_state_set_code(state, &contract_address,
+                                          evm_result.output_data,
+                                          (uint32_t)evm_result.output_size);
+
+                        result->contract_address = contract_address;
+                        result->contract_created = true;
+                    }
                 }
             } else {
                 // Empty code - contract created with no code
@@ -578,7 +742,7 @@ post_execution:
 
     // Calculate actual gas cost
     uint64_t gas_used = result->gas_used;
-    uint64_t gas_refund = result->gas_refund;
+    uint64_t gas_refund = result->gas_refund + auth_gas_refund;
 
     // Apply refund cap: London+ (EIP-3529) = gas_used/5, pre-London = gas_used/2
     uint64_t max_refund = (evm->fork >= FORK_LONDON) ? gas_used / 5 : gas_used / 2;

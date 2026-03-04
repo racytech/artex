@@ -144,7 +144,9 @@ bool test_runner_run_state_test(test_runner_t *runner,
             // Determine transaction type based on available fields
             // The presence of accessLists in the JSON indicates EIP-2930 (even if empty)
             transaction_type_t tx_type = TX_TYPE_LEGACY;
-            if (!uint256_is_zero(&test->transaction.max_fee_per_blob_gas) ||
+            if (test->transaction.has_authorization_list) {
+                tx_type = TX_TYPE_EIP7702;
+            } else if (!uint256_is_zero(&test->transaction.max_fee_per_blob_gas) ||
                 test->transaction.blob_versioned_hashes_count > 0) {
                 tx_type = TX_TYPE_EIP4844;
             } else if (!uint256_is_zero(&test->transaction.max_fee_per_gas)) {
@@ -171,8 +173,30 @@ bool test_runner_run_state_test(test_runner_t *runner,
                 .access_list_count = 0,
                 .max_fee_per_blob_gas = test->transaction.max_fee_per_blob_gas,
                 .blob_versioned_hashes = test->transaction.blob_versioned_hashes,
-                .blob_versioned_hashes_count = test->transaction.blob_versioned_hashes_count
+                .blob_versioned_hashes_count = test->transaction.blob_versioned_hashes_count,
+                .authorization_list = NULL,
+                .authorization_list_count = 0
             };
+
+            // Convert EIP-7702 authorization list
+            authorization_t *tx_auth_list = NULL;
+            if (test->transaction.authorization_list_count > 0) {
+                tx_auth_list = calloc(test->transaction.authorization_list_count, sizeof(authorization_t));
+                if (tx_auth_list) {
+                    for (size_t i = 0; i < test->transaction.authorization_list_count; i++) {
+                        const test_authorization_t *src = &test->transaction.authorization_list[i];
+                        tx_auth_list[i].chain_id = src->chain_id;
+                        tx_auth_list[i].address = src->address;
+                        tx_auth_list[i].nonce = src->nonce;
+                        tx_auth_list[i].y_parity = src->y_parity;
+                        tx_auth_list[i].r = src->r;
+                        tx_auth_list[i].s = src->s;
+                        tx_auth_list[i].signer = src->signer;
+                    }
+                    tx.authorization_list = tx_auth_list;
+                    tx.authorization_list_count = test->transaction.authorization_list_count;
+                }
+            }
             
             // Convert access list to transaction format
             access_list_entry_t *tx_access_list = NULL;
@@ -254,6 +278,7 @@ bool test_runner_run_state_test(test_runner_t *runner,
                     
                     transaction_result_free(&tx_result);
                     if (tx_access_list) free(tx_access_list);
+                    if (tx_auth_list) free(tx_auth_list);
                     
                     if (runner->config.stop_on_fail) {
                         goto cleanup;
@@ -267,7 +292,8 @@ bool test_runner_run_state_test(test_runner_t *runner,
                     transaction_result_free(&tx_result);
                 }
                 if (tx_access_list) free(tx_access_list);
-                
+                if (tx_auth_list) free(tx_auth_list);
+
                 // Test passes for this case
                 continue;
             }
@@ -277,11 +303,13 @@ bool test_runner_run_state_test(test_runner_t *runner,
                 result->status = TEST_ERROR;
                 test_result_add_failure(result, "execution", NULL, NULL, "Transaction execution failed but no exception was expected");
                 if (tx_access_list) free(tx_access_list);
+                if (tx_auth_list) free(tx_auth_list);
                 goto cleanup;
             }
             
-            // Free access list
+            // Free access list and auth list
             if (tx_access_list) free(tx_access_list);
+            if (tx_auth_list) free(tx_auth_list);
             
             // Note: EVM errors (STACK_UNDERFLOW, OUT_OF_GAS, etc.) are valid
             // transaction outcomes in Ethereum — the transaction is still processed

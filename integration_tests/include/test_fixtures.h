@@ -98,6 +98,19 @@ typedef struct {
 } test_access_list_t;
 
 /**
+ * Authorization tuple for EIP-7702 set code transactions
+ */
+typedef struct {
+    uint256_t chain_id;
+    address_t address;       // Delegate target
+    uint64_t nonce;
+    uint8_t y_parity;
+    uint256_t r;
+    uint256_t s;
+    address_t signer;        // Pre-computed signer from test JSON
+} test_authorization_t;
+
+/**
  * Transaction data
  */
 typedef struct {
@@ -130,6 +143,11 @@ typedef struct {
     uint256_t max_fee_per_blob_gas;
     hash_t *blob_versioned_hashes;
     size_t blob_versioned_hashes_count;
+
+    // EIP-7702 Authorization list
+    test_authorization_t *authorization_list;
+    size_t authorization_list_count;
+    bool has_authorization_list;  // true if authorizationList field present in JSON
 } test_transaction_t;
 
 /**

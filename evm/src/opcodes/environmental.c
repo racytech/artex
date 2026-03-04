@@ -574,7 +574,7 @@ evm_status_t op_extcodesize(evm_t *evm)
         return EVM_OUT_OF_GAS;
     }
 
-    // Get code size from state
+    // Get code size from state (no delegation resolution per EIP-7702 spec)
     uint32_t code_size = evm_state_get_code_size(evm->state, &addr);
 
     // Push code size onto stack
@@ -649,7 +649,7 @@ evm_status_t op_extcodecopy(evm_t *evm)
             return EVM_INTERNAL_ERROR;
         }
 
-        // Get code from state
+        // Get code from state (no delegation resolution per EIP-7702 spec)
         uint32_t code_size = 0;
         const uint8_t *code = evm_state_get_code_ptr(evm->state, &addr, &code_size);
 
@@ -719,17 +719,17 @@ evm_status_t op_extcodehash(evm_t *evm)
         return EVM_OUT_OF_GAS;
     }
 
-    // Get code hash from state
+    // Get code hash from state (no delegation resolution per EIP-7702 spec)
+    // EIP-1052 + EIP-161: return 0 for empty/non-existent accounts,
+    // keccak256(code) otherwise
     uint256_t hash = UINT256_ZERO;
 
-    // Check if account exists
-    if (evm_state_exists(evm->state, &addr))
+    if (!evm_state_is_empty(evm->state, &addr))
     {
         hash_t code_hash = evm_state_get_code_hash(evm->state, &addr);
         // Convert hash_t (32 bytes) to uint256_t
         hash = uint256_from_bytes(code_hash.bytes, 32);
     }
-    // If account doesn't exist, hash remains 0
 
     if (!evm_stack_push(evm->stack, &hash))
     {

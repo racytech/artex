@@ -326,6 +326,50 @@ bool parse_transaction(const cJSON *json, test_transaction_t *out) {
         }
     }
 
+    // EIP-7702 authorization list
+    const cJSON *auth_list = cJSON_GetObjectItemCaseSensitive(json, "authorizationList");
+    if (auth_list && cJSON_IsArray(auth_list)) {
+        out->has_authorization_list = true;
+        int count = cJSON_GetArraySize(auth_list);
+        if (count > 0) {
+            out->authorization_list = calloc(count, sizeof(test_authorization_t));
+            if (!out->authorization_list) return false;
+            out->authorization_list_count = count;
+            int idx = 0;
+            const cJSON *item;
+            cJSON_ArrayForEach(item, auth_list) {
+                if (cJSON_IsObject(item)) {
+                    test_authorization_t *auth = &out->authorization_list[idx];
+                    if (json_get_string(item, "chainId", &str))
+                        parse_uint256(str, &auth->chain_id);
+                    if (json_get_string(item, "address", &str))
+                        parse_address(str, &auth->address);
+                    if (json_get_string(item, "nonce", &str)) {
+                        uint256_t nonce_u256;
+                        parse_uint256(str, &nonce_u256);
+                        auth->nonce = uint256_to_uint64(&nonce_u256);
+                    }
+                    if (json_get_string(item, "yParity", &str)) {
+                        uint256_t yp;
+                        parse_uint256(str, &yp);
+                        auth->y_parity = (uint8_t)uint256_to_uint64(&yp);
+                    } else if (json_get_string(item, "v", &str)) {
+                        uint256_t v;
+                        parse_uint256(str, &v);
+                        auth->y_parity = (uint8_t)uint256_to_uint64(&v);
+                    }
+                    if (json_get_string(item, "r", &str))
+                        parse_uint256(str, &auth->r);
+                    if (json_get_string(item, "s", &str))
+                        parse_uint256(str, &auth->s);
+                    if (json_get_string(item, "signer", &str))
+                        parse_address(str, &auth->signer);
+                    idx++;
+                }
+            }
+        }
+    }
+
     return true;
 }
 

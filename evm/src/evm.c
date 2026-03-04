@@ -286,6 +286,26 @@ void evm_mark_storage_warm(evm_t *evm, const address_t *addr, const uint256_t *k
 }
 
 //==============================================================================
+// EIP-7702 Delegation Resolution
+//==============================================================================
+
+bool evm_resolve_delegation(evm_state_t *state, const address_t *addr, address_t *target_addr)
+{
+    if (!state || !addr || !target_addr) return false;
+
+    uint32_t code_len = 0;
+    const uint8_t *code = evm_state_get_code_ptr(state, addr, &code_len);
+
+    if (code && code_len == 23 &&
+        code[0] == 0xef && code[1] == 0x01 && code[2] == 0x00) {
+        memcpy(target_addr->bytes, &code[3], 20);
+        return true;
+    }
+
+    return false;
+}
+
+//==============================================================================
 // Result Helpers
 //==============================================================================
 
@@ -651,6 +671,15 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         // For CALL, load code from the code address in state
         uint32_t code_len = 0;
         const uint8_t *contract_code = evm_state_get_code_ptr(evm->state, &msg->code_addr, &code_len);
+
+        // EIP-7702: If code is a delegation designator, load delegated code
+        if (contract_code && code_len == 23 &&
+            contract_code[0] == 0xef && contract_code[1] == 0x01 && contract_code[2] == 0x00)
+        {
+            address_t delegate_addr;
+            memcpy(delegate_addr.bytes, &contract_code[3], 20);
+            contract_code = evm_state_get_code_ptr(evm->state, &delegate_addr, &code_len);
+        }
 
         if (contract_code && code_len > 0)
         {
