@@ -202,7 +202,7 @@ add_executable(test_verkle_state
 target_link_libraries(test_verkle_state verkle_state)
 add_test(NAME test_verkle_state COMMAND test_verkle_state)
 
-# Test: Verkle commitment store (hash_store-backed persistence)
+# Test: Verkle commitment store (art_store-backed persistence)
 add_executable(test_verkle_commit_store
     state/tests/test_verkle_commit_store.c
 )
