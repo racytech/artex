@@ -91,6 +91,49 @@ static uint64_t calculate_floor_data_gas(const transaction_t *tx, evm_fork_t for
 }
 
 /**
+ * EIP-4844: fake_exponential for blob base fee calculation
+ * Approximates factor * e^(numerator/denominator) using integer arithmetic.
+ *
+ * def fake_exponential(factor, numerator, denominator):
+ *     i = 1
+ *     output = 0
+ *     numerator_accum = factor * denominator
+ *     while numerator_accum > 0:
+ *         output += numerator_accum
+ *         numerator_accum = (numerator_accum * numerator) // (denominator * i)
+ *         i += 1
+ *     return output // denominator
+ */
+static uint256_t fake_exponential(const uint256_t *factor, const uint256_t *numerator, const uint256_t *denominator) {
+    uint256_t i = uint256_from_uint64(1);
+    uint256_t output = UINT256_ZERO;
+    uint256_t numerator_accum = uint256_mul(factor, denominator);
+
+    while (!uint256_is_zero(&numerator_accum)) {
+        output = uint256_add(&output, &numerator_accum);
+        // numerator_accum = (numerator_accum * numerator) / (denominator * i)
+        uint256_t num_product = uint256_mul(&numerator_accum, numerator);
+        uint256_t den_product = uint256_mul(denominator, &i);
+        if (uint256_is_zero(&den_product)) break;
+        numerator_accum = uint256_div(&num_product, &den_product);
+        uint256_t one = uint256_from_uint64(1);
+        i = uint256_add(&i, &one);
+    }
+
+    if (uint256_is_zero(denominator)) return UINT256_ZERO;
+    return uint256_div(&output, denominator);
+}
+
+/**
+ * EIP-4844: Calculate blob base fee from excess blob gas
+ */
+uint256_t calc_blob_gas_price(const uint256_t *excess_blob_gas) {
+    uint256_t min_blob_base_fee = uint256_from_uint64(1);
+    uint256_t blob_base_fee_update_fraction = uint256_from_uint64(3338477);
+    return fake_exponential(&min_blob_base_fee, excess_blob_gas, &blob_base_fee_update_fraction);
+}
+
+/**
  * Calculate effective gas price based on transaction type
  */
 uint256_t transaction_effective_gas_price(
@@ -188,7 +231,8 @@ bool transaction_execute(
         .difficulty = env->difficulty,
         .coinbase = env->coinbase,
         .base_fee = env->base_fee,
-        .chain_id = evm->chain_config ? uint256_from_uint64(evm->chain_config->chain_id) : uint256_from_uint64(1)
+        .chain_id = evm->chain_config ? uint256_from_uint64(evm->chain_config->chain_id) : uint256_from_uint64(1),
+        .excess_blob_gas = env->excess_blob_gas
     };
     evm_set_block_env(evm, &block_env);
 
@@ -204,6 +248,39 @@ bool transaction_execute(
     if (tx->type == TX_TYPE_EIP4844 && evm->fork < FORK_CANCUN) {
         LOG_EVM_ERROR("EIP-4844 type-3 tx not valid before Cancun");
         return false;
+    }
+
+    // EIP-4844 blob transaction validations
+    if (tx->type == TX_TYPE_EIP4844) {
+        // Blob tx cannot be contract creation
+        if (tx->is_create) {
+            LOG_EVM_ERROR("EIP-4844: blob tx cannot be contract creation");
+            return false;
+        }
+        // Must have at least one blob hash
+        if (tx->blob_versioned_hashes_count == 0) {
+            LOG_EVM_ERROR("EIP-4844: blob tx must have at least one blob hash");
+            return false;
+        }
+        // Max blobs per block: 6 in Cancun (max_blob_gas=786432, gas_per_blob=131072)
+        if (tx->blob_versioned_hashes_count > 6) {
+            LOG_EVM_ERROR("EIP-4844: too many blobs (%zu > 6)", tx->blob_versioned_hashes_count);
+            return false;
+        }
+        // Validate blob hash version: must start with VERSIONED_HASH_VERSION_KZG = 0x01
+        for (size_t i = 0; i < tx->blob_versioned_hashes_count; i++) {
+            if (tx->blob_versioned_hashes[i].bytes[0] != 0x01) {
+                LOG_EVM_ERROR("EIP-4844: invalid blob hash version byte 0x%02x at index %zu",
+                              tx->blob_versioned_hashes[i].bytes[0], i);
+                return false;
+            }
+        }
+        // max_fee_per_blob_gas must be >= blob_base_fee
+        uint256_t blob_base_fee = calc_blob_gas_price(&env->excess_blob_gas);
+        if (uint256_lt(&tx->max_fee_per_blob_gas, &blob_base_fee)) {
+            LOG_EVM_ERROR("EIP-4844: max_fee_per_blob_gas below blob base fee");
+            return false;
+        }
     }
 
     // EIP-3860 (Shanghai+): Reject contract creation with initcode > MAX_INITCODE_SIZE
@@ -242,7 +319,7 @@ bool transaction_execute(
         }
     }
 
-    // Balance check: sender must have enough for maximum gas cost + value
+    // Balance check: sender must have enough for maximum gas cost + value + blob gas cost
     // EIP-1559: use max_fee_per_gas (not effective_gas_price) for balance check
     {
         uint256_t max_gas_price;
@@ -254,6 +331,15 @@ bool transaction_execute(
         uint256_t gl = uint256_from_uint64(tx->gas_limit);
         uint256_t max_gas_cost = uint256_mul(&max_gas_price, &gl);
         uint256_t total_cost = uint256_add(&max_gas_cost, &tx->value);
+
+        // EIP-4844: add blob gas cost (max_fee_per_blob_gas * blob_count * GAS_PER_BLOB)
+        if (tx->type == TX_TYPE_EIP4844) {
+            uint64_t total_blob_gas = tx->blob_versioned_hashes_count * 131072; // GAS_PER_BLOB = 2^17
+            uint256_t blob_gas = uint256_from_uint64(total_blob_gas);
+            uint256_t blob_cost = uint256_mul(&tx->max_fee_per_blob_gas, &blob_gas);
+            total_cost = uint256_add(&total_cost, &blob_cost);
+        }
+
         uint256_t sender_balance = evm_state_get_balance(state, &tx->sender);
         if (uint256_lt(&sender_balance, &total_cost)) {
             LOG_EVM_ERROR("Insufficient sender balance for max gas cost + value");
@@ -270,8 +356,14 @@ bool transaction_execute(
         }
     }
 
+    // Set transaction context on EVM
+    evm->tx.origin = tx->sender;
+    evm->tx.gas_price = transaction_effective_gas_price(tx, env);
+    evm->tx.blob_hashes = tx->blob_versioned_hashes;
+    evm->tx.blob_hashes_count = tx->blob_versioned_hashes_count;
+
     // Calculate effective gas price
-    uint256_t effective_gas_price = transaction_effective_gas_price(tx, env);
+    uint256_t effective_gas_price = evm->tx.gas_price;
     uint256_t gas_limit_u256 = uint256_from_uint64(tx->gas_limit);
     uint256_t gas_cost = uint256_mul(&effective_gas_price, &gas_limit_u256);
 
@@ -301,6 +393,20 @@ bool transaction_execute(
         return false;
     }
 
+    // EIP-4844: deduct blob gas cost from sender (blob gas is burned, not paid to coinbase)
+    uint256_t blob_gas_cost = UINT256_ZERO;
+    if (tx->type == TX_TYPE_EIP4844) {
+        uint256_t blob_base_fee = calc_blob_gas_price(&env->excess_blob_gas);
+        uint64_t total_blob_gas = tx->blob_versioned_hashes_count * 131072;
+        uint256_t blob_gas_u256 = uint256_from_uint64(total_blob_gas);
+        blob_gas_cost = uint256_mul(&blob_base_fee, &blob_gas_u256);
+        if (!evm_state_sub_balance(state, &tx->sender, &blob_gas_cost)) {
+            LOG_EVM_ERROR("Failed to deduct blob gas cost from sender");
+            evm_state_revert(state, snapshot);
+            return false;
+        }
+    }
+
     // Snapshot AFTER nonce increment and gas deduction, but BEFORE value transfer
     // and contract creation. Per Ethereum spec, on EVM error/revert we revert
     // value transfer and execution state, but keep nonce increment and gas deduction.
@@ -310,11 +416,11 @@ bool transaction_execute(
     bool collision = false;
     if (tx->is_create) {
         // EIP-684: collision if account has nonce or code
-        // EIP-7610 (Prague+): also collision if account has non-empty storage
+        // EIP-7610 (retroactive): also collision if account has non-empty storage
         uint64_t existing_nonce = evm_state_get_nonce(state, &contract_address);
         uint32_t existing_code = evm_state_get_code_size(state, &contract_address);
         collision = (existing_nonce > 0 || existing_code > 0);
-        if (!collision && evm->fork >= FORK_PRAGUE) {
+        if (!collision) {
             collision = evm_state_has_storage(state, &contract_address);
         }
         if (collision) {

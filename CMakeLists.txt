@@ -97,8 +97,9 @@ add_library(evm STATIC
     evm/src/opcodes/block.c
     evm/src/opcodes/create.c
     evm/src/precompile.c
+    evm/vendor/mini-gmp.c
 )
-target_include_directories(evm PUBLIC ${CMAKE_SOURCE_DIR}/evm/include)
+target_include_directories(evm PUBLIC ${CMAKE_SOURCE_DIR}/evm/include ${CMAKE_SOURCE_DIR}/evm/vendor)
 target_link_libraries(evm evm_state common ssl crypto secp256k1)
 
 #==============================================================================

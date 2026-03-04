@@ -454,9 +454,6 @@ evm_status_t op_selfdestruct(evm_t *evm)
     // Get current contract balance
     uint256_t balance = evm_state_get_balance(evm->state, &evm->msg.recipient);
 
-    // Check if beneficiary exists for gas calculation
-    bool beneficiary_exists = evm_state_exists(evm->state, &beneficiary_addr);
-
     // Calculate gas cost - fork-dependent
     uint64_t gas_cost = 0;
 
@@ -475,10 +472,31 @@ evm_status_t op_selfdestruct(evm_t *evm)
             }
         }
 
-        // EIP-150: Add new account creation cost if sending balance to non-existent account
-        if (!beneficiary_exists && !uint256_is_zero(&balance))
+        // EIP-3529 (London+): skip new account cost if contract already self-destructed
+        bool skip_new_account = false;
+        if (evm->fork >= FORK_LONDON)
         {
-            gas_cost += 25000;
+            skip_new_account = evm_state_is_self_destructed(evm->state, &evm->msg.recipient);
+        }
+
+        if (!skip_new_account && !uint256_is_zero(&balance))
+        {
+            // Spurious Dragon+ (EIP-161): 25000 if beneficiary is empty
+            // Pre-Spurious Dragon (EIP-150): 25000 if beneficiary doesn't exist
+            bool charge_new_account;
+            if (evm->fork >= FORK_SPURIOUS_DRAGON)
+            {
+                charge_new_account = evm_state_is_empty(evm->state, &beneficiary_addr);
+            }
+            else
+            {
+                charge_new_account = !evm_state_exists(evm->state, &beneficiary_addr);
+            }
+
+            if (charge_new_account)
+            {
+                gas_cost += 25000;
+            }
         }
     }
     // Pre-TW: SELFDESTRUCT costs 0 gas

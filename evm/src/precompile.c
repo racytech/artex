@@ -13,6 +13,7 @@
 #include <secp256k1.h>
 #include <secp256k1_recovery.h>
 #include "keccak256.h"
+#include "mini-gmp.h"
 
 // Helper: compute keccak256 of data into out (32 bytes)
 static void keccak256_hash(const uint8_t *data, size_t len, uint8_t out[32])
@@ -169,7 +170,7 @@ static evm_status_t precompile_ecrecover(const uint8_t *input, size_t input_size
 // SHA-256 Precompile (0x02)
 //==============================================================================
 
-// Gas: 60 base + 12 per word (EIP-150+), 12 base + 6 per word (pre-EIP-150)
+// Gas: 60 base + 12 per word (constant across all forks)
 // Input: arbitrary bytes
 // Output: 32 bytes — SHA-256 digest
 static evm_status_t precompile_sha256(const uint8_t *input, size_t input_size,
@@ -178,9 +179,7 @@ static evm_status_t precompile_sha256(const uint8_t *input, size_t input_size,
                                       evm_fork_t fork)
 {
     uint64_t words = (input_size + 31) / 32;
-    uint64_t cost = (fork >= FORK_TANGERINE_WHISTLE)
-                    ? 60 + 12 * words
-                    : 12 + 6 * words;
+    uint64_t cost = 60 + 12 * words;
 
     if (*gas < cost)
         return EVM_OUT_OF_GAS;
@@ -199,7 +198,7 @@ static evm_status_t precompile_sha256(const uint8_t *input, size_t input_size,
 // RIPEMD-160 Precompile (0x03)
 //==============================================================================
 
-// Gas: 600 base + 120 per word (EIP-150+), 120 base + 12 per word (pre-EIP-150)
+// Gas: 600 base + 120 per word (constant across all forks)
 // Input: arbitrary bytes
 // Output: 32 bytes — RIPEMD-160 digest left-padded to 32 bytes
 static evm_status_t precompile_ripemd160(const uint8_t *input, size_t input_size,
@@ -208,9 +207,7 @@ static evm_status_t precompile_ripemd160(const uint8_t *input, size_t input_size
                                          evm_fork_t fork)
 {
     uint64_t words = (input_size + 31) / 32;
-    uint64_t cost = (fork >= FORK_TANGERINE_WHISTLE)
-                    ? 600 + 120 * words
-                    : 120 + 12 * words;
+    uint64_t cost = 600 + 120 * words;
 
     if (*gas < cost)
         return EVM_OUT_OF_GAS;
@@ -239,9 +236,7 @@ static evm_status_t precompile_identity(const uint8_t *input, size_t input_size,
                                         evm_fork_t fork)
 {
     uint64_t words = (input_size + 31) / 32;
-    uint64_t cost = (fork >= FORK_TANGERINE_WHISTLE)
-                    ? 15 + 3 * words
-                    : 3 + 1 * words;
+    uint64_t cost = 15 + 3 * words;
 
     if (*gas < cost)
         return EVM_OUT_OF_GAS;
@@ -413,6 +408,262 @@ static evm_status_t precompile_blake2f(const uint8_t *input, size_t input_size,
 }
 
 //==============================================================================
+// MODEXP Precompile (0x05) — EIP-198 / EIP-2565
+//==============================================================================
+
+// Read a 32-byte big-endian uint from input (zero-padded if short).
+// Returns UINT64_MAX if the value doesn't fit in uint64_t.
+static uint64_t modexp_read_len(const uint8_t *input, size_t input_size, size_t offset)
+{
+    uint8_t buf[32];
+    memset(buf, 0, 32);
+    if (offset < input_size)
+    {
+        size_t avail = input_size - offset;
+        size_t n = avail < 32 ? avail : 32;
+        memcpy(buf, input + offset, n);
+    }
+
+    // Check that the high 24 bytes are zero (value must fit in uint64_t)
+    for (int i = 0; i < 24; i++)
+    {
+        if (buf[i] != 0)
+            return UINT64_MAX;
+    }
+    uint64_t val = 0;
+    for (int i = 24; i < 32; i++)
+        val = (val << 8) | buf[i];
+    return val;
+}
+
+// Find the highest set bit position (0-indexed from MSB) in a big-endian byte buffer.
+// Returns 0 if all bytes are zero.
+static uint64_t modexp_head_bit_len(const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++)
+    {
+        if (data[i] != 0)
+        {
+            // Find highest bit in this byte
+            uint8_t b = data[i];
+            unsigned bits = 0;
+            while (b > 0) { bits++; b >>= 1; }
+            // Total bit length = bits in this byte + 8 * remaining bytes
+            return (uint64_t)bits + 8 * (len - 1 - i);
+        }
+    }
+    return 0;
+}
+
+// EIP-198 mult_complexity (Byzantium to Istanbul)
+static uint64_t modexp_mult_complexity_eip198(uint64_t x)
+{
+    if (x <= 64)
+        return x * x;
+    else if (x <= 1024)
+        return x * x / 4 + 96 * x - 3072;
+    else
+        return x * x / 16 + 480 * x - 199680;
+}
+
+// EIP-2565 mult_complexity (Berlin+)
+static uint64_t modexp_mult_complexity_eip2565(uint64_t x)
+{
+    uint64_t words = (x + 7) / 8;
+    return words * words;
+}
+
+static uint64_t modexp_gas(uint64_t base_len, uint64_t exp_len, uint64_t mod_len,
+                            const uint8_t *exp_head, size_t exp_head_len,
+                            evm_fork_t fork)
+{
+    // Compute adjusted exponent length
+    uint64_t adjusted_exp_len = 0;
+    uint64_t head_bit_len = modexp_head_bit_len(exp_head, exp_head_len);
+
+    if (exp_len <= 32)
+    {
+        // adjusted_exp_len = floor(log2(exponent)) = bit_length - 1
+        adjusted_exp_len = (head_bit_len > 0) ? head_bit_len - 1 : 0;
+    }
+    else
+    {
+        // 8 * (exp_len - 32) + floor(log2(first_32_bytes))
+        adjusted_exp_len = 8 * (exp_len - 32);
+        if (head_bit_len > 0)
+            adjusted_exp_len += head_bit_len - 1;
+    }
+
+    uint64_t max_len = base_len > mod_len ? base_len : mod_len;
+
+    if (fork >= FORK_BERLIN)
+    {
+        // EIP-2565
+        uint64_t mc = modexp_mult_complexity_eip2565(max_len);
+        uint64_t iter = adjusted_exp_len > 1 ? adjusted_exp_len : 1;
+        uint64_t gas = mc * iter / 3;
+        return gas > 200 ? gas : 200;
+    }
+    else
+    {
+        // EIP-198
+        uint64_t mc = modexp_mult_complexity_eip198(max_len);
+        uint64_t iter = adjusted_exp_len > 1 ? adjusted_exp_len : 1;
+        return mc * iter / 20;
+    }
+}
+
+static evm_status_t precompile_modexp(const uint8_t *input, size_t input_size,
+                                       uint64_t *gas,
+                                       uint8_t **output, size_t *output_size,
+                                       evm_fork_t fork)
+{
+    // Parse lengths (3 x 32 bytes at offset 0, 32, 64)
+    uint64_t base_len = modexp_read_len(input, input_size, 0);
+    uint64_t exp_len = modexp_read_len(input, input_size, 32);
+    uint64_t mod_len = modexp_read_len(input, input_size, 64);
+
+    // Overflow check: if any length is > 2^32 it will cost too much gas anyway
+    if (base_len == UINT64_MAX || exp_len == UINT64_MAX || mod_len == UINT64_MAX)
+        return EVM_OUT_OF_GAS;
+
+    // Get exponent head (first min(32, exp_len) bytes) for gas calculation
+    size_t exp_head_len = exp_len < 32 ? (size_t)exp_len : 32;
+    uint8_t exp_head[32];
+    memset(exp_head, 0, 32);
+    size_t exp_offset = 96 + base_len;
+    if (exp_offset < input_size)
+    {
+        size_t avail = input_size - exp_offset;
+        size_t n = avail < exp_head_len ? avail : exp_head_len;
+        memcpy(exp_head, input + exp_offset, n);
+    }
+
+    // Compute gas cost
+    uint64_t cost = modexp_gas(base_len, exp_len, mod_len, exp_head, exp_head_len, fork);
+    if (*gas < cost)
+        return EVM_OUT_OF_GAS;
+    *gas -= cost;
+
+    // mod_len == 0: return empty
+    if (mod_len == 0)
+    {
+        *output = NULL;
+        *output_size = 0;
+        return EVM_SUCCESS;
+    }
+
+    // Helper: safe read from input with zero-padding
+    // data starts at offset 96; base at 96, exp at 96+base_len, mod at 96+base_len+exp_len
+    size_t data_offset = 96;
+
+    // Allocate buffers for base, exp, mod bytes (zero-padded)
+    uint8_t *base_bytes = calloc((size_t)base_len + 1, 1);
+    uint8_t *exp_bytes = calloc((size_t)exp_len + 1, 1);
+    uint8_t *mod_bytes = calloc((size_t)mod_len + 1, 1);
+    if ((!base_bytes && base_len > 0) || (!exp_bytes && exp_len > 0) || !mod_bytes)
+    {
+        free(base_bytes);
+        free(exp_bytes);
+        free(mod_bytes);
+        return EVM_INTERNAL_ERROR;
+    }
+
+    // Copy from input (with bounds checking + zero-padding)
+    size_t base_off = data_offset;
+    size_t exp_off = data_offset + base_len;
+    size_t mod_off = data_offset + base_len + exp_len;
+
+    for (uint64_t i = 0; i < base_len; i++)
+    {
+        size_t idx = base_off + i;
+        base_bytes[i] = (idx < input_size) ? input[idx] : 0;
+    }
+    for (uint64_t i = 0; i < exp_len; i++)
+    {
+        size_t idx = exp_off + i;
+        exp_bytes[i] = (idx < input_size) ? input[idx] : 0;
+    }
+    for (uint64_t i = 0; i < mod_len; i++)
+    {
+        size_t idx = mod_off + i;
+        mod_bytes[i] = (idx < input_size) ? input[idx] : 0;
+    }
+
+    // Import into GMP
+    mpz_t b, e, m, r;
+    mpz_init(b);
+    mpz_init(e);
+    mpz_init(m);
+    mpz_init(r);
+
+    if (base_len > 0)
+        mpz_import(b, (size_t)base_len, 1, 1, 0, 0, base_bytes);
+    if (exp_len > 0)
+        mpz_import(e, (size_t)exp_len, 1, 1, 0, 0, exp_bytes);
+    if (mod_len > 0)
+        mpz_import(m, (size_t)mod_len, 1, 1, 0, 0, mod_bytes);
+
+    // Compute: if mod == 0, result is all zeros
+    if (mpz_sgn(m) == 0)
+    {
+        // Result is mod_len zero bytes
+        *output = calloc((size_t)mod_len, 1);
+        if (!*output)
+        {
+            mpz_clear(b); mpz_clear(e); mpz_clear(m); mpz_clear(r);
+            free(base_bytes); free(exp_bytes); free(mod_bytes);
+            return EVM_INTERNAL_ERROR;
+        }
+        *output_size = (size_t)mod_len;
+    }
+    else
+    {
+        // mpz_powm: r = b^e mod m
+        // Note: mini-gmp returns 1 for exp=0 without reducing mod m,
+        // so we explicitly reduce afterward
+        mpz_powm(r, b, e, m);
+        mpz_mod(r, r, m);
+
+        // Export result to big-endian bytes
+        *output = calloc((size_t)mod_len, 1);
+        if (!*output)
+        {
+            mpz_clear(b); mpz_clear(e); mpz_clear(m); mpz_clear(r);
+            free(base_bytes); free(exp_bytes); free(mod_bytes);
+            return EVM_INTERNAL_ERROR;
+        }
+
+        if (mpz_sgn(r) != 0)
+        {
+            size_t count = 0;
+            uint8_t *raw = (uint8_t *)mpz_export(NULL, &count, 1, 1, 0, 0, r);
+            if (raw && count > 0)
+            {
+                // Right-align in output buffer (big-endian, zero-padded on left)
+                size_t out_len = (size_t)mod_len;
+                if (count <= out_len)
+                    memcpy(*output + (out_len - count), raw, count);
+                else
+                    memcpy(*output, raw + (count - out_len), out_len);
+                free(raw);
+            }
+        }
+        *output_size = (size_t)mod_len;
+    }
+
+    mpz_clear(b);
+    mpz_clear(e);
+    mpz_clear(m);
+    mpz_clear(r);
+    free(base_bytes);
+    free(exp_bytes);
+    free(mod_bytes);
+
+    return EVM_SUCCESS;
+}
+
+//==============================================================================
 // Stub for unimplemented precompiles
 //==============================================================================
 
@@ -450,17 +701,19 @@ evm_status_t precompile_execute(const address_t *addr,
         return precompile_identity(input, input_size, gas, output, output_size, fork);
 
     case PRECOMPILE_MODEXP:
+        return precompile_modexp(input, input_size, gas, output, output_size, fork);
+
     case PRECOMPILE_BN256_ADD:
     case PRECOMPILE_BN256_MUL:
     case PRECOMPILE_BN256_PAIRING:
+        return precompile_stub(idx, gas);
+
     case PRECOMPILE_BLAKE2F:
         return precompile_blake2f(input, input_size, gas, output, output_size);
     case PRECOMPILE_POINT_EVAL:
     case PRECOMPILE_BLS_G1ADD:
-    case PRECOMPILE_BLS_G1MUL:
     case PRECOMPILE_BLS_G1MSM:
     case PRECOMPILE_BLS_G2ADD:
-    case PRECOMPILE_BLS_G2MUL:
     case PRECOMPILE_BLS_G2MSM:
     case PRECOMPILE_BLS_PAIRING:
     case PRECOMPILE_BLS_MAP_G1:

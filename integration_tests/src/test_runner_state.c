@@ -14,6 +14,7 @@ extern uint64_t get_time_microseconds(void);
 extern chain_config_t *create_test_chain_config(const char *fork_name);
 extern bool hash_equals(const hash_t *a, const hash_t *b);
 
+
 //==============================================================================
 // State Test Runner
 //==============================================================================
@@ -143,7 +144,10 @@ bool test_runner_run_state_test(test_runner_t *runner,
             // Determine transaction type based on available fields
             // The presence of accessLists in the JSON indicates EIP-2930 (even if empty)
             transaction_type_t tx_type = TX_TYPE_LEGACY;
-            if (!uint256_is_zero(&test->transaction.max_fee_per_gas)) {
+            if (!uint256_is_zero(&test->transaction.max_fee_per_blob_gas) ||
+                test->transaction.blob_versioned_hashes_count > 0) {
+                tx_type = TX_TYPE_EIP4844;
+            } else if (!uint256_is_zero(&test->transaction.max_fee_per_gas)) {
                 tx_type = TX_TYPE_EIP1559;
             } else if (access_list) {
                 tx_type = TX_TYPE_EIP2930;
@@ -164,7 +168,10 @@ bool test_runner_run_state_test(test_runner_t *runner,
                 .data_size = data_len,
                 .is_create = test->transaction.is_create,
                 .access_list = NULL,
-                .access_list_count = 0
+                .access_list_count = 0,
+                .max_fee_per_blob_gas = test->transaction.max_fee_per_blob_gas,
+                .blob_versioned_hashes = test->transaction.blob_versioned_hashes,
+                .blob_versioned_hashes_count = test->transaction.blob_versioned_hashes_count
             };
             
             // Convert access list to transaction format
@@ -193,6 +200,8 @@ bool test_runner_run_state_test(test_runner_t *runner,
                 .gas_limit = uint256_to_uint64(&test->env.gas_limit),
                 .difficulty = test->env.difficulty,
                 .base_fee = test->env.base_fee,
+                .prev_randao = test->env.prev_randao,
+                .excess_blob_gas = test->env.excess_blob_gas,
                 .skip_coinbase_payment = false  // State tests include coinbase payment in expected state root
             };
             
@@ -204,7 +213,8 @@ bool test_runner_run_state_test(test_runner_t *runner,
                 .difficulty = block_env.difficulty,
                 .coinbase = block_env.coinbase,
                 .base_fee = block_env.base_fee,
-                .chain_id = uint256_from_uint64(runner->evm->chain_config->chain_id)
+                .chain_id = uint256_from_uint64(runner->evm->chain_config->chain_id),
+                .excess_blob_gas = block_env.excess_blob_gas,
             };
             evm_set_block_env(runner->evm, &evm_block);
             
@@ -292,7 +302,7 @@ bool test_runner_run_state_test(test_runner_t *runner,
                 
                 test_result_add_failure(result, "state_root", expected_str, actual_str,
                                       "State root mismatch");
-                
+
                 free(expected_str);
                 free(actual_str);
                 

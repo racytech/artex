@@ -5,6 +5,7 @@
 #include "evm.h"
 #include "interpreter.h"
 #include "precompile.h"
+#include "transaction.h"
 #include "fork.h"
 #include "evm_stack.h"
 #include "evm_memory.h"
@@ -199,6 +200,11 @@ void evm_set_block_env(evm_t *evm, const evm_block_env_t *block)
 
     // Recompute fork based on new block number
     evm->fork = fork_get_active(block->number, evm->chain_config);
+
+    // EIP-4844: compute blob base fee from excess blob gas
+    if (evm->fork >= FORK_CANCUN) {
+        evm->block.blob_base_fee = calc_blob_gas_price(&block->excess_blob_gas);
+    }
 
     LOG_EVM_DEBUG("Set block environment: number=%lu, fork=%s",
               block->number, fork_get_name(evm->fork));
@@ -545,15 +551,26 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     }
 
     //==========================================================================
-    // Value Transfer
+    // Value Transfer & Account Touch
     //==========================================================================
 
-    // Transfer value if non-zero (for CALL family, not CREATE - CREATE handles it separately)
-    // Only transfer for internal calls (depth > 0) - top-level calls already transferred in transaction layer
-    if (msg->depth > 0 && (msg->kind == EVM_CALL || msg->kind == EVM_CALLCODE) && !uint256_is_zero(&msg->value))
+    if (msg->depth > 0)
     {
-        evm_state_sub_balance(evm->state, &msg->caller, &msg->value);
-        evm_state_add_balance(evm->state, &msg->recipient, &msg->value);
+        // Touch recipient for CALL/STATICCALL — ensures the account exists in the
+        // state trie. On pre-EIP-161 (Frontier/Homestead) touched empty accounts
+        // appear in the state root. On EIP-161+ they are pruned at root computation.
+        if (msg->kind == EVM_CALL || msg->kind == EVM_STATICCALL)
+        {
+            uint256_t zero = UINT256_ZERO;
+            evm_state_add_balance(evm->state, &msg->recipient, &zero);
+        }
+
+        // Transfer value if non-zero (CALL or CALLCODE, not CREATE — CREATE handles it separately)
+        if ((msg->kind == EVM_CALL || msg->kind == EVM_CALLCODE) && !uint256_is_zero(&msg->value))
+        {
+            evm_state_sub_balance(evm->state, &msg->caller, &msg->value);
+            evm_state_add_balance(evm->state, &msg->recipient, &msg->value);
+        }
     }
 
     // Handle contract creation

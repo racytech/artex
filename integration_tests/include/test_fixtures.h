@@ -125,6 +125,11 @@ typedef struct {
     // Access lists (EIP-2930) - Array for multiple test cases
     test_access_list_t *access_lists;
     size_t access_lists_count;
+
+    // EIP-4844 Blob transaction fields
+    uint256_t max_fee_per_blob_gas;
+    hash_t *blob_versioned_hashes;
+    size_t blob_versioned_hashes_count;
 } test_transaction_t;
 
 /**
@@ -189,7 +194,9 @@ typedef struct {
     uint256_t number;
     uint256_t timestamp;
     uint256_t difficulty;
-    uint256_t base_fee;     // EIP-1559 (optional)
+    uint256_t base_fee;         // EIP-1559 (optional)
+    hash_t prev_randao;         // Post-merge PREVRANDAO (currentRandom)
+    uint256_t excess_blob_gas;  // EIP-4844 (currentExcessBlobGas)
 } test_env_t;
 
 /**

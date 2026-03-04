@@ -687,6 +687,10 @@ evm_status_t op_extcodehash(evm_t *evm)
         return EVM_INTERNAL_ERROR;
     }
 
+    // EIP-1052: EXTCODEHASH introduced in Constantinople
+    if (evm->fork < FORK_CONSTANTINOPLE)
+        return EVM_INVALID_OPCODE;
+
     // Pop address from stack
     uint256_t address_u256;
     if (!evm_stack_pop(evm->stack, &address_u256))

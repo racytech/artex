@@ -588,10 +588,19 @@ uint64_t gas_call_cost(evm_fork_t fork,
     if (has_value)
     {
         cost += 9000;
+    }
 
-        // Account creation (if recipient doesn't exist)
-        if (!account_exists)
+    // Account creation cost (if recipient doesn't exist)
+    if (!account_exists)
+    {
+        if (fork < FORK_SPURIOUS_DRAGON)
         {
+            // Pre-EIP-161: charge 25000 for calling any non-existent account
+            cost += 25000;
+        }
+        else if (has_value)
+        {
+            // Post-EIP-161: only charge 25000 when transferring value
             cost += 25000;
         }
     }

@@ -68,7 +68,12 @@ typedef struct {
     // Access list (EIP-2930)
     access_list_entry_t *access_list;
     size_t access_list_count;
-    
+
+    // EIP-4844 Blob fields
+    uint256_t max_fee_per_blob_gas;
+    const hash_t *blob_versioned_hashes;
+    size_t blob_versioned_hashes_count;
+
     // Flags
     bool is_create;            // True if this is a contract creation
 } transaction_t;
@@ -84,6 +89,7 @@ typedef struct {
     uint256_t difficulty;
     uint256_t base_fee;        // EIP-1559 base fee
     hash_t prev_randao;        // Post-merge: PREVRANDAO (replaces difficulty)
+    uint256_t excess_blob_gas; // EIP-4844 excess blob gas
     bool skip_coinbase_payment; // Skip coinbase payment (for state tests)
 } block_env_t;
 
@@ -167,8 +173,16 @@ uint256_t transaction_effective_gas_price(
 );
 
 /**
+ * EIP-4844: Calculate blob base fee from excess blob gas
+ *
+ * @param excess_blob_gas Excess blob gas from block header
+ * @return Blob base fee
+ */
+uint256_t calc_blob_gas_price(const uint256_t *excess_blob_gas);
+
+/**
  * Free transaction result resources
- * 
+ *
  * @param result Transaction result to free
  */
 void transaction_result_free(transaction_result_t *result);

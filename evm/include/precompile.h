@@ -46,16 +46,14 @@ extern "C" {
 #define PRECOMPILE_BLAKE2F         0x09
 #define PRECOMPILE_POINT_EVAL      0x0A
 
-// BLS12-381 precompiles (Prague+, EIP-2537)
+// BLS12-381 precompiles (Prague+, EIP-2537) — 7 precompiles at 0x0B-0x11
 #define PRECOMPILE_BLS_G1ADD       0x0B
-#define PRECOMPILE_BLS_G1MUL       0x0C
-#define PRECOMPILE_BLS_G1MSM       0x0D
-#define PRECOMPILE_BLS_G2ADD       0x0E
-#define PRECOMPILE_BLS_G2MUL       0x0F
-#define PRECOMPILE_BLS_G2MSM       0x10
-#define PRECOMPILE_BLS_PAIRING     0x11
-#define PRECOMPILE_BLS_MAP_G1      0x12
-#define PRECOMPILE_BLS_MAP_G2      0x13
+#define PRECOMPILE_BLS_G1MSM       0x0C
+#define PRECOMPILE_BLS_G2ADD       0x0D
+#define PRECOMPILE_BLS_G2MSM       0x0E
+#define PRECOMPILE_BLS_PAIRING     0x0F
+#define PRECOMPILE_BLS_MAP_G1      0x10
+#define PRECOMPILE_BLS_MAP_G2      0x11
 
 //==============================================================================
 // Precompile Interface

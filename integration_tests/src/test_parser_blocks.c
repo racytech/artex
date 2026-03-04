@@ -304,6 +304,28 @@ bool parse_transaction(const cJSON *json, test_transaction_t *out) {
         }
     }
     
+    // EIP-4844 blob fields
+    if (json_get_string(json, "maxFeePerBlobGas", &str)) {
+        parse_uint256(str, &out->max_fee_per_blob_gas);
+    }
+
+    const cJSON *blob_hashes = cJSON_GetObjectItemCaseSensitive(json, "blobVersionedHashes");
+    if (blob_hashes && cJSON_IsArray(blob_hashes)) {
+        int count = cJSON_GetArraySize(blob_hashes);
+        if (count > 0) {
+            out->blob_versioned_hashes = calloc(count, sizeof(hash_t));
+            if (!out->blob_versioned_hashes) return false;
+            out->blob_versioned_hashes_count = count;
+            int idx = 0;
+            const cJSON *item;
+            cJSON_ArrayForEach(item, blob_hashes) {
+                if (cJSON_IsString(item)) {
+                    parse_hash(item->valuestring, &out->blob_versioned_hashes[idx++]);
+                }
+            }
+        }
+    }
+
     return true;
 }
 
@@ -341,6 +363,14 @@ bool parse_environment(const cJSON *json, test_env_t *out) {
     if (json_get_string(json, "currentBaseFee", &str)) {
         parse_uint256(str, &out->base_fee);
     }
-    
+
+    if (json_get_string(json, "currentRandom", &str)) {
+        parse_hash(str, &out->prev_randao);
+    }
+
+    if (json_get_string(json, "currentExcessBlobGas", &str)) {
+        parse_uint256(str, &out->excess_blob_gas);
+    }
+
     return true;
 }

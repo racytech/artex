@@ -138,16 +138,24 @@ static evm_status_t execute_create(evm_t *evm,
     // Increment sender nonce BEFORE snapshot — persists even if CREATE fails
     evm_state_set_nonce(evm->state, &evm->msg.recipient, sender_nonce + 1);
 
+    // EIP-2929 (Berlin+): mark contract address as warm BEFORE collision check.
+    // Per EIP-2929, the target address is added to accessed_addresses regardless
+    // of whether CREATE/CREATE2 succeeds or fails due to collision.
+    if (evm->fork >= FORK_BERLIN)
+    {
+        evm_mark_address_warm(evm, contract_addr);
+    }
+
     //==========================================================================
     // Collision Detection
     //==========================================================================
 
     // EIP-684: collision if target has non-zero nonce or code
-    // EIP-7610 (Prague+): also collision if target has non-empty storage
+    // EIP-7610 (retroactive): also collision if target has non-empty storage
     uint64_t target_nonce = evm_state_get_nonce(evm->state, contract_addr);
     uint32_t target_code_size = evm_state_get_code_size(evm->state, contract_addr);
     bool collision = (target_nonce > 0 || target_code_size > 0);
-    if (!collision && evm->fork >= FORK_PRAGUE)
+    if (!collision)
     {
         collision = evm_state_has_storage(evm->state, contract_addr);
     }
@@ -186,12 +194,6 @@ static evm_status_t execute_create(evm_t *evm,
     if (evm->fork >= FORK_SPURIOUS_DRAGON)
     {
         evm_state_set_nonce(evm->state, contract_addr, 1);
-    }
-
-    // EIP-2929 (Berlin+): mark contract address as warm
-    if (evm->fork >= FORK_BERLIN)
-    {
-        evm_mark_address_warm(evm, contract_addr);
     }
 
     //==========================================================================

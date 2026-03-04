@@ -88,6 +88,7 @@ void state_test_free(state_test_t *test) {
     // Free transaction
     free(test->transaction.gas_limit);
     free(test->transaction.value);
+    free(test->transaction.blob_versioned_hashes);
     
     for (size_t i = 0; i < test->transaction.data_count; i++) {
         free(test->transaction.data[i]);

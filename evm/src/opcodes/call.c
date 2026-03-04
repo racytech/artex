@@ -105,7 +105,16 @@ static evm_status_t prepare_call(
     //==========================================================================
 
     // For new_account gas: only CALL can create accounts; CALLCODE/DELEGATECALL/STATICCALL cannot
-    bool account_exists = can_create_account ? evm_state_exists(evm->state, target_addr) : true;
+    // Pre-EIP-161: check if account exists
+    // EIP-161+ (Spurious Dragon): check if account is empty (go-ethereum uses Empty not Exist)
+    bool account_exists;
+    if (!can_create_account) {
+        account_exists = true;  // CALLCODE/DELEGATECALL/STATICCALL never charge new account cost
+    } else if (evm->fork >= FORK_SPURIOUS_DRAGON) {
+        account_exists = !evm_state_is_empty(evm->state, target_addr);
+    } else {
+        account_exists = evm_state_exists(evm->state, target_addr);
+    }
 
     // Cold/warm access (Berlin+)
     bool is_cold = !evm_is_address_warm(evm, target_addr);

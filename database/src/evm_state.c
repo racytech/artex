@@ -62,8 +62,8 @@ typedef struct {
     journal_type_t type;
     address_t addr;
     union {
-        uint64_t old_nonce;
-        uint256_t old_balance;
+        struct { uint64_t val; bool dirty; } nonce;
+        struct { uint256_t val; bool dirty; } balance;
         struct { hash_t old_hash; bool old_has_code; uint8_t *old_code; uint32_t old_code_size; } code;
         struct { uint256_t slot; uint256_t old_value; } storage;
         uint256_t slot;             // WARM_SLOT
@@ -310,7 +310,7 @@ void evm_state_set_nonce(evm_state_t *es, const address_t *addr, uint64_t nonce)
     journal_entry_t je = {
         .type = JOURNAL_NONCE,
         .addr = *addr,
-        .data.old_nonce = ca->account.nonce
+        .data.nonce = { .val = ca->account.nonce, .dirty = ca->dirty }
     };
     journal_push(es, &je);
 
@@ -344,7 +344,7 @@ void evm_state_set_balance(evm_state_t *es, const address_t *addr,
     journal_entry_t je = {
         .type = JOURNAL_BALANCE,
         .addr = *addr,
-        .data.old_balance = ca->account.balance
+        .data.balance = { .val = ca->account.balance, .dirty = ca->dirty }
     };
     journal_push(es, &je);
 
@@ -773,13 +773,19 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
         case JOURNAL_NONCE: {
             cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
                 &es->accounts, je->addr.bytes, ADDRESS_SIZE, NULL);
-            if (ca) ca->account.nonce = je->data.old_nonce;
+            if (ca) {
+                ca->account.nonce = je->data.nonce.val;
+                ca->dirty = je->data.nonce.dirty;
+            }
             break;
         }
         case JOURNAL_BALANCE: {
             cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
                 &es->accounts, je->addr.bytes, ADDRESS_SIZE, NULL);
-            if (ca) ca->account.balance = je->data.old_balance;
+            if (ca) {
+                ca->account.balance = je->data.balance.val;
+                ca->dirty = je->data.balance.dirty;
+            }
             break;
         }
         case JOURNAL_CODE: {

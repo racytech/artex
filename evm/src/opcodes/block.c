@@ -310,9 +310,18 @@ evm_status_t op_blobhash(evm_t *evm)
     if (!evm_use_gas(evm, GAS_VERY_LOW))
         return EVM_OUT_OF_GAS;
 
-    // No blob transactions supported yet — push 0
-    uint256_t zero = UINT256_ZERO;
-    if (!evm_stack_push(evm->stack, &zero))
+    // EIP-4844: return versioned hash at index, or 0 if out of bounds
+    uint256_t result = UINT256_ZERO;
+    uint64_t idx = uint256_to_uint64(&index);
+
+    // Check if index is within range (if index > UINT64_MAX, high bits nonzero → skip)
+    uint256_t idx_check = uint256_from_uint64(idx);
+    if (uint256_is_equal(&index, &idx_check) && idx < evm->tx.blob_hashes_count && evm->tx.blob_hashes) {
+        // Convert hash_t (big-endian bytes) to uint256_t
+        result = uint256_from_bytes(evm->tx.blob_hashes[idx].bytes, HASH_SIZE);
+    }
+
+    if (!evm_stack_push(evm->stack, &result))
         return EVM_STACK_OVERFLOW;
 
     return EVM_SUCCESS;
@@ -334,8 +343,8 @@ evm_status_t op_blobbasefee(evm_t *evm)
     if (!evm_use_gas(evm, GAS_BASE))
         return EVM_OUT_OF_GAS;
 
-    // Blob base fee — default to 1 (minimum) when not set
-    uint256_t blob_base_fee = uint256_from_uint64(1);
+    // EIP-4844: push blob base fee from block environment
+    uint256_t blob_base_fee = evm->block.blob_base_fee;
     if (!evm_stack_push(evm->stack, &blob_base_fee))
         return EVM_STACK_OVERFLOW;
 

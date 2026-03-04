@@ -134,6 +134,8 @@ typedef struct
     address_t coinbase;    // Block beneficiary address
     uint256_t base_fee;    // Base fee per gas (EIP-1559)
     uint256_t chain_id;    // Chain ID
+    uint256_t excess_blob_gas; // EIP-4844: excess blob gas
+    uint256_t blob_base_fee;   // EIP-4844: computed blob base fee
     hash_t block_hash[256]; // Recent block hashes (for BLOCKHASH opcode)
 } evm_block_env_t;
 
@@ -148,6 +150,8 @@ typedef struct
 {
     address_t origin;    // Transaction origin (tx.origin)
     uint256_t gas_price; // Gas price for this transaction
+    const hash_t *blob_hashes;  // EIP-4844: blob versioned hashes
+    size_t blob_hashes_count;   // Number of blob hashes
 } evm_tx_context_t;
 
 //==============================================================================
