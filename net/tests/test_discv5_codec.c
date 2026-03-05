@@ -2,15 +2,16 @@
  * Test: Discv5 Packet Codec — all 4 wire test vectors from ethereum/devp2p.
  *
  * Tests:
- *  1. Key derivation — ECDH + HKDF → session keys
- *  2. ID nonce signing — SHA256-based identity proof
- *  3. Ordinary packet (flag=0) — ping message
- *  4. WHOAREYOU packet (flag=1)
- *  5. Handshake without ENR (flag=2, enr-seq matches)
- *  6. Handshake with ENR (flag=2, enr-seq=0)
- *  7. Decode ordinary — unmask + parse + decrypt
- *  8. Decode WHOAREYOU — unmask + parse
- *  9. Decode handshake — unmask + parse + decrypt
+ *  1. ECDH compressed + Key derivation — ECDH + HKDF → session keys
+ *  2. Handshake key derivation — independent KDF verification for packet tests
+ *  3. ID nonce signing — SHA256-based identity proof
+ *  4. Ordinary packet (flag=0) — ping message
+ *  5. WHOAREYOU packet (flag=1)
+ *  6. Handshake without ENR (flag=2, enr-seq matches)
+ *  7. Handshake with ENR (flag=2, enr-seq=0)
+ *  8. Decode ordinary — unmask + parse + decrypt
+ *  9. Decode WHOAREYOU — unmask + parse
+ * 10. Decode handshake — unmask + parse + decrypt
  */
 
 #include "../include/discv5_codec.h"
@@ -128,7 +129,78 @@ static void test_key_derivation(void) {
 }
 
 /* =========================================================================
- * Test 2: ID nonce signing
+ * Test 2: Handshake key derivation (independent verification)
+ *
+ * The handshake packet tests (tests 5–6) use hardcoded read-keys.
+ * This test verifies that discv5_derive_keys() with eph_key=0x0288ef00...
+ * actually produces those keys, closing the loop.
+ * ========================================================================= */
+
+static void test_handshake_key_derivation(void) {
+    TEST("handshake key derivation");
+
+    /* Ephemeral key used in both handshake packet tests */
+    uint8_t eph_key[32];
+    hex_to_bytes("0288ef00023598499cb6c940146d050d2b1fb914198c327f76aad590bead68b6", eph_key, 32);
+
+    /* Node B's compressed public key (destination) */
+    uint8_t dest_pub_comp[33];
+    hex_to_bytes("0317931e6e0840220642f230037d285d122bc59063221ef3226b1f403ddc69ca91", dest_pub_comp, 33);
+
+    uint8_t dest_pub[64];
+    ASSERT(secp256k1_wrap_decompress(dest_pub, dest_pub_comp), "decompress");
+
+    uint8_t node_id_a[32], node_id_b[32];
+    hex_to_bytes(NODE_A_ID, node_id_a, 32);
+    hex_to_bytes(NODE_B_ID, node_id_b, 32);
+
+    /* Case 1: challenge_data with enr-seq=1 (handshake without ENR) */
+    {
+        uint8_t cd[63];
+        hex_to_bytes("000000000000000000000000000000006469736376350001010102030405060708090a0b0c00180102030405060708090a0b0c0d0e0f100000000000000001", cd, 63);
+
+        discv5_keys_t keys;
+        ASSERT(discv5_derive_keys(&keys, eph_key, dest_pub,
+                                   cd, 63, node_id_a, node_id_b),
+               "derive keys (seq=1)");
+
+        uint8_t exp[16];
+        hex_to_bytes("4f9fac6de7567d1e3b1241dffe90f662", exp, 16);
+        if (memcmp(keys.initiator_key, exp, 16) != 0) {
+            char got[33];
+            bytes_to_hex_str(keys.initiator_key, 16, got);
+            printf("FAIL: initiator_key mismatch (seq=1): %s\n", got);
+            tests_failed++;
+            return;
+        }
+    }
+
+    /* Case 2: challenge_data with enr-seq=0 (handshake with ENR) */
+    {
+        uint8_t cd[63];
+        hex_to_bytes("000000000000000000000000000000006469736376350001010102030405060708090a0b0c00180102030405060708090a0b0c0d0e0f100000000000000000", cd, 63);
+
+        discv5_keys_t keys;
+        ASSERT(discv5_derive_keys(&keys, eph_key, dest_pub,
+                                   cd, 63, node_id_a, node_id_b),
+               "derive keys (seq=0)");
+
+        uint8_t exp[16];
+        hex_to_bytes("53b1c075f41876423154e157470c2f48", exp, 16);
+        if (memcmp(keys.initiator_key, exp, 16) != 0) {
+            char got[33];
+            bytes_to_hex_str(keys.initiator_key, 16, got);
+            printf("FAIL: initiator_key mismatch (seq=0): %s\n", got);
+            tests_failed++;
+            return;
+        }
+    }
+
+    PASS();
+}
+
+/* =========================================================================
+ * Test 3: ID nonce signing
  * ========================================================================= */
 
 static void test_id_nonce_signing(void) {
@@ -586,6 +658,7 @@ int main(void) {
 
     test_ecdh_compressed();
     test_key_derivation();
+    test_handshake_key_derivation();
     test_id_nonce_signing();
     test_encode_ordinary();
     test_encode_whoareyou();

@@ -394,6 +394,70 @@ static void test_max_size(void) {
 }
 
 /* =========================================================================
+ * Test 11: EIP-778 spec test vector — exact encoding match
+ * ========================================================================= */
+
+static void test_eip778_vector(void) {
+    TEST("EIP-778 spec test vector");
+
+    enr_t enr;
+    enr_init(&enr);
+    enr.seq = 1;
+
+    uint8_t priv[32];
+    hex_to_bytes("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291", priv, 32);
+
+    ASSERT(enr_set_v4_identity(&enr, priv), "set identity");
+
+    /* ip = 127.0.0.1 */
+    uint8_t ip[] = { 0x7f, 0x00, 0x00, 0x01 };
+    enr_set(&enr, "ip", ip, 4);
+
+    /* udp = 30303 = 0x765f */
+    uint8_t udp[] = { 0x76, 0x5f };
+    enr_set(&enr, "udp", udp, 2);
+
+    enr_sort(&enr);
+    ASSERT(enr_sign(&enr, priv), "sign");
+
+    /* Encode */
+    uint8_t buf[ENR_MAX_SIZE];
+    size_t encoded_len;
+    ASSERT(enr_encode(&enr, buf, &encoded_len), "encode");
+
+    /* Expected RLP from EIP-778 (134 bytes) */
+    uint8_t expected[134];
+    hex_to_bytes(
+        "f884b8407098ad865b00a582051940cb9cf36836572411a47278783077011599"
+        "ed5cd16b76f2635f4e234738f30813a89eb9137e3e3df5266e3a1f11df72ecf1"
+        "145ccb9c01826964827634826970847f00000189736563703235366b31a103ca"
+        "634cae0d49acb401d8a4c6b6fe8c55b70d115bf400769cc1400f3258cd313883"
+        "75647082765f",
+        expected, 134);
+
+    ASSERT(encoded_len == 134, "length = 134");
+
+    if (memcmp(buf, expected, 134) != 0) {
+        for (size_t i = 0; i < 134; i++) {
+            if (buf[i] != expected[i]) {
+                printf("FAIL: mismatch at byte %zu: got %02x, expected %02x\n",
+                       i, buf[i], expected[i]);
+                tests_failed++;
+                return;
+            }
+        }
+    }
+
+    /* Also verify decode roundtrip */
+    enr_t decoded;
+    ASSERT(enr_decode(&decoded, buf, encoded_len), "decode");
+    ASSERT(decoded.seq == 1, "decoded seq = 1");
+    ASSERT(enr_verify(&decoded), "decoded verifies");
+
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -413,6 +477,7 @@ int main(void) {
     test_tamper_fails();
     test_set_ip4();
     test_max_size();
+    test_eip778_vector();
 
     printf("-------------------------------------\n");
     printf("Results: %d passed, %d failed\n", tests_passed, tests_failed);
