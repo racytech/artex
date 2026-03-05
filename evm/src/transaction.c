@@ -133,9 +133,11 @@ static uint256_t fake_exponential(const uint256_t *factor, const uint256_t *nume
 /**
  * EIP-4844: Calculate blob base fee from excess blob gas
  */
-uint256_t calc_blob_gas_price(const uint256_t *excess_blob_gas) {
+uint256_t calc_blob_gas_price(const uint256_t *excess_blob_gas, evm_fork_t fork) {
     uint256_t min_blob_base_fee = uint256_from_uint64(1);
-    uint256_t blob_base_fee_update_fraction = uint256_from_uint64(3338477);
+    // EIP-7742: Prague uses different blob base fee update fraction
+    uint64_t fraction = (fork >= FORK_PRAGUE) ? 5007716 : 3338477;
+    uint256_t blob_base_fee_update_fraction = uint256_from_uint64(fraction);
     return fake_exponential(&min_blob_base_fee, excess_blob_gas, &blob_base_fee_update_fraction);
 }
 
@@ -309,9 +311,10 @@ bool transaction_execute(
             LOG_EVM_ERROR("EIP-4844: blob tx must have at least one blob hash");
             return false;
         }
-        // Max blobs per block: 6 in Cancun (max_blob_gas=786432, gas_per_blob=131072)
-        if (tx->blob_versioned_hashes_count > 6) {
-            LOG_EVM_ERROR("EIP-4844: too many blobs (%zu > 6)", tx->blob_versioned_hashes_count);
+        // Max blobs per block: 6 in Cancun, 9 in Prague (EIP-7742)
+        uint64_t max_blobs = (evm->fork >= FORK_PRAGUE) ? 9 : 6;
+        if (tx->blob_versioned_hashes_count > max_blobs) {
+            LOG_EVM_ERROR("EIP-4844: too many blobs (%zu > %lu)", tx->blob_versioned_hashes_count, max_blobs);
             return false;
         }
         // Validate blob hash version: must start with VERSIONED_HASH_VERSION_KZG = 0x01
@@ -323,7 +326,7 @@ bool transaction_execute(
             }
         }
         // max_fee_per_blob_gas must be >= blob_base_fee
-        uint256_t blob_base_fee = calc_blob_gas_price(&env->excess_blob_gas);
+        uint256_t blob_base_fee = calc_blob_gas_price(&env->excess_blob_gas, evm->fork);
         if (uint256_lt(&tx->max_fee_per_blob_gas, &blob_base_fee)) {
             LOG_EVM_ERROR("EIP-4844: max_fee_per_blob_gas below blob base fee");
             return false;
@@ -475,7 +478,7 @@ bool transaction_execute(
     // EIP-4844: deduct blob gas cost from sender (blob gas is burned, not paid to coinbase)
     uint256_t blob_gas_cost = UINT256_ZERO;
     if (tx->type == TX_TYPE_EIP4844) {
-        uint256_t blob_base_fee = calc_blob_gas_price(&env->excess_blob_gas);
+        uint256_t blob_base_fee = calc_blob_gas_price(&env->excess_blob_gas, evm->fork);
         uint64_t total_blob_gas = tx->blob_versioned_hashes_count * 131072;
         uint256_t blob_gas_u256 = uint256_from_uint64(total_blob_gas);
         blob_gas_cost = uint256_mul(&blob_base_fee, &blob_gas_u256);

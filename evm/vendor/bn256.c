@@ -6,6 +6,9 @@
 #include "bn256.h"
 #include <string.h>
 #include <stdlib.h>
+#ifdef BN256_DEBUG
+#include <stdio.h>
+#endif
 
 //==============================================================================
 // Constants (lazy-initialized)
@@ -615,9 +618,12 @@ static void fp6_neg(bn256_fp6_t *r, const bn256_fp6_t *a)
 // (a0 + a1*v + a2*v²)(b0 + b1*v + b2*v²)
 static void fp6_mul(bn256_fp6_t *r, const bn256_fp6_t *a, const bn256_fp6_t *b)
 {
+    // Compute into local temporaries to avoid aliasing bugs (r may == a or b)
     bn256_fp2_t t0, t1, t2, tmp1, tmp2;
+    bn256_fp2_t ra, rb, rc;
     fp2_init(&t0); fp2_init(&t1); fp2_init(&t2);
     fp2_init(&tmp1); fp2_init(&tmp2);
+    fp2_init(&ra); fp2_init(&rb); fp2_init(&rc);
 
     fp2_mul(&t0, &a->a, &b->a);   // t0 = a0*b0
     fp2_mul(&t1, &a->b, &b->b);   // t1 = a1*b1
@@ -626,31 +632,36 @@ static void fp6_mul(bn256_fp6_t *r, const bn256_fp6_t *a, const bn256_fp6_t *b)
     // c0 = t0 + ξ*((a1+a2)(b1+b2) - t1 - t2)
     fp2_add(&tmp1, &a->b, &a->c);
     fp2_add(&tmp2, &b->b, &b->c);
-    fp2_mul(&r->a, &tmp1, &tmp2);
-    fp2_sub(&r->a, &r->a, &t1);
-    fp2_sub(&r->a, &r->a, &t2);
-    fp2_mul_xi(&r->a, &r->a);
-    fp2_add(&r->a, &r->a, &t0);
+    fp2_mul(&ra, &tmp1, &tmp2);
+    fp2_sub(&ra, &ra, &t1);
+    fp2_sub(&ra, &ra, &t2);
+    fp2_mul_xi(&ra, &ra);
+    fp2_add(&ra, &ra, &t0);
 
     // c1 = (a0+a1)(b0+b1) - t0 - t1 + ξ*t2
     fp2_add(&tmp1, &a->a, &a->b);
     fp2_add(&tmp2, &b->a, &b->b);
-    fp2_mul(&r->b, &tmp1, &tmp2);
-    fp2_sub(&r->b, &r->b, &t0);
-    fp2_sub(&r->b, &r->b, &t1);
+    fp2_mul(&rb, &tmp1, &tmp2);
+    fp2_sub(&rb, &rb, &t0);
+    fp2_sub(&rb, &rb, &t1);
     fp2_mul_xi(&tmp1, &t2);
-    fp2_add(&r->b, &r->b, &tmp1);
+    fp2_add(&rb, &rb, &tmp1);
 
     // c2 = (a0+a2)(b0+b2) - t0 - t2 + t1
     fp2_add(&tmp1, &a->a, &a->c);
     fp2_add(&tmp2, &b->a, &b->c);
-    fp2_mul(&r->c, &tmp1, &tmp2);
-    fp2_sub(&r->c, &r->c, &t0);
-    fp2_sub(&r->c, &r->c, &t2);
-    fp2_add(&r->c, &r->c, &t1);
+    fp2_mul(&rc, &tmp1, &tmp2);
+    fp2_sub(&rc, &rc, &t0);
+    fp2_sub(&rc, &rc, &t2);
+    fp2_add(&rc, &rc, &t1);
+
+    fp2_copy(&r->a, &ra);
+    fp2_copy(&r->b, &rb);
+    fp2_copy(&r->c, &rc);
 
     fp2_clear(&t0); fp2_clear(&t1); fp2_clear(&t2);
     fp2_clear(&tmp1); fp2_clear(&tmp2);
+    fp2_clear(&ra); fp2_clear(&rb); fp2_clear(&rc);
 }
 
 static void fp6_square(bn256_fp6_t *r, const bn256_fp6_t *a)
@@ -1204,6 +1215,8 @@ static void g2_copy(bn256_g2_t *dst, const bn256_g2_t *src)
     fp2_copy(&dst->z, &src->z);
 }
 
+static void g2_scalar_mul(bn256_g2_t *r, const bn256_g2_t *pt, const mpz_t k);
+
 int bn256_g2_unmarshal(bn256_g2_t *pt, const uint8_t input[128])
 {
     bn256_ensure_init();
@@ -1241,6 +1254,17 @@ int bn256_g2_unmarshal(bn256_g2_t *pt, const uint8_t input[128])
     // Set Z = 1
     fp_set_ui(&pt->z.a, 1);
     fp_set_ui(&pt->z.b, 0);
+
+    // Subgroup check: pt * r must be infinity
+    bn256_g2_t check;
+    bn256_g2_init(&check);
+    g2_scalar_mul(&check, pt, bn256_r);
+    bool in_subgroup = g2_is_infinity(&check);
+    bn256_g2_clear(&check);
+
+    if (!in_subgroup)
+        return -1;
+
     return 0;
 }
 
@@ -1352,6 +1376,28 @@ static void g2_add(bn256_g2_t *r, const bn256_g2_t *p, const bn256_g2_t *q)
     fp2_clear(&J); fp2_clear(&rr); fp2_clear(&V);
 }
 
+// G2 scalar multiplication (double-and-add)
+static void g2_scalar_mul(bn256_g2_t *r, const bn256_g2_t *pt, const mpz_t k)
+{
+    g2_set_infinity(r);
+    if (mpz_sgn(k) == 0) return;
+
+    int nbits = (int)mpz_sizeinbase(k, 2);
+    bn256_g2_t tmp;
+    bn256_g2_init(&tmp);
+    for (int i = nbits - 1; i >= 0; i--)
+    {
+        g2_double(&tmp, r);
+        g2_copy(r, &tmp);
+        if (mpz_tstbit(k, i))
+        {
+            g2_add(&tmp, r, pt);
+            g2_copy(r, &tmp);
+        }
+    }
+    bn256_g2_clear(&tmp);
+}
+
 //==============================================================================
 // Optimal Ate Pairing
 // Reference: go-ethereum crypto/bn256/cloudflare/optimalAte.go
@@ -1424,344 +1470,211 @@ static void fp12_mul_line(bn256_fp12_t *r, const bn256_fp12_t *a, const line_res
 // Updates T to 2T, returns line coefficients
 static void line_func_double(line_result_t *l, bn256_g2_t *T, const bn256_g1_t *Q)
 {
-    // This computes the tangent line at T on the twist curve,
-    // evaluates it at Q (a G1 point), and doubles T.
-
-    bn256_fp2_t A, B, C, D, E, G, tmp;
-    fp2_init(&A); fp2_init(&B); fp2_init(&C); fp2_init(&D);
-    fp2_init(&E); fp2_init(&G); fp2_init(&tmp);
-
-    // A = (T.x * T.y) / 2
-    fp2_mul(&A, &T->x, &T->y);
-    // Divide by 2: multiply by inverse of 2
-    bn256_fp_t two_inv;
-    fp_init(&two_inv);
-    fp_set_ui(&two_inv, 2);
-    fp_inv(&two_inv, &two_inv);
-    fp2_mul_scalar(&A, &A, &two_inv);
-    fp_clear(&two_inv);
-
-    // B = T.y²
-    fp2_square(&B, &T->y);
-
-    // C = T.z²
-    fp2_square(&C, &T->z);
-
-    // D = 3 * twist_b * C  (twist_b = 3/(9+u))
-    twist_b_ensure_init();
-    fp2_mul(&D, &twist_b, &C);
-    fp2_add(&tmp, &D, &D);
-    fp2_add(&D, &tmp, &D);  // D = 3 * twist_b * C
-
-    // E = unused, let's call D as it is = 3b'C
-    // Following go-ethereum's lineFunctionDouble more carefully:
-
-    // G = (B + D) / 2
-    fp2_add(&G, &B, &D);
-    bn256_fp_t half;
-    fp_init(&half);
-    fp_set_ui(&half, 2);
-    fp_inv(&half, &half);
-    fp2_mul_scalar(&G, &G, &half);
-    fp_clear(&half);
-
-    // T.x = A * (B - D)
-    fp2_sub(&tmp, &B, &D);
-    fp2_mul(&T->x, &A, &tmp);
-
-    // T.y = G² - 3*D²
-    fp2_square(&T->y, &G);
-    fp2_square(&tmp, &D);
-    bn256_fp2_t three_d2;
-    fp2_init(&three_d2);
-    fp2_add(&three_d2, &tmp, &tmp);
-    fp2_add(&three_d2, &three_d2, &tmp);  // 3*D²
-    fp2_sub(&T->y, &T->y, &three_d2);
-
-    // T.z = B * T.z_old * ... wait
-    // Actually: T.z_new = B * T.z_old (the original T.z before we modify it)
-    // But we already used C = T.z². Let me track T.z_old.
-    // T.z_new = 2 * T.y_old * T.z_old ... but we need original y and z
-    // Let me re-read the algorithm more carefully.
-
-    // Actually, let me just use the standard doubling + line eval approach:
-    // The tangent line at T = (X, Y, Z) on the twist is:
-    // l(Q) is evaluated using Q's affine coordinates
-
-    // Let me use a cleaner formulation.
-    // For the tangent at T in Jacobian:
-    // lambda = 3*X²/(2*Y*Z) in the affine case
-    // Line: l(xQ, yQ) = yQ*Z_T³ - Y_T - lambda*(xQ*Z_T² - X_T)
-    // Which simplifies to specific coefficients for the sparse Fp12 representation.
-
-    // Following Section 3 of "High-Speed Software Implementation of the Optimal Ate Pairing over Barreto-Naehrig Curves"
-
-    // Line coefficients for the tangent at T evaluated at Q = (xQ, yQ):
-    // l.a = -2*Y*Z * yQ       (in Fp2, scaled by Fp element yQ)
-    // l.b = 3*X² * xQ         (in Fp2, scaled by Fp element xQ)
-    // l.c = 3*b'*Z² - Y²      (pure Fp2)
-
-    // But we also need to update T to 2T.
-    // Let's just do the doubling and line evaluation separately but efficiently.
-
-    fp2_clear(&A); fp2_clear(&B); fp2_clear(&C); fp2_clear(&D);
-    fp2_clear(&E); fp2_clear(&G); fp2_clear(&tmp); fp2_clear(&three_d2);
-
-    // OK, let me restart with a cleaner implementation.
-    // I'll compute the line coefficients and double T at the same time.
-
-    bn256_fp2_t X2, Y2, Z2, XY, YZ, XZ;
-    fp2_init(&X2); fp2_init(&Y2); fp2_init(&Z2);
-    fp2_init(&XY); fp2_init(&YZ); fp2_init(&XZ);
-
-    fp2_square(&X2, &T->x);     // X²
-    fp2_square(&Y2, &T->y);     // Y²
-    fp2_square(&Z2, &T->z);     // Z²
-
-    // Line coefficients (evaluated at Q with affine coords xQ, yQ in Fp):
-    // We represent them as elements that will multiply into Fp12 sparsely.
-
-    // a_coeff = -2*Y*Z  (will be multiplied by yQ from G1)
-    fp2_mul(&l->a, &T->y, &T->z);
-    fp2_add(&l->a, &l->a, &l->a);
-    fp2_neg(&l->a, &l->a);
-    // Scale by yQ (Fp element)
-    fp2_mul_scalar(&l->a, &l->a, &Q->y);
-
-    // b_coeff = 3*X²  (will be multiplied by xQ from G1)
-    fp2_add(&l->b, &X2, &X2);
-    fp2_add(&l->b, &l->b, &X2);  // 3*X²
-    fp2_mul_scalar(&l->b, &l->b, &Q->x);
-
-    // c_coeff = 3*b'*Z² - Y²
-    twist_b_ensure_init();
-    fp2_mul(&l->c, &twist_b, &Z2);
-    bn256_fp2_t three_bz2;
-    fp2_init(&three_bz2);
-    fp2_add(&three_bz2, &l->c, &l->c);
-    fp2_add(&three_bz2, &three_bz2, &l->c);  // 3*b'*Z²
-    fp2_sub(&l->c, &three_bz2, &Y2);
-
-    // Now double T using standard Jacobian doubling for y² = x³ + b' curve
-    // (a = 0 for BN curves)
-
-    // Use the efficient doubling:
-    // A = X*Y/2
-    fp2_mul(&XY, &T->x, &T->y);
-    fp_init(&two_inv);
-    fp_set_ui(&two_inv, 2);
-    fp_inv(&two_inv, &two_inv);
-    fp2_mul_scalar(&XY, &XY, &two_inv);
-    fp_clear(&two_inv);
-
-    // D = 3*b'*Z²  (already computed as three_bz2)
-    // X3 = XY * (Y² - 3*b'*Z²) = A * (Y² - D)
-    bn256_fp2_t Y2_minus_D;
-    fp2_init(&Y2_minus_D);
-    fp2_sub(&Y2_minus_D, &Y2, &three_bz2);
-    fp2_mul(&T->x, &XY, &Y2_minus_D);
-
-    // Z3 = Y² * Z²  ... wait, actually
-    // For a=0 curve doubling:
-    // Z3 = 2*Y*Z  ... wait that's not right either for Jacobian.
-    // Standard Jacobian doubling for a=0:
-    // M = 3*X²
-    // S = 4*X*Y²
-    // X3 = M² - 2S
-    // Y3 = M*(S-X3) - 8*Y⁴
-    // Z3 = 2*Y*Z
-
-    // Let me just use the standard formulas directly.
-    bn256_fp2_t M, S, Y4;
-    fp2_init(&M); fp2_init(&S); fp2_init(&Y4);
-
-    // M = 3*X²
-    fp2_add(&M, &X2, &X2);
-    fp2_add(&M, &M, &X2);
-
-    // S = 4*X*Y²
-    fp2_mul(&S, &T->x, &Y2);
-    // Wait, T->x was already modified above. This is a bug.
-    // I need to save original values before modifying T.
-    // Let me restructure.
-
-    fp2_clear(&M); fp2_clear(&S); fp2_clear(&Y4);
-    fp2_clear(&Y2_minus_D); fp2_clear(&three_bz2);
-    fp2_clear(&X2); fp2_clear(&Y2); fp2_clear(&Z2);
-    fp2_clear(&XY); fp2_clear(&YZ); fp2_clear(&XZ);
-
-    // ---- CLEAN RESTART of line_func_double ----
-    // Save original T coordinates
-    bn256_fp2_t ox, oy, oz;
-    fp2_init(&ox); fp2_init(&oy); fp2_init(&oz);
+    // Following go-ethereum's lineFunctionDouble (optimalAte.go).
+    // Save original T coordinates before modification.
+    bn256_fp2_t ox, oy, oz, oz2;
+    fp2_init(&ox); fp2_init(&oy); fp2_init(&oz); fp2_init(&oz2);
     fp2_copy(&ox, &T->x);
     fp2_copy(&oy, &T->y);
     fp2_copy(&oz, &T->z);
+    fp2_square(&oz2, &oz);  // Z² (= r.t in go-ethereum)
 
-    bn256_fp2_t ox2, oy2, oz2;
-    fp2_init(&ox2); fp2_init(&oy2); fp2_init(&oz2);
-    fp2_square(&ox2, &ox);
-    fp2_square(&oy2, &oy);
-    fp2_square(&oz2, &oz);
+    // Standard doubling intermediate values:
+    bn256_fp2_t A, B, C, D, E, G;
+    fp2_init(&A); fp2_init(&B); fp2_init(&C);
+    fp2_init(&D); fp2_init(&E); fp2_init(&G);
 
-    // Line coefficients
-    // a = -2*Y*Z * yQ
-    fp2_mul(&l->a, &oy, &oz);
-    fp2_add(&l->a, &l->a, &l->a);
-    fp2_neg(&l->a, &l->a);
-    fp2_mul_scalar(&l->a, &l->a, &Q->y);
+    fp2_square(&A, &ox);       // A = X²
+    fp2_square(&B, &oy);       // B = Y²
+    fp2_square(&C, &B);        // C = Y⁴
 
-    // b = 3*X² * xQ
-    fp2_add(&l->b, &ox2, &ox2);
-    fp2_add(&l->b, &l->b, &ox2);
+    // D = 2*((X+B)² - A - C) = 4*X*Y² (= S in standard doubling)
+    fp2_add(&D, &ox, &B);
+    fp2_square(&D, &D);
+    fp2_sub(&D, &D, &A);
+    fp2_sub(&D, &D, &C);
+    fp2_add(&D, &D, &D);       // D = 4*X*Y²
+
+    // E = 3*A = 3*X² (= M in standard doubling)
+    fp2_add(&E, &A, &A);
+    fp2_add(&E, &E, &A);
+
+    // G = E² = 9*X⁴
+    fp2_square(&G, &E);
+
+    // Point doubling: T = 2T
+    // X3 = G - 2*D
+    fp2_sub(&T->x, &G, &D);
+    fp2_sub(&T->x, &T->x, &D);
+
+    // Z3 = (Y+Z)² - B - Z² = 2*Y*Z
+    fp2_add(&T->z, &oy, &oz);
+    fp2_square(&T->z, &T->z);
+    fp2_sub(&T->z, &T->z, &B);
+    fp2_sub(&T->z, &T->z, &oz2);
+
+    // Y3 = E*(D - X3) - 8*C
+    fp2_sub(&T->y, &D, &T->x);
+    fp2_mul(&T->y, &E, &T->y);
+    bn256_fp2_t eightC;
+    fp2_init(&eightC);
+    fp2_add(&eightC, &C, &C);   // 2C
+    fp2_add(&eightC, &eightC, &eightC); // 4C
+    fp2_add(&eightC, &eightC, &eightC); // 8C
+    fp2_sub(&T->y, &T->y, &eightC);
+
+    // Line coefficients (go-ethereum naming: a, b, c → our l.c, l.b, l.a):
+    // l.b (go's b) = -2*E*Z² * xQ  (at position ω)
+    bn256_fp2_t t;
+    fp2_init(&t);
+    fp2_mul(&t, &E, &oz2);      // E * Z² = 3*X²*Z²
+    fp2_add(&t, &t, &t);        // 6*X²*Z²
+    fp2_neg(&l->b, &t);         // -6*X²*Z²
     fp2_mul_scalar(&l->b, &l->b, &Q->x);
 
-    // c = 3*b'*Z² - Y²
-    twist_b_ensure_init();
-    bn256_fp2_t bpz2;
-    fp2_init(&bpz2);
-    fp2_mul(&bpz2, &twist_b, &oz2);
-    fp2_add(&l->c, &bpz2, &bpz2);
-    fp2_add(&l->c, &l->c, &bpz2);  // 3*b'*Z²
-    fp2_sub(&l->c, &l->c, &oy2);
+    // l.c (go's a) = (X+E)² - A - G - 4*B  (at position ω³)
+    fp2_add(&l->c, &ox, &E);
+    fp2_square(&l->c, &l->c);
+    fp2_sub(&l->c, &l->c, &A);
+    fp2_sub(&l->c, &l->c, &G);
+    bn256_fp2_t fourB;
+    fp2_init(&fourB);
+    fp2_add(&fourB, &B, &B);
+    fp2_add(&fourB, &fourB, &fourB);
+    fp2_sub(&l->c, &l->c, &fourB);  // = 6*X³ - 4*Y²
 
-    // Double T using standard Jacobian (a=0)
-    // M = 3*X²
-    bn256_fp2_t dM, dS, dY4;
-    fp2_init(&dM); fp2_init(&dS); fp2_init(&dY4);
+    // l.a (go's c) = 2*Z3*Z² * yQ  (at position 1)
+    fp2_mul(&l->a, &T->z, &oz2);
+    fp2_add(&l->a, &l->a, &l->a);
+    fp2_mul_scalar(&l->a, &l->a, &Q->y);
 
-    fp2_add(&dM, &ox2, &ox2);
-    fp2_add(&dM, &dM, &ox2);  // 3X²
-
-    // S = 4*X*Y²
-    fp2_mul(&dS, &ox, &oy2);
-    fp2_add(&dS, &dS, &dS);
-    fp2_add(&dS, &dS, &dS);  // 4*X*Y²
-
-    // X3 = M² - 2S
-    fp2_square(&T->x, &dM);
-    fp2_sub(&T->x, &T->x, &dS);
-    fp2_sub(&T->x, &T->x, &dS);
-
-    // Z3 = 2*Y*Z
-    fp2_mul(&T->z, &oy, &oz);
-    fp2_add(&T->z, &T->z, &T->z);
-
-    // Y3 = M*(S - X3) - 8*Y⁴
-    fp2_square(&dY4, &oy2);  // Y⁴
-    fp2_sub(&T->y, &dS, &T->x);
-    fp2_mul(&T->y, &dM, &T->y);
-    fp2_add(&dY4, &dY4, &dY4);  // 2Y⁴
-    fp2_add(&dY4, &dY4, &dY4);  // 4Y⁴
-    fp2_add(&dY4, &dY4, &dY4);  // 8Y⁴
-    fp2_sub(&T->y, &T->y, &dY4);
-
-    fp2_clear(&ox); fp2_clear(&oy); fp2_clear(&oz);
-    fp2_clear(&ox2); fp2_clear(&oy2); fp2_clear(&oz2);
-    fp2_clear(&bpz2);
-    fp2_clear(&dM); fp2_clear(&dS); fp2_clear(&dY4);
+    fp2_clear(&ox); fp2_clear(&oy); fp2_clear(&oz); fp2_clear(&oz2);
+    fp2_clear(&A); fp2_clear(&B); fp2_clear(&C);
+    fp2_clear(&D); fp2_clear(&E); fp2_clear(&G);
+    fp2_clear(&eightC); fp2_clear(&t); fp2_clear(&fourB);
 }
 
 // Line function for addition: line through T and Q2 evaluated at Q1
 // Updates T to T + Q2
+// Following go-ethereum's lineFunctionAdd (optimalAte.go)
 static void line_func_add(line_result_t *l, bn256_g2_t *T,
                           const bn256_g2_t *Q2, const bn256_g1_t *Q1)
 {
-    // Save T coordinates
+    // T.z² (= r.t in go-ethereum)
     bn256_fp2_t t_z2;
     fp2_init(&t_z2);
     fp2_square(&t_z2, &T->z);
 
-    // U = Q2.x * T.z² - T.x
-    bn256_fp2_t U, t1;
-    fp2_init(&U); fp2_init(&t1);
-    fp2_mul(&U, &Q2->x, &t_z2);
-    fp2_sub(&U, &U, &T->x);  // U = Q2.x*Tz² - Tx
+    // r2 = Q2.y²
+    bn256_fp2_t r2;
+    fp2_init(&r2);
+    fp2_square(&r2, &Q2->y);
 
-    // V = Q2.y * T.z³ - T.y
-    bn256_fp2_t V;
-    fp2_init(&V);
-    fp2_mul(&V, &T->z, &t_z2);  // T.z³
-    fp2_mul(&V, &Q2->y, &V);
-    fp2_sub(&V, &V, &T->y);  // V = Q2.y*Tz³ - Ty
+    // B = Q2.x * T.z²
+    bn256_fp2_t B;
+    fp2_init(&B);
+    fp2_mul(&B, &Q2->x, &t_z2);
 
-    // Line coefficients:
-    // a = V * T.z * yQ1  (negated for the line equation)
-    // b = -U * xQ1
-    // c = U * T.y - V * T.x  (evaluated using original T)
+    // D = ((Q2.y + T.z)² - r2 - t_z2) * t_z2 = 2*Q2.y*T.z³
+    bn256_fp2_t D;
+    fp2_init(&D);
+    fp2_add(&D, &Q2->y, &T->z);
+    fp2_square(&D, &D);
+    fp2_sub(&D, &D, &r2);
+    fp2_sub(&D, &D, &t_z2);
+    fp2_mul(&D, &D, &t_z2);
 
-    // Actually, the line through T and Q2 evaluated at the G1 point Q1:
-    // In the twist setting:
-    // l(Q1) encodes as a sparse Fp12 element with:
-    // a = (Q2.y*Tz³ - Ty) * Tz * yQ1   ... this needs careful derivation
+    // H = B - T.x = Q2.x*T.z² - T.x
+    bn256_fp2_t H;
+    fp2_init(&H);
+    fp2_sub(&H, &B, &T->x);
 
-    // Let me use a simpler approach: compute chord line coefficients
-    // l(xQ1, yQ1) = V*Tz*(yQ1) - U*(xQ1) + (U*Ty - V*Tx*Tz^{-1}*...)
-    // This is getting complicated. Let me follow go-ethereum more directly.
+    // I = H², E = 4*H², J = H*E = 4*H³
+    bn256_fp2_t I, E, J;
+    fp2_init(&I); fp2_init(&E); fp2_init(&J);
+    fp2_square(&I, &H);
+    fp2_add(&E, &I, &I);
+    fp2_add(&E, &E, &E);
+    fp2_mul(&J, &H, &E);
 
-    // go-ethereum lineFunctionAdd:
-    // r0 = T.z² * Q2.y - T.y
-    // r1 = T.z² * Q2.x - T.x
-    // (r0 is what I called V, r1 is what I called U)
+    // L1 = D - 2*T.y = 2*(Q2.y*T.z³ - T.y)
+    bn256_fp2_t L1;
+    fp2_init(&L1);
+    fp2_sub(&L1, &D, &T->y);
+    fp2_sub(&L1, &L1, &T->y);
 
-    // a = r1 (the slope denominator, times twist)
-    // b = -r0 (the slope numerator, times twist)
-    // c = ...
+    // V_add = T.x * E = 4*T.x*H²
+    bn256_fp2_t V_add;
+    fp2_init(&V_add);
+    fp2_mul(&V_add, &T->x, &E);
 
-    // Actually from go-ethereum optimalAte.go lineFunctionAdd:
-    // The return values a, b, c form the line evaluation
-    // a = r1 ← this is U above
-    // b = -r0 ← this is -V above
-    // c = r0*T.x - r1*T.y (using original T)
+    // Point addition: compute new coordinates
+    bn256_fp2_t newX, newY, newZ, newT;
+    fp2_init(&newX); fp2_init(&newY); fp2_init(&newZ); fp2_init(&newT);
 
-    // Then these get combined with Q1 coordinates when multiplied into the accumulator.
+    // X3 = L1² - J - 2*V_add
+    fp2_square(&newX, &L1);
+    fp2_sub(&newX, &newX, &J);
+    fp2_sub(&newX, &newX, &V_add);
+    fp2_sub(&newX, &newX, &V_add);
 
-    // Line eval components:
-    // l.a = U * yQ1  (will be placed in the Fp12 multiplication correctly)
-    // l.b = -V * xQ1
-    // l.c = V*Tx - U*Ty
+    // Z3 = (T.z + H)² - t_z2 - I = 2*T.z*H
+    fp2_add(&newZ, &T->z, &H);
+    fp2_square(&newZ, &newZ);
+    fp2_sub(&newZ, &newZ, &t_z2);
+    fp2_sub(&newZ, &newZ, &I);
 
-    fp2_mul_scalar(&l->a, &U, &Q1->y);
-    fp2_neg(&t1, &V);
-    fp2_mul_scalar(&l->b, &t1, &Q1->x);
-    fp2_mul(&l->c, &V, &T->x);
-    fp2_mul(&t1, &U, &T->y);
-    fp2_sub(&l->c, &l->c, &t1);
+    // Y3 = L1*(V_add - X3) - 2*T.y*J
+    bn256_fp2_t t1;
+    fp2_init(&t1);
+    fp2_sub(&newY, &V_add, &newX);
+    fp2_mul(&newY, &L1, &newY);
+    fp2_mul(&t1, &T->y, &J);
+    fp2_add(&t1, &t1, &t1);
+    fp2_sub(&newY, &newY, &t1);
 
-    // Now update T = T + Q2 using addition formulas
-    // We have U = Q2.x*Tz² - Tx and V = Q2.y*Tz³ - Ty
-    // This is equivalent to the H and r values in standard addition
+    // Z3² (= rOut.t)
+    fp2_square(&newT, &newZ);
 
-    bn256_fp2_t U2, H3, S;
-    fp2_init(&U2); fp2_init(&H3); fp2_init(&S);
+    // Line coefficients (go's a, b, c → our l.c, l.b, l.a):
 
-    fp2_square(&U2, &U);        // U²
-    fp2_mul(&H3, &U2, &U);     // U³
+    // l.c (go's a) = 2*L1*Q2.x - ((Q2.y + Z3)² - r2 - Z3²)
+    bn256_fp2_t t_line;
+    fp2_init(&t_line);
+    fp2_add(&t_line, &Q2->y, &newZ);
+    fp2_square(&t_line, &t_line);
+    fp2_sub(&t_line, &t_line, &r2);
+    fp2_sub(&t_line, &t_line, &newT);  // = 2*Q2.y*Z3
 
-    // S = T.x * U²
-    fp2_mul(&S, &T->x, &U2);
+    bn256_fp2_t t2_line;
+    fp2_init(&t2_line);
+    fp2_mul(&t2_line, &L1, &Q2->x);
+    fp2_add(&t2_line, &t2_line, &t2_line);  // 2*L1*Q2.x
+    fp2_sub(&l->c, &t2_line, &t_line);
 
-    // T.x = V² - U³ - 2*S
-    fp2_square(&T->x, &V);
-    fp2_sub(&T->x, &T->x, &H3);
-    fp2_sub(&T->x, &T->x, &S);
-    fp2_sub(&T->x, &T->x, &S);
+    // l.a (go's c) = 2*Z3 * yQ1
+    fp2_add(&l->a, &newZ, &newZ);
+    fp2_mul_scalar(&l->a, &l->a, &Q1->y);
 
-    // T.y = V*(S - T.x) - T.y*U³
-    fp2_sub(&t1, &S, &T->x);
-    fp2_mul(&t1, &V, &t1);
-    fp2_mul(&T->y, &T->y, &H3);
-    fp2_sub(&T->y, &t1, &T->y);
+    // l.b (go's b) = -2*L1 * xQ1
+    fp2_neg(&l->b, &L1);
+    fp2_add(&l->b, &l->b, &l->b);
+    fp2_mul_scalar(&l->b, &l->b, &Q1->x);
 
-    // T.z = T.z * U
-    fp2_mul(&T->z, &T->z, &U);
+    // Update T
+    fp2_copy(&T->x, &newX);
+    fp2_copy(&T->y, &newY);
+    fp2_copy(&T->z, &newZ);
 
-    fp2_clear(&t_z2); fp2_clear(&U); fp2_clear(&t1); fp2_clear(&V);
-    fp2_clear(&U2); fp2_clear(&H3); fp2_clear(&S);
+    fp2_clear(&t_z2); fp2_clear(&r2); fp2_clear(&B); fp2_clear(&D);
+    fp2_clear(&H); fp2_clear(&I); fp2_clear(&E); fp2_clear(&J);
+    fp2_clear(&L1); fp2_clear(&V_add);
+    fp2_clear(&newX); fp2_clear(&newY); fp2_clear(&newZ); fp2_clear(&newT);
+    fp2_clear(&t1); fp2_clear(&t_line); fp2_clear(&t2_line);
 }
 
 // The BN parameter u and the loop parameter 6u+2
-// u = 4965661367071055456
+// u = 4965661367192848881
 // 6u+2 = 29793968203157093138  -- this is the value used in the Miller loop
 // Its NAF representation determines the loop structure.
 // We encode 6u+2 in binary with sign bits.
@@ -1918,9 +1831,9 @@ static void final_exponentiation(bn256_fp12_t *result, const bn256_fp12_t *f)
     // (p⁴ - p² + 1)/r = (p³ + p²(6u²+1) + p(-36u³-18u²-12u-1) + (-36u³-18u²-6u-1)) · (1/r')
     // But in practice, we use the formula involving exponentiations by u.
 
-    // u = 4965661367071055456 (the BN parameter)
+    // u = 4965661367192848881 (the BN parameter)
     mpz_t u_val;
-    mpz_init_set_str(u_val, "4965661367071055456", 10);
+    mpz_init_set_str(u_val, "4965661367192848881", 10);
 
     // Compute various powers of t0 by u
     fp12_exp(&fu, &t0, u_val);      // t0^u
@@ -1930,7 +1843,7 @@ static void final_exponentiation(bn256_fp12_t *result, const bn256_fp12_t *f)
     // Frobenius maps
     fp12_frobenius(&fp, &t0);       // t0^p
     fp12_frobenius(&t1, &fu);       // fu^p (t0^(u*p))
-    fp12_frobenius(&t2, &fu2);      // fu2^p (t0^(u²*p))
+    fp12_frobenius_p2(&t2, &fu2);   // fu2^(p²) — this is y2 in go-ethereum
 
     bn256_fp12_t fp2p, fp3p, fu2p, fu3p;
     fp12_init(&fp2p); fp12_init(&fp3p); fp12_init(&fu2p); fp12_init(&fu3p);
@@ -1938,8 +1851,8 @@ static void final_exponentiation(bn256_fp12_t *result, const bn256_fp12_t *f)
     fp12_frobenius_p2(&fp2_val, &t0);  // t0^(p²)
     fp12_frobenius(&fp3, &fp2_val);    // t0^(p³) = (t0^(p²))^p
 
-    fp12_frobenius_p2(&fu2p, &fu);     // fu^(p²)
-    fp12_frobenius(&fu3p, &fu2);       // fu2^p
+    fp12_frobenius(&fu2p, &fu2);        // fu2^p (go-ethereum: Frobenius(fu2))
+    fp12_frobenius(&fu3p, &fu3);        // fu3^p (go-ethereum: Frobenius(fu3))
 
     // y0 = fp * fp2 * fp3
     bn256_fp12_t y0, y1, y2, y3, y4, y5, y6;
@@ -2057,10 +1970,35 @@ int bn256_pairing_check(const bn256_g1_t *g1_points,
         fp12_clear(&tmp);
     }
 
+    // Debug: print full accumulator (all 12 Fp coefficients) before final exp
+    #ifdef BN256_DEBUG
+    {
+        char buf[200];
+        mpz_t *vals[] = {&acc.a.a.a.v, &acc.a.a.b.v, &acc.a.b.a.v, &acc.a.b.b.v,
+                         &acc.a.c.a.v, &acc.a.c.b.v, &acc.b.a.a.v, &acc.b.a.b.v,
+                         &acc.b.b.a.v, &acc.b.b.b.v, &acc.b.c.a.v, &acc.b.c.b.v};
+        for (int idx = 0; idx < 12; idx++) {
+            mpz_get_str(buf, 10, *vals[idx]);
+            fprintf(stderr, "ACC[%d] = %s\n", idx, buf);
+        }
+    }
+    #endif
+
     // Final exponentiation
     bn256_fp12_t result;
     fp12_init(&result);
     final_exponentiation(&result, &acc);
+
+    #ifdef BN256_DEBUG
+    {
+        char buf[80];
+        mpz_get_str(buf, 16, result.a.a.a.v);
+        fprintf(stderr, "DBG result.a.a.a = %s\n", buf);
+        mpz_get_str(buf, 16, result.a.a.b.v);
+        fprintf(stderr, "DBG result.a.a.b = %s\n", buf);
+        fprintf(stderr, "DBG fp12_is_one = %d\n", fp12_is_one(&result));
+    }
+    #endif
 
     int check = fp12_is_one(&result) ? 1 : 0;
 

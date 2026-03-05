@@ -203,7 +203,7 @@ void evm_set_block_env(evm_t *evm, const evm_block_env_t *block)
 
     // EIP-4844: compute blob base fee from excess blob gas
     if (evm->fork >= FORK_CANCUN) {
-        evm->block.blob_base_fee = calc_blob_gas_price(&block->excess_blob_gas);
+        evm->block.blob_base_fee = calc_blob_gas_price(&block->excess_blob_gas, evm->fork);
     }
 
     LOG_EVM_DEBUG("Set block environment: number=%lu, fork=%s",

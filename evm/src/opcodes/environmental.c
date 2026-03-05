@@ -696,7 +696,8 @@ evm_status_t op_extcodecopy(evm_t *evm)
             {
                 uint8_t byte = 0;
                 uint64_t src_idx = code_offset + i;
-                if (code && src_idx < code_size)
+                // Guard against uint64 overflow wrap-around
+                if (code && src_idx >= code_offset && src_idx < code_size)
                 {
                     byte = code[src_idx];
                 }
