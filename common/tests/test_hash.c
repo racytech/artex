@@ -163,16 +163,26 @@ static void test_real_ethereum_hashes(void) {
 
 static void test_hash_keccak256(void) {
     printf("Testing hash_keccak256...\n");
-    
-    // Note: This is a placeholder test since keccak256 is not implemented yet
+
+    // keccak256("hello") = 0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8
     const char* test_data = "hello";
     hash_t h = hash_keccak256((const uint8_t*)test_data, strlen(test_data));
-    
-    // Currently returns zero hash (placeholder)
-    assert(hash_is_zero(&h));
-    
-    printf("  ⚠️  Keccak-256 is placeholder (returns zero hash)\n");
-    printf("✅ hash_keccak256 placeholder passed\n");
+
+    hash_t expected;
+    assert(hash_from_hex("0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8", &expected));
+    assert(hash_equal(&h, &expected));
+
+    // keccak256("") = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
+    hash_t empty = hash_keccak256(NULL, 0);
+    hash_t expected_empty;
+    assert(hash_from_hex("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470", &expected_empty));
+    assert(hash_equal(&empty, &expected_empty));
+
+    char hex[67];
+    hash_to_hex(&h, hex);
+    printf("  keccak256(\"hello\") = %s\n", hex);
+    printf("  keccak256(\"\") verified\n");
+    printf("  hash_keccak256 passed\n");
 }
 
 int main(void) {
@@ -187,7 +197,6 @@ int main(void) {
     test_real_ethereum_hashes();
     test_hash_keccak256();
     
-    printf("\n✅ All hash tests passed!\n");
-    printf("Note: Keccak-256 implementation needed for production use.\n");
+    printf("\nAll hash tests passed!\n");
     return 0;
 }
