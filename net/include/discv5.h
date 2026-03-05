@@ -117,6 +117,12 @@ const uint8_t *discv5_engine_local_id(const discv5_engine_t *engine);
 /** Get the local ENR sequence number. */
 uint64_t discv5_engine_enr_seq(const discv5_engine_t *engine);
 
+/** Get the UDP socket file descriptor (for testing/polling). */
+int discv5_engine_udp_fd(const discv5_engine_t *engine);
+
+/** Get the bound UDP port (host byte order). */
+uint16_t discv5_engine_udp_port(const discv5_engine_t *engine);
+
 /**
  * Register a TALKREQ handler for a protocol.
  * The handler is called when a TALKREQ with matching protocol string arrives.

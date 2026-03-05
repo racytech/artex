@@ -914,6 +914,18 @@ uint64_t discv5_engine_enr_seq(const discv5_engine_t *e) {
     return e->local_enr.seq;
 }
 
+int discv5_engine_udp_fd(const discv5_engine_t *e) {
+    return e ? e->udp_fd : -1;
+}
+
+uint16_t discv5_engine_udp_port(const discv5_engine_t *e) {
+    if (!e || e->udp_fd < 0) return 0;
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    if (getsockname(e->udp_fd, (struct sockaddr *)&addr, &len) < 0) return 0;
+    return ntohs(addr.sin_port);
+}
+
 /* =========================================================================
  * Public API: add node, register handler
  * ========================================================================= */

@@ -553,6 +553,27 @@ add_executable(test_portal
 target_link_libraries(test_portal portal history)
 add_test(NAME test_portal COMMAND test_portal)
 
+# Test: Roundtrip (encode→decode→verify for all codecs, random inputs)
+add_executable(test_roundtrip
+    net/tests/test_roundtrip.c
+)
+target_link_libraries(test_roundtrip rlp bytes portal_wire ssz discv5 utp history)
+add_test(NAME test_roundtrip COMMAND test_roundtrip)
+
+# Test: uTP Stress (concurrent connections, packet loss, large transfers)
+add_executable(test_utp_stress
+    net/tests/test_utp_stress.c
+)
+target_link_libraries(test_utp_stress utp)
+add_test(NAME test_utp_stress COMMAND test_utp_stress)
+
+# Test: Loopback Integration (full stack — Discv5 + Portal via real UDP on localhost)
+add_executable(test_loopback
+    net/tests/test_loopback.c
+)
+target_link_libraries(test_loopback portal discv5 portal_wire ssz history)
+add_test(NAME test_loopback COMMAND test_loopback)
+
 #==============================================================================
 # Build Summary
 #==============================================================================
