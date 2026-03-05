@@ -14,6 +14,8 @@ set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG")
 include_directories(
     ${CMAKE_SOURCE_DIR}/database/include
     ${CMAKE_SOURCE_DIR}/common/include
+    ${CMAKE_SOURCE_DIR}/evm/include
+    ${CMAKE_SOURCE_DIR}/executor/include
     ${CMAKE_SOURCE_DIR}/third_party
 )
 
@@ -246,6 +248,27 @@ add_executable(bench_uthash_vs_art
     database/tests/bench_uthash_vs_art.c
 )
 target_link_libraries(bench_uthash_vs_art art_database)
+
+#==============================================================================
+# Block Executor (block header/body decode + transaction decode + execution)
+#==============================================================================
+
+add_library(block_executor STATIC
+    executor/src/block.c
+    executor/src/tx_decoder.c
+    executor/src/block_executor.c
+)
+target_include_directories(block_executor PUBLIC
+    ${CMAKE_SOURCE_DIR}/executor/include
+)
+target_link_libraries(block_executor evm common secp256k1)
+
+# Test: Block Executor (header/body decode, tx decode, execution)
+add_executable(test_block_executor
+    executor/tests/test_block_executor.c
+)
+target_link_libraries(test_block_executor block_executor evm evm_state state_db common)
+add_test(NAME test_block_executor COMMAND test_block_executor)
 
 #==============================================================================
 # Integration Tests (Ethereum test vectors — cJSON required)
