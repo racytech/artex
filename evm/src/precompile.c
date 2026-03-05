@@ -2,7 +2,7 @@
  * Precompiled Contracts Implementation
  *
  * Implemented: ECRECOVER (0x01), SHA-256 (0x02), RIPEMD-160 (0x03), IDENTITY (0x04)
- * Stubbed: MODEXP, BN256, BLAKE2F, POINT_EVAL, BLS12-381
+ * Stubbed: POINT_EVAL, BLS12-381
  */
 
 #include "precompile.h"
@@ -13,7 +13,9 @@
 #include <secp256k1.h>
 #include <secp256k1_recovery.h>
 #include "keccak256.h"
+#include "bn256.h"
 #include "mini-gmp.h"
+#include "blst.h"
 
 // Helper: compute keccak256 of data into out (32 bytes)
 static void keccak256_hash(const uint8_t *data, size_t len, uint8_t out[32])
@@ -664,6 +666,343 @@ static evm_status_t precompile_modexp(const uint8_t *input, size_t input_size,
 }
 
 //==============================================================================
+// BN256 ADD (0x06) — EIP-196
+//==============================================================================
+
+static evm_status_t precompile_bn256_add(const uint8_t *input, size_t input_size,
+                                         uint64_t *gas, uint8_t **output,
+                                         size_t *output_size, evm_fork_t fork)
+{
+    uint64_t required = (fork >= FORK_ISTANBUL) ? 150 : 500;
+    if (*gas < required)
+        return EVM_OUT_OF_GAS;
+    *gas -= required;
+
+    // Pad input to 128 bytes
+    uint8_t padded[128];
+    memset(padded, 0, 128);
+    if (input_size > 128) input_size = 128;
+    if (input_size > 0) memcpy(padded, input, input_size);
+
+    bn256_g1_t p1, p2, result;
+    bn256_g1_init(&p1);
+    bn256_g1_init(&p2);
+    bn256_g1_init(&result);
+
+    if (bn256_g1_unmarshal(&p1, padded) != 0 ||
+        bn256_g1_unmarshal(&p2, padded + 64) != 0)
+    {
+        bn256_g1_clear(&p1);
+        bn256_g1_clear(&p2);
+        bn256_g1_clear(&result);
+        *gas = 0;
+        return EVM_REVERT;
+    }
+
+    bn256_g1_add(&result, &p1, &p2);
+
+    *output = malloc(64);
+    bn256_g1_marshal(*output, &result);
+    *output_size = 64;
+
+    bn256_g1_clear(&p1);
+    bn256_g1_clear(&p2);
+    bn256_g1_clear(&result);
+    return EVM_SUCCESS;
+}
+
+//==============================================================================
+// BN256 MUL (0x07) — EIP-196
+//==============================================================================
+
+static evm_status_t precompile_bn256_mul(const uint8_t *input, size_t input_size,
+                                         uint64_t *gas, uint8_t **output,
+                                         size_t *output_size, evm_fork_t fork)
+{
+    uint64_t required = (fork >= FORK_ISTANBUL) ? 6000 : 40000;
+    if (*gas < required)
+        return EVM_OUT_OF_GAS;
+    *gas -= required;
+
+    // Pad input to 96 bytes
+    uint8_t padded[96];
+    memset(padded, 0, 96);
+    if (input_size > 96) input_size = 96;
+    if (input_size > 0) memcpy(padded, input, input_size);
+
+    bn256_g1_t pt, result;
+    bn256_g1_init(&pt);
+    bn256_g1_init(&result);
+
+    if (bn256_g1_unmarshal(&pt, padded) != 0)
+    {
+        bn256_g1_clear(&pt);
+        bn256_g1_clear(&result);
+        *gas = 0;
+        return EVM_REVERT;
+    }
+
+    bn256_g1_scalar_mul(&result, &pt, padded + 64);
+
+    *output = malloc(64);
+    bn256_g1_marshal(*output, &result);
+    *output_size = 64;
+
+    bn256_g1_clear(&pt);
+    bn256_g1_clear(&result);
+    return EVM_SUCCESS;
+}
+
+//==============================================================================
+// BN256 PAIRING (0x08) — EIP-197
+//==============================================================================
+
+static evm_status_t precompile_bn256_pairing(const uint8_t *input, size_t input_size,
+                                             uint64_t *gas, uint8_t **output,
+                                             size_t *output_size, evm_fork_t fork)
+{
+    // Input must be multiple of 192 bytes
+    if (input_size % 192 != 0)
+    {
+        *gas = 0;
+        return EVM_REVERT;
+    }
+
+    size_t k = input_size / 192;
+
+    uint64_t required = (fork >= FORK_ISTANBUL)
+        ? (34000 * k + 45000)
+        : (80000 * k + 100000);
+    if (*gas < required)
+        return EVM_OUT_OF_GAS;
+    *gas -= required;
+
+    // Empty input: pairing check passes
+    *output = calloc(32, 1);
+    *output_size = 32;
+
+    if (k == 0)
+    {
+        (*output)[31] = 1;
+        return EVM_SUCCESS;
+    }
+
+    // Unmarshal all points
+    bn256_g1_t *g1s = malloc(k * sizeof(bn256_g1_t));
+    bn256_g2_t *g2s = malloc(k * sizeof(bn256_g2_t));
+
+    for (size_t i = 0; i < k; i++)
+    {
+        bn256_g1_init(&g1s[i]);
+        bn256_g2_init(&g2s[i]);
+    }
+
+    for (size_t i = 0; i < k; i++)
+    {
+        const uint8_t *pair = input + i * 192;
+        if (bn256_g1_unmarshal(&g1s[i], pair) != 0 ||
+            bn256_g2_unmarshal(&g2s[i], pair + 64) != 0)
+        {
+            for (size_t j = 0; j < k; j++)
+            {
+                bn256_g1_clear(&g1s[j]);
+                bn256_g2_clear(&g2s[j]);
+            }
+            free(g1s);
+            free(g2s);
+            free(*output);
+            *output = NULL;
+            *output_size = 0;
+            *gas = 0;
+            return EVM_REVERT;
+        }
+    }
+
+    int result = bn256_pairing_check(g1s, g2s, k);
+
+    if (result == 1)
+        (*output)[31] = 1;
+    // else already zeroed
+
+    for (size_t i = 0; i < k; i++)
+    {
+        bn256_g1_clear(&g1s[i]);
+        bn256_g2_clear(&g2s[i]);
+    }
+    free(g1s);
+    free(g2s);
+
+    return EVM_SUCCESS;
+}
+
+//==============================================================================
+// KZG Point Evaluation Precompile (0x0A) — EIP-4844
+//==============================================================================
+
+// KZG_SETUP_G2_1: [s]₂ from Ethereum mainnet trusted setup (compressed G2)
+static const uint8_t KZG_SETUP_G2_1_BYTES[96] = {
+    0xb5, 0xbf, 0xd7, 0xdd, 0x8c, 0xde, 0xb1, 0x28,
+    0x84, 0x3b, 0xc2, 0x87, 0x23, 0x0a, 0xf3, 0x89,
+    0x26, 0x18, 0x70, 0x75, 0xcb, 0xfb, 0xef, 0xa8,
+    0x10, 0x09, 0xa2, 0xce, 0x61, 0x5a, 0xc5, 0x3d,
+    0x29, 0x14, 0xe5, 0x87, 0x0c, 0xb4, 0x52, 0xd2,
+    0xaf, 0xaa, 0xab, 0x24, 0xf3, 0x49, 0x9f, 0x72,
+    0x18, 0x5c, 0xbf, 0xee, 0x53, 0x49, 0x27, 0x14,
+    0x73, 0x44, 0x29, 0xb7, 0xb3, 0x86, 0x08, 0xe2,
+    0x39, 0x26, 0xc9, 0x11, 0xcc, 0xec, 0xea, 0xc9,
+    0xa3, 0x68, 0x51, 0x47, 0x7b, 0xa4, 0xc6, 0x0b,
+    0x08, 0x70, 0x41, 0xde, 0x62, 0x10, 0x00, 0xed,
+    0xc9, 0x8e, 0xda, 0xda, 0x20, 0xc1, 0xde, 0xf2
+};
+
+// BLS_MODULUS (scalar field order r of BLS12-381, big-endian)
+static const uint8_t BLS_MODULUS[32] = {
+    0x73, 0xed, 0xa7, 0x53, 0x29, 0x9d, 0x7d, 0x48,
+    0x33, 0x39, 0xd8, 0x08, 0x09, 0xa1, 0xd8, 0x05,
+    0x53, 0xbd, 0xa4, 0x02, 0xff, 0xfe, 0x5b, 0xfe,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01
+};
+
+// Gas: 50,000 fixed
+// Input: 192 bytes — versioned_hash(32) | z(32) | y(32) | commitment(48) | proof(48)
+// Output: 64 bytes — FIELD_ELEMENTS_PER_BLOB(32) | BLS_MODULUS(32)
+static evm_status_t precompile_point_eval(const uint8_t *input, size_t input_size,
+                                          uint64_t *gas, uint8_t **output,
+                                          size_t *output_size, evm_fork_t fork)
+{
+    (void)fork;
+
+    if (*gas < 50000)
+        return EVM_OUT_OF_GAS;
+    *gas -= 50000;
+
+    // Input must be exactly 192 bytes
+    if (input_size != 192)
+    {
+        *gas = 0;
+        return EVM_REVERT;
+    }
+
+    const uint8_t *versioned_hash = input;
+    const uint8_t *z_bytes = input + 32;
+    const uint8_t *y_bytes = input + 64;
+    const uint8_t *commitment_bytes = input + 96;
+    const uint8_t *proof_bytes = input + 144;
+
+    // Validate z < BLS_MODULUS and y < BLS_MODULUS
+    if (memcmp(z_bytes, BLS_MODULUS, 32) >= 0 ||
+        memcmp(y_bytes, BLS_MODULUS, 32) >= 0)
+    {
+        *gas = 0;
+        return EVM_REVERT;
+    }
+
+    // Validate versioned_hash == 0x01 || SHA-256(commitment)[1:]
+    uint8_t computed_hash[32];
+    SHA256(commitment_bytes, 48, computed_hash);
+    computed_hash[0] = 0x01;
+    if (memcmp(versioned_hash, computed_hash, 32) != 0)
+    {
+        *gas = 0;
+        return EVM_REVERT;
+    }
+
+    // Decompress commitment and proof (G1 points)
+    blst_p1_affine commitment_aff, proof_aff;
+    if (blst_p1_uncompress(&commitment_aff, commitment_bytes) != BLST_SUCCESS ||
+        blst_p1_uncompress(&proof_aff, proof_bytes) != BLST_SUCCESS)
+    {
+        *gas = 0;
+        return EVM_REVERT;
+    }
+
+    // Subgroup check
+    if (!blst_p1_affine_in_g1(&commitment_aff) ||
+        !blst_p1_affine_in_g1(&proof_aff))
+    {
+        *gas = 0;
+        return EVM_REVERT;
+    }
+
+    // Lazy-init [s]₂ from trusted setup
+    static blst_p2_affine kzg_setup_g2_1_aff;
+    static blst_p2 kzg_setup_g2_1;
+    static bool kzg_g2_loaded = false;
+    if (!kzg_g2_loaded)
+    {
+        blst_p2_uncompress(&kzg_setup_g2_1_aff, KZG_SETUP_G2_1_BYTES);
+        blst_p2_from_affine(&kzg_setup_g2_1, &kzg_setup_g2_1_aff);
+        kzg_g2_loaded = true;
+    }
+
+    // Pairing check: e(proof, [s]₂ - z·G2) · e(y·G1 - commitment, G2) == 1
+
+    // Q1 = [s]₂ - z·G2
+    blst_scalar z_scalar;
+    blst_scalar_from_bendian(&z_scalar, z_bytes);
+    uint8_t z_le[32];
+    blst_lendian_from_scalar(z_le, &z_scalar);
+
+    blst_p2 z_g2;
+    blst_p2_mult(&z_g2, blst_p2_generator(), z_le, 256);
+    blst_p2_cneg(&z_g2, 1);  // negate
+
+    blst_p2 q1;
+    blst_p2_add_or_double(&q1, &kzg_setup_g2_1, &z_g2);
+
+    // P2 = y·G1 - commitment
+    blst_scalar y_scalar;
+    blst_scalar_from_bendian(&y_scalar, y_bytes);
+    uint8_t y_le[32];
+    blst_lendian_from_scalar(y_le, &y_scalar);
+
+    blst_p1 y_g1;
+    blst_p1_mult(&y_g1, blst_p1_generator(), y_le, 256);
+
+    blst_p1 commitment_jac;
+    blst_p1_from_affine(&commitment_jac, &commitment_aff);
+    blst_p1_cneg(&commitment_jac, 1);
+
+    blst_p1 p2;
+    blst_p1_add_or_double(&p2, &y_g1, &commitment_jac);
+
+    // Convert to affine for miller loop
+    blst_p2_affine q1_aff;
+    blst_p2_to_affine(&q1_aff, &q1);
+
+    blst_p1_affine p2_aff;
+    blst_p1_to_affine(&p2_aff, &p2);
+
+    // Multi-pairing: e(proof, Q1) · e(P2, G2) == 1
+    const blst_p1_affine *Ps[2] = { &proof_aff, &p2_aff };
+    const blst_p2_affine *Qs[2] = { &q1_aff, &BLS12_381_G2 };
+
+    blst_fp12 gt;
+    blst_miller_loop_n(&gt, Qs, Ps, 2);
+
+    blst_fp12 pairing_result;
+    blst_final_exp(&pairing_result, &gt);
+
+    if (!blst_fp12_is_one(&pairing_result))
+    {
+        *gas = 0;
+        return EVM_REVERT;
+    }
+
+    // Success: output FIELD_ELEMENTS_PER_BLOB (4096) || BLS_MODULUS
+    *output = calloc(64, 1);
+    if (!*output)
+        return EVM_INTERNAL_ERROR;
+
+    (*output)[30] = 0x10;  // 4096 = 0x1000, big-endian
+    (*output)[31] = 0x00;
+    memcpy(*output + 32, BLS_MODULUS, 32);
+    *output_size = 64;
+
+    return EVM_SUCCESS;
+}
+
+//==============================================================================
 // Stub for unimplemented precompiles
 //==============================================================================
 
@@ -704,13 +1043,16 @@ evm_status_t precompile_execute(const address_t *addr,
         return precompile_modexp(input, input_size, gas, output, output_size, fork);
 
     case PRECOMPILE_BN256_ADD:
+        return precompile_bn256_add(input, input_size, gas, output, output_size, fork);
     case PRECOMPILE_BN256_MUL:
+        return precompile_bn256_mul(input, input_size, gas, output, output_size, fork);
     case PRECOMPILE_BN256_PAIRING:
-        return precompile_stub(idx, gas);
+        return precompile_bn256_pairing(input, input_size, gas, output, output_size, fork);
 
     case PRECOMPILE_BLAKE2F:
         return precompile_blake2f(input, input_size, gas, output, output_size);
     case PRECOMPILE_POINT_EVAL:
+        return precompile_point_eval(input, input_size, gas, output, output_size, fork);
     case PRECOMPILE_BLS_G1ADD:
     case PRECOMPILE_BLS_G1MSM:
     case PRECOMPILE_BLS_G2ADD:

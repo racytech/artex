@@ -98,9 +98,20 @@ add_library(evm STATIC
     evm/src/opcodes/create.c
     evm/src/precompile.c
     evm/vendor/mini-gmp.c
+    evm/vendor/bn256.c
 )
-target_include_directories(evm PUBLIC ${CMAKE_SOURCE_DIR}/evm/include ${CMAKE_SOURCE_DIR}/evm/vendor)
-target_link_libraries(evm evm_state common ssl crypto secp256k1)
+# blst (BLS12-381 — pre-built static library)
+add_library(blst STATIC IMPORTED)
+set_target_properties(blst PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/third_party/blst/libblst.a
+)
+
+target_include_directories(evm PUBLIC
+    ${CMAKE_SOURCE_DIR}/evm/include
+    ${CMAKE_SOURCE_DIR}/evm/vendor
+    ${CMAKE_SOURCE_DIR}/third_party/blst/bindings
+)
+target_link_libraries(evm evm_state common ssl crypto secp256k1 blst)
 
 #==============================================================================
 # Tests

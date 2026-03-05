@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 // Forward declaration from test_runner_core.c
 extern uint64_t get_time_microseconds(void);
@@ -38,7 +39,7 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
     if (runner->config.fork_filter_count > 0 && test->network) {
         bool fork_allowed = false;
         for (size_t i = 0; i < runner->config.fork_filter_count; i++) {
-            if (strcmp(runner->config.fork_filter[i], test->network) == 0) {
+            if (strcasecmp(runner->config.fork_filter[i], test->network) == 0) {
                 fork_allowed = true;
                 break;
             }
