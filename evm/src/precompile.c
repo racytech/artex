@@ -1003,6 +1003,418 @@ static evm_status_t precompile_point_eval(const uint8_t *input, size_t input_siz
 }
 
 //==============================================================================
+// BLS12-381 Precompiles (0x0B–0x11) — EIP-2537
+//==============================================================================
+
+// BLS12-381 base field modulus p (48 bytes, big-endian)
+static const uint8_t BLS12_381_P[48] = {
+    0x1a, 0x01, 0x11, 0xea, 0x39, 0x7f, 0xe6, 0x9a,
+    0x4b, 0x1b, 0xa7, 0xb6, 0x43, 0x4b, 0xac, 0xd7,
+    0x64, 0x77, 0x4b, 0x84, 0xf3, 0x85, 0x12, 0xbf,
+    0x67, 0x30, 0xd2, 0xa0, 0xf6, 0xb0, 0xf6, 0x24,
+    0x1e, 0xab, 0xff, 0xfe, 0xb1, 0x53, 0xff, 0xff,
+    0xb9, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xaa, 0xab
+};
+
+// G1 MSM discount table (128 entries, k=1..128)
+static const uint16_t g1_msm_discount[128] = {
+    1000, 949, 848, 797, 764, 750, 738, 728,
+    719, 712, 705, 698, 692, 687, 682, 677,
+    673, 669, 665, 661, 658, 654, 651, 648,
+    645, 642, 640, 637, 635, 632, 630, 627,
+    625, 623, 621, 619, 617, 615, 613, 611,
+    609, 608, 606, 604, 603, 601, 599, 598,
+    596, 595, 593, 592, 591, 589, 588, 586,
+    585, 584, 582, 581, 580, 579, 577, 576,
+    575, 574, 573, 572, 570, 569, 568, 567,
+    566, 565, 564, 563, 562, 561, 560, 559,
+    558, 557, 556, 555, 554, 553, 552, 551,
+    550, 549, 548, 547, 547, 546, 545, 544,
+    543, 542, 541, 540, 540, 539, 538, 537,
+    536, 536, 535, 534, 533, 532, 532, 531,
+    530, 529, 528, 528, 527, 526, 525, 525,
+    524, 523, 522, 522, 521, 520, 520, 519
+};
+
+// G2 MSM discount table (128 entries, k=1..128)
+static const uint16_t g2_msm_discount[128] = {
+    1000, 1000, 923, 884, 855, 832, 812, 796,
+    782, 770, 759, 749, 740, 732, 724, 717,
+    711, 704, 699, 693, 688, 683, 679, 674,
+    670, 666, 663, 659, 655, 652, 649, 646,
+    643, 640, 637, 634, 632, 629, 627, 624,
+    622, 620, 618, 615, 613, 611, 609, 607,
+    606, 604, 602, 600, 598, 597, 595, 593,
+    592, 590, 589, 587, 586, 584, 583, 582,
+    580, 579, 578, 576, 575, 574, 573, 571,
+    570, 569, 568, 567, 566, 565, 563, 562,
+    561, 560, 559, 558, 557, 556, 555, 554,
+    553, 552, 552, 551, 550, 549, 548, 547,
+    546, 545, 545, 544, 543, 542, 541, 541,
+    540, 539, 538, 537, 537, 536, 535, 535,
+    534, 533, 532, 532, 531, 530, 530, 529,
+    528, 528, 527, 526, 526, 525, 524, 524
+};
+
+//------------------------------------------------------------------------------
+// BLS12-381 encoding helpers
+//------------------------------------------------------------------------------
+
+// Decode a 64-byte padded Fp element (top 16 bytes must be zero, value < p)
+static int bls_decode_fp(blst_fp *out, const uint8_t input[64])
+{
+    for (int i = 0; i < 16; i++)
+        if (input[i] != 0) return -1;
+    if (memcmp(input + 16, BLS12_381_P, 48) >= 0) return -1;
+    blst_fp_from_bendian(out, input + 16);
+    return 0;
+}
+
+// Check if buffer is all zeros
+static bool bls_is_zero(const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++)
+        if (data[i] != 0) return false;
+    return true;
+}
+
+// Decode a 128-byte G1 point (two padded Fp elements, or all zeros = infinity)
+static int bls_decode_g1(blst_p1_affine *out, const uint8_t input[128])
+{
+    if (bls_is_zero(input, 128))
+    {
+        memset(out, 0, sizeof(*out));
+        return 0;
+    }
+    if (bls_decode_fp(&out->x, input) != 0) return -1;
+    if (bls_decode_fp(&out->y, input + 64) != 0) return -1;
+    if (!blst_p1_affine_on_curve(out)) return -1;
+    return 0;
+}
+
+// Decode a 256-byte G2 point (four padded Fp elements, or all zeros = infinity)
+static int bls_decode_g2(blst_p2_affine *out, const uint8_t input[256])
+{
+    if (bls_is_zero(input, 256))
+    {
+        memset(out, 0, sizeof(*out));
+        return 0;
+    }
+    if (bls_decode_fp(&out->x.fp[0], input) != 0) return -1;
+    if (bls_decode_fp(&out->x.fp[1], input + 64) != 0) return -1;
+    if (bls_decode_fp(&out->y.fp[0], input + 128) != 0) return -1;
+    if (bls_decode_fp(&out->y.fp[1], input + 192) != 0) return -1;
+    if (!blst_p2_affine_on_curve(out)) return -1;
+    return 0;
+}
+
+// Encode a G1 point (Jacobian) to 128 bytes
+static void bls_encode_g1(uint8_t output[128], const blst_p1 *p)
+{
+    memset(output, 0, 128);
+    if (blst_p1_is_inf(p)) return;
+    blst_p1_affine aff;
+    blst_p1_to_affine(&aff, p);
+    blst_bendian_from_fp(output + 16, &aff.x);
+    blst_bendian_from_fp(output + 80, &aff.y);
+}
+
+// Encode a G2 point (Jacobian) to 256 bytes
+static void bls_encode_g2(uint8_t output[256], const blst_p2 *p)
+{
+    memset(output, 0, 256);
+    if (blst_p2_is_inf(p)) return;
+    blst_p2_affine aff;
+    blst_p2_to_affine(&aff, p);
+    blst_bendian_from_fp(output + 16, &aff.x.fp[0]);
+    blst_bendian_from_fp(output + 80, &aff.x.fp[1]);
+    blst_bendian_from_fp(output + 144, &aff.y.fp[0]);
+    blst_bendian_from_fp(output + 208, &aff.y.fp[1]);
+}
+
+//------------------------------------------------------------------------------
+// 0x0B — BLS12_G1ADD (375 gas)
+//------------------------------------------------------------------------------
+
+static evm_status_t precompile_bls_g1add(const uint8_t *input, size_t input_size,
+                                          uint64_t *gas, uint8_t **output,
+                                          size_t *output_size)
+{
+    if (*gas < 375) return EVM_OUT_OF_GAS;
+    *gas -= 375;
+
+    if (input_size != 256) { *gas = 0; return EVM_REVERT; }
+
+    blst_p1_affine a, b;
+    if (bls_decode_g1(&a, input) != 0 || bls_decode_g1(&b, input + 128) != 0)
+    { *gas = 0; return EVM_REVERT; }
+
+    blst_p1 aj, bj, r;
+    blst_p1_from_affine(&aj, &a);
+    blst_p1_from_affine(&bj, &b);
+    blst_p1_add_or_double(&r, &aj, &bj);
+
+    *output = malloc(128);
+    if (!*output) return EVM_INTERNAL_ERROR;
+    bls_encode_g1(*output, &r);
+    *output_size = 128;
+    return EVM_SUCCESS;
+}
+
+//------------------------------------------------------------------------------
+// 0x0C — BLS12_G1MSM (discount-table gas, subgroup check required)
+//------------------------------------------------------------------------------
+
+static evm_status_t precompile_bls_g1msm(const uint8_t *input, size_t input_size,
+                                          uint64_t *gas, uint8_t **output,
+                                          size_t *output_size)
+{
+    if (input_size == 0 || input_size % 160 != 0)
+    { *gas = 0; return EVM_REVERT; }
+
+    size_t k = input_size / 160;
+    size_t idx = (k <= 128) ? k - 1 : 127;
+    uint64_t cost = (uint64_t)k * 12000 * g1_msm_discount[idx] / 1000;
+    if (*gas < cost) return EVM_OUT_OF_GAS;
+    *gas -= cost;
+
+    // Decode, validate, and compute MSM
+    blst_p1 result;
+    memset(&result, 0, sizeof(result));  // identity
+
+    for (size_t i = 0; i < k; i++)
+    {
+        const uint8_t *pair = input + i * 160;
+        blst_p1_affine pt;
+        if (bls_decode_g1(&pt, pair) != 0)
+        { *gas = 0; return EVM_REVERT; }
+
+        // Subgroup check (infinity passes)
+        if (!blst_p1_affine_is_inf(&pt) && !blst_p1_affine_in_g1(&pt))
+        { *gas = 0; return EVM_REVERT; }
+
+        // Scalar is 32 bytes big-endian, convert to little-endian
+        uint8_t scalar_le[32];
+        for (int j = 0; j < 32; j++)
+            scalar_le[j] = pair[160 - 1 - j];  // bytes [128..159] reversed
+
+        blst_p1 pj, scaled;
+        blst_p1_from_affine(&pj, &pt);
+        blst_p1_mult(&scaled, &pj, scalar_le, 256);
+        blst_p1_add_or_double(&result, &result, &scaled);
+    }
+
+    *output = malloc(128);
+    if (!*output) return EVM_INTERNAL_ERROR;
+    bls_encode_g1(*output, &result);
+    *output_size = 128;
+    return EVM_SUCCESS;
+}
+
+//------------------------------------------------------------------------------
+// 0x0D — BLS12_G2ADD (600 gas)
+//------------------------------------------------------------------------------
+
+static evm_status_t precompile_bls_g2add(const uint8_t *input, size_t input_size,
+                                          uint64_t *gas, uint8_t **output,
+                                          size_t *output_size)
+{
+    if (*gas < 600) return EVM_OUT_OF_GAS;
+    *gas -= 600;
+
+    if (input_size != 512) { *gas = 0; return EVM_REVERT; }
+
+    blst_p2_affine a, b;
+    if (bls_decode_g2(&a, input) != 0 || bls_decode_g2(&b, input + 256) != 0)
+    { *gas = 0; return EVM_REVERT; }
+
+    blst_p2 aj, bj, r;
+    blst_p2_from_affine(&aj, &a);
+    blst_p2_from_affine(&bj, &b);
+    blst_p2_add_or_double(&r, &aj, &bj);
+
+    *output = malloc(256);
+    if (!*output) return EVM_INTERNAL_ERROR;
+    bls_encode_g2(*output, &r);
+    *output_size = 256;
+    return EVM_SUCCESS;
+}
+
+//------------------------------------------------------------------------------
+// 0x0E — BLS12_G2MSM (discount-table gas, subgroup check required)
+//------------------------------------------------------------------------------
+
+static evm_status_t precompile_bls_g2msm(const uint8_t *input, size_t input_size,
+                                          uint64_t *gas, uint8_t **output,
+                                          size_t *output_size)
+{
+    if (input_size == 0 || input_size % 288 != 0)
+    { *gas = 0; return EVM_REVERT; }
+
+    size_t k = input_size / 288;
+    size_t idx = (k <= 128) ? k - 1 : 127;
+    uint64_t cost = (uint64_t)k * 22500 * g2_msm_discount[idx] / 1000;
+    if (*gas < cost) return EVM_OUT_OF_GAS;
+    *gas -= cost;
+
+    blst_p2 result;
+    memset(&result, 0, sizeof(result));
+
+    for (size_t i = 0; i < k; i++)
+    {
+        const uint8_t *pair = input + i * 288;
+        blst_p2_affine pt;
+        if (bls_decode_g2(&pt, pair) != 0)
+        { *gas = 0; return EVM_REVERT; }
+
+        if (!blst_p2_affine_is_inf(&pt) && !blst_p2_affine_in_g2(&pt))
+        { *gas = 0; return EVM_REVERT; }
+
+        uint8_t scalar_le[32];
+        for (int j = 0; j < 32; j++)
+            scalar_le[j] = pair[288 - 1 - j];
+
+        blst_p2 pj, scaled;
+        blst_p2_from_affine(&pj, &pt);
+        blst_p2_mult(&scaled, &pj, scalar_le, 256);
+        blst_p2_add_or_double(&result, &result, &scaled);
+    }
+
+    *output = malloc(256);
+    if (!*output) return EVM_INTERNAL_ERROR;
+    bls_encode_g2(*output, &result);
+    *output_size = 256;
+    return EVM_SUCCESS;
+}
+
+//------------------------------------------------------------------------------
+// 0x0F — BLS12_PAIRING (32600*k + 37700 gas, subgroup check required)
+//------------------------------------------------------------------------------
+
+static evm_status_t precompile_bls_pairing(const uint8_t *input, size_t input_size,
+                                            uint64_t *gas, uint8_t **output,
+                                            size_t *output_size)
+{
+    if (input_size == 0 || input_size % 384 != 0)
+    { *gas = 0; return EVM_REVERT; }
+
+    size_t k = input_size / 384;
+    uint64_t cost = (uint64_t)k * 32600 + 37700;
+    if (*gas < cost) return EVM_OUT_OF_GAS;
+    *gas -= cost;
+
+    // Decode and validate all points
+    blst_p1_affine *g1s = malloc(k * sizeof(blst_p1_affine));
+    blst_p2_affine *g2s = malloc(k * sizeof(blst_p2_affine));
+    if (!g1s || !g2s) { free(g1s); free(g2s); return EVM_INTERNAL_ERROR; }
+
+    for (size_t i = 0; i < k; i++)
+    {
+        const uint8_t *pair = input + i * 384;
+        if (bls_decode_g1(&g1s[i], pair) != 0 ||
+            bls_decode_g2(&g2s[i], pair + 128) != 0)
+        { free(g1s); free(g2s); *gas = 0; return EVM_REVERT; }
+
+        // Subgroup checks
+        if (!blst_p1_affine_is_inf(&g1s[i]) && !blst_p1_affine_in_g1(&g1s[i]))
+        { free(g1s); free(g2s); *gas = 0; return EVM_REVERT; }
+        if (!blst_p2_affine_is_inf(&g2s[i]) && !blst_p2_affine_in_g2(&g2s[i]))
+        { free(g1s); free(g2s); *gas = 0; return EVM_REVERT; }
+    }
+
+    // Multi-pairing — filter out pairs where either point is infinity
+    const blst_p1_affine **Ps = malloc(k * sizeof(blst_p1_affine *));
+    const blst_p2_affine **Qs = malloc(k * sizeof(blst_p2_affine *));
+    size_t valid = 0;
+    for (size_t i = 0; i < k; i++)
+    {
+        if (!blst_p1_affine_is_inf(&g1s[i]) && !blst_p2_affine_is_inf(&g2s[i]))
+        {
+            Ps[valid] = &g1s[i];
+            Qs[valid] = &g2s[i];
+            valid++;
+        }
+    }
+
+    *output = calloc(32, 1);
+    if (!*output) { free(g1s); free(g2s); free(Ps); free(Qs); return EVM_INTERNAL_ERROR; }
+
+    if (valid == 0)
+    {
+        // All pairs had infinity — product of identities = 1
+        (*output)[31] = 1;
+    }
+    else
+    {
+        blst_fp12 gt;
+        blst_miller_loop_n(&gt, Qs, Ps, valid);
+        blst_fp12 final;
+        blst_final_exp(&final, &gt);
+        if (blst_fp12_is_one(&final))
+            (*output)[31] = 1;
+    }
+    *output_size = 32;
+
+    free(g1s); free(g2s); free(Ps); free(Qs);
+    return EVM_SUCCESS;
+}
+
+//------------------------------------------------------------------------------
+// 0x10 — BLS12_MAP_FP_TO_G1 (5500 gas)
+//------------------------------------------------------------------------------
+
+static evm_status_t precompile_bls_map_g1(const uint8_t *input, size_t input_size,
+                                           uint64_t *gas, uint8_t **output,
+                                           size_t *output_size)
+{
+    if (*gas < 5500) return EVM_OUT_OF_GAS;
+    *gas -= 5500;
+
+    if (input_size != 64) { *gas = 0; return EVM_REVERT; }
+
+    blst_fp u;
+    if (bls_decode_fp(&u, input) != 0)
+    { *gas = 0; return EVM_REVERT; }
+
+    blst_p1 r;
+    blst_map_to_g1(&r, &u, NULL);
+
+    *output = malloc(128);
+    if (!*output) return EVM_INTERNAL_ERROR;
+    bls_encode_g1(*output, &r);
+    *output_size = 128;
+    return EVM_SUCCESS;
+}
+
+//------------------------------------------------------------------------------
+// 0x11 — BLS12_MAP_FP2_TO_G2 (23800 gas)
+//------------------------------------------------------------------------------
+
+static evm_status_t precompile_bls_map_g2(const uint8_t *input, size_t input_size,
+                                           uint64_t *gas, uint8_t **output,
+                                           size_t *output_size)
+{
+    if (*gas < 23800) return EVM_OUT_OF_GAS;
+    *gas -= 23800;
+
+    if (input_size != 128) { *gas = 0; return EVM_REVERT; }
+
+    blst_fp2 u;
+    if (bls_decode_fp(&u.fp[0], input) != 0 ||
+        bls_decode_fp(&u.fp[1], input + 64) != 0)
+    { *gas = 0; return EVM_REVERT; }
+
+    blst_p2 r;
+    blst_map_to_g2(&r, &u, NULL);
+
+    *output = malloc(256);
+    if (!*output) return EVM_INTERNAL_ERROR;
+    bls_encode_g2(*output, &r);
+    *output_size = 256;
+    return EVM_SUCCESS;
+}
+
+//==============================================================================
 // Stub for unimplemented precompiles
 //==============================================================================
 
@@ -1054,13 +1466,19 @@ evm_status_t precompile_execute(const address_t *addr,
     case PRECOMPILE_POINT_EVAL:
         return precompile_point_eval(input, input_size, gas, output, output_size, fork);
     case PRECOMPILE_BLS_G1ADD:
+        return precompile_bls_g1add(input, input_size, gas, output, output_size);
     case PRECOMPILE_BLS_G1MSM:
+        return precompile_bls_g1msm(input, input_size, gas, output, output_size);
     case PRECOMPILE_BLS_G2ADD:
+        return precompile_bls_g2add(input, input_size, gas, output, output_size);
     case PRECOMPILE_BLS_G2MSM:
+        return precompile_bls_g2msm(input, input_size, gas, output, output_size);
     case PRECOMPILE_BLS_PAIRING:
+        return precompile_bls_pairing(input, input_size, gas, output, output_size);
     case PRECOMPILE_BLS_MAP_G1:
+        return precompile_bls_map_g1(input, input_size, gas, output, output_size);
     case PRECOMPILE_BLS_MAP_G2:
-        return precompile_stub(idx, gas);
+        return precompile_bls_map_g2(input, input_size, gas, output, output_size);
 
     default:
         return EVM_INTERNAL_ERROR;
