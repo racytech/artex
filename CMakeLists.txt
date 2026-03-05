@@ -419,6 +419,11 @@ add_library(discv5 STATIC
 )
 target_link_libraries(discv5 discv5_codec discv5_session discv5_table enr rlp hash secp256k1_wrap hkdf aes blst bytes)
 
+# uTP — micro Transport Protocol (BEP29 over Discv5 TALKREQ)
+add_library(utp STATIC
+    net/src/utp.c
+)
+
 #==============================================================================
 # Tests — Networking
 #==============================================================================
@@ -489,6 +494,13 @@ add_executable(test_discv5
 )
 target_link_libraries(test_discv5 discv5)
 add_test(NAME test_discv5 COMMAND test_discv5)
+
+# Test: uTP (micro Transport Protocol — BEP29 test vectors + loopback)
+add_executable(test_utp
+    net/tests/test_utp.c
+)
+target_link_libraries(test_utp utp)
+add_test(NAME test_utp COMMAND test_utp)
 
 #==============================================================================
 # Build Summary
