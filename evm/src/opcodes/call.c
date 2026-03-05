@@ -51,13 +51,9 @@ static evm_status_t prepare_call(
 {
     bool has_value = !uint256_is_zero(value);
 
-    // Check static call violation (can't transfer value in static context)
-    if (evm->msg.is_static && has_value)
-    {
-        return EVM_STATIC_CALL_VIOLATION;
-    }
-
     // Check if value transfer is allowed for this call type
+    // Note: static+value check for CALL is done in op_call() before calling prepare_call.
+    // CALLCODE with value in static context is permitted (EIP-214: only CALL is restricted).
     if (!allow_value && has_value)
     {
         return EVM_STATIC_CALL_VIOLATION;
@@ -234,6 +230,23 @@ evm_status_t op_call(evm_t *evm)
     address_t target_addr;
     address_from_uint256(&addr, &target_addr);
 
+    // EIP-214: CALL with non-zero value in static context is forbidden
+    if (evm->msg.is_static && !uint256_is_zero(&value))
+    {
+        return EVM_STATIC_CALL_VIOLATION;
+    }
+
+    // Overflow check: impossibly large memory args/ret means OOG
+    if (args_size.high != 0 || (uint64_t)(args_size.low >> 64) != 0 ||
+        ret_size.high != 0 || (uint64_t)(ret_size.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&args_size) &&
+        (args_offset.high != 0 || (uint64_t)(args_offset.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&ret_size) &&
+        (ret_offset.high != 0 || (uint64_t)(ret_offset.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+
     uint64_t args_size_u64 = uint256_to_uint64(&args_size);
     uint64_t args_offset_u64 = uint256_to_uint64(&args_offset);
     uint64_t ret_size_u64 = uint256_to_uint64(&ret_size);
@@ -356,7 +369,17 @@ evm_status_t op_callcode(evm_t *evm)
     address_t target_addr;
     address_from_uint256(&addr, &target_addr);
 
-    // Convert sizes to uint64_t
+    // Overflow check: impossibly large memory args/ret means OOG
+    if (args_size.high != 0 || (uint64_t)(args_size.low >> 64) != 0 ||
+        ret_size.high != 0 || (uint64_t)(ret_size.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&args_size) &&
+        (args_offset.high != 0 || (uint64_t)(args_offset.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&ret_size) &&
+        (ret_offset.high != 0 || (uint64_t)(ret_offset.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+
     uint64_t args_size_u64 = uint256_to_uint64(&args_size);
     uint64_t args_offset_u64 = uint256_to_uint64(&args_offset);
     uint64_t ret_size_u64 = uint256_to_uint64(&ret_size);
@@ -505,7 +528,17 @@ evm_status_t op_delegatecall(evm_t *evm)
     address_t target_addr;
     address_from_uint256(&addr, &target_addr);
 
-    // Convert sizes to uint64_t
+    // Overflow check: impossibly large memory args/ret means OOG
+    if (args_size.high != 0 || (uint64_t)(args_size.low >> 64) != 0 ||
+        ret_size.high != 0 || (uint64_t)(ret_size.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&args_size) &&
+        (args_offset.high != 0 || (uint64_t)(args_offset.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&ret_size) &&
+        (ret_offset.high != 0 || (uint64_t)(ret_offset.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+
     uint64_t args_size_u64 = uint256_to_uint64(&args_size);
     uint64_t args_offset_u64 = uint256_to_uint64(&args_offset);
     uint64_t ret_size_u64 = uint256_to_uint64(&ret_size);
@@ -657,7 +690,17 @@ evm_status_t op_staticcall(evm_t *evm)
     address_t target_addr;
     address_from_uint256(&addr, &target_addr);
 
-    // Convert sizes to uint64_t
+    // Overflow check: impossibly large memory args/ret means OOG
+    if (args_size.high != 0 || (uint64_t)(args_size.low >> 64) != 0 ||
+        ret_size.high != 0 || (uint64_t)(ret_size.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&args_size) &&
+        (args_offset.high != 0 || (uint64_t)(args_offset.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&ret_size) &&
+        (ret_offset.high != 0 || (uint64_t)(ret_offset.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+
     uint64_t args_size_u64 = uint256_to_uint64(&args_size);
     uint64_t args_offset_u64 = uint256_to_uint64(&args_offset);
     uint64_t ret_size_u64 = uint256_to_uint64(&ret_size);

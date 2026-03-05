@@ -699,6 +699,9 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
                 evm_stack_destroy(evm->stack);
                 evm_memory_destroy(evm->memory);
                 evm_restore_context(evm, &saved_context);
+                // Codeless call produces no output — clear stale return data
+                if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+                evm->return_data_size = 0;
             }
 
             *result = evm_result_success(msg->gas, NULL, 0);
@@ -717,8 +720,11 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
             evm_stack_destroy(evm->stack);
             evm_memory_destroy(evm->memory);
             evm_restore_context(evm, &saved_context);
+            // No code to execute — clear stale return data
+            if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+            evm->return_data_size = 0;
         }
-        
+
         *result = evm_result_success(evm->gas_left, NULL, 0);
         return true;
     }

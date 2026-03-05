@@ -184,6 +184,9 @@ static evm_status_t execute_create(evm_t *evm,
         {
             evm->gas_left = 0;
         }
+        // CREATE produces empty return data
+        if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+        evm->return_data_size = 0;
         uint256_t zero = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &zero))
             return EVM_STACK_OVERFLOW;
@@ -336,6 +339,9 @@ static evm_status_t execute_create(evm_t *evm,
     {
         // No init code — create empty contract
         success = true;
+        // CREATE produces empty return data
+        if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+        evm->return_data_size = 0;
     }
 
     //==========================================================================
@@ -384,6 +390,13 @@ evm_status_t op_create(evm_t *evm)
         !evm_stack_pop(evm->stack, &offset) ||
         !evm_stack_pop(evm->stack, &size))
         return EVM_STACK_UNDERFLOW;
+
+    // Overflow check: impossibly large size or offset means OOG
+    if (size.high != 0 || (uint64_t)(size.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&size) &&
+        (offset.high != 0 || (uint64_t)(offset.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
 
     uint64_t size_u64 = uint256_to_uint64(&size);
     uint64_t offset_u64 = uint256_to_uint64(&offset);
@@ -487,7 +500,13 @@ evm_status_t op_create2(evm_t *evm)
         !evm_stack_pop(evm->stack, &salt))
         return EVM_STACK_UNDERFLOW;
 
-    // Convert to uint64_t
+    // Overflow check: impossibly large size or offset means OOG
+    if (size.high != 0 || (uint64_t)(size.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&size) &&
+        (offset.high != 0 || (uint64_t)(offset.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+
     uint64_t size_u64 = uint256_to_uint64(&size);
     uint64_t offset_u64 = uint256_to_uint64(&offset);
 

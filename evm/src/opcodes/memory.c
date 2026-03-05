@@ -27,7 +27,10 @@ evm_status_t op_mload(evm_t *evm)
     uint256_t offset;
     evm_stack_pop(evm->stack, &offset);
 
-    // Convert offset to uint64
+    // Impossibly large offset — guaranteed OOG
+    if (offset.high != 0 || (uint64_t)(offset.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+
     uint64_t mem_offset = uint256_to_uint64(&offset);
 
     // Calculate memory expansion gas cost
@@ -71,7 +74,10 @@ evm_status_t op_mstore(evm_t *evm)
     evm_stack_pop(evm->stack, &offset);
     evm_stack_pop(evm->stack, &value);
 
-    // Convert offset to uint64
+    // Impossibly large offset — guaranteed OOG
+    if (offset.high != 0 || (uint64_t)(offset.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+
     uint64_t mem_offset = uint256_to_uint64(&offset);
 
     // Calculate memory expansion gas cost
@@ -109,7 +115,10 @@ evm_status_t op_mstore8(evm_t *evm)
     evm_stack_pop(evm->stack, &offset);
     evm_stack_pop(evm->stack, &value);
 
-    // Convert offset to uint64
+    // Impossibly large offset — guaranteed OOG
+    if (offset.high != 0 || (uint64_t)(offset.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+
     uint64_t mem_offset = uint256_to_uint64(&offset);
 
     // Calculate memory expansion gas cost

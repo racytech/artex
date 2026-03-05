@@ -1263,11 +1263,11 @@ op_invalid:
 
 error:
     LOG_EVM_ERROR("Execution error at PC=%lu: status=%d", evm->pc, status);
-    // Invalid opcode consumes all remaining gas
-    if (status == EVM_INVALID_OPCODE)
+    // All exceptional halts (non-REVERT) consume all remaining gas per EVM spec.
+    // Only REVERT preserves remaining gas.
+    if (status != EVM_REVERT)
         evm->gas_left = 0;
-    // For non-REVERT errors (OOG, invalid opcode, etc.), clear return data.
-    // Only REVERT should propagate output data on error.
+    // For non-REVERT errors, also clear return data (no output on error).
     if (status != EVM_REVERT)
     {
         if (evm->return_data)

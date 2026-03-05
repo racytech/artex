@@ -59,7 +59,13 @@ static evm_status_t op_log_common(evm_t *evm, uint8_t num_topics)
         }
     }
 
-    // Convert offset and size to uint64_t
+    // Overflow check: impossibly large size or offset means OOG
+    if (size_u256.high != 0 || (uint64_t)(size_u256.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&size_u256) &&
+        (offset_u256.high != 0 || (uint64_t)(offset_u256.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+
     uint64_t offset = uint256_to_uint64(&offset_u256);
     uint64_t size = uint256_to_uint64(&size_u256);
 

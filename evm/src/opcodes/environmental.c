@@ -267,7 +267,13 @@ evm_status_t op_calldatacopy(evm_t *evm)
     if (!evm_stack_pop(evm->stack, &size_256))
         return EVM_STACK_UNDERFLOW;
 
-    // Convert to uint64
+    // Overflow check: impossibly large size or dest_offset means OOG
+    if (size_256.high != 0 || (uint64_t)(size_256.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&size_256) &&
+        (dest_offset_256.high != 0 || (uint64_t)(dest_offset_256.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+
     uint64_t dest_offset = uint256_to_uint64(&dest_offset_256);
     uint64_t size = uint256_to_uint64(&size_256);
 
@@ -362,19 +368,15 @@ evm_status_t op_codecopy(evm_t *evm)
     if (!evm_stack_pop(evm->stack, &size_256))
         return EVM_STACK_UNDERFLOW;
 
-    // Convert to uint64
+    // Overflow check: impossibly large size or dest_offset means OOG
+    if (size_256.high != 0 || (uint64_t)(size_256.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&size_256) &&
+        (dest_offset_256.high != 0 || (uint64_t)(dest_offset_256.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+
     uint64_t dest_offset = uint256_to_uint64(&dest_offset_256);
     uint64_t size = uint256_to_uint64(&size_256);
-
-    // Check for unreasonably large sizes that would cause issues
-    if (size > (UINT64_MAX / 2)) {
-        return EVM_OUT_OF_GAS;
-    }
-
-    // Check for overflow in dest_offset + size calculation
-    if (size > 0 && dest_offset > UINT64_MAX - size) {
-        return EVM_OUT_OF_GAS;
-    }
 
     // Calculate dynamic gas: base + copy cost + memory expansion
     // Note: gas depends only on dest memory expansion, NOT on source offset
@@ -499,10 +501,23 @@ evm_status_t op_returndatacopy(evm_t *evm)
     if (!evm_stack_pop(evm->stack, &size_256))
         return EVM_STACK_UNDERFLOW;
 
-    // Convert to uint64
+    // Overflow check: impossibly large size or dest_offset means OOG
+    if (size_256.high != 0 || (uint64_t)(size_256.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&size_256) &&
+        (dest_offset_256.high != 0 || (uint64_t)(dest_offset_256.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+
     uint64_t dest_offset = uint256_to_uint64(&dest_offset_256);
-    uint64_t offset = uint256_to_uint64(&offset_256);
     uint64_t size = uint256_to_uint64(&size_256);
+
+    // For RETURNDATACOPY, offset must also be checked for bounds against return_data_size.
+    // If offset overflows uint64 but size > 0, it's definitely out of bounds.
+    if (!uint256_is_zero(&size_256) &&
+        (offset_256.high != 0 || (uint64_t)(offset_256.low >> 64) != 0))
+        return EVM_INVALID_MEMORY_ACCESS;
+
+    uint64_t offset = uint256_to_uint64(&offset_256);
 
     // Calculate dynamic gas: base + copy cost + memory expansion
     uint64_t copy_gas = gas_copy_cost(size);
@@ -618,6 +633,13 @@ evm_status_t op_extcodecopy(evm_t *evm)
     {
         return EVM_STACK_UNDERFLOW;
     }
+
+    // Overflow check: impossibly large size or dest_offset means OOG
+    if (size_u256.high != 0 || (uint64_t)(size_u256.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&size_u256) &&
+        (dest_offset_u256.high != 0 || (uint64_t)(dest_offset_u256.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
 
     uint64_t dest_offset = uint256_to_uint64(&dest_offset_u256);
     uint64_t size = uint256_to_uint64(&size_u256);

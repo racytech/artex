@@ -35,7 +35,13 @@ evm_status_t op_keccak256(evm_t *evm)
     if (!evm_stack_pop(evm->stack, &size_256))
         return EVM_STACK_UNDERFLOW;
 
-    // Convert to uint64
+    // Overflow check: impossibly large size or offset means OOG
+    if (size_256.high != 0 || (uint64_t)(size_256.low >> 64) != 0)
+        return EVM_OUT_OF_GAS;
+    if (!uint256_is_zero(&size_256) &&
+        (offset_256.high != 0 || (uint64_t)(offset_256.low >> 64) != 0))
+        return EVM_OUT_OF_GAS;
+
     uint64_t offset = uint256_to_uint64(&offset_256);
     uint64_t size = uint256_to_uint64(&size_256);
 
