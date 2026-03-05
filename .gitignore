@@ -155,3 +155,9 @@ state/TODO.md
 state/tests/verkle_vectors.bin
 state/tests/gen_verkle_vectors/gen_verkle_vectors
 state/tests/gen_verkle_vectors/go.sum
+
+# Fuzz testing
+build-fuzz/
+build-dbg/
+crash-*
+net/fuzz/corpus/

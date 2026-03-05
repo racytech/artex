@@ -331,6 +331,11 @@ bool discv5_decode_header(discv5_header_t *hdr,
     memcpy(hdr->nonce, static_hdr + 9, 12);
     hdr->authdata_size = get_be16(static_hdr + 21);
 
+    /* Reject unreasonable authdata sizes.
+     * Max valid: handshake with ENR ≈ 34 + 64 + 33 + 300 = 431.
+     * Use 512 as a generous upper bound. */
+    if (hdr->authdata_size > 512) return false;
+
     size_t header_len = DISCV5_STATIC_HDR_SIZE + hdr->authdata_size;
     if (header_len > masked_len) return false;
 
@@ -361,6 +366,10 @@ bool discv5_decode_header(discv5_header_t *hdr,
         memcpy(hdr->auth.handshake.src_id, authdata, 32);
         hdr->auth.handshake.sig_size = authdata[32];
         hdr->auth.handshake.eph_key_size = authdata[33];
+
+        /* Validate sizes fit in destination buffers */
+        if (hdr->auth.handshake.sig_size > 64) return false;
+        if (hdr->auth.handshake.eph_key_size > 33) return false;
 
         size_t expected = 34 + hdr->auth.handshake.sig_size
                              + hdr->auth.handshake.eph_key_size;

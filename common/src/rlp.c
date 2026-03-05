@@ -194,12 +194,14 @@ static bool decode_length(const uint8_t* data, size_t data_len, size_t* out_len,
         // Long string
         size_t len_of_len = prefix - 0xb7;
         if (data_len < 1 + len_of_len) return false;
-        
+
         *out_len = 0;
         for (size_t i = 0; i < len_of_len; i++) {
             *out_len = (*out_len << 8) | data[1 + i];
         }
         *out_header_len = 1 + len_of_len;
+        // Validate total doesn't exceed available data (prevents overflow)
+        if (*out_len > data_len - *out_header_len) return false;
         return true;
     } else if (prefix <= 0xf7) {
         // Short list
@@ -210,12 +212,14 @@ static bool decode_length(const uint8_t* data, size_t data_len, size_t* out_len,
         // Long list
         size_t len_of_len = prefix - 0xf7;
         if (data_len < 1 + len_of_len) return false;
-        
+
         *out_len = 0;
         for (size_t i = 0; i < len_of_len; i++) {
             *out_len = (*out_len << 8) | data[1 + i];
         }
         *out_header_len = 1 + len_of_len;
+        // Validate total doesn't exceed available data (prevents overflow)
+        if (*out_len > data_len - *out_header_len) return false;
         return true;
     }
 }
