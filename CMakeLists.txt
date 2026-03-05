@@ -430,6 +430,12 @@ add_library(portal_wire STATIC
 )
 target_link_libraries(portal_wire ssz)
 
+# Portal Overlay Table — Kademlia routing with data_radius
+add_library(portal_table STATIC
+    net/src/portal_table.c
+)
+target_link_libraries(portal_table blst)
+
 #==============================================================================
 # Tests — Networking
 #==============================================================================
@@ -514,6 +520,13 @@ add_executable(test_portal_wire
 )
 target_link_libraries(test_portal_wire portal_wire ssz)
 add_test(NAME test_portal_wire COMMAND test_portal_wire)
+
+# Test: Portal Overlay Table (Kademlia + radius filtering)
+add_executable(test_portal_table
+    net/tests/test_portal_table.c
+)
+target_link_libraries(test_portal_table portal_table blst)
+add_test(NAME test_portal_table COMMAND test_portal_table)
 
 #==============================================================================
 # Build Summary
