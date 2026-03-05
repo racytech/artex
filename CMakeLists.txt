@@ -424,6 +424,12 @@ add_library(utp STATIC
     net/src/utp.c
 )
 
+# Portal Wire Protocol — message codec (SSZ-encoded)
+add_library(portal_wire STATIC
+    net/src/portal_wire.c
+)
+target_link_libraries(portal_wire ssz)
+
 #==============================================================================
 # Tests — Networking
 #==============================================================================
@@ -501,6 +507,13 @@ add_executable(test_utp
 )
 target_link_libraries(test_utp utp)
 add_test(NAME test_utp COMMAND test_utp)
+
+# Test: Portal Wire Protocol (message codec test vectors)
+add_executable(test_portal_wire
+    net/tests/test_portal_wire.c
+)
+target_link_libraries(test_portal_wire portal_wire ssz)
+add_test(NAME test_portal_wire COMMAND test_portal_wire)
 
 #==============================================================================
 # Build Summary
