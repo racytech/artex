@@ -231,11 +231,18 @@ bool transaction_execute(
     result->status = EVM_SUCCESS;
 
     // Set block environment in EVM (this will determine the fork)
+    // Post-merge (Paris+): DIFFICULTY opcode returns PREVRANDAO
+    uint256_t block_difficulty = env->difficulty;
+    hash_t zero_hash;
+    memset(&zero_hash, 0, sizeof(zero_hash));
+    if (memcmp(&env->prev_randao, &zero_hash, sizeof(hash_t)) != 0) {
+        block_difficulty = uint256_from_bytes(env->prev_randao.bytes, 32);
+    }
     evm_block_env_t block_env = {
         .number = env->block_number,
         .timestamp = env->timestamp,
         .gas_limit = env->gas_limit,
-        .difficulty = env->difficulty,
+        .difficulty = block_difficulty,
         .coinbase = env->coinbase,
         .base_fee = env->base_fee,
         .chain_id = evm->chain_config ? uint256_from_uint64(evm->chain_config->chain_id) : uint256_from_uint64(1),

@@ -530,7 +530,7 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
             if (evm->fork >= FORK_BYZANTIUM) max_precompile = 8;  // + MODEXP, BN256
             if (evm->fork >= FORK_ISTANBUL)  max_precompile = 9;  // + BLAKE2F
             if (evm->fork >= FORK_CANCUN)    max_precompile = 10; // + POINT_EVAL
-            if (evm->fork >= FORK_PRAGUE)    max_precompile = 19; // + BLS12-381
+            if (evm->fork >= FORK_PRAGUE)    max_precompile = 0x11; // + BLS12-381 (0x0B-0x11)
 
             for (uint8_t i = 1; i <= max_precompile; i++)
             {

@@ -195,7 +195,12 @@ evm_status_t op_jump(evm_t *evm)
         return EVM_STACK_UNDERFLOW;
     }
 
-    // Convert to uint64
+    // Destination must fit in code size — reject if high bits set
+    if (dest_256.high != 0 || (uint64_t)(dest_256.low >> 64) != 0)
+    {
+        return EVM_INVALID_JUMP;
+    }
+
     uint64_t dest = uint256_to_uint64(&dest_256);
 
     // Validate jump destination
@@ -243,6 +248,12 @@ evm_status_t op_jumpi(evm_t *evm)
     }
 
     // Condition is true, perform jump
+    // Destination must fit in code size — reject if high bits set
+    if (dest_256.high != 0 || (uint64_t)(dest_256.low >> 64) != 0)
+    {
+        return EVM_INVALID_JUMP;
+    }
+
     uint64_t dest = uint256_to_uint64(&dest_256);
 
     // Validate jump destination

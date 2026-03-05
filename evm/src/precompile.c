@@ -458,21 +458,27 @@ static uint64_t modexp_head_bit_len(const uint8_t *data, size_t len)
 }
 
 // EIP-198 mult_complexity (Byzantium to Istanbul)
+// Returns UINT64_MAX on overflow.
 static uint64_t modexp_mult_complexity_eip198(uint64_t x)
 {
+    __uint128_t xx = (__uint128_t)x * x;
+    __uint128_t result;
     if (x <= 64)
-        return x * x;
+        result = xx;
     else if (x <= 1024)
-        return x * x / 4 + 96 * x - 3072;
+        result = xx / 4 + 96 * x - 3072;
     else
-        return x * x / 16 + 480 * x - 199680;
+        result = xx / 16 + 480 * x - 199680;
+    return (result > UINT64_MAX) ? UINT64_MAX : (uint64_t)result;
 }
 
 // EIP-2565 mult_complexity (Berlin+)
+// Returns UINT64_MAX on overflow.
 static uint64_t modexp_mult_complexity_eip2565(uint64_t x)
 {
     uint64_t words = (x + 7) / 8;
-    return words * words;
+    __uint128_t result = (__uint128_t)words * words;
+    return (result > UINT64_MAX) ? UINT64_MAX : (uint64_t)result;
 }
 
 static uint64_t modexp_gas(uint64_t base_len, uint64_t exp_len, uint64_t mod_len,
@@ -491,9 +497,14 @@ static uint64_t modexp_gas(uint64_t base_len, uint64_t exp_len, uint64_t mod_len
     else
     {
         // 8 * (exp_len - 32) + floor(log2(first_32_bytes))
-        adjusted_exp_len = 8 * (exp_len - 32);
-        if (head_bit_len > 0)
-            adjusted_exp_len += head_bit_len - 1;
+        // Cap at UINT64_MAX to avoid overflow
+        if (exp_len - 32 > UINT64_MAX / 8)
+            adjusted_exp_len = UINT64_MAX;
+        else {
+            adjusted_exp_len = 8 * (exp_len - 32);
+            if (head_bit_len > 0)
+                adjusted_exp_len += head_bit_len - 1;
+        }
     }
 
     uint64_t max_len = base_len > mod_len ? base_len : mod_len;
@@ -503,7 +514,9 @@ static uint64_t modexp_gas(uint64_t base_len, uint64_t exp_len, uint64_t mod_len
         // EIP-2565
         uint64_t mc = modexp_mult_complexity_eip2565(max_len);
         uint64_t iter = adjusted_exp_len > 1 ? adjusted_exp_len : 1;
-        uint64_t gas = mc * iter / 3;
+        // Overflow-safe: use 128-bit multiply
+        __uint128_t gas128 = (__uint128_t)mc * iter / 3;
+        uint64_t gas = (gas128 > UINT64_MAX) ? UINT64_MAX : (uint64_t)gas128;
         return gas > 200 ? gas : 200;
     }
     else
@@ -511,7 +524,8 @@ static uint64_t modexp_gas(uint64_t base_len, uint64_t exp_len, uint64_t mod_len
         // EIP-198
         uint64_t mc = modexp_mult_complexity_eip198(max_len);
         uint64_t iter = adjusted_exp_len > 1 ? adjusted_exp_len : 1;
-        return mc * iter / 20;
+        __uint128_t gas128 = (__uint128_t)mc * iter / 20;
+        return (gas128 > UINT64_MAX) ? UINT64_MAX : (uint64_t)gas128;
     }
 }
 
@@ -525,9 +539,24 @@ static evm_status_t precompile_modexp(const uint8_t *input, size_t input_size,
     uint64_t exp_len = modexp_read_len(input, input_size, 32);
     uint64_t mod_len = modexp_read_len(input, input_size, 64);
 
-    // Overflow check: if any length is > 2^32 it will cost too much gas anyway
-    if (base_len == UINT64_MAX || exp_len == UINT64_MAX || mod_len == UINT64_MAX)
+    // If base_len or mod_len overflow uint64, gas is astronomical → OOG
+    if (base_len == UINT64_MAX || mod_len == UINT64_MAX)
         return EVM_OUT_OF_GAS;
+
+    // exp_len overflow: gas depends on max(base_len, mod_len)
+    // If max_len > 0, the gas will be huge → OOG
+    // If max_len == 0, mc=0 and gas = min_gas (200 for EIP-2565)
+    if (exp_len == UINT64_MAX) {
+        uint64_t max_len = base_len > mod_len ? base_len : mod_len;
+        if (max_len > 0)
+            return EVM_OUT_OF_GAS;
+        // max_len==0: gas = minimum (200 for Berlin+, 0 for pre-Berlin)
+        uint64_t min_gas = (fork >= FORK_BERLIN) ? 200 : 0;
+        if (*gas < min_gas)
+            return EVM_OUT_OF_GAS;
+        *gas -= min_gas;
+        goto modexp_done;
+    }
 
     // Get exponent head (first min(32, exp_len) bytes) for gas calculation
     size_t exp_head_len = exp_len < 32 ? (size_t)exp_len : 32;
@@ -547,6 +576,7 @@ static evm_status_t precompile_modexp(const uint8_t *input, size_t input_size,
         return EVM_OUT_OF_GAS;
     *gas -= cost;
 
+modexp_done:
     // mod_len == 0: return empty
     if (mod_len == 0)
     {

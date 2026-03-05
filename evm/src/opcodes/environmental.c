@@ -364,26 +364,20 @@ evm_status_t op_codecopy(evm_t *evm)
 
     // Convert to uint64
     uint64_t dest_offset = uint256_to_uint64(&dest_offset_256);
-    uint64_t offset = uint256_to_uint64(&offset_256);
     uint64_t size = uint256_to_uint64(&size_256);
 
     // Check for unreasonably large sizes that would cause issues
-    // Any size close to UINT64_MAX is impossible to handle correctly
-    // Maximum reasonable memory size is much smaller than this
     if (size > (UINT64_MAX / 2)) {
-        // Size too large - would cause overflow in various calculations
         return EVM_OUT_OF_GAS;
     }
 
-    // Check for overflow in offset + size calculation
-    if (size > 0 && offset > UINT64_MAX - size) {
-        return EVM_OUT_OF_GAS;
-    }
+    // Check for overflow in dest_offset + size calculation
     if (size > 0 && dest_offset > UINT64_MAX - size) {
         return EVM_OUT_OF_GAS;
     }
 
     // Calculate dynamic gas: base + copy cost + memory expansion
+    // Note: gas depends only on dest memory expansion, NOT on source offset
     uint64_t copy_gas = gas_copy_cost(size);
     uint64_t mem_gas = evm_memory_access_cost(evm->memory, dest_offset, size);
     if (!evm_use_gas(evm, GAS_VERY_LOW + copy_gas + mem_gas))
@@ -400,15 +394,26 @@ evm_status_t op_codecopy(evm_t *evm)
         return EVM_INVALID_MEMORY_ACCESS;
     }
 
-    // Copy data from code to memory
-    for (uint64_t i = 0; i < size; i++)
-    {
-        uint8_t byte = 0;
-        if (offset + i < evm->code_size)
-        {
-            byte = evm->code[offset + i];
+    // Source offset can be any uint256 — bytes beyond code are zero-filled
+    // Check if offset_256 exceeds code_size entirely (all zeros)
+    bool offset_out_of_range = (offset_256.high != 0 ||
+                                (uint64_t)(offset_256.low >> 64) != 0 ||
+                                uint256_to_uint64(&offset_256) >= evm->code_size);
+
+    if (offset_out_of_range) {
+        // All bytes are zero — just zero-fill destination
+        for (uint64_t i = 0; i < size; i++) {
+            evm_memory_write_byte(evm->memory, dest_offset + i, 0);
         }
-        evm_memory_write_byte(evm->memory, dest_offset + i, byte);
+    } else {
+        uint64_t offset = uint256_to_uint64(&offset_256);
+        for (uint64_t i = 0; i < size; i++) {
+            uint8_t byte = 0;
+            if (offset + i < evm->code_size) {
+                byte = evm->code[offset + i];
+            }
+            evm_memory_write_byte(evm->memory, dest_offset + i, byte);
+        }
     }
 
     return EVM_SUCCESS;

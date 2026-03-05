@@ -135,6 +135,17 @@ static evm_status_t execute_create(evm_t *evm,
         }
     }
 
+    // EIP-2681: nonce overflow check — CREATE fails if nonce >= 2^64-1
+    if (sender_nonce >= UINT64_MAX)
+    {
+        LOG_EVM_DEBUG("CREATE: Sender nonce at maximum (EIP-2681)");
+        if (init_code) free(init_code);
+        uint256_t zero = UINT256_ZERO;
+        if (!evm_stack_push(evm->stack, &zero))
+            return EVM_STACK_OVERFLOW;
+        return EVM_SUCCESS;
+    }
+
     // Increment sender nonce BEFORE snapshot — persists even if CREATE fails
     evm_state_set_nonce(evm->state, &evm->msg.recipient, sender_nonce + 1);
 

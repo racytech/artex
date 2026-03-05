@@ -499,9 +499,15 @@ evm_status_t op_signextend(evm_t *evm)
     evm_stack_pop(evm->stack, &x);  // Second pop: value to extend
 
     // Sign extend x from (b+1) bytes
-    // Convert b to uint64 for byte number
-    uint64_t byte_num = uint256_to_uint64(&b);
-    uint256_t result = uint256_signextend(&x, byte_num);
+    // If b >= 31, value is unchanged (all 32 bytes are kept)
+    // Must check full uint256 to avoid truncation by uint256_to_uint64
+    uint256_t result;
+    if (b.high != 0 || b.low > 30) {
+        result = x;
+    } else {
+        unsigned int byte_num = (unsigned int)uint256_to_uint64(&b);
+        result = uint256_signextend(&x, byte_num);
+    }
 
     // Push result
     if (!evm_stack_push(evm->stack, &result))
