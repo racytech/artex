@@ -659,20 +659,28 @@ evm_status_t op_extcodecopy(evm_t *evm)
         const uint8_t *code = evm_state_get_code_ptr(evm->state, &addr, &code_size);
 
         // Copy code to memory (out of bounds reads return 0)
-        uint64_t code_offset = uint256_to_uint64(&offset_u256);
-        for (uint64_t i = 0; i < size; i++)
+        // Check if offset overflows uint64 — if so, all bytes are zero-padded
+        bool offset_out_of_range = (offset_u256.high != 0 ||
+                                    (uint64_t)(offset_u256.low >> 64) != 0);
+        if (offset_out_of_range)
         {
-            uint8_t byte = 0;
-            uint64_t src_idx = code_offset + i;
-            if (code && src_idx < code_size)
-            {
-                byte = code[src_idx];
-            }
-            evm_memory_write_byte(evm->memory, dest_offset + i, byte);
+            for (uint64_t i = 0; i < size; i++)
+                evm_memory_write_byte(evm->memory, dest_offset + i, 0);
         }
-
-        LOG_EVM_DEBUG("EXTCODECOPY: code_size=%u, offset=%lu, size=%lu",
-                      code_size, code_offset, size);
+        else
+        {
+            uint64_t code_offset = uint256_to_uint64(&offset_u256);
+            for (uint64_t i = 0; i < size; i++)
+            {
+                uint8_t byte = 0;
+                uint64_t src_idx = code_offset + i;
+                if (code && src_idx < code_size)
+                {
+                    byte = code[src_idx];
+                }
+                evm_memory_write_byte(evm->memory, dest_offset + i, byte);
+            }
+        }
     }
 
     return EVM_SUCCESS;

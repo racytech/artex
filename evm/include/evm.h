@@ -72,7 +72,7 @@ struct evm_result_t
 {
     evm_status_t status;    // Execution status
     uint64_t gas_left;      // Remaining gas after execution
-    uint64_t gas_refund;    // Gas refund amount
+    int64_t gas_refund;     // Gas refund amount (can be negative)
     uint8_t *output_data;   // Return data (NULL if none)
     size_t output_size;     // Size of return data
     address_t created_addr; // Address of created contract (CREATE/CREATE2)
@@ -182,7 +182,7 @@ struct evm_t
 
     uint64_t pc;         // Program counter
     uint64_t gas_left;   // Remaining gas
-    uint64_t gas_refund; // Gas refund accumulator
+    int64_t gas_refund;  // Gas refund accumulator (can be negative per-frame)
 
     // Return data from last call
     uint8_t *return_data;

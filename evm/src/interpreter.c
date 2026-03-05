@@ -49,7 +49,7 @@
 
 evm_result_t evm_result_create(evm_status_t status,
                                uint64_t gas_left,
-                               uint64_t gas_refund,
+                               int64_t gas_refund,
                                uint8_t *output_data,
                                size_t output_size)
 {
@@ -390,6 +390,9 @@ evm_result_t evm_interpret(evm_t *evm)
 
 op_stop:
     status = op_stop(evm);
+    // STOP produces no output — clear stale return data from subcalls
+    if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+    evm->return_data_size = 0;
     goto done;
 
 op_add:
@@ -1241,6 +1244,9 @@ op_revert:
 
 op_selfdestruct:
     status = op_selfdestruct(evm);
+    // SELFDESTRUCT produces no output — clear stale return data from subcalls
+    if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+    evm->return_data_size = 0;
     goto done;
 
     //==========================================================================
@@ -1260,6 +1266,17 @@ error:
     // Invalid opcode consumes all remaining gas
     if (status == EVM_INVALID_OPCODE)
         evm->gas_left = 0;
+    // For non-REVERT errors (OOG, invalid opcode, etc.), clear return data.
+    // Only REVERT should propagate output data on error.
+    if (status != EVM_REVERT)
+    {
+        if (evm->return_data)
+        {
+            free(evm->return_data);
+            evm->return_data = NULL;
+        }
+        evm->return_data_size = 0;
+    }
     // Fall through to done
 
 done:

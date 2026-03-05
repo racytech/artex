@@ -34,7 +34,7 @@ evm_result_t evm_interpret(evm_t *evm);
  */
 evm_result_t evm_result_create(evm_status_t status,
                                 uint64_t gas_left,
-                                uint64_t gas_refund,
+                                int64_t gas_refund,
                                 uint8_t *output_data,
                                 size_t output_size);
 

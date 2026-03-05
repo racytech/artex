@@ -195,7 +195,22 @@ bool transaction_validate(
     uint256_t effective_gas_price = transaction_effective_gas_price(tx, env);
     uint256_t gas_limit_u256 = uint256_from_uint64(tx->gas_limit);
     uint256_t gas_cost = uint256_mul(&effective_gas_price, &gas_limit_u256);
+
+    // Check for multiplication overflow (gasPrice * gasLimit > 2^256)
+    if (tx->gas_limit > 0) {
+        uint256_t check = uint256_div(&gas_cost, &gas_limit_u256);
+        if (!uint256_eq(&check, &effective_gas_price)) {
+            LOG_EVM_ERROR("Gas cost overflow: gasPrice * gasLimit exceeds uint256");
+            return false;
+        }
+    }
+
     uint256_t total_cost = uint256_add(&tx->value, &gas_cost);
+    // Check for addition overflow (value + gas_cost > 2^256)
+    if (uint256_lt(&total_cost, &gas_cost)) {
+        LOG_EVM_ERROR("Total cost overflow: value + gas_cost exceeds uint256");
+        return false;
+    }
 
     if (uint256_lt(&sender_balance, &total_cost)) {
         LOG_EVM_ERROR("Insufficient balance for transaction");
@@ -362,7 +377,19 @@ bool transaction_execute(
         }
         uint256_t gl = uint256_from_uint64(tx->gas_limit);
         uint256_t max_gas_cost = uint256_mul(&max_gas_price, &gl);
+        // Check for multiplication overflow
+        if (tx->gas_limit > 0) {
+            uint256_t check = uint256_div(&max_gas_cost, &gl);
+            if (!uint256_eq(&check, &max_gas_price)) {
+                LOG_EVM_ERROR("Gas cost overflow in balance check");
+                return false;
+            }
+        }
         uint256_t total_cost = uint256_add(&max_gas_cost, &tx->value);
+        if (uint256_lt(&total_cost, &max_gas_cost)) {
+            LOG_EVM_ERROR("Total cost overflow in balance check");
+            return false;
+        }
 
         // EIP-4844: add blob gas cost (max_fee_per_blob_gas * blob_count * GAS_PER_BLOB)
         if (tx->type == TX_TYPE_EIP4844) {
@@ -749,7 +776,9 @@ bool transaction_execute(
 post_execution:
 // Calculate actual gas cost
     uint64_t gas_used = result->gas_used;
-    uint64_t gas_refund = result->gas_refund + auth_gas_refund;
+    // Clamp refund to 0 (per-frame refunds can go negative, but net transaction refund >= 0)
+    int64_t net_refund = result->gas_refund + (int64_t)auth_gas_refund;
+    uint64_t gas_refund = (net_refund > 0) ? (uint64_t)net_refund : 0;
 
     // Apply refund cap: London+ (EIP-3529) = gas_used/5, pre-London = gas_used/2
     uint64_t max_refund = (evm->fork >= FORK_LONDON) ? gas_used / 5 : gas_used / 2;

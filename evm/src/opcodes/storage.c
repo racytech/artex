@@ -234,17 +234,7 @@ evm_status_t op_sstore(evm_t *evm)
     }
 
     // Apply gas refund (can be negative for dirty writes)
-    if (gas_refund > 0) {
-        evm_refund_gas(evm, (uint64_t)gas_refund);
-    } else if (gas_refund < 0) {
-        // Negative refund: reduce accumulated refund counter
-        uint64_t reduction = (uint64_t)(-gas_refund);
-        if (evm->gas_refund >= reduction) {
-            evm->gas_refund -= reduction;
-        } else {
-            evm->gas_refund = 0;
-        }
-    }
+    evm->gas_refund += gas_refund;
 
     // Store value to storage using current contract address
     evm_state_set_storage(evm->state, &evm->msg.recipient, &key, &value);

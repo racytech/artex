@@ -749,14 +749,14 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         // Save subcall's return data before destroying its context
         uint8_t *subcall_return_data = evm->return_data;
         size_t subcall_return_size = evm->return_data_size;
-        
+
         // Destroy subcall's stack and memory
         evm_stack_destroy(evm->stack);
         evm_memory_destroy(evm->memory);
-        
+
         // Restore parent's context
         evm_restore_context(evm, &saved_context);
-        
+
         // Update parent's return data with subcall's output
         // (This makes it available for RETURNDATASIZE/RETURNDATACOPY)
         if (evm->return_data)

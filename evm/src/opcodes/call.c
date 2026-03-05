@@ -253,6 +253,10 @@ evm_status_t op_call(evm_t *evm)
     // If graceful failure (depth/balance check), push 0 and return
     if (graceful_failure)
     {
+        // Clear return data — failed CALL produces empty return data
+        if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+        evm->return_data_size = 0;
+
         uint256_t result = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &result))
             return EVM_STACK_OVERFLOW;
@@ -376,6 +380,10 @@ evm_status_t op_callcode(evm_t *evm)
     // If graceful failure (depth/balance check), push 0 and return
     if (graceful_failure)
     {
+        // Clear return data — failed CALLCODE produces empty return data
+        if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+        evm->return_data_size = 0;
+
         uint256_t result = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &result))
         {
@@ -524,6 +532,10 @@ evm_status_t op_delegatecall(evm_t *evm)
     // If graceful failure (depth check), push 0 and return
     if (graceful_failure)
     {
+        // Clear return data — failed call produces empty return data
+        if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+        evm->return_data_size = 0;
+
         uint256_t result = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &result))
         {
@@ -671,6 +683,10 @@ evm_status_t op_staticcall(evm_t *evm)
     // If graceful failure (depth check), push 0 and return
     if (graceful_failure)
     {
+        // Clear return data — failed call produces empty return data
+        if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+        evm->return_data_size = 0;
+
         uint256_t result = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &result))
         {
