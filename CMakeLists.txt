@@ -436,6 +436,17 @@ add_library(portal_table STATIC
 )
 target_link_libraries(portal_table blst)
 
+# History Network — content key codec + content ID derivation
+add_library(history STATIC
+    net/src/history.c
+)
+
+# Portal Overlay Handler — generic sub-protocol integration layer
+add_library(portal STATIC
+    net/src/portal.c
+)
+target_link_libraries(portal portal_wire portal_table discv5 utp)
+
 #==============================================================================
 # Tests — Networking
 #==============================================================================
@@ -527,6 +538,20 @@ add_executable(test_portal_table
 )
 target_link_libraries(test_portal_table portal_table blst)
 add_test(NAME test_portal_table COMMAND test_portal_table)
+
+# Test: History Network (content key codec + content ID derivation)
+add_executable(test_history
+    net/tests/test_history.c
+)
+target_link_libraries(test_history history)
+add_test(NAME test_history COMMAND test_history)
+
+# Test: Portal Overlay Handler (sub-protocol integration)
+add_executable(test_portal
+    net/tests/test_portal.c
+)
+target_link_libraries(test_portal portal history)
+add_test(NAME test_portal COMMAND test_portal)
 
 #==============================================================================
 # Build Summary
