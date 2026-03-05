@@ -1548,7 +1548,6 @@ static void line_func_double(line_result_t *l, bn256_g2_t *T, const bn256_g1_t *
     // Use the efficient doubling:
     // A = X*Y/2
     fp2_mul(&XY, &T->x, &T->y);
-    fp_set_ui(&two_inv, 2);
     fp_init(&two_inv);
     fp_set_ui(&two_inv, 2);
     fp_inv(&two_inv, &two_inv);

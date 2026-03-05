@@ -507,8 +507,8 @@ evm_status_t op_returndatacopy(evm_t *evm)
         return EVM_OUT_OF_GAS;
     }
 
-    // Check if trying to read beyond return data
-    if (offset + size > evm->return_data_size)
+    // Check for overflow and bounds (EIP-211: revert if out of bounds even for size==0)
+    if (offset + size < offset || offset + size > evm->return_data_size)
     {
         return EVM_INVALID_MEMORY_ACCESS;
     }
