@@ -166,14 +166,16 @@ block_result_t block_execute(evm_t *evm,
         address_t hist_addr;
         memcpy(hist_addr.bytes, HISTORY_ADDR, 20);
 
-        /* Ensure account exists in cache (pre-state has code deployed) */
-        evm_state_get_nonce(evm->state, &hist_addr);
-
-        /* Store parent hash at slot (block.number - 1) % 8191 */
-        uint64_t slot_idx = (header->number - 1) % BLOCKHASH_SERVE_WINDOW;
-        uint256_t slot = uint256_from_uint64(slot_idx);
-        uint256_t parent_hash_val = uint256_from_bytes(header->parent_hash.bytes, 32);
-        evm_state_set_storage(evm->state, &hist_addr, &slot, &parent_hash_val);
+        /* Only write storage if the contract has code deployed */
+        uint32_t hist_code_len = 0;
+        evm_state_get_code_ptr(evm->state, &hist_addr, &hist_code_len);
+        if (hist_code_len > 0) {
+            /* Store parent hash at slot (block.number - 1) % 8191 */
+            uint64_t slot_idx = (header->number - 1) % BLOCKHASH_SERVE_WINDOW;
+            uint256_t slot = uint256_from_uint64(slot_idx);
+            uint256_t parent_hash_val = uint256_from_bytes(header->parent_hash.bytes, 32);
+            evm_state_set_storage(evm->state, &hist_addr, &slot, &parent_hash_val);
+        }
 
         #undef BLOCKHASH_SERVE_WINDOW
     }
@@ -189,14 +191,19 @@ block_result_t block_execute(evm_t *evm,
         address_t beacon_addr;
         memcpy(beacon_addr.bytes, BEACON_ROOT_ADDR, 20);
 
-        uint64_t ts_idx = header->timestamp % HISTORY_BUFFER_LENGTH;
-        uint256_t ts_slot = uint256_from_uint64(ts_idx);
-        uint256_t ts_val = uint256_from_uint64(header->timestamp);
-        evm_state_set_storage(evm->state, &beacon_addr, &ts_slot, &ts_val);
+        /* Only write storage if the contract has code deployed */
+        uint32_t beacon_code_len = 0;
+        evm_state_get_code_ptr(evm->state, &beacon_addr, &beacon_code_len);
+        if (beacon_code_len > 0) {
+            uint64_t ts_idx = header->timestamp % HISTORY_BUFFER_LENGTH;
+            uint256_t ts_slot = uint256_from_uint64(ts_idx);
+            uint256_t ts_val = uint256_from_uint64(header->timestamp);
+            evm_state_set_storage(evm->state, &beacon_addr, &ts_slot, &ts_val);
 
-        uint256_t root_slot = uint256_from_uint64(ts_idx + HISTORY_BUFFER_LENGTH);
-        uint256_t root_val = uint256_from_bytes(header->parent_beacon_root.bytes, 32);
-        evm_state_set_storage(evm->state, &beacon_addr, &root_slot, &root_val);
+            uint256_t root_slot = uint256_from_uint64(ts_idx + HISTORY_BUFFER_LENGTH);
+            uint256_t root_val = uint256_from_bytes(header->parent_beacon_root.bytes, 32);
+            evm_state_set_storage(evm->state, &beacon_addr, &root_slot, &root_val);
+        }
 
         #undef HISTORY_BUFFER_LENGTH
     }
