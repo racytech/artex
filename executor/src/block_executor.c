@@ -1,6 +1,7 @@
 #include "block_executor.h"
 #include "tx_decoder.h"
 #include "fork.h"
+#include "transaction.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -50,7 +51,8 @@ static void header_to_evm_block_env(const block_header_t *hdr,
     if (hdr->has_blob_gas) {
         env->excess_blob_gas = uint256_from_uint64(hdr->excess_blob_gas);
         /* Compute blob base fee from excess blob gas */
-        env->blob_base_fee = calc_blob_gas_price(&env->excess_blob_gas);
+        evm_fork_t fork = config ? fork_get_active(hdr->number, config) : FORK_CANCUN;
+        env->blob_base_fee = calc_blob_gas_price(&env->excess_blob_gas, fork);
     }
 
     /* block_hash[256] would need to be populated from a block hash oracle.
