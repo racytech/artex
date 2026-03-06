@@ -149,6 +149,15 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
                    block_idx, block->tx_count);
         }
 
+        // Invalid block: test expects this block to be rejected
+        if (block->expect_exception) {
+            if (runner->config.verbose) {
+                printf("    Expected invalid block: %s — skipping execution\n",
+                       block->expect_exception);
+            }
+            continue;
+        }
+
         // Decode full block RLP → header + body
         if (!block->rlp || block->rlp_len == 0) {
             result->status = TEST_ERROR;

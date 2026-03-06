@@ -163,6 +163,7 @@ typedef struct {
     uint8_t **uncles;       // Array of uncle headers RLP
     size_t *uncle_len;
     size_t uncle_count;
+    char *expect_exception; // Non-NULL if block should be rejected
 } test_block_t;
 
 //==============================================================================

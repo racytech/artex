@@ -111,6 +111,12 @@ bool parse_blockchain_test(const char *filepath, blockchain_test_t **out) {
                     }
                 }
                 
+                // Expected exception (invalid block marker)
+                const char *exc_str;
+                if (json_get_string(block_item, "expectException", &exc_str)) {
+                    block->expect_exception = strdup(exc_str);
+                }
+
                 // Uncles (array of RLP)
                 const cJSON *uncles = json_get_array(block_item, "uncleHeaders");
                 if (uncles) {

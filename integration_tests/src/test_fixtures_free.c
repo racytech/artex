@@ -48,6 +48,7 @@ void blockchain_test_free(blockchain_test_t *test) {
         test_block_t *block = &test->blocks[i];
         
         free(block->header.extra_data);
+        free(block->expect_exception);
         free(block->rlp);
         
         // Free transactions
