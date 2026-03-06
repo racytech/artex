@@ -1,21 +1,18 @@
 /*
- * Code Store Test
+ * Code Store Tests
  *
- * Tests code_store (append-only code.dat) integration with data_layer.
- *
- * Five phases:
- *   1. Store + read back: varying sizes (32B, 1KB, 24KB)
- *   2. Dedup: same key twice, code_store count stays the same
- *   3. Mixed state + code: dl_get vs dl_get_code route correctly
- *   4. Merge with code keys: state merge doesn't interfere with code
- *   5. Scale: 100K code entries, random sample read-back
- *
- * Usage: ./test_code_store [scale_thousands]
- *   Default: 100 (100K code entries in phase 5)
+ * Validates content-addressed code storage:
+ *   1. Basic put/get/contains/get_size
+ *   2. Deduplication (same code stored once)
+ *   3. Multiple distinct codes
+ *   4. Persistence (close + reopen)
+ *   5. Large code (~24KB)
+ *   6. Empty code (zero-length)
+ *   7. Buffer too small (returns required size)
+ *   8. Stress: many unique + duplicate codes
  */
 
-#include "../include/data_layer.h"
-#include "../include/state_store.h"
+#include "../include/code_store.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,504 +20,374 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <inttypes.h>
-#include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
-// ============================================================================
-// Constants
-// ============================================================================
+/* =========================================================================
+ * Helpers
+ * ========================================================================= */
 
-#define KEY_SIZE       32
-#define STATE_VAL_LEN  32   // state value size
+#define BASE_PATH "/tmp/test_code_store"
 
-// ============================================================================
-// RNG (SplitMix64)
-// ============================================================================
+static int test_num = 0;
+static int pass_count = 0;
 
-typedef struct { uint64_t state; } rng_t;
+#define RUN(fn) do { \
+    test_num++; \
+    printf("  [%2d] %-50s", test_num, #fn); \
+    fn(); \
+    pass_count++; \
+    printf("OK\n"); \
+} while (0)
 
-static inline uint64_t rng_next(rng_t *rng) {
-    uint64_t z = (rng->state += 0x9e3779b97f4a7c15ULL);
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    return z ^ (z >> 31);
+#define ASSERT(cond, fmt, ...) do { \
+    if (!(cond)) { \
+        printf("FAIL\n      %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); \
+        exit(1); \
+    } \
+} while (0)
+
+static void cleanup(void) {
+    unlink(BASE_PATH ".idx");
+    unlink(BASE_PATH ".dat");
 }
 
-static inline rng_t rng_create(uint64_t seed) {
-    rng_t r = { .state = seed };
-    rng_next(&r);
-    return r;
+/* Generate a deterministic code hash from index */
+static void make_hash(uint64_t i, uint8_t hash[32]) {
+    memset(hash, 0, 32);
+    memcpy(hash, &i, 8);
+    uint64_t x = i * 0x517cc1b727220a95ULL;
+    memcpy(hash + 8, &x, 8);
+    x = x * 0x6c62272e07bb0142ULL;
+    memcpy(hash + 16, &x, 8);
+    x = x * 0x9e3779b97f4a7c15ULL;
+    memcpy(hash + 24, &x, 8);
 }
 
-static void generate_key(uint8_t key[KEY_SIZE], uint64_t seed, uint64_t index) {
-    rng_t rng = rng_create(seed ^ (index * 0x517cc1b727220a95ULL));
-    uint64_t r0 = rng_next(&rng);
-    uint64_t r1 = rng_next(&rng);
-    uint64_t r2 = rng_next(&rng);
-    uint64_t r3 = rng_next(&rng);
-    memcpy(key,      &r0, 8);
-    memcpy(key + 8,  &r1, 8);
-    memcpy(key + 16, &r2, 8);
-    memcpy(key + 24, &r3, 8);
-}
-
-// Generate deterministic bytecode of given length
-static void generate_bytecode(uint8_t *buf, uint32_t len,
-                               uint64_t seed, uint64_t index) {
-    rng_t rng = rng_create(seed ^ (index * 0xA3F1C2D4E5B6A7F8ULL));
-    for (uint32_t i = 0; i < len; i += 8) {
-        uint64_t r = rng_next(&rng);
-        uint32_t remain = len - i;
-        memcpy(buf + i, &r, remain < 8 ? remain : 8);
+/* Generate deterministic code bytes from index */
+static void make_code(uint64_t i, uint8_t *buf, uint32_t len) {
+    for (uint32_t j = 0; j < len; j++) {
+        buf[j] = (uint8_t)((i * 31 + j * 7) & 0xFF);
     }
 }
 
-// ============================================================================
-// Utilities
-// ============================================================================
+/* =========================================================================
+ * Tests
+ * ========================================================================= */
 
-static size_t get_rss_mb(void) {
-    FILE *f = fopen("/proc/self/status", "r");
-    if (!f) return 0;
-    char line[256];
-    size_t rss_kb = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "VmRSS:", 6) == 0) {
-            sscanf(line + 6, "%zu", &rss_kb);
-            break;
-        }
-    }
-    fclose(f);
-    return rss_kb / 1024;
+static void test_create_destroy(void) {
+    cleanup();
+    code_store_t *cs = code_store_create(BASE_PATH, 1000);
+    ASSERT(cs != NULL, "create failed");
+    ASSERT(code_store_count(cs) == 0, "count should be 0");
+    code_store_destroy(cs);
 }
 
-static double now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec / 1e9;
+static void test_put_get_single(void) {
+    cleanup();
+    code_store_t *cs = code_store_create(BASE_PATH, 1000);
+    ASSERT(cs != NULL, "create failed");
+
+    uint8_t hash[32];
+    make_hash(1, hash);
+    uint8_t code[100];
+    make_code(1, code, 100);
+
+    ASSERT(code_store_put(cs, hash, code, 100), "put failed");
+    ASSERT(code_store_count(cs) == 1, "count should be 1");
+    ASSERT(code_store_contains(cs, hash), "should contain hash");
+    ASSERT(code_store_get_size(cs, hash) == 100, "size should be 100");
+
+    uint8_t buf[100];
+    uint32_t len = code_store_get(cs, hash, buf, 100);
+    ASSERT(len == 100, "get returned %u", len);
+    ASSERT(memcmp(buf, code, 100) == 0, "data mismatch");
+
+    code_store_destroy(cs);
 }
 
-// ============================================================================
-// Phase 1: Store + Read Back (varying sizes)
-// ============================================================================
+static void test_dedup(void) {
+    cleanup();
+    code_store_t *cs = code_store_create(BASE_PATH, 1000);
 
-static bool phase1(data_layer_t *dl, uint64_t seed) {
-    printf("\n========================================\n");
-    printf("Phase 1: Store + Read Back\n");
-    printf("========================================\n");
+    uint8_t hash[32];
+    make_hash(42, hash);
+    uint8_t code[200];
+    make_code(42, code, 200);
 
-    uint32_t sizes[] = { 32, 256, 1024, 4096, 12000, 24576 };
-    int num_sizes = sizeof(sizes) / sizeof(sizes[0]);
-
-    for (int i = 0; i < num_sizes; i++) {
-        uint32_t len = sizes[i];
-        uint8_t key[KEY_SIZE];
-        // Use separate key space for code (seed + 0x1000000)
-        generate_key(key, seed + 0x1000000ULL, (uint64_t)i);
-
-        uint8_t *bytecode = malloc(len);
-        generate_bytecode(bytecode, len, seed, (uint64_t)i);
-
-        // Store
-        if (!dl_put_code(dl, key, bytecode, len)) {
-            printf("  FAIL: dl_put_code failed for size %u\n", len);
-            free(bytecode);
-            return false;
-        }
-
-        // Verify length
-        uint32_t got_len = dl_code_length(dl, key);
-        if (got_len != len) {
-            printf("  FAIL: dl_code_length = %u, expected %u\n", got_len, len);
-            free(bytecode);
-            return false;
-        }
-
-        // Read back
-        uint8_t *got = malloc(len);
-        uint32_t out_len = 0;
-        if (!dl_get_code(dl, key, got, &out_len)) {
-            printf("  FAIL: dl_get_code failed for size %u\n", len);
-            free(bytecode);
-            free(got);
-            return false;
-        }
-        if (out_len != len || memcmp(got, bytecode, len) != 0) {
-            printf("  FAIL: data mismatch for size %u\n", len);
-            free(bytecode);
-            free(got);
-            return false;
-        }
-
-        printf("  %5u bytes: store + read OK\n", len);
-        free(bytecode);
-        free(got);
+    /* Put same code 100 times */
+    for (int i = 0; i < 100; i++) {
+        ASSERT(code_store_put(cs, hash, code, 200), "put %d failed", i);
     }
 
-    dl_stats_t st = dl_stats(dl);
-    printf("\n  code entries: %u\n", st.code_count);
-    printf("  code.dat:     %" PRIu64 " bytes\n", st.code_file_size);
-    printf("  Phase 1: PASS\n");
-    return true;
+    /* Should be stored once */
+    ASSERT(code_store_count(cs) == 1, "count should be 1, got %" PRIu64,
+           code_store_count(cs));
+
+    /* Verify data */
+    uint8_t buf[200];
+    uint32_t len = code_store_get(cs, hash, buf, 200);
+    ASSERT(len == 200, "get returned %u", len);
+    ASSERT(memcmp(buf, code, 200) == 0, "data mismatch");
+
+    code_store_destroy(cs);
 }
 
-// ============================================================================
-// Phase 2: Dedup
-// ============================================================================
+static void test_multiple_codes(void) {
+    cleanup();
+    code_store_t *cs = code_store_create(BASE_PATH, 1000);
 
-static bool phase2(data_layer_t *dl, uint64_t seed) {
-    printf("\n========================================\n");
-    printf("Phase 2: Dedup\n");
-    printf("========================================\n");
+    #define N_CODES 500
+    uint8_t codes[N_CODES][256];
+    uint8_t hashes[N_CODES][32];
+    uint32_t lengths[N_CODES];
 
-    dl_stats_t before = dl_stats(dl);
-
-    // Re-insert the same keys from phase 1
-    uint32_t sizes[] = { 32, 256, 1024, 4096, 12000, 24576 };
-    int num_sizes = sizeof(sizes) / sizeof(sizes[0]);
-
-    for (int i = 0; i < num_sizes; i++) {
-        uint32_t len = sizes[i];
-        uint8_t key[KEY_SIZE];
-        generate_key(key, seed + 0x1000000ULL, (uint64_t)i);
-
-        uint8_t *bytecode = malloc(len);
-        generate_bytecode(bytecode, len, seed, (uint64_t)i);
-
-        // Should be a no-op (dedup)
-        if (!dl_put_code(dl, key, bytecode, len)) {
-            printf("  FAIL: dedup dl_put_code failed\n");
-            free(bytecode);
-            return false;
-        }
-        free(bytecode);
+    for (int i = 0; i < N_CODES; i++) {
+        make_hash((uint64_t)i, hashes[i]);
+        lengths[i] = 50 + (uint32_t)(i % 200);  /* 50-249 bytes */
+        make_code((uint64_t)i, codes[i], lengths[i]);
+        ASSERT(code_store_put(cs, hashes[i], codes[i], lengths[i]),
+               "put %d failed", i);
     }
 
-    dl_stats_t after = dl_stats(dl);
-    if (after.code_count != before.code_count) {
-        printf("  FAIL: code_count changed from %u to %u (should be unchanged)\n",
-               before.code_count, after.code_count);
-        return false;
-    }
-    if (after.code_file_size != before.code_file_size) {
-        printf("  FAIL: code_file_size changed (should be unchanged)\n");
-        return false;
+    ASSERT(code_store_count(cs) == N_CODES, "count should be %d", N_CODES);
+
+    /* Verify all */
+    uint8_t buf[256];
+    for (int i = 0; i < N_CODES; i++) {
+        uint32_t len = code_store_get(cs, hashes[i], buf, 256);
+        ASSERT(len == lengths[i], "code %d: expected %u, got %u",
+               i, lengths[i], len);
+        ASSERT(memcmp(buf, codes[i], lengths[i]) == 0,
+               "code %d: data mismatch", i);
     }
 
-    printf("  dedup: %d re-inserts, code_count unchanged at %u\n",
-           num_sizes, after.code_count);
-    printf("  Phase 2: PASS\n");
-    return true;
+    code_store_destroy(cs);
 }
 
-// ============================================================================
-// Phase 3: Mixed State + Code
-// ============================================================================
+static void test_persistence(void) {
+    cleanup();
 
-static bool phase3(data_layer_t *dl, uint64_t seed) {
-    printf("\n========================================\n");
-    printf("Phase 3: Mixed State + Code\n");
-    printf("========================================\n");
+    uint8_t hash[32];
+    make_hash(99, hash);
+    uint8_t code[150];
+    make_code(99, code, 150);
 
-    uint64_t num_state = 1000;
-    uint64_t num_code = 100;
-    uint8_t key[KEY_SIZE];
-
-    // Insert state keys
-    double t0 = now_sec();
-    for (uint64_t i = 0; i < num_state; i++) {
-        generate_key(key, seed, i);
-        uint8_t value[STATE_VAL_LEN];
-        generate_bytecode(value, STATE_VAL_LEN, seed, i);
-        dl_put(dl, key, value, STATE_VAL_LEN);
+    /* Create, put, sync, destroy */
+    {
+        code_store_t *cs = code_store_create(BASE_PATH, 1000);
+        ASSERT(cs != NULL, "create failed");
+        ASSERT(code_store_put(cs, hash, code, 150), "put failed");
+        code_store_sync(cs);
+        code_store_destroy(cs);
     }
 
-    // Merge state to disk
-    dl_merge(dl);
-    double t1 = now_sec();
-    printf("  inserted + merged %"PRIu64" state keys in %.3fs\n",
-           num_state, t1 - t0);
+    /* Reopen, verify */
+    {
+        code_store_t *cs = code_store_open(BASE_PATH);
+        ASSERT(cs != NULL, "open failed");
+        ASSERT(code_store_count(cs) == 1, "count should be 1");
+        ASSERT(code_store_contains(cs, hash), "should contain hash");
 
-    // Insert code keys (separate key space)
-    for (uint64_t i = 0; i < num_code; i++) {
-        generate_key(key, seed + 0x2000000ULL, i);
-        uint32_t len = 256 + (uint32_t)(i % 1024);  // varying sizes
-        uint8_t *bytecode = malloc(len);
-        generate_bytecode(bytecode, len, seed + 0x2000000ULL, i);
-        dl_put_code(dl, key, bytecode, len);
-        free(bytecode);
+        uint8_t buf[150];
+        uint32_t len = code_store_get(cs, hash, buf, 150);
+        ASSERT(len == 150, "get returned %u", len);
+        ASSERT(memcmp(buf, code, 150) == 0, "data mismatch after reopen");
+        code_store_destroy(cs);
     }
-    printf("  inserted %" PRIu64 " code entries\n", num_code);
-
-    // Verify state keys read via dl_get (not dl_get_code)
-    uint64_t state_errors = 0;
-    for (uint64_t i = 0; i < num_state; i++) {
-        generate_key(key, seed, i);
-        uint8_t got[STATE_VAL_LEN];
-        uint16_t got_len = 0;
-        if (!dl_get(dl, key, got, &got_len)) {
-            state_errors++;
-        } else {
-            uint8_t expected[STATE_VAL_LEN];
-            generate_bytecode(expected, STATE_VAL_LEN, seed, i);
-            if (got_len != STATE_VAL_LEN || memcmp(got, expected, STATE_VAL_LEN) != 0)
-                state_errors++;
-        }
-    }
-    if (state_errors > 0) {
-        printf("  FAIL: %" PRIu64 " state read errors\n", state_errors);
-        return false;
-    }
-
-    // Verify code keys read via dl_get_code (not dl_get)
-    uint64_t code_errors = 0;
-    for (uint64_t i = 0; i < num_code; i++) {
-        generate_key(key, seed + 0x2000000ULL, i);
-        uint32_t len = 256 + (uint32_t)(i % 1024);
-        uint8_t *expected = malloc(len);
-        generate_bytecode(expected, len, seed + 0x2000000ULL, i);
-
-        uint8_t *got = malloc(len);
-        uint32_t got_len = 0;
-        if (!dl_get_code(dl, key, got, &got_len)) {
-            code_errors++;
-        } else if (got_len != len || memcmp(got, expected, len) != 0) {
-            code_errors++;
-        }
-        free(expected);
-        free(got);
-    }
-    if (code_errors > 0) {
-        printf("  FAIL: %" PRIu64 " code read errors\n", code_errors);
-        return false;
-    }
-
-    // Verify dl_get returns false for code keys
-    generate_key(key, seed + 0x2000000ULL, 0);
-    uint8_t tmp[STATE_VAL_LEN];
-    uint16_t tmp_len = 0;
-    if (dl_get(dl, key, tmp, &tmp_len)) {
-        printf("  FAIL: dl_get should return false for code key\n");
-        return false;
-    }
-
-    // Verify dl_get_code returns false for state keys
-    generate_key(key, seed, 0);
-    uint8_t code_tmp[256];
-    uint32_t code_tmp_len = 0;
-    if (dl_get_code(dl, key, code_tmp, &code_tmp_len)) {
-        printf("  FAIL: dl_get_code should return false for state key\n");
-        return false;
-    }
-
-    dl_stats_t st = dl_stats(dl);
-    printf("\n  state: %" PRIu64 " reads OK\n", num_state);
-    printf("  code:  %" PRIu64 " reads OK\n", num_code);
-    printf("  cross-check: dl_get(code_key)=false, dl_get_code(state_key)=false\n");
-    printf("  index keys: %" PRIu64 " (state + code)\n", st.index_keys);
-    printf("  Phase 3: PASS\n");
-    return true;
 }
 
-// ============================================================================
-// Phase 4: Merge with Code Keys
-// ============================================================================
+static void test_large_code(void) {
+    cleanup();
+    code_store_t *cs = code_store_create(BASE_PATH, 100);
 
-static bool phase4(data_layer_t *dl, uint64_t seed) {
-    printf("\n========================================\n");
-    printf("Phase 4: Merge + Code Coexistence\n");
-    printf("========================================\n");
+    #define LARGE_LEN 24576  /* 24KB */
+    uint8_t *code = malloc(LARGE_LEN);
+    ASSERT(code != NULL, "malloc failed");
+    make_code(7, code, LARGE_LEN);
 
-    dl_stats_t before = dl_stats(dl);
+    uint8_t hash[32];
+    make_hash(7, hash);
 
-    // Buffer more state writes + merge
-    uint64_t num_state = 5000;
-    uint8_t key[KEY_SIZE];
+    ASSERT(code_store_put(cs, hash, code, LARGE_LEN), "put large failed");
+    ASSERT(code_store_get_size(cs, hash) == LARGE_LEN, "size mismatch");
 
-    for (uint64_t i = 0; i < num_state; i++) {
-        generate_key(key, seed + 0x3000000ULL, i);
-        uint8_t value[STATE_VAL_LEN];
-        generate_bytecode(value, STATE_VAL_LEN, seed + 0x3000000ULL, i);
-        dl_put(dl, key, value, STATE_VAL_LEN);
+    uint8_t *buf = malloc(LARGE_LEN);
+    ASSERT(buf != NULL, "malloc failed");
+    uint32_t len = code_store_get(cs, hash, buf, LARGE_LEN);
+    ASSERT(len == LARGE_LEN, "get returned %u", len);
+    ASSERT(memcmp(buf, code, LARGE_LEN) == 0, "large code data mismatch");
+
+    free(code);
+    free(buf);
+    code_store_destroy(cs);
+}
+
+static void test_empty_code(void) {
+    cleanup();
+    code_store_t *cs = code_store_create(BASE_PATH, 100);
+
+    uint8_t hash[32];
+    make_hash(0, hash);
+
+    /* Store empty code (code_len = 0) */
+    ASSERT(code_store_put(cs, hash, NULL, 0), "put empty failed");
+    ASSERT(code_store_contains(cs, hash), "should contain empty");
+    ASSERT(code_store_get_size(cs, hash) == 0, "size should be 0");
+
+    uint8_t buf[1];
+    uint32_t len = code_store_get(cs, hash, buf, 1);
+    ASSERT(len == 0, "get should return 0 for empty code");
+
+    code_store_destroy(cs);
+}
+
+static void test_buffer_too_small(void) {
+    cleanup();
+    code_store_t *cs = code_store_create(BASE_PATH, 100);
+
+    uint8_t hash[32];
+    make_hash(5, hash);
+    uint8_t code[500];
+    make_code(5, code, 500);
+
+    ASSERT(code_store_put(cs, hash, code, 500), "put failed");
+
+    /* Buffer too small → returns required size */
+    uint8_t small_buf[10];
+    memset(small_buf, 0xAA, 10);
+    uint32_t len = code_store_get(cs, hash, small_buf, 10);
+    ASSERT(len == 500, "should return required size 500, got %u", len);
+
+    /* Verify buffer untouched */
+    uint8_t expected[10];
+    memset(expected, 0xAA, 10);
+    ASSERT(memcmp(small_buf, expected, 10) == 0, "buffer should be untouched");
+
+    code_store_destroy(cs);
+}
+
+static void test_not_found(void) {
+    cleanup();
+    code_store_t *cs = code_store_create(BASE_PATH, 100);
+
+    uint8_t hash[32];
+    make_hash(999, hash);
+
+    ASSERT(!code_store_contains(cs, hash), "should not contain");
+    ASSERT(code_store_get_size(cs, hash) == 0, "size should be 0");
+
+    uint8_t buf[100];
+    uint32_t len = code_store_get(cs, hash, buf, 100);
+    ASSERT(len == 0, "get should return 0");
+
+    code_store_destroy(cs);
+}
+
+static void test_stress(void) {
+    cleanup();
+    code_store_t *cs = code_store_create(BASE_PATH, 20000);
+
+    #define STRESS_UNIQUE  10000
+    #define STRESS_DUPES   50000
+
+    /* Insert unique codes */
+    for (uint64_t i = 0; i < STRESS_UNIQUE; i++) {
+        uint8_t hash[32], code[128];
+        make_hash(i, hash);
+        uint32_t code_len = 32 + (uint32_t)(i % 96);  /* 32-127 bytes */
+        make_code(i, code, code_len);
+        ASSERT(code_store_put(cs, hash, code, code_len), "put %" PRIu64 " failed", i);
     }
 
-    double t0 = now_sec();
-    uint64_t merged = dl_merge(dl);
-    double t1 = now_sec();
+    ASSERT(code_store_count(cs) == STRESS_UNIQUE,
+           "count should be %d, got %" PRIu64, STRESS_UNIQUE, code_store_count(cs));
 
-    dl_stats_t after = dl_stats(dl);
-    printf("  merged %" PRIu64 " state entries in %.3fs\n", merged, t1 - t0);
-    printf("  index keys: %" PRIu64 " (was %" PRIu64 ")\n",
-           after.index_keys, before.index_keys);
-    printf("  code_count unchanged: %u\n", after.code_count);
+    /* Insert duplicates (should be no-ops) */
+    for (uint64_t i = 0; i < STRESS_DUPES; i++) {
+        uint64_t idx = i % STRESS_UNIQUE;
+        uint8_t hash[32], code[128];
+        make_hash(idx, hash);
+        uint32_t code_len = 32 + (uint32_t)(idx % 96);
+        make_code(idx, code, code_len);
+        ASSERT(code_store_put(cs, hash, code, code_len), "dup put failed");
+    }
 
-    // Verify code entries from phase 3 are still readable
-    uint64_t code_errors = 0;
+    /* Count should not change */
+    ASSERT(code_store_count(cs) == STRESS_UNIQUE,
+           "count after dupes: %" PRIu64, code_store_count(cs));
+
+    /* Verify all codes */
+    uint8_t buf[128];
+    for (uint64_t i = 0; i < STRESS_UNIQUE; i++) {
+        uint8_t hash[32], code[128];
+        make_hash(i, hash);
+        uint32_t code_len = 32 + (uint32_t)(i % 96);
+        make_code(i, code, code_len);
+
+        uint32_t len = code_store_get(cs, hash, buf, 128);
+        ASSERT(len == code_len, "code %" PRIu64 ": expected %u, got %u",
+               i, code_len, len);
+        ASSERT(memcmp(buf, code, code_len) == 0,
+               "code %" PRIu64 ": data mismatch", i);
+    }
+
+    /* Persistence check */
+    code_store_sync(cs);
+    code_store_destroy(cs);
+
+    cs = code_store_open(BASE_PATH);
+    ASSERT(cs != NULL, "reopen failed");
+    ASSERT(code_store_count(cs) == STRESS_UNIQUE,
+           "count after reopen: %" PRIu64, code_store_count(cs));
+
+    /* Spot-check 100 random codes */
     for (uint64_t i = 0; i < 100; i++) {
-        generate_key(key, seed + 0x2000000ULL, i);
-        uint32_t len = 256 + (uint32_t)(i % 1024);
-        uint8_t *expected = malloc(len);
-        generate_bytecode(expected, len, seed + 0x2000000ULL, i);
+        uint64_t idx = (i * 97) % STRESS_UNIQUE;
+        uint8_t hash[32], code[128];
+        make_hash(idx, hash);
+        uint32_t code_len = 32 + (uint32_t)(idx % 96);
+        make_code(idx, code, code_len);
 
-        uint8_t *got = malloc(len);
-        uint32_t got_len = 0;
-        if (!dl_get_code(dl, key, got, &got_len) ||
-            got_len != len || memcmp(got, expected, len) != 0) {
-            code_errors++;
-        }
-        free(expected);
-        free(got);
-    }
-    if (code_errors > 0) {
-        printf("  FAIL: %" PRIu64 " code entries corrupted after merge\n", code_errors);
-        return false;
+        uint32_t len = code_store_get(cs, hash, buf, 128);
+        ASSERT(len == code_len, "reopen code %" PRIu64 ": len mismatch", idx);
+        ASSERT(memcmp(buf, code, code_len) == 0,
+               "reopen code %" PRIu64 ": data mismatch", idx);
     }
 
-    printf("  code entries intact after state merge\n");
-    printf("  Phase 4: PASS\n");
-    return true;
+    code_store_destroy(cs);
 }
 
-// ============================================================================
-// Phase 5: Scale
-// ============================================================================
+/* =========================================================================
+ * Main
+ * ========================================================================= */
 
-static bool phase5(data_layer_t *dl, uint64_t seed, uint64_t num_codes) {
-    printf("\n========================================\n");
-    printf("Phase 5: Scale (%" PRIu64 "K code entries)\n", num_codes / 1000);
-    printf("========================================\n");
+int main(void) {
+    printf("=== code_store Tests ===\n\n");
 
-    double t0 = now_sec();
-    uint64_t total_bytes = 0;
+    printf("Phase 1: Basic Operations\n");
+    RUN(test_create_destroy);
+    RUN(test_put_get_single);
+    RUN(test_not_found);
+    RUN(test_empty_code);
+    RUN(test_buffer_too_small);
 
-    for (uint64_t i = 0; i < num_codes; i++) {
-        uint8_t key[KEY_SIZE];
-        generate_key(key, seed + 0x5000000ULL, i);
+    printf("\nPhase 2: Deduplication\n");
+    RUN(test_dedup);
 
-        // Vary bytecode size: 100 to ~3000 bytes (avg ~1500)
-        uint32_t len = 100 + (uint32_t)(rng_next(&(rng_t){ .state = seed ^ i }) % 2900);
-        uint8_t *bytecode = malloc(len);
-        generate_bytecode(bytecode, len, seed + 0x5000000ULL, i);
+    printf("\nPhase 3: Multiple Codes\n");
+    RUN(test_multiple_codes);
 
-        if (!dl_put_code(dl, key, bytecode, len)) {
-            printf("  FAIL: dl_put_code at index %" PRIu64 "\n", i);
-            free(bytecode);
-            return false;
-        }
-        total_bytes += len;
-        free(bytecode);
+    printf("\nPhase 4: Persistence\n");
+    RUN(test_persistence);
 
-        if ((i + 1) % (num_codes / 5) == 0) {
-            dl_stats_t st = dl_stats(dl);
-            printf("  %6" PRIu64 "K entries | code.dat %4" PRIu64 " MB | RSS %zu MB\n",
-                   (i + 1) / 1000, st.code_file_size / (1024 * 1024),
-                   get_rss_mb());
-        }
-    }
-    double t1 = now_sec();
+    printf("\nPhase 5: Large Code\n");
+    RUN(test_large_code);
 
-    // Verify random sample
-    printf("\n  verifying...");
-    fflush(stdout);
-    uint64_t check = num_codes < 10000 ? num_codes : 10000;
-    uint64_t step = num_codes / check;
-    uint64_t errors = 0;
+    printf("\nPhase 6: Stress (10K unique + 50K dupes)\n");
+    RUN(test_stress);
 
-    for (uint64_t i = 0; i < num_codes; i += step) {
-        uint8_t key[KEY_SIZE];
-        generate_key(key, seed + 0x5000000ULL, i);
-
-        uint32_t len = 100 + (uint32_t)(rng_next(&(rng_t){ .state = seed ^ i }) % 2900);
-        uint8_t *expected = malloc(len);
-        generate_bytecode(expected, len, seed + 0x5000000ULL, i);
-
-        uint8_t *got = malloc(len);
-        uint32_t got_len = 0;
-        if (!dl_get_code(dl, key, got, &got_len) ||
-            got_len != len || memcmp(got, expected, len) != 0) {
-            errors++;
-        }
-        free(expected);
-        free(got);
-    }
-    printf(" %" PRIu64 " sampled, %" PRIu64 " errors\n", check, errors);
-
-    if (errors > 0) {
-        printf("  FAIL\n");
-        return false;
-    }
-
-    dl_stats_t st = dl_stats(dl);
-    printf("\n  ============================================\n");
-    printf("  Phase 5 Summary\n");
-    printf("  ============================================\n");
-    printf("  code entries:    %u\n", st.code_count);
-    printf("  code.dat:        %" PRIu64 " MB\n", st.code_file_size / (1024 * 1024));
-    printf("  total bytecode:  %" PRIu64 " MB\n", total_bytes / (1024 * 1024));
-    printf("  insert time:     %.2fs (%.1f Kk/s)\n",
-           t1 - t0, num_codes / (t1 - t0) / 1000.0);
-    printf("  index keys:      %" PRIu64 "\n", st.index_keys);
-    printf("  RSS:             %zu MB\n", get_rss_mb());
-    printf("  ============================================\n");
-    printf("  Phase 5: PASS\n");
-    return true;
-}
-
-// ============================================================================
-// Main
-// ============================================================================
-
-int main(int argc, char *argv[]) {
-    uint64_t scale_thousands = 100;
-    if (argc >= 2) {
-        scale_thousands = (uint64_t)atoll(argv[1]);
-        if (scale_thousands == 0) {
-            fprintf(stderr, "Usage: %s [scale_thousands]\n", argv[0]);
-            return 1;
-        }
-    }
-
-    uint64_t seed = 0xC0DE5700EC0DE500ULL;
-    const char *state_path = "/tmp/art_cs_test_state.dat";
-    const char *code_path = "/tmp/art_cs_test_code.dat";
-
-    printf("============================================\n");
-    printf("Code Store Test\n");
-    printf("============================================\n");
-    printf("scale:  %" PRIu64 "K code entries (phase 5)\n", scale_thousands);
-    printf("RSS:    %zu MB\n", get_rss_mb());
-
-    data_layer_t *dl = dl_create(state_path, code_path, KEY_SIZE, 4);
-    if (!dl) {
-        fprintf(stderr, "FAIL: dl_create\n");
-        return 1;
-    }
-
-    double t_start = now_sec();
-    int result = 0;
-
-    if (!phase1(dl, seed))                                   { result = 1; goto cleanup; }
-    if (!phase2(dl, seed))                                   { result = 1; goto cleanup; }
-    if (!phase3(dl, seed))                                   { result = 1; goto cleanup; }
-    if (!phase4(dl, seed))                                   { result = 1; goto cleanup; }
-    if (!phase5(dl, seed, scale_thousands * 1000))           { result = 1; goto cleanup; }
-
-    double t_end = now_sec();
-    dl_stats_t st = dl_stats(dl);
-
-    printf("\n============================================\n");
-    printf("ALL PHASES PASSED\n");
-    printf("============================================\n");
-    printf("total time:   %.1fs\n", t_end - t_start);
-    printf("index keys:   %" PRIu64 "\n", st.index_keys);
-    printf("code entries: %u\n", st.code_count);
-    printf("code.dat:     %" PRIu64 " MB\n", st.code_file_size / (1024 * 1024));
-    printf("final RSS:    %zu MB\n", get_rss_mb());
-    printf("============================================\n");
-
-cleanup:
-    dl_destroy(dl);
-    unlink(state_path);
-    unlink(code_path);
-    return result;
+    cleanup();
+    printf("\n=== Results: %d / %d passed ===\n", pass_count, test_num);
+    return 0;
 }

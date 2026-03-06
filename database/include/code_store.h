@@ -6,101 +6,105 @@
 #include <stdbool.h>
 
 /**
- * Code Store — Append-only storage for contract bytecode.
+ * Code Store — Content-Addressed, Append-Only, Deduplicated.
  *
- * code.dat: raw bytecode concatenated, no framing or length prefix.
- * In-memory index array tracks {offset, length} per entry (12 bytes each).
+ * Stores Ethereum contract bytecode keyed by code hash (32 bytes).
+ * Backed by two files:
+ *   - Index:  disk_hash mapping code_hash (32B) → {offset, length} (12B)
+ *   - Data:   append-only flat file of raw code bytes
  *
- * Content-addressed by keccak256(bytecode) — dedup handled by caller
- * via compact_art lookup before calling code_store_append.
+ * Properties:
+ *   - Content-addressed: same code → same hash → stored once (free dedup)
+ *   - Write-once: code is immutable after deployment, never updated/deleted
+ *   - Variable-length: codes range from 0 to ~24KB
+ *   - Thread-safe: reads are lock-free (pread), writes serialized by mutex
  *
- * Opaque handle — struct defined in code_store.c.
+ * File layout (data file):
+ *   [Header: 4096 bytes]
+ *     magic[4] "CDST" | version[4] 1 | data_size[8] | reserved[4080]
+ *   [Code region: offset 4096+]
+ *     raw bytes, appended sequentially, no framing
+ *
+ * Crash safety:
+ *   - Data written before index entry (orphaned bytes on crash = harmless)
+ *   - Index inherits disk_hash crash safety (dirty flag + recovery)
  */
 
 typedef struct code_store code_store_t;
 
-// ============================================================================
-// Lifecycle
-// ============================================================================
+/* =========================================================================
+ * Lifecycle
+ * ========================================================================= */
 
 /**
- * Create a new code store, truncating any existing file at path.
+ * Create a new code store.
+ * Creates two files: <path>.idx (disk_hash index) and <path>.dat (data).
+ * capacity_hint: expected number of unique codes (sizes disk_hash).
  * Returns NULL on failure.
  */
-code_store_t *code_store_create(const char *path);
+code_store_t *code_store_create(const char *path, uint64_t capacity_hint);
 
 /**
- * Open an existing code store without truncating.
- * Sets file_size from fstat. Entries array starts empty
- * (populated by checkpoint/recovery in Stage 3).
- * Returns NULL on failure.
+ * Open an existing code store from <path>.idx and <path>.dat.
+ * Returns NULL on failure or corrupt files.
  */
 code_store_t *code_store_open(const char *path);
 
 /**
- * Close file descriptor and free resources. Does NOT unlink the file.
+ * Close files, free struct. Does NOT remove files.
  */
 void code_store_destroy(code_store_t *cs);
 
-// ============================================================================
-// Write (append-only)
-// ============================================================================
+/* =========================================================================
+ * Operations
+ * ========================================================================= */
 
 /**
- * Append bytecode to code.dat. Returns entry index.
- * Caller is responsible for dedup (check compact_art before calling).
+ * Store code bytes keyed by code_hash.
+ * If code_hash already exists, this is a no-op (deduplication).
+ * code_len may be 0 (empty code).
+ * Returns true on success.
  */
-uint32_t code_store_append(code_store_t *cs, const void *bytecode, uint32_t len);
-
-// ============================================================================
-// Read
-// ============================================================================
+bool code_store_put(code_store_t *cs, const uint8_t code_hash[32],
+                    const uint8_t *code, uint32_t code_len);
 
 /**
- * Get bytecode length for a given entry index.
- * Returns 0 if index is out of range.
+ * Retrieve code by hash.
+ * buf: caller-provided buffer of buf_len bytes.
+ * Returns actual code length.
+ *   - If code not found: returns 0.
+ *   - If buf_len < code length: returns required size, buf untouched.
+ *   - Otherwise: copies code into buf, returns code length.
  */
-uint32_t code_store_length(const code_store_t *cs, uint32_t index);
+uint32_t code_store_get(const code_store_t *cs, const uint8_t code_hash[32],
+                        uint8_t *buf, uint32_t buf_len);
 
 /**
- * Read bytecode into buf. buf_len must be >= code_store_length().
- * Returns false on error or if index is out of range.
+ * Check if code_hash exists in the store.
  */
-bool code_store_read(code_store_t *cs, uint32_t index,
-                     void *out, uint32_t buf_len);
-
-// ============================================================================
-// Durability
-// ============================================================================
+bool code_store_contains(const code_store_t *cs, const uint8_t code_hash[32]);
 
 /**
- * Flush pending writes to disk (fdatasync).
+ * Get code length without reading data. Returns 0 if not found.
+ */
+uint32_t code_store_get_size(const code_store_t *cs, const uint8_t code_hash[32]);
+
+/* =========================================================================
+ * Durability
+ * ========================================================================= */
+
+/**
+ * Sync both index and data file to disk.
  */
 void code_store_sync(code_store_t *cs);
 
-// ============================================================================
-// Stats / Accessors
-// ============================================================================
-
-uint32_t code_store_count(const code_store_t *cs);
-uint64_t code_store_file_size(const code_store_t *cs);
-
-// ============================================================================
-// Checkpoint / Recovery Accessors
-// ============================================================================
+/* =========================================================================
+ * Stats
+ * ========================================================================= */
 
 /**
- * Get entry metadata by index (for checkpoint serialization).
- * Returns false if index is out of range.
+ * Number of unique codes stored.
  */
-bool code_store_get_entry(const code_store_t *cs, uint32_t index,
-                           uint64_t *out_offset, uint32_t *out_length);
+uint64_t code_store_count(const code_store_t *cs);
 
-/**
- * Add an entry to the in-memory array without writing to file.
- * Used by checkpoint recovery to restore the entries index.
- * Returns false on allocation failure.
- */
-bool code_store_add_entry(code_store_t *cs, uint64_t offset, uint32_t length);
-
-#endif // CODE_STORE_H
+#endif /* CODE_STORE_H */
