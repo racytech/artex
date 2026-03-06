@@ -115,6 +115,104 @@ fail:
     return false;
 }
 
+/* Forward declaration for auth signer recovery */
+static bool recover_sender(const uint8_t signing_hash[32],
+                           const uint256_t *r, const uint256_t *s,
+                           int recid, address_t *sender);
+
+/* =========================================================================
+ * Authorization list decoding (EIP-7702)
+ * ========================================================================= */
+
+static bool decode_authorization_list(const rlp_item_t *item,
+                                       authorization_t **out,
+                                       size_t *out_count) {
+    *out = NULL;
+    *out_count = 0;
+    if (!item || rlp_get_type(item) != RLP_TYPE_LIST) return true; /* empty is ok */
+
+    size_t count = rlp_get_list_count(item);
+    if (count == 0) return true;
+
+    authorization_t *auths = calloc(count, sizeof(authorization_t));
+    if (!auths) return false;
+
+    for (size_t i = 0; i < count; i++) {
+        const rlp_item_t *tuple = rlp_get_list_item(item, i);
+        if (!tuple || rlp_get_type(tuple) != RLP_TYPE_LIST ||
+            rlp_get_list_count(tuple) != 6) {
+            goto fail;
+        }
+
+        /* [chain_id, address, nonce, y_parity, r, s] */
+        if (!rlp_to_uint256(rlp_get_list_item(tuple, 0), &auths[i].chain_id))
+            goto fail;
+
+        const rlp_item_t *addr_item = rlp_get_list_item(tuple, 1);
+        if (!addr_item || rlp_get_type(addr_item) != RLP_TYPE_STRING) goto fail;
+        const bytes_t *addr_bytes = rlp_get_string(addr_item);
+        if (!addr_bytes || addr_bytes->len != 20) goto fail;
+        memcpy(auths[i].address.bytes, addr_bytes->data, 20);
+
+        if (!rlp_to_uint64(rlp_get_list_item(tuple, 2), &auths[i].nonce))
+            goto fail;
+
+        uint64_t y_parity;
+        if (!rlp_to_uint64(rlp_get_list_item(tuple, 3), &y_parity))
+            goto fail;
+        auths[i].y_parity = (uint8_t)y_parity;
+
+        if (!rlp_to_uint256(rlp_get_list_item(tuple, 4), &auths[i].r))
+            goto fail;
+        if (!rlp_to_uint256(rlp_get_list_item(tuple, 5), &auths[i].s))
+            goto fail;
+
+        /* Recover signer: keccak256(0x05 || rlp([chain_id, address, nonce])) */
+        rlp_item_t *auth_list = rlp_list_new();
+        /* Clone chain_id field */
+        bytes_t chain_enc = rlp_encode(rlp_get_list_item(tuple, 0));
+        rlp_item_t *chain_clone = rlp_decode(chain_enc.data, chain_enc.len);
+        rlp_list_append(auth_list, chain_clone);
+        free(chain_enc.data);
+        /* Clone address field */
+        bytes_t addr_enc = rlp_encode(rlp_get_list_item(tuple, 1));
+        rlp_item_t *addr_clone = rlp_decode(addr_enc.data, addr_enc.len);
+        rlp_list_append(auth_list, addr_clone);
+        free(addr_enc.data);
+        /* Clone nonce field */
+        bytes_t nonce_enc = rlp_encode(rlp_get_list_item(tuple, 2));
+        rlp_item_t *nonce_clone = rlp_decode(nonce_enc.data, nonce_enc.len);
+        rlp_list_append(auth_list, nonce_clone);
+        free(nonce_enc.data);
+
+        bytes_t rlp_encoded = rlp_encode(auth_list);
+        size_t total = 1 + rlp_encoded.len;
+        uint8_t *buf = malloc(total);
+        buf[0] = 0x05; /* EIP-7702 auth magic byte */
+        memcpy(buf + 1, rlp_encoded.data, rlp_encoded.len);
+
+        hash_t signing_hash = hash_keccak256(buf, total);
+        free(buf);
+        free(rlp_encoded.data);
+        rlp_item_free(auth_list);
+
+        /* Recover — on failure, signer stays zero (transaction.c skips zero signers) */
+        int recid = (int)auths[i].y_parity;
+        if (recid == 0 || recid == 1) {
+            recover_sender(signing_hash.bytes, &auths[i].r, &auths[i].s,
+                           recid, &auths[i].signer);
+        }
+    }
+
+    *out = auths;
+    *out_count = count;
+    return true;
+
+fail:
+    free(auths);
+    return false;
+}
+
 /* =========================================================================
  * Sender recovery via secp256k1 ecrecover
  * ========================================================================= */
@@ -427,6 +525,36 @@ static bool decode_eip4844(transaction_t *tx, const rlp_item_t *list,
 }
 
 /* =========================================================================
+ * EIP-7702 (type 4) decode
+ * ========================================================================= */
+
+static bool decode_eip7702(transaction_t *tx, const rlp_item_t *list,
+                           uint64_t chain_id) {
+    /* [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas, gasLimit,
+     *  destination, value, data, accessList, authorizationList,
+     *  signatureYParity, signatureR, signatureS]  → 13 fields */
+    if (rlp_get_list_count(list) != 13) return false;
+    (void)chain_id;
+
+    tx->type = TX_TYPE_EIP7702;
+    if (!rlp_to_uint64(rlp_get_list_item(list, 1), &tx->nonce)) return false;
+    if (!rlp_to_uint256(rlp_get_list_item(list, 2), &tx->max_priority_fee_per_gas)) return false;
+    if (!rlp_to_uint256(rlp_get_list_item(list, 3), &tx->max_fee_per_gas)) return false;
+    if (!rlp_to_uint64(rlp_get_list_item(list, 4), &tx->gas_limit)) return false;
+
+    if (!decode_typed_common(tx, list, 5, 6, 7, 8)) return false;
+
+    /* Authorization list */
+    if (!decode_authorization_list(rlp_get_list_item(list, 9),
+                                    &tx->authorization_list,
+                                    &tx->authorization_list_count))
+        return false;
+
+    /* Fields 0..9 are signing payload (10 fields) */
+    return typed_recover_sender(tx, 0x04, list, 10, 10, 11, 12);
+}
+
+/* =========================================================================
  * Public API
  * ========================================================================= */
 
@@ -459,6 +587,7 @@ bool tx_decode_rlp(transaction_t *tx, const rlp_item_t *item,
         case 0x01: ok = decode_eip2930(tx, inner, chain_id); break;
         case 0x02: ok = decode_eip1559(tx, inner, chain_id); break;
         case 0x03: ok = decode_eip4844(tx, inner, chain_id); break;
+        case 0x04: ok = decode_eip7702(tx, inner, chain_id); break;
         default: break;
         }
 
@@ -501,5 +630,6 @@ void tx_decoded_free(transaction_t *tx) {
         free(tx->access_list);
     }
     free((void *)tx->blob_versioned_hashes);
+    free(tx->authorization_list);
     memset(tx, 0, sizeof(*tx));
 }
