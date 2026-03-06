@@ -79,7 +79,7 @@ bool verkle_state_revert_block(verkle_state_t *vs);
 void verkle_state_sync(verkle_state_t *vs);
 
 /* =========================================================================
- * Version (uint8 → 32-byte LE slot)
+ * Version (byte 0 of packed basic data at suffix 0)
  * ========================================================================= */
 
 uint8_t verkle_state_get_version(verkle_state_t *vs,
@@ -89,7 +89,7 @@ void    verkle_state_set_version(verkle_state_t *vs,
                                  uint8_t version);
 
 /* =========================================================================
- * Nonce (uint64 → 32-byte LE slot)
+ * Nonce (8-byte BE in packed basic data at suffix 0)
  * ========================================================================= */
 
 uint64_t verkle_state_get_nonce(verkle_state_t *vs,
@@ -99,7 +99,7 @@ void     verkle_state_set_nonce(verkle_state_t *vs,
                                 uint64_t nonce);
 
 /* =========================================================================
- * Balance (raw 32-byte LE value)
+ * Balance (16-byte BE in packed basic data; API: 32-byte LE, low 16 bytes)
  * ========================================================================= */
 
 void verkle_state_get_balance(verkle_state_t *vs,
@@ -110,7 +110,7 @@ void verkle_state_set_balance(verkle_state_t *vs,
                               const uint8_t balance[32]);
 
 /* =========================================================================
- * Code Hash (raw 32 bytes)
+ * Code Hash (raw 32 bytes at suffix 1)
  * ========================================================================= */
 
 void verkle_state_get_code_hash(verkle_state_t *vs,
@@ -121,7 +121,7 @@ void verkle_state_set_code_hash(verkle_state_t *vs,
                                 const uint8_t hash[32]);
 
 /* =========================================================================
- * Code Size (uint64 → 32-byte LE slot)
+ * Code Size (3-byte BE uint24 in packed basic data at suffix 0)
  * ========================================================================= */
 
 uint64_t verkle_state_get_code_size(verkle_state_t *vs,
@@ -131,10 +131,10 @@ void     verkle_state_set_code_size(verkle_state_t *vs,
                                     uint64_t size);
 
 /* =========================================================================
- * Code (bytecode split into 32-byte chunks, domain 3)
+ * Code (31-byte chunks with PUSHDATA prefix, EIP-6800)
  * ========================================================================= */
 
-/** Store contract bytecode (splits into 32-byte chunks, sets code_size).
+/** Store contract bytecode (31-byte chunks with PUSHDATA prefix, sets code_size).
  *  Does NOT set code_hash — caller must set it separately.
  *  Returns false on error. */
 bool verkle_state_set_code(verkle_state_t *vs,

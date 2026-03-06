@@ -186,10 +186,12 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
     cs_local.current = UINT256_ZERO_INIT;
 
     // Load from verkle_state
-    uint8_t slot_le[32], val_le[32];
+    // Slot key: LE for key derivation arithmetic
+    // Value: BE (Ethereum convention — go-ethereum uses common.LeftPadBytes)
+    uint8_t slot_le[32], val_be[32];
     uint256_to_bytes_le(slot, slot_le);
-    verkle_state_get_storage(es->vs, addr->bytes, slot_le, val_le);
-    cs_local.original = uint256_from_bytes_le(val_le, 32);
+    verkle_state_get_storage(es->vs, addr->bytes, slot_le, val_be);
+    cs_local.original = uint256_from_bytes(val_be, 32);
     cs_local.current = cs_local.original;
 
     if (!mem_art_insert(&es->storage, skey, SLOT_KEY_SIZE,
@@ -1030,6 +1032,17 @@ static bool finalize_account_cb(const uint8_t *key, size_t key_len,
         uint8_t balance_le[32];
         uint256_to_bytes_le(&ca->balance, balance_le);
         verkle_state_set_balance(ctx->es->vs, ca->addr.bytes, balance_le);
+
+        // Always write code_hash when account is dirty (e.g. newly created)
+        if (!ca->code_dirty) {
+            if (ca->has_code) {
+                verkle_state_set_code_hash(ctx->es->vs, ca->addr.bytes,
+                                          ca->code_hash.bytes);
+            } else {
+                verkle_state_set_code_hash(ctx->es->vs, ca->addr.bytes,
+                                          HASH_EMPTY_CODE.bytes);
+            }
+        }
     }
 
     if (ca->code_dirty) {
@@ -1039,9 +1052,9 @@ static bool finalize_account_cb(const uint8_t *key, size_t key_len,
             verkle_state_set_code_hash(ctx->es->vs, ca->addr.bytes,
                                       ca->code_hash.bytes);
         } else {
-            // Code cleared
-            uint8_t zero32[32] = {0};
-            verkle_state_set_code_hash(ctx->es->vs, ca->addr.bytes, zero32);
+            // Code cleared — write keccak256("") as code hash
+            verkle_state_set_code_hash(ctx->es->vs, ca->addr.bytes,
+                                      HASH_EMPTY_CODE.bytes);
             verkle_state_set_code_size(ctx->es->vs, ca->addr.bytes, 0);
         }
     }
@@ -1061,16 +1074,16 @@ static bool finalize_storage_cb(const uint8_t *key, size_t key_len,
     // Extract address from composite key
     const uint8_t *addr = cs->key;
 
-    // Extract slot (stored as BE in composite key) and convert to LE for verkle
+    // Slot key: LE for verkle key derivation arithmetic
     uint256_t slot = uint256_from_bytes(cs->key + ADDRESS_SIZE, 32);
     uint8_t slot_le[32];
     uint256_to_bytes_le(&slot, slot_le);
 
-    // Convert value to LE for verkle
-    uint8_t val_le[32];
-    uint256_to_bytes_le(&cs->current, val_le);
+    // Value: BE (Ethereum convention)
+    uint8_t val_be[32];
+    uint256_to_bytes(&cs->current, val_be);
 
-    verkle_state_set_storage(ctx->es->vs, addr, slot_le, val_le);
+    verkle_state_set_storage(ctx->es->vs, addr, slot_le, val_be);
 
     return true;
 }
@@ -1091,9 +1104,77 @@ bool evm_state_finalize(evm_state_t *es) {
 // State Root — delegate to verkle_state
 // ============================================================================
 
+// Flush callback: writes ALL cached accounts to verkle (ignores dirty flag)
+static bool flush_all_accounts_cb(const uint8_t *key, size_t key_len,
+                                    const void *value, size_t value_len,
+                                    void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    finalize_ctx_t *ctx = (finalize_ctx_t *)user_data;
+    const cached_account_t *ca = (const cached_account_t *)value;
+
+    if (ca->self_destructed) {
+        verkle_state_set_nonce(ctx->es->vs, ca->addr.bytes, 0);
+        uint8_t zero32[32] = {0};
+        verkle_state_set_balance(ctx->es->vs, ca->addr.bytes, zero32);
+        verkle_state_set_code_hash(ctx->es->vs, ca->addr.bytes, zero32);
+        verkle_state_set_code_size(ctx->es->vs, ca->addr.bytes, 0);
+        return true;
+    }
+
+    // Skip empty accounts that never existed
+    bool is_empty = (ca->nonce == 0 &&
+                     uint256_is_zero(&ca->balance) &&
+                     !ca->has_code);
+    if (!ca->existed && !ca->created && is_empty) return true;
+
+    verkle_state_set_nonce(ctx->es->vs, ca->addr.bytes, ca->nonce);
+    uint8_t balance_le[32];
+    uint256_to_bytes_le(&ca->balance, balance_le);
+    verkle_state_set_balance(ctx->es->vs, ca->addr.bytes, balance_le);
+
+    if (ca->code && ca->code_size > 0) {
+        verkle_state_set_code(ctx->es->vs, ca->addr.bytes,
+                             ca->code, ca->code_size);
+        verkle_state_set_code_hash(ctx->es->vs, ca->addr.bytes,
+                                  ca->code_hash.bytes);
+    } else {
+        // Account without code: write keccak256("") as code hash
+        verkle_state_set_code_hash(ctx->es->vs, ca->addr.bytes,
+                                  HASH_EMPTY_CODE.bytes);
+    }
+
+    return true;
+}
+
+static bool flush_all_storage_cb(const uint8_t *key, size_t key_len,
+                                   const void *value, size_t value_len,
+                                   void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    finalize_ctx_t *ctx = (finalize_ctx_t *)user_data;
+    const cached_slot_t *cs = (const cached_slot_t *)value;
+
+    const uint8_t *addr = cs->key;
+    uint256_t slot = uint256_from_bytes(cs->key + ADDRESS_SIZE, 32);
+    uint8_t slot_le[32];
+    uint256_to_bytes_le(&slot, slot_le);
+
+    // Value: BE (Ethereum convention)
+    uint8_t val_be[32];
+    uint256_to_bytes(&cs->current, val_be);
+
+    verkle_state_set_storage(ctx->es->vs, addr, slot_le, val_be);
+    return true;
+}
+
 hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     (void)prune_empty;  // Not applicable for verkle
     if (!es) return hash_zero();
+
+    // Flush ALL cached state to verkle tree (not just dirty),
+    // because commit() may have cleared dirty flags before root computation.
+    finalize_ctx_t ctx = { .es = es, .ok = true };
+    mem_art_foreach(&es->accounts, flush_all_accounts_cb, &ctx);
+    mem_art_foreach(&es->storage, flush_all_storage_cb, &ctx);
 
     hash_t root;
     verkle_state_root_hash(es->vs, root.bytes);

@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 /**
- * Verkle Key Derivation — Pedersen Hash
+ * Verkle Key Derivation — Pedersen Hash (EIP-6800)
  *
  * Maps (address, tree_index, sub_index) to a 32-byte verkle tree key.
  *
@@ -21,24 +21,49 @@ extern "C" {
  *   scalar[3] = tree_index_hi    (upper 16 bytes LE, 128 bits)
  *
  *   stem = map_to_field(pedersen_commit(scalars, CRS))[0:31]
+ *
+ * Account header layout (tree_index=0, all same stem):
+ *   Suffix 0:       Basic data (packed: version|reserved|code_size|nonce|balance)
+ *   Suffix 1:       Code hash (32-byte keccak256)
+ *   Suffixes 64-127:  Header storage (slots 0-63)
+ *   Suffixes 128-255: Code chunks 0-127 (31-byte with PUSHDATA prefix)
  */
 
 /* =========================================================================
- * Account Layout Constants
+ * Layout Constants (EIP-6800)
  * ========================================================================= */
 
-/** Domain separator for state key derivation (leaf commitment uses 1). */
-#define VERKLE_KEY_DOMAIN          2
+/** Domain separator for all key derivation. */
+#define VERKLE_KEY_DOMAIN              2
 
-/** Domain separator for code key derivation (separate from state). */
-#define VERKLE_CODE_DOMAIN         3
+/** Suffix for packed basic data (version + code_size + nonce + balance). */
+#define VERKLE_BASIC_DATA_SUFFIX       0
 
-/** Account header fields (tree_index = 0). */
-#define VERKLE_VERSION_SUFFIX      0
-#define VERKLE_BALANCE_SUFFIX      1
-#define VERKLE_NONCE_SUFFIX        2
-#define VERKLE_CODE_HASH_SUFFIX    3
-#define VERKLE_CODE_SIZE_SUFFIX    4
+/** Suffix for code hash (keccak256). */
+#define VERKLE_CODE_HASH_SUFFIX        1
+
+/** Offset for header storage slots 0-63 (suffixes 64-127). */
+#define VERKLE_HEADER_STORAGE_OFFSET   64
+
+/** Offset for code chunks (suffixes 128-255 in first stem). */
+#define VERKLE_CODE_OFFSET             128
+
+/** Verkle node width (256 children per internal node). */
+#define VERKLE_NODE_WIDTH              256
+
+/**
+ * Basic data layout within the 32-byte value at suffix 0 (big-endian):
+ *   [0]      version     (1 byte)
+ *   [1..4]   reserved    (4 bytes, zero)
+ *   [5..7]   code_size   (3 bytes, BE uint24)
+ *   [8..15]  nonce       (8 bytes, BE uint64)
+ *   [16..31] balance     (16 bytes, BE uint128)
+ */
+#define VERKLE_BASIC_DATA_VERSION_OFFSET     0
+#define VERKLE_BASIC_DATA_CODE_SIZE_OFFSET   5
+#define VERKLE_BASIC_DATA_NONCE_OFFSET       8
+#define VERKLE_BASIC_DATA_BALANCE_OFFSET     16
+#define VERKLE_BASIC_DATA_BALANCE_SIZE       16
 
 /* =========================================================================
  * Core Key Derivation
@@ -73,30 +98,24 @@ void verkle_derive_stem(uint8_t stem[31],
  * Account Header Convenience
  * ========================================================================= */
 
-/** Derive key for account version (tree_index=0, suffix=0). */
-void verkle_account_version_key(uint8_t key[32], const uint8_t address[20]);
+/** Derive key for packed basic data (tree_index=0, suffix=0). */
+void verkle_account_basic_data_key(uint8_t key[32], const uint8_t address[20]);
 
-/** Derive key for account balance (tree_index=0, suffix=1). */
-void verkle_account_balance_key(uint8_t key[32], const uint8_t address[20]);
-
-/** Derive key for account nonce (tree_index=0, suffix=2). */
-void verkle_account_nonce_key(uint8_t key[32], const uint8_t address[20]);
-
-/** Derive key for account code hash (tree_index=0, suffix=3). */
+/** Derive key for code hash (tree_index=0, suffix=1). */
 void verkle_account_code_hash_key(uint8_t key[32], const uint8_t address[20]);
-
-/** Derive key for account code size (tree_index=0, suffix=4). */
-void verkle_account_code_size_key(uint8_t key[32], const uint8_t address[20]);
 
 /* =========================================================================
  * Storage Slot Convenience
  * ========================================================================= */
 
 /**
- * Derive key for a storage slot.
+ * Derive key for a storage slot (EIP-6800).
  *
- * Mapping: tree_index = (slot >> 8) + 1, sub_index = slot & 0xFF.
- * tree_index=0 is reserved for account header.
+ * Slots 0-63:  header storage at suffix (64 + slot) in header stem.
+ * Slots >= 64: main storage at MAIN_STORAGE_OFFSET + slot.
+ *   MAIN_STORAGE_OFFSET = 256^31 = 2^248.
+ *   tree_index = (MAIN_STORAGE_OFFSET + slot) / 256
+ *   sub_index  = (MAIN_STORAGE_OFFSET + slot) % 256
  *
  * @param key     Output: 32-byte key
  * @param address 20-byte address
@@ -111,11 +130,11 @@ void verkle_storage_key(uint8_t key[32],
  * ========================================================================= */
 
 /**
- * Derive key for code chunk #chunk_id.
+ * Derive key for code chunk #chunk_id (EIP-6800).
  *
- * Uses domain separator 3 (separate from state domain 2).
- * Mapping: tree_index = chunk_id / 256, sub_index = chunk_id % 256.
- * Each group of 256 chunks shares a stem (one leaf node, 8192 bytes of code).
+ * pos = CODE_OFFSET + chunk_id = 128 + chunk_id.
+ * tree_index = pos / 256, sub_index = pos % 256.
+ * Chunks 0-127 share the header stem (tree_index=0, suffixes 128-255).
  *
  * @param key       Output: 32-byte key
  * @param address   20-byte address

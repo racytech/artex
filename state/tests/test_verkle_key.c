@@ -158,37 +158,32 @@ static void test_same_stem_different_suffix(void) {
  * ========================================================================= */
 
 static void test_account_convenience(void) {
-    printf("Phase 5: Account convenience keys\n");
+    printf("Phase 5: Account convenience keys (EIP-6800)\n");
 
     uint8_t addr[20];
     for (int i = 0; i < 20; i++) addr[i] = (uint8_t)(i + 1);
 
-    uint8_t key_ver[32], key_bal[32], key_non[32], key_ch[32], key_cs[32];
-    verkle_account_version_key(key_ver, addr);
-    verkle_account_balance_key(key_bal, addr);
-    verkle_account_nonce_key(key_non, addr);
+    uint8_t key_bd[32], key_ch[32];
+    verkle_account_basic_data_key(key_bd, addr);
     verkle_account_code_hash_key(key_ch, addr);
-    verkle_account_code_size_key(key_cs, addr);
 
-    /* All should share the same stem (tree_index=0 for all) */
-    ASSERT(memcmp(key_ver, key_bal, 31) == 0, "version/balance share stem");
-    ASSERT(memcmp(key_ver, key_non, 31) == 0, "version/nonce share stem");
-    ASSERT(memcmp(key_ver, key_ch, 31) == 0, "version/code_hash share stem");
-    ASSERT(memcmp(key_ver, key_cs, 31) == 0, "version/code_size share stem");
+    /* Both should share the same stem (tree_index=0 for all) */
+    ASSERT(memcmp(key_bd, key_ch, 31) == 0, "basic_data/code_hash share stem");
 
     /* Check suffix bytes */
-    ASSERT(key_ver[31] == VERKLE_VERSION_SUFFIX, "version suffix = 0");
-    ASSERT(key_bal[31] == VERKLE_BALANCE_SUFFIX, "balance suffix = 1");
-    ASSERT(key_non[31] == VERKLE_NONCE_SUFFIX, "nonce suffix = 2");
-    ASSERT(key_ch[31] == VERKLE_CODE_HASH_SUFFIX, "code_hash suffix = 3");
-    ASSERT(key_cs[31] == VERKLE_CODE_SIZE_SUFFIX, "code_size suffix = 4");
+    ASSERT(key_bd[31] == VERKLE_BASIC_DATA_SUFFIX, "basic_data suffix = 0");
+    ASSERT(key_ch[31] == VERKLE_CODE_HASH_SUFFIX, "code_hash suffix = 1");
 
     /* Verify these match manual derivation */
     uint8_t key_manual[32];
     uint8_t zero_ti[32] = {0};
-    verkle_derive_key(key_manual, addr, zero_ti, VERKLE_BALANCE_SUFFIX);
-    ASSERT(memcmp(key_bal, key_manual, 32) == 0,
-           "balance_key matches manual derive with tree_index=0, suffix=1");
+    verkle_derive_key(key_manual, addr, zero_ti, VERKLE_BASIC_DATA_SUFFIX);
+    ASSERT(memcmp(key_bd, key_manual, 32) == 0,
+           "basic_data_key matches manual derive with tree_index=0, suffix=0");
+
+    verkle_derive_key(key_manual, addr, zero_ti, VERKLE_CODE_HASH_SUFFIX);
+    ASSERT(memcmp(key_ch, key_manual, 32) == 0,
+           "code_hash_key matches manual derive with tree_index=0, suffix=1");
 
     printf("  OK\n\n");
 }
@@ -198,59 +193,69 @@ static void test_account_convenience(void) {
  * ========================================================================= */
 
 static void test_storage_key_math(void) {
-    printf("Phase 6: Storage key math\n");
+    printf("Phase 6: Storage key math (EIP-6800)\n");
 
     uint8_t addr[20] = {0xDE, 0xAD};
+    uint8_t zero_ti[32] = {0};
 
-    /* slot=0: tree_index = (0 >> 8) + 1 = 1, sub_index = 0 */
+    /* slot=0 (header storage): tree_index=0, suffix=64+0=64 */
     uint8_t slot0[32] = {0};
     uint8_t key0[32];
     verkle_storage_key(key0, addr, slot0);
-    ASSERT(key0[31] == 0, "slot 0: sub_index = 0");
+    ASSERT(key0[31] == VERKLE_HEADER_STORAGE_OFFSET,
+           "slot 0: suffix = 64");
 
-    /* Verify stem matches derive_key with tree_index=1 */
-    uint8_t ti1[32] = {0};
-    ti1[0] = 1;
+    /* Verify stem matches header stem (tree_index=0) */
     uint8_t key_manual[32];
-    verkle_derive_key(key_manual, addr, ti1, 0);
+    verkle_derive_key(key_manual, addr, zero_ti, VERKLE_HEADER_STORAGE_OFFSET);
     ASSERT(memcmp(key0, key_manual, 32) == 0,
-           "slot 0 matches tree_index=1, sub_index=0");
+           "slot 0 matches tree_index=0, suffix=64");
 
-    /* slot=255: tree_index = (255 >> 8) + 1 = 1, sub_index = 255 */
+    /* slot=63 (last header storage): suffix=64+63=127 */
+    uint8_t slot63[32] = {0};
+    slot63[0] = 63;
+    uint8_t key63[32];
+    verkle_storage_key(key63, addr, slot63);
+    ASSERT(key63[31] == 127, "slot 63: suffix = 127");
+    ASSERT(memcmp(key0, key63, 31) == 0,
+           "slots 0 and 63 share header stem");
+
+    /* slot=64 (first main storage): MAIN_STORAGE_OFFSET + 64
+     * tree_index = (2^248 + 64) >> 8 = 2^240
+     * sub_index = 64 & 0xFF = 64 */
+    uint8_t slot64[32] = {0};
+    slot64[0] = 64;
+    uint8_t key64[32];
+    verkle_storage_key(key64, addr, slot64);
+    ASSERT(key64[31] == 64, "slot 64: sub_index = 64");
+    ASSERT(memcmp(key0, key64, 31) != 0,
+           "slot 64 has different stem from header slots");
+
+    /* Verify slot 64: tree_index = 2^240 → byte[30] = 1 in LE */
+    uint8_t ti_main[32] = {0};
+    ti_main[30] = 1;
+    verkle_derive_key(key_manual, addr, ti_main, 64);
+    ASSERT(memcmp(key64, key_manual, 32) == 0,
+           "slot 64 matches tree_index=2^240, sub_index=64");
+
+    /* slot=255 (main storage): sub_index=255, same tree_index as slot 64 */
     uint8_t slot255[32] = {0};
     slot255[0] = 255;
     uint8_t key255[32];
     verkle_storage_key(key255, addr, slot255);
     ASSERT(key255[31] == 255, "slot 255: sub_index = 255");
-    ASSERT(memcmp(key0, key255, 31) == 0,
-           "slots 0 and 255 share stem (same tree_index)");
+    ASSERT(memcmp(key64, key255, 31) == 0,
+           "slots 64 and 255 share stem");
 
-    /* slot=256: tree_index = (256 >> 8) + 1 = 2, sub_index = 0 */
+    /* slot=256: sub_index=0, tree_index = 2^240 + 1 */
     uint8_t slot256[32] = {0};
-    slot256[0] = 0;    /* 256 & 0xFF = 0 */
-    slot256[1] = 1;    /* 256 >> 8 = 1 (LE: byte[1] = 1) */
+    slot256[0] = 0;
+    slot256[1] = 1;
     uint8_t key256[32];
     verkle_storage_key(key256, addr, slot256);
     ASSERT(key256[31] == 0, "slot 256: sub_index = 0");
-    ASSERT(memcmp(key0, key256, 31) != 0,
-           "slot 256 has different stem from slot 0");
-
-    /* Verify slot 256 matches tree_index=2 */
-    uint8_t ti2[32] = {0};
-    ti2[0] = 2;
-    verkle_derive_key(key_manual, addr, ti2, 0);
-    ASSERT(memcmp(key256, key_manual, 32) == 0,
-           "slot 256 matches tree_index=2, sub_index=0");
-
-    /* slot=257: tree_index = 2, sub_index = 1 */
-    uint8_t slot257[32] = {0};
-    slot257[0] = 1;    /* 257 & 0xFF = 1 */
-    slot257[1] = 1;    /* 257 >> 8 = 1 */
-    uint8_t key257[32];
-    verkle_storage_key(key257, addr, slot257);
-    ASSERT(key257[31] == 1, "slot 257: sub_index = 1");
-    ASSERT(memcmp(key256, key257, 31) == 0,
-           "slots 256 and 257 share stem");
+    ASSERT(memcmp(key64, key256, 31) != 0,
+           "slot 256 has different stem from slot 64");
 
     printf("  OK\n\n");
 }
@@ -328,23 +333,33 @@ static void test_domain_separation(void) {
  * ========================================================================= */
 
 static void test_header_storage_separation(void) {
-    printf("Phase 9: Header vs storage key separation\n");
+    printf("Phase 9: Header storage shares stem with account header\n");
 
     uint8_t addr[20];
     for (int i = 0; i < 20; i++) addr[i] = (uint8_t)(0x50 + i);
 
-    /* Account header stem (tree_index=0) */
+    /* Account header stem (tree_index=0, suffix=0) */
     uint8_t header_key[32];
-    verkle_account_balance_key(header_key, addr);
+    verkle_account_basic_data_key(header_key, addr);
 
-    /* Storage slot 0 stem (tree_index=1) */
+    /* Header storage slot 0 (tree_index=0, suffix=64) — shares stem! */
     uint8_t slot0[32] = {0};
-    uint8_t storage_key[32];
-    verkle_storage_key(storage_key, addr, slot0);
+    uint8_t storage_key0[32];
+    verkle_storage_key(storage_key0, addr, slot0);
 
-    /* Stems must differ — header uses tree_index=0, storage uses tree_index=1 */
-    ASSERT(memcmp(header_key, storage_key, 31) != 0,
-           "account header and storage slot 0 have different stems");
+    /* In EIP-6800, header storage slots 0-63 share the same stem */
+    ASSERT(memcmp(header_key, storage_key0, 31) == 0,
+           "header storage slot 0 shares stem with account header");
+    ASSERT(header_key[31] == VERKLE_BASIC_DATA_SUFFIX, "header suffix=0");
+    ASSERT(storage_key0[31] == VERKLE_HEADER_STORAGE_OFFSET, "storage slot 0 suffix=64");
+
+    /* Main storage slot 64 has different stem */
+    uint8_t slot64[32] = {0};
+    slot64[0] = 64;
+    uint8_t storage_key64[32];
+    verkle_storage_key(storage_key64, addr, slot64);
+    ASSERT(memcmp(header_key, storage_key64, 31) != 0,
+           "main storage slot 64 has different stem from header");
 
     printf("  OK\n\n");
 }
@@ -354,11 +369,15 @@ static void test_header_storage_separation(void) {
  * ========================================================================= */
 
 static void test_large_storage_slot(void) {
-    printf("Phase 10: Large storage slot\n");
+    printf("Phase 10: Large storage slot (EIP-6800)\n");
 
     uint8_t addr[20] = {0x77};
 
-    /* slot = 0x10000 (65536): tree_index = (65536 >> 8) + 1 = 257, sub_index = 0 */
+    /* slot = 0x10000 (65536, main storage since >= 64)
+     * pos = MAIN_STORAGE_OFFSET + 65536 = 2^248 + 65536
+     * sub_index = 65536 & 0xFF = 0
+     * tree_index = (2^248 + 65536) >> 8 = 2^240 + 256
+     * In LE: tree_index[0]=0, tree_index[1]=1, ..., tree_index[30]=1 */
     uint8_t slot[32] = {0};
     slot[0] = 0x00;  /* 65536 & 0xFF = 0 */
     slot[1] = 0x00;  /* (65536 >> 8) & 0xFF = 0 */
@@ -369,15 +388,18 @@ static void test_large_storage_slot(void) {
 
     ASSERT(key[31] == 0, "slot 0x10000: sub_index = 0");
 
-    /* Verify: tree_index should be 257 = 0x0101 LE */
+    /* tree_index = slot>>8 + 2^240
+     * slot>>8 = 256 → byte[0]=0, byte[1]=1
+     * 2^240 → byte[30]=1
+     * Result: byte[1]=1, byte[30]=1, rest zero */
     uint8_t expected_ti[32] = {0};
-    expected_ti[0] = 0x01;  /* 257 & 0xFF */
-    expected_ti[1] = 0x01;  /* (257 >> 8) & 0xFF */
+    expected_ti[1] = 0x01;   /* 256 from slot>>8 */
+    expected_ti[30] = 0x01;  /* 2^240 from MAIN_STORAGE_OFFSET */
 
     uint8_t key_manual[32];
     verkle_derive_key(key_manual, addr, expected_ti, 0);
     ASSERT(memcmp(key, key_manual, 32) == 0,
-           "slot 0x10000 matches tree_index=257, sub_index=0");
+           "slot 0x10000 matches expected tree_index");
 
     printf("  OK\n\n");
 }

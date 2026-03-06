@@ -30,6 +30,7 @@ static const char *fork_names[] = {
     [FORK_CANCUN] = "Cancun",
     [FORK_PRAGUE] = "Prague",
     [FORK_OSAKA] = "Osaka",
+    [FORK_VERKLE] = "Verkle",
     [FORK_LATEST] = "Latest",
 };
 
@@ -68,6 +69,7 @@ static const chain_config_t mainnet_config = {
         .cancun = 1710338135,   // Timestamp: March 13, 2024
         .prague = UINT64_MAX,
         .osaka = UINT64_MAX,
+        .verkle = UINT64_MAX,
     }};
 
 const chain_config_t *chain_config_mainnet(void)
@@ -101,6 +103,7 @@ static const chain_config_t sepolia_config = {
         .cancun = 1706655072,   // Timestamp: Jan 30, 2024
         .prague = UINT64_MAX,
         .osaka = UINT64_MAX,
+        .verkle = UINT64_MAX,
     }};
 
 const chain_config_t *chain_config_sepolia(void)
@@ -134,6 +137,7 @@ static const chain_config_t goerli_config = {
         .cancun = 1705473120,   // Timestamp: Jan 17, 2024
         .prague = UINT64_MAX,
         .osaka = UINT64_MAX,
+        .verkle = UINT64_MAX,
     }};
 
 const chain_config_t *chain_config_goerli(void)
@@ -167,6 +171,7 @@ static const chain_config_t holesky_config = {
         .cancun = 1707305664,   // Timestamp: Feb 7, 2024
         .prague = UINT64_MAX,
         .osaka = UINT64_MAX,
+        .verkle = UINT64_MAX,
     }};
 
 const chain_config_t *chain_config_holesky(void)
@@ -208,6 +213,7 @@ chain_config_t *chain_config_create(uint64_t chain_id, const char *name)
     config->fork_blocks.cancun = UINT64_MAX;
     config->fork_blocks.prague = UINT64_MAX;
     config->fork_blocks.osaka = UINT64_MAX;
+    config->fork_blocks.verkle = UINT64_MAX;
 
     return config;
 }
@@ -235,6 +241,8 @@ evm_fork_t fork_get_active(uint64_t block_number, uint64_t timestamp, const chai
     const fork_schedule_t *forks = &config->fork_blocks;
 
     // Post-merge forks: check timestamps (Shanghai+)
+    if (timestamp >= forks->verkle)
+        return FORK_VERKLE;
     if (timestamp >= forks->osaka)
         return FORK_OSAKA;
     if (timestamp >= forks->prague)
@@ -328,6 +336,8 @@ uint64_t fork_get_activation_block(const chain_config_t *config, evm_fork_t fork
         return forks->prague;
     case FORK_OSAKA:
         return forks->osaka;
+    case FORK_VERKLE:
+        return forks->verkle;
     default:
         return UINT64_MAX;
     }

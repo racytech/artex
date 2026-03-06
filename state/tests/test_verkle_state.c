@@ -76,7 +76,7 @@ static void test_nonce(void) {
  * ========================================================================= */
 
 static void test_balance(void) {
-    printf("Phase 3: Balance round-trip\n");
+    printf("Phase 3: Balance round-trip (EIP-6800: 16-byte uint128)\n");
 
     verkle_state_t *vs = verkle_state_create();
     uint8_t addr[20] = {0x10, 0x20};
@@ -87,13 +87,26 @@ static void test_balance(void) {
     ASSERT(memcmp(got, zero_bal, 32) == 0,
            "default balance is zero");
 
-    /* Set a large balance (uses upper bytes too) */
-    uint8_t balance[32];
-    for (int i = 0; i < 32; i++) balance[i] = (uint8_t)(i + 1);
+    /* Set a balance that fits in uint128 (low 16 bytes LE) */
+    uint8_t balance[32] = {0};
+    for (int i = 0; i < 16; i++) balance[i] = (uint8_t)(i + 1);
+    /* Upper 16 bytes stay zero — EIP-6800 balance is uint128 */
     verkle_state_set_balance(vs, addr, balance);
     verkle_state_get_balance(vs, addr, got);
     ASSERT(memcmp(got, balance, 32) == 0,
-           "balance round-trips full 32 bytes");
+           "balance round-trips low 16 bytes (uint128)");
+
+    /* Verify upper 16 bytes are truncated */
+    uint8_t balance_full[32];
+    for (int i = 0; i < 32; i++) balance_full[i] = (uint8_t)(i + 1);
+    verkle_state_set_balance(vs, addr, balance_full);
+    verkle_state_get_balance(vs, addr, got);
+    /* Upper bytes[16..31] should be zero (truncated to uint128) */
+    ASSERT(memcmp(got, balance, 16) == 0,
+           "low 16 bytes preserved");
+    uint8_t zero16[16] = {0};
+    ASSERT(memcmp(got + 16, zero16, 16) == 0,
+           "upper 16 bytes truncated to zero");
 
     verkle_state_destroy(vs);
     printf("  OK\n\n");
@@ -360,7 +373,7 @@ static void test_end_to_end(void) {
 
     uint8_t balance[32] = {0};
     balance[0] = 0x00; balance[1] = 0xE1; balance[2] = 0xF5; balance[3] = 0x05;
-    /* 100000000 in LE = 0x05F5E100 */
+    /* 100000000 in LE = 0x05F5E100 (fits in uint128) */
     verkle_state_set_balance(vs, alice, balance);
 
     uint8_t code_hash[32];
@@ -568,43 +581,56 @@ static void test_code_header_integration(void) {
  * Phase 17: Code Key Domain Separation
  * ========================================================================= */
 
-static void test_code_domain_separation(void) {
-    printf("Phase 17: Code key domain separation\n");
+static void test_code_layout(void) {
+    printf("Phase 17: Code chunk layout (EIP-6800)\n");
 
     uint8_t addr[20] = {0xA5};
 
-    /* Code chunk 0 key (domain 3) */
+    /* Code chunk 0: pos=128+0=128, tree_index=0, suffix=128 */
     uint8_t code_key[32];
     verkle_code_chunk_key(code_key, addr, 0);
 
-    /* Storage slot 0 key (domain 2) */
+    /* Account header key (tree_index=0, suffix=0) */
+    uint8_t header_key[32];
+    verkle_account_basic_data_key(header_key, addr);
+
+    /* Header storage slot 0 (tree_index=0, suffix=64) */
     uint8_t storage_key[32];
     uint8_t slot[32] = {0};
     verkle_storage_key(storage_key, addr, slot);
 
-    /* Account header key (domain 2, tree_index=0) */
-    uint8_t header_key[32];
-    verkle_account_version_key(header_key, addr);
+    /* All share the same stem (tree_index=0) in EIP-6800 */
+    ASSERT(memcmp(code_key, header_key, 31) == 0,
+           "code chunk 0 shares stem with header");
+    ASSERT(memcmp(code_key, storage_key, 31) == 0,
+           "code chunk 0 shares stem with header storage");
 
-    /* All stems must differ (different domains / tree_indices) */
-    ASSERT(memcmp(code_key, storage_key, 31) != 0,
-           "code stem differs from storage stem");
-    ASSERT(memcmp(code_key, header_key, 31) != 0,
-           "code stem differs from header stem");
+    /* Different suffixes */
+    ASSERT(header_key[31] == 0, "header suffix=0");
+    ASSERT(storage_key[31] == 64, "storage slot 0 suffix=64");
+    ASSERT(code_key[31] == 128, "code chunk 0 suffix=128");
 
-    /* Two code chunks in the same group share a stem */
+    /* Chunks 0 and 1 share stem, differ in suffix */
     uint8_t code_key2[32];
     verkle_code_chunk_key(code_key2, addr, 1);
     ASSERT(memcmp(code_key, code_key2, 31) == 0,
-           "chunks 0 and 1 share stem (same group)");
-    ASSERT(code_key[31] != code_key2[31],
-           "chunks 0 and 1 differ in suffix");
+           "chunks 0 and 1 share stem");
+    ASSERT(code_key[31] == 128 && code_key2[31] == 129,
+           "chunks 0=128, 1=129");
 
-    /* Chunk 256 is in a different group → different stem */
-    uint8_t code_key256[32];
-    verkle_code_chunk_key(code_key256, addr, 256);
-    ASSERT(memcmp(code_key, code_key256, 31) != 0,
-           "chunk 0 and chunk 256 have different stems");
+    /* Chunk 127 is last in header stem (suffix=255) */
+    uint8_t code_key127[32];
+    verkle_code_chunk_key(code_key127, addr, 127);
+    ASSERT(memcmp(code_key, code_key127, 31) == 0,
+           "chunk 127 shares header stem");
+    ASSERT(code_key127[31] == 255, "chunk 127 suffix=255");
+
+    /* Chunk 128: pos=128+128=256, tree_index=1, suffix=0 → different stem */
+    uint8_t code_key128[32];
+    verkle_code_chunk_key(code_key128, addr, 128);
+    ASSERT(memcmp(code_key, code_key128, 31) != 0,
+           "chunk 128 has different stem from header");
+    ASSERT(code_key128[31] == 0, "chunk 128 suffix=0");
 
     printf("  OK\n\n");
 }
@@ -791,7 +817,7 @@ int main(void) {
     test_code_aligned();
     test_code_large();
     test_code_header_integration();
-    test_code_domain_separation();
+    test_code_layout();
     test_flat_backend();
     test_flat_tree_root_match();
 

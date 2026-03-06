@@ -237,23 +237,31 @@ int main(int argc, char **argv)
             uint32_t r = (uint32_t)(rng_next(&rng) % 100);
 
             if (r < 40) {
-                /* Balance update (40%) — existing account */
+                /* Balance update (40%) — existing account (packed basic data) */
                 uint32_t idx = (uint32_t)(rng_next(&rng) % addr_count);
-                uint8_t bal[32] = {0};
+                uint8_t val[32] = {0};
                 uint64_t b = rng_next(&rng) % 1000000;
-                memcpy(bal, &b, sizeof(b));
+                /* Pack balance as 16-byte BE at offset 16 */
+                for (int bi = 7; bi >= 0; bi--) {
+                    val[31 - bi] = (uint8_t)(b & 0xFF);
+                    b >>= 8;
+                }
                 uint8_t key[32];
-                verkle_account_balance_key(key, addrs[idx]);
-                verkle_journal_set(j, key, bal);
+                verkle_account_basic_data_key(key, addrs[idx]);
+                verkle_journal_set(j, key, val);
             } else if (r < 60) {
-                /* Nonce increment (20%) — existing account */
+                /* Nonce increment (20%) — existing account (packed basic data) */
                 uint32_t idx = (uint32_t)(rng_next(&rng) % addr_count);
                 uint64_t nonce = verkle_state_get_nonce(vs, addrs[idx]);
                 nonce++;
                 uint8_t val[32] = {0};
-                memcpy(val, &nonce, sizeof(nonce));
+                /* Pack nonce as 8-byte BE at offset 8 */
+                for (int ni = 7; ni >= 0; ni--) {
+                    val[VERKLE_BASIC_DATA_NONCE_OFFSET + ni] = (uint8_t)(nonce & 0xFF);
+                    nonce >>= 8;
+                }
                 uint8_t key[32];
-                verkle_account_nonce_key(key, addrs[idx]);
+                verkle_account_basic_data_key(key, addrs[idx]);
                 verkle_journal_set(j, key, val);
             } else if (r < 85) {
                 /* Storage write (25%) — existing account, random slot */
@@ -265,63 +273,55 @@ int main(int argc, char **argv)
                 verkle_storage_key(key, addrs[idx], slot);
                 verkle_journal_set(j, key, val);
             } else if (r < 95) {
-                /* New account (10%) */
+                /* New account (10%) — packed basic data */
                 if (addr_count < addr_cap) {
                     uint8_t addr[20];
                     rng_addr(&rng, addr);
                     memcpy(addrs[addr_count++], addr, 20);
 
                     uint8_t key[32], val[32];
-                    /* version */
                     memset(val, 0, 32);
-                    verkle_account_version_key(key, addr);
-                    verkle_journal_set(j, key, val);
-                    /* nonce */
-                    val[0] = 1;
-                    verkle_account_nonce_key(key, addr);
-                    verkle_journal_set(j, key, val);
-                    /* balance */
-                    memset(val, 0, 32);
+                    /* Pack: version=0, nonce=1 (BE at offset 8), balance (BE at offset 16) */
+                    val[VERKLE_BASIC_DATA_NONCE_OFFSET + 7] = 1; /* nonce=1 */
                     uint64_t b = rng_next(&rng) % 1000000;
-                    memcpy(val, &b, sizeof(b));
-                    verkle_account_balance_key(key, addr);
+                    for (int bi = 7; bi >= 0; bi--) {
+                        val[31 - bi] = (uint8_t)(b & 0xFF);
+                        b >>= 8;
+                    }
+                    verkle_account_basic_data_key(key, addr);
                     verkle_journal_set(j, key, val);
                 }
             } else {
-                /* Code deploy (5%) */
+                /* Code deploy (5%) — packed basic data + code chunks */
                 if (addr_count < addr_cap) {
                     uint8_t addr[20];
                     rng_addr(&rng, addr);
                     memcpy(addrs[addr_count++], addr, 20);
-
-                    /* Set account header via journal */
-                    uint8_t key[32], val[32];
-                    memset(val, 0, 32);
-                    verkle_account_version_key(key, addr);
-                    verkle_journal_set(j, key, val);
-                    memset(val, 0, 32); val[0] = 1;
-                    verkle_account_nonce_key(key, addr);
-                    verkle_journal_set(j, key, val);
 
                     /* Code: 256-2048 bytes */
                     uint32_t code_len = 256 + (uint32_t)(rng_next(&rng) % 1793);
                     uint8_t *code = malloc(code_len);
                     rng_bytes(&rng, code, code_len);
 
-                    /* Code size */
+                    /* Packed basic data: version=0, code_size (3 BE), nonce=1, balance=0 */
+                    uint8_t key[32], val[32];
                     memset(val, 0, 32);
-                    memcpy(val, &code_len, sizeof(code_len));
-                    verkle_account_code_size_key(key, addr);
+                    val[5] = (uint8_t)((code_len >> 16) & 0xFF);
+                    val[6] = (uint8_t)((code_len >> 8) & 0xFF);
+                    val[7] = (uint8_t)(code_len & 0xFF);
+                    val[VERKLE_BASIC_DATA_NONCE_OFFSET + 7] = 1;
+                    verkle_account_basic_data_key(key, addr);
                     verkle_journal_set(j, key, val);
 
-                    /* Code chunks via journal */
-                    uint32_t num_chunks = (code_len + 31) / 32;
+                    /* Code chunks via journal (31-byte raw slices for bench) */
+                    uint32_t num_chunks = (code_len + 30) / 31;
                     for (uint32_t c = 0; c < num_chunks; c++) {
                         memset(val, 0, 32);
-                        uint32_t offset = c * 32;
+                        uint32_t offset = c * 31;
                         uint32_t copy = code_len - offset;
-                        if (copy > 32) copy = 32;
-                        memcpy(val, code + offset, copy);
+                        if (copy > 31) copy = 31;
+                        /* val[0] = pushdata prefix (0 for bench) */
+                        memcpy(val + 1, code + offset, copy);
                         verkle_code_chunk_key(key, addr, c);
                         verkle_journal_set(j, key, val);
                     }
