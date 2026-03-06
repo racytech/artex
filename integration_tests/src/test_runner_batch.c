@@ -14,6 +14,7 @@
 // Forward declarations
 extern cJSON* load_json_file(const char *filepath);
 extern bool parse_state_test_from_json(const cJSON *test_obj, const char *test_name, state_test_t **out);
+extern bool parse_blockchain_test_from_json(const cJSON *test_obj, const char *test_name, blockchain_test_t **out);
 
 //==============================================================================
 // File Test Execution
@@ -113,17 +114,44 @@ bool test_runner_run_file(test_runner_t *runner,
         return tests_run > 0;
         
     } else if (is_blockchain_test) {
-        blockchain_test_t *test = NULL;
-        if (!parse_blockchain_test(filepath, &test)) {
+        cJSON *root = load_json_file(filepath);
+        if (!root) {
             if (runner->config.verbose) {
-                fprintf(stderr, "  ERROR: Failed to parse blockchain test\n");
+                fprintf(stderr, "  ERROR: Failed to load JSON: %s\n", filepath);
             }
             return false;
         }
-        
-        success = test_runner_run_blockchain_test(runner, test, &result);
-        blockchain_test_free(test);
-        
+
+        int tests_run = 0;
+        cJSON *test_obj;
+        cJSON_ArrayForEach(test_obj, root) {
+            if (!test_obj->string) continue;
+
+            blockchain_test_t *test = NULL;
+            if (!parse_blockchain_test_from_json(test_obj, test_obj->string, &test)) {
+                if (runner->config.verbose) {
+                    fprintf(stderr, "  ERROR: Failed to parse test: %s\n", test_obj->string);
+                }
+                continue;
+            }
+
+            success = test_runner_run_blockchain_test(runner, test, &result);
+            tests_run++;
+
+            if (success) {
+                test_results_add(results, &result);
+                test_result_free(&result);
+            }
+
+            blockchain_test_free(test);
+
+            if (!success) break;
+        }
+
+        cJSON_Delete(root);
+        return tests_run > 0;
+
+
     } else if (is_transaction_test) {
         transaction_test_t *test = NULL;
         if (!parse_transaction_test(filepath, &test)) {

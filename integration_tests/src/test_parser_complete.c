@@ -11,28 +11,16 @@
 // Blockchain Test Parsing
 //==============================================================================
 
-bool parse_blockchain_test(const char *filepath, blockchain_test_t **out) {
-    if (!filepath || !out) return false;
-    
-    cJSON *root = load_json_file(filepath);
-    if (!root) return false;
-    
-    // Blockchain tests have one test case per file, stored as single object key
-    const cJSON *test_case = root->child;
-    if (!test_case) {
-        cJSON_Delete(root);
-        return false;
-    }
-    
+bool parse_blockchain_test_from_json(const cJSON *test_case, const char *test_name,
+                                     blockchain_test_t **out) {
+    if (!test_case || !out) return false;
+
     blockchain_test_t *test = calloc(1, sizeof(blockchain_test_t));
-    if (!test) {
-        cJSON_Delete(root);
-        return false;
-    }
-    
+    if (!test) return false;
+
     // Test name
-    if (test_case->string) {
-        test->name = strdup(test_case->string);
+    if (test_name) {
+        test->name = strdup(test_name);
     }
     
     // Network/fork
@@ -156,9 +144,26 @@ bool parse_blockchain_test(const char *filepath, blockchain_test_t **out) {
         }
     }
     
-    cJSON_Delete(root);
     *out = test;
     return true;
+}
+
+bool parse_blockchain_test(const char *filepath, blockchain_test_t **out) {
+    if (!filepath || !out) return false;
+
+    cJSON *root = load_json_file(filepath);
+    if (!root) return false;
+
+    // Take the first test case from the file
+    const cJSON *test_case = root->child;
+    if (!test_case) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    bool ok = parse_blockchain_test_from_json(test_case, test_case->string, out);
+    cJSON_Delete(root);
+    return ok;
 }
 
 //==============================================================================

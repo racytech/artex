@@ -848,6 +848,9 @@ post_execution:
         evm_state_add_balance(state, &env->coinbase, &coinbase_payment);
     }
 
+    // Update gas_used to reflect effective gas after refund (for receipt/block gasUsed)
+    result->gas_used = gas_used - gas_refund;
+
     // NOTE: EIP-161 empty account cleanup and finalize are handled by caller
 
     return true;

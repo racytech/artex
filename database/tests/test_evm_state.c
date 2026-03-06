@@ -473,10 +473,10 @@ static void test_self_destruct(void) {
     ASSERT(!evm_state_is_self_destructed(es, &addr), "should not be destructed");
     printf("  created account:           OK\n");
 
-    // Self-destruct
+    // Self-destruct (account still exists until finalization)
     evm_state_self_destruct(es, &addr);
     ASSERT(evm_state_is_self_destructed(es, &addr), "should be destructed");
-    ASSERT(!evm_state_exists(es, &addr), "destructed account should not exist");
+    ASSERT(evm_state_exists(es, &addr), "destructed account still exists until finalize");
     printf("  self-destruct:             OK\n");
 
     // Snapshot, self-destruct another account, revert
