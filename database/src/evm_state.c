@@ -734,8 +734,14 @@ static bool commit_account_cb(const uint8_t *key, size_t key_len,
                                void *user_data) {
     (void)key; (void)key_len; (void)value_len; (void)user_data;
     cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
-    ca->created = false;    // pre-state accounts are not "created in tx"
-    ca->existed = true;     // they existed before the transaction
+    // Only promote to "existed" if the account was genuinely present
+    // (pre-existing, created, or written-to).  Phantom cache entries
+    // from read-only lookups must NOT be promoted, or they pollute the
+    // state root on pre-EIP-161 forks where empty accounts are kept.
+    if (ca->existed || ca->created || ca->dirty || ca->code_dirty) {
+        ca->existed = true;
+    }
+    ca->created = false;
     ca->dirty = false;
     ca->code_dirty = false;
     ca->self_destructed = false;
@@ -1403,4 +1409,5 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
 
     return root;
 }
+
 

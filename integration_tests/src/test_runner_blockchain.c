@@ -210,6 +210,7 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
             snprintf(msg, sizeof(msg), "State root mismatch after block %zu", block_idx);
             test_result_add_failure(result, "block_state_root",
                                   expected_str, actual_str, msg);
+
             free(expected_str);
             free(actual_str);
 
