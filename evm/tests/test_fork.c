@@ -28,64 +28,69 @@ void test_fork_names(void)
 void test_mainnet_fork_detection(void)
 {
     printf("Testing mainnet fork detection...\n");
-    
+
     const chain_config_t *mainnet = chain_config_mainnet();
-    
-    // Test various block numbers
-    assert(fork_get_active(0, mainnet) == FORK_FRONTIER);
-    assert(fork_get_active(1000000, mainnet) == FORK_FRONTIER);
-    assert(fork_get_active(1150000, mainnet) == FORK_HOMESTEAD);
-    assert(fork_get_active(2463000, mainnet) == FORK_TANGERINE_WHISTLE);
-    assert(fork_get_active(2675000, mainnet) == FORK_SPURIOUS_DRAGON);
-    assert(fork_get_active(4370000, mainnet) == FORK_BYZANTIUM);
-    assert(fork_get_active(7280000, mainnet) == FORK_CONSTANTINOPLE);
-    assert(fork_get_active(9069000, mainnet) == FORK_ISTANBUL);
-    assert(fork_get_active(12244000, mainnet) == FORK_BERLIN);
-    assert(fork_get_active(12965000, mainnet) == FORK_LONDON);
-    assert(fork_get_active(15537394, mainnet) == FORK_PARIS);
-    assert(fork_get_active(17034870, mainnet) == FORK_SHANGHAI);
-    assert(fork_get_active(19426587, mainnet) == FORK_CANCUN);
-    assert(fork_get_active(20000000, mainnet) == FORK_CANCUN);  // Current latest
-    
+
+    // Pre-merge: block number matters, timestamp=0 (irrelevant)
+    assert(fork_get_active(0, 0, mainnet) == FORK_FRONTIER);
+    assert(fork_get_active(1000000, 0, mainnet) == FORK_FRONTIER);
+    assert(fork_get_active(1150000, 0, mainnet) == FORK_HOMESTEAD);
+    assert(fork_get_active(2463000, 0, mainnet) == FORK_TANGERINE_WHISTLE);
+    assert(fork_get_active(2675000, 0, mainnet) == FORK_SPURIOUS_DRAGON);
+    assert(fork_get_active(4370000, 0, mainnet) == FORK_BYZANTIUM);
+    assert(fork_get_active(7280000, 0, mainnet) == FORK_CONSTANTINOPLE);
+    assert(fork_get_active(9069000, 0, mainnet) == FORK_ISTANBUL);
+    assert(fork_get_active(12244000, 0, mainnet) == FORK_BERLIN);
+    assert(fork_get_active(12965000, 0, mainnet) == FORK_LONDON);
+    assert(fork_get_active(15537394, 0, mainnet) == FORK_PARIS);
+
+    // Post-merge: timestamp matters
+    assert(fork_get_active(17034870, 1681338455, mainnet) == FORK_SHANGHAI);
+    assert(fork_get_active(19426587, 1710338135, mainnet) == FORK_CANCUN);
+    assert(fork_get_active(20000000, 1710338135, mainnet) == FORK_CANCUN);
+
     printf("  ✓ Mainnet fork detection correct\n");
 }
 
 void test_sepolia_fork_detection(void)
 {
     printf("Testing Sepolia fork detection...\n");
-    
+
     const chain_config_t *sepolia = chain_config_sepolia();
-    
-    // Sepolia started with all pre-merge forks active
-    assert(fork_get_active(0, sepolia) == FORK_FRONTIER);
-    assert(fork_get_active(1735371, sepolia) == FORK_PARIS);
-    assert(fork_get_active(2990908, sepolia) == FORK_SHANGHAI);
-    assert(fork_get_active(5187023, sepolia) == FORK_CANCUN);
-    assert(fork_get_active(6000000, sepolia) == FORK_CANCUN);
-    
+
+    // Sepolia: all pre-merge forks at block 0, Paris at 1735371
+    // With timestamp=0, pre-merge blocks return Gray Glacier (last pre-merge fork at block 0)
+    assert(fork_get_active(0, 0, sepolia) == FORK_GRAY_GLACIER);
+    assert(fork_get_active(1735371, 0, sepolia) == FORK_PARIS);
+
+    // Post-merge: timestamp-based
+    assert(fork_get_active(2990908, 1677557088, sepolia) == FORK_SHANGHAI);
+    assert(fork_get_active(5187023, 1706655072, sepolia) == FORK_CANCUN);
+    assert(fork_get_active(6000000, 1706655072, sepolia) == FORK_CANCUN);
+
     printf("  ✓ Sepolia fork detection correct\n");
 }
 
 void test_fork_is_active(void)
 {
     printf("Testing fork_is_active...\n");
-    
+
     const chain_config_t *mainnet = chain_config_mainnet();
-    
-    // At block 9069000 (Istanbul activation)
-    assert(fork_is_active(9069000, mainnet, FORK_FRONTIER) == true);
-    assert(fork_is_active(9069000, mainnet, FORK_HOMESTEAD) == true);
-    assert(fork_is_active(9069000, mainnet, FORK_BYZANTIUM) == true);
-    assert(fork_is_active(9069000, mainnet, FORK_ISTANBUL) == true);
-    assert(fork_is_active(9069000, mainnet, FORK_BERLIN) == false);
-    assert(fork_is_active(9069000, mainnet, FORK_LONDON) == false);
-    assert(fork_is_active(9069000, mainnet, FORK_PARIS) == false);
-    
-    // At block 15537394 (Paris/Merge activation)
-    assert(fork_is_active(15537394, mainnet, FORK_LONDON) == true);
-    assert(fork_is_active(15537394, mainnet, FORK_PARIS) == true);
-    assert(fork_is_active(15537394, mainnet, FORK_SHANGHAI) == false);
-    
+
+    // At block 9069000 (Istanbul activation), timestamp=0 (pre-merge)
+    assert(fork_is_active(9069000, 0, mainnet, FORK_FRONTIER) == true);
+    assert(fork_is_active(9069000, 0, mainnet, FORK_HOMESTEAD) == true);
+    assert(fork_is_active(9069000, 0, mainnet, FORK_BYZANTIUM) == true);
+    assert(fork_is_active(9069000, 0, mainnet, FORK_ISTANBUL) == true);
+    assert(fork_is_active(9069000, 0, mainnet, FORK_BERLIN) == false);
+    assert(fork_is_active(9069000, 0, mainnet, FORK_LONDON) == false);
+    assert(fork_is_active(9069000, 0, mainnet, FORK_PARIS) == false);
+
+    // At block 15537394 (Paris/Merge activation), timestamp before Shanghai
+    assert(fork_is_active(15537394, 0, mainnet, FORK_LONDON) == true);
+    assert(fork_is_active(15537394, 0, mainnet, FORK_PARIS) == true);
+    assert(fork_is_active(15537394, 0, mainnet, FORK_SHANGHAI) == false);
+
     printf("  ✓ fork_is_active works correctly\n");
 }
 
@@ -164,10 +169,10 @@ void test_custom_chain_config(void)
     // All forks should be disabled (UINT64_MAX)
     assert(fork_get_activation_block(custom, FORK_HOMESTEAD) == UINT64_MAX);
     assert(fork_get_activation_block(custom, FORK_BYZANTIUM) == UINT64_MAX);
-    
+
     // Any block should return FRONTIER
-    assert(fork_get_active(0, custom) == FORK_FRONTIER);
-    assert(fork_get_active(1000000, custom) == FORK_FRONTIER);
+    assert(fork_get_active(0, 0, custom) == FORK_FRONTIER);
+    assert(fork_get_active(1000000, 0, custom) == FORK_FRONTIER);
     
     chain_config_free(custom);
     
@@ -200,8 +205,9 @@ void test_fork_activation_blocks(void)
     assert(fork_get_activation_block(mainnet, FORK_BERLIN) == 12244000);
     assert(fork_get_activation_block(mainnet, FORK_LONDON) == 12965000);
     assert(fork_get_activation_block(mainnet, FORK_PARIS) == 15537394);
-    assert(fork_get_activation_block(mainnet, FORK_SHANGHAI) == 17034870);
-    assert(fork_get_activation_block(mainnet, FORK_CANCUN) == 19426587);
+    // Post-merge: activation values are timestamps
+    assert(fork_get_activation_block(mainnet, FORK_SHANGHAI) == 1681338455);
+    assert(fork_get_activation_block(mainnet, FORK_CANCUN) == 1710338135);
     
     printf("  ✓ Fork activation blocks correct\n");
 }

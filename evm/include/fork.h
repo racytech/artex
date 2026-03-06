@@ -58,10 +58,14 @@ extern "C"
     //==============================================================================
 
     /**
-     * Fork activation block numbers for a specific chain
+     * Fork activation schedule for a specific chain.
+     *
+     * Pre-merge fields (frontier through paris): block numbers.
+     * Post-merge fields (shanghai through osaka): timestamps.
      */
     typedef struct
     {
+        /* Pre-merge: activation block numbers */
         uint64_t frontier;
         uint64_t homestead;
         uint64_t tangerine_whistle; // EIP-150
@@ -76,6 +80,7 @@ extern "C"
         uint64_t arrow_glacier;
         uint64_t gray_glacier;
         uint64_t paris; // The Merge
+        /* Post-merge: activation timestamps */
         uint64_t shanghai;
         uint64_t cancun;
         uint64_t prague;
@@ -97,23 +102,28 @@ extern "C"
     //==============================================================================
 
     /**
-     * Determine the active fork for a given block number
+     * Determine the active fork for a given block number and timestamp.
+     *
+     * Pre-merge forks (Frontier-Paris) are checked against block_number.
+     * Post-merge forks (Shanghai+) are checked against timestamp.
      *
      * @param block_number Current block number
+     * @param timestamp Current block timestamp
      * @param config Chain configuration
-     * @return Active fork at this block number
+     * @return Active fork at this block
      */
-    evm_fork_t fork_get_active(uint64_t block_number, const chain_config_t *config);
+    evm_fork_t fork_get_active(uint64_t block_number, uint64_t timestamp, const chain_config_t *config);
 
     /**
-     * Check if a specific fork is active at a block number
+     * Check if a specific fork is active at a block number/timestamp
      *
      * @param block_number Current block number
+     * @param timestamp Current block timestamp
      * @param config Chain configuration
      * @param fork Fork to check
      * @return true if fork is active, false otherwise
      */
-    bool fork_is_active(uint64_t block_number, const chain_config_t *config, evm_fork_t fork);
+    bool fork_is_active(uint64_t block_number, uint64_t timestamp, const chain_config_t *config, evm_fork_t fork);
 
     /**
      * Get the block number when a fork activates

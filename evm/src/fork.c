@@ -63,9 +63,11 @@ static const chain_config_t mainnet_config = {
         .london = 12965000,
         .arrow_glacier = 13773000,
         .gray_glacier = 15050000,
-        .paris = 15537394, // The Merge (TTD-based, approx)
-        .shanghai = 17034870,
-        .cancun = 19426587,
+        .paris = 15537394,      // The Merge (TTD-based, approx block)
+        .shanghai = 1681338455, // Timestamp: April 12, 2023
+        .cancun = 1710338135,   // Timestamp: March 13, 2024
+        .prague = UINT64_MAX,
+        .osaka = UINT64_MAX,
     }};
 
 const chain_config_t *chain_config_mainnet(void)
@@ -94,9 +96,11 @@ static const chain_config_t sepolia_config = {
         .london = 0,
         .arrow_glacier = 0,
         .gray_glacier = 0,
-        .paris = 1735371, // The Merge
-        .shanghai = 2990908,
-        .cancun = 5187023,
+        .paris = 1735371,       // The Merge (block number)
+        .shanghai = 1677557088, // Timestamp: Feb 28, 2023
+        .cancun = 1706655072,   // Timestamp: Jan 30, 2024
+        .prague = UINT64_MAX,
+        .osaka = UINT64_MAX,
     }};
 
 const chain_config_t *chain_config_sepolia(void)
@@ -126,8 +130,10 @@ static const chain_config_t goerli_config = {
         .arrow_glacier = 0,
         .gray_glacier = 0,
         .paris = 7382818,
-        .shanghai = 8656122,
-        .cancun = 10299893,
+        .shanghai = 1678832736, // Timestamp: March 14, 2023
+        .cancun = 1705473120,   // Timestamp: Jan 17, 2024
+        .prague = UINT64_MAX,
+        .osaka = UINT64_MAX,
     }};
 
 const chain_config_t *chain_config_goerli(void)
@@ -156,9 +162,11 @@ static const chain_config_t holesky_config = {
         .london = 0,
         .arrow_glacier = 0,
         .gray_glacier = 0,
-        .paris = 0, // Launched post-merge
-        .shanghai = 6698,
-        .cancun = 894733,
+        .paris = 0,             // Launched post-merge
+        .shanghai = 1696000704, // Timestamp: Sept 29, 2023
+        .cancun = 1707305664,   // Timestamp: Feb 7, 2024
+        .prague = UINT64_MAX,
+        .osaka = UINT64_MAX,
     }};
 
 const chain_config_t *chain_config_holesky(void)
@@ -217,7 +225,7 @@ void chain_config_free(chain_config_t *config)
 // Fork Detection
 //==============================================================================
 
-evm_fork_t fork_get_active(uint64_t block_number, const chain_config_t *config)
+evm_fork_t fork_get_active(uint64_t block_number, uint64_t timestamp, const chain_config_t *config)
 {
     if (!config)
     {
@@ -226,15 +234,17 @@ evm_fork_t fork_get_active(uint64_t block_number, const chain_config_t *config)
 
     const fork_schedule_t *forks = &config->fork_blocks;
 
-    // Check from newest to oldest fork
-    if (block_number >= forks->osaka)
+    // Post-merge forks: check timestamps (Shanghai+)
+    if (timestamp >= forks->osaka)
         return FORK_OSAKA;
-    if (block_number >= forks->prague)
+    if (timestamp >= forks->prague)
         return FORK_PRAGUE;
-    if (block_number >= forks->cancun)
+    if (timestamp >= forks->cancun)
         return FORK_CANCUN;
-    if (block_number >= forks->shanghai)
+    if (timestamp >= forks->shanghai)
         return FORK_SHANGHAI;
+
+    // Pre-merge forks: check block numbers (Frontier-Paris)
     if (block_number >= forks->paris)
         return FORK_PARIS;
     if (block_number >= forks->gray_glacier)
@@ -265,9 +275,9 @@ evm_fork_t fork_get_active(uint64_t block_number, const chain_config_t *config)
     return FORK_FRONTIER;
 }
 
-bool fork_is_active(uint64_t block_number, const chain_config_t *config, evm_fork_t fork)
+bool fork_is_active(uint64_t block_number, uint64_t timestamp, const chain_config_t *config, evm_fork_t fork)
 {
-    evm_fork_t active = fork_get_active(block_number, config);
+    evm_fork_t active = fork_get_active(block_number, timestamp, config);
     return active >= fork;
 }
 

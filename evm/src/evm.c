@@ -198,8 +198,8 @@ void evm_set_block_env(evm_t *evm, const evm_block_env_t *block)
 
     evm->block = *block;
 
-    // Recompute fork based on new block number
-    evm->fork = fork_get_active(block->number, evm->chain_config);
+    // Recompute fork based on new block number/timestamp
+    evm->fork = fork_get_active(block->number, block->timestamp, evm->chain_config);
 
     // EIP-4844: compute blob base fee from excess blob gas
     if (evm->fork >= FORK_CANCUN) {

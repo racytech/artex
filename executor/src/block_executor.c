@@ -51,7 +51,7 @@ static void header_to_evm_block_env(const block_header_t *hdr,
     if (hdr->has_blob_gas) {
         env->excess_blob_gas = uint256_from_uint64(hdr->excess_blob_gas);
         /* Compute blob base fee from excess blob gas */
-        evm_fork_t fork = config ? fork_get_active(hdr->number, config) : FORK_CANCUN;
+        evm_fork_t fork = config ? fork_get_active(hdr->number, hdr->timestamp, config) : FORK_CANCUN;
         env->blob_base_fee = calc_blob_gas_price(&env->excess_blob_gas, fork);
     }
 

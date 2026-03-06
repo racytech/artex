@@ -163,8 +163,47 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.cancun = 0;
         test_config.fork_blocks.prague = 0;
         test_config.fork_blocks.osaka = 0;
+    } else if (strcmp(fork_name, "ParisToShanghaiAtTime15k") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.berlin = 0;
+        test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.paris = 0;
+        test_config.fork_blocks.shanghai = 15000; // timestamp
+    } else if (strcmp(fork_name, "ShanghaiToCancunAtTime15k") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.berlin = 0;
+        test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.paris = 0;
+        test_config.fork_blocks.shanghai = 0;
+        test_config.fork_blocks.cancun = 15000; // timestamp
+    } else if (strcmp(fork_name, "CancunToPragueAtTime15k") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.berlin = 0;
+        test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.paris = 0;
+        test_config.fork_blocks.shanghai = 0;
+        test_config.fork_blocks.cancun = 0;
+        test_config.fork_blocks.prague = 15000; // timestamp
     } else {
-        // Unknown/transition fork — return NULL to signal skip
+        // Unknown fork — return NULL to signal skip
         return NULL;
     }
 

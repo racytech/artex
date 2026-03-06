@@ -103,7 +103,8 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
     {
         bool prune_empty = false;
         // Determine if we need EIP-161 pruning based on fork
-        evm_fork_t fork = fork_get_active(0, fork_config);
+        uint64_t genesis_ts = uint256_to_uint64(&test->genesis_header.timestamp);
+        evm_fork_t fork = fork_get_active(0, genesis_ts, fork_config);
         if (fork >= FORK_SPURIOUS_DRAGON)
             prune_empty = true;
 
