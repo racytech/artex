@@ -120,6 +120,29 @@ block_result_t block_execute(evm_t *evm,
     /* Commit state before executing transactions (EIP-2200 original values) */
     evm_state_commit(evm->state);
 
+    /* EIP-2935: Store parent block hash in history contract (Prague+) */
+    if (evm->fork >= FORK_PRAGUE) {
+        static const uint8_t HISTORY_ADDR[20] = {
+            0x00, 0x00, 0xF9, 0x08, 0x27, 0xF1, 0xC5, 0x3a, 0x10, 0xcb,
+            0x7A, 0x02, 0x33, 0x5B, 0x17, 0x53, 0x20, 0x00, 0x29, 0x35
+        };
+        #define BLOCKHASH_SERVE_WINDOW 8191
+
+        address_t hist_addr;
+        memcpy(hist_addr.bytes, HISTORY_ADDR, 20);
+
+        /* Ensure account exists in cache (pre-state has code deployed) */
+        evm_state_get_nonce(evm->state, &hist_addr);
+
+        /* Store parent hash at slot (block.number - 1) % 8191 */
+        uint64_t slot_idx = (header->number - 1) % BLOCKHASH_SERVE_WINDOW;
+        uint256_t slot = uint256_from_uint64(slot_idx);
+        uint256_t parent_hash_val = uint256_from_bytes(header->parent_hash.bytes, 32);
+        evm_state_set_storage(evm->state, &hist_addr, &slot, &parent_hash_val);
+
+        #undef BLOCKHASH_SERVE_WINDOW
+    }
+
     /* EIP-4788: Store parent beacon block root (Cancun+) */
     if (evm->fork >= FORK_CANCUN && header->has_parent_beacon_root) {
         static const uint8_t BEACON_ROOT_ADDR[20] = {
