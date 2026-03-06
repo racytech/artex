@@ -60,6 +60,41 @@ static void header_to_evm_block_env(const block_header_t *hdr,
 }
 
 /* =========================================================================
+ * System contract call helper (Prague+)
+ * ========================================================================= */
+
+static void system_call(evm_t *evm, const uint8_t addr_bytes[20]) {
+    address_t contract_addr, system_addr;
+    memcpy(contract_addr.bytes, addr_bytes, 20);
+    memset(system_addr.bytes, 0xff, 20);
+    system_addr.bytes[19] = 0xfe;  /* SYSTEM_ADDRESS */
+
+    /* Only call if contract has code */
+    uint32_t code_len = 0;
+    evm_state_get_code_ptr(evm->state, &contract_addr, &code_len);
+    if (code_len == 0) return;
+
+    /* Set tx context for system call */
+    evm_tx_context_t sys_tx;
+    memset(&sys_tx, 0, sizeof(sys_tx));
+    address_copy(&sys_tx.origin, &system_addr);
+
+    evm_set_tx_context(evm, &sys_tx);
+
+    /* Execute: caller=SYSTEM_ADDRESS, empty calldata, generous gas, depth=0 */
+    uint256_t zero = UINT256_ZERO;
+    evm_message_t msg = evm_message_call(
+        &system_addr, &contract_addr, &zero,
+        NULL, 0, 30000000, 0);
+    evm_result_t result;
+    evm_execute(evm, &msg, &result);
+    evm_result_free(&result);
+
+    /* Commit system call state changes (reset access lists, commit originals) */
+    evm_state_commit_tx(evm->state);
+}
+
+/* =========================================================================
  * Block reward by fork (PoW era only)
  * ========================================================================= */
 
@@ -256,6 +291,24 @@ block_result_t block_execute(evm_t *evm,
         uint256_t amount_wei = uint256_mul(&gwei, &multiplier);
         evm_state_add_balance(evm->state, &body->withdrawals[w].address,
                               &amount_wei);
+    }
+
+    /* EIP-7002: Dequeue withdrawal requests (Prague+) */
+    if (evm->fork >= FORK_PRAGUE) {
+        static const uint8_t WITHDRAWAL_REQ_ADDR[20] = {
+            0x00, 0x00, 0x09, 0x61, 0xef, 0x48, 0x0e, 0xb5, 0x5e, 0x80,
+            0xd1, 0x9a, 0xd8, 0x35, 0x79, 0xa6, 0x4c, 0x00, 0x70, 0x02
+        };
+        system_call(evm, WITHDRAWAL_REQ_ADDR);
+    }
+
+    /* EIP-7251: Dequeue consolidation requests (Prague+) */
+    if (evm->fork >= FORK_PRAGUE) {
+        static const uint8_t CONSOLIDATION_REQ_ADDR[20] = {
+            0x00, 0x00, 0xbb, 0xdd, 0xc7, 0xce, 0x48, 0x86, 0x42, 0xfb,
+            0x57, 0x9f, 0x8b, 0x00, 0xf3, 0xa5, 0x90, 0x00, 0x72, 0x51
+        };
+        system_call(evm, CONSOLIDATION_REQ_ADDR);
     }
 
     /* Finalize state: flush dirty accounts/storage to state_db */
