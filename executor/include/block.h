@@ -153,6 +153,16 @@ bool block_body_get_uncle(const block_body_t *body, size_t index,
  */
 void block_body_free(block_body_t *body);
 
+/**
+ * Compute the block hash from full block RLP bytes.
+ * Hash = keccak256(RLP(header_list)).
+ *
+ * @param data  Full block RLP bytes
+ * @param len   Length of data
+ * @return Block hash, or zero hash on error
+ */
+hash_t block_hash_from_rlp(const uint8_t *data, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

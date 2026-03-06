@@ -331,7 +331,7 @@ static void test_executor_smoke(void) {
     ASSERT(body.tx_count == 1, "body tx count");
 
     /* Execute! */
-    block_result_t result = block_execute(evm, &header, &body);
+    block_result_t result = block_execute(evm, &header, &body, NULL);
 
     printf("\n    gas_used=%lu, tx_count=%zu, success=%d, first_failure=%d\n    ",
            result.gas_used, result.tx_count, result.success, result.first_failure);

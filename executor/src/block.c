@@ -317,3 +317,32 @@ void block_body_free(block_body_t *body) {
         body->withdrawal_count = 0;
     }
 }
+
+hash_t block_hash_from_rlp(const uint8_t *data, size_t len) {
+    hash_t zero = {0};
+    if (!data || len == 0) return zero;
+
+    /* Decode outer list */
+    rlp_item_t *root = rlp_decode(data, len);
+    if (!root || rlp_get_type(root) != RLP_TYPE_LIST) {
+        if (root) rlp_item_free(root);
+        return zero;
+    }
+
+    /* Element 0 is the header list */
+    const rlp_item_t *hdr_item = rlp_get_list_item(root, 0);
+    if (!hdr_item) {
+        rlp_item_free(root);
+        return zero;
+    }
+
+    /* Re-encode header → keccak256 gives the block hash */
+    bytes_t hdr_encoded = rlp_encode(hdr_item);
+    rlp_item_free(root);
+
+    if (!hdr_encoded.data) return zero;
+
+    hash_t result = hash_keccak256(hdr_encoded.data, hdr_encoded.len);
+    free(hdr_encoded.data);
+    return result;
+}

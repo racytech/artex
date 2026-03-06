@@ -753,6 +753,108 @@ void evm_state_commit(evm_state_t *es) {
 }
 
 // ============================================================================
+// Per-transaction commit (for block execution inter-tx boundaries)
+// ============================================================================
+
+// Context for collecting self-destructed addresses
+typedef struct {
+    address_t addrs[256];
+    size_t    count;
+} selfdestructed_ctx_t;
+
+// Phase 1: commit accounts, collect self-destructed ones
+static bool commit_tx_account_cb(const uint8_t *key, size_t key_len,
+                                  const void *value, size_t value_len,
+                                  void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
+    selfdestructed_ctx_t *ctx = (selfdestructed_ctx_t *)user_data;
+
+    if (ca->self_destructed) {
+        // Collect address for storage cleanup
+        if (ctx->count < 256)
+            ctx->addrs[ctx->count++] = ca->addr;
+
+        // Zero out the account so next tx sees it as empty/non-existent
+        ca->account.balance = UINT256_ZERO;
+        ca->account.nonce = 0;
+        ca->account.has_code = false;
+        memset(ca->account.code_hash.bytes, 0, 32);
+        if (ca->code) { free(ca->code); ca->code = NULL; }
+        ca->code_size = 0;
+        ca->existed = false;
+        ca->created = false;
+        ca->dirty = false;
+        ca->code_dirty = false;
+        ca->self_destructed = false;
+        return true;
+    }
+
+    // Normal commit — only promote to "existed" if the account was genuinely
+    // present (pre-existing, created, or written-to).  Phantom cache entries
+    // created by read-only lookups (e.g. evm_state_get_code_ptr for a
+    // CALLCODE target) must NOT be marked as existed, or they will pollute
+    // the state root on pre-EIP-161 forks where empty accounts are kept.
+    if (ca->existed || ca->created || ca->dirty || ca->code_dirty) {
+        ca->existed = true;
+    }
+    ca->created = false;
+    ca->dirty = false;
+    ca->code_dirty = false;
+    ca->self_destructed = false;
+    return true;
+}
+
+// Phase 2: commit storage, zero slots belonging to self-destructed accounts
+static bool commit_tx_slot_cb(const uint8_t *key, size_t key_len,
+                               const void *value, size_t value_len,
+                               void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    cached_slot_t *cs = (cached_slot_t *)(uintptr_t)value;
+    selfdestructed_ctx_t *ctx = (selfdestructed_ctx_t *)user_data;
+
+    // Check if this slot belongs to a self-destructed account
+    for (size_t i = 0; i < ctx->count; i++) {
+        if (memcmp(cs->key, ctx->addrs[i].bytes, ADDRESS_SIZE) == 0) {
+            cs->current = UINT256_ZERO;
+            cs->original = UINT256_ZERO;
+            cs->dirty = false;
+            return true;
+        }
+    }
+
+    // Normal commit: set original = current
+    cs->original = cs->current;
+    cs->dirty = false;
+    return true;
+}
+
+void evm_state_commit_tx(evm_state_t *es) {
+    if (!es) return;
+
+    selfdestructed_ctx_t ctx = { .count = 0 };
+
+    // Phase 1: commit accounts, collect self-destructed
+    mem_art_foreach(&es->accounts, commit_tx_account_cb, &ctx);
+
+    // Phase 2: commit storage (zero self-destructed, set original=current for rest)
+    mem_art_foreach(&es->storage, commit_tx_slot_cb, &ctx);
+
+    // Clear journal
+    es->journal_len = 0;
+
+    // Clear access lists (each tx starts fresh)
+    mem_art_destroy(&es->warm_addrs);
+    mem_art_init(&es->warm_addrs);
+    mem_art_destroy(&es->warm_slots);
+    mem_art_init(&es->warm_slots);
+
+    // Clear transient storage (per-tx lifetime, EIP-1153)
+    mem_art_destroy(&es->transient);
+    mem_art_init(&es->transient);
+}
+
+// ============================================================================
 // Snapshot / Revert
 // ============================================================================
 

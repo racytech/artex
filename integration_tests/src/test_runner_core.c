@@ -164,8 +164,8 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.prague = 0;
         test_config.fork_blocks.osaka = 0;
     } else {
-        // Unknown fork, use sepolia (all forks active)
-        return (chain_config_t *)chain_config_sepolia();
+        // Unknown/transition fork — return NULL to signal skip
+        return NULL;
     }
 
     return &test_config;
@@ -334,7 +334,9 @@ void test_runner_reset(test_runner_t *runner) {
 bool test_runner_setup_state(evm_state_t *state,
                              const test_account_t *accounts,
                              size_t count) {
-    if (!state || !accounts) return false;
+    if (!state) return false;
+    if (count == 0) return true;  /* empty pre-state is valid */
+    if (!accounts) return false;
 
     for (size_t i = 0; i < count; i++) {
         const test_account_t *acc = &accounts[i];

@@ -128,6 +128,16 @@ bool evm_state_is_created(evm_state_t *es, const address_t *addr);
  */
 void evm_state_commit(evm_state_t *es);
 
+/**
+ * Per-transaction commit for block execution.
+ * Call after each transaction_execute() in a block:
+ *   - Processes self-destructed accounts (zeros balance/nonce/code/storage)
+ *   - Commits remaining accounts (existed=true, clears created/dirty flags)
+ *   - Sets original = current for storage (EIP-2200)
+ *   - Clears journal, access lists, and transient storage
+ */
+void evm_state_commit_tx(evm_state_t *es);
+
 /** Take snapshot. Returns journal position for later revert. */
 uint32_t evm_state_snapshot(evm_state_t *es);
 

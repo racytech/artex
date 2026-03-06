@@ -46,14 +46,17 @@ typedef struct {
  * before calling this function. The state should contain the pre-state
  * from the previous block.
  *
- * @param evm     EVM instance (with state and chain config)
- * @param header  Decoded block header
- * @param body    Decoded block body (transaction list)
+ * @param evm          EVM instance (with state and chain config)
+ * @param header       Decoded block header
+ * @param body         Decoded block body (transaction list)
+ * @param block_hashes Optional: 256 recent block hashes for BLOCKHASH opcode
+ *                     (indexed by block_number % 256). NULL = all zeros.
  * @return Block execution result
  */
 block_result_t block_execute(evm_t *evm,
                              const block_header_t *header,
-                             const block_body_t *body);
+                             const block_body_t *body,
+                             const hash_t *block_hashes);
 
 /**
  * Free block result resources.

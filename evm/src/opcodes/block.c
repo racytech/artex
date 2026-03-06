@@ -68,10 +68,8 @@ evm_status_t op_blockhash(evm_t *evm)
     uint64_t block_idx = uint256_to_uint64(&block_number);
     uint64_t hash_idx = block_idx % 256;
     
-    // Convert hash to uint256
-    uint256_t hash_value;
-    memset(&hash_value, 0, sizeof(uint256_t));
-    memcpy(&hash_value, &evm->block.block_hash[hash_idx], sizeof(hash_t) < sizeof(uint256_t) ? sizeof(hash_t) : sizeof(uint256_t));
+    // Convert hash to uint256 (hash_t is big-endian bytes, uint256_t has internal layout)
+    uint256_t hash_value = uint256_from_bytes(evm->block.block_hash[hash_idx].bytes, 32);
 
     if (!evm_stack_push(evm->stack, &hash_value))
     {

@@ -79,7 +79,8 @@ static uint256_t get_block_reward(evm_fork_t fork) {
 
 block_result_t block_execute(evm_t *evm,
                              const block_header_t *header,
-                             const block_body_t *body) {
+                             const block_body_t *body,
+                             const hash_t *block_hashes) {
     block_result_t result;
     memset(&result, 0, sizeof(result));
     result.first_failure = -1;
@@ -105,6 +106,8 @@ block_result_t block_execute(evm_t *evm,
     /* Set up block environment on the EVM */
     evm_block_env_t evm_env;
     header_to_evm_block_env(header, &evm_env, evm->chain_config);
+    if (block_hashes)
+        memcpy(evm_env.block_hash, block_hashes, sizeof(evm_env.block_hash));
     evm_set_block_env(evm, &evm_env);
 
     /* Build block_env_t for transaction_execute */
@@ -186,6 +189,11 @@ block_result_t block_execute(evm_t *evm,
         }
 
         tx_decoded_free(&tx);
+
+        /* Per-transaction commit: process self-destructs, reset access
+         * lists and transient storage, commit storage originals.
+         * Must happen after each tx so the next tx sees clean state. */
+        evm_state_commit_tx(evm->state);
     }
 
     /* Pay block reward (PoW only — zero after The Merge) */

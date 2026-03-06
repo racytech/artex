@@ -265,6 +265,8 @@ bool transaction_execute(
         .chain_id = evm->chain_config ? uint256_from_uint64(evm->chain_config->chain_id) : uint256_from_uint64(1),
         .excess_blob_gas = env->excess_blob_gas
     };
+    // Preserve block hashes (may have been set by block_execute)
+    memcpy(block_env.block_hash, evm->block.block_hash, sizeof(block_env.block_hash));
     evm_set_block_env(evm, &block_env);
 
     // Reject transaction types not supported by the current fork
@@ -589,6 +591,18 @@ bool transaction_execute(
         }
     }
 
+    // EIP-2930: warm access list addresses and storage keys (Berlin+)
+    // Per spec: access list warming happens before execution and persists on revert.
+    if (tx->access_list && tx->access_list_count > 0 && evm->fork >= FORK_BERLIN) {
+        for (size_t i = 0; i < tx->access_list_count; i++) {
+            evm_mark_address_warm(evm, &tx->access_list[i].address);
+            for (size_t k = 0; k < tx->access_list[i].storage_keys_count; k++) {
+                evm_mark_storage_warm(evm, &tx->access_list[i].address,
+                                      &tx->access_list[i].storage_keys[k]);
+            }
+        }
+    }
+
     // Snapshot AFTER nonce increment and gas deduction, but BEFORE value transfer
     // and contract creation. Per Ethereum spec, on EVM error/revert we revert
     // value transfer and execution state, but keep nonce increment and gas deduction.
@@ -648,15 +662,20 @@ bool transaction_execute(
         goto post_execution;
     }
 
-    // Transfer value (if any)
-    if (!uint256_is_zero(&tx->value)) {
-        if (!evm_state_sub_balance(state, &tx->sender, &tx->value)) {
-            LOG_EVM_ERROR("Failed to deduct value from sender");
-            evm_state_revert(state, snapshot);
-            return false;
-        }
-
+    // Transfer value and touch recipient.
+    // Always call add_balance (even with 0 value) to touch the recipient in
+    // the state trie.  In pre-EIP-161 forks (Frontier/Homestead), touched
+    // empty accounts appear in the state root.  go-ethereum always calls
+    // Transfer(sender, recipient, value) which internally does AddBalance.
+    {
         address_t recipient = tx->is_create ? contract_address : tx->to;
+        if (!uint256_is_zero(&tx->value)) {
+            if (!evm_state_sub_balance(state, &tx->sender, &tx->value)) {
+                LOG_EVM_ERROR("Failed to deduct value from sender");
+                evm_state_revert(state, snapshot);
+                return false;
+            }
+        }
         evm_state_add_balance(state, &recipient, &tx->value);
     }
 

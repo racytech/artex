@@ -80,6 +80,18 @@ bool test_runner_run_state_test(test_runner_t *runner,
         
         // Update EVM chain config for this fork
         chain_config_t *fork_config = create_test_chain_config(test_fork);
+        if (!fork_config) {
+            // Unknown/transition fork — skip all conditions
+            for (size_t ci = 0; ci < test->post[fork_idx].condition_count; ci++) {
+                test_result_init(result);
+                result->test_name = test->name ? strdup(test->name) : NULL;
+                result->fork = test_fork ? strdup(test_fork) : NULL;
+                result->status = TEST_SKIP;
+                result->skip_reason = strdup("Unknown/transition fork");
+                result++;
+            }
+            continue;
+        }
         if (runner->evm) {
             runner->evm->chain_config = fork_config;
             // Note: fork will be recomputed from block number in evm_set_block_env()

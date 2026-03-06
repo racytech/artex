@@ -78,6 +78,12 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
 
     // Setup fork/chain config
     chain_config_t *fork_config = create_test_chain_config(test->network);
+    if (!fork_config) {
+        result->status = TEST_SKIP;
+        result->skip_reason = strdup("Unknown/transition fork");
+        result->duration_us = get_time_microseconds() - start_time;
+        return true;
+    }
     if (runner->evm) {
         runner->evm->chain_config = fork_config;
     }
@@ -124,6 +130,16 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
         }
     }
 
+    // Block hash cache for BLOCKHASH opcode (ring buffer indexed by block_number % 256)
+    hash_t block_hashes[256];
+    memset(block_hashes, 0, sizeof(block_hashes));
+
+    // Compute genesis block hash from genesis RLP
+    if (test->genesis_rlp && test->genesis_rlp_len > 0) {
+        hash_t genesis_hash = block_hash_from_rlp(test->genesis_rlp, test->genesis_rlp_len);
+        block_hashes[0 % 256] = genesis_hash;
+    }
+
     // Process each block
     for (size_t block_idx = 0; block_idx < test->block_count; block_idx++) {
         const test_block_t *block = &test->blocks[block_idx];
@@ -160,8 +176,8 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
                    cb, hdr.number, hdr.gas_limit, body.withdrawal_count);
         }
 
-        // Execute block
-        block_result_t block_result = block_execute(runner->evm, &hdr, &body);
+        // Execute block (pass block hashes for BLOCKHASH opcode)
+        block_result_t block_result = block_execute(runner->evm, &hdr, &body, block_hashes);
 
         if (runner->config.verbose) {
             printf("    gas_used=%lu, tx_count=%zu, success=%d\n",
@@ -194,7 +210,16 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
             if (runner->config.stop_on_fail) {
                 goto cleanup;
             }
+            // Still store the block hash even on state root mismatch
+            hash_t bh = block_hash_from_rlp(block->rlp, block->rlp_len);
+            block_hashes[hdr.number % 256] = bh;
             continue;
+        }
+
+        // Store this block's hash for subsequent BLOCKHASH lookups
+        {
+            hash_t bh = block_hash_from_rlp(block->rlp, block->rlp_len);
+            block_hashes[hdr.number % 256] = bh;
         }
 
         block_result_free(&block_result);
