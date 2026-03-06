@@ -1,15 +1,36 @@
 /**
  * Test Runner - Blockchain Test Execution
+ *
+ * Wires parsed blockchain test fixtures to the block executor:
+ *   1. Setup genesis pre-state
+ *   2. Verify genesis state root
+ *   3. For each block: decode RLP → block_execute() → verify state root
+ *   4. Verify post-state accounts (balance, nonce, code, storage)
  */
 
 #include "test_runner.h"
+#include "block.h"
+#include "block_executor.h"
+#include "fork.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
-// Forward declaration from test_runner_core.c
+// Forward declarations from test_runner_core.c
 extern uint64_t get_time_microseconds(void);
+extern chain_config_t *create_test_chain_config(const char *fork_name);
+extern bool hash_equals(const hash_t *a, const hash_t *b);
+
+//==============================================================================
+// Helpers
+//==============================================================================
+
+static void format_address(const address_t *addr, char *buf, size_t buf_size) {
+    snprintf(buf, buf_size, "0x");
+    for (int i = 0; i < 20; i++)
+        snprintf(buf + 2 + i * 2, 3, "%02x", addr->bytes[i]);
+}
 
 //==============================================================================
 // Blockchain Test Runner
@@ -19,22 +40,22 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
                                      const blockchain_test_t *test,
                                      test_result_t *result) {
     if (!runner || !test || !result) return false;
-    
+
     test_result_init(result);
-    
+
     uint64_t start_time = get_time_microseconds();
-    
+
     // Set test name and fork
     result->test_name = test->name ? strdup(test->name) : NULL;
     result->fork = test->network ? strdup(test->network) : NULL;
-    
+
     if (runner->config.verbose) {
         printf("Running blockchain test: %s\n", test->name ? test->name : "(unnamed)");
         printf("  Network: %s\n", test->network ? test->network : "(unknown)");
         printf("  Pre-state accounts: %zu\n", test->pre_state_count);
         printf("  Blocks to process: %zu\n", test->block_count);
     }
-    
+
     // Check fork filter
     if (runner->config.fork_filter_count > 0 && test->network) {
         bool fork_allowed = false;
@@ -51,195 +72,228 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
             return true;
         }
     }
-    
+
     // Reset state
     test_runner_reset(runner);
-    
+
+    // Setup fork/chain config
+    chain_config_t *fork_config = create_test_chain_config(test->network);
+    if (runner->evm) {
+        runner->evm->chain_config = fork_config;
+    }
+
     // Setup genesis/pre-state
     if (!test_runner_setup_state(runner->state, test->pre_state, test->pre_state_count)) {
         result->status = TEST_ERROR;
-        test_result_add_failure(result, "genesis_state", NULL, NULL, 
+        test_result_add_failure(result, "genesis_state", NULL, NULL,
                               "Failed to setup genesis state");
         goto cleanup;
     }
-    
-    // Verify genesis state root if available
-    hash_t actual_genesis_root;
-    // TODO: State root computation requires MPT integration
-    memset(&actual_genesis_root, 0, sizeof(actual_genesis_root));
-    
-    if (runner->config.verbose) {
-        char *genesis_root_str = hash_to_hex_string(&actual_genesis_root);
-        printf("  Genesis state root: %s\n", genesis_root_str);
-        free(genesis_root_str);
-        
-        char *expected_root_str = hash_to_hex_string(&test->genesis_header.state_root);
-        printf("  Expected root: %s\n", expected_root_str);
-        free(expected_root_str);
-    }
-    
-    if (!hash_equals(&actual_genesis_root, &test->genesis_header.state_root)) {
-        result->status = TEST_FAIL;
-        
-        char *expected_str = hash_to_hex_string(&test->genesis_header.state_root);
-        char *actual_str = hash_to_hex_string(&actual_genesis_root);
-        
-        test_result_add_failure(result, "genesis_state_root", expected_str, actual_str,
-                              "Genesis state root mismatch");
-        
-        free(expected_str);
-        free(actual_str);
-        
-        if (runner->config.stop_on_fail) {
+
+    // Commit pre-state as "original" for EIP-2200 storage tracking
+    evm_state_commit(runner->state);
+
+    // Verify genesis state root
+    {
+        bool prune_empty = false;
+        // Determine if we need EIP-161 pruning based on fork
+        evm_fork_t fork = fork_get_active(0, fork_config);
+        if (fork >= FORK_SPURIOUS_DRAGON)
+            prune_empty = true;
+
+        hash_t actual_genesis_root = evm_state_compute_state_root_ex(runner->state, prune_empty);
+
+        if (runner->config.verbose) {
+            char *expected_str = hash_to_hex_string(&test->genesis_header.state_root);
+            char *actual_str = hash_to_hex_string(&actual_genesis_root);
+            printf("  Genesis state root: %s\n", actual_str);
+            printf("  Expected root:      %s\n", expected_str);
+            free(expected_str);
+            free(actual_str);
+        }
+
+        if (!hash_equals(&actual_genesis_root, &test->genesis_header.state_root)) {
+            char *expected_str = hash_to_hex_string(&test->genesis_header.state_root);
+            char *actual_str = hash_to_hex_string(&actual_genesis_root);
+            test_result_add_failure(result, "genesis_state_root",
+                                  expected_str, actual_str,
+                                  "Genesis state root mismatch");
+            free(expected_str);
+            free(actual_str);
             goto cleanup;
         }
     }
-    
+
     // Process each block
     for (size_t block_idx = 0; block_idx < test->block_count; block_idx++) {
         const test_block_t *block = &test->blocks[block_idx];
-        
+
         if (runner->config.verbose) {
-            printf("  Processing block %zu...\n", block_idx);
-            printf("    Transactions: %zu\n", block->tx_count);
+            printf("  Processing block %zu (%zu txs)...\n",
+                   block_idx, block->tx_count);
         }
-        
-        // TODO: Process block when EVM is ready
-        // For now, we just verify we can access the block data
-        
-        // Process each transaction in the block
-        for (size_t tx_idx = 0; tx_idx < block->tx_count; tx_idx++) {
-            // TODO: Decode and execute transaction RLP
-            // uint8_t *tx_rlp = block->transactions[tx_idx];
-            // size_t tx_len = block->tx_len[tx_idx];
-            
-            // TODO: Execute transaction
-            // evm_execute_transaction(runner->evm, runner->state_db, tx_rlp, tx_len);
-            
-            if (runner->config.verbose) {
-                printf("      TX %zu: %zu bytes\n", tx_idx, block->tx_len[tx_idx]);
+
+        // Decode full block RLP → header + body
+        if (!block->rlp || block->rlp_len == 0) {
+            result->status = TEST_ERROR;
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Block %zu has no RLP data", block_idx);
+            test_result_add_failure(result, "block_rlp", NULL, NULL, msg);
+            goto cleanup;
+        }
+
+        block_header_t hdr;
+        block_body_t body;
+        if (!block_decode_full_rlp(block->rlp, block->rlp_len, &hdr, &body)) {
+            result->status = TEST_ERROR;
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Failed to decode block %zu RLP", block_idx);
+            test_result_add_failure(result, "block_decode", NULL, NULL, msg);
+            goto cleanup;
+        }
+
+        // Debug: print coinbase from decoded header
+        if (runner->config.verbose) {
+            char cb[43];
+            format_address(&hdr.coinbase, cb, sizeof(cb));
+            printf("    Header coinbase: %s, number=%lu, gas_limit=%lu, withdrawals=%zu\n",
+                   cb, hdr.number, hdr.gas_limit, body.withdrawal_count);
+        }
+
+        // Execute block
+        block_result_t block_result = block_execute(runner->evm, &hdr, &body);
+
+        if (runner->config.verbose) {
+            printf("    gas_used=%lu, tx_count=%zu, success=%d\n",
+                   block_result.gas_used, block_result.tx_count,
+                   block_result.success);
+        }
+
+        // Track statistics
+        runner->total_transactions += block_result.tx_count;
+        runner->total_gas_used += block_result.gas_used;
+
+        // Verify state root against expected (from JSON block header)
+        // Compute state root ourselves (block_execute's finalize may affect root)
+        bool prune = (runner->evm->fork >= FORK_SPURIOUS_DRAGON);
+        hash_t computed_root = evm_state_compute_state_root_ex(runner->state, prune);
+        hash_t *expected_root = (hash_t *)&block->header.state_root;
+        if (!hash_equals(&computed_root, expected_root)) {
+            char *expected_str = hash_to_hex_string(expected_root);
+            char *actual_str = hash_to_hex_string(&computed_root);
+            char msg[128];
+            snprintf(msg, sizeof(msg), "State root mismatch after block %zu", block_idx);
+            test_result_add_failure(result, "block_state_root",
+                                  expected_str, actual_str, msg);
+            free(expected_str);
+            free(actual_str);
+
+            block_result_free(&block_result);
+            block_body_free(&body);
+
+            if (runner->config.stop_on_fail) {
+                goto cleanup;
             }
-            
-            runner->total_transactions++;
+            continue;
         }
-        
-        // TODO: Verify block state root after execution
-        // hash_t block_state_root;
-        // state_db_get_state_root(runner->state_db, &block_state_root);
-        // if (!hash_equals(&block_state_root, &block->header.state_root)) {
-        //     // Block state root mismatch
-        // }
+
+        block_result_free(&block_result);
+        block_body_free(&body);
     }
-    
-    // Verify final state
-    hash_t final_state_root;
-    // TODO: State root computation requires MPT integration
-    memset(&final_state_root, 0, sizeof(final_state_root));
-    
-    if (runner->config.verbose) {
-        printf("  Final state verification...\n");
-        char *final_root_str = hash_to_hex_string(&final_state_root);
-        printf("    Actual state root: %s\n", final_root_str);
-        free(final_root_str);
-    }
-    
+
     // Verify post-state accounts (if provided)
     if (test->post_state_count > 0) {
         for (size_t i = 0; i < test->post_state_count; i++) {
             const test_account_t *expected_acc = &test->post_state[i];
-            
-            // Get actual account state
-            uint256_t actual_balance;
-            actual_balance = evm_state_get_balance(runner->state, &expected_acc->address);
-            if (uint256_is_zero(&actual_balance) && !evm_state_exists(runner->state, &expected_acc->address)) {
-                // Account doesn't exist
-                if (!uint256_is_zero(&expected_acc->balance)) {
-                    result->status = TEST_FAIL;
-                    
-                    char addr_str[43];
-                    snprintf(addr_str, sizeof(addr_str), "0x");
-                    for (int j = 0; j < 20; j++) {
-                        snprintf(addr_str + 2 + j*2, 3, "%02x", expected_acc->address.bytes[j]);
-                    }
-                    
-                    char *expected_str = uint256_to_hex_string(&expected_acc->balance);
-                    
-                    char msg[256];
-                    snprintf(msg, sizeof(msg), "Account %s missing", addr_str);
-                    
-                    test_result_add_failure(result, "account_balance", expected_str, "0x0", msg);
-                    free(expected_str);
-                    
-                    if (runner->config.stop_on_fail) {
-                        goto cleanup;
-                    }
-                    continue;
-                }
-            }
-            
+
+            char addr_str[43];
+            format_address(&expected_acc->address, addr_str, sizeof(addr_str));
+
             // Verify balance
+            uint256_t actual_balance = evm_state_get_balance(runner->state, &expected_acc->address);
             if (!uint256_eq(&actual_balance, &expected_acc->balance)) {
-                result->status = TEST_FAIL;
-                
-                char addr_str[43];
-                snprintf(addr_str, sizeof(addr_str), "0x");
-                for (int j = 0; j < 20; j++) {
-                    snprintf(addr_str + 2 + j*2, 3, "%02x", expected_acc->address.bytes[j]);
-                }
-                
                 char *expected_str = uint256_to_hex_string(&expected_acc->balance);
                 char *actual_str = uint256_to_hex_string(&actual_balance);
-                
                 char msg[256];
                 snprintf(msg, sizeof(msg), "Balance mismatch for %s", addr_str);
-                
-                test_result_add_failure(result, "account_balance", expected_str, actual_str, msg);
-                
+                test_result_add_failure(result, "account_balance",
+                                      expected_str, actual_str, msg);
                 free(expected_str);
                 free(actual_str);
-                
-                if (runner->config.stop_on_fail) {
-                    goto cleanup;
+                if (runner->config.stop_on_fail) goto cleanup;
+            }
+
+            // Verify nonce
+            uint64_t actual_nonce = evm_state_get_nonce(runner->state, &expected_acc->address);
+            uint64_t expected_nonce = uint256_to_uint64(&expected_acc->nonce);
+            if (actual_nonce != expected_nonce) {
+                char expected_str[32], actual_str[32];
+                snprintf(expected_str, sizeof(expected_str), "0x%lx", expected_nonce);
+                snprintf(actual_str, sizeof(actual_str), "0x%lx", actual_nonce);
+                char msg[256];
+                snprintf(msg, sizeof(msg), "Nonce mismatch for %s", addr_str);
+                test_result_add_failure(result, "account_nonce",
+                                      expected_str, actual_str, msg);
+                if (runner->config.stop_on_fail) goto cleanup;
+            }
+
+            // Verify code
+            if (expected_acc->code && expected_acc->code_len > 0) {
+                uint32_t actual_code_len = 0;
+                const uint8_t *actual_code = evm_state_get_code_ptr(runner->state,
+                                                                    &expected_acc->address,
+                                                                    &actual_code_len);
+                if ((size_t)actual_code_len != expected_acc->code_len ||
+                    (actual_code_len > 0 && memcmp(actual_code, expected_acc->code,
+                                                    actual_code_len) != 0)) {
+                    char expected_str[32], actual_str[32];
+                    snprintf(expected_str, sizeof(expected_str), "%zu bytes", expected_acc->code_len);
+                    snprintf(actual_str, sizeof(actual_str), "%u bytes", actual_code_len);
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "Code mismatch for %s", addr_str);
+                    test_result_add_failure(result, "account_code",
+                                          expected_str, actual_str, msg);
+                    if (runner->config.stop_on_fail) goto cleanup;
                 }
             }
-            
-            // TODO: Verify nonce, code, storage when available
+
+            // Verify storage
+            for (size_t j = 0; j < expected_acc->storage_count; j++) {
+                const test_storage_entry_t *entry = &expected_acc->storage[j];
+                uint256_t actual_val = evm_state_get_storage(runner->state,
+                                                             &expected_acc->address,
+                                                             &entry->key);
+                if (!uint256_eq(&actual_val, &entry->value)) {
+                    char *expected_str = uint256_to_hex_string(&entry->value);
+                    char *actual_str = uint256_to_hex_string(&actual_val);
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "Storage mismatch for %s", addr_str);
+                    test_result_add_failure(result, "account_storage",
+                                          expected_str, actual_str, msg);
+                    free(expected_str);
+                    free(actual_str);
+                    if (runner->config.stop_on_fail) goto cleanup;
+                }
+            }
         }
     }
-    
-    // Verify last block hash
-    if (test->block_count > 0) {
-        // TODO: Compute actual last block hash
-        // For now, just check if it's provided
-        if (runner->config.verbose) {
-            char *expected_hash_str = hash_to_hex_string(&test->last_block_hash);
-            printf("  Expected last block hash: %s\n", expected_hash_str);
-            free(expected_hash_str);
-        }
-        
-        // TODO: Verify when block hash calculation is implemented
-        // if (!hash_equals(&actual_last_hash, &test->last_block_hash)) {
-        //     result->status = TEST_FAIL;
-        //     ...
-        // }
-    }
-    
+
 cleanup:
     result->duration_us = get_time_microseconds() - start_time;
-    
+
     // If no failures were added and not already failed, mark as pass
-    if (result->status != TEST_FAIL && result->status != TEST_ERROR && 
+    if (result->status != TEST_FAIL && result->status != TEST_ERROR &&
         result->status != TEST_SKIP) {
         result->status = TEST_PASS;
     }
-    
+
     if (runner->config.verbose) {
-        printf("  Result: %s (%.2f ms)\n", 
-               result->status == TEST_PASS ? "PASS" : 
-               result->status == TEST_FAIL ? "FAIL" : 
+        printf("  Result: %s (%.2f ms)\n",
+               result->status == TEST_PASS ? "PASS" :
+               result->status == TEST_FAIL ? "FAIL" :
                result->status == TEST_SKIP ? "SKIP" : "ERROR",
                result->duration_us / 1000.0);
     }
-    
+
     return true;
 }

@@ -60,6 +60,20 @@ static void header_to_evm_block_env(const block_header_t *hdr,
 }
 
 /* =========================================================================
+ * Block reward by fork (PoW era only)
+ * ========================================================================= */
+
+static uint256_t get_block_reward(evm_fork_t fork) {
+    if (fork >= FORK_PARIS)
+        return UINT256_ZERO;  /* No PoW reward after The Merge */
+    if (fork >= FORK_CONSTANTINOPLE)
+        return uint256_from_uint64(2000000000000000000ULL);  /* 2 ETH */
+    if (fork >= FORK_BYZANTIUM)
+        return uint256_from_uint64(3000000000000000000ULL);  /* 3 ETH */
+    return uint256_from_uint64(5000000000000000000ULL);      /* 5 ETH */
+}
+
+/* =========================================================================
  * Block execution
  * ========================================================================= */
 
@@ -102,6 +116,29 @@ block_result_t block_execute(evm_t *evm,
 
     /* Commit state before executing transactions (EIP-2200 original values) */
     evm_state_commit(evm->state);
+
+    /* EIP-4788: Store parent beacon block root (Cancun+) */
+    if (evm->fork >= FORK_CANCUN && header->has_parent_beacon_root) {
+        static const uint8_t BEACON_ROOT_ADDR[20] = {
+            0x00, 0x0F, 0x3d, 0xf6, 0xD7, 0x32, 0x80, 0x7E, 0xf1, 0x31,
+            0x9f, 0xB7, 0xB8, 0xbB, 0x85, 0x22, 0xd0, 0xBe, 0xac, 0x02
+        };
+        #define HISTORY_BUFFER_LENGTH 8191
+
+        address_t beacon_addr;
+        memcpy(beacon_addr.bytes, BEACON_ROOT_ADDR, 20);
+
+        uint64_t ts_idx = header->timestamp % HISTORY_BUFFER_LENGTH;
+        uint256_t ts_slot = uint256_from_uint64(ts_idx);
+        uint256_t ts_val = uint256_from_uint64(header->timestamp);
+        evm_state_set_storage(evm->state, &beacon_addr, &ts_slot, &ts_val);
+
+        uint256_t root_slot = uint256_from_uint64(ts_idx + HISTORY_BUFFER_LENGTH);
+        uint256_t root_val = uint256_from_bytes(header->parent_beacon_root.bytes, 32);
+        evm_state_set_storage(evm->state, &beacon_addr, &root_slot, &root_val);
+
+        #undef HISTORY_BUFFER_LENGTH
+    }
 
     uint64_t cumulative_gas = 0;
     result.success = true;
@@ -151,11 +188,51 @@ block_result_t block_execute(evm_t *evm,
         tx_decoded_free(&tx);
     }
 
+    /* Pay block reward (PoW only — zero after The Merge) */
+    uint256_t base_reward = get_block_reward(evm->fork);
+    if (!uint256_is_zero(&base_reward)) {
+        uint256_t miner_reward = base_reward;
+
+        /* Uncle inclusion bonuses */
+        size_t uncle_count = block_body_uncle_count(body);
+        for (size_t u = 0; u < uncle_count; u++) {
+            /* Miner gets base_reward/32 per uncle included */
+            uint256_t thirty_two = uint256_from_uint64(32);
+            uint256_t uncle_bonus = uint256_div(&base_reward, &thirty_two);
+            miner_reward = uint256_add(&miner_reward, &uncle_bonus);
+
+            /* Uncle miner gets base_reward * (uncle_num + 8 - block_num) / 8 */
+            block_header_t uncle_hdr;
+            if (block_body_get_uncle(body, u, &uncle_hdr)) {
+                uint64_t depth = uncle_hdr.number + 8 - header->number;
+                uint256_t depth_u = uint256_from_uint64(depth);
+                uint256_t eight = uint256_from_uint64(8);
+                uint256_t uncle_miner_reward = uint256_mul(&base_reward, &depth_u);
+                uncle_miner_reward = uint256_div(&uncle_miner_reward, &eight);
+                evm_state_add_balance(evm->state, &uncle_hdr.coinbase,
+                                      &uncle_miner_reward);
+            }
+        }
+
+        evm_state_add_balance(evm->state, &header->coinbase, &miner_reward);
+    }
+
+    /* Process EIP-4895 withdrawals (Shanghai+) */
+    for (size_t w = 0; w < body->withdrawal_count; w++) {
+        /* Withdrawal amount is in Gwei — convert to Wei (* 1e9) */
+        uint256_t gwei = uint256_from_uint64(body->withdrawals[w].amount_gwei);
+        uint256_t multiplier = uint256_from_uint64(1000000000ULL);
+        uint256_t amount_wei = uint256_mul(&gwei, &multiplier);
+        evm_state_add_balance(evm->state, &body->withdrawals[w].address,
+                              &amount_wei);
+    }
+
     /* Finalize state: flush dirty accounts/storage to state_db */
     evm_state_finalize(evm->state);
 
-    /* Compute state root (trie-agnostic — MPT or Verkle) */
-    result.state_root = evm_state_compute_state_root(evm->state);
+    /* Compute state root — prune empty accounts post-Spurious Dragon (EIP-161) */
+    bool prune_empty = (evm->fork >= FORK_SPURIOUS_DRAGON);
+    result.state_root = evm_state_compute_state_root_ex(evm->state, prune_empty);
     result.gas_used = cumulative_gas;
 
     return result;

@@ -187,15 +187,133 @@ bool block_body_decode_rlp(block_body_t *body,
 
 const rlp_item_t *block_body_tx(const block_body_t *body, size_t index) {
     if (!body || !body->_rlp || index >= body->tx_count) return NULL;
-    const rlp_item_t *txs = rlp_get_list_item(body->_rlp, 0);
+    const rlp_item_t *txs = rlp_get_list_item(body->_rlp, body->_tx_list_idx);
     if (!txs) return NULL;
     return rlp_get_list_item(txs, index);
 }
 
+/* =========================================================================
+ * Full block RLP decode: [header_list, transactions_list, uncles_list, ...]
+ * ========================================================================= */
+
+bool block_decode_full_rlp(const uint8_t *data, size_t len,
+                           block_header_t *hdr, block_body_t *body) {
+    if (!data || len == 0 || !hdr || !body) return false;
+    memset(body, 0, sizeof(*body));
+
+    rlp_item_t *root = rlp_decode(data, len);
+    if (!root || rlp_get_type(root) != RLP_TYPE_LIST) {
+        if (root) rlp_item_free(root);
+        return false;
+    }
+
+    /* Full block: [header, transactions, uncles, ...] — at least 3 elements */
+    size_t count = rlp_get_list_count(root);
+    if (count < 3) {
+        rlp_item_free(root);
+        return false;
+    }
+
+    /* Element 0: header list — re-encode and decode */
+    const rlp_item_t *hdr_item = rlp_get_list_item(root, 0);
+    if (!hdr_item || rlp_get_type(hdr_item) != RLP_TYPE_LIST) {
+        rlp_item_free(root);
+        return false;
+    }
+
+    bytes_t hdr_encoded = rlp_encode(hdr_item);
+    if (!hdr_encoded.data) {
+        rlp_item_free(root);
+        return false;
+    }
+
+    bool ok = block_header_decode_rlp(hdr, hdr_encoded.data, hdr_encoded.len);
+    free(hdr_encoded.data);
+    if (!ok) {
+        rlp_item_free(root);
+        return false;
+    }
+
+    /* Element 1: transactions list */
+    const rlp_item_t *txs = rlp_get_list_item(root, 1);
+    if (!txs || rlp_get_type(txs) != RLP_TYPE_LIST) {
+        rlp_item_free(root);
+        return false;
+    }
+
+    body->_rlp = root;
+    body->_tx_list_idx = 1; /* transactions at index 1 in full block */
+    body->tx_count = rlp_get_list_count(txs);
+
+    /* Element 3: withdrawals list (Shanghai+, EIP-4895) */
+    if (count > 3) {
+        const rlp_item_t *wds = rlp_get_list_item(root, 3);
+        if (wds && rlp_get_type(wds) == RLP_TYPE_LIST) {
+            size_t wd_count = rlp_get_list_count(wds);
+            if (wd_count > 0) {
+                body->withdrawals = calloc(wd_count, sizeof(withdrawal_t));
+                if (body->withdrawals) {
+                    body->withdrawal_count = wd_count;
+                    for (size_t w = 0; w < wd_count; w++) {
+                        const rlp_item_t *wd = rlp_get_list_item(wds, w);
+                        if (!wd || rlp_get_type(wd) != RLP_TYPE_LIST ||
+                            rlp_get_list_count(wd) < 4)
+                            continue;
+                        rlp_get_uint64(rlp_get_list_item(wd, 0),
+                                       &body->withdrawals[w].index);
+                        rlp_get_uint64(rlp_get_list_item(wd, 1),
+                                       &body->withdrawals[w].validator_index);
+                        rlp_get_address(rlp_get_list_item(wd, 2),
+                                        &body->withdrawals[w].address);
+                        rlp_get_uint64(rlp_get_list_item(wd, 3),
+                                       &body->withdrawals[w].amount_gwei);
+                    }
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+size_t block_body_uncle_count(const block_body_t *body) {
+    if (!body || !body->_rlp) return 0;
+    /* Uncle list is one past the tx list */
+    size_t uncle_list_idx = body->_tx_list_idx + 1;
+    const rlp_item_t *uncles = rlp_get_list_item(body->_rlp, uncle_list_idx);
+    if (!uncles || rlp_get_type(uncles) != RLP_TYPE_LIST) return 0;
+    return rlp_get_list_count(uncles);
+}
+
+bool block_body_get_uncle(const block_body_t *body, size_t index,
+                          block_header_t *hdr) {
+    if (!body || !body->_rlp || !hdr) return false;
+    size_t uncle_list_idx = body->_tx_list_idx + 1;
+    const rlp_item_t *uncles = rlp_get_list_item(body->_rlp, uncle_list_idx);
+    if (!uncles || rlp_get_type(uncles) != RLP_TYPE_LIST) return false;
+    if (index >= rlp_get_list_count(uncles)) return false;
+
+    const rlp_item_t *uncle_item = rlp_get_list_item(uncles, index);
+    if (!uncle_item || rlp_get_type(uncle_item) != RLP_TYPE_LIST) return false;
+
+    /* Re-encode the uncle header RLP and decode it */
+    bytes_t encoded = rlp_encode(uncle_item);
+    if (!encoded.data) return false;
+
+    bool ok = block_header_decode_rlp(hdr, encoded.data, encoded.len);
+    free(encoded.data);
+    return ok;
+}
+
 void block_body_free(block_body_t *body) {
-    if (body && body->_rlp) {
-        rlp_item_free(body->_rlp);
-        body->_rlp = NULL;
+    if (body) {
+        if (body->_rlp) {
+            rlp_item_free(body->_rlp);
+            body->_rlp = NULL;
+        }
+        free(body->withdrawals);
+        body->withdrawals = NULL;
         body->tx_count = 0;
+        body->withdrawal_count = 0;
     }
 }

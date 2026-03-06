@@ -296,11 +296,13 @@ if(CJSON_FOUND)
         add_library(integration_tests STATIC ${INTEGRATION_TEST_SOURCES})
         target_include_directories(integration_tests PUBLIC
             integration_tests/include
+            executor/include
             ${CJSON_INCLUDE_DIRS}
         )
         target_link_libraries(integration_tests PUBLIC
             evm
             evm_state
+            block_executor
             common
             ${CJSON_LIBRARIES}
         )

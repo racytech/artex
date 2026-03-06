@@ -58,6 +58,16 @@ typedef struct {
 } block_header_t;
 
 /**
+ * EIP-4895 withdrawal (Shanghai+).
+ */
+typedef struct {
+    uint64_t  index;
+    uint64_t  validator_index;
+    address_t address;
+    uint64_t  amount_gwei;  /* amount in Gwei (multiply by 1e9 for Wei) */
+} withdrawal_t;
+
+/**
  * Decoded block body — holds transaction list.
  *
  * Body RLP: [transactions_list, uncles_list, withdrawals_list?]
@@ -65,7 +75,11 @@ typedef struct {
  */
 typedef struct {
     rlp_item_t *_rlp;      /* internal: keep RLP alive for tx pointers */
+    size_t      _tx_list_idx; /* index of tx list in _rlp (0=body-only, 1=full block) */
     size_t      tx_count;
+    /* EIP-4895 withdrawals (Shanghai+) */
+    withdrawal_t *withdrawals;
+    size_t        withdrawal_count;
 } block_body_t;
 
 /**
@@ -104,6 +118,35 @@ bool block_body_decode_rlp(block_body_t *body,
  * @return RLP item, or NULL if out of range
  */
 const rlp_item_t *block_body_tx(const block_body_t *body, size_t index);
+
+/**
+ * Decode a full block RLP [header, transactions, uncles] into
+ * both a block_header_t and a block_body_t.
+ *
+ * @param data  Full block RLP bytes
+ * @param len   Length of data
+ * @param hdr   Output header struct
+ * @param body  Output body struct (call block_body_free() when done)
+ * @return true on success
+ */
+bool block_decode_full_rlp(const uint8_t *data, size_t len,
+                           block_header_t *hdr, block_body_t *body);
+
+/**
+ * Get the number of uncle headers in the block body.
+ */
+size_t block_body_uncle_count(const block_body_t *body);
+
+/**
+ * Decode the uncle header at the given index.
+ *
+ * @param body   Decoded body
+ * @param index  Uncle index (0-based)
+ * @param hdr    Output uncle header
+ * @return true on success
+ */
+bool block_body_get_uncle(const block_body_t *body, size_t index,
+                          block_header_t *hdr);
 
 /**
  * Free block body resources.
