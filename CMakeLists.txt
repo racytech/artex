@@ -13,14 +13,17 @@ set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG")
 # Include directories
 include_directories(
     ${CMAKE_SOURCE_DIR}/database/include
+    ${CMAKE_SOURCE_DIR}/state/include
     ${CMAKE_SOURCE_DIR}/common/include
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/executor/include
+    ${CMAKE_SOURCE_DIR}/net/include
     ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_SOURCE_DIR}/third_party/blst/bindings
 )
 
 #==============================================================================
-# Libraries
+# Libraries — Database
 #==============================================================================
 
 # In-Memory ART Tree (general-purpose, variable-size keys/values)
@@ -33,6 +36,28 @@ add_library(compact_art STATIC
     database/src/compact_art.c
 )
 
+# ART Store (compact_art-indexed persistent record store)
+add_library(art_store STATIC
+    database/src/art_store.c
+)
+target_link_libraries(art_store compact_art)
+
+# Disk Hash (zero-RAM disk-backed hash table, pread/pwrite)
+add_library(disk_hash STATIC
+    database/src/disk_hash.c
+)
+target_link_libraries(disk_hash pthread)
+
+# Code Store (content-addressed, append-only, deduplicated)
+add_library(code_store STATIC
+    database/src/code_store.c
+)
+target_link_libraries(code_store disk_hash pthread)
+
+#==============================================================================
+# Libraries — Common
+#==============================================================================
+
 # Common Utilities (keccak256, hash, rlp, bytes, uint256, address)
 add_library(common STATIC
     common/src/keccak256.c
@@ -44,42 +69,84 @@ add_library(common STATIC
     common/src/logger.c
 )
 
-# Data Layer (state store + code store + checkpoint + write buffer + index merge)
-add_library(data_layer STATIC
-    database/src/state_store.c
-    database/src/code_store.c
-    database/src/checkpoint.c
-    database/src/data_layer.c
-)
-target_link_libraries(data_layer compact_art art_database)
+#==============================================================================
+# Libraries — Verkle State
+#==============================================================================
 
-# State DB (account state + contract storage — dual data_layer wrapper)
-add_library(state_db STATIC
-    database/src/state_db.c
+# blst (BLS12-381 field arithmetic — pre-built static library)
+add_library(blst STATIC IMPORTED)
+set_target_properties(blst PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/third_party/blst/libblst.a
 )
-target_link_libraries(state_db data_layer)
 
-# Account Encoding (shared module — compact variable-length account serialization)
-add_library(account STATIC
-    database/src/account.c
+# Banderwagon curve arithmetic (twisted Edwards over blst_fr)
+add_library(banderwagon STATIC
+    state/src/banderwagon.c
 )
-target_link_libraries(account common)
+target_link_libraries(banderwagon blst)
 
-# EVM State (typed in-memory interface over state_db)
-add_library(evm_state STATIC
-    database/src/evm_state.c
+# Pedersen commitment (CRS + vector commitment over banderwagon)
+add_library(pedersen STATIC
+    state/src/pedersen.c
 )
-target_link_libraries(evm_state state_db account common art_database intermediate_hashes)
+target_link_libraries(pedersen banderwagon blst)
 
-# Intermediate Hashes (MPT commitment via flat hash storage)
-add_library(intermediate_hashes STATIC
-    database/src/intermediate_hashes.c
+# Verkle tree (in-memory width-256 trie with Pedersen commitments)
+add_library(verkle STATIC
+    state/src/verkle.c
 )
-target_link_libraries(intermediate_hashes compact_art common)
+target_link_libraries(verkle pedersen banderwagon)
+
+# Verkle key derivation (pedersen hash for address/storage → tree key mapping)
+add_library(verkle_key STATIC
+    state/src/verkle_key.c
+)
+target_link_libraries(verkle_key pedersen)
+
+# Verkle state (typed account/storage interface over verkle tree)
+add_library(verkle_state STATIC
+    state/src/verkle_state.c
+)
+target_link_libraries(verkle_state verkle verkle_key verkle_flat)
+
+# Verkle commitment store (art_store-backed commitment persistence)
+add_library(verkle_commit_store STATIC
+    state/src/verkle_commit_store.c
+)
+target_link_libraries(verkle_commit_store verkle banderwagon art_store)
+
+# Verkle snapshot (binary tree serialization/deserialization)
+add_library(verkle_snapshot STATIC
+    state/src/verkle_snapshot.c
+)
+target_link_libraries(verkle_snapshot verkle banderwagon)
+
+# Verkle journal (block revert + crash recovery + background checkpoint)
+add_library(verkle_journal STATIC
+    state/src/verkle_journal.c
+)
+target_link_libraries(verkle_journal verkle verkle_snapshot banderwagon)
+
+# Verkle flat updater (disk-backed commitment updates, O(block) RAM)
+add_library(verkle_flat STATIC
+    state/src/verkle_flat.c
+)
+target_link_libraries(verkle_flat verkle_commit_store art_store pedersen banderwagon)
+
+#==============================================================================
+# Libraries — EVM
+#==============================================================================
+
+# secp256k1 (ECDSA, ECDH — pre-built static library)
+add_library(secp256k1 STATIC IMPORTED)
+set_target_properties(secp256k1 PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/third_party/secp256k1/build/lib/libsecp256k1.a
+)
 
 # EVM (Ethereum Virtual Machine)
 add_library(evm STATIC
     evm/src/evm.c
+    evm/src/evm_state.c
     evm/src/evm_stack.c
     evm/src/evm_memory.c
     evm/src/gas.c
@@ -102,21 +169,115 @@ add_library(evm STATIC
     evm/vendor/mini-gmp.c
     evm/vendor/bn256.c
 )
-# blst (BLS12-381 — pre-built static library)
-add_library(blst STATIC IMPORTED)
-set_target_properties(blst PROPERTIES
-    IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/third_party/blst/libblst.a
-)
-
 target_include_directories(evm PUBLIC
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/evm/vendor
-    ${CMAKE_SOURCE_DIR}/third_party/blst/bindings
 )
-target_link_libraries(evm evm_state common ssl crypto secp256k1 blst)
+target_link_libraries(evm verkle_state art_database common ssl crypto secp256k1 blst)
 
 #==============================================================================
-# Tests
+# Libraries — Block Executor
+#==============================================================================
+
+add_library(block_executor STATIC
+    executor/src/block.c
+    executor/src/tx_decoder.c
+    executor/src/block_executor.c
+)
+target_include_directories(block_executor PUBLIC
+    ${CMAKE_SOURCE_DIR}/executor/include
+)
+target_link_libraries(block_executor evm common secp256k1)
+
+#==============================================================================
+# Libraries — Networking / Portal
+#==============================================================================
+
+# HKDF-SHA256 (RFC 5869 key derivation, uses BLST for SHA-256)
+add_library(hkdf STATIC
+    net/src/hkdf.c
+)
+target_link_libraries(hkdf blst)
+
+# AES-128 CTR + GCM (AES-NI intrinsics)
+add_library(aes STATIC
+    net/src/aes.c
+)
+target_compile_options(aes PRIVATE -maes)
+
+# secp256k1 wrapper (thin C wrapper over libsecp256k1)
+add_library(secp256k1_wrap STATIC
+    net/src/secp256k1_wrap.c
+)
+target_include_directories(secp256k1_wrap PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/secp256k1/include
+)
+target_link_libraries(secp256k1_wrap secp256k1)
+
+# SSZ — Simple Serialize (Portal Network subset)
+add_library(ssz STATIC
+    net/src/ssz.c
+)
+
+# ENR — Ethereum Node Record (EIP-778)
+add_library(enr STATIC
+    net/src/enr.c
+)
+target_link_libraries(enr common secp256k1_wrap)
+
+# Discv5 Packet Codec (wire protocol encoding/decoding)
+add_library(discv5_codec STATIC
+    net/src/discv5_codec.c
+)
+target_link_libraries(discv5_codec hkdf aes secp256k1_wrap blst)
+
+# Discv5 Session Management (handshake state + LRU cache)
+add_library(discv5_session STATIC
+    net/src/discv5_session.c
+)
+target_link_libraries(discv5_session discv5_codec secp256k1_wrap blst)
+
+# Discv5 Kademlia Routing Table (256 k-buckets, XOR distance)
+add_library(discv5_table STATIC
+    net/src/discv5_table.c
+)
+
+# Discv5 Protocol Engine (full protocol: codec + sessions + table + UDP)
+add_library(discv5 STATIC
+    net/src/discv5.c
+)
+target_link_libraries(discv5 discv5_codec discv5_session discv5_table enr common secp256k1_wrap hkdf aes blst)
+
+# uTP — micro Transport Protocol (BEP29 over Discv5 TALKREQ)
+add_library(utp STATIC
+    net/src/utp.c
+)
+
+# Portal Wire Protocol — message codec (SSZ-encoded)
+add_library(portal_wire STATIC
+    net/src/portal_wire.c
+)
+target_link_libraries(portal_wire ssz)
+
+# Portal Overlay Table — Kademlia routing with data_radius
+add_library(portal_table STATIC
+    net/src/portal_table.c
+)
+target_link_libraries(portal_table blst)
+
+# History Network — content key codec + content ID derivation
+add_library(history STATIC
+    net/src/history.c
+)
+
+# Portal Overlay Handler — generic sub-protocol integration layer
+add_library(portal STATIC
+    net/src/portal.c
+)
+target_link_libraries(portal portal_wire portal_table discv5 utp)
+
+#==============================================================================
+# Tests — Database
 #==============================================================================
 
 enable_testing()
@@ -146,6 +307,13 @@ add_executable(test_stress_compact_art
 )
 target_link_libraries(test_stress_compact_art compact_art)
 
+# Test: Compact ART Iterator Seek (lower-bound)
+add_executable(test_compact_art_seek
+    database/tests/test_compact_art_seek.c
+)
+target_link_libraries(test_compact_art_seek compact_art)
+add_test(NAME test_compact_art_seek COMMAND test_compact_art_seek)
+
 # Benchmark: compact_art vs mem_art (memory comparison)
 add_executable(bench_compact_art_index
     database/tests/bench_compact_art_index.c
@@ -158,117 +326,277 @@ add_executable(bench_per_block_merge
 )
 target_link_libraries(bench_per_block_merge compact_art art_database)
 
-# Test: Data Layer Module (library API)
-add_executable(test_data_layer
-    database/tests/test_data_layer.c
+# Benchmark: dual compact_art RSS (accounts 32B + storage 64B)
+add_executable(bench_dual_index
+    database/tests/bench_dual_index.c
 )
-target_link_libraries(test_data_layer data_layer)
+target_link_libraries(bench_dual_index compact_art)
 
-# Test: Code Store (code.dat + dedup + mixed state/code)
+# Benchmark: art_store scale (RAM + disk + throughput at mainnet scale)
+add_executable(bench_art_store_scale
+    database/tests/bench_art_store_scale.c
+)
+target_link_libraries(bench_art_store_scale art_store)
+
+# Stress Test: ART Store (correctness + persistence at scale)
+add_executable(test_stress_art_store
+    database/tests/test_stress_art_store.c
+)
+target_link_libraries(test_stress_art_store art_store)
+
+# Test: Disk Hash (zero-RAM disk-backed hash table)
+add_executable(test_disk_hash
+    database/tests/test_disk_hash.c
+)
+target_link_libraries(test_disk_hash disk_hash)
+add_test(NAME test_disk_hash COMMAND test_disk_hash)
+
+# Stress Test: Disk Hash (correctness at scale, fail-fast)
+add_executable(test_stress_disk_hash
+    database/tests/test_stress_disk_hash.c
+)
+target_link_libraries(test_stress_disk_hash disk_hash)
+
+# Crash Simulation Test: Disk Hash (fork + kill -9 + recovery)
+add_executable(test_crash_disk_hash
+    database/tests/test_crash_disk_hash.c
+)
+target_link_libraries(test_crash_disk_hash disk_hash)
+
+# Multi-Threaded Stress Test: Disk Hash (1 writer + N readers)
+add_executable(test_mt_disk_hash
+    database/tests/test_mt_disk_hash.c
+)
+target_link_libraries(test_mt_disk_hash disk_hash pthread)
+
+# Test: Code Store (content-addressed bytecode storage)
 add_executable(test_code_store
     database/tests/test_code_store.c
 )
-target_link_libraries(test_code_store data_layer)
+target_link_libraries(test_code_store code_store)
+add_test(NAME test_code_store COMMAND test_code_store)
 
-# Test: Checkpoint & Recovery (index.dat serialization + CRC)
-add_executable(test_checkpoint
-    database/tests/test_checkpoint.c
-)
-target_link_libraries(test_checkpoint data_layer)
+#==============================================================================
+# Tests — Verkle State
+#==============================================================================
 
-# PoC: Account Encoding (compact variable-length account serialization)
-add_executable(test_account_encoding
-    database/tests/test_account_encoding.c
+# Test: Banderwagon curve arithmetic (twisted Edwards + blst)
+add_executable(test_banderwagon
+    state/tests/test_banderwagon.c
 )
+target_link_libraries(test_banderwagon banderwagon)
+add_test(NAME test_banderwagon COMMAND test_banderwagon)
 
-# PoC: Data Layer Integration Test (write buffer + index + state.dat)
-add_executable(test_data_layer_poc
-    database/tests/test_data_layer_poc.c
+# Test: Pedersen commitment (CRS generation + commit/update)
+add_executable(test_pedersen
+    state/tests/test_pedersen.c
 )
-target_link_libraries(test_data_layer_poc compact_art art_database)
+target_link_libraries(test_pedersen pedersen)
+add_test(NAME test_pedersen COMMAND test_pedersen)
 
-# Test: Data Layer Integration Stress (state + code + checkpoint + recovery)
-add_executable(test_stress_data_layer
-    database/tests/test_stress_data_layer.c
+# Test: Verkle tree (in-memory trie with Pedersen commitments)
+add_executable(test_verkle
+    state/tests/test_verkle.c
 )
-target_link_libraries(test_stress_data_layer data_layer)
+target_link_libraries(test_verkle verkle)
+add_test(NAME test_verkle COMMAND test_verkle)
 
-# Scale Test: Data Layer (realistic Ethereum block simulation, long-running)
-add_executable(test_scale_data_layer
-    database/tests/test_scale_data_layer.c
+# Test: Verkle key derivation (pedersen hash → tree key mapping)
+add_executable(test_verkle_key
+    state/tests/test_verkle_key.c
 )
-target_link_libraries(test_scale_data_layer data_layer)
+target_link_libraries(test_verkle_key verkle_key)
+add_test(NAME test_verkle_key COMMAND test_verkle_key)
 
-# Benchmark: MPT commitment (state root computation at scale)
-add_executable(bench_mpt
-    database/tests/bench_mpt.c
+# Test: Verkle state (typed account/storage interface)
+add_executable(test_verkle_state
+    state/tests/test_verkle_state.c
 )
-target_link_libraries(bench_mpt data_layer intermediate_hashes common)
+target_link_libraries(test_verkle_state verkle_state)
+add_test(NAME test_verkle_state COMMAND test_verkle_state)
 
-# Test: State DB (account state + contract storage + checkpoint)
-add_executable(test_state_db
-    database/tests/test_state_db.c
+# Test: Verkle commitment store (art_store-backed persistence)
+add_executable(test_verkle_commit_store
+    state/tests/test_verkle_commit_store.c
 )
-target_link_libraries(test_state_db state_db)
-add_test(NAME test_state_db COMMAND test_state_db)
+target_link_libraries(test_verkle_commit_store verkle_commit_store verkle)
+add_test(NAME test_verkle_commit_store COMMAND test_verkle_commit_store)
 
-# Test: EVM State (typed interface over state_db)
-add_executable(test_evm_state
-    database/tests/test_evm_state.c
+# Test: Verkle snapshot (binary tree serialization/deserialization)
+add_executable(test_verkle_snapshot
+    state/tests/test_verkle_snapshot.c
 )
-target_link_libraries(test_evm_state evm_state)
-add_test(NAME test_evm_state COMMAND test_evm_state)
+target_link_libraries(test_verkle_snapshot verkle_snapshot verkle_state)
+add_test(NAME test_verkle_snapshot COMMAND test_verkle_snapshot)
 
-# Test: Intermediate Hashes (MPT commitment)
-add_executable(test_intermediate_hashes
-    database/tests/test_intermediate_hashes.c
+# Test: Verkle journal (block revert + crash recovery + checkpoint)
+add_executable(test_verkle_journal
+    state/tests/test_verkle_journal.c
 )
-target_link_libraries(test_intermediate_hashes intermediate_hashes compact_art common)
-add_test(NAME test_intermediate_hashes COMMAND test_intermediate_hashes)
+target_link_libraries(test_verkle_journal verkle_journal verkle_state)
+add_test(NAME test_verkle_journal COMMAND test_verkle_journal)
 
-# Test: Compact ART Iterator Seek (lower-bound)
-add_executable(test_compact_art_seek
-    database/tests/test_compact_art_seek.c
+# Benchmark: Verkle state scale (block simulation)
+add_executable(bench_verkle_state
+    state/tests/bench_verkle_state.c
 )
-target_link_libraries(test_compact_art_seek compact_art)
-add_test(NAME test_compact_art_seek COMMAND test_compact_art_seek)
+target_link_libraries(bench_verkle_state verkle_journal verkle_state verkle_snapshot)
 
-# Test: MPT Cross-Validation (Python HexaryTrie reference)
-add_executable(test_mpt_cross_validation
-    database/tests/test_mpt_cross_validation.c
+# Test: Verkle flat updater (disk-backed commitment updates)
+add_executable(test_verkle_flat
+    state/tests/test_verkle_flat.c
 )
-target_link_libraries(test_mpt_cross_validation intermediate_hashes compact_art common)
-add_test(NAME test_mpt_cross_validation
-    COMMAND test_mpt_cross_validation
+target_link_libraries(test_verkle_flat verkle_flat verkle)
+add_test(NAME test_verkle_flat COMMAND test_verkle_flat)
+
+# Stress Test: Verkle flat updater (cross-validated, fail-fast)
+add_executable(test_stress_verkle_flat
+    state/tests/test_stress_verkle_flat.c
+)
+target_link_libraries(test_stress_verkle_flat verkle_flat verkle verkle_commit_store)
+
+# Benchmark: Verkle flat scale (disk-backed block simulation)
+add_executable(bench_verkle_flat
+    state/tests/bench_verkle_flat.c
+)
+target_link_libraries(bench_verkle_flat verkle_state)
+
+# Test: Verkle cross-validation (go-verkle reference vectors)
+add_executable(test_verkle_cross_validation
+    state/tests/test_verkle_cross_validation.c
+)
+target_link_libraries(test_verkle_cross_validation verkle_flat verkle)
+add_test(NAME test_verkle_cross_validation
+    COMMAND test_verkle_cross_validation
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
-# Benchmark: uthash vs mem_art (cache performance comparison)
-add_executable(bench_uthash_vs_art
-    database/tests/bench_uthash_vs_art.c
-)
-target_link_libraries(bench_uthash_vs_art art_database)
-
 #==============================================================================
-# Block Executor (block header/body decode + transaction decode + execution)
+# Tests — Networking
 #==============================================================================
 
-add_library(block_executor STATIC
-    executor/src/block.c
-    executor/src/tx_decoder.c
-    executor/src/block_executor.c
+# Test: HKDF-SHA256 (RFC 5869 + Discv5 key derivation vectors)
+add_executable(test_hkdf
+    net/tests/test_hkdf.c
 )
-target_include_directories(block_executor PUBLIC
-    ${CMAKE_SOURCE_DIR}/executor/include
-)
-target_link_libraries(block_executor evm common secp256k1)
+target_link_libraries(test_hkdf hkdf)
+add_test(NAME test_hkdf COMMAND test_hkdf)
 
-# Test: Block Executor (header/body decode, tx decode, execution)
-add_executable(test_block_executor
-    executor/tests/test_block_executor.c
+# Test: AES-128 CTR + GCM (NIST + Discv5 vectors)
+add_executable(test_aes
+    net/tests/test_aes.c
 )
-target_link_libraries(test_block_executor block_executor evm evm_state state_db common)
-add_test(NAME test_block_executor COMMAND test_block_executor)
+target_link_libraries(test_aes aes)
+target_compile_options(test_aes PRIVATE -maes)
+add_test(NAME test_aes COMMAND test_aes)
+
+# Test: secp256k1 wrapper (ECDSA, ECDH, key operations)
+add_executable(test_secp256k1_wrap
+    net/tests/test_secp256k1_wrap.c
+)
+target_include_directories(test_secp256k1_wrap PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/secp256k1/include
+)
+target_link_libraries(test_secp256k1_wrap secp256k1_wrap)
+add_test(NAME test_secp256k1_wrap COMMAND test_secp256k1_wrap)
+
+# Test: SSZ (Portal Network subset)
+add_executable(test_ssz
+    net/tests/test_ssz.c
+)
+target_link_libraries(test_ssz ssz)
+add_test(NAME test_ssz COMMAND test_ssz)
+
+# Test: ENR (Ethereum Node Record — EIP-778)
+add_executable(test_enr
+    net/tests/test_enr.c
+)
+target_link_libraries(test_enr enr)
+add_test(NAME test_enr COMMAND test_enr)
+
+# Test: Discv5 Packet Codec (wire protocol test vectors)
+add_executable(test_discv5_codec
+    net/tests/test_discv5_codec.c
+)
+target_link_libraries(test_discv5_codec discv5_codec enr)
+add_test(NAME test_discv5_codec COMMAND test_discv5_codec)
+
+# Test: Discv5 Session Management (handshake state + LRU cache)
+add_executable(test_discv5_session
+    net/tests/test_discv5_session.c
+)
+target_link_libraries(test_discv5_session discv5_session)
+add_test(NAME test_discv5_session COMMAND test_discv5_session)
+
+# Test: Discv5 Kademlia Routing Table
+add_executable(test_discv5_table
+    net/tests/test_discv5_table.c
+)
+target_link_libraries(test_discv5_table discv5_table)
+add_test(NAME test_discv5_table COMMAND test_discv5_table)
+
+# Test: Discv5 Protocol Engine
+add_executable(test_discv5
+    net/tests/test_discv5.c
+)
+target_link_libraries(test_discv5 discv5)
+add_test(NAME test_discv5 COMMAND test_discv5)
+
+# Test: uTP (micro Transport Protocol — BEP29 test vectors + loopback)
+add_executable(test_utp
+    net/tests/test_utp.c
+)
+target_link_libraries(test_utp utp)
+add_test(NAME test_utp COMMAND test_utp)
+
+# Test: Portal Wire Protocol (message codec test vectors)
+add_executable(test_portal_wire
+    net/tests/test_portal_wire.c
+)
+target_link_libraries(test_portal_wire portal_wire ssz)
+add_test(NAME test_portal_wire COMMAND test_portal_wire)
+
+# Test: Portal Overlay Table (Kademlia + radius filtering)
+add_executable(test_portal_table
+    net/tests/test_portal_table.c
+)
+target_link_libraries(test_portal_table portal_table blst)
+add_test(NAME test_portal_table COMMAND test_portal_table)
+
+# Test: History Network (content key codec + content ID derivation)
+add_executable(test_history
+    net/tests/test_history.c
+)
+target_link_libraries(test_history history)
+add_test(NAME test_history COMMAND test_history)
+
+# Test: Portal Overlay Handler (sub-protocol integration)
+add_executable(test_portal
+    net/tests/test_portal.c
+)
+target_link_libraries(test_portal portal history)
+add_test(NAME test_portal COMMAND test_portal)
+
+# Test: Roundtrip (encode→decode→verify for all codecs, random inputs)
+add_executable(test_roundtrip
+    net/tests/test_roundtrip.c
+)
+target_link_libraries(test_roundtrip common portal_wire ssz discv5 utp history)
+add_test(NAME test_roundtrip COMMAND test_roundtrip)
+
+# Test: uTP Stress (concurrent connections, packet loss, large transfers)
+add_executable(test_utp_stress
+    net/tests/test_utp_stress.c
+)
+target_link_libraries(test_utp_stress utp)
+add_test(NAME test_utp_stress COMMAND test_utp_stress)
+
+# Test: Loopback Integration (full stack — Discv5 + Portal via real UDP on localhost)
+add_executable(test_loopback
+    net/tests/test_loopback.c
+)
+target_link_libraries(test_loopback portal discv5 portal_wire ssz history)
+add_test(NAME test_loopback COMMAND test_loopback)
 
 #==============================================================================
 # Integration Tests (Ethereum test vectors — cJSON required)
@@ -301,8 +629,8 @@ if(CJSON_FOUND)
         )
         target_link_libraries(integration_tests PUBLIC
             evm
-            evm_state
             block_executor
+            verkle_state
             common
             ${CJSON_LIBRARIES}
         )
@@ -329,7 +657,7 @@ endif()
 
 message(STATUS "")
 message(STATUS "========================================")
-message(STATUS "ART Database Configuration")
+message(STATUS "ART Configuration")
 message(STATUS "========================================")
 message(STATUS "Build type:        ${CMAKE_BUILD_TYPE}")
 message(STATUS "C Compiler:        ${CMAKE_C_COMPILER}")
@@ -338,11 +666,12 @@ message(STATUS "")
 message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
 message(STATUS "  - compact_art (space-efficient index ART)")
-message(STATUS "  - common (keccak256, hash, rlp, bytes)")
-message(STATUS "  - data_layer (state store + code store + write buffer + merge)")
-message(STATUS "  - state_db (account state + contract storage wrapper)")
-message(STATUS "  - account (compact variable-length account encoding)")
-message(STATUS "  - evm_state (typed in-memory EVM state interface)")
-message(STATUS "  - intermediate_hashes (MPT commitment via flat hash storage)")
+message(STATUS "  - art_store (ART-indexed persistent record store)")
+message(STATUS "  - disk_hash (zero-RAM disk-backed hash table)")
+message(STATUS "  - code_store (content-addressed bytecode storage)")
+message(STATUS "  - verkle (verkle tree with Pedersen commitments)")
+message(STATUS "  - evm (Ethereum Virtual Machine)")
+message(STATUS "  - block_executor (block decode + execution)")
+message(STATUS "  - portal (Portal Network stack)")
 message(STATUS "========================================")
 message(STATUS "")

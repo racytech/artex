@@ -504,15 +504,48 @@ char* uint256_to_hex(const uint256_t* a) {
 
 void uint256_to_bytes(const uint256_t* a, uint8_t* bytes) {
     if (!a || !bytes) return;
-    
+
     uint64_t words[4];
     uint256_to_words(a, words);
-    
+
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 8; j++) {
             bytes[31 - (i * 8 + j)] = (words[i] >> (j * 8)) & 0xFF;
         }
     }
+}
+
+void uint256_to_bytes_le(const uint256_t* a, uint8_t* bytes) {
+    if (!a || !bytes) return;
+
+    uint64_t words[4];
+    uint256_to_words(a, words);
+
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 8; j++) {
+            bytes[i * 8 + j] = (words[i] >> (j * 8)) & 0xFF;
+        }
+    }
+}
+
+uint256_t uint256_from_bytes_le(const uint8_t* bytes, size_t len) {
+    uint256_t result = {UINT128_ZERO, UINT128_ZERO};
+
+    if (!bytes || len == 0) return result;
+    if (len > 32) len = 32;
+
+    uint64_t words[4] = {0, 0, 0, 0};
+
+    for (size_t i = 0; i < len; i++) {
+        size_t word_idx = i / 8;
+        size_t byte_pos = i % 8;
+
+        if (word_idx < 4) {
+            words[word_idx] |= ((uint64_t)bytes[i] << (byte_pos * 8));
+        }
+    }
+
+    return uint256_from_words(words);
 }
 
 void uint256_to_words(const uint256_t* a, uint64_t words[4]) {

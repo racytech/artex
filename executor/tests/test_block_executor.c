@@ -17,7 +17,7 @@
 #include "uint256.h"
 #include "evm.h"
 #include "evm_state.h"
-#include "state_db.h"
+#include "verkle_state.h"
 #include "fork.h"
 #include <stdio.h>
 #include <string.h>
@@ -263,12 +263,12 @@ static void test_executor_smoke(void) {
      * Sender: 0x9d8A62f656a8d1615C1294fd71e9CFb3E4855A4F
      */
 
-    /* Create state DB in /tmp */
-    state_db_t *sdb = sdb_create("/tmp/art_block_executor_test");
-    ASSERT(sdb != NULL, "create state_db");
+    /* Create verkle state (in-memory tree) */
+    verkle_state_t *vs = verkle_state_create();
+    ASSERT(vs != NULL, "create verkle_state");
 
     /* Create EVM state */
-    evm_state_t *state = evm_state_create(sdb);
+    evm_state_t *state = evm_state_create(vs);
     ASSERT(state != NULL, "create evm_state");
 
     /* Create EVM */
@@ -348,10 +348,7 @@ static void test_executor_smoke(void) {
     rlp_item_free(body_rlp);
     evm_destroy(evm);
     evm_state_destroy(state);
-    sdb_destroy(sdb);
-
-    /* Clean up temp dir */
-    system("rm -rf /tmp/art_block_executor_test");
+    verkle_state_destroy(vs);
 
     PASS();
 }

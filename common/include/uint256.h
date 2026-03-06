@@ -76,6 +76,8 @@ uint256_t uint256_make(uint128_t high, uint128_t low);
 uint64_t uint256_to_uint64(const uint256_t* a);
 char* uint256_to_hex(const uint256_t* a);
 void uint256_to_bytes(const uint256_t* a, uint8_t* bytes);
+void uint256_to_bytes_le(const uint256_t* a, uint8_t* bytes);
+uint256_t uint256_from_bytes_le(const uint8_t* bytes, size_t len);
 void uint256_to_words(const uint256_t* a, uint64_t words[4]);
 uint256_t uint256_from_words(const uint64_t words[4]);
 
