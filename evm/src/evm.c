@@ -9,6 +9,7 @@
 #include "fork.h"
 #include "evm_stack.h"
 #include "evm_memory.h"
+#include "verkle_key.h"
 #include "logger.h"
 #include <stdlib.h>
 #include <string.h>
@@ -577,6 +578,29 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
 
     if (msg->depth > 0)
     {
+        // EIP-4762 (Verkle): When calling a non-existent, non-precompile account,
+        // charge witness gas for the code_hash leaf (proof of absence).
+        // The basic_data write has already been charged in prepare_call().
+        if (evm->fork >= FORK_VERKLE &&
+            (msg->kind == EVM_CALL || msg->kind == EVM_CALLCODE) &&
+            !is_precompile(&msg->recipient, evm->fork) &&
+            !evm_state_exists(evm->state, &msg->recipient))
+        {
+            uint8_t vk[32];
+            verkle_account_code_hash_key(vk, msg->recipient.bytes);
+            uint64_t wgas = evm_state_witness_gas_access(evm->state, vk, true, false);
+            if (wgas > 0 && !evm_use_gas(evm, wgas)) {
+                evm_state_revert(evm->state, subcall_snapshot);
+                evm_stack_destroy(evm->stack);
+                evm_memory_destroy(evm->memory);
+                evm_restore_context(evm, &saved_context);
+                if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+                evm->return_data_size = 0;
+                *result = evm_result_error(EVM_OUT_OF_GAS, 0);
+                return true;
+            }
+        }
+
         // Touch recipient for CALL/STATICCALL — ensures the account exists in the
         // state trie. On pre-EIP-161 (Frontier/Homestead) touched empty accounts
         // appear in the state root. On EIP-161+ they are pruned at root computation.
@@ -693,6 +717,9 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
             // No code at address - simple value transfer
             LOG_EVM_DEBUG("No code at address, simple value transfer");
 
+            // Save subcall's remaining gas before restoring parent context
+            uint64_t subcall_gas_remaining = evm->gas_left;
+
             // Cleanup and restore context if subcall
             if (is_subcall)
             {
@@ -704,7 +731,7 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
                 evm->return_data_size = 0;
             }
 
-            *result = evm_result_success(msg->gas, NULL, 0);
+            *result = evm_result_success(subcall_gas_remaining, NULL, 0);
             return true;
         }
     }

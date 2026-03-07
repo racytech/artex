@@ -147,6 +147,7 @@ set_target_properties(secp256k1 PROPERTIES
 add_library(evm STATIC
     evm/src/evm.c
     evm/src/evm_state.c
+    evm/src/witness_gas.c
     evm/src/evm_stack.c
     evm/src/evm_memory.c
     evm/src/gas.c

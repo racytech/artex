@@ -96,6 +96,7 @@ struct evm_state {
     mem_art_t         warm_addrs;   // key: addr[20], value: (none, 0 bytes)
     mem_art_t         warm_slots;   // key: skey[52], value: (none, 0 bytes)
     mem_art_t         transient;    // key: skey[52], value: uint256_t (EIP-1153)
+    witness_gas_t     witness_gas;  // EIP-4762 verkle witness gas tracker
 };
 
 // ============================================================================
@@ -235,6 +236,8 @@ evm_state_t *evm_state_create(verkle_state_t *vs) {
         return NULL;
     }
 
+    witness_gas_init(&es->witness_gas);
+
     return es;
 }
 
@@ -260,6 +263,7 @@ void evm_state_destroy(evm_state_t *es) {
     mem_art_destroy(&es->warm_addrs);
     mem_art_destroy(&es->warm_slots);
     mem_art_destroy(&es->transient);
+    witness_gas_destroy(&es->witness_gas);
 
     // Free any code pointers still owned by journal entries (not reverted)
     for (uint32_t i = 0; i < es->journal_len; i++) {
@@ -724,8 +728,11 @@ static bool commit_account_cb(const uint8_t *key, size_t key_len,
                                void *user_data) {
     (void)key; (void)key_len; (void)value_len; (void)user_data;
     cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
-    // Only promote to "existed" if the account was genuinely present
-    if (ca->existed || ca->created || ca->dirty || ca->code_dirty) {
+    // EIP-161: Only promote to "existed" if the account is non-empty.
+    bool is_empty = (ca->nonce == 0 &&
+                     uint256_is_zero(&ca->balance) &&
+                     !ca->has_code);
+    if ((ca->existed || ca->created || ca->dirty || ca->code_dirty) && !is_empty) {
         ca->existed = true;
     }
     ca->created = false;
@@ -776,7 +783,13 @@ static bool commit_tx_account_cb(const uint8_t *key, size_t key_len,
         return true;
     }
 
-    if (ca->existed || ca->created || ca->dirty || ca->code_dirty) {
+    // EIP-161: Only promote to "existed" if the account is non-empty.
+    // Empty accounts touched by zero-value transfers must NOT be
+    // persisted in the state tree (they are pruned).
+    bool is_empty = (ca->nonce == 0 &&
+                     uint256_is_zero(&ca->balance) &&
+                     !ca->has_code);
+    if ((ca->existed || ca->created || ca->dirty || ca->code_dirty) && !is_empty) {
         ca->existed = true;
     }
     ca->created = false;
@@ -824,6 +837,13 @@ void evm_state_commit_tx(evm_state_t *es) {
 
     mem_art_destroy(&es->transient);
     mem_art_init(&es->transient);
+
+    witness_gas_reset(&es->witness_gas);
+}
+
+void evm_state_begin_block(evm_state_t *es) {
+    if (!es) return;
+    witness_gas_reset(&es->witness_gas);
 }
 
 // ============================================================================
@@ -1162,6 +1182,15 @@ static bool flush_all_storage_cb(const uint8_t *key, size_t key_len,
     uint8_t val_be[32];
     uint256_to_bytes(&cs->current, val_be);
 
+    // Skip if value matches what's already in the verkle tree.
+    // This avoids inserting zero-value leaves for read-only cached slots
+    // (e.g., SLOAD of non-existent storage) while still flushing genuine
+    // modifications whose dirty flags were cleared by commit/commit_tx.
+    uint8_t stored_be[32];
+    verkle_state_get_storage(ctx->es->vs, addr, slot_le, stored_be);
+    if (memcmp(val_be, stored_be, 32) == 0)
+        return true;
+
     verkle_state_set_storage(ctx->es->vs, addr, slot_le, val_be);
     return true;
 }
@@ -1179,4 +1208,17 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     hash_t root;
     verkle_state_root_hash(es->vs, root.bytes);
     return root;
+}
+
+// ============================================================================
+// Witness Gas (EIP-4762)
+// ============================================================================
+
+uint64_t evm_state_witness_gas_access(evm_state_t *es,
+                                       const uint8_t key[32],
+                                       bool is_write,
+                                       bool value_was_empty)
+{
+    if (!es) return 0;
+    return witness_gas_access_event(&es->witness_gas, key, is_write, value_was_empty);
 }

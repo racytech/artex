@@ -9,6 +9,7 @@
 #include "evm_stack.h"
 #include "evm_memory.h"
 #include "gas.h"
+#include "verkle_key.h"
 #include "logger.h"
 #include "uint256.h"
 #include "address.h"
@@ -149,6 +150,51 @@ static evm_status_t execute_create(evm_t *evm,
     // Increment sender nonce BEFORE snapshot — persists even if CREATE fails
     evm_state_set_nonce(evm->state, &evm->msg.recipient, sender_nonce + 1);
 
+    //==========================================================================
+    // Gas Forwarding (moved before witness gas, matching go-ethereum)
+    //==========================================================================
+    // In go-ethereum, gas forwarding (63/64 rule) happens in the opcode handler
+    // BEFORE evm.create() charges PreCheckGas/InitGas. This affects the 1/64
+    // retained by the parent, so we must do it in the same order.
+
+    uint64_t gas_forwarded;
+    if (evm->fork >= FORK_TANGERINE_WHISTLE)
+    {
+        gas_forwarded = gas_max_call_gas(evm->gas_left);
+    }
+    else
+    {
+        gas_forwarded = evm->gas_left;
+    }
+    evm->gas_left -= gas_forwarded;
+
+    // Helper macro: fail CREATE, consume all forwarded gas, push 0
+#define CREATE_FAIL_PUSH_ZERO() do { \
+    if (init_code) free(init_code); \
+    if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; } \
+    evm->return_data_size = 0; \
+    uint256_t zero = UINT256_ZERO; \
+    if (!evm_stack_push(evm->stack, &zero)) \
+        return EVM_STACK_OVERFLOW; \
+    return EVM_SUCCESS; \
+} while(0)
+
+    // EIP-4762 (Verkle): ContractCreatePreCheckGas — read basic_data + code_hash
+    // Charged from forwarded gas (not parent's gas_left).
+    if (evm->fork >= FORK_VERKLE) {
+        uint8_t vk1[32], vk2[32];
+        verkle_account_basic_data_key(vk1, contract_addr->bytes);
+        verkle_account_code_hash_key(vk2, contract_addr->bytes);
+        uint64_t g1 = evm_state_witness_gas_access(evm->state, vk1, false, false);
+        uint64_t g2 = evm_state_witness_gas_access(evm->state, vk2, false, false);
+        uint64_t precheck = g1 + g2;
+        if (precheck > gas_forwarded) {
+            // OOG: consume all forwarded gas, parent retains its 1/64
+            CREATE_FAIL_PUSH_ZERO();
+        }
+        gas_forwarded -= precheck;
+    }
+
     // EIP-2929 (Berlin+): mark contract address as warm BEFORE collision check.
     // Per EIP-2929, the target address is added to accessed_addresses regardless
     // of whether CREATE/CREATE2 succeeds or fails due to collision.
@@ -173,29 +219,38 @@ static evm_status_t execute_create(evm_t *evm,
     if (collision)
     {
         LOG_EVM_DEBUG("CREATE: Address collision detected");
-        if (init_code) free(init_code);
-        // Consume forwarded gas (collision consumes all gas that would be forwarded)
-        if (evm->fork >= FORK_TANGERINE_WHISTLE)
-        {
-            uint64_t gas_forwarded = gas_max_call_gas(evm->gas_left);
-            evm->gas_left -= gas_forwarded;
-        }
-        else
-        {
-            evm->gas_left = 0;
-        }
-        // CREATE produces empty return data
-        if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
-        evm->return_data_size = 0;
-        uint256_t zero = UINT256_ZERO;
-        if (!evm_stack_push(evm->stack, &zero))
-            return EVM_STACK_OVERFLOW;
-        return EVM_SUCCESS;
+        // Consume all forwarded gas (collision consumes all gas)
+        CREATE_FAIL_PUSH_ZERO();
     }
 
     // Take snapshot AFTER nonce increment but BEFORE account creation/value transfer
     // Revert undoes contract creation and value transfer but preserves sender nonce
     uint32_t snapshot = evm_state_snapshot(evm->state);
+
+    // EIP-4762 (Verkle): ContractCreateInitGas — write basic_data + code_hash
+    // Charged from forwarded gas.
+    if (evm->fork >= FORK_VERKLE) {
+        uint8_t vk1[32], vk2[32];
+        verkle_account_basic_data_key(vk1, contract_addr->bytes);
+        verkle_account_code_hash_key(vk2, contract_addr->bytes);
+        uint64_t g1 = evm_state_witness_gas_access(evm->state, vk1, true, false);
+        uint64_t g2 = evm_state_witness_gas_access(evm->state, vk2, true, false);
+        uint64_t init_gas = g1 + g2;
+        if (init_gas > gas_forwarded) {
+            // OOG: consume all forwarded gas, revert, push 0
+            if (init_code) free(init_code);
+            evm_state_revert(evm->state, snapshot);
+            if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+            evm->return_data_size = 0;
+            uint256_t zero = UINT256_ZERO;
+            if (!evm_stack_push(evm->stack, &zero))
+                return EVM_STACK_OVERFLOW;
+            return EVM_SUCCESS;
+        }
+        gas_forwarded -= init_gas;
+    }
+
+#undef CREATE_FAIL_PUSH_ZERO
 
     //==========================================================================
     // Contract Account Initialization
@@ -228,18 +283,6 @@ static evm_status_t execute_create(evm_t *evm,
 
     if (init_code_size > 0)
     {
-        // Gas Forwarding: EIP-150 (Tangerine Whistle+) uses 63/64 rule
-        // Pre-TW: all remaining gas is forwarded to init code
-        uint64_t gas_forwarded;
-        if (evm->fork >= FORK_TANGERINE_WHISTLE)
-        {
-            gas_forwarded = gas_max_call_gas(evm->gas_left);
-        }
-        else
-        {
-            gas_forwarded = evm->gas_left;
-        }
-        evm->gas_left -= gas_forwarded;
 
         evm_message_t init_msg = {
             .kind = msg_kind,
@@ -276,6 +319,35 @@ static evm_status_t execute_create(evm_t *evm,
                      init_result.output_data[0] == 0xEF)
             {
                 success = false;
+            }
+            else if (evm->fork >= FORK_VERKLE)
+            {
+                // EIP-4762: per-chunk witness gas replaces 200/byte deployment.
+                // Charge per chunk; stop on OOG (consume only partial gas).
+                uint32_t num_chunks = ((uint32_t)init_result.output_size + 30) / 31;
+                uint64_t total_wgas = 0;
+                bool deploy_oog = false;
+                for (uint32_t c = 0; c < num_chunks; c++) {
+                    uint8_t ck[32];
+                    verkle_code_chunk_key(ck, contract_addr->bytes, c);
+                    uint64_t chunk_gas = evm_state_witness_gas_access(
+                        evm->state, ck, true, false);
+                    if (init_result.gas_left - total_wgas < chunk_gas) {
+                        // OOG: consume available gas for this chunk, stop
+                        total_wgas = init_result.gas_left;
+                        deploy_oog = true;
+                        break;
+                    }
+                    total_wgas += chunk_gas;
+                }
+                init_result.gas_left -= total_wgas;
+                if (!deploy_oog) {
+                    evm_state_set_code(evm->state, contract_addr,
+                                       init_result.output_data,
+                                       (uint32_t)init_result.output_size);
+                } else {
+                    success = false;
+                }
             }
             else
             {
@@ -411,7 +483,8 @@ evm_status_t op_create(evm_t *evm)
         return EVM_OUT_OF_GAS;
     }
 
-    uint64_t base_cost = 32000;
+    // EIP-4762: CREATE base gas reduced from 32000 to 1000 in Verkle
+    uint64_t base_cost = (evm->fork >= FORK_VERKLE) ? 1000 : 32000;
     uint64_t mem_expansion_cost = 0;
 
     if (size_u64 > 0) {
@@ -520,8 +593,8 @@ evm_status_t op_create2(evm_t *evm)
     // Gas Calculation
     //==========================================================================
 
-    // Base cost: 32000 gas
-    uint64_t base_cost = 32000;
+    // EIP-4762: CREATE2 base gas reduced from 32000 to 1000 in Verkle
+    uint64_t base_cost = (evm->fork >= FORK_VERKLE) ? 1000 : 32000;
 
     // Memory expansion cost
     uint64_t mem_expansion_cost = 0;

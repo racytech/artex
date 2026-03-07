@@ -189,9 +189,9 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
         // Execute block (pass block hashes for BLOCKHASH opcode)
         block_result_t block_result = block_execute(runner->evm, &hdr, &body, block_hashes);
 
-        if (runner->config.verbose) {
-            printf("    gas_used=%lu, tx_count=%zu, success=%d\n",
-                   block_result.gas_used, block_result.tx_count,
+        {
+            printf("    gas_used=%lu (expected=%lu), tx_count=%zu, success=%d\n",
+                   block_result.gas_used, hdr.gas_used, block_result.tx_count,
                    block_result.success);
         }
 

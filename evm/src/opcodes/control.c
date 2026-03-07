@@ -8,6 +8,8 @@
 #include "evm_memory.h"
 #include "uint256.h"
 #include "gas.h"
+#include "precompile.h"
+#include "verkle_key.h"
 #include "logger.h"
 #include <string.h>
 #include <stdlib.h>
@@ -482,7 +484,57 @@ evm_status_t op_selfdestruct(evm_t *evm)
     // Calculate gas cost - fork-dependent
     uint64_t gas_cost = 0;
 
-    if (evm->fork >= FORK_TANGERINE_WHISTLE)
+    if (evm->fork >= FORK_VERKLE)
+    {
+        // EIP-4762: base cost (5000) + witness gas for self-destruct
+        // constantGas = SelfdestructGasEIP150 = 5000
+        gas_cost = 5000;
+        bool balance_is_zero = uint256_is_zero(&balance);
+        bool same_addr = (memcmp(evm->msg.recipient.bytes, beneficiary_addr.bytes, 20) == 0);
+
+        // Read access for contract basic_data (always)
+        uint8_t vk[32];
+        verkle_account_basic_data_key(vk, evm->msg.recipient.bytes);
+        gas_cost += evm_state_witness_gas_access(evm->state, vk, false, false);
+
+        // If beneficiary is precompile/systemContract AND balance is zero, skip
+        static const uint8_t SYSTEM_ADDR[20] = {
+            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xfe
+        };
+        bool ben_is_precompile = is_precompile(&beneficiary_addr, evm->fork);
+        bool ben_is_system = (memcmp(beneficiary_addr.bytes, SYSTEM_ADDR, 20) == 0);
+        if ((ben_is_precompile || ben_is_system) && balance_is_zero) {
+            // Only contract read access charged
+        } else {
+            // Read beneficiary basic_data (even when balance=0)
+            if (!same_addr) {
+                uint8_t vk_ben[32];
+                verkle_account_basic_data_key(vk_ben, beneficiary_addr.bytes);
+                gas_cost += evm_state_witness_gas_access(evm->state, vk_ben, false, false);
+            }
+
+            // Write access if transferring balance
+            if (!balance_is_zero) {
+                gas_cost += evm_state_witness_gas_access(evm->state, vk, true, false);
+                if (!same_addr) {
+                    if (evm_state_exists(evm->state, &beneficiary_addr)) {
+                        uint8_t vk_ben[32];
+                        verkle_account_basic_data_key(vk_ben, beneficiary_addr.bytes);
+                        gas_cost += evm_state_witness_gas_access(evm->state, vk_ben, true, false);
+                    } else {
+                        // AddAccount: basic_data + code_hash write
+                        uint8_t vk_bd[32], vk_ch[32];
+                        verkle_account_basic_data_key(vk_bd, beneficiary_addr.bytes);
+                        verkle_account_code_hash_key(vk_ch, beneficiary_addr.bytes);
+                        gas_cost += evm_state_witness_gas_access(evm->state, vk_bd, true, false);
+                        gas_cost += evm_state_witness_gas_access(evm->state, vk_ch, true, false);
+                    }
+                }
+            }
+        }
+    }
+    else if (evm->fork >= FORK_TANGERINE_WHISTLE)
     {
         gas_cost = 5000;  // EIP-150 base cost
 

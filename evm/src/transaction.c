@@ -5,6 +5,7 @@
 #include "transaction.h"
 #include "evm.h"
 #include "opcodes/create.h"
+#include "verkle_key.h"
 #include "logger.h"
 #include <stdlib.h>
 #include <string.h>
@@ -59,7 +60,8 @@ static uint64_t calculate_intrinsic_gas(const transaction_t *tx, evm_fork_t fork
     }
 
     // Add cost for access list (EIP-2930)
-    if (tx->access_list && tx->access_list_count > 0) {
+    // Verkle (EIP-4762): access list gas costs are superseded by witness gas
+    if (fork < FORK_VERKLE && tx->access_list && tx->access_list_count > 0) {
         for (size_t i = 0; i < tx->access_list_count; i++) {
             gas += G_ACCESS_LIST_ADDRESS;
             gas += tx->access_list[i].storage_keys_count * G_ACCESS_LIST_STORAGE_KEY;
@@ -81,7 +83,9 @@ static uint64_t calculate_intrinsic_gas(const transaction_t *tx, evm_fork_t fork
  * tokens = zero_bytes * 1 + non_zero_bytes * 4
  */
 static uint64_t calculate_floor_data_gas(const transaction_t *tx, evm_fork_t fork) {
-    if (fork < FORK_PRAGUE) return 0;
+    /* EIP-7623 applies to Prague only.
+     * Verkle test config (ethereum/tests) does not activate Prague/Cancun. */
+    if (fork < FORK_PRAGUE || fork >= FORK_VERKLE) return 0;
 
     const uint64_t FLOOR_CALLDATA_COST = 10;
     const uint64_t TX_BASE_COST = 21000;
@@ -603,6 +607,29 @@ bool transaction_execute(
         }
     }
 
+    // EIP-4762 (Verkle): transaction-level access events (free, no gas charged).
+    // Marks stems/leaves as accessed so subsequent witness gas lookups are warm.
+    if (evm->fork >= FORK_VERKLE) {
+        uint8_t vk[32];
+        // AddTxOrigin: sender basic_data (write — nonce/balance change) + code_hash (read)
+        verkle_account_basic_data_key(vk, tx->sender.bytes);
+        evm_state_witness_gas_access(state, vk, true, false);
+        verkle_account_code_hash_key(vk, tx->sender.bytes);
+        evm_state_witness_gas_access(state, vk, false, false);
+
+        if (!tx->is_create) {
+            // AddTxDestination(addr, sendsValue, doesntExist)
+            bool sends_value = !uint256_is_zero(&tx->value);
+            bool doesnt_exist = !evm_state_exists(state, &tx->to);
+            verkle_account_basic_data_key(vk, tx->to.bytes);
+            evm_state_witness_gas_access(state, vk, sends_value, false);
+            verkle_account_code_hash_key(vk, tx->to.bytes);
+            evm_state_witness_gas_access(state, vk, doesnt_exist, false);
+        }
+        // CREATE: contract address is NOT pre-warmed here.
+        // ContractCreateInitGas charges it from execution gas below.
+    }
+
     // Snapshot AFTER nonce increment and gas deduction, but BEFORE value transfer
     // and contract creation. Per Ethereum spec, on EVM error/revert we revert
     // value transfer and execution state, but keep nonce increment and gas deduction.
@@ -682,6 +709,36 @@ bool transaction_execute(
     // Gas available for EVM execution
     uint64_t gas_for_execution = tx->gas_limit - intrinsic_gas;
 
+    // EIP-4762: ContractCreateInitGas — charge witness gas for contract address
+    // from execution gas BEFORE running initcode (matches go-ethereum evm.create).
+    // Tracked separately and added to gas_used in result.
+    uint64_t contract_init_gas = 0;
+    if (tx->is_create && evm->fork >= FORK_VERKLE) {
+        uint8_t vk[32];
+        verkle_account_basic_data_key(vk, contract_address.bytes);
+        uint64_t g1 = evm_state_witness_gas_access(state, vk, true, false);
+        if (g1 > gas_for_execution) {
+            evm_state_revert(state, exec_snapshot);
+            result->status = EVM_OUT_OF_GAS;
+            result->gas_used = tx->gas_limit;
+            result->gas_refund = 0;
+            goto post_execution;
+        }
+        gas_for_execution -= g1;
+        contract_init_gas += g1;
+        verkle_account_code_hash_key(vk, contract_address.bytes);
+        uint64_t g2 = evm_state_witness_gas_access(state, vk, true, false);
+        if (g2 > gas_for_execution) {
+            evm_state_revert(state, exec_snapshot);
+            result->status = EVM_OUT_OF_GAS;
+            result->gas_used = tx->gas_limit;
+            result->gas_refund = 0;
+            goto post_execution;
+        }
+        gas_for_execution -= g2;
+        contract_init_gas += g2;
+    }
+
     // Create EVM message
     address_t recipient = tx->is_create ? contract_address : tx->to;
     address_t code_addr = tx->is_create ? contract_address : tx->to;
@@ -719,11 +776,11 @@ bool transaction_execute(
     } else if (evm_result.status == EVM_REVERT) {
         // REVERT opcode: revert state changes but refund unused gas
         evm_state_revert(state, exec_snapshot);
-        result->gas_used = intrinsic_gas + (gas_for_execution - evm_result.gas_left);
+        result->gas_used = intrinsic_gas + contract_init_gas + (gas_for_execution - evm_result.gas_left);
         result->gas_refund = 0;
     } else {
         // SUCCESS: keep state changes, normal gas accounting
-        result->gas_used = intrinsic_gas + (gas_for_execution - evm_result.gas_left);
+        result->gas_used = intrinsic_gas + contract_init_gas + (gas_for_execution - evm_result.gas_left);
         result->gas_refund = evm_result.gas_refund;
 
         // Handle contract creation on success
@@ -747,12 +804,43 @@ bool transaction_execute(
                     result->gas_refund = 0;
                     result->contract_created = false;
                 }
+                else if (evm->fork >= FORK_VERKLE) {
+                    // EIP-4762: per-chunk witness gas replaces 200/byte deployment.
+                    uint32_t num_chunks = ((uint32_t)evm_result.output_size + 30) / 31;
+                    uint64_t total_wgas = 0;
+                    bool deploy_oog = false;
+                    for (uint32_t c = 0; c < num_chunks; c++) {
+                        uint8_t ck[32];
+                        verkle_code_chunk_key(ck, contract_address.bytes, c);
+                        uint64_t chunk_gas = evm_state_witness_gas_access(
+                            state, ck, true, false);
+                        if (evm_result.gas_left - total_wgas < chunk_gas) {
+                            total_wgas = evm_result.gas_left;
+                            deploy_oog = true;
+                            break;
+                        }
+                        total_wgas += chunk_gas;
+                    }
+                    result->gas_used += total_wgas;
+                    if (!deploy_oog) {
+                        evm_state_set_code(state, &contract_address,
+                                          evm_result.output_data,
+                                          (uint32_t)evm_result.output_size);
+                        result->contract_address = contract_address;
+                        result->contract_created = true;
+                    } else {
+                        evm_state_revert(state, exec_snapshot);
+                        result->status = EVM_OUT_OF_GAS;
+                        result->gas_used = tx->gas_limit;
+                        result->gas_refund = 0;
+                        result->contract_created = false;
+                    }
+                }
                 else {
-                    // Charge deployment gas (200 gas per byte)
+                    // Pre-Verkle: charge 200 gas per byte
                     const uint64_t G_CODE_DEPOSIT = 200;
                     uint64_t deployment_gas = evm_result.output_size * G_CODE_DEPOSIT;
 
-                    // Check if enough gas left for deployment
                     if (evm_result.gas_left < deployment_gas) {
                         LOG_EVM_DEBUG("Insufficient gas for code deployment");
                         evm_state_revert(state, exec_snapshot);
@@ -761,14 +849,10 @@ bool transaction_execute(
                         result->gas_refund = 0;
                         result->contract_created = false;
                     } else {
-                        // Deduct deployment gas
                         result->gas_used += deployment_gas;
-
-                        // Store contract code
                         evm_state_set_code(state, &contract_address,
                                           evm_result.output_data,
                                           (uint32_t)evm_result.output_size);
-
                         result->contract_address = contract_address;
                         result->contract_created = true;
                     }
@@ -796,7 +880,17 @@ bool transaction_execute(
     // Post-execution: Gas refunds and coinbase payment
     //==========================================================================
 post_execution:
-// Calculate actual gas cost
+    // EIP-4762 (Verkle): coinbase access event for witness proof (no gas charged to user).
+    // The coinbase balance update is a protocol-level operation.
+    if (evm->fork >= FORK_VERKLE && !env->skip_coinbase_payment) {
+        uint8_t vk[32];
+        verkle_account_basic_data_key(vk, env->coinbase.bytes);
+        // Record access event in witness tracker but don't charge gas
+        evm_state_witness_gas_access(state, vk, true,
+                                      evm_state_is_empty(state, &env->coinbase));
+    }
+
+    // Calculate actual gas cost
     uint64_t gas_used = result->gas_used;
     // Clamp refund to 0 (per-frame refunds can go negative, but net transaction refund >= 0)
     int64_t net_refund = result->gas_refund + (int64_t)auth_gas_refund;

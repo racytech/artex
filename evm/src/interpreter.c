@@ -18,6 +18,8 @@
 #include "opcodes/logging.h"
 #include "opcodes/call.h"
 #include "opcodes/create.h"
+#include "verkle_key.h"
+#include "evm_state.h"
 #include "logger.h"
 #include <stdlib.h>
 #include <string.h>
@@ -26,14 +28,23 @@
 // Dispatch Table - Maps opcodes to label addresses
 //==============================================================================
 
-#define DISPATCH()                                  \
-    do                                              \
-    {                                               \
-        if (evm->pc >= evm->code_size)              \
-        {                                           \
-            goto done;                              \
-        }                                           \
-        goto *dispatch_table[evm->code[evm->pc]];  \
+#define DISPATCH()                                                  \
+    do                                                              \
+    {                                                               \
+        if (evm->pc >= evm->code_size)                              \
+        {                                                           \
+            goto done;                                              \
+        }                                                           \
+        if (verkle_chunk_mode) {                                    \
+            uint8_t ck[32];                                         \
+            verkle_code_chunk_key(ck, code_addr.bytes,              \
+                                 (uint32_t)(evm->pc / 31));         \
+            uint64_t cwg = evm_state_witness_gas_access(            \
+                evm->state, ck, false, false);                      \
+            if (cwg > 0 && !evm_use_gas(evm, cwg))                  \
+                goto done_oog;                                      \
+        }                                                           \
+        goto *dispatch_table[evm->code[evm->pc]];                  \
     } while (0)
 
 #define NEXT()      \
@@ -96,6 +107,17 @@ evm_result_t evm_interpret(evm_t *evm)
     }
     printf("\n");
     } // end debug output
+
+    // EIP-4762 (Verkle): code chunk witness gas per instruction.
+    // Skip for deployment (initcode) and system calls.
+    bool is_deployment = (evm->msg.kind == EVM_CREATE || evm->msg.kind == EVM_CREATE2);
+    static const uint8_t SYSTEM_ADDR[20] = {
+        0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+        0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xfe
+    };
+    bool is_system_call = (memcmp(evm->msg.caller.bytes, SYSTEM_ADDR, 20) == 0);
+    bool verkle_chunk_mode = (evm->fork >= FORK_VERKLE && !is_deployment && !is_system_call);
+    address_t code_addr = evm->msg.code_addr;
 
     // Computed goto dispatch table (GCC/Clang extension)
     static const void *dispatch_table[256] = {
@@ -1260,6 +1282,10 @@ op_invalid:
     //==========================================================================
     // Exit Points
     //==========================================================================
+
+done_oog:
+    status = EVM_OUT_OF_GAS;
+    // Fall through to error
 
 error:
     LOG_EVM_ERROR("Execution error at PC=%lu: status=%d", evm->pc, status);

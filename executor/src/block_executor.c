@@ -2,6 +2,7 @@
 #include "tx_decoder.h"
 #include "fork.h"
 #include "transaction.h"
+#include "verkle_key.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -63,7 +64,8 @@ static void header_to_evm_block_env(const block_header_t *hdr,
  * System contract call helper (Prague+)
  * ========================================================================= */
 
-static void system_call(evm_t *evm, const uint8_t addr_bytes[20]) {
+static void system_call(evm_t *evm, const uint8_t addr_bytes[20],
+                        const uint8_t *calldata, size_t calldata_len) {
     address_t contract_addr, system_addr;
     memcpy(contract_addr.bytes, addr_bytes, 20);
     memset(system_addr.bytes, 0xff, 20);
@@ -81,16 +83,26 @@ static void system_call(evm_t *evm, const uint8_t addr_bytes[20]) {
 
     evm_set_tx_context(evm, &sys_tx);
 
-    /* Execute: caller=SYSTEM_ADDRESS, empty calldata, generous gas, depth=0 */
+    /* EIP-4762: record witness access for the target contract's basic_data.
+     * System calls don't charge gas, but the access events must be recorded
+     * so subsequent transactions see the address as warm. */
+    if (evm->fork >= FORK_VERKLE) {
+        uint8_t vk[32];
+        verkle_account_basic_data_key(vk, addr_bytes);
+        evm_state_witness_gas_access(evm->state, vk, false, false);
+    }
+
+    /* Execute: caller=SYSTEM_ADDRESS, generous gas, depth=0 */
     uint256_t zero = UINT256_ZERO;
     evm_message_t msg = evm_message_call(
         &system_addr, &contract_addr, &zero,
-        NULL, 0, 30000000, 0);
+        calldata, calldata_len, 30000000, 0);
     evm_result_t result;
     evm_execute(evm, &msg, &result);
     evm_result_free(&result);
 
-    /* Commit system call state changes (reset access lists, commit originals) */
+    /* Commit system call state changes (reset access lists, commit originals).
+     * NOTE: witness gas is NOT reset here — it persists per-block (EIP-4762). */
     evm_state_commit_tx(evm->state);
 }
 
@@ -155,13 +167,18 @@ block_result_t block_execute(evm_t *evm,
     /* Commit state before executing transactions (EIP-2200 original values) */
     evm_state_commit(evm->state);
 
-    /* EIP-2935: Store parent block hash in history contract (Prague+) */
+    /* Reset per-block witness gas state (EIP-4762) */
+    evm_state_begin_block(evm->state);
+
+    /* EIP-2935/EIP-7709: Store parent block hash in history contract (Prague+).
+     * The contract at 0xff..fe is read-only (SLOAD), so we write storage
+     * directly at the state level. */
     if (evm->fork >= FORK_PRAGUE) {
         static const uint8_t HISTORY_ADDR[20] = {
-            0x00, 0x00, 0xF9, 0x08, 0x27, 0xF1, 0xC5, 0x3a, 0x10, 0xcb,
-            0x7A, 0x02, 0x33, 0x5B, 0x17, 0x53, 0x20, 0x00, 0x29, 0x35
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe
         };
-        #define BLOCKHASH_SERVE_WINDOW 8191
+        #define BLOCKHASH_SERVE_WINDOW 8192
 
         address_t hist_addr;
         memcpy(hist_addr.bytes, HISTORY_ADDR, 20);
@@ -170,7 +187,7 @@ block_result_t block_execute(evm_t *evm,
         uint32_t hist_code_len = 0;
         evm_state_get_code_ptr(evm->state, &hist_addr, &hist_code_len);
         if (hist_code_len > 0) {
-            /* Store parent hash at slot (block.number - 1) % 8191 */
+            /* Store parent hash at slot (block.number - 1) % SERVE_WINDOW */
             uint64_t slot_idx = (header->number - 1) % BLOCKHASH_SERVE_WINDOW;
             uint256_t slot = uint256_from_uint64(slot_idx);
             uint256_t parent_hash_val = uint256_from_bytes(header->parent_hash.bytes, 32);
@@ -306,7 +323,7 @@ block_result_t block_execute(evm_t *evm,
             0x00, 0x00, 0x09, 0x61, 0xef, 0x48, 0x0e, 0xb5, 0x5e, 0x80,
             0xd1, 0x9a, 0xd8, 0x35, 0x79, 0xa6, 0x4c, 0x00, 0x70, 0x02
         };
-        system_call(evm, WITHDRAWAL_REQ_ADDR);
+        system_call(evm, WITHDRAWAL_REQ_ADDR, NULL, 0);
     }
 
     /* EIP-7251: Dequeue consolidation requests (Prague+) */
@@ -315,7 +332,7 @@ block_result_t block_execute(evm_t *evm,
             0x00, 0x00, 0xbb, 0xdd, 0xc7, 0xce, 0x48, 0x86, 0x42, 0xfb,
             0x57, 0x9f, 0x8b, 0x00, 0xf3, 0xa5, 0x90, 0x00, 0x72, 0x51
         };
-        system_call(evm, CONSOLIDATION_REQ_ADDR);
+        system_call(evm, CONSOLIDATION_REQ_ADDR, NULL, 0);
     }
 
     /* Finalize state: flush dirty accounts/storage to state_db */

@@ -7,6 +7,7 @@
 #include "address.h"
 #include "hash.h"
 #include "verkle_state.h"
+#include "witness_gas.h"
 
 /**
  * EVM State — Typed, in-memory state interface above verkle_state.
@@ -139,6 +140,12 @@ void evm_state_commit(evm_state_t *es);
  */
 void evm_state_commit_tx(evm_state_t *es);
 
+/**
+ * Reset per-block witness gas state (EIP-4762).
+ * Call at the start of each block before processing transactions.
+ */
+void evm_state_begin_block(evm_state_t *es);
+
 /** Take snapshot. Returns journal position for later revert. */
 uint32_t evm_state_snapshot(evm_state_t *es);
 
@@ -168,6 +175,17 @@ uint256_t evm_state_tload(evm_state_t *es, const address_t *addr,
                            const uint256_t *key);
 void      evm_state_tstore(evm_state_t *es, const address_t *addr,
                             const uint256_t *key, const uint256_t *value);
+
+// ============================================================================
+// Witness Gas (EIP-4762, Verkle+)
+// ============================================================================
+
+/** Verkle witness gas access event. Returns gas to charge.
+ *  key must be a 32-byte verkle tree key (key[0:31] = stem). */
+uint64_t evm_state_witness_gas_access(evm_state_t *es,
+                                       const uint8_t key[32],
+                                       bool is_write,
+                                       bool value_was_empty);
 
 // ============================================================================
 // Finalize

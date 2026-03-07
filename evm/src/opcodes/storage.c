@@ -7,6 +7,7 @@
 #include "opcodes/storage.h"
 #include "evm_stack.h"
 #include "gas.h"
+#include "verkle_key.h"
 #include "logger.h"
 #include <stdlib.h>
 
@@ -48,7 +49,7 @@ static uint64_t calculate_sstore_gas(
         return GAS_SSTORE_RESET;         // 5000
     }
 
-    // ── Istanbul+ (EIP-2200 / EIP-2929 / EIP-3529) ─────────────────────
+    // ── Istanbul+ (EIP-2200 / EIP-2929 / EIP-3529 / EIP-4762) ──────────
     //
     // Structure (matching geth gasSStoreEIP2929 / gasSStoreEIP2200):
     //   cost  = 0
@@ -57,8 +58,11 @@ static uint64_t calculate_sstore_gas(
 
     uint64_t cost = 0;
 
-    // Berlin+ (EIP-2929): cold/warm access
-    if (evm->fork >= FORK_BERLIN) {
+    // Verkle (EIP-4762): no cold/warm — witness gas charged separately
+    if (evm->fork >= FORK_VERKLE) {
+        // cost stays 0 — witness gas handled in op_sstore
+    } else if (evm->fork >= FORK_BERLIN) {
+        // Berlin+ (EIP-2929): cold/warm access
         bool is_warm = evm_is_storage_warm(evm, &evm->msg.recipient, key);
         if (!is_warm) {
             cost += GAS_SLOAD_COLD;  // 2100
@@ -67,7 +71,8 @@ static uint64_t calculate_sstore_gas(
     }
 
     // EIP-2200 gas constants depend on fork
-    uint64_t sload_gas   = (evm->fork >= FORK_BERLIN) ? GAS_SLOAD_WARM : GAS_SLOAD_ISTANBUL;
+    // Verkle keeps SLOAD_GAS (100) per EIP-4762: "remove EIP-2200 costs except SLOAD_GAS"
+    uint64_t sload_gas = (evm->fork >= FORK_BERLIN) ? GAS_SLOAD_WARM : GAS_SLOAD_ISTANBUL;
     uint64_t sstore_reset = (evm->fork >= FORK_BERLIN) ? (GAS_SSTORE_RESET - GAS_SLOAD_COLD) : GAS_SSTORE_RESET;
     int64_t  clear_refund = (evm->fork >= FORK_LONDON) ? 4800 : GAS_SSTORE_REFUND;
 
@@ -145,11 +150,21 @@ evm_status_t op_sload(evm_t *evm)
 
     // Check if storage slot is cold/warm and charge appropriate gas (EIP-2929)
     uint64_t gas_cost;
-    if (evm->fork >= FORK_BERLIN)
+    if (evm->fork >= FORK_VERKLE)
+    {
+        // EIP-4762: witness gas replaces cold/warm
+        uint8_t slot_le[32], vk[32];
+        uint256_to_bytes_le(&key, slot_le);
+        verkle_storage_key(vk, evm->msg.recipient.bytes, slot_le);
+        gas_cost = evm_state_witness_gas_access(evm->state, vk, false, false);
+        // Warm fallback: if fully warm (witness gas=0), charge WarmStorageReadCost
+        if (gas_cost == 0) gas_cost = GAS_SLOAD_WARM;
+    }
+    else if (evm->fork >= FORK_BERLIN)
     {
         bool is_warm = evm_is_storage_warm(evm, &evm->msg.recipient, &key);
         gas_cost = is_warm ? GAS_SLOAD_WARM : GAS_SLOAD_COLD;
-        
+
         // Mark as warm for future accesses
         if (!is_warm)
         {
@@ -224,17 +239,30 @@ evm_status_t op_sstore(evm_t *evm)
     uint256_t current_value = evm_state_get_storage(evm->state, &evm->msg.recipient, &key);
     uint256_t original_value = evm_state_get_committed_storage(evm->state, &evm->msg.recipient, &key);
 
-    // Calculate fork-specific SSTORE gas cost and refund
-    int64_t gas_refund = 0;
-    uint64_t gas_cost = calculate_sstore_gas(evm, &key, &current_value, &original_value, &value, &gas_refund);
+    if (evm->fork >= FORK_VERKLE) {
+        // EIP-4762 (Verkle): witness gas is the COMPLETE SSTORE cost.
+        // No EIP-2200 gas (SSTORE_SET/RESET), no refunds.
+        uint8_t slot_le[32], vk[32];
+        uint256_to_bytes_le(&key, slot_le);
+        verkle_storage_key(vk, evm->msg.recipient.bytes, slot_le);
+        uint64_t wgas = evm_state_witness_gas_access(evm->state, vk, true, false);
+        // Warm fallback: if fully warm (witness gas=0), charge WarmStorageReadCost
+        if (wgas == 0) wgas = GAS_SLOAD_WARM;
+        if (!evm_use_gas(evm, wgas))
+            return EVM_OUT_OF_GAS;
+    } else {
+        // Calculate fork-specific SSTORE gas cost and refund (EIP-2200)
+        int64_t gas_refund = 0;
+        uint64_t gas_cost = calculate_sstore_gas(evm, &key, &current_value, &original_value, &value, &gas_refund);
 
-    // Deduct gas
-    if (!evm_use_gas(evm, gas_cost)) {
-        return EVM_OUT_OF_GAS;
+        // Deduct gas
+        if (!evm_use_gas(evm, gas_cost)) {
+            return EVM_OUT_OF_GAS;
+        }
+
+        // Apply gas refund (can be negative for dirty writes)
+        evm->gas_refund += gas_refund;
     }
-
-    // Apply gas refund (can be negative for dirty writes)
-    evm->gas_refund += gas_refund;
 
     // Store value to storage using current contract address
     evm_state_set_storage(evm->state, &evm->msg.recipient, &key, &value);

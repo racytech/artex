@@ -9,6 +9,7 @@
 #include "address.h"
 #include "gas.h"
 #include "hash.h"
+#include "verkle_key.h"
 #include <string.h>
 
 //==============================================================================
@@ -39,36 +40,62 @@ evm_status_t op_blockhash(evm_t *evm)
 
     // Check if block number is within valid range (last 256 blocks)
     uint256_t current_block = uint256_from_uint64(evm->block.number);
-    
+
     // If requested block is >= current block, return 0
     if (uint256_ge(&block_number, &current_block))
     {
         if (!evm_stack_push(evm->stack, &UINT256_ZERO))
-        {
             return EVM_STACK_OVERFLOW;
-        }
         return EVM_SUCCESS;
     }
 
     // If block is too old (>256 blocks ago), return 0
     uint256_t diff = uint256_sub(&current_block, &block_number);
     uint256_t max_depth = uint256_from_uint64(256);
-    
+
     if (uint256_gt(&diff, &max_depth))
     {
         if (!evm_stack_push(evm->stack, &UINT256_ZERO))
-        {
             return EVM_STACK_OVERFLOW;
-        }
         return EVM_SUCCESS;
     }
 
-    // Get block hash from block context
-    // block_number is within range [current - 256, current)
+    // EIP-7709 (Verkle): read block hash from the history storage contract
+    // at 0xff..fe, slot = block_number % 8192. Charges witness gas for
+    // the storage slot access.
+    if (evm->fork >= FORK_VERKLE) {
+        #define BLOCKHASH_SERVE_WINDOW 8192
+        static const uint8_t HISTORY_ADDR[20] = {
+            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xfe
+        };
+        uint64_t block_idx = uint256_to_uint64(&block_number);
+        uint64_t slot_idx = block_idx % BLOCKHASH_SERVE_WINDOW;
+        uint256_t slot = uint256_from_uint64(slot_idx);
+
+        // Charge witness gas for the storage slot read
+        address_t hist_addr;
+        memcpy(hist_addr.bytes, HISTORY_ADDR, 20);
+        uint8_t slot_le[32], vk[32];
+        uint256_to_bytes_le(&slot, slot_le);
+        verkle_storage_key(vk, HISTORY_ADDR, slot_le);
+        uint64_t wgas = evm_state_witness_gas_access(evm->state, vk, false, false);
+        if (wgas == 0) wgas = GAS_SLOAD_WARM;  /* warm storage read */
+        if (!evm_use_gas(evm, wgas))
+            return EVM_OUT_OF_GAS;
+
+        // Read the block hash from contract storage
+        uint256_t hash_value = evm_state_get_storage(evm->state, &hist_addr, &slot);
+        if (!evm_stack_push(evm->stack, &hash_value))
+            return EVM_STACK_OVERFLOW;
+        #undef BLOCKHASH_SERVE_WINDOW
+        return EVM_SUCCESS;
+    }
+
+    // Pre-Verkle: get block hash from block context cache
     uint64_t block_idx = uint256_to_uint64(&block_number);
     uint64_t hash_idx = block_idx % 256;
-    
-    // Convert hash to uint256 (hash_t is big-endian bytes, uint256_t has internal layout)
+
     uint256_t hash_value = uint256_from_bytes(evm->block.block_hash[hash_idx].bytes, 32);
 
     if (!evm_stack_push(evm->stack, &hash_value))

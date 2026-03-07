@@ -5,7 +5,9 @@
 #include "evm.h"
 #include "opcodes/stack.h"
 #include "evm_stack.h"
+#include "evm_state.h"
 #include "gas.h"
+#include "verkle_key.h"
 #include "logger.h"
 
 // POP (0x50): Remove item from stack
@@ -74,6 +76,34 @@ evm_status_t op_push(evm_t *evm, uint8_t num_bytes)
     if (!evm_stack_push(evm->stack, &value))
     {
         return EVM_STACK_OVERFLOW;
+    }
+
+    // EIP-4762 (Verkle): charge code chunk witness gas for PUSH data bytes.
+    // Skip during deployment (initcode) and system calls.
+    if (evm->fork >= FORK_VERKLE &&
+        evm->msg.kind != EVM_CREATE && evm->msg.kind != EVM_CREATE2) {
+        static const uint8_t SYS_ADDR[20] = {
+            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xfe
+        };
+        if (memcmp(evm->msg.caller.bytes, SYS_ADDR, 20) != 0) {
+            uint64_t data_start = evm->pc + 1;
+            if (data_start < evm->code_size) {
+                uint64_t data_end = data_start + num_bytes;
+                if (data_end > evm->code_size)
+                    data_end = evm->code_size;
+                uint32_t start_chunk = (uint32_t)(data_start / 31);
+                uint32_t end_chunk = (uint32_t)((data_end - 1) / 31);
+                for (uint32_t c = start_chunk; c <= end_chunk; c++) {
+                    uint8_t ck[32];
+                    verkle_code_chunk_key(ck, evm->msg.code_addr.bytes, c);
+                    uint64_t cwg = evm_state_witness_gas_access(
+                        evm->state, ck, false, false);
+                    if (cwg > 0 && !evm_use_gas(evm, cwg))
+                        return EVM_OUT_OF_GAS;
+                }
+            }
+        }
     }
 
     // Advance PC past the opcode AND the pushed bytes
