@@ -1,4 +1,5 @@
 #include "block_executor.h"
+#include "dao_fork.h"
 #include "tx_decoder.h"
 #include "fork.h"
 #include "transaction.h"
@@ -169,6 +170,11 @@ block_result_t block_execute(evm_t *evm,
 
     /* Reset per-block witness gas state (EIP-4762) */
     evm_state_begin_block(evm->state);
+
+    /* DAO fork: drain 116 accounts into refund contract at block 1,920,000 */
+    if (header->number == DAO_FORK_BLOCK && chain_id == 1) {
+        apply_dao_fork(evm->state);
+    }
 
     /* EIP-2935/EIP-7709: Store parent block hash in history contract (Prague+).
      * The contract at 0xff..fe is read-only (SLOAD), so we write storage

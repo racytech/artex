@@ -11,6 +11,7 @@
 #include "block.h"
 #include "tx_decoder.h"
 #include "block_executor.h"
+#include "dao_fork.h"
 #include "rlp.h"
 #include "hash.h"
 #include "address.h"
@@ -354,6 +355,118 @@ static void test_executor_smoke(void) {
 }
 
 /* =========================================================================
+ * Test 5: DAO fork — drain accounts into refund contract
+ * ========================================================================= */
+
+static void test_dao_fork(void) {
+    TEST("DAO fork drain");
+
+    /* Create verkle state + evm state (no EVM needed, just state) */
+    verkle_state_t *vs = verkle_state_create();
+    ASSERT(vs != NULL, "create verkle_state");
+    evm_state_t *state = evm_state_create(vs);
+    ASSERT(state != NULL, "create evm_state");
+
+    /* Pick 3 drain addresses from the list and give them known balances */
+    address_t addr1, addr2, addr3;
+    address_from_hex("0xd4fe7bc31cedb7bfb8a345f31e668033056b2728", &addr1);
+    address_from_hex("0xb3fb0e5aba0e20e5c49d252dfd30e102b171a425", &addr2);
+    address_from_hex("0xbb9bc244d798123fde783fcc1c72d3bb8c189413", &addr3); /* The DAO contract itself */
+
+    uint256_t bal1 = uint256_from_uint64(1000000);
+    uint256_t bal2 = uint256_from_uint64(2000000);
+    uint256_t bal3 = uint256_from_uint64(3000000);
+
+    evm_state_add_balance(state, &addr1, &bal1);
+    evm_state_add_balance(state, &addr2, &bal2);
+    evm_state_add_balance(state, &addr3, &bal3);
+    evm_state_commit(state);
+
+    /* Refund contract address */
+    address_t refund;
+    address_from_hex("0xbf4ed7b27f1d666546e30d74d50d173d20bca754", &refund);
+
+    /* Verify refund contract doesn't exist yet */
+    uint256_t refund_bal_before = evm_state_get_balance(state, &refund);
+    ASSERT(uint256_is_zero(&refund_bal_before), "refund starts at 0");
+
+    /* Apply the DAO fork */
+    apply_dao_fork(state);
+
+    /* All drain accounts should be zero */
+    uint256_t bal_after;
+    bal_after = evm_state_get_balance(state, &addr1);
+    ASSERT(uint256_is_zero(&bal_after), "addr1 drained");
+    bal_after = evm_state_get_balance(state, &addr2);
+    ASSERT(uint256_is_zero(&bal_after), "addr2 drained");
+    bal_after = evm_state_get_balance(state, &addr3);
+    ASSERT(uint256_is_zero(&bal_after), "addr3 drained");
+
+    /* Refund contract should have all the balance */
+    uint256_t expected_total = uint256_from_uint64(6000000); /* 1M + 2M + 3M */
+    uint256_t refund_bal = evm_state_get_balance(state, &refund);
+    ASSERT(uint256_is_equal(&refund_bal, &expected_total), "refund has total");
+
+    /* Cleanup */
+    evm_state_destroy(state);
+    verkle_state_destroy(vs);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 6: DAO fork — no-op on non-mainnet or wrong block
+ * ========================================================================= */
+
+static void test_dao_fork_block_check(void) {
+    TEST("DAO fork block/chain gate");
+
+    /* Create state with balance on a drain address */
+    verkle_state_t *vs = verkle_state_create();
+    ASSERT(vs != NULL, "create verkle_state");
+    evm_state_t *state = evm_state_create(vs);
+    ASSERT(state != NULL, "create evm_state");
+    evm_t *evm = evm_create(state, chain_config_mainnet());
+    ASSERT(evm != NULL, "create evm");
+
+    address_t drain_addr;
+    address_from_hex("0xd4fe7bc31cedb7bfb8a345f31e668033056b2728", &drain_addr);
+    uint256_t bal = uint256_from_uint64(5000);
+    evm_state_add_balance(state, &drain_addr, &bal);
+    evm_state_commit(state);
+
+    /* Execute a block at number != 1920000 — DAO fork should NOT trigger */
+    block_header_t header;
+    memset(&header, 0, sizeof(header));
+    header.number = 100;
+    header.gas_limit = 5000000;
+    header.timestamp = 1438269988;
+
+    /* Empty body */
+    rlp_item_t *body_rlp = rlp_list_new();
+    rlp_list_append(body_rlp, rlp_list_new()); /* empty txs */
+    rlp_list_append(body_rlp, rlp_list_new()); /* empty uncles */
+    bytes_t body_enc = rlp_encode(body_rlp);
+    block_body_t body;
+    ASSERT(block_body_decode_rlp(&body, body_enc.data, body_enc.len), "decode body");
+
+    block_result_t result = block_execute(evm, &header, &body, NULL);
+    (void)result;
+
+    /* Drain address should still have its balance */
+    uint256_t bal_after = evm_state_get_balance(state, &drain_addr);
+    ASSERT(uint256_is_equal(&bal_after, &bal), "not drained at block 100");
+
+    block_result_free(&result);
+    block_body_free(&body);
+    free(body_enc.data);
+    rlp_item_free(body_rlp);
+    evm_destroy(evm);
+    evm_state_destroy(state);
+    verkle_state_destroy(vs);
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -364,6 +477,8 @@ int main(void) {
     test_legacy_tx_decode();
     test_body_decode();
     test_executor_smoke();
+    test_dao_fork();
+    test_dao_fork_block_check();
 
     printf("\n=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);

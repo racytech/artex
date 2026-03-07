@@ -184,6 +184,7 @@ add_library(block_executor STATIC
     executor/src/block.c
     executor/src/tx_decoder.c
     executor/src/block_executor.c
+    executor/src/dao_fork.c
 )
 target_include_directories(block_executor PUBLIC
     ${CMAKE_SOURCE_DIR}/executor/include
@@ -598,6 +599,12 @@ add_executable(test_loopback
 )
 target_link_libraries(test_loopback portal discv5 portal_wire ssz history)
 add_test(NAME test_loopback COMMAND test_loopback)
+
+add_executable(test_block_executor
+    executor/tests/test_block_executor.c
+)
+target_link_libraries(test_block_executor block_executor evm verkle_state common)
+add_test(NAME test_block_executor COMMAND test_block_executor)
 
 #==============================================================================
 # Integration Tests (Ethereum test vectors — cJSON required)
