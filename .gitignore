@@ -126,6 +126,9 @@ __archive/
 integration_tests/fixtures/
 integration_tests/fixtures_2/
 
+# Block data
+data/
+
 # Root directory test/benchmark files
 /*.c
 

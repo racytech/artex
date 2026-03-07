@@ -67,7 +67,9 @@ add_library(common STATIC
     common/src/uint256.c
     common/src/address.c
     common/src/logger.c
+    common/src/snappy_decode.c
 )
+target_link_libraries(common snappy)
 
 #==============================================================================
 # Libraries — Verkle State
@@ -185,6 +187,7 @@ add_library(block_executor STATIC
     executor/src/tx_decoder.c
     executor/src/block_executor.c
     executor/src/dao_fork.c
+    executor/src/era1.c
 )
 target_include_directories(block_executor PUBLIC
     ${CMAKE_SOURCE_DIR}/executor/include
@@ -607,7 +610,7 @@ target_link_libraries(test_block_executor block_executor evm verkle_state common
 add_test(NAME test_block_executor COMMAND test_block_executor)
 
 #==============================================================================
-# Integration Tests (Ethereum test vectors — cJSON required)
+# cJSON detection (used by chain_replay + integration tests)
 #==============================================================================
 
 find_package(PkgConfig QUIET)
@@ -626,6 +629,15 @@ endif()
 
 if(CJSON_FOUND)
     message(STATUS "Found cJSON: ${CJSON_LIBRARIES}")
+
+    # Chain replay tool
+    add_executable(chain_replay tools/chain_replay.c)
+    target_include_directories(chain_replay PRIVATE ${CJSON_INCLUDE_DIRS})
+    target_link_libraries(chain_replay block_executor evm verkle_state common ${CJSON_LIBRARIES})
+
+    #==============================================================================
+    # Integration Tests (Ethereum test vectors)
+    #==============================================================================
 
     file(GLOB_RECURSE INTEGRATION_TEST_SOURCES "integration_tests/src/*.c")
     if(INTEGRATION_TEST_SOURCES)
