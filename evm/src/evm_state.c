@@ -30,6 +30,8 @@ typedef struct cached_account {
     uint32_t   code_size;
     bool dirty;
     bool code_dirty;
+    bool block_dirty;           // survives commit_tx, cleared at block end
+    bool block_code_dirty;      // same for code
     bool created;               // newly created this execution
     bool existed;               // existed in backing store before
     bool self_destructed;
@@ -42,6 +44,7 @@ typedef struct cached_slot {
     uint256_t original;             // value when first loaded
     uint256_t current;
     bool dirty;
+    bool block_dirty;           // survives commit_tx, cleared at block end
 } cached_slot_t;
 
 // --- Journal ---
@@ -323,6 +326,7 @@ void evm_state_set_nonce(evm_state_t *es, const address_t *addr, uint64_t nonce)
 
     ca->nonce = nonce;
     ca->dirty = true;
+    ca->block_dirty = true;
 }
 
 void evm_state_increment_nonce(evm_state_t *es, const address_t *addr) {
@@ -357,6 +361,7 @@ void evm_state_set_balance(evm_state_t *es, const address_t *addr,
 
     ca->balance = *balance;
     ca->dirty = true;
+    ca->block_dirty = true;
 }
 
 void evm_state_add_balance(evm_state_t *es, const address_t *addr,
@@ -515,6 +520,8 @@ void evm_state_set_code(evm_state_t *es, const address_t *addr,
 
     ca->dirty = true;
     ca->code_dirty = true;
+    ca->block_dirty = true;
+    ca->block_code_dirty = true;
 }
 
 // ============================================================================
@@ -556,6 +563,7 @@ void evm_state_set_storage(evm_state_t *es, const address_t *addr,
 
     cs->current = *value;
     cs->dirty = true;
+    cs->block_dirty = true;
 }
 
 bool evm_state_has_storage(evm_state_t *es, const address_t *addr) {
@@ -669,6 +677,7 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
     ca->code_size = 0;
     ca->created = true;
     ca->dirty = true;
+    ca->block_dirty = true;
     ca->code_dirty = false;
     ca->self_destructed = false;
 }
@@ -691,6 +700,7 @@ void evm_state_self_destruct(evm_state_t *es, const address_t *addr) {
 
     ca->self_destructed = true;
     ca->dirty = true;
+    ca->block_dirty = true;
 }
 
 bool evm_state_is_self_destructed(evm_state_t *es, const address_t *addr) {
@@ -779,6 +789,8 @@ static bool commit_tx_account_cb(const uint8_t *key, size_t key_len,
         ca->created = false;
         ca->dirty = false;
         ca->code_dirty = false;
+        ca->block_dirty = true;        // destruction is a block-level change
+        ca->block_code_dirty = true;
         ca->self_destructed = false;
         return true;
     }
@@ -811,6 +823,7 @@ static bool commit_tx_slot_cb(const uint8_t *key, size_t key_len,
             cs->current = UINT256_ZERO;
             cs->original = UINT256_ZERO;
             cs->dirty = false;
+            cs->block_dirty = true;     // destruction is a block-level change
             return true;
         }
     }
@@ -1125,13 +1138,16 @@ bool evm_state_finalize(evm_state_t *es) {
 // State Root — delegate to verkle_state
 // ============================================================================
 
-// Flush callback: writes ALL cached accounts to verkle (ignores dirty flag)
+// Flush callback: writes block-dirty cached accounts to verkle
 static bool flush_all_accounts_cb(const uint8_t *key, size_t key_len,
                                     const void *value, size_t value_len,
                                     void *user_data) {
     (void)key; (void)key_len; (void)value_len;
     finalize_ctx_t *ctx = (finalize_ctx_t *)user_data;
     const cached_account_t *ca = (const cached_account_t *)value;
+
+    // Skip accounts not modified during this block
+    if (!ca->block_dirty && !ca->block_code_dirty) return true;
 
     if (ca->self_destructed) {
         verkle_state_set_nonce(ctx->es->vs, ca->addr.bytes, 0);
@@ -1174,6 +1190,9 @@ static bool flush_all_storage_cb(const uint8_t *key, size_t key_len,
     finalize_ctx_t *ctx = (finalize_ctx_t *)user_data;
     const cached_slot_t *cs = (const cached_slot_t *)value;
 
+    // Skip slots not modified during this block
+    if (!cs->block_dirty) return true;
+
     const uint8_t *addr = cs->key;
     uint256_t slot = uint256_from_bytes(cs->key + ADDRESS_SIZE, 32);
     uint8_t slot_le[32];
@@ -1184,9 +1203,8 @@ static bool flush_all_storage_cb(const uint8_t *key, size_t key_len,
     uint256_to_bytes(&cs->current, val_be);
 
     // Skip if value matches what's already in the verkle tree.
-    // This avoids inserting zero-value leaves for read-only cached slots
-    // (e.g., SLOAD of non-existent storage) while still flushing genuine
-    // modifications whose dirty flags were cleared by commit/commit_tx.
+    // Prevents creating zero-value leaves for slots written back to their
+    // original value (e.g., SSTORE(slot, 0) when slot was already 0).
     uint8_t stored_be[32];
     verkle_state_get_storage(ctx->es->vs, addr, slot_le, stored_be);
     if (memcmp(val_be, stored_be, 32) == 0)
@@ -1196,12 +1214,30 @@ static bool flush_all_storage_cb(const uint8_t *key, size_t key_len,
     return true;
 }
 
+static bool clear_block_dirty_account_cb(const uint8_t *key, size_t key_len,
+                                          const void *value, size_t value_len,
+                                          void *user_data) {
+    (void)key; (void)key_len; (void)value_len; (void)user_data;
+    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
+    ca->block_dirty = false;
+    ca->block_code_dirty = false;
+    return true;
+}
+
+static bool clear_block_dirty_slot_cb(const uint8_t *key, size_t key_len,
+                                       const void *value, size_t value_len,
+                                       void *user_data) {
+    (void)key; (void)key_len; (void)value_len; (void)user_data;
+    cached_slot_t *cs = (cached_slot_t *)(uintptr_t)value;
+    cs->block_dirty = false;
+    return true;
+}
+
 hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     (void)prune_empty;  // Not applicable for verkle
     if (!es) return hash_zero();
 
-    // Flush ALL cached state to verkle (not just dirty),
-    // because commit() may have cleared dirty flags before root computation.
+    // Flush only block-dirty cached state to verkle
     finalize_ctx_t ctx = { .es = es, .ok = true };
     mem_art_foreach(&es->accounts, flush_all_accounts_cb, &ctx);
     mem_art_foreach(&es->storage, flush_all_storage_cb, &ctx);
@@ -1212,6 +1248,11 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
 
     hash_t root;
     verkle_state_root_hash(es->vs, root.bytes);
+
+    // Clear block_dirty flags — next block starts fresh
+    mem_art_foreach(&es->accounts, clear_block_dirty_account_cb, NULL);
+    mem_art_foreach(&es->storage, clear_block_dirty_slot_cb, NULL);
+
     return root;
 }
 
