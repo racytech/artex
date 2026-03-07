@@ -16,6 +16,7 @@
 #define VF_SLOT_KEY_SIZE    32
 #define VF_SLOT_RECORD_SIZE 32
 #define VF_INITIAL_CAP      4096
+#define VF_INITIAL_CAPACITY (1 << 20)  /* ~1M buckets for disk_hash */
 #define VF_STEM_LEN         31
 #define VF_KEY_LEN          32
 #define VF_VALUE_LEN        32
@@ -139,7 +140,7 @@ static bool slot_get(const verkle_flat_t *vf, int depth,
     if (!vf->slot_store) return false;
     uint8_t key[32], val[32];
     make_slot_key(key, depth, path, slot);
-    if (!art_store_get(vf->slot_store, key, val))
+    if (!disk_hash_get(vf->slot_store, key, val))
         return false;
     memcpy(out_stem, val, 31);
     return true;
@@ -154,7 +155,7 @@ static void slot_put(verkle_flat_t *vf, int depth,
     make_slot_key(key, depth, path, slot);
     memset(val, 0, 32);
     memcpy(val, stem, 31);
-    art_store_put(vf->slot_store, key, val);
+    disk_hash_put(vf->slot_store, key, val);
 }
 
 static void slot_delete(verkle_flat_t *vf, int depth,
@@ -163,7 +164,7 @@ static void slot_delete(verkle_flat_t *vf, int depth,
     if (!vf->slot_store) return;
     uint8_t key[32];
     make_slot_key(key, depth, path, slot);
-    art_store_delete(vf->slot_store, key);
+    disk_hash_delete(vf->slot_store, key);
 }
 
 /* =========================================================================
@@ -180,23 +181,25 @@ static verkle_flat_t *alloc_handle(void) {
 static bool create_slot_store(verkle_flat_t *vf, const char *commit_dir)
 {
     char slot_path[512];
-    snprintf(slot_path, sizeof(slot_path), "%s/slots.art", commit_dir);
-    vf->slot_store = art_store_create(slot_path, VF_SLOT_KEY_SIZE,
-                                       VF_SLOT_RECORD_SIZE);
+    snprintf(slot_path, sizeof(slot_path), "%s/slots.dh", commit_dir);
+    vf->slot_store = disk_hash_create(slot_path, VF_SLOT_KEY_SIZE,
+                                       VF_SLOT_RECORD_SIZE,
+                                       VF_INITIAL_CAPACITY);
     return vf->slot_store != NULL;
 }
 
 static bool open_slot_store(verkle_flat_t *vf, const char *commit_dir)
 {
     char slot_path[512];
-    snprintf(slot_path, sizeof(slot_path), "%s/slots.art", commit_dir);
+    snprintf(slot_path, sizeof(slot_path), "%s/slots.dh", commit_dir);
     /* If file doesn't exist yet, create it (migration from old format) */
     struct stat st;
     if (stat(slot_path, &st) != 0) {
-        vf->slot_store = art_store_create(slot_path, VF_SLOT_KEY_SIZE,
-                                           VF_SLOT_RECORD_SIZE);
+        vf->slot_store = disk_hash_create(slot_path, VF_SLOT_KEY_SIZE,
+                                           VF_SLOT_RECORD_SIZE,
+                                           VF_INITIAL_CAPACITY);
     } else {
-        vf->slot_store = art_store_open(slot_path);
+        vf->slot_store = disk_hash_open(slot_path);
     }
     return vf->slot_store != NULL;
 }
@@ -210,21 +213,22 @@ verkle_flat_t *verkle_flat_create(const char *value_dir,
     mkdir(value_dir, 0755);
 
     char value_path[512];
-    snprintf(value_path, sizeof(value_path), "%s/values.art", value_dir);
-    vf->value_store = art_store_create(value_path, VF_VALUE_KEY_SIZE,
-                                        VF_VALUE_RECORD_SIZE);
+    snprintf(value_path, sizeof(value_path), "%s/values.dh", value_dir);
+    vf->value_store = disk_hash_create(value_path, VF_VALUE_KEY_SIZE,
+                                        VF_VALUE_RECORD_SIZE,
+                                        VF_INITIAL_CAPACITY);
     if (!vf->value_store) { free(vf); return NULL; }
 
     vf->commit_store = vcs_create(commit_dir);
     if (!vf->commit_store) {
-        art_store_destroy(vf->value_store);
+        disk_hash_destroy(vf->value_store);
         free(vf);
         return NULL;
     }
 
     if (!create_slot_store(vf, commit_dir)) {
         vcs_destroy(vf->commit_store);
-        art_store_destroy(vf->value_store);
+        disk_hash_destroy(vf->value_store);
         free(vf);
         return NULL;
     }
@@ -239,20 +243,20 @@ verkle_flat_t *verkle_flat_open(const char *value_dir,
     if (!vf) return NULL;
 
     char value_path[512];
-    snprintf(value_path, sizeof(value_path), "%s/values.art", value_dir);
-    vf->value_store = art_store_open(value_path);
+    snprintf(value_path, sizeof(value_path), "%s/values.dh", value_dir);
+    vf->value_store = disk_hash_open(value_path);
     if (!vf->value_store) { free(vf); return NULL; }
 
     vf->commit_store = vcs_open(commit_dir);
     if (!vf->commit_store) {
-        art_store_destroy(vf->value_store);
+        disk_hash_destroy(vf->value_store);
         free(vf);
         return NULL;
     }
 
     if (!open_slot_store(vf, commit_dir)) {
         vcs_destroy(vf->commit_store);
-        art_store_destroy(vf->value_store);
+        disk_hash_destroy(vf->value_store);
         free(vf);
         return NULL;
     }
@@ -262,9 +266,9 @@ verkle_flat_t *verkle_flat_open(const char *value_dir,
 
 void verkle_flat_destroy(verkle_flat_t *vf) {
     if (!vf) return;
-    if (vf->value_store)  art_store_destroy(vf->value_store);
+    if (vf->value_store)  disk_hash_destroy(vf->value_store);
     if (vf->commit_store) vcs_destroy(vf->commit_store);
-    if (vf->slot_store)   art_store_destroy(vf->slot_store);
+    if (vf->slot_store)   disk_hash_destroy(vf->slot_store);
     free(vf->changes);
     free(vf->undos);
     free(vf->commit_undos);
@@ -311,7 +315,7 @@ bool verkle_flat_set(verkle_flat_t *vf,
         }
     }
     if (!found) {
-        if (art_store_get(vf->value_store, key, undo->old_value)) {
+        if (disk_hash_get(vf->value_store, key, undo->old_value)) {
             found = true;
         }
     }
@@ -342,7 +346,7 @@ bool verkle_flat_get(const verkle_flat_t *vf,
     }
 
     /* Fall through to value store */
-    return art_store_get(vf->value_store, key, value);
+    return disk_hash_get(vf->value_store, key, value);
 }
 
 /* =========================================================================
@@ -524,7 +528,7 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             uint8_t full_key[32];
             memcpy(full_key, sg->stem, 31);
             full_key[31] = suffix;
-            bool had_old = art_store_get(vf->value_store, full_key, old_value);
+            bool had_old = disk_hash_get(vf->value_store, full_key, old_value);
 
             /* Split into lo/hi 16-byte halves with EIP-6800 leaf marker */
             uint8_t old_lo[32] = {0}, new_lo[32] = {0};
@@ -554,7 +558,7 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             }
 
             /* Write new value to value store */
-            art_store_put(vf->value_store, full_key, new_value);
+            disk_hash_put(vf->value_store, full_key, new_value);
         }
 
         /* Update leaf commitment for C1/C2 changes (batch inversions) */
@@ -617,7 +621,7 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             uint8_t full_key[32];
             memcpy(full_key, sg->stem, 31);
             full_key[31] = suffix;
-            art_store_put(vf->value_store, full_key, val);
+            disk_hash_put(vf->value_store, full_key, val);
         }
 
         /* Compute C1, C2 via full MSM */
@@ -962,16 +966,16 @@ bool verkle_flat_revert_block(verkle_flat_t *vf) {
     for (uint32_t i = vf->undo_count; i > blk->undo_start; i--) {
         vf_undo_t *u = &vf->undos[i - 1];
         if (u->had_value) {
-            art_store_put(vf->value_store, u->key, u->old_value);
+            disk_hash_put(vf->value_store, u->key, u->old_value);
         } else {
-            art_store_delete(vf->value_store, u->key);
+            disk_hash_delete(vf->value_store, u->key);
         }
     }
 
     /* Restore commitments + slots in reverse */
     for (uint32_t i = vf->cu_count; i > blk->commit_undo_start; i--) {
         vf_commit_undo_t *cu = &vf->commit_undos[i - 1];
-        art_store_t *store;
+        disk_hash_t *store;
         switch (cu->store_id) {
             case VF_STORE_LEAF:     store = vf->commit_store->leaf_store; break;
             case VF_STORE_INTERNAL: store = vf->commit_store->internal_store; break;
@@ -979,9 +983,9 @@ bool verkle_flat_revert_block(verkle_flat_t *vf) {
             default: continue;
         }
         if (cu->data_len == 0) {
-            art_store_delete(store, cu->cs_key);
+            disk_hash_delete(store, cu->cs_key);
         } else {
-            art_store_put(store, cu->cs_key, cu->old_data);
+            disk_hash_put(store, cu->cs_key, cu->old_data);
         }
     }
 
@@ -1072,7 +1076,7 @@ void verkle_flat_root_hash(const verkle_flat_t *vf, uint8_t out[32]) {
 
 void verkle_flat_sync(verkle_flat_t *vf) {
     if (!vf) return;
-    art_store_sync(vf->value_store);
+    disk_hash_sync(vf->value_store);
     vcs_sync(vf->commit_store);
-    if (vf->slot_store) art_store_sync(vf->slot_store);
+    if (vf->slot_store) disk_hash_sync(vf->slot_store);
 }

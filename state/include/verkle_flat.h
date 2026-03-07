@@ -2,7 +2,7 @@
 #define VERKLE_FLAT_H
 
 #include "verkle_commit_store.h"
-#include "art_store.h"
+#include "disk_hash.h"
 #include "banderwagon.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -17,10 +17,10 @@ extern "C" {
  * Replaces the in-memory verkle tree for block execution.
  * RAM usage: O(block_changes) instead of O(total_state).
  *
- * Disk-backed stores (all art_store):
- *   - Value store:      art_store (key=32B, record=32B) — all state values
+ * Disk-backed stores (all disk_hash):
+ *   - Value store:      disk_hash (key=32B, record=32B) — all state values
  *   - Commitment store: verkle_commit_store — leaf (C1,C2,commit) + internal
- *   - Slot store:       art_store — maps (depth,path,slot) → occupant stem
+ *   - Slot store:       disk_hash — maps (depth,path,slot) → occupant stem
  *
  * Per-block flow:
  *   1. begin_block()
@@ -65,9 +65,9 @@ typedef struct {
 /** Main handle. */
 typedef struct {
     /* Stores (owned) */
-    art_store_t             *value_store;
+    disk_hash_t             *value_store;
     verkle_commit_store_t   *commit_store;
-    art_store_t             *slot_store;    /* (depth,path,slot) → occupant stem */
+    disk_hash_t             *slot_store;    /* (depth,path,slot) → occupant stem */
 
     /* Current block changes */
     vf_change_t  *changes;

@@ -2,7 +2,7 @@
 #define VERKLE_COMMIT_STORE_H
 
 #include "verkle.h"
-#include "art_store.h"
+#include "disk_hash.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -11,23 +11,23 @@ extern "C" {
 #endif
 
 /**
- * Verkle Commitment Store — art_store-backed persistence for commitment points.
+ * Verkle Commitment Store — disk_hash-backed persistence for commitment points.
  *
  * Persists banderwagon commitment points so they survive restarts,
  * avoiding expensive full MSM recomputation on reload.
  *
- * Two art_stores with 32-byte keys:
+ * Two disk_hash tables with 32-byte keys:
  *   Leaf store:     key=[0x00 || stem (31B)]          → record: C1||C2||commitment (96B)
  *   Internal store: key=[depth+1 || path_prefix (31B)] → record: commitment (32B)
  *
  * Files created inside the given directory:
- *   dir/leaves.art    — leaf art_store (key=32, record=96)
- *   dir/internals.art — internal art_store (key=32, record=32)
+ *   dir/leaves.dh    — leaf disk_hash (key=32, record=96)
+ *   dir/internals.dh — internal disk_hash (key=32, record=32)
  */
 
 typedef struct {
-    art_store_t *leaf_store;      /* key=32, record=96 (C1+C2+commitment) */
-    art_store_t *internal_store;  /* key=32, record=32 (commitment) */
+    disk_hash_t *leaf_store;      /* key=32, record=96 (C1+C2+commitment) */
+    disk_hash_t *internal_store;  /* key=32, record=32 (commitment) */
 } verkle_commit_store_t;
 
 /* =========================================================================
@@ -88,7 +88,7 @@ bool vcs_flush_tree(verkle_commit_store_t *cs, const verkle_tree_t *vt);
  * Durability
  * ========================================================================= */
 
-/** Flush to disk (calls art_store_sync on both stores). */
+/** Flush to disk (calls disk_hash_sync on both stores). */
 void vcs_sync(verkle_commit_store_t *cs);
 
 #ifdef __cplusplus
