@@ -842,12 +842,20 @@ bool transaction_execute(
                     uint64_t deployment_gas = evm_result.output_size * G_CODE_DEPOSIT;
 
                     if (evm_result.gas_left < deployment_gas) {
-                        LOG_EVM_DEBUG("Insufficient gas for code deployment");
-                        evm_state_revert(state, exec_snapshot);
-                        result->status = EVM_OUT_OF_GAS;
-                        result->gas_used = tx->gas_limit;
-                        result->gas_refund = 0;
-                        result->contract_created = false;
+                        if (evm->fork >= FORK_HOMESTEAD) {
+                            // Homestead+: OOG, consume all gas, revert
+                            LOG_EVM_DEBUG("Insufficient gas for code deployment");
+                            evm_state_revert(state, exec_snapshot);
+                            result->status = EVM_OUT_OF_GAS;
+                            result->gas_used = tx->gas_limit;
+                            result->gas_refund = 0;
+                            result->contract_created = false;
+                        } else {
+                            // Frontier: contract created with empty code,
+                            // remaining gas refunded (EIP-2 not yet active)
+                            result->contract_address = contract_address;
+                            result->contract_created = true;
+                        }
                     } else {
                         result->gas_used += deployment_gas;
                         evm_state_set_code(state, &contract_address,
