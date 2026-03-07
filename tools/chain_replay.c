@@ -211,8 +211,10 @@ int main(int argc, char **argv) {
 
     printf("Era1 archive: %zu files in %s\n", archive.count, era1_dir);
 
-    /* Create verkle state (in-memory for now) */
-    verkle_state_t *vs = verkle_state_create();
+    /* Create verkle state (flat/disk-backed for O(block) RAM) */
+    const char *value_dir = "/tmp/chain_replay_values";
+    const char *commit_dir = "/tmp/chain_replay_commits";
+    verkle_state_t *vs = verkle_state_create_flat(value_dir, commit_dir);
     if (!vs) {
         fprintf(stderr, "Failed to create verkle state\n");
         archive_close(&archive);
@@ -236,6 +238,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Open block 0 for genesis state writes (required for flat backend) */
+    evm_state_begin_block(state, 0);
+
     /* Load genesis state */
     if (!load_genesis(state, genesis_path)) {
         fprintf(stderr, "Failed to load genesis state\n");
@@ -246,8 +251,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Commit genesis state */
+    /* Commit genesis as original state (EIP-2200) + flush to flat backend */
     evm_state_commit(state);
+    evm_state_finalize(state);
 
     /* Block hash ring buffer for BLOCKHASH opcode */
     hash_t block_hashes[BLOCK_HASH_WINDOW];
