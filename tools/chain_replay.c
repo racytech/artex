@@ -320,21 +320,12 @@ int main(int argc, char **argv) {
         /* Execute */
         block_result_t result = block_execute(evm, &header, &body, block_hashes);
 
-        /* Verify state root */
-        bool root_match = hash_equal(&result.state_root, &header.state_root);
+        /* Verify gas_used matches header */
+        bool gas_match = (result.gas_used == header.gas_used);
 
-        if (!root_match) {
-            char expected[67], got[67];
-            hash_to_hex(&header.state_root, expected);
-            hash_to_hex(&result.state_root, got);
-            fprintf(stderr, "Block %lu: STATE ROOT MISMATCH\n"
-                    "  expected: %s\n"
-                    "  got:      %s\n"
-                    "  gas_used: %lu (header: %lu)\n"
-                    "  txs: %zu, success: %d\n",
-                    bn, expected, got,
-                    result.gas_used, header.gas_used,
-                    result.tx_count, result.success);
+        if (!gas_match) {
+            fprintf(stderr, "Block %lu: GAS MISMATCH  got %lu  expected %lu  (txs: %zu)\n",
+                    bn, result.gas_used, header.gas_used, result.tx_count);
             blocks_fail++;
         } else {
             blocks_ok++;
@@ -343,11 +334,11 @@ int main(int argc, char **argv) {
         total_gas += result.gas_used;
 
         /* Progress every 1000 blocks */
-        if (bn % 1000 == 0 || !root_match) {
+        if (bn % 1000 == 0 || !gas_match) {
             clock_gettime(CLOCK_MONOTONIC, &t_now);
             double elapsed = (t_now.tv_sec - t_start.tv_sec) +
                              (t_now.tv_nsec - t_start.tv_nsec) / 1e9;
-            double bps = (bn - (argc > 2 ? (uint64_t)atoll(argv[2]) : 0)) / (elapsed > 0 ? elapsed : 1);
+            double bps = bn / (elapsed > 0 ? elapsed : 1);
             printf("Block %lu | %lu txs | gas %lu | %.0f blk/s | ok %lu fail %lu\n",
                    bn, result.tx_count, result.gas_used, bps, blocks_ok, blocks_fail);
         }

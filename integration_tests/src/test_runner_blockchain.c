@@ -88,6 +88,9 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
         runner->evm->chain_config = fork_config;
     }
 
+    // Open block 0 for genesis state writes (required for flat verkle backend)
+    evm_state_begin_block(runner->state, 0);
+
     // Setup genesis/pre-state
     if (!test_runner_setup_state(runner->state, test->pre_state, test->pre_state_count)) {
         result->status = TEST_ERROR;
@@ -98,6 +101,9 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
 
     // Commit pre-state as "original" for EIP-2200 storage tracking
     evm_state_commit(runner->state);
+
+    // Flush genesis state to verkle backend + commit block 0
+    evm_state_finalize(runner->state);
 
     // Verify genesis state root
     {

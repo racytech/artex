@@ -168,8 +168,8 @@ block_result_t block_execute(evm_t *evm,
     /* Commit state before executing transactions (EIP-2200 original values) */
     evm_state_commit(evm->state);
 
-    /* Reset per-block witness gas state (EIP-4762) */
-    evm_state_begin_block(evm->state);
+    /* Begin block: reset witness gas + open flat backend block */
+    evm_state_begin_block(evm->state, header->number);
 
     /* DAO fork: drain 116 accounts into refund contract at block 1,920,000 */
     if (header->number == DAO_FORK_BLOCK && chain_id == 1) {

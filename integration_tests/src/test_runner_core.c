@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 //==============================================================================
 // Test Chain Configuration
@@ -289,14 +290,43 @@ uint64_t get_time_microseconds(void) {
 }
 
 //==============================================================================
+// Temp directory helpers (for flat verkle backend)
+//==============================================================================
+
+static void rm_rf(const char *path) {
+    if (!path || !path[0]) return;
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
+    system(cmd);
+}
+
+/* Flat backend temp dirs — stored per runner instance */
+static __thread char flat_value_dir[256];
+static __thread char flat_commit_dir[256];
+
+static void make_flat_dirs(void) {
+    snprintf(flat_value_dir, sizeof(flat_value_dir), "/tmp/vk_val_XXXXXX");
+    snprintf(flat_commit_dir, sizeof(flat_commit_dir), "/tmp/vk_com_XXXXXX");
+    mkdtemp(flat_value_dir);
+    mkdtemp(flat_commit_dir);
+}
+
+static void cleanup_flat_dirs(void) {
+    rm_rf(flat_value_dir);
+    rm_rf(flat_commit_dir);
+    flat_value_dir[0] = '\0';
+    flat_commit_dir[0] = '\0';
+}
+
+//==============================================================================
 // Test Runner Lifecycle
 //==============================================================================
 
 bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config) {
     if (!runner) return false;
-    
+
     memset(runner, 0, sizeof(*runner));
-    
+
     // Set configuration
     if (config) {
         runner->config = *config;
@@ -308,10 +338,12 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
         runner->config.fork_filter_count = 0;
         runner->config.timeout_ms = 30000; // 30 second default timeout
     }
-    
-    // Initialize Verkle State + EVM State
-    runner->vs = verkle_state_create();
+
+    // Initialize Verkle State (flat/disk-backed) + EVM State
+    make_flat_dirs();
+    runner->vs = verkle_state_create_flat(flat_value_dir, flat_commit_dir);
     if (!runner->vs) {
+        cleanup_flat_dirs();
         return false;
     }
 
@@ -319,6 +351,7 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
     if (!runner->state) {
         verkle_state_destroy(runner->vs);
         runner->vs = NULL;
+        cleanup_flat_dirs();
         return false;
     }
 
@@ -329,15 +362,16 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
         verkle_state_destroy(runner->vs);
         runner->state = NULL;
         runner->vs = NULL;
+        cleanup_flat_dirs();
         return false;
     }
-    
+
     return true;
 }
 
 void test_runner_destroy(test_runner_t *runner) {
     if (!runner) return;
-    
+
     if (runner->evm) {
         evm_destroy(runner->evm);
     }
@@ -349,14 +383,16 @@ void test_runner_destroy(test_runner_t *runner) {
     if (runner->vs) {
         verkle_state_destroy(runner->vs);
     }
-    
+
+    cleanup_flat_dirs();
+
     memset(runner, 0, sizeof(*runner));
 }
 
 void test_runner_reset(test_runner_t *runner) {
     if (!runner) return;
 
-    // Destroy old state and recreate fresh
+    // Destroy old state
     if (runner->evm) {
         evm_destroy(runner->evm);
         runner->evm = NULL;
@@ -369,8 +405,11 @@ void test_runner_reset(test_runner_t *runner) {
         verkle_state_destroy(runner->vs);
         runner->vs = NULL;
     }
+    cleanup_flat_dirs();
 
-    runner->vs = verkle_state_create();
+    // Recreate fresh with new flat dirs
+    make_flat_dirs();
+    runner->vs = verkle_state_create_flat(flat_value_dir, flat_commit_dir);
     if (runner->vs) {
         runner->state = evm_state_create(runner->vs);
         if (runner->state) {

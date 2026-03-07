@@ -141,10 +141,11 @@ void evm_state_commit(evm_state_t *es);
 void evm_state_commit_tx(evm_state_t *es);
 
 /**
- * Reset per-block witness gas state (EIP-4762).
- * Call at the start of each block before processing transactions.
+ * Begin a new block.
+ * Resets per-block witness gas state (EIP-4762) and opens a block
+ * in the backing verkle store (required for flat backend).
  */
-void evm_state_begin_block(evm_state_t *es);
+void evm_state_begin_block(evm_state_t *es, uint64_t block_number);
 
 /** Take snapshot. Returns journal position for later revert. */
 uint32_t evm_state_snapshot(evm_state_t *es);

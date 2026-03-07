@@ -841,9 +841,10 @@ void evm_state_commit_tx(evm_state_t *es) {
     witness_gas_reset(&es->witness_gas);
 }
 
-void evm_state_begin_block(evm_state_t *es) {
+void evm_state_begin_block(evm_state_t *es, uint64_t block_number) {
     if (!es) return;
     witness_gas_reset(&es->witness_gas);
+    verkle_state_begin_block(es->vs, block_number);
 }
 
 // ============================================================================
@@ -1199,11 +1200,15 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     (void)prune_empty;  // Not applicable for verkle
     if (!es) return hash_zero();
 
-    // Flush ALL cached state to verkle tree (not just dirty),
+    // Flush ALL cached state to verkle (not just dirty),
     // because commit() may have cleared dirty flags before root computation.
     finalize_ctx_t ctx = { .es = es, .ok = true };
     mem_art_foreach(&es->accounts, flush_all_accounts_cb, &ctx);
     mem_art_foreach(&es->storage, flush_all_storage_cb, &ctx);
+
+    // Commit block in flat backend (processes buffered writes, updates commitments).
+    // No-op for in-memory tree backend.
+    verkle_state_commit_block(es->vs);
 
     hash_t root;
     verkle_state_root_hash(es->vs, root.bytes);
