@@ -125,6 +125,7 @@ struct mpt_store {
     disk_hash_t     *index;
     int              data_fd;
     uint64_t         data_size;
+    uint64_t         live_bytes;     /* sum of live node sizes */
     uint8_t          root_hash[32];
 
     dirty_entry_t   *dirty;
@@ -498,11 +499,18 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         return false;
 
     ms->data_size += rlp_len;
+    ms->live_bytes += rlp_len;
     return true;
 }
 
 /* Delete a node's index entry (data stays as garbage in .dat) */
 static void delete_node(mpt_store_t *ms, const uint8_t hash[32]) {
+    /* Look up the record to get its size before deleting */
+    node_record_t rec;
+    if (disk_hash_get(ms->index, hash, &rec)) {
+        if (ms->live_bytes >= rec.length)
+            ms->live_bytes -= rec.length;
+    }
     disk_hash_delete(ms->index, hash);
 }
 
@@ -647,7 +655,8 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
 
     ms->index     = index;
     ms->data_fd   = data_fd;
-    ms->data_size = 0;
+    ms->data_size  = 0;
+    ms->live_bytes = 0;
     memcpy(ms->root_hash, EMPTY_ROOT, 32);
     ms->idx_path  = idx_path;
     ms->dat_path  = dat_path;
@@ -690,9 +699,10 @@ mpt_store_t *mpt_store_open(const char *path) {
         return NULL;
     }
 
-    ms->index     = index;
-    ms->data_fd   = data_fd;
-    ms->data_size = hdr.data_size;
+    ms->index      = index;
+    ms->data_fd    = data_fd;
+    ms->data_size  = hdr.data_size;
+    ms->live_bytes = hdr.data_size; /* best estimate; will track from here */
     memcpy(ms->root_hash, hdr.root_hash, 32);
     ms->idx_path  = idx_path;
     ms->dat_path  = dat_path;
@@ -818,6 +828,13 @@ static node_ref_t build_fresh(mpt_store_t *ms, dirty_entry_t *entries,
         if (entries[i].value != NULL) live++;
     }
     if (live == 0) return empty;
+
+    /* All nibbles consumed — remaining entries have identical keys.
+     * Should not happen after dedup, but handle defensively. */
+    if (depth >= MAX_NIBBLES) {
+        return make_leaf(ms, NULL, 0,
+                         entries[start].value, entries[start].value_len);
+    }
 
     /* Compact live entries to front (stable order) */
     if (live < end - start) {
@@ -1283,6 +1300,23 @@ bool mpt_store_commit_batch(mpt_store_t *ms) {
     /* Sort dirty entries by nibbles */
     qsort(ms->dirty, ms->dirty_count, sizeof(dirty_entry_t), dirty_cmp);
 
+    /* Deduplicate: keep the LAST entry for each key (last staged wins) */
+    if (ms->dirty_count > 1) {
+        size_t w = 0;
+        for (size_t r = 1; r < ms->dirty_count; r++) {
+            if (memcmp(ms->dirty[w].nibbles, ms->dirty[r].nibbles,
+                       MAX_NIBBLES) == 0) {
+                /* Duplicate key — free the earlier value, keep the later */
+                free(ms->dirty[w].value);
+                ms->dirty[w] = ms->dirty[r];
+            } else {
+                w++;
+                if (w != r) ms->dirty[w] = ms->dirty[r];
+            }
+        }
+        ms->dirty_count = w + 1;
+    }
+
     /* Build current root ref */
     node_ref_t root_ref;
     if (memcmp(ms->root_hash, EMPTY_ROOT, 32) == 0) {
@@ -1412,7 +1446,8 @@ bool mpt_store_compact(mpt_store_t *ms) {
     /* Reopen */
     ms->index = disk_hash_open(old_idx);
     ms->data_fd = open(old_dat, O_RDWR);
-    ms->data_size = new_ms->data_size;
+    ms->data_size  = new_ms->data_size;
+    ms->live_bytes = new_ms->live_bytes; /* after compact, all data is live */
 
     /* Cleanup new_ms (files already renamed, just free struct) */
     new_ms->idx_path = NULL;
@@ -1443,10 +1478,9 @@ mpt_store_stats_t mpt_store_stats(const mpt_store_t *ms) {
     if (fstat(ms->data_fd, &sb) == 0)
         st.data_file_size = (uint64_t)sb.st_size;
 
-    /* Approximate live data: we don't track exact sizes, so estimate */
-    /* A more accurate approach would walk the trie, but that's expensive */
-    st.live_data_bytes = ms->data_size; /* upper bound (includes garbage) */
-    st.garbage_bytes = 0; /* can't compute cheaply without walking */
+    st.live_data_bytes = ms->live_bytes;
+    st.garbage_bytes = ms->data_size > ms->live_bytes
+                     ? ms->data_size - ms->live_bytes : 0;
 
     return st;
 }

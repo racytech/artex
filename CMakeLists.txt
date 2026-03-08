@@ -471,6 +471,12 @@ add_test(NAME test_mpt_store_vectors
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+# Benchmark: MPT Store at scale (realistic Ethereum workload)
+add_executable(bench_mpt_store
+    tools/bench_mpt_store.c
+)
+target_link_libraries(bench_mpt_store mpt_store common)
+
 # Test: Verkle journal (block revert + crash recovery + checkpoint)
 add_executable(test_verkle_journal
     state/tests/test_verkle_journal.c
