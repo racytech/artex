@@ -141,6 +141,13 @@ add_library(mpt STATIC
 )
 target_link_libraries(mpt common)
 
+# MPT Store (persistent Merkle Patricia Trie with incremental updates)
+add_library(mpt_store STATIC
+    mpt/src/mpt_store.c
+)
+target_include_directories(mpt_store PUBLIC ${CMAKE_SOURCE_DIR}/mpt/include)
+target_link_libraries(mpt_store disk_hash common)
+
 #==============================================================================
 # Libraries — EVM
 #==============================================================================
@@ -446,6 +453,23 @@ add_executable(test_evm_state_audit
 )
 target_link_libraries(test_evm_state_audit evm verkle_state)
 add_test(NAME test_evm_state_audit COMMAND test_evm_state_audit)
+
+# Test: MPT Store (persistent trie with incremental updates)
+add_executable(test_mpt_store
+    mpt/tests/test_mpt_store.c
+)
+target_link_libraries(test_mpt_store mpt_store mpt common)
+add_test(NAME test_mpt_store COMMAND test_mpt_store)
+
+# Test: MPT Store cross-validation against Python reference vectors
+add_executable(test_mpt_store_vectors
+    mpt/tests/test_mpt_store_vectors.c
+)
+target_link_libraries(test_mpt_store_vectors mpt_store common)
+add_test(NAME test_mpt_store_vectors
+    COMMAND test_mpt_store_vectors
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
 
 # Test: Verkle journal (block revert + crash recovery + checkpoint)
 add_executable(test_verkle_journal
