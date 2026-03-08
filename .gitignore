@@ -127,7 +127,7 @@ integration_tests/fixtures/
 integration_tests/fixtures_2/
 
 # Block data
-data/
+data/era1/
 
 # Root directory test/benchmark files
 /*.c

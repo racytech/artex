@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+extern bool g_trace_calls __attribute__((weak));
+
 /* =========================================================================
  * Build block_env_t from block_header_t
  * ========================================================================= */
@@ -234,6 +236,12 @@ block_result_t block_execute(evm_t *evm,
     uint64_t cumulative_gas = 0;
     result.success = true;
 
+    if (g_trace_calls) {
+        fprintf(stderr, "BLOCK number=%lu gas_limit=%lu timestamp=%lu difficulty_lo=%lu difficulty_hi=%lu\n",
+                header->number, header->gas_limit, header->timestamp,
+                (unsigned long)header->difficulty.low, (unsigned long)header->difficulty.high);
+    }
+
     for (size_t i = 0; i < tx_count; i++) {
         const rlp_item_t *tx_item = block_body_tx(body, i);
         if (!tx_item) {
@@ -250,6 +258,18 @@ block_result_t block_execute(evm_t *evm,
             result.success = false;
             if (result.first_failure < 0) result.first_failure = (int)i;
             break;
+        }
+
+        /* Trace transaction details when debugging */
+        if (g_trace_calls) {
+            fprintf(stderr, "TX[%zu] sender=%02x%02x..%02x%02x to=%02x%02x..%02x%02x "
+                    "is_create=%d nonce=%lu gas_limit=%lu data_len=%zu\n",
+                    i,
+                    tx.sender.bytes[0], tx.sender.bytes[1],
+                    tx.sender.bytes[18], tx.sender.bytes[19],
+                    tx.to.bytes[0], tx.to.bytes[1],
+                    tx.to.bytes[18], tx.to.bytes[19],
+                    tx.is_create, tx.nonce, tx.gas_limit, tx.data_size);
         }
 
         /* Execute transaction */
@@ -291,6 +311,9 @@ block_result_t block_execute(evm_t *evm,
 
         /* Uncle inclusion bonuses */
         size_t uncle_count = block_body_uncle_count(body);
+        if (uncle_count > 0) {
+            fprintf(stderr, "UNCLE block=%lu count=%zu\n", header->number, uncle_count);
+        }
         for (size_t u = 0; u < uncle_count; u++) {
             /* Miner gets base_reward/32 per uncle included */
             uint256_t thirty_two = uint256_from_uint64(32);
@@ -301,6 +324,12 @@ block_result_t block_execute(evm_t *evm,
             block_header_t uncle_hdr;
             if (block_body_get_uncle(body, u, &uncle_hdr)) {
                 uint64_t depth = uncle_hdr.number + 8 - header->number;
+                if (g_trace_calls) {
+                    fprintf(stderr, "UNCLE[%zu] number=%lu depth=%lu coinbase=%02x%02x..%02x%02x\n",
+                            u, uncle_hdr.number, depth,
+                            uncle_hdr.coinbase.bytes[0], uncle_hdr.coinbase.bytes[1],
+                            uncle_hdr.coinbase.bytes[18], uncle_hdr.coinbase.bytes[19]);
+                }
                 uint256_t depth_u = uint256_from_uint64(depth);
                 uint256_t eight = uint256_from_uint64(8);
                 uint256_t uncle_miner_reward = uint256_mul(&base_reward, &depth_u);
@@ -346,6 +375,7 @@ block_result_t block_execute(evm_t *evm,
 
     /* Compute state root — prune empty accounts post-Spurious Dragon (EIP-161) */
     bool prune_empty = (evm->fork >= FORK_SPURIOUS_DRAGON);
+    /* Verkle flush: writes block-dirty state to backing store, clears dirty flags */
     result.state_root = evm_state_compute_state_root_ex(evm->state, prune_empty);
     result.gas_used = cumulative_gas;
 

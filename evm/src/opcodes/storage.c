@@ -10,6 +10,8 @@
 #include "verkle_key.h"
 #include "logger.h"
 #include <stdlib.h>
+#include <stdio.h>
+extern bool g_trace_calls __attribute__((weak));
 
 //==============================================================================
 // Helper Functions
@@ -195,6 +197,15 @@ evm_status_t op_sload(evm_t *evm)
     // Load value from storage using current contract address
     uint256_t value = evm_state_get_storage(evm->state, &evm->msg.recipient, &key);
 
+    if (g_trace_calls) {
+        char addr_hex[41];
+        for (int i = 0; i < 20; i++) sprintf(addr_hex + i*2, "%02x", evm->msg.recipient.bytes[i]);
+        fprintf(stderr, "  SLOAD depth=%d addr=%s slot=%016lx_%016lx val=%016lx_%016lx\n",
+                evm->msg.depth, addr_hex,
+                (unsigned long)(key.low >> 64), (unsigned long)key.low,
+                (unsigned long)(value.low >> 64), (unsigned long)value.low);
+    }
+
     if (!evm_stack_push(evm->stack, &value))
     {
         return EVM_STACK_OVERFLOW;
@@ -254,6 +265,16 @@ evm_status_t op_sstore(evm_t *evm)
         // Calculate fork-specific SSTORE gas cost and refund (EIP-2200)
         int64_t gas_refund = 0;
         uint64_t gas_cost = calculate_sstore_gas(evm, &key, &current_value, &original_value, &value, &gas_refund);
+
+        if (g_trace_calls) {
+            char addr_hex[41];
+            for (int i = 0; i < 20; i++) sprintf(addr_hex + i*2, "%02x", evm->msg.recipient.bytes[i]);
+            fprintf(stderr, "  SSTORE depth=%d addr=%s slot=%016lx_%016lx val=%016lx_%016lx cost=%lu refund=%ld\n",
+                    evm->msg.depth, addr_hex,
+                    (unsigned long)(key.low >> 64), (unsigned long)key.low,
+                    (unsigned long)(value.low >> 64), (unsigned long)value.low,
+                    gas_cost, gas_refund);
+        }
 
         // Deduct gas
         if (!evm_use_gas(evm, gas_cost)) {

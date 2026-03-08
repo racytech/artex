@@ -15,6 +15,10 @@
 #include "logger.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+
+// Debug: set to true to trace CALL gas
+bool g_trace_calls __attribute__((weak)) = false;
 
 //==============================================================================
 // Helper Functions
@@ -185,6 +189,16 @@ static evm_status_t prepare_call(
         // Calculate CALL gas overhead (cold/warm + value_transfer + account_creation)
         uint64_t call_cost = gas_call_cost(evm->fork, is_cold, has_value, account_exists);
 
+        if (g_trace_calls) {
+            fprintf(stderr, "  CALL@pc=%lu depth=%d target=%02x%02x..%02x%02x "
+                    "exists=%d value=%s cold=%d cost=%lu gas_before=%lu\n",
+                    evm->pc, evm->msg.depth,
+                    target_addr->bytes[0], target_addr->bytes[1],
+                    target_addr->bytes[18], target_addr->bytes[19],
+                    account_exists, has_value?"yes":"no", is_cold,
+                    call_cost, evm->gas_left);
+        }
+
         // Deduct call overhead + delegation gas
         if (!evm_use_gas(evm, call_cost + delegation_gas_cost))
             return EVM_OUT_OF_GAS;
@@ -237,9 +251,17 @@ static evm_status_t prepare_call(
         gas_to_forward = gas_requested;
     }
 
+    if (g_trace_calls) {
+        fprintf(stderr, "    fwd_gas: requested=%lu forwarded=%lu stipend=%lu gas_left=%lu\n",
+                gas_requested, gas_to_forward, stipend, evm->gas_left);
+    }
+
     // Deduct the forwarded gas from caller
     if (!evm_use_gas(evm, gas_to_forward))
     {
+        if (g_trace_calls) {
+            fprintf(stderr, "    OOG: need %lu, have %lu\n", gas_to_forward, evm->gas_left);
+        }
         *gas_forwarded = 0;
         return EVM_OUT_OF_GAS;
     }
@@ -368,6 +390,18 @@ evm_status_t op_call(evm_t *evm)
     }
 
     bool call_succeeded = (subcall_result.status == EVM_SUCCESS);
+
+    if (g_trace_calls) {
+        char caller_hex[41], tgt_hex[41];
+        for (int i = 0; i < 20; i++) {
+            sprintf(caller_hex + i*2, "%02x", evm->msg.recipient.bytes[i]);
+            sprintf(tgt_hex + i*2, "%02x", target_addr.bytes[i]);
+        }
+        char *val_hex = uint256_to_hex(&value);
+        fprintf(stderr, "  CALL depth=%d caller=%s target=%s value=%s status=%d gas_left=%lu\n",
+                evm->msg.depth, caller_hex, tgt_hex, val_hex,
+                subcall_result.status, subcall_result.gas_left);
+    }
 
     // Refund unused gas on SUCCESS or REVERT (per Ethereum spec)
     if (subcall_result.status == EVM_SUCCESS || subcall_result.status == EVM_REVERT)
@@ -521,6 +555,18 @@ evm_status_t op_callcode(evm_t *evm)
     }
 
     bool call_succeeded = (subcall_result.status == EVM_SUCCESS);
+
+    if (g_trace_calls) {
+        char caller_hex[41], tgt_hex[41];
+        for (int i = 0; i < 20; i++) {
+            sprintf(caller_hex + i*2, "%02x", evm->msg.recipient.bytes[i]);
+            sprintf(tgt_hex + i*2, "%02x", target_addr.bytes[i]);
+        }
+        char *val_hex = uint256_to_hex(&value);
+        fprintf(stderr, "  CALLCODE depth=%d caller=%s target=%s value=%s status=%d gas_left=%lu\n",
+                evm->msg.depth, caller_hex, tgt_hex, val_hex,
+                subcall_result.status, subcall_result.gas_left);
+    }
 
     // Refund unused gas on SUCCESS or REVERT (per Ethereum spec)
     if (subcall_result.status == EVM_SUCCESS || subcall_result.status == EVM_REVERT)

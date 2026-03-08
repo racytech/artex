@@ -23,6 +23,9 @@
 #include "logger.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+
+extern bool g_trace_calls __attribute__((weak));
 
 //==============================================================================
 // Dispatch Table - Maps opcodes to label addresses
@@ -43,6 +46,10 @@
                 evm->state, ck, false, false);                      \
             if (cwg > 0 && !evm_use_gas(evm, cwg))                  \
                 goto done_oog;                                      \
+        }                                                           \
+        if (g_trace_calls && evm->msg.depth == 0) {                 \
+            fprintf(stderr, "  OP pc=%zu op=0x%02x gas=%lu\n",      \
+                    evm->pc, evm->code[evm->pc], evm->gas_left);   \
         }                                                           \
         goto *dispatch_table[evm->code[evm->pc]];                  \
     } while (0)
@@ -1288,7 +1295,7 @@ done_oog:
     // Fall through to error
 
 error:
-    LOG_EVM_ERROR("Execution error at PC=%lu: status=%d", evm->pc, status);
+    LOG_EVM_DEBUG("Execution error at PC=%lu: status=%d", evm->pc, status);
     // All exceptional halts (non-REVERT) consume all remaining gas per EVM spec.
     // Only REVERT preserves remaining gas.
     if (status != EVM_REVERT)

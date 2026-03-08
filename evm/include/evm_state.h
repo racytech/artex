@@ -212,4 +212,14 @@ bool evm_state_finalize(evm_state_t *es);
  */
 hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
 
+/**
+ * Compute MPT (Merkle Patricia Trie) state root from the in-memory caches.
+ * Used for pre-Verkle block validation against block headers.
+ * Must be called AFTER evm_state_compute_state_root_ex() (which flushes
+ * dirty state and sets existed flags).
+ * @param prune_empty  If true (EIP-161+), exclude empty accounts from the trie.
+ */
+hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty);
+void evm_state_debug_dump(evm_state_t *es);
+
 #endif // EVM_STATE_H

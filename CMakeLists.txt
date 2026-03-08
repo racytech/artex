@@ -135,6 +135,12 @@ add_library(verkle_flat STATIC
 )
 target_link_libraries(verkle_flat verkle_commit_store art_store disk_hash pedersen banderwagon)
 
+# MPT batch root computation (Ethereum MPT state root from sorted key-value pairs)
+add_library(mpt STATIC
+    state/src/mpt.c
+)
+target_link_libraries(mpt common)
+
 #==============================================================================
 # Libraries — EVM
 #==============================================================================
@@ -176,7 +182,7 @@ target_include_directories(evm PUBLIC
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/evm/vendor
 )
-target_link_libraries(evm verkle_state art_database common ssl crypto secp256k1 blst)
+target_link_libraries(evm verkle_state art_database mpt common ssl crypto secp256k1 blst)
 
 #==============================================================================
 # Libraries — Block Executor
@@ -434,6 +440,13 @@ add_executable(test_verkle_snapshot
 target_link_libraries(test_verkle_snapshot verkle_snapshot verkle_state)
 add_test(NAME test_verkle_snapshot COMMAND test_verkle_snapshot)
 
+# Test: EVM state management audit
+add_executable(test_evm_state_audit
+    evm/tests/test_evm_state_audit.c
+)
+target_link_libraries(test_evm_state_audit evm verkle_state)
+add_test(NAME test_evm_state_audit COMMAND test_evm_state_audit)
+
 # Test: Verkle journal (block revert + crash recovery + checkpoint)
 add_executable(test_verkle_journal
     state/tests/test_verkle_journal.c
@@ -633,7 +646,7 @@ if(CJSON_FOUND)
     # Chain replay tool
     add_executable(chain_replay tools/chain_replay.c)
     target_include_directories(chain_replay PRIVATE ${CJSON_INCLUDE_DIRS})
-    target_link_libraries(chain_replay block_executor evm verkle_state common ${CJSON_LIBRARIES})
+    target_link_libraries(chain_replay block_executor evm verkle_state mpt common ${CJSON_LIBRARIES})
 
     #==============================================================================
     # Integration Tests (Ethereum test vectors)

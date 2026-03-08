@@ -9,6 +9,9 @@
 #include "logger.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+
+extern bool g_trace_calls __attribute__((weak));
 
 //==============================================================================
 // Helper Functions
@@ -903,6 +906,11 @@ post_execution:
     // Clamp refund to 0 (per-frame refunds can go negative, but net transaction refund >= 0)
     int64_t net_refund = result->gas_refund + (int64_t)auth_gas_refund;
     uint64_t gas_refund = (net_refund > 0) ? (uint64_t)net_refund : 0;
+
+    if (g_trace_calls) {
+        fprintf(stderr, "  TX refund: gas_used_before=%lu gas_refund=%lu (raw=%ld) gas_left=%lu\n",
+                gas_used, gas_refund, (long)result->gas_refund, tx->gas_limit - gas_used);
+    }
 
     // Apply refund cap: London+ (EIP-3529) = gas_used/5, pre-London = gas_used/2
     uint64_t max_refund = (evm->fork >= FORK_LONDON) ? gas_used / 5 : gas_used / 2;

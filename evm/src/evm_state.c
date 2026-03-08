@@ -1,10 +1,13 @@
 #include "evm_state.h"
 #include "mem_art.h"
 #include "keccak256.h"
+#include "mpt.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+extern bool g_trace_calls __attribute__((weak));
 
 // ============================================================================
 // Internal constants
@@ -65,8 +68,8 @@ typedef struct {
     journal_type_t type;
     address_t addr;
     union {
-        struct { uint64_t val; bool dirty; } nonce;
-        struct { uint256_t val; bool dirty; } balance;
+        struct { uint64_t val; bool dirty; bool block_dirty; } nonce;
+        struct { uint256_t val; bool dirty; bool block_dirty; } balance;
         struct { hash_t old_hash; bool old_has_code; uint8_t *old_code; uint32_t old_code_size; } code;
         struct { uint256_t slot; uint256_t old_value; } storage;
         uint256_t slot;             // WARM_SLOT
@@ -80,6 +83,8 @@ typedef struct {
             uint32_t   old_code_size;
             bool       old_dirty;
             bool       old_code_dirty;
+            bool       old_block_dirty;
+            bool       old_block_code_dirty;
             bool       old_created;
             bool       old_existed;
             bool       old_self_destructed;
@@ -289,7 +294,15 @@ bool evm_state_exists(evm_state_t *es, const address_t *addr) {
     if (!es || !addr) return false;
     cached_account_t *ca = ensure_account(es, addr);
     if (!ca) return false;
-    return ca->existed || ca->created;
+    // In geth, Exist() returns true once CreateAccount() is called (e.g. from
+    // Call()), even for empty accounts.  Our CALL touch sets dirty via
+    // add_balance(addr, 0).  Without checking dirty, the same non-existent
+    // address is charged 25000 new-account gas on every CALL within one tx.
+    // dirty is properly reverted by the journal on subcall failure.
+    // block_dirty survives commit_tx (cleared only at block end), so accounts
+    // touched in earlier transactions of the same block are still "existing"
+    // — matching geth's Frontier behavior where empty objects persist.
+    return ca->existed || ca->created || ca->dirty || ca->block_dirty;
 }
 
 bool evm_state_is_empty(evm_state_t *es, const address_t *addr) {
@@ -320,7 +333,7 @@ void evm_state_set_nonce(evm_state_t *es, const address_t *addr, uint64_t nonce)
     journal_entry_t je = {
         .type = JOURNAL_NONCE,
         .addr = *addr,
-        .data.nonce = { .val = ca->nonce, .dirty = ca->dirty }
+        .data.nonce = { .val = ca->nonce, .dirty = ca->dirty, .block_dirty = ca->block_dirty }
     };
     journal_push(es, &je);
 
@@ -355,7 +368,7 @@ void evm_state_set_balance(evm_state_t *es, const address_t *addr,
     journal_entry_t je = {
         .type = JOURNAL_BALANCE,
         .addr = *addr,
-        .data.balance = { .val = ca->balance, .dirty = ca->dirty }
+        .data.balance = { .val = ca->balance, .dirty = ca->dirty, .block_dirty = ca->block_dirty }
     };
     journal_push(es, &je);
 
@@ -659,6 +672,8 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
             .old_code_size      = ca->code_size,
             .old_dirty          = ca->dirty,
             .old_code_dirty     = ca->code_dirty,
+            .old_block_dirty    = ca->block_dirty,
+            .old_block_code_dirty = ca->block_code_dirty,
             .old_created        = ca->created,
             .old_existed        = ca->existed,
             .old_self_destructed = ca->self_destructed,
@@ -789,8 +804,8 @@ static bool commit_tx_account_cb(const uint8_t *key, size_t key_len,
         ca->created = false;
         ca->dirty = false;
         ca->code_dirty = false;
-        ca->block_dirty = true;        // destruction is a block-level change
-        ca->block_code_dirty = true;
+        ca->block_dirty = false;       // account is dead — nothing to flush
+        ca->block_code_dirty = false;
         ca->self_destructed = false;
         return true;
     }
@@ -823,7 +838,7 @@ static bool commit_tx_slot_cb(const uint8_t *key, size_t key_len,
             cs->current = UINT256_ZERO;
             cs->original = UINT256_ZERO;
             cs->dirty = false;
-            cs->block_dirty = true;     // destruction is a block-level change
+            cs->block_dirty = false;    // account is dead — zeroed slots don't need flush
             return true;
         }
     }
@@ -884,6 +899,7 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
             if (ca) {
                 ca->nonce = je->data.nonce.val;
                 ca->dirty = je->data.nonce.dirty;
+                ca->block_dirty = je->data.nonce.block_dirty;
             }
             break;
         }
@@ -893,6 +909,7 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
             if (ca) {
                 ca->balance = je->data.balance.val;
                 ca->dirty = je->data.balance.dirty;
+                ca->block_dirty = je->data.balance.block_dirty;
             }
             break;
         }
@@ -933,6 +950,8 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
                 ca->code_size       = je->data.create.old_code_size;
                 ca->dirty           = je->data.create.old_dirty;
                 ca->code_dirty      = je->data.create.old_code_dirty;
+                ca->block_dirty     = je->data.create.old_block_dirty;
+                ca->block_code_dirty = je->data.create.old_block_code_dirty;
                 ca->created         = je->data.create.old_created;
                 ca->existed         = je->data.create.old_existed;
                 ca->self_destructed = je->data.create.old_self_destructed;
@@ -1034,6 +1053,7 @@ bool evm_state_is_slot_warm(const evm_state_t *es, const address_t *addr,
 typedef struct {
     evm_state_t *es;
     bool ok;
+    bool prune_empty;  // EIP-158: skip writing empty touched accounts
 } finalize_ctx_t;
 
 static bool finalize_account_cb(const uint8_t *key, size_t key_len,
@@ -1144,10 +1164,19 @@ static bool flush_all_accounts_cb(const uint8_t *key, size_t key_len,
                                     void *user_data) {
     (void)key; (void)key_len; (void)value_len;
     finalize_ctx_t *ctx = (finalize_ctx_t *)user_data;
-    const cached_account_t *ca = (const cached_account_t *)value;
+    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
 
     // Skip accounts not modified during this block
     if (!ca->block_dirty && !ca->block_code_dirty) return true;
+
+    if (g_trace_calls) {
+        fprintf(stderr, "FLUSH_ACCT %02x%02x..%02x%02x nonce=%lu has_code=%d existed=%d created=%d self_destructed=%d bal=",
+                key[0], key[1], key[18], key[19],
+                ca->nonce, ca->has_code, ca->existed, ca->created, ca->self_destructed);
+        uint8_t balbuf[32]; uint256_to_bytes(&ca->balance, balbuf);
+        for (int bi = 0; bi < 32; bi++) fprintf(stderr, "%02x", balbuf[bi]);
+        fprintf(stderr, "\n");
+    }
 
     if (ca->self_destructed) {
         verkle_state_set_nonce(ctx->es->vs, ca->addr.bytes, 0);
@@ -1158,11 +1187,16 @@ static bool flush_all_accounts_cb(const uint8_t *key, size_t key_len,
         return true;
     }
 
-    // Skip empty accounts that never existed
+    // Skip empty accounts that never existed.
+    // In pre-EIP-158 (prune_empty=false), touched empty accounts must persist
+    // — geth keeps empty state objects across blocks in Frontier/Homestead.
     bool is_empty = (ca->nonce == 0 &&
                      uint256_is_zero(&ca->balance) &&
                      !ca->has_code);
-    if (!ca->existed && !ca->created && is_empty) return true;
+    if (!ca->existed && !ca->created && is_empty && ctx->prune_empty) return true;
+
+    // Mark as existing for future blocks (account is now in the store)
+    ca->existed = true;
 
     verkle_state_set_nonce(ctx->es->vs, ca->addr.bytes, ca->nonce);
     uint8_t balance_le[32];
@@ -1234,11 +1268,10 @@ static bool clear_block_dirty_slot_cb(const uint8_t *key, size_t key_len,
 }
 
 hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
-    (void)prune_empty;  // Not applicable for verkle
     if (!es) return hash_zero();
 
     // Flush only block-dirty cached state to verkle
-    finalize_ctx_t ctx = { .es = es, .ok = true };
+    finalize_ctx_t ctx = { .es = es, .ok = true, .prune_empty = prune_empty };
     mem_art_foreach(&es->accounts, flush_all_accounts_cb, &ctx);
     mem_art_foreach(&es->storage, flush_all_storage_cb, &ctx);
 
@@ -1253,6 +1286,335 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     mem_art_foreach(&es->accounts, clear_block_dirty_account_cb, NULL);
     mem_art_foreach(&es->storage, clear_block_dirty_slot_cb, NULL);
 
+    return root;
+}
+
+// ============================================================================
+// MPT State Root Computation (pre-Verkle block validation)
+// ============================================================================
+
+// RLP-encode big-endian integer: strips leading zeros, encodes as byte string.
+// Returns bytes written (max: 1 + be_len). out must be large enough.
+static size_t mpt_rlp_be(const uint8_t *be, size_t be_len, uint8_t *out) {
+    size_t i = 0;
+    while (i < be_len && be[i] == 0) i++;
+    size_t len = be_len - i;
+    if (len == 0)             { out[0] = 0x80;          return 1; }
+    if (len == 1 && be[i] < 0x80) { out[0] = be[i];    return 1; }
+    out[0] = 0x80 + (uint8_t)len;
+    memcpy(out + 1, be + i, len);
+    return 1 + len;
+}
+
+// RLP-encode uint64 as big-endian integer.
+static size_t mpt_rlp_u64(uint64_t v, uint8_t *out) {
+    if (v == 0) { out[0] = 0x80; return 1; }
+    uint8_t be[8];
+    for (int i = 7; i >= 0; i--) { be[i] = v & 0xFF; v >>= 8; }
+    return mpt_rlp_be(be, 8, out);
+}
+
+// RLP-encode account [nonce, balance, storage_root, code_hash].
+// Returns bytes written. out must be >= 120 bytes.
+static size_t mpt_rlp_account(uint64_t nonce, const uint256_t *balance,
+                               const uint8_t sr[32], const uint8_t ch[32],
+                               uint8_t *out) {
+    uint8_t payload[120];
+    size_t pos = 0;
+    pos += mpt_rlp_u64(nonce, payload + pos);
+    uint8_t bal_be[32];
+    uint256_to_bytes(balance, bal_be);
+    pos += mpt_rlp_be(bal_be, 32, payload + pos);
+    payload[pos++] = 0xa0; memcpy(payload + pos, sr, 32); pos += 32;  // storage_root
+    payload[pos++] = 0xa0; memcpy(payload + pos, ch, 32); pos += 32;  // code_hash
+    // List wrapper — account payload is 66..110 bytes, always > 55
+    if (pos <= 55) {
+        out[0] = 0xc0 + (uint8_t)pos;
+        memcpy(out + 1, payload, pos);
+        return 1 + pos;
+    } else {
+        // Long list: 0xf7 + length_of_length, then length in BE, then payload
+        out[0] = 0xf8;  // 0xf7 + 1 (length fits in 1 byte since pos < 256)
+        out[1] = (uint8_t)pos;
+        memcpy(out + 2, payload, pos);
+        return 2 + pos;
+    }
+}
+
+// Storage entry for MPT collection
+typedef struct {
+    uint8_t  addr[20];
+    uint8_t  slot_hash[32];    // keccak256(slot_be)
+    uint8_t  value_rlp[33];   // RLP(trimmed big-endian value)
+    uint8_t  value_len;
+} mpt_slot_entry_t;
+
+typedef struct {
+    mpt_slot_entry_t *entries;
+    size_t count, cap;
+} mpt_slot_vec_t;
+
+static bool mpt_collect_slot_cb(const uint8_t *key, size_t key_len,
+                                 const void *value, size_t value_len,
+                                 void *user_data) {
+    (void)key_len; (void)value_len;
+    mpt_slot_vec_t *v = (mpt_slot_vec_t *)user_data;
+    const cached_slot_t *cs = (const cached_slot_t *)value;
+    if (uint256_is_zero(&cs->current)) return true;
+
+    if (v->count >= v->cap) {
+        size_t nc = v->cap ? v->cap * 2 : 256;
+        mpt_slot_entry_t *ne = realloc(v->entries, nc * sizeof(*ne));
+        if (!ne) return false;
+        v->entries = ne; v->cap = nc;
+    }
+    mpt_slot_entry_t *e = &v->entries[v->count++];
+    memcpy(e->addr, key, 20);
+    hash_t h = hash_keccak256(key + 20, 32);
+    memcpy(e->slot_hash, h.bytes, 32);
+    uint8_t vbe[32];
+    uint256_to_bytes(&cs->current, vbe);
+    e->value_len = (uint8_t)mpt_rlp_be(vbe, 32, e->value_rlp);
+    return true;
+}
+
+// Account entry for MPT collection
+typedef struct {
+    uint8_t  addr_hash[32];
+    uint8_t  value_rlp[120];
+    uint8_t  value_len;
+} mpt_acct_entry_t;
+
+typedef struct {
+    mpt_acct_entry_t *entries;
+    size_t count, cap;
+    bool prune_empty;
+    mem_art_t *storage_roots;   // addr[20] → hash_t
+} mpt_acct_ctx_t;
+
+static bool mpt_collect_acct_cb(const uint8_t *key, size_t key_len,
+                                  const void *value, size_t value_len,
+                                  void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    mpt_acct_ctx_t *ctx = (mpt_acct_ctx_t *)user_data;
+    const cached_account_t *ca = (const cached_account_t *)value;
+
+    // Only include accounts that exist in the state
+    if (!ca->existed) return true;
+
+    const uint8_t *code_hash = ca->has_code
+        ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
+
+    const void *sr_ptr = mem_art_get(ctx->storage_roots, ca->addr.bytes, 20, NULL);
+    const uint8_t *storage_root = sr_ptr
+        ? ((const hash_t *)sr_ptr)->bytes : HASH_EMPTY_STORAGE.bytes;
+
+    // Prune empty accounts (EIP-161+)
+    bool is_empty = (ca->nonce == 0 &&
+                     uint256_is_zero(&ca->balance) &&
+                     !ca->has_code &&
+                     memcmp(storage_root, HASH_EMPTY_STORAGE.bytes, 32) == 0);
+    if (is_empty && ctx->prune_empty) return true;
+
+    if (ctx->count >= ctx->cap) {
+        size_t nc = ctx->cap ? ctx->cap * 2 : 1024;
+        mpt_acct_entry_t *ne = realloc(ctx->entries, nc * sizeof(*ne));
+        if (!ne) return false;
+        ctx->entries = ne; ctx->cap = nc;
+    }
+    mpt_acct_entry_t *e = &ctx->entries[ctx->count++];
+    hash_t ah = hash_keccak256(ca->addr.bytes, 20);
+    memcpy(e->addr_hash, ah.bytes, 32);
+    e->value_len = (uint8_t)mpt_rlp_account(
+        ca->nonce, &ca->balance, storage_root, code_hash, e->value_rlp);
+    return true;
+}
+
+// Debug: dump block_dirty accounts and storage
+static bool debug_dump_acct_cb(const uint8_t *key, size_t key_len,
+                                const void *value, size_t value_len,
+                                void *user_data) {
+    (void)key_len; (void)value_len; (void)user_data;
+    const cached_account_t *ca = (const cached_account_t *)value;
+    if (!ca->block_dirty && !ca->block_code_dirty) return true;
+    fprintf(stderr, "  DIRTY_ACCT %02x%02x..%02x%02x nonce=%lu has_code=%d existed=%d created=%d block_dirty=%d bal=",
+            key[0], key[1], key[18], key[19],
+            ca->nonce, ca->has_code, ca->existed, ca->created, ca->block_dirty);
+    uint8_t bal[32]; uint256_to_bytes(&ca->balance, bal);
+    for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", bal[i]);
+    fprintf(stderr, "\n");
+    return true;
+}
+static bool debug_dump_slot_cb(const uint8_t *key, size_t key_len,
+                                const void *value, size_t value_len,
+                                void *user_data) {
+    (void)key_len; (void)value_len; (void)user_data;
+    const cached_slot_t *cs = (const cached_slot_t *)value;
+    if (!cs->block_dirty) return true;
+    fprintf(stderr, "  DIRTY_SLOT addr=%02x%02x..%02x%02x slot=",
+            key[0], key[1], key[18], key[19]);
+    for (int i = 20; i < 52; i++) fprintf(stderr, "%02x", key[i]);
+    uint8_t vbe[32]; uint256_to_bytes(&cs->current, vbe);
+    fprintf(stderr, " val=");
+    for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", vbe[i]);
+    fprintf(stderr, "\n");
+    return true;
+}
+void evm_state_debug_dump(evm_state_t *es) {
+    fprintf(stderr, "=== EVM STATE DEBUG DUMP ===\n");
+    mem_art_foreach(&es->accounts, debug_dump_acct_cb, NULL);
+    mem_art_foreach(&es->storage, debug_dump_slot_cb, NULL);
+    fprintf(stderr, "=== END DUMP ===\n");
+}
+
+// Debug: count accounts in MPT
+static bool mpt_debug_count_cb(const uint8_t *key, size_t key_len,
+                                const void *value, size_t value_len,
+                                void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    size_t *counts = (size_t *)user_data;
+    const cached_account_t *ca = (const cached_account_t *)value;
+    counts[0]++;  // total cached
+    if (ca->existed) counts[1]++;
+    if (ca->block_dirty) counts[2]++;
+    if (ca->has_code) counts[3]++;
+    return true;
+}
+
+// Debug: dump all state to file for Python cross-validation
+typedef struct {
+    FILE *f;
+    mem_art_t *storage;
+} dump_ctx_t;
+
+static bool mpt_dump_acct_cb(const uint8_t *key, size_t key_len,
+                               const void *value, size_t value_len,
+                               void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    dump_ctx_t *ctx = (dump_ctx_t *)user_data;
+    const cached_account_t *ca = (const cached_account_t *)value;
+    if (!ca->existed) return true;
+    // addr nonce balance_hex has_code code_hash_hex
+    fprintf(ctx->f, "ACCT ");
+    for (int i = 0; i < 20; i++) fprintf(ctx->f, "%02x", ca->addr.bytes[i]);
+    fprintf(ctx->f, " %lu ", ca->nonce);
+    uint8_t bal[32]; uint256_to_bytes(&ca->balance, bal);
+    for (int i = 0; i < 32; i++) fprintf(ctx->f, "%02x", bal[i]);
+    fprintf(ctx->f, " %d ", ca->has_code);
+    const uint8_t *ch = ca->has_code ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
+    for (int i = 0; i < 32; i++) fprintf(ctx->f, "%02x", ch[i]);
+    fprintf(ctx->f, "\n");
+    return true;
+}
+
+static bool mpt_dump_slot_cb(const uint8_t *key, size_t key_len,
+                               const void *value, size_t value_len,
+                               void *user_data) {
+    (void)key_len; (void)value_len;
+    dump_ctx_t *ctx = (dump_ctx_t *)user_data;
+    const cached_slot_t *cs = (const cached_slot_t *)value;
+    if (uint256_is_zero(&cs->current)) return true;
+    // SLOT addr slot_be value_be
+    fprintf(ctx->f, "SLOT ");
+    for (int i = 0; i < 20; i++) fprintf(ctx->f, "%02x", key[i]);
+    fprintf(ctx->f, " ");
+    for (int i = 20; i < 52; i++) fprintf(ctx->f, "%02x", key[i]);
+    fprintf(ctx->f, " ");
+    uint8_t vbe[32]; uint256_to_bytes(&cs->current, vbe);
+    for (int i = 0; i < 32; i++) fprintf(ctx->f, "%02x", vbe[i]);
+    fprintf(ctx->f, "\n");
+    return true;
+}
+
+void evm_state_dump_mpt(evm_state_t *es, const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    dump_ctx_t ctx = { .f = f, .storage = &es->storage };
+    mem_art_foreach(&es->accounts, mpt_dump_acct_cb, &ctx);
+    mem_art_foreach(&es->storage, mpt_dump_slot_cb, &ctx);
+    fclose(f);
+    fprintf(stderr, "MPT state dumped to %s\n", path);
+}
+
+hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
+    hash_t root = hash_zero();
+    if (!es) return root;
+
+    if (g_trace_calls) {
+        size_t counts[4] = {0};
+        mem_art_foreach(&es->accounts, mpt_debug_count_cb, counts);
+        fprintf(stderr, "MPT_DEBUG: total_cached=%zu existed=%zu block_dirty=%zu has_code=%zu prune_empty=%d\n",
+                counts[0], counts[1], counts[2], counts[3], prune_empty);
+    }
+
+    // --- Phase 1: collect all non-zero storage entries ---
+    mpt_slot_vec_t sv = {0};
+    mem_art_foreach(&es->storage, mpt_collect_slot_cb, &sv);
+
+    // --- Phase 2: compute per-account storage roots ---
+    // Storage is sorted by addr||slot in mem_art, so group by addr prefix.
+    mem_art_t storage_roots;
+    mem_art_init(&storage_roots);
+
+    mpt_batch_entry_t *batch = NULL;
+    size_t batch_cap = 0;
+    size_t i = 0;
+    while (i < sv.count) {
+        size_t start = i;
+        while (i < sv.count && memcmp(sv.entries[i].addr, sv.entries[start].addr, 20) == 0)
+            i++;
+        size_t n = i - start;
+        if (n > batch_cap) {
+            batch_cap = n;
+            batch = realloc(batch, batch_cap * sizeof(*batch));
+        }
+        for (size_t j = 0; j < n; j++) {
+            memcpy(batch[j].key, sv.entries[start + j].slot_hash, 32);
+            batch[j].value     = sv.entries[start + j].value_rlp;
+            batch[j].value_len = sv.entries[start + j].value_len;
+        }
+        hash_t sr;
+        mpt_compute_root_batch(batch, n, &sr);
+        mem_art_insert(&storage_roots, sv.entries[start].addr, 20, &sr, sizeof(sr));
+    }
+    free(batch);
+    free(sv.entries);
+
+    if (g_trace_calls) {
+        fprintf(stderr, "MPT_DEBUG: storage_entries=%zu\n", sv.count);
+        // Count unique addresses with storage
+        size_t sr_count = 0;
+        // We already computed storage_roots, count them
+    }
+
+    // --- Phase 3: collect account entries ---
+    mpt_acct_ctx_t ac = { .prune_empty = prune_empty, .storage_roots = &storage_roots };
+    mem_art_foreach(&es->accounts, mpt_collect_acct_cb, &ac);
+
+    if (g_trace_calls) {
+        fprintf(stderr, "MPT_DEBUG: accounts_in_trie=%zu\n", ac.count);
+    }
+
+    // --- Phase 4: compute state root ---
+    if (ac.count > 0) {
+        mpt_batch_entry_t *ab = malloc(ac.count * sizeof(*ab));
+        if (ab) {
+            for (size_t j = 0; j < ac.count; j++) {
+                memcpy(ab[j].key, ac.entries[j].addr_hash, 32);
+                ab[j].value     = ac.entries[j].value_rlp;
+                ab[j].value_len = ac.entries[j].value_len;
+            }
+            mpt_compute_root_batch(ab, ac.count, &root);
+            free(ab);
+        }
+    } else {
+        // Empty state: keccak256(0x80)
+        const uint8_t empty_rlp[] = {0x80};
+        root = hash_keccak256(empty_rlp, 1);
+    }
+
+    free(ac.entries);
+    mem_art_destroy(&storage_roots);
     return root;
 }
 
