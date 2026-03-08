@@ -118,6 +118,223 @@ typedef struct {
 } mpt_node_t;
 
 /* =========================================================================
+ * In-memory LRU node cache
+ *
+ * Caches raw RLP bytes keyed by node hash. Eliminates disk I/O for hot
+ * trie nodes (top levels, recently written nodes). All operations O(1).
+ *
+ * Layout: flat pre-allocated entry array + index-based doubly-linked LRU
+ * list + separate hash table (open chaining with index links).
+ * ========================================================================= */
+
+#define NCACHE_SENTINEL 0xFFFFFFFFU
+
+typedef struct {
+    uint8_t  hash[32];
+    uint8_t  rlp[MAX_NODE_RLP];
+    uint16_t rlp_len;
+    uint32_t ht_next;       /* next in hash bucket chain */
+    uint32_t lru_prev;      /* doubly-linked LRU list */
+    uint32_t lru_next;
+} ncache_entry_t;
+
+typedef struct {
+    ncache_entry_t *entries;
+    uint32_t       *buckets;        /* hash table → entry index */
+    uint32_t        capacity;
+    uint32_t        bucket_mask;    /* bucket_count - 1 (power of 2) */
+    uint32_t        count;
+    uint32_t        lru_head;       /* most recently used */
+    uint32_t        lru_tail;       /* least recently used */
+    uint32_t        free_head;      /* free list (uses lru_next for chain) */
+    uint64_t        hits;
+    uint64_t        misses;
+} node_cache_t;
+
+static inline uint32_t ncache_bucket(const node_cache_t *c,
+                                      const uint8_t hash[32]) {
+    uint64_t h;
+    memcpy(&h, hash, 8);
+    return (uint32_t)(h & c->bucket_mask);
+}
+
+static node_cache_t *ncache_create(uint32_t capacity) {
+    if (capacity == 0) return NULL;
+
+    node_cache_t *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+
+    /* Round bucket count up to next power of 2 (at least 2× capacity) */
+    uint32_t bc = 1;
+    while (bc < capacity * 2) bc <<= 1;
+
+    c->entries = calloc(capacity, sizeof(ncache_entry_t));
+    c->buckets = malloc(bc * sizeof(uint32_t));
+    if (!c->entries || !c->buckets) {
+        free(c->entries); free(c->buckets); free(c);
+        return NULL;
+    }
+
+    c->capacity    = capacity;
+    c->bucket_mask = bc - 1;
+    c->count       = 0;
+    c->lru_head    = NCACHE_SENTINEL;
+    c->lru_tail    = NCACHE_SENTINEL;
+    c->hits        = 0;
+    c->misses      = 0;
+
+    /* Initialize buckets to empty */
+    for (uint32_t i = 0; i < bc; i++)
+        c->buckets[i] = NCACHE_SENTINEL;
+
+    /* Build free list (chain through lru_next) */
+    for (uint32_t i = 0; i < capacity; i++)
+        c->entries[i].lru_next = (i + 1 < capacity) ? i + 1 : NCACHE_SENTINEL;
+    c->free_head = 0;
+
+    return c;
+}
+
+static void ncache_destroy(node_cache_t *c) {
+    if (!c) return;
+    free(c->entries);
+    free(c->buckets);
+    free(c);
+}
+
+/* Remove entry from LRU list (does NOT touch hash table or free list) */
+static void ncache_lru_remove(node_cache_t *c, uint32_t idx) {
+    ncache_entry_t *e = &c->entries[idx];
+    if (e->lru_prev != NCACHE_SENTINEL)
+        c->entries[e->lru_prev].lru_next = e->lru_next;
+    else
+        c->lru_head = e->lru_next;
+    if (e->lru_next != NCACHE_SENTINEL)
+        c->entries[e->lru_next].lru_prev = e->lru_prev;
+    else
+        c->lru_tail = e->lru_prev;
+}
+
+/* Push entry to front of LRU list (most recently used) */
+static void ncache_lru_push_front(node_cache_t *c, uint32_t idx) {
+    ncache_entry_t *e = &c->entries[idx];
+    e->lru_prev = NCACHE_SENTINEL;
+    e->lru_next = c->lru_head;
+    if (c->lru_head != NCACHE_SENTINEL)
+        c->entries[c->lru_head].lru_prev = idx;
+    c->lru_head = idx;
+    if (c->lru_tail == NCACHE_SENTINEL)
+        c->lru_tail = idx;
+}
+
+/* Remove entry from its hash bucket chain */
+static void ncache_ht_remove(node_cache_t *c, uint32_t idx) {
+    uint32_t b = ncache_bucket(c, c->entries[idx].hash);
+    uint32_t *prev = &c->buckets[b];
+    while (*prev != NCACHE_SENTINEL) {
+        if (*prev == idx) {
+            *prev = c->entries[idx].ht_next;
+            return;
+        }
+        prev = &c->entries[*prev].ht_next;
+    }
+}
+
+/* Look up a node by hash. On hit, copies RLP to buf and moves to LRU front. */
+static bool ncache_get(node_cache_t *c, const uint8_t hash[32],
+                        uint8_t *buf, uint16_t *out_len) {
+    uint32_t b = ncache_bucket(c, hash);
+    uint32_t idx = c->buckets[b];
+    while (idx != NCACHE_SENTINEL) {
+        ncache_entry_t *e = &c->entries[idx];
+        if (memcmp(e->hash, hash, 32) == 0) {
+            /* Hit — copy data and move to LRU front */
+            memcpy(buf, e->rlp, e->rlp_len);
+            *out_len = e->rlp_len;
+            ncache_lru_remove(c, idx);
+            ncache_lru_push_front(c, idx);
+            c->hits++;
+            return true;
+        }
+        idx = e->ht_next;
+    }
+    c->misses++;
+    return false;
+}
+
+/* Insert or update a node in the cache. Evicts LRU tail if full. */
+static void ncache_put(node_cache_t *c, const uint8_t hash[32],
+                        const uint8_t *rlp, uint16_t rlp_len) {
+    if (rlp_len > MAX_NODE_RLP) return;
+
+    /* Check if already present — update in place */
+    uint32_t b = ncache_bucket(c, hash);
+    uint32_t idx = c->buckets[b];
+    while (idx != NCACHE_SENTINEL) {
+        ncache_entry_t *e = &c->entries[idx];
+        if (memcmp(e->hash, hash, 32) == 0) {
+            memcpy(e->rlp, rlp, rlp_len);
+            e->rlp_len = rlp_len;
+            ncache_lru_remove(c, idx);
+            ncache_lru_push_front(c, idx);
+            return;
+        }
+        idx = e->ht_next;
+    }
+
+    /* Allocate a slot */
+    uint32_t slot;
+    if (c->free_head != NCACHE_SENTINEL) {
+        slot = c->free_head;
+        c->free_head = c->entries[slot].lru_next;
+    } else {
+        /* Evict LRU tail */
+        slot = c->lru_tail;
+        ncache_lru_remove(c, slot);
+        ncache_ht_remove(c, slot);
+        c->count--;
+    }
+
+    /* Fill entry */
+    ncache_entry_t *e = &c->entries[slot];
+    memcpy(e->hash, hash, 32);
+    memcpy(e->rlp, rlp, rlp_len);
+    e->rlp_len = rlp_len;
+
+    /* Insert into hash bucket */
+    b = ncache_bucket(c, hash);
+    e->ht_next = c->buckets[b];
+    c->buckets[b] = slot;
+
+    /* Push to LRU front */
+    ncache_lru_push_front(c, slot);
+    c->count++;
+}
+
+/* Remove a node from the cache (if present). */
+static void ncache_delete(node_cache_t *c, const uint8_t hash[32]) {
+    uint32_t b = ncache_bucket(c, hash);
+    uint32_t idx = c->buckets[b];
+    uint32_t *prev = &c->buckets[b];
+    while (idx != NCACHE_SENTINEL) {
+        ncache_entry_t *e = &c->entries[idx];
+        if (memcmp(e->hash, hash, 32) == 0) {
+            /* Remove from hash chain */
+            *prev = e->ht_next;
+            /* Remove from LRU */
+            ncache_lru_remove(c, idx);
+            /* Return to free list */
+            e->lru_next = c->free_head;
+            c->free_head = idx;
+            c->count--;
+            return;
+        }
+        prev = &e->ht_next;
+        idx = e->ht_next;
+    }
+}
+
+/* =========================================================================
  * Main struct
  * ========================================================================= */
 
@@ -132,6 +349,8 @@ struct mpt_store {
     size_t           dirty_count;
     size_t           dirty_cap;
     bool             batch_active;
+
+    node_cache_t    *cache;          /* NULL = no caching */
 
     char            *idx_path;
     char            *dat_path;
@@ -465,6 +684,13 @@ static bool decode_node(const uint8_t *rlp, size_t rlp_len, mpt_node_t *node) {
  * Returns the RLP length, or 0 on failure. */
 static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
                             uint8_t *buf) {
+    /* Check cache first */
+    if (ms->cache) {
+        uint16_t cached_len;
+        if (ncache_get(ms->cache, hash, buf, &cached_len))
+            return cached_len;
+    }
+
     node_record_t rec;
     if (!disk_hash_get(ms->index, hash, &rec))
         return 0;
@@ -474,6 +700,11 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
                       (off_t)(PAGE_SIZE + rec.offset));
     if (n != (ssize_t)rec.length)
         return 0;
+
+    /* Populate cache on miss */
+    if (ms->cache)
+        ncache_put(ms->cache, hash, buf, (uint16_t)rec.length);
+
     return rec.length;
 }
 
@@ -500,6 +731,11 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
 
     ms->data_size += rlp_len;
     ms->live_bytes += rlp_len;
+
+    /* Cache newly written node — very likely to be read next block */
+    if (ms->cache && rlp_len <= MAX_NODE_RLP)
+        ncache_put(ms->cache, out_hash, rlp, (uint16_t)rlp_len);
+
     return true;
 }
 
@@ -512,6 +748,10 @@ static void delete_node(mpt_store_t *ms, const uint8_t hash[32]) {
             ms->live_bytes -= rec.length;
     }
     disk_hash_delete(ms->index, hash);
+
+    /* Evict from cache */
+    if (ms->cache)
+        ncache_delete(ms->cache, hash);
 }
 
 /* =========================================================================
@@ -720,6 +960,7 @@ void mpt_store_destroy(mpt_store_t *ms) {
         free(ms->dirty);
     }
 
+    ncache_destroy(ms->cache);
     disk_hash_destroy(ms->index);
     close(ms->data_fd);
     free(ms->idx_path);
@@ -1468,6 +1709,12 @@ bool mpt_store_compact(mpt_store_t *ms) {
  * Stats
  * ========================================================================= */
 
+void mpt_store_set_cache(mpt_store_t *ms, uint32_t max_entries) {
+    if (!ms) return;
+    ncache_destroy(ms->cache);
+    ms->cache = ncache_create(max_entries); /* NULL if max_entries == 0 */
+}
+
 mpt_store_stats_t mpt_store_stats(const mpt_store_t *ms) {
     mpt_store_stats_t st = {0};
     if (!ms) return st;
@@ -1481,6 +1728,13 @@ mpt_store_stats_t mpt_store_stats(const mpt_store_t *ms) {
     st.live_data_bytes = ms->live_bytes;
     st.garbage_bytes = ms->data_size > ms->live_bytes
                      ? ms->data_size - ms->live_bytes : 0;
+
+    if (ms->cache) {
+        st.cache_hits     = ms->cache->hits;
+        st.cache_misses   = ms->cache->misses;
+        st.cache_count    = ms->cache->count;
+        st.cache_capacity = ms->cache->capacity;
+    }
 
     return st;
 }

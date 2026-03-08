@@ -125,6 +125,18 @@ void mpt_store_discard_batch(mpt_store_t *ms);
 bool mpt_store_compact(mpt_store_t *ms);
 
 /* =========================================================================
+ * Node Cache
+ * ========================================================================= */
+
+/**
+ * Enable an in-memory LRU cache for hot trie nodes.
+ * max_entries: number of cache slots (0 = disable cache).
+ * Each entry uses ~1070 bytes, so 32K entries ≈ 34 MB.
+ * Can be called at any time; replaces any existing cache.
+ */
+void mpt_store_set_cache(mpt_store_t *ms, uint32_t max_entries);
+
+/* =========================================================================
  * Stats
  * ========================================================================= */
 
@@ -133,6 +145,10 @@ typedef struct {
     uint64_t data_file_size;  /** Total .dat file size in bytes */
     uint64_t live_data_bytes; /** Approximate bytes of live node data */
     uint64_t garbage_bytes;   /** data_file_size - header - live_data_bytes */
+    uint64_t cache_hits;      /** Cache hit count (0 if no cache) */
+    uint64_t cache_misses;    /** Cache miss count (0 if no cache) */
+    uint32_t cache_count;     /** Current entries in cache */
+    uint32_t cache_capacity;  /** Max cache entries */
 } mpt_store_stats_t;
 
 /**
