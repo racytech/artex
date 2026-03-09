@@ -143,9 +143,9 @@ target_link_libraries(mpt common)
 
 # MPT Store (persistent Merkle Patricia Trie with incremental updates)
 add_library(mpt_store STATIC
-    mpt/src/mpt_store.c
+    database/src/mpt_store.c
 )
-target_include_directories(mpt_store PUBLIC ${CMAKE_SOURCE_DIR}/mpt/include)
+target_include_directories(mpt_store PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 target_link_libraries(mpt_store disk_hash common)
 
 #==============================================================================
@@ -456,14 +456,14 @@ add_test(NAME test_evm_state_audit COMMAND test_evm_state_audit)
 
 # Test: MPT Store (persistent trie with incremental updates)
 add_executable(test_mpt_store
-    mpt/tests/test_mpt_store.c
+    database/tests/test_mpt_store.c
 )
 target_link_libraries(test_mpt_store mpt_store mpt common)
 add_test(NAME test_mpt_store COMMAND test_mpt_store)
 
 # Test: MPT Store cross-validation against Python reference vectors
 add_executable(test_mpt_store_vectors
-    mpt/tests/test_mpt_store_vectors.c
+    database/tests/test_mpt_store_vectors.c
 )
 target_link_libraries(test_mpt_store_vectors mpt_store common)
 add_test(NAME test_mpt_store_vectors
