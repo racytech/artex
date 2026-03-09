@@ -255,11 +255,13 @@ bool transaction_execute(
     result->status = EVM_SUCCESS;
 
     // Set block environment in EVM (this will determine the fork)
-    // Post-merge (Paris+): DIFFICULTY opcode returns PREVRANDAO
+    // Post-merge (Paris+): DIFFICULTY opcode returns PREVRANDAO (EIP-4399)
+    // Pre-merge: use the difficulty field from the block header.
+    // We must check the fork level, NOT whether mix_hash is non-zero,
+    // because pre-merge PoW blocks have non-zero mix_hash (the PoW solution).
+    evm_fork_t tx_fork = fork_get_active(env->block_number, env->timestamp, evm->chain_config);
     uint256_t block_difficulty = env->difficulty;
-    hash_t zero_hash;
-    memset(&zero_hash, 0, sizeof(zero_hash));
-    if (memcmp(&env->prev_randao, &zero_hash, sizeof(hash_t)) != 0) {
+    if (tx_fork >= FORK_PARIS) {
         block_difficulty = uint256_from_bytes(env->prev_randao.bytes, 32);
     }
     evm_block_env_t block_env = {
