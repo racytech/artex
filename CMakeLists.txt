@@ -575,6 +575,23 @@ target_link_libraries(test_loopback portal discv5 portal_wire ssz history)
 add_test(NAME test_loopback COMMAND test_loopback)
 
 #==============================================================================
+# TUI — Terminal Dashboard
+#==============================================================================
+
+add_library(dashboard STATIC
+    tui/src/dashboard.c
+)
+target_include_directories(dashboard PUBLIC
+    ${CMAKE_SOURCE_DIR}/tui/include
+)
+
+# Demo: Dashboard (visual test — not automated)
+add_executable(test_dashboard
+    tui/tests/test_dashboard.c
+)
+target_link_libraries(test_dashboard dashboard)
+
+#==============================================================================
 # Build Summary
 #==============================================================================
 
