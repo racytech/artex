@@ -3,10 +3,15 @@
  *
  * Two-file design:
  *   <path>.idx — disk_hash index: node_hash (32B) → {offset, length} (12B)
- *   <path>.dat — append-only flat file of RLP-encoded trie node data
+ *   <path>.dat — slot-allocated flat file of RLP-encoded trie node data
+ *
+ * Slot allocation: nodes are stored in size-class slots (64, 128, 256, 512,
+ * 1024 bytes). Deleted slots go onto per-class free lists (intrusive linked
+ * lists on disk). New writes reuse free slots before appending. This
+ * eliminates garbage accumulation — no compaction needed in steady state.
  *
  * Crash-safe: data written before index (orphaned bytes = harmless).
- * Root hash written to .dat header only on sync().
+ * Root hash and free list heads written to .dat header only on sync().
  */
 
 #include "mpt_store.h"
@@ -32,6 +37,14 @@
 #define MAX_NODE_RLP       1024         /* generous upper bound for node RLP */
 #define DIRTY_INIT_CAP     256
 
+/* Size-class slot allocator: nodes are padded to the smallest class that fits.
+ * Freed slots form intrusive linked lists (next-pointer stored in first 8B). */
+#define NUM_SIZE_CLASSES    5
+static const uint16_t SIZE_CLASSES[NUM_SIZE_CLASSES] = {64, 128, 256, 512, 1024};
+
+/* Default LRU cache: 2 GB */
+#define MPT_DEFAULT_CACHE_MB 2048
+
 /* Empty trie root = keccak256(RLP("")) = keccak256(0x80) */
 static const uint8_t EMPTY_ROOT[32] = {
     0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
@@ -44,12 +57,18 @@ static const uint8_t EMPTY_ROOT[32] = {
  * On-disk types
  * ========================================================================= */
 
+/* Max free offsets that fit in the header (4096 - 76 = 4020 bytes = 502 offsets).
+ * Overflow is silently dropped on sync — lost slots become padding waste. */
+#define MAX_HDR_FREE_OFFSETS  502
+
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint32_t version;
     uint8_t  root_hash[32];
-    uint64_t data_size;     /* total bytes written after header */
-    uint8_t  reserved[4048];
+    uint64_t data_size;                        /* total bytes allocated after header */
+    uint64_t free_slot_bytes;                  /* total bytes on free lists */
+    uint32_t free_counts[NUM_SIZE_CLASSES];    /* entries per size class (20 bytes) */
+    uint8_t  free_data[4020];                  /* packed uint64_t offsets per class */
 } mpt_store_header_t;
 
 _Static_assert(sizeof(mpt_store_header_t) == PAGE_SIZE,
@@ -335,6 +354,19 @@ static void ncache_delete(node_cache_t *c, const uint8_t hash[32]) {
 }
 
 /* =========================================================================
+ * In-memory free list (one per size class)
+ *
+ * Simple dynamic array of free slot offsets. Zero disk I/O during normal
+ * operation. Serialized into the .dat header on sync().
+ * ========================================================================= */
+
+typedef struct {
+    uint64_t *offsets;
+    uint32_t  count;
+    uint32_t  capacity;
+} free_list_t;
+
+/* =========================================================================
  * Main struct
  * ========================================================================= */
 
@@ -342,8 +374,12 @@ struct mpt_store {
     disk_hash_t     *index;
     int              data_fd;
     uint64_t         data_size;
-    uint64_t         live_bytes;     /* sum of live node sizes */
+    uint64_t         live_bytes;     /* sum of live node RLP sizes */
     uint8_t          root_hash[32];
+
+    /* Size-class free lists (in-memory, serialized to header on sync) */
+    free_list_t      free_lists[NUM_SIZE_CLASSES];
+    uint64_t         free_slot_bytes; /* total bytes on free lists */
 
     dirty_entry_t   *dirty;
     size_t           dirty_count;
@@ -377,13 +413,71 @@ static void keccak(const uint8_t *data, size_t len, uint8_t out[32]) {
     keccak_final(&ctx, out);
 }
 
-static void write_header(int fd, const uint8_t root[32], uint64_t data_size) {
+static bool free_list_push(free_list_t *fl, uint64_t offset) {
+    if (fl->count >= fl->capacity) {
+        uint32_t new_cap = fl->capacity ? fl->capacity * 2 : 64;
+        uint64_t *new_buf = realloc(fl->offsets, new_cap * sizeof(uint64_t));
+        if (!new_buf) return false;
+        fl->offsets = new_buf;
+        fl->capacity = new_cap;
+    }
+    fl->offsets[fl->count++] = offset;
+    return true;
+}
+
+static bool free_list_pop(free_list_t *fl, uint64_t *out) {
+    if (fl->count == 0) return false;
+    *out = fl->offsets[--fl->count];
+    return true;
+}
+
+static void free_list_clear(free_list_t *fl) {
+    fl->count = 0;
+}
+
+static void free_list_destroy(free_list_t *fl) {
+    free(fl->offsets);
+    fl->offsets = NULL;
+    fl->count = fl->capacity = 0;
+}
+
+/* Forward declaration (used by mpt_store_create/open) */
+void mpt_store_set_cache_mb(mpt_store_t *ms, uint32_t megabytes);
+
+/* Return index of smallest size class that fits `len` bytes */
+static int size_class_for(uint32_t len) {
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
+        if (len <= SIZE_CLASSES[i]) return i;
+    return NUM_SIZE_CLASSES - 1; /* shouldn't happen: MAX_NODE_RLP == 1024 */
+}
+
+static void write_header(int fd, const mpt_store_t *ms) {
     mpt_store_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.magic     = MPT_STORE_MAGIC;
     hdr.version   = MPT_STORE_VERSION;
-    hdr.data_size = data_size;
-    memcpy(hdr.root_hash, root, 32);
+    hdr.data_size = ms->data_size;
+    memcpy(hdr.root_hash, ms->root_hash, 32);
+    hdr.free_slot_bytes = ms->free_slot_bytes;
+
+    /* Serialize in-memory free lists into header */
+    uint32_t total = 0;
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
+        total += ms->free_lists[i].count;
+
+    /* Pack offsets sequentially: class 0, class 1, ... Truncate if overflow */
+    size_t pos = 0;
+    uint64_t *dst = (uint64_t *)hdr.free_data;
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+        uint32_t avail = (MAX_HDR_FREE_OFFSETS > pos)
+                       ? (uint32_t)(MAX_HDR_FREE_OFFSETS - pos) : 0;
+        uint32_t n = ms->free_lists[i].count < avail
+                   ? ms->free_lists[i].count : avail;
+        hdr.free_counts[i] = n;
+        for (uint32_t j = 0; j < n; j++)
+            dst[pos++] = ms->free_lists[i].offsets[j];
+    }
+
     (void)pwrite(fd, &hdr, PAGE_SIZE, 0);
 }
 
@@ -709,6 +803,7 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
 }
 
 /* Write a node to the data file and insert its hash into the index.
+ * Uses size-class free lists to reuse deleted slots before appending.
  * Returns true on success. */
 static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
                        uint8_t out_hash[32]) {
@@ -718,18 +813,30 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
     if (disk_hash_contains(ms->index, out_hash))
         return true;
 
-    /* Append to data file */
+    /* Allocate a slot: try free list first, then append */
+    int sc = size_class_for((uint32_t)rlp_len);
+    uint16_t slot_size = SIZE_CLASSES[sc];
+    uint64_t write_offset;
+
+    if (free_list_pop(&ms->free_lists[sc], &write_offset)) {
+        /* Reusing a freed slot — no disk I/O needed */
+        ms->free_slot_bytes -= slot_size;
+    } else {
+        /* Append at end of data area */
+        write_offset = ms->data_size;
+        ms->data_size += slot_size;
+    }
+
     ssize_t n = pwrite(ms->data_fd, rlp, rlp_len,
-                       (off_t)(PAGE_SIZE + ms->data_size));
+                       (off_t)(PAGE_SIZE + write_offset));
     if (n != (ssize_t)rlp_len)
         return false;
 
-    /* Insert index entry */
-    node_record_t rec = { .offset = ms->data_size, .length = (uint32_t)rlp_len };
+    /* Insert index entry (stores actual RLP length, not slot size) */
+    node_record_t rec = { .offset = write_offset, .length = (uint32_t)rlp_len };
     if (!disk_hash_put(ms->index, out_hash, &rec))
         return false;
 
-    ms->data_size += rlp_len;
     ms->live_bytes += rlp_len;
 
     /* Cache newly written node — very likely to be read next block */
@@ -739,13 +846,18 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
     return true;
 }
 
-/* Delete a node's index entry (data stays as garbage in .dat) */
+/* Delete a node: remove from index and push its slot onto the free list */
 static void delete_node(mpt_store_t *ms, const uint8_t hash[32]) {
-    /* Look up the record to get its size before deleting */
+    /* Look up the record to get offset and size before deleting */
     node_record_t rec;
     if (disk_hash_get(ms->index, hash, &rec)) {
         if (ms->live_bytes >= rec.length)
             ms->live_bytes -= rec.length;
+
+        /* Push slot onto its size-class free list (in-memory, no disk I/O) */
+        int sc = size_class_for(rec.length);
+        free_list_push(&ms->free_lists[sc], rec.offset);
+        ms->free_slot_bytes += SIZE_CLASSES[sc];
     }
     disk_hash_delete(ms->index, hash);
 
@@ -883,8 +995,6 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
         return NULL;
     }
 
-    write_header(data_fd, EMPTY_ROOT, 0);
-
     mpt_store_t *ms = calloc(1, sizeof(*ms));
     if (!ms) {
         close(data_fd);
@@ -900,6 +1010,12 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
     memcpy(ms->root_hash, EMPTY_ROOT, 32);
     ms->idx_path  = idx_path;
     ms->dat_path  = dat_path;
+    /* free_heads and free_slot_bytes zeroed by calloc */
+
+    write_header(data_fd, ms);
+
+    /* Enable default LRU cache */
+    mpt_store_set_cache_mb(ms, MPT_DEFAULT_CACHE_MB);
 
     return ms;
 }
@@ -944,8 +1060,23 @@ mpt_store_t *mpt_store_open(const char *path) {
     ms->data_size  = hdr.data_size;
     ms->live_bytes = hdr.data_size; /* best estimate; will track from here */
     memcpy(ms->root_hash, hdr.root_hash, 32);
+    /* Deserialize free lists from header */
+    ms->free_slot_bytes = hdr.free_slot_bytes;
+    {
+        const uint64_t *src = (const uint64_t *)hdr.free_data;
+        size_t pos = 0;
+        for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+            uint32_t n = hdr.free_counts[i];
+            if (n > MAX_HDR_FREE_OFFSETS - pos) n = 0; /* corrupt guard */
+            for (uint32_t j = 0; j < n; j++)
+                free_list_push(&ms->free_lists[i], src[pos++]);
+        }
+    }
     ms->idx_path  = idx_path;
     ms->dat_path  = dat_path;
+
+    /* Enable default LRU cache */
+    mpt_store_set_cache_mb(ms, MPT_DEFAULT_CACHE_MB);
 
     return ms;
 }
@@ -961,6 +1092,8 @@ void mpt_store_destroy(mpt_store_t *ms) {
     }
 
     ncache_destroy(ms->cache);
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
+        free_list_destroy(&ms->free_lists[i]);
     disk_hash_destroy(ms->index);
     close(ms->data_fd);
     free(ms->idx_path);
@@ -970,7 +1103,7 @@ void mpt_store_destroy(mpt_store_t *ms) {
 
 void mpt_store_sync(mpt_store_t *ms) {
     if (!ms) return;
-    write_header(ms->data_fd, ms->root_hash, ms->data_size);
+    write_header(ms->data_fd, ms);
     fsync(ms->data_fd);
     disk_hash_sync(ms->index);
 }
@@ -1641,12 +1774,13 @@ bool mpt_store_compact(mpt_store_t *ms) {
     memcpy(tmp_base, ms->dat_path, base_len);
     memcpy(tmp_base + base_len, ".compact", 9);
 
-    /* Create new store */
+    /* Create new store (disable cache — temp store doesn't need it) */
     mpt_store_t *new_ms = mpt_store_create(tmp_base, disk_hash_count(ms->index));
     if (!new_ms) {
         free(tmp_path); free(tmp_base);
         return false;
     }
+    mpt_store_set_cache(new_ms, 0); /* no cache for temp compaction store */
 
     /* Walk and copy all reachable nodes */
     node_ref_t root_ref;
@@ -1690,10 +1824,25 @@ bool mpt_store_compact(mpt_store_t *ms) {
     ms->data_size  = new_ms->data_size;
     ms->live_bytes = new_ms->live_bytes; /* after compact, all data is live */
 
+    /* Reset free lists — compacted store has no free slots */
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
+        free_list_clear(&ms->free_lists[i]);
+    ms->free_slot_bytes = 0;
+
+    /* Invalidate cache — all offsets changed after compaction */
+    if (ms->cache) {
+        uint32_t cap = ms->cache->capacity;
+        ncache_destroy(ms->cache);
+        ms->cache = ncache_create(cap);
+    }
+
     /* Cleanup new_ms (files already renamed, just free struct) */
     new_ms->idx_path = NULL;
     new_ms->dat_path = NULL;
     /* Can't use mpt_store_destroy since index/fd are stale */
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
+        free_list_destroy(&new_ms->free_lists[i]);
+    ncache_destroy(new_ms->cache);
     free(new_ms->dirty);
     free(new_ms);
 
@@ -1715,6 +1864,18 @@ void mpt_store_set_cache(mpt_store_t *ms, uint32_t max_entries) {
     ms->cache = ncache_create(max_entries); /* NULL if max_entries == 0 */
 }
 
+void mpt_store_set_cache_mb(mpt_store_t *ms, uint32_t megabytes) {
+    if (!ms) return;
+    if (megabytes == 0) {
+        mpt_store_set_cache(ms, 0);
+        return;
+    }
+    uint32_t entries = (uint32_t)(
+        (uint64_t)megabytes * 1024 * 1024 / sizeof(ncache_entry_t));
+    if (entries == 0) entries = 1;
+    mpt_store_set_cache(ms, entries);
+}
+
 mpt_store_stats_t mpt_store_stats(const mpt_store_t *ms) {
     mpt_store_stats_t st = {0};
     if (!ms) return st;
@@ -1726,8 +1887,9 @@ mpt_store_stats_t mpt_store_stats(const mpt_store_t *ms) {
         st.data_file_size = (uint64_t)sb.st_size;
 
     st.live_data_bytes = ms->live_bytes;
-    st.garbage_bytes = ms->data_size > ms->live_bytes
-                     ? ms->data_size - ms->live_bytes : 0;
+    st.free_bytes = ms->free_slot_bytes;
+    st.garbage_bytes = ms->data_size > ms->live_bytes + ms->free_slot_bytes
+                     ? ms->data_size - ms->live_bytes - ms->free_slot_bytes : 0;
 
     if (ms->cache) {
         st.cache_hits     = ms->cache->hits;

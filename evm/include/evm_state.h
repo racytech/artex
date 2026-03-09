@@ -8,6 +8,7 @@
 #include "hash.h"
 #include "verkle_state.h"
 #include "witness_gas.h"
+#include "mpt_store.h"
 
 /**
  * EVM State — Typed, in-memory state interface above verkle_state.
@@ -36,8 +37,12 @@ typedef struct evm_state evm_state_t;
 // Lifecycle
 // ============================================================================
 
-/** Create EVM state over an existing verkle_state. vs is NOT owned. */
-evm_state_t *evm_state_create(verkle_state_t *vs);
+/**
+ * Create EVM state over an existing verkle_state. vs is NOT owned.
+ * mpt_path: if non-NULL, enables persistent incremental MPT for state root
+ * computation. If NULL, falls back to batch root rebuild (slow at scale).
+ */
+evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path);
 
 /** Destroy EVM state and free all in-memory caches. */
 void evm_state_destroy(evm_state_t *es);

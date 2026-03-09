@@ -189,7 +189,7 @@ target_include_directories(evm PUBLIC
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/evm/vendor
 )
-target_link_libraries(evm verkle_state art_database mpt common ssl crypto secp256k1 blst)
+target_link_libraries(evm verkle_state art_database mpt mpt_store common ssl crypto secp256k1 blst)
 
 #==============================================================================
 # Libraries — Block Executor

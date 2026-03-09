@@ -482,7 +482,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    state = evm_state_create(vs);
+    state = evm_state_create(vs, "/tmp/chain_replay_mpt");
     if (!state) {
         fprintf(stderr, "Failed to create EVM state\n");
         verkle_state_destroy(vs);

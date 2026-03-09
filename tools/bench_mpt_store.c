@@ -314,12 +314,12 @@ static void usage(const char *prog) {
         "  --updates-per-block <n>  Account updates per block (default: 150)\n"
         "  --report <n>             Report every N blocks (default: 10000)\n"
         "  --compact <n>            Compact every N blocks (0=never, default: 0)\n"
-        "  --cache <n>              Node cache entries (0=off, default: 0; 32768=~34MB)\n"
+        "  --cache-mb <n>           Node cache in MB (default: 2048 = 2 GB, 0=off)\n"
         "  --resume                 Resume from existing store\n"
         "\n"
         "Examples:\n"
         "  %s 1000000                          # 1M blocks (~13M accounts)\n"
-        "  %s 1000000 --cache 32768            # 1M blocks with 32K node cache\n"
+        "  %s 1000000 --cache-mb 512           # 1M blocks with 512 MB cache\n"
         "  %s 10000000 --path /data/mpt_bench  # 10M blocks (~130M accounts)\n"
         "  %s 100000000 --resume               # Continue to 100M blocks\n",
         prog, prog, prog, prog, prog);
@@ -338,7 +338,7 @@ int main(int argc, char **argv) {
     uint32_t updates_per_block = 150;
     uint32_t report_interval = 10000;
     uint32_t compact_interval = 0;
-    uint32_t cache_entries = 0;  /* 0 = disabled */
+    int32_t cache_mb = -1;  /* -1 = use store default (2 GB) */
     bool resume = false;
 
     /* Parse args */
@@ -359,8 +359,8 @@ int main(int argc, char **argv) {
             report_interval = (uint32_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--compact") == 0 && i + 1 < argc) {
             compact_interval = (uint32_t)atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
-            cache_entries = (uint32_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--cache-mb") == 0 && i + 1 < argc) {
+            cache_mb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--resume") == 0) {
             resume = true;
         } else {
@@ -390,13 +390,12 @@ int main(int argc, char **argv) {
     printf("  Report every:     %u blocks\n", report_interval);
     if (compact_interval > 0)
         printf("  Compact every:    %u blocks\n", compact_interval);
-    if (cache_entries > 0) {
-        char cache_mem[32];
-        format_bytes(cache_mem, sizeof(cache_mem),
-                     (size_t)cache_entries * 1070);
-        printf("  Node cache:       %u entries (~%s)\n",
-               cache_entries, cache_mem);
-    }
+    if (cache_mb < 0)
+        printf("  Node cache:       default (2 GB)\n");
+    else if (cache_mb == 0)
+        printf("  Node cache:       disabled\n");
+    else
+        printf("  Node cache:       %d MB\n", cache_mb);
     printf("  Resume:           %s\n", resume ? "yes" : "no");
     printf("\n");
 
@@ -444,9 +443,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Enable node cache if requested */
-    if (cache_entries > 0)
-        mpt_store_set_cache(ms, cache_entries);
+    /* Configure node cache (store auto-enables 2 GB by default) */
+    if (cache_mb >= 0)
+        mpt_store_set_cache_mb(ms, (uint32_t)cache_mb);
 
     /* PRNG for account selection */
     rng_t rng = rng_create(0xDEADBEEFCAFE1234ULL + start_block);
@@ -467,21 +466,12 @@ int main(int argc, char **argv) {
     uint64_t ops_since_report = 0;
 
     /* Print header */
-    if (cache_entries > 0) {
-        printf("%-12s  %-10s  %-10s  %-12s  %-10s  %-10s  %-8s  %-8s  %s\n",
-               "Block", "Accounts", "blk/s", "ops/s", "RSS", "Disk",
-               "Garbage", "CacheHit", "Root");
-        printf("%-12s  %-10s  %-10s  %-12s  %-10s  %-10s  %-8s  %-8s  %s\n",
-               "-----", "--------", "-----", "-----", "---", "----",
-               "-------", "--------", "----");
-    } else {
-        printf("%-12s  %-10s  %-10s  %-12s  %-10s  %-10s  %-8s  %s\n",
-               "Block", "Accounts", "blk/s", "ops/s", "RSS", "Disk",
-               "Garbage", "Root");
-        printf("%-12s  %-10s  %-10s  %-12s  %-10s  %-10s  %-8s  %s\n",
-               "-----", "--------", "-----", "-----", "---", "----",
-               "-------", "----");
-    }
+    printf("%-12s  %-10s  %-10s  %-12s  %-10s  %-10s  %-8s  %-8s  %s\n",
+           "Block", "Accounts", "blk/s", "ops/s", "RSS", "Disk",
+           "Reuse", "CacheHit", "Root");
+    printf("%-12s  %-10s  %-10s  %-12s  %-10s  %-10s  %-8s  %-8s  %s\n",
+           "-----", "--------", "-----", "-----", "---", "----",
+           "-----", "--------", "----");
 
     for (uint64_t block = start_block; block < num_blocks; block++) {
         mpt_store_begin_batch(ms);
@@ -553,25 +543,21 @@ int main(int argc, char **argv) {
             format_bytes(rss_s, sizeof(rss_s), rss_net * 1024);
             format_bytes(disk_s, sizeof(disk_s), disk);
 
-            double garb_pct = stats.data_file_size > 0
-                ? 100.0 * stats.garbage_bytes / stats.data_file_size
+            /* Reuse: free_bytes / (free_bytes + live_data) — higher = more recycling */
+            double reuse_pct = (stats.free_bytes + stats.live_data_bytes) > 0
+                ? 100.0 * stats.free_bytes / (stats.free_bytes + stats.live_data_bytes)
                 : 0.0;
-            snprintf(garb_s, sizeof(garb_s), "%.1f%%", garb_pct);
+            snprintf(garb_s, sizeof(garb_s), "%.1f%%", reuse_pct);
 
-            if (cache_entries > 0) {
-                uint64_t total_lookups = stats.cache_hits + stats.cache_misses;
-                char hit_s[32];
-                if (total_lookups > 0)
-                    snprintf(hit_s, sizeof(hit_s), "%.1f%%",
-                             100.0 * stats.cache_hits / total_lookups);
-                else
-                    snprintf(hit_s, sizeof(hit_s), "—");
-                printf("%-12s  %-10s  %-10s  %-12s  %-10s  %-10s  %-8s  %-8s  ",
-                       blk_s, acct_s, bps, ops, rss_s, disk_s, garb_s, hit_s);
-            } else {
-                printf("%-12s  %-10s  %-10s  %-12s  %-10s  %-10s  %-8s  ",
-                       blk_s, acct_s, bps, ops, rss_s, disk_s, garb_s);
-            }
+            uint64_t total_lookups = stats.cache_hits + stats.cache_misses;
+            char hit_s[32];
+            if (total_lookups > 0)
+                snprintf(hit_s, sizeof(hit_s), "%.1f%%",
+                         100.0 * stats.cache_hits / total_lookups);
+            else
+                snprintf(hit_s, sizeof(hit_s), "—");
+            printf("%-12s  %-10s  %-10s  %-12s  %-10s  %-10s  %-8s  %-8s  ",
+                   blk_s, acct_s, bps, ops, rss_s, disk_s, garb_s, hit_s);
             print_hash(root);
             printf("\n");
 
@@ -633,12 +619,13 @@ int main(int argc, char **argv) {
     printf("  Disk total:       %s\n", disk_s);
     printf("  Live nodes:       %" PRIu64 "\n", final_stats.node_count);
     printf("  Live data:        %s\n", live_s);
-    printf("  Garbage:          %s (%.1f%%)\n", garb_s,
-           final_stats.data_file_size > 0
-           ? 100.0 * final_stats.garbage_bytes / final_stats.data_file_size
-           : 0.0);
 
-    if (cache_entries > 0) {
+    char free_s[32];
+    format_bytes(free_s, sizeof(free_s), final_stats.free_bytes);
+    printf("  Free list:        %s (available for reuse)\n", free_s);
+    printf("  Padding waste:    %s\n", garb_s);
+
+    {
         uint64_t total_lookups = final_stats.cache_hits + final_stats.cache_misses;
         printf("  Cache:            %u/%u entries",
                final_stats.cache_count, final_stats.cache_capacity);

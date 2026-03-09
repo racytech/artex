@@ -347,7 +347,7 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
         return false;
     }
 
-    runner->state = evm_state_create(runner->vs);
+    runner->state = evm_state_create(runner->vs, NULL);
     if (!runner->state) {
         verkle_state_destroy(runner->vs);
         runner->vs = NULL;
@@ -411,7 +411,7 @@ void test_runner_reset(test_runner_t *runner) {
     make_flat_dirs();
     runner->vs = verkle_state_create_flat(flat_value_dir, flat_commit_dir);
     if (runner->vs) {
-        runner->state = evm_state_create(runner->vs);
+        runner->state = evm_state_create(runner->vs, NULL);
         if (runner->state) {
             runner->evm = evm_create(runner->state, NULL);
         }

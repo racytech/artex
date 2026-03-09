@@ -46,7 +46,7 @@ typedef struct {
 static test_state_t make_state(void) {
     test_state_t ts;
     ts.vs = verkle_state_create();
-    ts.es = evm_state_create(ts.vs);
+    ts.es = evm_state_create(ts.vs, NULL);
     return ts;
 }
 

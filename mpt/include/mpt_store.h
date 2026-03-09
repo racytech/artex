@@ -13,7 +13,11 @@
  *
  * Two files:
  *   <path>.idx — disk_hash index: node_hash[32] → {offset[8], length[4]}
- *   <path>.dat — append-only flat file of RLP-encoded trie node data
+ *   <path>.dat — slot-allocated flat file of RLP-encoded trie node data
+ *
+ * Slot allocation: nodes stored in size-class slots (64–1024 bytes).
+ * Deleted slots go onto per-class free lists. New writes reuse free
+ * slots before appending. Eliminates garbage accumulation.
  *
  * On each block:
  *   1. mpt_store_begin_batch()
@@ -22,10 +26,9 @@
  *      deletes stale nodes, returns new root hash
  *
  * Node reads: root_hash → disk_hash_get → {offset,len} → pread from .dat
- * Two I/O ops per node, both page-cache friendly. ~0 committed RAM.
+ * Two I/O ops per node, both page-cache friendly.
  *
- * Garbage: stale node data accumulates in .dat as dead bytes.
- * mpt_store_compact() rewrites .dat with only live nodes.
+ * Default: 2 GB in-memory LRU cache for hot trie nodes.
  */
 
 typedef struct mpt_store mpt_store_t;
@@ -133,8 +136,17 @@ bool mpt_store_compact(mpt_store_t *ms);
  * max_entries: number of cache slots (0 = disable cache).
  * Each entry uses ~1070 bytes, so 32K entries ≈ 34 MB.
  * Can be called at any time; replaces any existing cache.
+ *
+ * Note: create/open auto-enable a 2 GB cache by default.
+ * Call with 0 to disable.
  */
 void mpt_store_set_cache(mpt_store_t *ms, uint32_t max_entries);
+
+/**
+ * Set cache size in megabytes. Convenience wrapper over set_cache().
+ * 0 = disable cache.
+ */
+void mpt_store_set_cache_mb(mpt_store_t *ms, uint32_t megabytes);
 
 /* =========================================================================
  * Stats
@@ -144,7 +156,8 @@ typedef struct {
     uint64_t node_count;      /** Live nodes in the index */
     uint64_t data_file_size;  /** Total .dat file size in bytes */
     uint64_t live_data_bytes; /** Approximate bytes of live node data */
-    uint64_t garbage_bytes;   /** data_file_size - header - live_data_bytes */
+    uint64_t free_bytes;      /** Bytes on free lists (available for reuse) */
+    uint64_t garbage_bytes;   /** Unreclaimable waste (padding in slots) */
     uint64_t cache_hits;      /** Cache hit count (0 if no cache) */
     uint64_t cache_misses;    /** Cache miss count (0 if no cache) */
     uint32_t cache_count;     /** Current entries in cache */
