@@ -269,7 +269,7 @@ static void test_executor_smoke(void) {
     ASSERT(vs != NULL, "create verkle_state");
 
     /* Create EVM state */
-    evm_state_t *state = evm_state_create(vs, NULL);
+    evm_state_t *state = evm_state_create(vs, "/tmp/test_block_executor_mpt");
     ASSERT(state != NULL, "create evm_state");
 
     /* Create EVM */
@@ -364,7 +364,7 @@ static void test_dao_fork(void) {
     /* Create verkle state + evm state (no EVM needed, just state) */
     verkle_state_t *vs = verkle_state_create();
     ASSERT(vs != NULL, "create verkle_state");
-    evm_state_t *state = evm_state_create(vs, NULL);
+    evm_state_t *state = evm_state_create(vs, "/tmp/test_block_executor_mpt");
     ASSERT(state != NULL, "create evm_state");
 
     /* Pick 3 drain addresses from the list and give them known balances */
@@ -423,7 +423,7 @@ static void test_dao_fork_block_check(void) {
     /* Create state with balance on a drain address */
     verkle_state_t *vs = verkle_state_create();
     ASSERT(vs != NULL, "create verkle_state");
-    evm_state_t *state = evm_state_create(vs, NULL);
+    evm_state_t *state = evm_state_create(vs, "/tmp/test_block_executor_mpt");
     ASSERT(state != NULL, "create evm_state");
     evm_t *evm = evm_create(state, chain_config_mainnet());
     ASSERT(evm != NULL, "create evm");
