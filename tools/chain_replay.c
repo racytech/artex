@@ -44,6 +44,7 @@ static const char *VALUE_DIR  = "/tmp/chain_replay_values";
 static const char *COMMIT_DIR = "/tmp/chain_replay_commits";
 static const char *CKPT_PATH  = "/tmp/chain_replay.ckpt";
 static const char *CKPT_TMP   = "/tmp/chain_replay.ckpt.tmp";
+static const char *MPT_PATH   = "/tmp/chain_replay_mpt";
 
 /* =========================================================================
  * Graceful shutdown via SIGINT
@@ -431,7 +432,8 @@ int main(int argc, char **argv) {
         unlink(CKPT_PATH);
         /* Remove store directories (best-effort) */
         char cmd[512];
-        snprintf(cmd, sizeof(cmd), "rm -rf %s %s 2>/dev/null", VALUE_DIR, COMMIT_DIR);
+        snprintf(cmd, sizeof(cmd), "rm -rf %s %s %s.idx %s.dat 2>/dev/null",
+                 VALUE_DIR, COMMIT_DIR, MPT_PATH, MPT_PATH);
         (void)system(cmd);
     }
 
@@ -482,7 +484,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    state = evm_state_create(vs, "/tmp/chain_replay_mpt");
+    state = evm_state_create(vs, MPT_PATH);
     if (!state) {
         fprintf(stderr, "Failed to create EVM state\n");
         verkle_state_destroy(vs);
