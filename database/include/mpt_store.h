@@ -62,6 +62,13 @@ void mpt_store_destroy(mpt_store_t *ms);
  */
 void mpt_store_sync(mpt_store_t *ms);
 
+/**
+ * Flush deferred writes to disk. Writes all buffered nodes to .dat,
+ * applies pending deletes, syncs both files.
+ * Call at checkpoint time for transactional durability.
+ */
+void mpt_store_flush(mpt_store_t *ms);
+
 /* =========================================================================
  * Trie Root
  * ========================================================================= */

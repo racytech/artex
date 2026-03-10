@@ -62,6 +62,11 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
 void evm_state_destroy(evm_state_t *es);
 
 /**
+ * Flush deferred MPT writes to disk. Call at checkpoint time.
+ */
+void evm_state_flush(evm_state_t *es);
+
+/**
  * Evict all cached accounts and storage slots.
  * Call ONLY after compute_mpt_root (all dirty flags cleared, data on disk).
  * Read-through cache will reload entries on demand from MPT store.

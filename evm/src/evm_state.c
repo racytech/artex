@@ -393,17 +393,25 @@ void evm_state_evict_cache(evm_state_t *es) {
     mem_art_init(&es->storage);
 }
 
+void evm_state_flush(evm_state_t *es) {
+    if (!es) return;
+#ifdef ENABLE_MPT
+    if (es->account_mpt) mpt_store_flush(es->account_mpt);
+    if (es->storage_mpt) mpt_store_flush(es->storage_mpt);
+#endif
+}
+
 void evm_state_destroy(evm_state_t *es) {
     if (!es) return;
 
 #ifdef ENABLE_MPT
-    // Sync and destroy persistent MPT stores
+    // Flush deferred writes and destroy persistent MPT stores
     if (es->account_mpt) {
-        mpt_store_sync(es->account_mpt);
+        mpt_store_flush(es->account_mpt);
         mpt_store_destroy(es->account_mpt);
     }
     if (es->storage_mpt) {
-        mpt_store_sync(es->storage_mpt);
+        mpt_store_flush(es->storage_mpt);
         mpt_store_destroy(es->storage_mpt);
     }
 #endif

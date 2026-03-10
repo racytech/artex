@@ -384,7 +384,7 @@ void sync_destroy(sync_t *sync) {
         if (sync->vs) verkle_state_sync(sync->vs);
 #endif
 #ifdef ENABLE_MPT
-        if (sync->cs) code_store_sync(sync->cs);
+        if (sync->cs) code_store_flush(sync->cs);
 #endif
         checkpoint_save_internal(sync->config.checkpoint_path,
                                  sync->last_block, sync->block_hashes,
@@ -536,19 +536,7 @@ bool sync_execute_block(sync_t *sync,
         sync->config.checkpoint_interval > 0 &&
         sync->blocks_fail == 0 &&
         bn - sync->last_checkpoint_block >= sync->config.checkpoint_interval) {
-#ifdef ENABLE_VERKLE
-        if (sync->vs) verkle_state_sync(sync->vs);
-#endif
-        if (sync->config.checkpoint_path) {
-            checkpoint_save_internal(sync->config.checkpoint_path,
-                                     bn, sync->block_hashes,
-                                     sync->total_gas, sync->blocks_ok,
-                                     sync->blocks_fail);
-            sync->last_checkpoint_block = bn;
-        }
-
-        /* Evict cache to bound memory — data is on disk, read-through reloads */
-        evm_state_evict_cache(sync->state);
+        sync_checkpoint(sync);
     }
 
     block_result_free(&br);
@@ -562,18 +550,25 @@ bool sync_execute_block(sync_t *sync,
 bool sync_checkpoint(sync_t *sync) {
     if (!sync || !sync->config.checkpoint_path) return false;
 
+    /* Flush all stores to disk */
 #ifdef ENABLE_VERKLE
     if (sync->vs) verkle_state_sync(sync->vs);
 #endif
 #ifdef ENABLE_MPT
-    if (sync->cs) code_store_sync(sync->cs);
+    evm_state_flush(sync->state);
+    if (sync->cs) code_store_flush(sync->cs);
 #endif
 
+    /* Write checkpoint marker — the commit point */
     bool ok = checkpoint_save_internal(sync->config.checkpoint_path,
                                        sync->last_block, sync->block_hashes,
                                        sync->total_gas, sync->blocks_ok,
                                        sync->blocks_fail);
     if (ok) sync->last_checkpoint_block = sync->last_block;
+
+    /* Evict cache to bound memory — data is on disk, read-through reloads */
+    evm_state_evict_cache(sync->state);
+
     return ok;
 }
 
