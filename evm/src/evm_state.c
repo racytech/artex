@@ -3,6 +3,7 @@
 #include "keccak256.h"
 #ifdef ENABLE_MPT
 #include "mpt_store.h"
+#include "code_store.h"
 #endif
 #include <stdlib.h>
 #include <string.h>
@@ -119,8 +120,18 @@ struct evm_state {
 #ifdef ENABLE_MPT
     mpt_store_t      *account_mpt;  // persistent incremental account trie
     mpt_store_t      *storage_mpt;  // shared store for all per-account storage tries
+    code_store_t     *code_store;   // content-addressed bytecode store (not owned)
 #endif
 };
+
+// ============================================================================
+// Forward declarations (MPT read-through helpers defined later)
+// ============================================================================
+#ifdef ENABLE_MPT
+static bool mpt_rlp_decode_account(const uint8_t *rlp, size_t len,
+                                     cached_account_t *ca);
+static uint256_t mpt_rlp_decode_storage_value(const uint8_t *rlp, size_t len);
+#endif
 
 // ============================================================================
 // Internal helpers
@@ -188,6 +199,19 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
 
     ca_local.storage_root = HASH_EMPTY_STORAGE;
 
+#ifdef ENABLE_MPT
+    // Read-through: load account from persistent MPT store on cache miss
+    if (es->account_mpt) {
+        hash_t addr_hash = hash_keccak256(addr->bytes, 20);
+        uint8_t rlp_buf[256];
+        uint32_t rlp_len = mpt_store_get(es->account_mpt, addr_hash.bytes,
+                                          rlp_buf, sizeof(rlp_buf));
+        if (rlp_len > 0 && rlp_len <= sizeof(rlp_buf)) {
+            mpt_rlp_decode_account(rlp_buf, rlp_len, &ca_local);
+        }
+    }
+#endif
+
     if (!mem_art_insert(&es->accounts, addr->bytes, ADDRESS_SIZE,
                         &ca_local, sizeof(cached_account_t)))
         return NULL;
@@ -224,6 +248,26 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
     cs_local.current = cs_local.original;
 #endif
 
+#ifdef ENABLE_MPT
+    // Read-through: load storage slot from persistent storage MPT on cache miss
+    if (es->storage_mpt) {
+        cached_account_t *ca = ensure_account(es, addr);
+        if (ca && memcmp(ca->storage_root.bytes, HASH_EMPTY_STORAGE.bytes, 32) != 0) {
+            mpt_store_set_root(es->storage_mpt, ca->storage_root.bytes);
+            uint8_t slot_be[32];
+            uint256_to_bytes(slot, slot_be);
+            hash_t slot_hash = hash_keccak256(slot_be, 32);
+            uint8_t val_rlp[64];
+            uint32_t val_len = mpt_store_get(es->storage_mpt, slot_hash.bytes,
+                                              val_rlp, sizeof(val_rlp));
+            if (val_len > 0 && val_len <= sizeof(val_rlp)) {
+                cs_local.original = mpt_rlp_decode_storage_value(val_rlp, val_len);
+                cs_local.current = cs_local.original;
+            }
+        }
+    }
+#endif
+
     if (!mem_art_insert(&es->storage, skey, SLOT_KEY_SIZE,
                         &cs_local, sizeof(cached_slot_t)))
         return NULL;
@@ -236,7 +280,8 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
 // Lifecycle
 // ============================================================================
 
-evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path) {
+evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
+                               code_store_t *cs) {
 #ifdef ENABLE_VERKLE
     if (!vs) return NULL;
 #else
@@ -244,8 +289,10 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path) {
 #endif
 #ifdef ENABLE_MPT
     if (!mpt_path) return NULL;
+    (void)cs;  /* stored after MPT init */
 #else
     (void)mpt_path;
+    (void)cs;
 #endif
 
     evm_state_t *es = calloc(1, sizeof(evm_state_t));
@@ -319,6 +366,7 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path) {
         free(es);
         return NULL;
     }
+    es->code_store = cs;  /* not owned — caller manages lifecycle */
 #endif
 
     return es;
@@ -541,6 +589,23 @@ bool evm_state_get_code(evm_state_t *es, const address_t *addr,
 
         uint64_t got = verkle_state_get_code(es->vs, addr->bytes, ca->code, len);
         ca->code_size = (uint32_t)got;
+#elif defined(ENABLE_MPT)
+        if (es->code_store) {
+            uint32_t size = code_store_get_size(es->code_store,
+                                                 ca->code_hash.bytes);
+            if (size > 0) {
+                ca->code = malloc(size);
+                if (ca->code) {
+                    code_store_get(es->code_store, ca->code_hash.bytes,
+                                   ca->code, size);
+                    ca->code_size = size;
+                }
+            }
+        }
+        if (!ca->code) {
+            if (out_len) *out_len = 0;
+            return true;
+        }
 #else
         if (out_len) *out_len = 0;
         return true;
@@ -588,6 +653,23 @@ const uint8_t *evm_state_get_code_ptr(evm_state_t *es, const address_t *addr,
 
         uint64_t got = verkle_state_get_code(es->vs, addr->bytes, ca->code, len);
         ca->code_size = (uint32_t)got;
+#elif defined(ENABLE_MPT)
+        if (es->code_store) {
+            uint32_t size = code_store_get_size(es->code_store,
+                                                 ca->code_hash.bytes);
+            if (size > 0) {
+                ca->code = malloc(size);
+                if (ca->code) {
+                    code_store_get(es->code_store, ca->code_hash.bytes,
+                                   ca->code, size);
+                    ca->code_size = size;
+                }
+            }
+        }
+        if (!ca->code) {
+            if (out_len) *out_len = 0;
+            return NULL;
+        }
 #else
         if (out_len) *out_len = 0;
         return NULL;
@@ -629,6 +711,10 @@ void evm_state_set_code(evm_state_t *es, const address_t *addr,
         }
         ca->has_code = true;
         ca->code_hash = hash_keccak256(code, len);
+#ifdef ENABLE_MPT
+        if (es->code_store)
+            code_store_put(es->code_store, ca->code_hash.bytes, code, len);
+#endif
     } else {
         ca->has_code = false;
         ca->code_hash = hash_zero();
@@ -1522,6 +1608,103 @@ static size_t mpt_rlp_account(uint64_t nonce, const uint256_t *balance,
         memcpy(out + 2, payload, pos);
         return 2 + pos;
     }
+}
+
+// Decode RLP byte string header. Returns data offset and sets *data_len.
+// For single byte < 0x80, offset is 0 and data_len is 1.
+static size_t rlp_byte_hdr(const uint8_t *buf, size_t buf_len,
+                             size_t *data_len) {
+    if (buf_len == 0) return 0;
+    uint8_t b = buf[0];
+    if (b < 0x80) { *data_len = 1; return 0; }
+    if (b <= 0xb7) { *data_len = b - 0x80; return 1; }
+    size_t ll = b - 0xb7;
+    if (1 + ll > buf_len) return 0;
+    size_t len = 0;
+    for (size_t i = 0; i < ll; i++) len = (len << 8) | buf[1 + i];
+    *data_len = len;
+    return 1 + ll;
+}
+
+// Decode RLP list header. Returns data offset (payload start).
+static size_t rlp_list_hdr(const uint8_t *buf, size_t buf_len,
+                             size_t *payload_len) {
+    if (buf_len == 0) return 0;
+    uint8_t b = buf[0];
+    if (b >= 0xc0 && b <= 0xf7) { *payload_len = b - 0xc0; return 1; }
+    if (b >= 0xf8) {
+        size_t ll = b - 0xf7;
+        if (1 + ll > buf_len) return 0;
+        size_t len = 0;
+        for (size_t i = 0; i < ll; i++) len = (len << 8) | buf[1 + i];
+        *payload_len = len;
+        return 1 + ll;
+    }
+    return 0; /* not a list */
+}
+
+// Decode RLP [nonce, balance, storage_root, code_hash] → cached_account_t fields.
+// Sets nonce, balance, storage_root, code_hash, has_code, existed.
+static bool mpt_rlp_decode_account(const uint8_t *rlp, size_t len,
+                                     cached_account_t *ca) {
+    size_t payload_len;
+    size_t hdr = rlp_list_hdr(rlp, len, &payload_len);
+    if (hdr == 0 || hdr + payload_len > len) return false;
+
+    const uint8_t *p = rlp + hdr;
+    const uint8_t *end = p + payload_len;
+
+    // 1. nonce (RLP integer)
+    size_t item_len;
+    size_t off = rlp_byte_hdr(p, (size_t)(end - p), &item_len);
+    if (p + off + item_len > end) return false;
+    const uint8_t *data = p + off;
+    ca->nonce = 0;
+    for (size_t i = 0; i < item_len; i++)
+        ca->nonce = (ca->nonce << 8) | data[i];
+    p += off + item_len;
+
+    // 2. balance (RLP big-endian integer → uint256)
+    off = rlp_byte_hdr(p, (size_t)(end - p), &item_len);
+    if (p + off + item_len > end) return false;
+    data = p + off;
+    uint8_t bal_be[32];
+    memset(bal_be, 0, 32);
+    if (item_len > 0 && item_len <= 32)
+        memcpy(bal_be + 32 - item_len, data, item_len);
+    ca->balance = uint256_from_bytes(bal_be, 32);
+    p += off + item_len;
+
+    // 3. storage_root (32 bytes, encoded as 0xa0 + 32 bytes)
+    if (p + 33 > end) return false;
+    if (p[0] != 0xa0) return false;
+    memcpy(ca->storage_root.bytes, p + 1, 32);
+    p += 33;
+
+    // 4. code_hash (32 bytes, encoded as 0xa0 + 32 bytes)
+    if (p + 33 > end) return false;
+    if (p[0] != 0xa0) return false;
+    memcpy(ca->code_hash.bytes, p + 1, 32);
+    p += 33;
+
+    ca->has_code = !is_zero_hash(ca->code_hash.bytes) &&
+                   memcmp(ca->code_hash.bytes, HASH_EMPTY_CODE.bytes, 32) != 0;
+    ca->existed = true;
+
+    return true;
+}
+
+// Decode RLP-encoded storage value to uint256.
+// Storage values are RLP byte strings containing trimmed big-endian integers.
+static uint256_t mpt_rlp_decode_storage_value(const uint8_t *rlp, size_t len) {
+    size_t data_len;
+    size_t off = rlp_byte_hdr(rlp, len, &data_len);
+    const uint8_t *data = rlp + off;
+    uint8_t be[32];
+    memset(be, 0, 32);
+    if (data_len > 0 && data_len <= 32)
+        memcpy(be + 32 - data_len, data, data_len);
+    return uint256_from_bytes(be, 32);
 }
 
 // Storage entry for incremental MPT storage root computation

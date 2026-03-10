@@ -12,6 +12,9 @@
 #ifdef ENABLE_VERKLE
 #include "verkle_state.h"
 #endif
+#ifdef ENABLE_MPT
+#include "code_store.h"
+#endif
 #include "uint256.h"
 #include "address.h"
 #include "keccak256.h"
@@ -57,6 +60,9 @@ struct sync {
 #ifdef ENABLE_VERKLE
     verkle_state_t *vs;
 #endif
+#ifdef ENABLE_MPT
+    code_store_t *cs;
+#endif
     evm_state_t *state;
     evm_t       *evm;
 
@@ -68,7 +74,6 @@ struct sync {
     uint64_t last_checkpoint_block;
     uint64_t resumed_block;   /* block number from checkpoint (0 if fresh) */
     bool     genesis_loaded;
-    bool     can_validate_mpt; /* false after resume (cache lacks pre-existing state) */
 };
 
 // ============================================================================
@@ -258,6 +263,8 @@ sync_t *sync_create(const sync_config_t *config) {
         s->config.verkle_commit_dir = strdup(config->verkle_commit_dir);
     if (config->mpt_path)
         s->config.mpt_path = strdup(config->mpt_path);
+    if (config->code_store_path)
+        s->config.code_store_path = strdup(config->code_store_path);
     if (config->checkpoint_path)
         s->config.checkpoint_path = strdup(config->checkpoint_path);
 
@@ -313,6 +320,15 @@ sync_t *sync_create(const sync_config_t *config) {
     }
 #endif
 
+#ifdef ENABLE_MPT
+    /* Open or create code store */
+    if (s->config.code_store_path) {
+        s->cs = code_store_open(s->config.code_store_path);
+        if (!s->cs)
+            s->cs = code_store_create(s->config.code_store_path, 500000);
+    }
+#endif
+
     /* Create evm_state */
     s->state = evm_state_create(
 #ifdef ENABLE_VERKLE
@@ -321,8 +337,10 @@ sync_t *sync_create(const sync_config_t *config) {
         NULL,
 #endif
 #ifdef ENABLE_MPT
-        s->config.mpt_path
+        s->config.mpt_path,
+        s->cs
 #else
+        NULL,
         NULL
 #endif
     );
@@ -365,6 +383,9 @@ void sync_destroy(sync_t *sync) {
 #ifdef ENABLE_VERKLE
         if (sync->vs) verkle_state_sync(sync->vs);
 #endif
+#ifdef ENABLE_MPT
+        if (sync->cs) code_store_sync(sync->cs);
+#endif
         checkpoint_save_internal(sync->config.checkpoint_path,
                                  sync->last_block, sync->block_hashes,
                                  sync->total_gas, sync->blocks_ok,
@@ -377,10 +398,14 @@ void sync_destroy(sync_t *sync) {
 #ifdef ENABLE_VERKLE
     if (sync->vs) verkle_state_destroy(sync->vs);
 #endif
+#ifdef ENABLE_MPT
+    if (sync->cs) code_store_destroy(sync->cs);
+#endif
 
     free((char *)sync->config.verkle_value_dir);
     free((char *)sync->config.verkle_commit_dir);
     free((char *)sync->config.mpt_path);
+    free((char *)sync->config.code_store_path);
     free((char *)sync->config.checkpoint_path);
     free(sync);
 }
@@ -423,7 +448,6 @@ bool sync_load_genesis(sync_t *sync, const char *genesis_json_path,
     }
 
     sync->genesis_loaded = true;
-    sync->can_validate_mpt = true;  /* cache has full state from genesis */
     return true;
 }
 
@@ -457,14 +481,10 @@ bool sync_execute_block(sync_t *sync,
     result->expected_gas = header->gas_used;
     result->actual_gas   = br.gas_used;
 
-    /* Validate state root.
-     * Skipped after checkpoint resume: the in-memory account cache is empty,
-     * so incremental MPT updates would clobber correct trie entries with
-     * partial data (e.g. balance=reward instead of accumulated balance).
-     * Read-through caching would fix this — TODO. */
+    /* Validate state root */
     bool root_match = true;
 #ifdef ENABLE_MPT
-    if (sync->config.validate_state_root && sync->can_validate_mpt) {
+    if (sync->config.validate_state_root) {
         bool prune = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
         hash_t mpt_root = evm_state_compute_mpt_root(sync->state, prune);
         root_match = (memcmp(mpt_root.bytes, header->state_root.bytes, 32) == 0);
@@ -541,6 +561,9 @@ bool sync_checkpoint(sync_t *sync) {
 
 #ifdef ENABLE_VERKLE
     if (sync->vs) verkle_state_sync(sync->vs);
+#endif
+#ifdef ENABLE_MPT
+    if (sync->cs) code_store_sync(sync->cs);
 #endif
 
     bool ok = checkpoint_save_internal(sync->config.checkpoint_path,

@@ -56,10 +56,11 @@ static test_state_t make_state(void) {
     ts.es = evm_state_create(NULL,
 #endif
 #ifdef ENABLE_MPT
-        "/tmp/test_evm_state_audit_mpt"
+        "/tmp/test_evm_state_audit_mpt",
 #else
-        NULL
+        NULL,
 #endif
+        NULL  /* no code_store for tests */
     );
     return ts;
 }

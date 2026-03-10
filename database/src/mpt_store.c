@@ -1791,6 +1791,86 @@ bool mpt_store_commit_batch(mpt_store_t *ms) {
 }
 
 /* =========================================================================
+ * Point Lookup
+ * ========================================================================= */
+
+uint32_t mpt_store_get(const mpt_store_t *ms, const uint8_t key[32],
+                        uint8_t *buf, uint32_t buf_len) {
+    if (!ms) return 0;
+
+    /* Empty trie */
+    if (memcmp(ms->root_hash, EMPTY_ROOT, 32) == 0)
+        return 0;
+
+    /* Convert key to nibbles */
+    uint8_t key_nibs[MAX_NIBBLES];
+    bytes_to_nibbles(key, 32, key_nibs);
+    size_t depth = 0;
+
+    /* Start from root */
+    node_ref_t ref;
+    ref.type = REF_HASH;
+    memcpy(ref.hash, ms->root_hash, 32);
+
+    uint8_t node_buf[MAX_NODE_RLP];
+    size_t node_buf_len;
+    mpt_node_t node;
+
+    for (;;) {
+        if (!load_from_ref(ms, &ref, node_buf, &node_buf_len, &node))
+            return 0;
+
+        switch (node.type) {
+        case MPT_NODE_BRANCH: {
+            if (depth >= MAX_NIBBLES)
+                return 0;  /* consumed all nibbles at a branch = not found */
+            uint8_t nib = key_nibs[depth];
+            ref = node.branch.children[nib];
+            if (ref.type == REF_EMPTY)
+                return 0;  /* no child at this nibble */
+            depth++;
+            break;
+        }
+
+        case MPT_NODE_EXTENSION: {
+            /* Verify path nibbles match */
+            if (depth + node.extension.path_len > MAX_NIBBLES)
+                return 0;
+            if (memcmp(key_nibs + depth, node.extension.path,
+                       node.extension.path_len) != 0)
+                return 0;  /* path mismatch */
+            depth += node.extension.path_len;
+            ref = node.extension.child;
+            if (ref.type == REF_EMPTY)
+                return 0;
+            break;
+        }
+
+        case MPT_NODE_LEAF: {
+            /* Verify remaining key nibbles match leaf path */
+            size_t remaining = MAX_NIBBLES - depth;
+            if (node.leaf.path_len != remaining)
+                return 0;
+            if (memcmp(key_nibs + depth, node.leaf.path, remaining) != 0)
+                return 0;  /* key mismatch */
+
+            /* Found! Return value. */
+            uint32_t vlen = (uint32_t)node.leaf.value_len;
+            if (vlen == 0)
+                return 0;
+            if (buf_len < vlen)
+                return vlen;  /* caller buffer too small */
+            memcpy(buf, node.leaf.value, vlen);
+            return vlen;
+        }
+
+        default:
+            return 0;
+        }
+    }
+}
+
+/* =========================================================================
  * Compaction
  * ========================================================================= */
 

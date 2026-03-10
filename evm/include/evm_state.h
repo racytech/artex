@@ -19,6 +19,9 @@ typedef struct verkle_state_fwd verkle_state_t;
 #include "mpt_store.h"
 #endif
 
+/* Forward declaration — code_store lifecycle is managed by caller */
+typedef struct code_store code_store_t;
+
 /**
  * EVM State — Typed, in-memory state interface above verkle_state.
  *
@@ -50,8 +53,10 @@ typedef struct evm_state evm_state_t;
  * Create EVM state over an existing verkle_state. vs is NOT owned.
  * mpt_path: if non-NULL, enables persistent incremental MPT for state root
  * computation. If NULL, falls back to batch root rebuild (slow at scale).
+ * cs: if non-NULL, enables read-through for contract bytecode (not owned).
  */
-evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path);
+evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
+                               code_store_t *cs);
 
 /** Destroy EVM state and free all in-memory caches. */
 void evm_state_destroy(evm_state_t *es);

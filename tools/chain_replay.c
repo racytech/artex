@@ -33,6 +33,7 @@ static const char *VALUE_DIR  = "/tmp/chain_replay_values";
 static const char *COMMIT_DIR = "/tmp/chain_replay_commits";
 static const char *CKPT_PATH  = "/tmp/chain_replay.ckpt";
 static const char *MPT_PATH   = "/tmp/chain_replay_mpt";
+static const char *CODE_PATH  = "/tmp/chain_replay_code";
 
 /* =========================================================================
  * Graceful shutdown via SIGINT
@@ -204,8 +205,9 @@ int main(int argc, char **argv) {
         unlink(CKPT_PATH);
         char cmd[512];
         snprintf(cmd, sizeof(cmd),
-                 "rm -rf %s %s %s.idx %s.dat %s_storage.idx %s_storage.dat 2>/dev/null",
-                 VALUE_DIR, COMMIT_DIR, MPT_PATH, MPT_PATH, MPT_PATH, MPT_PATH);
+                 "rm -rf %s %s %s.idx %s.dat %s_storage.idx %s_storage.dat %s.idx %s.dat 2>/dev/null",
+                 VALUE_DIR, COMMIT_DIR, MPT_PATH, MPT_PATH, MPT_PATH, MPT_PATH,
+                 CODE_PATH, CODE_PATH);
         (void)system(cmd);
     }
 
@@ -225,6 +227,7 @@ int main(int argc, char **argv) {
 #endif
 #ifdef ENABLE_MPT
     cfg.mpt_path = MPT_PATH;
+    cfg.code_store_path = CODE_PATH;
 #endif
 
     sync_t *sync = sync_create(&cfg);

@@ -277,10 +277,11 @@ static void test_executor_smoke(void) {
     /* Create EVM state */
     evm_state_t *state = evm_state_create(vs,
 #ifdef ENABLE_MPT
-        "/tmp/test_block_executor_mpt"
+        "/tmp/test_block_executor_mpt",
 #else
-        NULL
+        NULL,
 #endif
+        NULL  /* no code_store for tests */
     );
     ASSERT(state != NULL, "create evm_state");
 
@@ -384,10 +385,11 @@ static void test_dao_fork(void) {
 #endif
     evm_state_t *state = evm_state_create(vs,
 #ifdef ENABLE_MPT
-        "/tmp/test_block_executor_mpt"
+        "/tmp/test_block_executor_mpt",
 #else
-        NULL
+        NULL,
 #endif
+        NULL  /* no code_store for tests */
     );
     ASSERT(state != NULL, "create evm_state");
 
@@ -455,10 +457,11 @@ static void test_dao_fork_block_check(void) {
 #endif
     evm_state_t *state = evm_state_create(vs,
 #ifdef ENABLE_MPT
-        "/tmp/test_block_executor_mpt"
+        "/tmp/test_block_executor_mpt",
 #else
-        NULL
+        NULL,
 #endif
+        NULL  /* no code_store for tests */
     );
     ASSERT(state != NULL, "create evm_state");
     evm_t *evm = evm_create(state, chain_config_mainnet());

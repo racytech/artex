@@ -130,6 +130,18 @@ bool mpt_store_commit_batch(mpt_store_t *ms);
 void mpt_store_discard_batch(mpt_store_t *ms);
 
 /* =========================================================================
+ * Point Lookup
+ * ========================================================================= */
+
+/**
+ * Retrieve the value for a 32-byte key by walking the trie from root.
+ * Returns actual value length. 0 = key not found or empty trie.
+ * If buf_len < value length, returns required size, buf untouched.
+ */
+uint32_t mpt_store_get(const mpt_store_t *ms, const uint8_t key[32],
+                        uint8_t *buf, uint32_t buf_len);
+
+/* =========================================================================
  * Compaction
  * ========================================================================= */
 

@@ -358,10 +358,11 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
         NULL,
 #endif
 #ifdef ENABLE_MPT
-        "/tmp/test_runner_mpt"
+        "/tmp/test_runner_mpt",
 #else
-        NULL
+        NULL,
 #endif
+        NULL  /* no code_store for tests */
     );
     if (!runner->state) {
 #ifdef ENABLE_VERKLE
@@ -443,10 +444,11 @@ void test_runner_reset(test_runner_t *runner) {
             NULL,
 #endif
 #ifdef ENABLE_MPT
-            "/tmp/test_runner_mpt"
+            "/tmp/test_runner_mpt",
 #else
-            NULL
+            NULL,
 #endif
+            NULL  /* no code_store for tests */
         );
         if (runner->state) {
             runner->evm = evm_create(runner->state, NULL);
