@@ -178,59 +178,27 @@ block_result_t block_execute(evm_t *evm,
         apply_dao_fork(evm->state);
     }
 
-    /* EIP-2935/EIP-7709: Store parent block hash in history contract (Prague+).
-     * The contract at 0xff..fe is read-only (SLOAD), so we write storage
-     * directly at the state level. */
-    if (evm->fork >= FORK_PRAGUE) {
-        static const uint8_t HISTORY_ADDR[20] = {
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe
-        };
-        #define BLOCKHASH_SERVE_WINDOW 8192
-
-        address_t hist_addr;
-        memcpy(hist_addr.bytes, HISTORY_ADDR, 20);
-
-        /* Only write storage if the contract has code deployed */
-        uint32_t hist_code_len = 0;
-        evm_state_get_code_ptr(evm->state, &hist_addr, &hist_code_len);
-        if (hist_code_len > 0) {
-            /* Store parent hash at slot (block.number - 1) % SERVE_WINDOW */
-            uint64_t slot_idx = (header->number - 1) % BLOCKHASH_SERVE_WINDOW;
-            uint256_t slot = uint256_from_uint64(slot_idx);
-            uint256_t parent_hash_val = uint256_from_bytes(header->parent_hash.bytes, 32);
-            evm_state_set_storage(evm->state, &hist_addr, &slot, &parent_hash_val);
-        }
-
-        #undef BLOCKHASH_SERVE_WINDOW
-    }
-
-    /* EIP-4788: Store parent beacon block root (Cancun+) */
+    /* EIP-4788: Store parent beacon block root (Cancun+).
+     * System call to beacon root contract with parent_beacon_root as calldata.
+     * The contract stores: timestamp at slot (timestamp % 8191),
+     *                      beacon_root at slot (timestamp % 8191 + 8191). */
     if (evm->fork >= FORK_CANCUN && header->has_parent_beacon_root) {
         static const uint8_t BEACON_ROOT_ADDR[20] = {
             0x00, 0x0F, 0x3d, 0xf6, 0xD7, 0x32, 0x80, 0x7E, 0xf1, 0x31,
             0x9f, 0xB7, 0xB8, 0xbB, 0x85, 0x22, 0xd0, 0xBe, 0xac, 0x02
         };
-        #define HISTORY_BUFFER_LENGTH 8191
+        system_call(evm, BEACON_ROOT_ADDR,
+                    header->parent_beacon_root.bytes, 32);
+    }
 
-        address_t beacon_addr;
-        memcpy(beacon_addr.bytes, BEACON_ROOT_ADDR, 20);
-
-        /* Only write storage if the contract has code deployed */
-        uint32_t beacon_code_len = 0;
-        evm_state_get_code_ptr(evm->state, &beacon_addr, &beacon_code_len);
-        if (beacon_code_len > 0) {
-            uint64_t ts_idx = header->timestamp % HISTORY_BUFFER_LENGTH;
-            uint256_t ts_slot = uint256_from_uint64(ts_idx);
-            uint256_t ts_val = uint256_from_uint64(header->timestamp);
-            evm_state_set_storage(evm->state, &beacon_addr, &ts_slot, &ts_val);
-
-            uint256_t root_slot = uint256_from_uint64(ts_idx + HISTORY_BUFFER_LENGTH);
-            uint256_t root_val = uint256_from_bytes(header->parent_beacon_root.bytes, 32);
-            evm_state_set_storage(evm->state, &beacon_addr, &root_slot, &root_val);
-        }
-
-        #undef HISTORY_BUFFER_LENGTH
+    /* EIP-2935: Store parent block hash in history contract (Prague+) */
+    if (evm->fork >= FORK_PRAGUE) {
+        static const uint8_t HISTORY_ADDR[20] = {
+            0x00, 0x00, 0xf9, 0x08, 0x27, 0xf1, 0xc5, 0x3a, 0x10, 0xcb,
+            0x7a, 0x02, 0x33, 0x5b, 0x17, 0x53, 0x20, 0x00, 0x29, 0x35
+        };
+        system_call(evm, HISTORY_ADDR,
+                    header->parent_hash.bytes, 32);
     }
 
     uint64_t cumulative_gas = 0;
