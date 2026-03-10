@@ -287,3 +287,122 @@ bool mpt_compute_root_batch(mpt_batch_entry_t *entries, size_t count,
     free(leaves);
     return ok;
 }
+
+//==============================================================================
+// Unsecured trie (variable-length raw keys)
+//==============================================================================
+
+typedef struct {
+    uint8_t nibbles[64];      // max 32 bytes = 64 nibbles
+    size_t  nibble_count;
+    const uint8_t *value;
+    size_t value_len;
+} batch_leaf_var_t;
+
+static bool build_subtrie_var(batch_leaf_var_t *leaves, size_t start, size_t end,
+                               size_t depth, hash_t *out) {
+    size_t count = end - start;
+
+    if (count == 0) {
+        const uint8_t empty_rlp[] = {0x80};
+        keccak256(empty_rlp, sizeof(empty_rlp), out->bytes);
+        return true;
+    }
+
+    if (count == 1) {
+        size_t remaining = leaves[start].nibble_count - depth;
+        return leaf_hash(&leaves[start].nibbles[depth], remaining,
+                         leaves[start].value, leaves[start].value_len, out);
+    }
+
+    /* Find minimum remaining nibble count across all leaves */
+    size_t min_remaining = leaves[start].nibble_count - depth;
+    for (size_t i = start + 1; i < end; i++) {
+        size_t rem = leaves[i].nibble_count - depth;
+        if (rem < min_remaining) min_remaining = rem;
+    }
+
+    /* Find common prefix (bounded by shortest remaining path) */
+    size_t common_len = min_remaining;
+    for (size_t i = start + 1; i < end && common_len > 0; i++) {
+        for (size_t j = 0; j < common_len; j++) {
+            if (leaves[start].nibbles[depth + j] != leaves[i].nibbles[depth + j]) {
+                common_len = j;
+                break;
+            }
+        }
+    }
+
+    if (common_len > 0) {
+        hash_t child;
+        if (!build_subtrie_var(leaves, start, end, depth + common_len, &child))
+            return false;
+        return extension_hash(&leaves[start].nibbles[depth], common_len, &child, out);
+    }
+
+    /* Branch node */
+    hash_t children[16];
+    memset(children, 0, sizeof(children));
+
+    size_t i = start;
+    while (i < end) {
+        uint8_t nibble = leaves[i].nibbles[depth];
+        size_t group_end = i + 1;
+        while (group_end < end && leaves[group_end].nibbles[depth] == nibble)
+            group_end++;
+
+        if (!build_subtrie_var(leaves, i, group_end, depth + 1, &children[nibble]))
+            return false;
+
+        i = group_end;
+    }
+
+    return branch_hash(children, out);
+}
+
+static int compare_unsecured_entries(const void *a, const void *b) {
+    const mpt_unsecured_entry_t *ea = (const mpt_unsecured_entry_t *)a;
+    const mpt_unsecured_entry_t *eb = (const mpt_unsecured_entry_t *)b;
+    size_t min_len = ea->key_len < eb->key_len ? ea->key_len : eb->key_len;
+    int cmp = min_len > 0 ? memcmp(ea->key, eb->key, min_len) : 0;
+    if (cmp != 0) return cmp;
+    return (ea->key_len < eb->key_len) ? -1 :
+           (ea->key_len > eb->key_len) ?  1 : 0;
+}
+
+bool mpt_compute_root_unsecured(mpt_unsecured_entry_t *entries,
+                                 size_t count, hash_t *out_root) {
+    if (!out_root) return false;
+
+    if (count == 0) {
+        const uint8_t empty_rlp[] = {0x80};
+        keccak256(empty_rlp, sizeof(empty_rlp), out_root->bytes);
+        return true;
+    }
+    if (!entries) return false;
+
+    /* Sort by raw key bytes */
+    qsort(entries, count, sizeof(mpt_unsecured_entry_t),
+          compare_unsecured_entries);
+
+    /* Expand keys to nibbles */
+    batch_leaf_var_t *leaves = malloc(count * sizeof(batch_leaf_var_t));
+    if (!leaves) return false;
+
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].key_len > 32) {
+            free(leaves);
+            return false;
+        }
+        bytes_to_nibbles(entries[i].key, entries[i].key_len,
+                         leaves[i].nibbles);
+        leaves[i].nibble_count = entries[i].key_len * 2;
+        leaves[i].value        = entries[i].value;
+        leaves[i].value_len    = entries[i].value_len;
+    }
+
+    bool ok = build_subtrie_var(leaves, 0, count, 0, out_root);
+
+    free(leaves);
+    return ok;
+}

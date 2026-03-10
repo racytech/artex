@@ -39,4 +39,30 @@ typedef struct {
 bool mpt_compute_root_batch(mpt_batch_entry_t *entries, size_t count,
                             hash_t *out_root);
 
+/**
+ * Batch entry for unsecured trie (variable-length raw keys).
+ * Used for transaction tries and receipt tries where keys are
+ * RLP-encoded indices (not keccak256-hashed).
+ */
+typedef struct {
+    const uint8_t *key;        // Raw key bytes (NOT hashed)
+    size_t         key_len;    // Key length in bytes
+    const uint8_t *value;      // Pointer to RLP-encoded value (caller-managed)
+    size_t         value_len;  // Length of value data
+} mpt_unsecured_entry_t;
+
+/**
+ * Compute MPT root hash from unsecured (raw-key) entries.
+ *
+ * Same algorithm as mpt_compute_root_batch but keys are used directly
+ * (not pre-hashed). Supports variable-length keys up to 32 bytes.
+ *
+ * @param entries Array of entries (may be reordered internally)
+ * @param count   Number of entries
+ * @param out_root Output 32-byte root hash
+ * @return true on success
+ */
+bool mpt_compute_root_unsecured(mpt_unsecured_entry_t *entries,
+                                 size_t count, hash_t *out_root);
+
 #endif // MPT_H

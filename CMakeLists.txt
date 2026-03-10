@@ -205,7 +205,7 @@ add_library(block_executor STATIC
 target_include_directories(block_executor PUBLIC
     ${CMAKE_SOURCE_DIR}/executor/include
 )
-target_link_libraries(block_executor evm common secp256k1)
+target_link_libraries(block_executor evm mpt common secp256k1)
 
 #==============================================================================
 # Libraries — Networking / Portal

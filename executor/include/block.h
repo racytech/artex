@@ -163,6 +163,33 @@ void block_body_free(block_body_t *body);
  */
 hash_t block_hash_from_rlp(const uint8_t *data, size_t len);
 
+/**
+ * Encode a block header to RLP bytes.
+ * Reverse of block_header_decode_rlp.
+ *
+ * @param hdr  Block header struct
+ * @return RLP-encoded bytes (caller must free .data), or {NULL,0} on error
+ */
+bytes_t block_header_encode_rlp(const block_header_t *hdr);
+
+/**
+ * Compute the block hash from a decoded block header struct.
+ * Hash = keccak256(block_header_encode_rlp(hdr)).
+ *
+ * @param hdr  Block header struct
+ * @return Block hash, or zero hash on error
+ */
+hash_t block_header_hash(const block_header_t *hdr);
+
+/**
+ * Compute the transaction trie root from a block body.
+ * Keys are RLP-encoded tx indices, values are raw tx RLP bytes.
+ *
+ * @param body  Decoded block body
+ * @return Transaction root hash, or empty trie root if no transactions
+ */
+hash_t block_compute_tx_root(const block_body_t *body);
+
 #ifdef __cplusplus
 }
 #endif
