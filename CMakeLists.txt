@@ -591,6 +591,14 @@ add_executable(test_dashboard
 )
 target_link_libraries(test_dashboard dashboard)
 
+# Demo: Dashboard with termbox2
+add_executable(test_dashboard_tb2
+    tui/tests/test_dashboard_tb2.c
+)
+target_include_directories(test_dashboard_tb2 PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party
+)
+
 #==============================================================================
 # Build Summary
 #==============================================================================

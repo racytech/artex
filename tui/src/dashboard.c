@@ -329,7 +329,7 @@ void dashboard_render(dashboard_t *db) {
     rb_puts(&ctx, ESC_CURSOR_HOME);
     rb_puts(&ctx, ESC_HIDE_CURSOR);
 
-    /* Compute inner widths for all sections */
+    /* Compute per-section inner widths and max labels */
     int widths[DASHBOARD_MAX_SECTIONS];
     int max_labels[DASHBOARD_MAX_SECTIONS];
     for (int i = 0; i < db->section_count; i++) {
@@ -338,6 +338,20 @@ void dashboard_render(dashboard_t *db) {
         else
             widths[i] = compute_inner_width(&db->sections[i]);
         max_labels[i] = section_max_label(&db->sections[i]);
+    }
+
+    /* Equalize: all sections get the same width and label alignment. */
+    int global_width = 0;
+    int global_label = 0;
+    for (int i = 0; i < db->section_count; i++) {
+        if (widths[i] > global_width)
+            global_width = widths[i];
+        if (max_labels[i] > global_label)
+            global_label = max_labels[i];
+    }
+    for (int i = 0; i < db->section_count; i++) {
+        widths[i] = global_width;
+        max_labels[i] = global_label;
     }
 
     int line = 0;
