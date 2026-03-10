@@ -190,6 +190,18 @@ hash_t block_header_hash(const block_header_t *hdr);
  */
 hash_t block_compute_tx_root(const block_body_t *body);
 
+/**
+ * Compute the withdrawals trie root from a withdrawal list.
+ * Keys are RLP-encoded withdrawal indices, values are RLP-encoded withdrawals.
+ * Each withdrawal is encoded as RLP([index, validator_index, address, amount]).
+ *
+ * @param withdrawals  Array of withdrawals
+ * @param count        Number of withdrawals
+ * @return Withdrawals root hash, or empty trie root if count is 0
+ */
+hash_t block_compute_withdrawals_root(const withdrawal_t *withdrawals,
+                                       size_t count);
+
 #ifdef __cplusplus
 }
 #endif

@@ -743,7 +743,7 @@ if(CJSON_FOUND)
         ${CMAKE_SOURCE_DIR}/engine/include
         ${CJSON_INCLUDE_DIRS}
     )
-    target_link_libraries(engine_handlers engine_rpc engine_types engine_store ${CJSON_LIBRARIES})
+    target_link_libraries(engine_handlers engine_rpc engine_types engine_store block_executor ${CJSON_LIBRARIES})
 
     # Engine (top-level orchestrator)
     add_library(engine STATIC
@@ -778,7 +778,7 @@ if(CJSON_FOUND)
         ${CMAKE_SOURCE_DIR}/engine/include
         ${CJSON_INCLUDE_DIRS}
     )
-    target_link_libraries(test_engine_handlers engine_rpc engine_handlers engine_types engine_store ${CJSON_LIBRARIES})
+    target_link_libraries(test_engine_handlers engine_rpc engine_handlers engine_types engine_store block_executor ${CJSON_LIBRARIES})
     add_test(NAME test_engine_handlers COMMAND test_engine_handlers)
 
     # Chain replay tool

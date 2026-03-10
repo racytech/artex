@@ -500,3 +500,59 @@ cleanup:
     free(entries);
     return root;
 }
+
+/* =========================================================================
+ * Withdrawals root computation (EIP-4895)
+ * ========================================================================= */
+
+hash_t block_compute_withdrawals_root(const withdrawal_t *withdrawals,
+                                       size_t count) {
+    hash_t root = {0};
+
+    if (count == 0) {
+        const uint8_t empty_rlp[] = {0x80};
+        return hash_keccak256(empty_rlp, 1);
+    }
+    if (!withdrawals) return root;
+
+    mpt_unsecured_entry_t *entries = calloc(count, sizeof(*entries));
+    bytes_t *keys   = calloc(count, sizeof(bytes_t));
+    bytes_t *values = calloc(count, sizeof(bytes_t));
+    if (!entries || !keys || !values) goto cleanup;
+
+    for (size_t i = 0; i < count; i++) {
+        /* Key: RLP-encoded withdrawal index in list */
+        keys[i] = rlp_encode_uint64_direct(i);
+        if (!keys[i].data) goto cleanup;
+
+        /* Value: RLP([index, validator_index, address, amount]) */
+        rlp_item_t *list = rlp_list_new();
+        if (!list) goto cleanup;
+        rlp_list_append(list, rlp_uint64(withdrawals[i].index));
+        rlp_list_append(list, rlp_uint64(withdrawals[i].validator_index));
+        rlp_list_append(list, rlp_string(withdrawals[i].address.bytes, 20));
+        rlp_list_append(list, rlp_uint64(withdrawals[i].amount_gwei));
+        values[i] = rlp_encode(list);
+        rlp_item_free(list);
+        if (!values[i].data) goto cleanup;
+
+        entries[i].key       = keys[i].data;
+        entries[i].key_len   = keys[i].len;
+        entries[i].value     = values[i].data;
+        entries[i].value_len = values[i].len;
+    }
+
+    mpt_compute_root_unsecured(entries, count, &root);
+
+cleanup:
+    if (keys) {
+        for (size_t i = 0; i < count; i++) free(keys[i].data);
+        free(keys);
+    }
+    if (values) {
+        for (size_t i = 0; i < count; i++) free(values[i].data);
+        free(values);
+    }
+    free(entries);
+    return root;
+}
