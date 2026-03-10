@@ -1443,9 +1443,6 @@ static node_ref_t merge_leaf(mpt_store_t *ms, const node_ref_t *old_ref,
     const uint8_t *leaf_suffix = leaf->leaf.path;
     size_t leaf_suffix_len = leaf->leaf.path_len;
 
-    /* Delete old leaf */
-    delete_ref(ms, old_ref);
-
     /* If only one dirty entry and it matches the leaf's key exactly */
     if (end - start == 1) {
         /* Check if the dirty key suffix matches */
@@ -1461,6 +1458,7 @@ static node_ref_t merge_leaf(mpt_store_t *ms, const node_ref_t *old_ref,
 
         if (match) {
             /* Update or delete the existing leaf */
+            delete_ref(ms, old_ref);
             if (entries[start].value == NULL) {
                 return (node_ref_t){ .type = REF_EMPTY };
             }
@@ -1473,7 +1471,9 @@ static node_ref_t merge_leaf(mpt_store_t *ms, const node_ref_t *old_ref,
      * then build a fresh subtrie from all entries combined */
     size_t total = (end - start) + 1;
     dirty_entry_t *merged = malloc(total * sizeof(*merged));
-    if (!merged) return (node_ref_t){ .type = REF_EMPTY };
+    if (!merged) return *old_ref;  /* allocation failed — keep trie unchanged */
+
+    delete_ref(ms, old_ref);
 
     /* Add existing leaf as first entry */
     memset(merged[0].nibbles, 0, MAX_NIBBLES);
@@ -1830,6 +1830,7 @@ static bool compact_walk(const mpt_store_t *old_ms, mpt_store_t *new_ms,
 
 bool mpt_store_compact(mpt_store_t *ms) {
     if (!ms || ms->batch_active) return false;
+    if (ms->shared) return false;  /* unsafe: would delete other tries' nodes */
 
     /* Create temp paths */
     char *tmp_path = make_path(ms->dat_path, ".compact");
@@ -1860,9 +1861,16 @@ bool mpt_store_compact(mpt_store_t *ms) {
 
     bool ok = compact_walk(ms, new_ms, &root_ref);
     if (!ok) {
+        /* Save paths before destroy frees them */
+        char *fail_idx = new_ms->idx_path;
+        char *fail_dat = new_ms->dat_path;
+        new_ms->idx_path = NULL;
+        new_ms->dat_path = NULL;
         mpt_store_destroy(new_ms);
-        unlink(new_ms->idx_path);
-        unlink(new_ms->dat_path);
+        unlink(fail_idx);
+        unlink(fail_dat);
+        free(fail_idx);
+        free(fail_dat);
         free(tmp_path); free(tmp_base);
         return false;
     }
@@ -1904,9 +1912,10 @@ bool mpt_store_compact(mpt_store_t *ms) {
     }
 
     /* Cleanup new_ms (files already renamed, just free struct) */
+    close(new_ms->data_fd);
+    disk_hash_destroy(new_ms->index);
     new_ms->idx_path = NULL;
     new_ms->dat_path = NULL;
-    /* Can't use mpt_store_destroy since index/fd are stale */
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
         free_list_destroy(&new_ms->free_lists[i]);
     ncache_destroy(new_ms->cache);

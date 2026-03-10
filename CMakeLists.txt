@@ -135,12 +135,6 @@ add_library(verkle_flat STATIC
 )
 target_link_libraries(verkle_flat verkle_commit_store art_store disk_hash pedersen banderwagon)
 
-# MPT batch root computation (Ethereum MPT state root from sorted key-value pairs)
-add_library(mpt STATIC
-    state/src/mpt.c
-)
-target_link_libraries(mpt common)
-
 # MPT Store (persistent Merkle Patricia Trie with incremental updates)
 add_library(mpt_store STATIC
     database/src/mpt_store.c
@@ -189,7 +183,7 @@ target_include_directories(evm PUBLIC
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/evm/vendor
 )
-target_link_libraries(evm verkle_state art_database mpt mpt_store common ssl crypto secp256k1 blst)
+target_link_libraries(evm verkle_state art_database mpt_store common ssl crypto secp256k1 blst)
 
 #==============================================================================
 # Libraries — Block Executor
@@ -454,13 +448,6 @@ add_executable(test_evm_state_audit
 target_link_libraries(test_evm_state_audit evm verkle_state)
 add_test(NAME test_evm_state_audit COMMAND test_evm_state_audit)
 
-# Test: MPT Store (persistent trie with incremental updates)
-add_executable(test_mpt_store
-    database/tests/test_mpt_store.c
-)
-target_link_libraries(test_mpt_store mpt_store mpt common)
-add_test(NAME test_mpt_store COMMAND test_mpt_store)
-
 # Test: MPT Store cross-validation against Python reference vectors
 add_executable(test_mpt_store_vectors
     database/tests/test_mpt_store_vectors.c
@@ -676,7 +663,7 @@ if(CJSON_FOUND)
     # Chain replay tool
     add_executable(chain_replay tools/chain_replay.c)
     target_include_directories(chain_replay PRIVATE ${CJSON_INCLUDE_DIRS})
-    target_link_libraries(chain_replay block_executor evm verkle_state mpt common ${CJSON_LIBRARIES})
+    target_link_libraries(chain_replay block_executor evm verkle_state common ${CJSON_LIBRARIES})
 
     #==============================================================================
     # Integration Tests (Ethereum test vectors)

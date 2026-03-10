@@ -91,6 +91,8 @@ typedef struct {
             bool       old_created;
             bool       old_existed;
             bool       old_self_destructed;
+            hash_t     old_storage_root;
+            bool       old_storage_dirty;
         } create;
     } data;
 } journal_entry_t;
@@ -744,6 +746,8 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
             .old_created        = ca->created,
             .old_existed        = ca->existed,
             .old_self_destructed = ca->self_destructed,
+            .old_storage_root   = ca->storage_root,
+            .old_storage_dirty  = ca->storage_dirty,
         },
     };
     journal_push(es, &je);
@@ -763,6 +767,8 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
     ca->mpt_dirty = true;
     ca->code_dirty = false;
     ca->self_destructed = false;
+    ca->storage_root = HASH_EMPTY_STORAGE;
+    ca->storage_dirty = true;
 }
 
 // ============================================================================
@@ -848,8 +854,9 @@ void evm_state_commit(evm_state_t *es) {
 // ============================================================================
 
 typedef struct {
-    address_t addrs[256];
+    address_t *addrs;
     size_t    count;
+    size_t    cap;
 } selfdestructed_ctx_t;
 
 static bool commit_tx_account_cb(const uint8_t *key, size_t key_len,
@@ -860,7 +867,12 @@ static bool commit_tx_account_cb(const uint8_t *key, size_t key_len,
     selfdestructed_ctx_t *ctx = (selfdestructed_ctx_t *)user_data;
 
     if (ca->self_destructed) {
-        if (ctx->count < 256)
+        if (ctx->count >= ctx->cap) {
+            size_t nc = ctx->cap ? ctx->cap * 2 : 16;
+            address_t *na = realloc(ctx->addrs, nc * sizeof(*na));
+            if (na) { ctx->addrs = na; ctx->cap = nc; }
+        }
+        if (ctx->count < ctx->cap)
             ctx->addrs[ctx->count++] = ca->addr;
 
         ca->balance = UINT256_ZERO;
@@ -922,10 +934,11 @@ static bool commit_tx_slot_cb(const uint8_t *key, size_t key_len,
 void evm_state_commit_tx(evm_state_t *es) {
     if (!es) return;
 
-    selfdestructed_ctx_t ctx = { .count = 0 };
+    selfdestructed_ctx_t ctx = { .addrs = NULL, .count = 0, .cap = 0 };
 
     mem_art_foreach(&es->accounts, commit_tx_account_cb, &ctx);
     mem_art_foreach(&es->storage, commit_tx_slot_cb, &ctx);
+    free(ctx.addrs);
 
     es->journal_len = 0;
 
@@ -1026,6 +1039,8 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
                 ca->created         = je->data.create.old_created;
                 ca->existed         = je->data.create.old_existed;
                 ca->self_destructed = je->data.create.old_self_destructed;
+                ca->storage_root    = je->data.create.old_storage_root;
+                ca->storage_dirty   = je->data.create.old_storage_dirty;
             }
             je->data.create.old_code = NULL;
             break;
@@ -1435,7 +1450,6 @@ static bool mpt_collect_dirty_slot_cb(const uint8_t *key, size_t key_len,
     (void)key_len; (void)value_len;
     cached_slot_t *cs = (cached_slot_t *)(uintptr_t)value;
     if (!cs->mpt_dirty) return true;
-    cs->mpt_dirty = false;
 
     mpt_storage_vec_t *v = (mpt_storage_vec_t *)user_data;
     if (v->count >= v->cap) {
@@ -1456,6 +1470,8 @@ static bool mpt_collect_dirty_slot_cb(const uint8_t *key, size_t key_len,
         uint256_to_bytes(&cs->current, vbe);
         e->value_len = (uint8_t)mpt_rlp_be(vbe, 32, e->value_rlp);
     }
+
+    cs->mpt_dirty = false;  // clear only after successful collection
     return true;
 }
 
@@ -1594,7 +1610,11 @@ static void compute_all_storage_roots(evm_state_t *es) {
 
         // Load this account's storage root into the shared store
         mpt_store_set_root(es->storage_mpt, ca->storage_root.bytes);
-        mpt_store_begin_batch(es->storage_mpt);
+        if (!mpt_store_begin_batch(es->storage_mpt)) {
+            fprintf(stderr, "FATAL: mpt_store_begin_batch failed for storage trie\n");
+            free(sv.entries);
+            goto clear;
+        }
 
         for (size_t j = start; j < i; j++) {
             if (sv.entries[j].value_len == 0)
@@ -1604,7 +1624,11 @@ static void compute_all_storage_roots(evm_state_t *es) {
                                  sv.entries[j].value_rlp, sv.entries[j].value_len);
         }
 
-        mpt_store_commit_batch(es->storage_mpt);
+        if (!mpt_store_commit_batch(es->storage_mpt)) {
+            fprintf(stderr, "FATAL: mpt_store_commit_batch failed for storage trie\n");
+            free(sv.entries);
+            goto clear;
+        }
         mpt_store_root(es->storage_mpt, ca->storage_root.bytes);
 
     }
@@ -1680,7 +1704,10 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     // Recompute storage roots incrementally for dirty-storage accounts
     compute_all_storage_roots(es);
 
-    mpt_store_begin_batch(es->account_mpt);
+    if (!mpt_store_begin_batch(es->account_mpt)) {
+        fprintf(stderr, "FATAL: mpt_store_begin_batch failed for account trie\n");
+        return root;
+    }
 
     mpt_incr_ctx_t ctx = {
         .mpt = es->account_mpt,
@@ -1688,7 +1715,10 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     };
     mem_art_foreach(&es->accounts, mpt_incr_update_cb, &ctx);
 
-    mpt_store_commit_batch(es->account_mpt);
+    if (!mpt_store_commit_batch(es->account_mpt)) {
+        fprintf(stderr, "FATAL: mpt_store_commit_batch failed for account trie\n");
+        return root;
+    }
 
     if (g_trace_calls) {
         fprintf(stderr, "MPT_INCR: updated=%zu deleted=%zu\n",
