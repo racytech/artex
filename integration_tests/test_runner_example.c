@@ -6,20 +6,38 @@
 
 #include "test_runner.h"
 #include "test_parser.h"
+#include "evm_tracer.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("Usage: %s <state_test.json> [fork]\n", argv[0]);
+        printf("Usage: %s <state_test.json> [fork] [--trace]\n", argv[0]);
         printf("\nExample:\n");
         printf("  %s integration_tests/fixtures/state_tests/frontier/opcodes/test_dup.json\n", argv[0]);
         printf("  %s integration_tests/fixtures/state_tests/frontier/opcodes/test_dup.json Berlin\n", argv[0]);
+        printf("  %s test.json Paris --trace 2>/tmp/trace.jsonl\n", argv[0]);
         return 1;
     }
-    
+
     const char *filepath = argv[1];
-    const char *fork = argc > 2 ? argv[2] : NULL;
+    const char *fork = NULL;
+    bool trace = false;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--trace") == 0)
+            trace = true;
+        else if (!fork)
+            fork = argv[i];
+    }
+
+#ifdef ENABLE_EVM_TRACE
+    if (trace)
+        evm_tracer_init(stderr);
+#else
+    if (trace)
+        fprintf(stderr, "WARNING: --trace requires build with -DENABLE_EVM_TRACE=ON\n");
+#endif
     
     printf("================================================================================\n");
     printf("Integration Test Runner\n");

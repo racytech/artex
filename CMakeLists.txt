@@ -10,6 +10,7 @@ project(art_database C)
 # Backend options (overridable via config.cmake or -D flags)
 option(ENABLE_MPT "Enable MPT (Merkle Patricia Trie) state root" ON)
 option(ENABLE_VERKLE "Enable Verkle state root" OFF)
+option(ENABLE_EVM_TRACE "Enable EIP-3155 EVM execution tracing" OFF)
 
 if(NOT ENABLE_MPT AND NOT ENABLE_VERKLE)
     message(FATAL_ERROR "At least one state backend must be enabled (ENABLE_MPT or ENABLE_VERKLE)")
@@ -194,6 +195,7 @@ set_target_properties(secp256k1 PROPERTIES
 add_library(evm STATIC
     evm/src/evm.c
     evm/src/evm_state.c
+    evm/src/evm_tracer.c
     evm/src/witness_gas.c
     evm/src/evm_stack.c
     evm/src/evm_memory.c
@@ -234,6 +236,9 @@ if(ENABLE_MPT)
 endif()
 if(ENABLE_VERKLE)
     target_compile_definitions(evm PUBLIC ENABLE_VERKLE=1)
+endif()
+if(ENABLE_EVM_TRACE)
+    target_compile_definitions(evm PUBLIC ENABLE_EVM_TRACE=1)
 endif()
 target_compile_definitions(evm PRIVATE
     MPT_STORAGE_CACHE_MB=${MPT_STORAGE_CACHE_MB}

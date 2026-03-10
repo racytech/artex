@@ -20,6 +20,7 @@
 #include "opcodes/create.h"
 #include "verkle_key.h"
 #include "evm_state.h"
+#include "evm_tracer.h"
 #include "logger.h"
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,7 @@ extern bool g_trace_calls __attribute__((weak));
     {                                                               \
         if (evm->pc >= evm->code_size)                              \
         {                                                           \
+            EVM_TRACE_IMPLICIT_STOP(evm);                           \
             goto done;                                              \
         }                                                           \
         if (verkle_chunk_mode) {                                    \
@@ -47,6 +49,7 @@ extern bool g_trace_calls __attribute__((weak));
             if (cwg > 0 && !evm_use_gas(evm, cwg))                  \
                 goto done_oog;                                      \
         }                                                           \
+        EVM_TRACE_DISPATCH(evm);                                    \
         if (g_trace_calls && evm->msg.depth == 0) {                 \
             fprintf(stderr, "  OP pc=%zu op=0x%02x gas=%lu\n",      \
                     evm->pc, evm->code[evm->pc], evm->gas_left);   \
@@ -419,6 +422,7 @@ evm_result_t evm_interpret(evm_t *evm)
 
 op_stop:
     status = op_stop(evm);
+    EVM_TRACE_EXIT(evm, NULL);
     // STOP produces no output — clear stale return data from subcalls
     if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
     evm->return_data_size = 0;
@@ -1247,6 +1251,7 @@ op_callcode:
 
 op_return:
     status = op_return(evm);
+    EVM_TRACE_EXIT(evm, NULL);
     goto done;
 
 op_delegatecall:
@@ -1269,10 +1274,12 @@ op_staticcall:
 
 op_revert:
     status = op_revert(evm);
+    EVM_TRACE_EXIT(evm, NULL);
     goto done;
 
 op_selfdestruct:
     status = op_selfdestruct(evm);
+    EVM_TRACE_EXIT(evm, NULL);
     // SELFDESTRUCT produces no output — clear stale return data from subcalls
     if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
     evm->return_data_size = 0;
@@ -1292,9 +1299,13 @@ op_invalid:
 
 done_oog:
     status = EVM_OUT_OF_GAS;
+    EVM_TRACE_EXIT(evm, "out of gas");
     // Fall through to error
 
 error:
+    if (status != EVM_OUT_OF_GAS) {
+        EVM_TRACE_EXIT(evm, "execution error");
+    }
     LOG_EVM_DEBUG("Execution error at PC=%lu: status=%d", evm->pc, status);
     // All exceptional halts (non-REVERT) consume all remaining gas per EVM spec.
     // Only REVERT preserves remaining gas.
@@ -1313,6 +1324,8 @@ error:
     // Fall through to done
 
 done:
+    // Emit any remaining pending trace (e.g. when pc >= code_size)
+    EVM_TRACE_EXIT(evm, NULL);
     // Create result with output data
     return evm_result_create(status, evm->gas_left, evm->gas_refund, evm->return_data, evm->return_data_size);
 }

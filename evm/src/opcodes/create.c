@@ -8,6 +8,7 @@
 #include "evm_state.h"
 #include "evm_stack.h"
 #include "evm_memory.h"
+#include "evm_tracer.h"
 #include "gas.h"
 #include "verkle_key.h"
 #include "logger.h"
@@ -220,6 +221,7 @@ static evm_status_t execute_create(evm_t *evm,
     {
         LOG_EVM_DEBUG("CREATE: Address collision detected");
         // Consume all forwarded gas (collision consumes all gas)
+        EVM_TRACE_RETURN(NULL, 0, gas_forwarded, "contract address collision");
         CREATE_FAIL_PUSH_ZERO();
     }
 
@@ -299,6 +301,11 @@ static evm_status_t execute_create(evm_t *evm,
 
         evm_result_t init_result;
         evm_execute(evm, &init_msg, &init_result);
+
+        EVM_TRACE_RETURN(init_result.output_data, init_result.output_size,
+                         gas_forwarded - init_result.gas_left,
+                         init_result.status != EVM_SUCCESS && init_result.status != EVM_REVERT
+                             ? "execution error" : NULL);
 
         // Free init code
         free(init_code);
@@ -409,8 +416,9 @@ static evm_status_t execute_create(evm_t *evm,
     }
     else
     {
-        // No init code — create empty contract
+        // No init code — create empty contract, return all forwarded gas
         success = true;
+        evm->gas_left += gas_forwarded;
         // CREATE produces empty return data
         if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
         evm->return_data_size = 0;

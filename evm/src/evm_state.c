@@ -1808,10 +1808,49 @@ static bool debug_dump_slot_cb(const uint8_t *key, size_t key_len,
     fprintf(stderr, "\n");
     return true;
 }
+static bool debug_dump_all_acct_cb(const uint8_t *key, size_t key_len,
+                                    const void *value, size_t value_len,
+                                    void *user_data) {
+    (void)key; (void)key_len; (void)value_len; (void)user_data;
+    const cached_account_t *ca = (const cached_account_t *)value;
+    if (!ca->existed && !ca->block_dirty && !ca->created && !ca->dirty)
+        return true;
+    fprintf(stderr, "  ACCT ");
+    for (int i = 0; i < 20; i++) fprintf(stderr, "%02x", ca->addr.bytes[i]);
+    fprintf(stderr, " nonce=%lu has_code=%d existed=%d created=%d blk_dirty=%d self_dest=%d bal=",
+            ca->nonce, ca->has_code, ca->existed, ca->created, ca->block_dirty, ca->self_destructed);
+    uint8_t bal[32]; uint256_to_bytes(&ca->balance, bal);
+    // trim leading zeros
+    int s = 0; while (s < 31 && bal[s] == 0) s++;
+    for (int i = s; i < 32; i++) fprintf(stderr, "%02x", bal[i]);
+    fprintf(stderr, " sr=");
+    for (int i = 0; i < 4; i++) fprintf(stderr, "%02x", ca->storage_root.bytes[i]);
+    fprintf(stderr, "...\n");
+    return true;
+}
+static bool debug_dump_all_slot_cb(const uint8_t *key, size_t key_len,
+                                    const void *value, size_t value_len,
+                                    void *user_data) {
+    (void)key_len; (void)value_len; (void)user_data;
+    const cached_slot_t *cs = (const cached_slot_t *)value;
+    if (uint256_is_zero(&cs->current)) return true;
+    fprintf(stderr, "  SLOT addr=");
+    for (int i = 0; i < 20; i++) fprintf(stderr, "%02x", key[i]);
+    // find first non-zero byte in slot key (key+20..key+51)
+    int ss = 20; while (ss < 51 && key[ss] == 0) ss++;
+    fprintf(stderr, " slot=");
+    for (int i = ss; i < 52; i++) fprintf(stderr, "%02x", key[i]);
+    uint8_t vbe[32]; uint256_to_bytes(&cs->current, vbe);
+    int vs = 0; while (vs < 31 && vbe[vs] == 0) vs++;
+    fprintf(stderr, " val=");
+    for (int i = vs; i < 32; i++) fprintf(stderr, "%02x", vbe[i]);
+    fprintf(stderr, "\n");
+    return true;
+}
 void evm_state_debug_dump(evm_state_t *es) {
-    fprintf(stderr, "=== EVM STATE DEBUG DUMP ===\n");
-    mem_art_foreach(&es->accounts, debug_dump_acct_cb, NULL);
-    mem_art_foreach(&es->storage, debug_dump_slot_cb, NULL);
+    fprintf(stderr, "=== EVM STATE DUMP (all non-trivial accounts) ===\n");
+    mem_art_foreach(&es->accounts, debug_dump_all_acct_cb, NULL);
+    mem_art_foreach(&es->storage, debug_dump_all_slot_cb, NULL);
     fprintf(stderr, "=== END DUMP ===\n");
 }
 
