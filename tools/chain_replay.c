@@ -432,8 +432,9 @@ int main(int argc, char **argv) {
         unlink(CKPT_PATH);
         /* Remove store directories (best-effort) */
         char cmd[512];
-        snprintf(cmd, sizeof(cmd), "rm -rf %s %s %s.idx %s.dat 2>/dev/null",
-                 VALUE_DIR, COMMIT_DIR, MPT_PATH, MPT_PATH);
+        snprintf(cmd, sizeof(cmd),
+                 "rm -rf %s %s %s.idx %s.dat %s_storage.idx %s_storage.dat 2>/dev/null",
+                 VALUE_DIR, COMMIT_DIR, MPT_PATH, MPT_PATH, MPT_PATH, MPT_PATH);
         (void)system(cmd);
     }
 

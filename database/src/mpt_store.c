@@ -388,6 +388,8 @@ struct mpt_store {
 
     node_cache_t    *cache;          /* NULL = no caching */
 
+    bool             shared;         /* multi-trie mode: skip node deletion */
+
     char            *idx_path;
     char            *dat_path;
 };
@@ -1117,6 +1119,16 @@ void mpt_store_root(const mpt_store_t *ms, uint8_t out[32]) {
     memcpy(out, ms->root_hash, 32);
 }
 
+void mpt_store_set_root(mpt_store_t *ms, const uint8_t root[32]) {
+    if (!ms) return;
+    memcpy(ms->root_hash, root, 32);
+}
+
+void mpt_store_set_shared(mpt_store_t *ms, bool shared) {
+    if (!ms) return;
+    ms->shared = shared;
+}
+
 /* =========================================================================
  * Batch staging
  * ========================================================================= */
@@ -1210,12 +1222,17 @@ static node_ref_t build_fresh(mpt_store_t *ms, dirty_entry_t *entries,
                          entries[start].value, entries[start].value_len);
     }
 
-    /* Compact live entries to front (stable order) */
+    /* Compact live entries to front (stable order).
+     * NULL out moved entries' value pointers to prevent double-free
+     * when commit_batch frees all dirty[0..count-1].value pointers. */
     if (live < end - start) {
         size_t w = start;
         for (size_t r = start; r < end; r++) {
             if (entries[r].value != NULL) {
-                if (w != r) entries[w] = entries[r];
+                if (w != r) {
+                    entries[w] = entries[r];
+                    entries[r].value = NULL;
+                }
                 w++;
             }
         }
@@ -1305,8 +1322,11 @@ static int single_child_index(const node_ref_t children[16]) {
     return idx;
 }
 
-/* Delete a stored node referenced by a ref (no-op for inline/empty) */
+/* Delete a stored node referenced by a ref (no-op for inline/empty).
+ * In shared (multi-trie) mode, skip deletion entirely — nodes may be
+ * referenced by other tries. Orphaned nodes are reclaimed by compaction. */
 static void delete_ref(mpt_store_t *ms, const node_ref_t *ref) {
+    if (ms->shared) return;
     if (ref->type == REF_HASH)
         delete_node(ms, ref->hash);
     /* Inline nodes are embedded in parent — nothing to delete */
@@ -1614,12 +1634,59 @@ static node_ref_t merge_extension(mpt_store_t *ms, const node_ref_t *old_ref,
         i = group_end;
     }
 
-    node_ref_t branch_ref = make_branch(ms, children);
+    /* Check if the branch is degenerate after processing dirty entries.
+     * Dirty entries that were deletes of non-existent keys produce REF_EMPTY
+     * children, so the branch may have fewer non-empty children than expected.
+     * A branch with 0 or 1 children is non-canonical and must be collapsed. */
+    int non_empty = count_children(children);
 
-    if (shared > 0) {
-        return make_extension(ms, ext_path, shared, &branch_ref);
+    if (non_empty == 0) {
+        return (node_ref_t){ .type = REF_EMPTY };
     }
-    return branch_ref;
+
+    node_ref_t subtrie_ref;
+    if (non_empty == 1) {
+        subtrie_ref = collapse_branch(ms, children);
+    } else {
+        subtrie_ref = make_branch(ms, children);
+    }
+
+    /* Prepend shared prefix (if any), maintaining canonical structure:
+     * ext + leaf → leaf, ext + ext → ext, ext + branch → ext(branch) */
+    if (shared > 0) {
+        if (subtrie_ref.type == REF_EMPTY)
+            return subtrie_ref;
+
+        uint8_t buf2[MAX_NODE_RLP];
+        size_t buf2_len;
+        mpt_node_t sub_node;
+        if (load_from_ref(ms, &subtrie_ref, buf2, &buf2_len, &sub_node)) {
+            if (sub_node.type == MPT_NODE_LEAF) {
+                /* ext(shared) + leaf(M) → leaf(shared+M) */
+                delete_ref(ms, &subtrie_ref);
+                uint8_t mp[MAX_NIBBLES];
+                memcpy(mp, ext_path, shared);
+                memcpy(mp + shared, sub_node.leaf.path,
+                       sub_node.leaf.path_len);
+                return make_leaf(ms, mp, shared + sub_node.leaf.path_len,
+                                 sub_node.leaf.value, sub_node.leaf.value_len);
+            }
+            if (sub_node.type == MPT_NODE_EXTENSION) {
+                /* ext(shared) + ext(M) → ext(shared+M) */
+                delete_ref(ms, &subtrie_ref);
+                uint8_t mp[MAX_NIBBLES];
+                memcpy(mp, ext_path, shared);
+                memcpy(mp + shared, sub_node.extension.path,
+                       sub_node.extension.path_len);
+                return make_extension(ms, mp,
+                                      shared + sub_node.extension.path_len,
+                                      &sub_node.extension.child);
+            }
+        }
+        return make_extension(ms, ext_path, shared, &subtrie_ref);
+    }
+
+    return subtrie_ref;
 }
 
 /* Core recursive function: update a subtrie with dirty entries */

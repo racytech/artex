@@ -72,6 +72,20 @@ void mpt_store_sync(mpt_store_t *ms);
  */
 void mpt_store_root(const mpt_store_t *ms, uint8_t out[32]);
 
+/**
+ * Set the root hash for subsequent batch operations.
+ * Use this to switch between different tries stored in the same mpt_store
+ * (e.g., per-account storage tries sharing a single node store).
+ */
+void mpt_store_set_root(mpt_store_t *ms, const uint8_t root[32]);
+
+/**
+ * Enable shared (multi-trie) mode. When true, commit_batch skips deletion
+ * of old nodes — they may be referenced by other tries sharing this store.
+ * Orphaned nodes are reclaimed by mpt_store_compact().
+ */
+void mpt_store_set_shared(mpt_store_t *ms, bool shared);
+
 /* =========================================================================
  * Batch Update Interface
  * ========================================================================= */
