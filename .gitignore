@@ -71,6 +71,7 @@ Makefile
 Testing/
 *.cmake
 !CMakeLists.txt
+!config.cmake
 
 # Debug files
 *.dSYM/

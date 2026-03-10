@@ -284,7 +284,7 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path) {
     /* Open or create persistent account MPT store */
     es->account_mpt = mpt_store_open(mpt_path);
     if (!es->account_mpt)
-        es->account_mpt = mpt_store_create(mpt_path, 500000000ULL);
+        es->account_mpt = mpt_store_create(mpt_path, (uint64_t)MPT_ACCOUNT_CAPACITY);
     if (!es->account_mpt) {
         mem_art_destroy(&es->accounts);
         mem_art_destroy(&es->storage);
@@ -303,9 +303,9 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path) {
     snprintf(storage_path, sizeof(storage_path), "%s_storage", mpt_path);
     es->storage_mpt = mpt_store_open(storage_path);
     if (!es->storage_mpt)
-        es->storage_mpt = mpt_store_create(storage_path, 1000000ULL);
+        es->storage_mpt = mpt_store_create(storage_path, (uint64_t)MPT_STORAGE_CAPACITY);
     if (es->storage_mpt) {
-        mpt_store_set_cache_mb(es->storage_mpt, 256);
+        mpt_store_set_cache_mb(es->storage_mpt, MPT_STORAGE_CACHE_MB);
         mpt_store_set_shared(es->storage_mpt, true);
     }
     if (!es->storage_mpt) {

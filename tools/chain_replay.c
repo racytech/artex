@@ -23,7 +23,10 @@
 bool g_trace_calls = false;  // Debug: trace CALL gas
 
 #define ERA1_BLOCKS_PER_FILE 8192
+
+#ifndef CHECKPOINT_INTERVAL
 #define CHECKPOINT_INTERVAL  256
+#endif
 
 /* Persistent store paths */
 static const char *VALUE_DIR  = "/tmp/chain_replay_values";

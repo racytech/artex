@@ -1,12 +1,35 @@
 cmake_minimum_required(VERSION 3.15)
+
+# Load project config if present (avoids -D flags on every cmake invocation)
+if(EXISTS "${CMAKE_SOURCE_DIR}/config.cmake")
+    include("${CMAKE_SOURCE_DIR}/config.cmake")
+endif()
+
 project(art_database C)
 
-# Backend options
+# Backend options (overridable via config.cmake or -D flags)
 option(ENABLE_MPT "Enable MPT (Merkle Patricia Trie) state root" ON)
 option(ENABLE_VERKLE "Enable Verkle state root" OFF)
 
 if(NOT ENABLE_MPT AND NOT ENABLE_VERKLE)
     message(FATAL_ERROR "At least one state backend must be enabled (ENABLE_MPT or ENABLE_VERKLE)")
+endif()
+
+# Tunable parameters (overridable via config.cmake or -D flags)
+if(NOT DEFINED MPT_ACCOUNT_CACHE_MB)
+    set(MPT_ACCOUNT_CACHE_MB 2048)
+endif()
+if(NOT DEFINED MPT_STORAGE_CACHE_MB)
+    set(MPT_STORAGE_CACHE_MB 2048)
+endif()
+if(NOT DEFINED MPT_ACCOUNT_CAPACITY)
+    set(MPT_ACCOUNT_CAPACITY 500000000)
+endif()
+if(NOT DEFINED MPT_STORAGE_CAPACITY)
+    set(MPT_STORAGE_CAPACITY 500000000)
+endif()
+if(NOT DEFINED CHECKPOINT_INTERVAL)
+    set(CHECKPOINT_INTERVAL 256)
 endif()
 
 # Set C standard
@@ -148,6 +171,7 @@ add_library(mpt_store STATIC
     database/src/mpt_store.c
 )
 target_include_directories(mpt_store PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+target_compile_definitions(mpt_store PRIVATE MPT_DEFAULT_CACHE_MB=${MPT_ACCOUNT_CACHE_MB})
 target_link_libraries(mpt_store disk_hash common)
 
 #==============================================================================
@@ -205,6 +229,11 @@ endif()
 if(ENABLE_VERKLE)
     target_compile_definitions(evm PUBLIC ENABLE_VERKLE=1)
 endif()
+target_compile_definitions(evm PRIVATE
+    MPT_STORAGE_CACHE_MB=${MPT_STORAGE_CACHE_MB}
+    MPT_ACCOUNT_CAPACITY=${MPT_ACCOUNT_CAPACITY}
+    MPT_STORAGE_CAPACITY=${MPT_STORAGE_CAPACITY}
+)
 
 #==============================================================================
 # Libraries — Block Executor
@@ -701,6 +730,7 @@ if(CJSON_FOUND)
 
     # Chain replay tool
     add_executable(chain_replay tools/chain_replay.c)
+    target_compile_definitions(chain_replay PRIVATE CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL})
     target_link_libraries(chain_replay sync)
 
     #==============================================================================
@@ -750,6 +780,13 @@ message(STATUS "C Compiler:        ${CMAKE_C_COMPILER}")
 message(STATUS "C Flags:           ${CMAKE_C_FLAGS}")
 message(STATUS "MPT backend:       ${ENABLE_MPT}")
 message(STATUS "Verkle backend:    ${ENABLE_VERKLE}")
+message(STATUS "")
+message(STATUS "Tuning:")
+message(STATUS "  Account cache:   ${MPT_ACCOUNT_CACHE_MB} MB")
+message(STATUS "  Storage cache:   ${MPT_STORAGE_CACHE_MB} MB")
+message(STATUS "  Account capacity:${MPT_ACCOUNT_CAPACITY}")
+message(STATUS "  Storage capacity:${MPT_STORAGE_CAPACITY}")
+message(STATUS "  Checkpoint every:${CHECKPOINT_INTERVAL} blocks")
 message(STATUS "")
 message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
