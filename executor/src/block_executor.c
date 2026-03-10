@@ -311,9 +311,6 @@ block_result_t block_execute(evm_t *evm,
 
         /* Uncle inclusion bonuses */
         size_t uncle_count = block_body_uncle_count(body);
-        if (uncle_count > 0) {
-            fprintf(stderr, "UNCLE block=%lu count=%zu\n", header->number, uncle_count);
-        }
         for (size_t u = 0; u < uncle_count; u++) {
             /* Miner gets base_reward/32 per uncle included */
             uint256_t thirty_two = uint256_from_uint64(32);
