@@ -6,9 +6,18 @@
 #include "uint256.h"
 #include "address.h"
 #include "hash.h"
+
+#ifdef ENABLE_VERKLE
 #include "verkle_state.h"
 #include "witness_gas.h"
+#else
+/* Forward declaration for API compatibility when verkle is disabled */
+typedef struct verkle_state_fwd verkle_state_t;
+#endif
+
+#ifdef ENABLE_MPT
 #include "mpt_store.h"
+#endif
 
 /**
  * EVM State — Typed, in-memory state interface above verkle_state.
@@ -217,6 +226,7 @@ bool evm_state_finalize(evm_state_t *es);
  */
 hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
 
+#ifdef ENABLE_MPT
 /**
  * Compute MPT (Merkle Patricia Trie) state root from the in-memory caches.
  * Used for pre-Verkle block validation against block headers.
@@ -225,6 +235,7 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
  * @param prune_empty  If true (EIP-161+), exclude empty accounts from the trie.
  */
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty);
+#endif
 void evm_state_debug_dump(evm_state_t *es);
 
 #endif // EVM_STATE_H

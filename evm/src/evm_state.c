@@ -1,7 +1,9 @@
 #include "evm_state.h"
 #include "mem_art.h"
 #include "keccak256.h"
+#ifdef ENABLE_MPT
 #include "mpt_store.h"
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -100,7 +102,9 @@ typedef struct {
 // --- Main struct ---
 
 struct evm_state {
+#ifdef ENABLE_VERKLE
     verkle_state_t   *vs;
+#endif
     mem_art_t         accounts;     // key: addr[20], value: cached_account_t
     mem_art_t         storage;      // key: skey[52], value: cached_slot_t
     journal_entry_t  *journal;
@@ -109,9 +113,13 @@ struct evm_state {
     mem_art_t         warm_addrs;   // key: addr[20], value: (none, 0 bytes)
     mem_art_t         warm_slots;   // key: skey[52], value: (none, 0 bytes)
     mem_art_t         transient;    // key: skey[52], value: uint256_t (EIP-1153)
+#ifdef ENABLE_VERKLE
     witness_gas_t     witness_gas;  // EIP-4762 verkle witness gas tracker
+#endif
+#ifdef ENABLE_MPT
     mpt_store_t      *account_mpt;  // persistent incremental account trie
     mpt_store_t      *storage_mpt;  // shared store for all per-account storage tries
+#endif
 };
 
 // ============================================================================
@@ -144,7 +152,7 @@ static bool is_zero_hash(const uint8_t h[32]) {
     return true;
 }
 
-// Load account from verkle_state into cache. Creates empty if not found.
+// Load account into cache. From verkle_state if enabled, else empty.
 static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) {
     cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
         &es->accounts, addr->bytes, ADDRESS_SIZE, NULL);
@@ -155,6 +163,7 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
     memset(&ca_local, 0, sizeof(ca_local));
     address_copy(&ca_local.addr, addr);
 
+#ifdef ENABLE_VERKLE
     // Load from verkle_state
     ca_local.nonce = verkle_state_get_nonce(es->vs, addr->bytes);
 
@@ -175,6 +184,7 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
     ca_local.existed = (ca_local.nonce != 0 ||
                         !uint256_is_zero(&ca_local.balance) ||
                         has_code_hash);
+#endif
 
     ca_local.storage_root = HASH_EMPTY_STORAGE;
 
@@ -186,7 +196,7 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
         &es->accounts, addr->bytes, ADDRESS_SIZE, NULL);
 }
 
-// Load storage slot from verkle_state into cache.
+// Load storage slot into cache. From verkle_state if enabled, else zero.
 static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
                                   const uint256_t *slot) {
     uint8_t skey[SLOT_KEY_SIZE];
@@ -203,6 +213,7 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
     cs_local.original = UINT256_ZERO_INIT;
     cs_local.current = UINT256_ZERO_INIT;
 
+#ifdef ENABLE_VERKLE
     // Load from verkle_state
     // Slot key: LE for key derivation arithmetic
     // Value: BE (Ethereum convention — go-ethereum uses common.LeftPadBytes)
@@ -211,6 +222,7 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
     verkle_state_get_storage(es->vs, addr->bytes, slot_le, val_be);
     cs_local.original = uint256_from_bytes(val_be, 32);
     cs_local.current = cs_local.original;
+#endif
 
     if (!mem_art_insert(&es->storage, skey, SLOT_KEY_SIZE,
                         &cs_local, sizeof(cached_slot_t)))
@@ -225,12 +237,23 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
 // ============================================================================
 
 evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path) {
-    if (!vs || !mpt_path) return NULL;
+#ifdef ENABLE_VERKLE
+    if (!vs) return NULL;
+#else
+    (void)vs;
+#endif
+#ifdef ENABLE_MPT
+    if (!mpt_path) return NULL;
+#else
+    (void)mpt_path;
+#endif
 
     evm_state_t *es = calloc(1, sizeof(evm_state_t));
     if (!es) return NULL;
 
+#ifdef ENABLE_VERKLE
     es->vs = vs;
+#endif
     es->journal_cap = JOURNAL_INIT_CAP;
     es->journal = malloc(es->journal_cap * sizeof(journal_entry_t));
     if (!es->journal) {
@@ -253,8 +276,11 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path) {
         return NULL;
     }
 
+#ifdef ENABLE_VERKLE
     witness_gas_init(&es->witness_gas);
+#endif
 
+#ifdef ENABLE_MPT
     /* Open or create persistent account MPT store */
     es->account_mpt = mpt_store_open(mpt_path);
     if (!es->account_mpt)
@@ -293,6 +319,7 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path) {
         free(es);
         return NULL;
     }
+#endif
 
     return es;
 }
@@ -310,6 +337,7 @@ static bool free_code_cb(const uint8_t *key, size_t key_len,
 void evm_state_destroy(evm_state_t *es) {
     if (!es) return;
 
+#ifdef ENABLE_MPT
     // Sync and destroy persistent MPT stores
     if (es->account_mpt) {
         mpt_store_sync(es->account_mpt);
@@ -319,6 +347,7 @@ void evm_state_destroy(evm_state_t *es) {
         mpt_store_sync(es->storage_mpt);
         mpt_store_destroy(es->storage_mpt);
     }
+#endif
 
     // Free code pointers owned by cached accounts
     mem_art_foreach(&es->accounts, free_code_cb, NULL);
@@ -329,7 +358,9 @@ void evm_state_destroy(evm_state_t *es) {
     mem_art_destroy(&es->warm_addrs);
     mem_art_destroy(&es->warm_slots);
     mem_art_destroy(&es->transient);
+#ifdef ENABLE_VERKLE
     witness_gas_destroy(&es->witness_gas);
+#endif
 
     // Free any code pointers still owned by journal entries (not reverted)
     for (uint32_t i = 0; i < es->journal_len; i++) {
@@ -478,8 +509,10 @@ uint32_t evm_state_get_code_size(evm_state_t *es, const address_t *addr) {
     // If no code, return 0
     if (!ca->has_code) return 0;
 
+#ifdef ENABLE_VERKLE
     // Load code size from verkle_state
     ca->code_size = (uint32_t)verkle_state_get_code_size(es->vs, addr->bytes);
+#endif
     return ca->code_size;
 }
 
@@ -496,6 +529,7 @@ bool evm_state_get_code(evm_state_t *es, const address_t *addr,
 
     // Load code into cache if not already loaded
     if (!ca->code) {
+#ifdef ENABLE_VERKLE
         uint64_t len = verkle_state_get_code_size(es->vs, addr->bytes);
         if (len == 0) {
             if (out_len) *out_len = 0;
@@ -507,6 +541,10 @@ bool evm_state_get_code(evm_state_t *es, const address_t *addr,
 
         uint64_t got = verkle_state_get_code(es->vs, addr->bytes, ca->code, len);
         ca->code_size = (uint32_t)got;
+#else
+        if (out_len) *out_len = 0;
+        return true;
+#endif
     }
 
     if (out && out_len) {
@@ -535,6 +573,7 @@ const uint8_t *evm_state_get_code_ptr(evm_state_t *es, const address_t *addr,
 
     // Load code into cache if not already loaded
     if (!ca->code) {
+#ifdef ENABLE_VERKLE
         uint64_t len = verkle_state_get_code_size(es->vs, addr->bytes);
         if (len == 0) {
             if (out_len) *out_len = 0;
@@ -549,6 +588,10 @@ const uint8_t *evm_state_get_code_ptr(evm_state_t *es, const address_t *addr,
 
         uint64_t got = verkle_state_get_code(es->vs, addr->bytes, ca->code, len);
         ca->code_size = (uint32_t)got;
+#else
+        if (out_len) *out_len = 0;
+        return NULL;
+#endif
     }
 
     if (out_len) *out_len = ca->code_size;
@@ -950,13 +993,19 @@ void evm_state_commit_tx(evm_state_t *es) {
     mem_art_destroy(&es->transient);
     mem_art_init(&es->transient);
 
+#ifdef ENABLE_VERKLE
     witness_gas_reset(&es->witness_gas);
+#endif
 }
 
 void evm_state_begin_block(evm_state_t *es, uint64_t block_number) {
     if (!es) return;
+#ifdef ENABLE_VERKLE
     witness_gas_reset(&es->witness_gas);
     verkle_state_begin_block(es->vs, block_number);
+#else
+    (void)block_number;
+#endif
 }
 
 // ============================================================================
@@ -1136,12 +1185,12 @@ bool evm_state_is_slot_warm(const evm_state_t *es, const address_t *addr,
 // Finalize — flush dirty state to verkle_state
 // ============================================================================
 
+#ifdef ENABLE_VERKLE
 typedef struct {
     evm_state_t *es;
     bool ok;
     bool prune_empty;  // EIP-158: skip writing empty touched accounts
 } finalize_ctx_t;
-
 static bool finalize_account_cb(const uint8_t *key, size_t key_len,
                                  const void *value, size_t value_len,
                                  void *user_data) {
@@ -1227,10 +1276,11 @@ static bool finalize_storage_cb(const uint8_t *key, size_t key_len,
 
     return true;
 }
+#endif /* ENABLE_VERKLE */
 
 bool evm_state_finalize(evm_state_t *es) {
     if (!es) return false;
-
+#ifdef ENABLE_VERKLE
     finalize_ctx_t ctx = { .es = es, .ok = true };
 
     mem_art_foreach(&es->accounts, finalize_account_cb, &ctx);
@@ -1238,12 +1288,16 @@ bool evm_state_finalize(evm_state_t *es) {
 
     mem_art_foreach(&es->storage, finalize_storage_cb, &ctx);
     return ctx.ok;
+#else
+    return true;
+#endif
 }
 
 // ============================================================================
 // State Root — delegate to verkle_state
 // ============================================================================
 
+#ifdef ENABLE_VERKLE
 // Flush callback: writes block-dirty cached accounts to verkle
 static bool flush_all_accounts_cb(const uint8_t *key, size_t key_len,
                                     const void *value, size_t value_len,
@@ -1333,6 +1387,7 @@ static bool flush_all_storage_cb(const uint8_t *key, size_t key_len,
     verkle_state_set_storage(ctx->es->vs, addr, slot_le, val_be);
     return true;
 }
+#endif /* ENABLE_VERKLE */
 
 static bool clear_block_dirty_account_cb(const uint8_t *key, size_t key_len,
                                           const void *value, size_t value_len,
@@ -1355,9 +1410,39 @@ static bool clear_block_dirty_slot_cb(const uint8_t *key, size_t key_len,
     return true;
 }
 
+// Promote block_dirty non-empty accounts to existed=true.
+// With VERKLE, flush_all_accounts_cb handles this. Without VERKLE, this callback
+// does the minimal equivalent: update the existed flag so MPT root computation
+// can distinguish live accounts from never-existed ones.
+#ifndef ENABLE_VERKLE
+static bool promote_block_dirty_cb(const uint8_t *key, size_t key_len,
+                                    const void *value, size_t value_len,
+                                    void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    bool prune_empty = *(bool *)user_data;
+    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
+
+    if (!ca->block_dirty && !ca->block_code_dirty) return true;
+
+    if (ca->self_destructed) {
+        ca->existed = false;
+        return true;
+    }
+
+    bool is_empty = (ca->nonce == 0 &&
+                     uint256_is_zero(&ca->balance) &&
+                     !ca->has_code);
+    if (!ca->existed && !ca->created && is_empty && prune_empty) return true;
+
+    ca->existed = true;
+    return true;
+}
+#endif
+
 hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     if (!es) return hash_zero();
 
+#ifdef ENABLE_VERKLE
     // Flush only block-dirty cached state to verkle
     finalize_ctx_t ctx = { .es = es, .ok = true, .prune_empty = prune_empty };
     mem_art_foreach(&es->accounts, flush_all_accounts_cb, &ctx);
@@ -1369,14 +1454,24 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
 
     hash_t root;
     verkle_state_root_hash(es->vs, root.bytes);
+#else
+    // Promote block_dirty accounts to existed (equivalent of verkle flush
+    // setting existed=true, needed for MPT root computation)
+    mem_art_foreach(&es->accounts, promote_block_dirty_cb, &prune_empty);
+#endif
 
     // Clear block_dirty flags — next block starts fresh
     mem_art_foreach(&es->accounts, clear_block_dirty_account_cb, NULL);
     mem_art_foreach(&es->storage, clear_block_dirty_slot_cb, NULL);
 
+#ifdef ENABLE_VERKLE
     return root;
+#else
+    return hash_zero();
+#endif
 }
 
+#ifdef ENABLE_MPT
 // ============================================================================
 // MPT State Root Computation (pre-Verkle block validation)
 // ============================================================================
@@ -1732,6 +1827,7 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
 
     return root;
 }
+#endif /* ENABLE_MPT */
 
 // ============================================================================
 // Witness Gas (EIP-4762)
@@ -1742,6 +1838,11 @@ uint64_t evm_state_witness_gas_access(evm_state_t *es,
                                        bool is_write,
                                        bool value_was_empty)
 {
+#ifdef ENABLE_VERKLE
     if (!es) return 0;
     return witness_gas_access_event(&es->witness_gas, key, is_write, value_was_empty);
+#else
+    (void)es; (void)key; (void)is_write; (void)value_was_empty;
+    return 0;
+#endif
 }

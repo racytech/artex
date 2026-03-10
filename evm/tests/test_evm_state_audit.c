@@ -4,7 +4,9 @@
  */
 
 #include "evm_state.h"
+#ifdef ENABLE_VERKLE
 #include "verkle_state.h"
+#endif
 #include "uint256.h"
 #include "hash.h"
 #include <stdio.h>
@@ -39,14 +41,26 @@ static address_t make_addr(uint8_t byte) {
 
 /* Create state + track verkle_state for proper cleanup */
 typedef struct {
+#ifdef ENABLE_VERKLE
     verkle_state_t *vs;
+#endif
     evm_state_t *es;
 } test_state_t;
 
 static test_state_t make_state(void) {
     test_state_t ts;
+#ifdef ENABLE_VERKLE
     ts.vs = verkle_state_create();
-    ts.es = evm_state_create(ts.vs, "/tmp/test_evm_state_audit_mpt");
+    ts.es = evm_state_create(ts.vs,
+#else
+    ts.es = evm_state_create(NULL,
+#endif
+#ifdef ENABLE_MPT
+        "/tmp/test_evm_state_audit_mpt"
+#else
+        NULL
+#endif
+    );
     return ts;
 }
 
@@ -56,10 +70,12 @@ static void free_state(test_state_t *ts) {
         evm_state_destroy(ts->es);
         ts->es = NULL;
     }
+#ifdef ENABLE_VERKLE
     if (ts->vs) {
         verkle_state_destroy(ts->vs);
         ts->vs = NULL;
     }
+#endif
 }
 
 /* =========================================================================
@@ -331,9 +347,11 @@ static void test_flush_sets_existed(void) {
     CHECK(evm_state_exists(es, &addr),
           "account should still exist after compute_state_root_ex");
 
+#ifdef ENABLE_VERKLE
     hash_t zero_root = hash_zero();
     CHECK(memcmp(root.bytes, zero_root.bytes, 32) != 0,
           "state root should not be zero after flushing an account");
+#endif
 
     PASS("flush_all_accounts_cb correctly processes block_dirty accounts");
 
@@ -359,12 +377,18 @@ static void test_prune_empty_frontier(void) {
     evm_state_finalize(es);
     evm_state_compute_state_root_ex(es, false);
 
+#ifdef ENABLE_VERKLE
     /* With prune_empty=false, block_dirty was cleared, but existed should
      * have been set to true by flush_all_accounts_cb */
     CHECK(evm_state_exists(es, &addr),
           "empty account should exist after flush with prune_empty=false");
 
     PASS("prune_empty=false: empty touched account is flushed (Frontier)");
+#else
+    /* Without verkle, flush is a no-op; block_dirty cleared, account not promoted */
+    (void)addr;
+    PASS("prune_empty=false: skipped (no verkle flush)");
+#endif
 
 cleanup:
     free_state(&ts);
@@ -397,6 +421,7 @@ cleanup:
     free_state(&ts);
 }
 
+#ifdef ENABLE_MPT
 /* =========================================================================
  * Test 8: MPT root consistency
  * ========================================================================= */
@@ -436,6 +461,7 @@ static void test_mpt_root_consistency(void) {
 cleanup:
     free_state(&ts);
 }
+#endif /* ENABLE_MPT */
 
 /* =========================================================================
  * Test 9: Storage visible across transactions
@@ -600,7 +626,9 @@ int main(void) {
     test_flush_sets_existed();
     test_prune_empty_frontier();
     test_prune_empty_eip161();
+#ifdef ENABLE_MPT
     test_mpt_root_consistency();
+#endif
     test_storage_across_txs();
     test_snapshot_revert_storage();
     test_balance_revert_restores_block_dirty();

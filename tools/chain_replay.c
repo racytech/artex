@@ -17,7 +17,9 @@
 #include "dao_fork.h"
 #include "evm.h"
 #include "evm_state.h"
+#ifdef ENABLE_VERKLE
 #include "verkle_state.h"
+#endif
 #include "fork.h"
 #include "hash.h"
 #include "uint256.h"
@@ -415,7 +417,9 @@ int main(int argc, char **argv) {
      * Decide: resume from checkpoint or fresh start
      * ===================================================================== */
 
+#ifdef ENABLE_VERKLE
     verkle_state_t *vs = NULL;
+#endif
     evm_state_t *state = NULL;
     hash_t block_hashes[BLOCK_HASH_WINDOW];
     memset(block_hashes, 0, sizeof(block_hashes));
@@ -442,8 +446,10 @@ int main(int argc, char **argv) {
     checkpoint_t ckpt;
     if (!force_clean &&
         file_exists(CKPT_PATH) &&
+#ifdef ENABLE_VERKLE
         dir_exists(VALUE_DIR) &&
         dir_exists(COMMIT_DIR) &&
+#endif
         checkpoint_load(CKPT_PATH, &ckpt))
     {
         printf("Checkpoint found: block %lu (ok=%lu fail=%lu gas=%lu)\n",
@@ -459,11 +465,13 @@ int main(int argc, char **argv) {
             return 1;
         }
 
+#ifdef ENABLE_VERKLE
         /* Open existing flat state */
         vs = verkle_state_open_flat(VALUE_DIR, COMMIT_DIR);
         if (!vs) {
             fprintf(stderr, "Failed to open existing verkle state — starting fresh\n");
         } else {
+#endif
             /* Restore checkpoint data */
             memcpy(block_hashes, ckpt.block_hashes, sizeof(block_hashes));
             start_block = ckpt.block_number + 1;
@@ -472,9 +480,12 @@ int main(int argc, char **argv) {
             blocks_fail = ckpt.blocks_fail;
             resumed = true;
             printf("Resuming from block %lu\n", start_block);
+#ifdef ENABLE_VERKLE
         }
+#endif
     }
 
+#ifdef ENABLE_VERKLE
     /* Fresh start if no checkpoint or resume failed */
     if (!vs) {
         vs = verkle_state_create_flat(VALUE_DIR, COMMIT_DIR);
@@ -484,11 +495,25 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+#endif
 
-    state = evm_state_create(vs, MPT_PATH);
+    state = evm_state_create(
+#ifdef ENABLE_VERKLE
+        vs,
+#else
+        NULL,
+#endif
+#ifdef ENABLE_MPT
+        MPT_PATH
+#else
+        NULL
+#endif
+    );
     if (!state) {
         fprintf(stderr, "Failed to create EVM state\n");
+#ifdef ENABLE_VERKLE
         verkle_state_destroy(vs);
+#endif
         archive_close(&archive);
         return 1;
     }
@@ -497,7 +522,9 @@ int main(int argc, char **argv) {
     if (!evm) {
         fprintf(stderr, "Failed to create EVM\n");
         evm_state_destroy(state);
+#ifdef ENABLE_VERKLE
         verkle_state_destroy(vs);
+#endif
         archive_close(&archive);
         return 1;
     }
@@ -511,7 +538,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Failed to load genesis state\n");
             evm_destroy(evm);
             evm_state_destroy(state);
+#ifdef ENABLE_VERKLE
             verkle_state_destroy(vs);
+#endif
             archive_close(&archive);
             return 1;
         }
@@ -538,7 +567,9 @@ int main(int argc, char **argv) {
         }
 
         /* Save genesis checkpoint */
+#ifdef ENABLE_VERKLE
         verkle_state_sync(vs);
+#endif
         checkpoint_save(CKPT_PATH, 0, block_hashes, 0, 0, 0);
         printf("Genesis checkpoint saved\n");
 
@@ -616,6 +647,7 @@ int main(int argc, char **argv) {
          *   - the very last block in the range
          */
         bool root_match = true;
+#ifdef ENABLE_MPT
         bool check_root = (bn % CHECKPOINT_INTERVAL == 0 ||
                            result.tx_count > 0 ||
                            block_body_uncle_count(&body) > 0 ||
@@ -626,6 +658,7 @@ int main(int argc, char **argv) {
             mpt_root = evm_state_compute_mpt_root(state, prune);
             root_match = (memcmp(mpt_root.bytes, header.state_root.bytes, 32) == 0);
         }
+#endif
 
         if (!gas_match) {
             fprintf(stderr, "Block %lu: GAS MISMATCH  got %lu  expected %lu  diff %+ld  (txs: %zu)\n",
@@ -638,6 +671,7 @@ int main(int argc, char **argv) {
                         result.receipts[ti].cumulative_gas);
             }
             blocks_fail++;
+#ifdef ENABLE_MPT
         } else if (!root_match) {
             char got_hex[67], exp_hex[67];
             hash_to_hex(&mpt_root, got_hex);
@@ -646,6 +680,7 @@ int main(int argc, char **argv) {
                     "  got:      %s\n  expected: %s\n",
                     bn, result.tx_count, got_hex, exp_hex);
             blocks_fail++;
+#endif
         } else {
             blocks_ok++;
         }
@@ -667,7 +702,9 @@ int main(int argc, char **argv) {
         /* Checkpoint every CHECKPOINT_INTERVAL blocks (only if clean) */
         if (blocks_fail == 0 &&
             bn - last_checkpoint_block >= CHECKPOINT_INTERVAL) {
+#ifdef ENABLE_VERKLE
             verkle_state_sync(vs);
+#endif
             checkpoint_save(CKPT_PATH, bn, block_hashes,
                             total_gas, blocks_ok, blocks_fail);
             last_checkpoint_block = bn;
@@ -685,14 +722,18 @@ int main(int argc, char **argv) {
              * the persistent state matches the last good block. Without
              * this, the store has block N's state but the checkpoint says
              * an earlier block, causing double-application on resume. */
+#ifdef ENABLE_VERKLE
             verkle_state_revert_block(vs);
+#endif
 
             /* Save checkpoint at the last good block (bn - 1) */
             uint64_t last_good = bn - 1;
             if (last_good > last_checkpoint_block) {
                 /* Exclude the failing block's gas from the checkpoint */
                 uint64_t good_gas = total_gas - result.gas_used;
+#ifdef ENABLE_VERKLE
                 verkle_state_sync(vs);
+#endif
                 checkpoint_save(CKPT_PATH, last_good, block_hashes,
                                 good_gas, blocks_ok, 0);
                 last_checkpoint_block = last_good;
@@ -705,7 +746,9 @@ int main(int argc, char **argv) {
 
     /* Final checkpoint — save at last executed block */
     if (blocks_fail == 0 && last_executed_block > last_checkpoint_block) {
+#ifdef ENABLE_VERKLE
         verkle_state_sync(vs);
+#endif
         checkpoint_save(CKPT_PATH, last_executed_block, block_hashes,
                         total_gas, blocks_ok, blocks_fail);
         printf("\nCheckpoint saved at block %lu\n", last_executed_block);
@@ -726,7 +769,9 @@ int main(int argc, char **argv) {
 
     evm_destroy(evm);
     evm_state_destroy(state);
+#ifdef ENABLE_VERKLE
     verkle_state_destroy(vs);
+#endif
     archive_close(&archive);
 
     return blocks_fail > 0 ? 1 : 0;

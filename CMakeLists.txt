@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.15)
 project(art_database C)
 
+# Backend options
+option(ENABLE_MPT "Enable MPT (Merkle Patricia Trie) state root" ON)
+option(ENABLE_VERKLE "Enable Verkle state root" OFF)
+
+if(NOT ENABLE_MPT AND NOT ENABLE_VERKLE)
+    message(FATAL_ERROR "At least one state backend must be enabled (ENABLE_MPT or ENABLE_VERKLE)")
+endif()
+
 # Set C standard
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -183,7 +191,20 @@ target_include_directories(evm PUBLIC
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/evm/vendor
 )
-target_link_libraries(evm verkle_state art_database mpt_store common ssl crypto secp256k1 blst)
+set(EVM_LINK_LIBS verkle_key pedersen banderwagon art_database common ssl crypto secp256k1 blst)
+if(ENABLE_VERKLE)
+    list(APPEND EVM_LINK_LIBS verkle_state)
+endif()
+if(ENABLE_MPT)
+    list(APPEND EVM_LINK_LIBS mpt_store)
+endif()
+target_link_libraries(evm ${EVM_LINK_LIBS})
+if(ENABLE_MPT)
+    target_compile_definitions(evm PUBLIC ENABLE_MPT=1)
+endif()
+if(ENABLE_VERKLE)
+    target_compile_definitions(evm PUBLIC ENABLE_VERKLE=1)
+endif()
 
 #==============================================================================
 # Libraries — Block Executor
@@ -445,7 +466,11 @@ add_test(NAME test_verkle_snapshot COMMAND test_verkle_snapshot)
 add_executable(test_evm_state_audit
     evm/tests/test_evm_state_audit.c
 )
-target_link_libraries(test_evm_state_audit evm verkle_state)
+set(TEST_EVM_AUDIT_LIBS evm)
+if(ENABLE_VERKLE)
+    list(APPEND TEST_EVM_AUDIT_LIBS verkle_state)
+endif()
+target_link_libraries(test_evm_state_audit ${TEST_EVM_AUDIT_LIBS})
 add_test(NAME test_evm_state_audit COMMAND test_evm_state_audit)
 
 # Test: MPT Store cross-validation against Python reference vectors
@@ -636,7 +661,11 @@ add_test(NAME test_loopback COMMAND test_loopback)
 add_executable(test_block_executor
     executor/tests/test_block_executor.c
 )
-target_link_libraries(test_block_executor block_executor evm verkle_state common)
+set(TEST_BLOCK_EXEC_LIBS block_executor evm common)
+if(ENABLE_VERKLE)
+    list(APPEND TEST_BLOCK_EXEC_LIBS verkle_state)
+endif()
+target_link_libraries(test_block_executor ${TEST_BLOCK_EXEC_LIBS})
 add_test(NAME test_block_executor COMMAND test_block_executor)
 
 #==============================================================================
@@ -663,7 +692,11 @@ if(CJSON_FOUND)
     # Chain replay tool
     add_executable(chain_replay tools/chain_replay.c)
     target_include_directories(chain_replay PRIVATE ${CJSON_INCLUDE_DIRS})
-    target_link_libraries(chain_replay block_executor evm verkle_state common ${CJSON_LIBRARIES})
+    set(CHAIN_REPLAY_LIBS block_executor evm common ${CJSON_LIBRARIES})
+    if(ENABLE_VERKLE)
+        list(APPEND CHAIN_REPLAY_LIBS verkle_state)
+    endif()
+    target_link_libraries(chain_replay ${CHAIN_REPLAY_LIBS})
 
     #==============================================================================
     # Integration Tests (Ethereum test vectors)
@@ -677,13 +710,11 @@ if(CJSON_FOUND)
             executor/include
             ${CJSON_INCLUDE_DIRS}
         )
-        target_link_libraries(integration_tests PUBLIC
-            evm
-            block_executor
-            verkle_state
-            common
-            ${CJSON_LIBRARIES}
-        )
+        set(INTEG_TEST_LIBS evm block_executor common ${CJSON_LIBRARIES})
+        if(ENABLE_VERKLE)
+            list(APPEND INTEG_TEST_LIBS verkle_state)
+        endif()
+        target_link_libraries(integration_tests PUBLIC ${INTEG_TEST_LIBS})
 
         add_executable(test_parser_verify integration_tests/test_parser_verify.c)
         target_link_libraries(test_parser_verify integration_tests)
@@ -712,6 +743,8 @@ message(STATUS "========================================")
 message(STATUS "Build type:        ${CMAKE_BUILD_TYPE}")
 message(STATUS "C Compiler:        ${CMAKE_C_COMPILER}")
 message(STATUS "C Flags:           ${CMAKE_C_FLAGS}")
+message(STATUS "MPT backend:       ${ENABLE_MPT}")
+message(STATUS "Verkle backend:    ${ENABLE_VERKLE}")
 message(STATUS "")
 message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
