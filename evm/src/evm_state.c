@@ -382,6 +382,17 @@ static bool free_code_cb(const uint8_t *key, size_t key_len,
     return true;
 }
 
+void evm_state_evict_cache(evm_state_t *es) {
+    if (!es) return;
+    /* Free heap-allocated code pointers before destroying arena */
+    mem_art_foreach(&es->accounts, free_code_cb, NULL);
+    /* Destroy and reinit account + storage trees */
+    mem_art_destroy(&es->accounts);
+    mem_art_destroy(&es->storage);
+    mem_art_init(&es->accounts);
+    mem_art_init(&es->storage);
+}
+
 void evm_state_destroy(evm_state_t *es) {
     if (!es) return;
 

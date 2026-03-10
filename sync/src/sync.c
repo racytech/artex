@@ -546,6 +546,9 @@ bool sync_execute_block(sync_t *sync,
                                      sync->blocks_fail);
             sync->last_checkpoint_block = bn;
         }
+
+        /* Evict cache to bound memory — data is on disk, read-through reloads */
+        evm_state_evict_cache(sync->state);
     }
 
     block_result_free(&br);
