@@ -86,9 +86,31 @@ static evm_status_t op_log_common(evm_t *evm, uint8_t num_topics)
         }
     }
 
-    // TODO: Store log entry in evm->logs array
-    // For now, just log to debug output
-    LOG_EVM_DEBUG("LOG%u: offset=%lu, size=%lu (stub - not stored)", 
+    // TODO: Capture log entry for receipt/bloom computation
+    //
+    // Required for Engine API block validation (receiptsRoot, logsBloom):
+    //
+    // 1. Define log_t struct (address, data, topics[0..4], topic_count)
+    //    — could live in evm.h or a new evm_log.h
+    //
+    // 2. Add a log accumulator to evm_t or transaction context:
+    //      log_t  *logs;
+    //      size_t  log_count;
+    //      size_t  log_cap;
+    //
+    // 3. Here: allocate log entry, copy contract address from evm->msg.recipient,
+    //    copy data from memory[offset..offset+size], copy topics from stack,
+    //    append to accumulator
+    //
+    // 4. On REVERT: discard logs added since the snapshot (depth-aware)
+    //    — evm_state snapshot/revert already handles this pattern,
+    //      logs need the same treatment (save log_count at snapshot,
+    //      truncate on revert)
+    //
+    // 5. After transaction_execute(): move logs into transaction_result_t
+    //    (currently commented out: log_t *logs; size_t log_count;)
+    //
+    LOG_EVM_DEBUG("LOG%u: offset=%lu, size=%lu (stub - not stored)",
                   num_topics, offset, size);
 
     return EVM_SUCCESS;

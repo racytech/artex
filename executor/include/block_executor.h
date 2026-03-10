@@ -14,6 +14,28 @@ extern "C" {
 
 /**
  * Per-transaction receipt (simplified).
+ *
+ * TODO: Extend for full Ethereum receipt (needed for receiptsRoot, logsBloom):
+ *
+ *   1. Add tx_type (uint8_t) — needed for typed receipt RLP envelope
+ *      (EIP-2718: type || RLP[status, cumGas, bloom, logs])
+ *
+ *   2. Add status_code (uint8_t) — 0=fail, 1=success
+ *      (post-Byzantium; pre-Byzantium uses intermediate state root)
+ *
+ *   3. Add logs_bloom[256] — per-tx 2048-bit bloom filter
+ *      Computed from tx logs: for each log, set 3 bit-pairs from
+ *      keccak256(address) and keccak256(each topic)
+ *
+ *   4. Add log_t *logs + log_count — actual log entries from EVM
+ *      (depends on log capture in LOG0-LOG4 opcodes, see evm/src/opcodes/logging.c)
+ *
+ *   5. Add receipt_encode_rlp(receipt) → bytes — RLP encode for trie insertion
+ *
+ * Once complete, block_execute() can:
+ *   - Compute per-tx bloom from logs after each tx
+ *   - OR all per-tx blooms → block logs_bloom (for header validation)
+ *   - Build receipt trie via mpt_compute_root_batch() → receiptsRoot
  */
 typedef struct {
     bool      success;       /* true if tx succeeded (even if EVM reverted) */
@@ -25,6 +47,19 @@ typedef struct {
 
 /**
  * Block execution result.
+ *
+ * TODO: Add computed roots for Engine API validation:
+ *
+ *   1. receipt_root (hash_t) — MPT root of RLP-encoded receipts
+ *      Build trie: key=RLP(tx_index), value=receipt_encode_rlp(receipt)
+ *      Use mpt_compute_root_batch() from state/include/mpt.h
+ *
+ *   2. logs_bloom[256] — aggregate bloom = OR of all per-tx blooms
+ *      Engine API provides logsBloom in payload; must match
+ *
+ *   3. tx_root (hash_t) — MPT root of RLP-encoded transactions
+ *      Build trie: key=RLP(tx_index), value=raw tx RLP bytes
+ *      Can compute from block_body transactions directly
  */
 typedef struct {
     hash_t      state_root;    /* post-execution state root */
