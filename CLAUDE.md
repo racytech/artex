@@ -2,57 +2,22 @@
 
 ## Current Work: MPT Store Integration into chain_replay
 
-Branch: `evm-verkle-dev-2` (based on `evm-verkle-dev-1`)
+Branch: `evm-verkle-dev-3`
 
-### Goal
-Replace the O(total_accounts) full MPT trie rebuild per block with O(dirty * trie_depth) incremental updates using `mpt_store`. This is critical for scaling past ~50K blocks where the full rebuild becomes the bottleneck.
-
-### Architecture
-Ethereum MPT has two trie levels:
-1. **Account trie**: `keccak256(address)` -> `RLP(nonce, balance, storage_root, code_hash)`
-2. **Per-account storage tries**: `keccak256(slot)` -> `RLP(value)` (one trie per account)
-
-`mpt_store` is a persistent disk-backed MPT with incremental batch updates. It uses disk_hash for O(1) node indexing, size-class slot allocation (no garbage), and a 2GB LRU cache.
+### Status
+- Incremental MPT root computation via `mpt_store` — DONE (account trie + per-account storage tries)
+- Read-through caching, cache eviction, deferred writes — DONE
+- 500K+ mainnet blocks validated, 44,039 state tests + 47,589 blockchain tests pass
 
 ---
 
-## Step 1: mpt_store for Account Trie -- DONE
+## TODO: Deferred Writes for Verkle Value Store (disk_hash)
 
-- `mpt_store_t *account_mpt` in `evm_state` — incremental account trie updates
-- `mpt_dirty` flag on `cached_account_t` — survives commit_tx, cleared after compute_mpt_root
-- `storage_dirty` flag on `cached_account_t` — set when any storage slot changes
+The MPT path already has deferred writes in `mpt_store.c` — nodes are buffered in memory and flushed to disk at checkpoint time, avoiding per-update pwrite() syscalls. The Verkle path (`verkle_state`) writes to `disk_hash` immediately on every state change. It needs the same deferred write pattern:
 
-## Step 2: Cache Storage Roots Per Account -- DONE
-
-- `hash_t storage_root` in `cached_account_t` — cached across blocks
-- Only recomputed for accounts with `storage_dirty == true`
-- Self-destruct resets to `HASH_EMPTY_STORAGE`
-
-## Step 3: Per-Account Storage Tries via mpt_store -- DONE
-
-- `mpt_store_t *storage_mpt` — shared store for ALL per-account storage tries
-- `mpt_store_set_root()` switches between tries per account
-- `mpt_store_set_shared()` disables node deletion (shared nodes across tries)
-- `mpt_dirty` flag on `cached_slot_t` — tracks which slots need mpt_store update
-- `compute_all_storage_roots()` collects dirty slots, groups by account, applies incremental updates
-- Validated: 250K+ mainnet blocks, 0 failures, ~315 blk/s
-
-### Key bugs fixed in Step 3
-- **build_fresh double-free**: compaction must NULL moved entries' value pointers
-- **merge_extension diverge path**: must collapse degenerate branches (0 or 1 children) and merge path prefixes canonically — otherwise deletes of non-existent keys create non-canonical tree structures
-
-### Files changed (Steps 1-3)
-- `evm/src/evm_state.c` — core logic (account/storage tries, flags, incremental updates)
-- `evm/include/evm_state.h` — evm_state_create signature (mpt_path param)
-- `database/src/mpt_store.c` — set_root, set_shared, build_fresh fix, merge_extension fix
-- `database/include/mpt_store.h` — new API declarations
-- `CMakeLists.txt` — link mpt_store to evm
-- `tools/chain_replay.c` — pass mpt_path, clean storage_mpt files on --clean
-- `executor/tests/test_block_executor.c` — NULL mpt_path
-- `integration_tests/src/test_runner_core.c` — NULL mpt_path
-- `evm/tests/test_evm_state_audit.c` — NULL mpt_path
-
----
+- Buffer disk_hash puts in memory, flush at checkpoint boundaries
+- This also enables non-per-block root computation: accumulate dirty state across multiple blocks, compute the Verkle root once per batch (e.g., every 256 blocks) instead of every block
+- Currently `compute_state_root_ex` is called every block from `block_executor.c` — for Verkle this flushes all dirty state and computes the root. Should be restructured to match the MPT pattern where root computation frequency is decoupled from block execution
 
 ## Nice to Have: Pipelined Root Computation
 
