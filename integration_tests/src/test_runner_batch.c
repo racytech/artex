@@ -15,6 +15,7 @@
 extern cJSON* load_json_file(const char *filepath);
 extern bool parse_state_test_from_json(const cJSON *test_obj, const char *test_name, state_test_t **out);
 extern bool parse_blockchain_test_from_json(const cJSON *test_obj, const char *test_name, blockchain_test_t **out);
+extern bool parse_engine_test_from_json(const cJSON *test_obj, const char *test_name, engine_test_t **out);
 
 //==============================================================================
 // File Test Execution
@@ -26,11 +27,15 @@ bool test_runner_run_file(test_runner_t *runner,
     if (!runner || !filepath || !results) return false;
     
     // Determine test type from path
+    // Note: engine tests must be checked before generic blockchain tests
+    // since "blockchain_tests_engine" contains "blockchain_tests"
+    bool is_engine_test = strstr(filepath, "blockchain_tests_engine") != NULL
+                       && strstr(filepath, "blockchain_tests_engine_x") == NULL;
     bool is_state_test = strstr(filepath, "state_tests") != NULL;
-    bool is_blockchain_test = strstr(filepath, "blockchain_tests") != NULL;
+    bool is_blockchain_test = !is_engine_test && strstr(filepath, "blockchain_tests") != NULL;
     bool is_transaction_test = strstr(filepath, "transaction_tests") != NULL;
-    
-    if (!is_state_test && !is_blockchain_test && !is_transaction_test) {
+
+    if (!is_state_test && !is_blockchain_test && !is_transaction_test && !is_engine_test) {
         // Try to detect from filename
         if (strstr(filepath, "state") || strstr(filepath, "State")) {
             is_state_test = true;
@@ -40,10 +45,11 @@ bool test_runner_run_file(test_runner_t *runner,
             is_transaction_test = true;
         }
     }
-    
+
     if (runner->config.verbose) {
         printf("Processing: %s\n", filepath);
-        printf("  Type: %s\n", 
+        printf("  Type: %s\n",
+               is_engine_test ? "engine_test" :
                is_state_test ? "state_test" :
                is_blockchain_test ? "blockchain_test" :
                is_transaction_test ? "transaction_test" : "unknown");
@@ -52,7 +58,46 @@ bool test_runner_run_file(test_runner_t *runner,
     test_result_t result;
     bool success = false;
     
-    if (is_state_test) {
+    if (is_engine_test) {
+        /* Engine test files contain multiple test objects (keyed by test name) */
+        cJSON *root = load_json_file(filepath);
+        if (!root) {
+            if (runner->config.verbose) {
+                fprintf(stderr, "  ERROR: Failed to load JSON: %s\n", filepath);
+            }
+            return false;
+        }
+
+        int tests_run = 0;
+        cJSON *test_obj;
+        cJSON_ArrayForEach(test_obj, root) {
+            if (!test_obj->string) continue;
+
+            engine_test_t *test = NULL;
+            if (!parse_engine_test_from_json(test_obj, test_obj->string, &test)) {
+                if (runner->config.verbose) {
+                    fprintf(stderr, "  ERROR: Failed to parse engine test: %s\n", test_obj->string);
+                }
+                continue;
+            }
+
+            success = test_runner_run_engine_test(runner, test, &result);
+            tests_run++;
+
+            if (success) {
+                test_results_add(results, &result);
+                test_result_free(&result);
+            }
+
+            engine_test_free(test);
+
+            if (!success) break;
+        }
+
+        cJSON_Delete(root);
+        return tests_run > 0;
+
+    } else if (is_state_test) {
         // State test files can contain multiple test objects
         cJSON *root = load_json_file(filepath);
         if (!root) {

@@ -152,6 +152,16 @@ bool parse_environment(const cJSON *json, test_env_t *out);
 bool parse_blockchain_test(const char *filepath, blockchain_test_t **out);
 
 /**
+ * Parse engine test from JSON object (blockchain_tests_engine format)
+ * @param test_obj cJSON object for one test entry
+ * @param test_name Test name/identifier
+ * @param out Output engine test (allocated)
+ * @return true on success, false on error
+ */
+bool parse_engine_test_from_json(const cJSON *test_obj, const char *test_name,
+                                  engine_test_t **out);
+
+/**
  * Parse state test from JSON file
  * @param filepath Path to JSON file
  * @param out Output state test (allocated)

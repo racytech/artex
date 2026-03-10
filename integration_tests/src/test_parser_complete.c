@@ -389,6 +389,212 @@ bool parse_state_test_from_json(const cJSON *test_obj, const char *test_name, st
 }
 
 //==============================================================================
+// Engine Test Parsing (blockchain_tests_engine format)
+//==============================================================================
+
+static bool parse_engine_payload(const cJSON *entry, engine_test_payload_t *payload) {
+    memset(payload, 0, sizeof(*payload));
+
+    /* newPayloadVersion: "1", "2", "3", or "4" */
+    const char *version_str;
+    if (json_get_string(entry, "newPayloadVersion", &version_str)) {
+        payload->new_payload_version = atoi(version_str);
+    }
+
+    const cJSON *params = json_get_array(entry, "params");
+    if (!params) return false;
+
+    /* params[0] = ExecutionPayload object */
+    const cJSON *ep = cJSON_GetArrayItem((cJSON *)params, 0);
+    if (!ep || !cJSON_IsObject(ep)) return false;
+
+    /* Fixed-size hash/address fields */
+    const char *str;
+    if (json_get_string(ep, "parentHash", &str))
+        parse_hex_string(str, payload->parent_hash, 32);
+    if (json_get_string(ep, "feeRecipient", &str))
+        parse_hex_string(str, payload->fee_recipient, 20);
+    if (json_get_string(ep, "stateRoot", &str))
+        parse_hex_string(str, payload->state_root, 32);
+    if (json_get_string(ep, "receiptsRoot", &str))
+        parse_hex_string(str, payload->receipts_root, 32);
+    if (json_get_string(ep, "logsBloom", &str))
+        parse_hex_string(str, payload->logs_bloom, 256);
+    if (json_get_string(ep, "prevRandao", &str))
+        parse_hex_string(str, payload->prev_randao, 32);
+    if (json_get_string(ep, "blockHash", &str))
+        parse_hex_string(str, payload->block_hash, 32);
+
+    /* Uint64 quantities */
+    if (json_get_string(ep, "blockNumber", &str))
+        parse_uint64(str, &payload->block_number);
+    if (json_get_string(ep, "gasLimit", &str))
+        parse_uint64(str, &payload->gas_limit);
+    if (json_get_string(ep, "gasUsed", &str))
+        parse_uint64(str, &payload->gas_used);
+    if (json_get_string(ep, "timestamp", &str))
+        parse_uint64(str, &payload->timestamp);
+
+    /* Extra data (variable length, max 32 bytes) */
+    if (json_get_string(ep, "extraData", &str)) {
+        payload->extra_data_len = parse_hex_string(str, payload->extra_data, 32);
+    }
+
+    /* Base fee per gas — uint256 stored as 32-byte big-endian */
+    if (json_get_string(ep, "baseFeePerGas", &str)) {
+        uint256_t base_fee;
+        parse_uint256(str, &base_fee);
+        uint256_to_bytes(&base_fee, payload->base_fee_per_gas);
+    }
+
+    /* Transactions array */
+    const cJSON *txs = json_get_array(ep, "transactions");
+    if (txs) {
+        int tx_count = cJSON_GetArraySize(txs);
+        if (tx_count > 0) {
+            payload->transactions = calloc(tx_count, sizeof(uint8_t *));
+            payload->tx_lengths = calloc(tx_count, sizeof(size_t));
+            payload->tx_count = tx_count;
+
+            const cJSON *tx_item;
+            int tx_idx = 0;
+            cJSON_ArrayForEach(tx_item, txs) {
+                if (cJSON_IsString(tx_item)) {
+                    payload->transactions[tx_idx] =
+                        parse_hex_alloc(tx_item->valuestring, &payload->tx_lengths[tx_idx]);
+                    tx_idx++;
+                }
+            }
+        }
+    }
+
+    /* Withdrawals — Shanghai+ (V2) */
+    const cJSON *wds = json_get_array(ep, "withdrawals");
+    if (wds) {
+        int wd_count = cJSON_GetArraySize(wds);
+        if (wd_count > 0) {
+            payload->withdrawals = calloc(wd_count, sizeof(withdrawal_t));
+            payload->withdrawal_count = wd_count;
+
+            const cJSON *wd_item;
+            int wd_idx = 0;
+            cJSON_ArrayForEach(wd_item, wds) {
+                if (!cJSON_IsObject(wd_item)) continue;
+                withdrawal_t *w = &payload->withdrawals[wd_idx++];
+
+                if (json_get_string(wd_item, "index", &str))
+                    parse_uint64(str, &w->index);
+                if (json_get_string(wd_item, "validatorIndex", &str))
+                    parse_uint64(str, &w->validator_index);
+                if (json_get_string(wd_item, "address", &str)) {
+                    uint8_t addr_bytes[20];
+                    parse_hex_string(str, addr_bytes, 20);
+                    memcpy(w->address.bytes, addr_bytes, 20);
+                }
+                if (json_get_string(wd_item, "amount", &str))
+                    parse_uint64(str, &w->amount_gwei);
+            }
+        }
+    }
+
+    /* Blob gas — Cancun+ (V3) */
+    if (json_get_string(ep, "blobGasUsed", &str)) {
+        parse_uint64(str, &payload->blob_gas_used);
+        payload->has_blob_gas = true;
+    }
+    if (json_get_string(ep, "excessBlobGas", &str)) {
+        parse_uint64(str, &payload->excess_blob_gas);
+        payload->has_blob_gas = true;
+    }
+
+    /* params[2] = parent beacon block root (Cancun+, string) */
+    const cJSON *param2 = cJSON_GetArrayItem((cJSON *)params, 2);
+    if (param2 && cJSON_IsString(param2)) {
+        if (parse_hash(param2->valuestring, &payload->parent_beacon_root)) {
+            payload->has_parent_beacon_root = true;
+        }
+    }
+
+    return true;
+}
+
+bool parse_engine_test_from_json(const cJSON *test_obj, const char *test_name,
+                                  engine_test_t **out) {
+    if (!test_obj || !out) return false;
+
+    engine_test_t *test = calloc(1, sizeof(engine_test_t));
+    if (!test) return false;
+
+    /* Test name */
+    if (test_name) {
+        test->name = strdup(test_name);
+    }
+
+    /* Network/fork */
+    const char *network;
+    if (json_get_string(test_obj, "network", &network)) {
+        test->network = strdup(network);
+    }
+
+    /* Genesis block header */
+    const cJSON *genesis_header = json_get_object(test_obj, "genesisBlockHeader");
+    if (genesis_header) {
+        parse_block_header(genesis_header, &test->genesis_header);
+    }
+
+    /* Pre-state */
+    const cJSON *pre = json_get_object(test_obj, "pre");
+    if (pre) {
+        parse_account_map(pre, &test->pre_state, &test->pre_state_count);
+    }
+
+    /* Post-state */
+    const cJSON *post = json_get_object(test_obj, "postState");
+    if (post) {
+        parse_account_map(post, &test->post_state, &test->post_state_count);
+    }
+
+    /* Last block hash */
+    const char *last_hash;
+    if (json_get_string(test_obj, "lastblockhash", &last_hash)) {
+        parse_hash(last_hash, &test->last_block_hash);
+    }
+
+    /* Chain config */
+    const cJSON *config = json_get_object(test_obj, "config");
+    if (config) {
+        const char *chain_id;
+        if (json_get_string(config, "chainid", &chain_id)) {
+            parse_uint256(chain_id, &test->chain_id);
+        }
+    }
+
+    /* Engine payloads */
+    const cJSON *payloads_arr = json_get_array(test_obj, "engineNewPayloads");
+    if (payloads_arr) {
+        int count = cJSON_GetArraySize(payloads_arr);
+        if (count > 0) {
+            test->payloads = calloc(count, sizeof(engine_test_payload_t));
+            test->payload_count = count;
+
+            const cJSON *entry;
+            int idx = 0;
+            cJSON_ArrayForEach(entry, payloads_arr) {
+                if (!parse_engine_payload(entry, &test->payloads[idx])) {
+                    /* If any payload fails to parse, skip this test */
+                    engine_test_free(test);
+                    return false;
+                }
+                idx++;
+            }
+        }
+    }
+
+    *out = test;
+    return true;
+}
+
+//==============================================================================
 // Transaction Test Parsing
 //==============================================================================
 

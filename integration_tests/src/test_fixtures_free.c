@@ -3,6 +3,7 @@
  */
 
 #include "test_fixtures.h"
+#include "block.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -67,6 +68,46 @@ void blockchain_test_free(blockchain_test_t *test) {
     }
     free(test->blocks);
     
+    memset(test, 0, sizeof(*test));
+    free(test);
+}
+
+//==============================================================================
+// Engine Test Cleanup
+//==============================================================================
+
+void engine_test_free(engine_test_t *test) {
+    if (!test) return;
+
+    free(test->name);
+    free(test->network);
+    free(test->genesis_header.extra_data);
+
+    /* Free pre-state */
+    for (size_t i = 0; i < test->pre_state_count; i++) {
+        test_account_free(&test->pre_state[i]);
+    }
+    free(test->pre_state);
+
+    /* Free post-state */
+    for (size_t i = 0; i < test->post_state_count; i++) {
+        test_account_free(&test->post_state[i]);
+    }
+    free(test->post_state);
+
+    /* Free payloads */
+    for (size_t i = 0; i < test->payload_count; i++) {
+        engine_test_payload_t *p = &test->payloads[i];
+
+        for (size_t j = 0; j < p->tx_count; j++) {
+            free(p->transactions[j]);
+        }
+        free(p->transactions);
+        free(p->tx_lengths);
+        free(p->withdrawals);
+    }
+    free(test->payloads);
+
     memset(test, 0, sizeof(*test));
     free(test);
 }
