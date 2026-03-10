@@ -166,6 +166,12 @@ add_library(verkle_flat STATIC
 )
 target_link_libraries(verkle_flat verkle_commit_store art_store disk_hash pedersen banderwagon)
 
+# In-Memory Batch MPT (testing only — used by test runner for state root verification)
+add_library(mem_mpt STATIC
+    database/src/mem_mpt.c
+)
+target_link_libraries(mem_mpt common)
+
 # MPT Store (persistent Merkle Patricia Trie with incremental updates)
 add_library(mpt_store STATIC
     database/src/mpt_store.c
@@ -215,7 +221,7 @@ target_include_directories(evm PUBLIC
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/evm/vendor
 )
-set(EVM_LINK_LIBS verkle_key pedersen banderwagon art_database common ssl crypto secp256k1 blst)
+set(EVM_LINK_LIBS verkle_key pedersen banderwagon art_database mem_mpt common ssl crypto secp256k1 blst)
 if(ENABLE_VERKLE)
     list(APPEND EVM_LINK_LIBS verkle_state)
 endif()

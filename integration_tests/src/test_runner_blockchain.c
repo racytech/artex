@@ -114,7 +114,11 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
         if (fork >= FORK_SPURIOUS_DRAGON)
             prune_empty = true;
 
+#ifdef ENABLE_MPT
+        hash_t actual_genesis_root = evm_state_compute_mpt_root(runner->state, prune_empty);
+#else
         hash_t actual_genesis_root = evm_state_compute_state_root_ex(runner->state, prune_empty);
+#endif
 
         if (runner->config.verbose) {
             char *expected_str = hash_to_hex_string(&test->genesis_header.state_root);
@@ -208,7 +212,11 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
         // Verify state root against expected (from JSON block header)
         // Compute state root ourselves (block_execute's finalize may affect root)
         bool prune = (runner->evm->fork >= FORK_SPURIOUS_DRAGON);
+#ifdef ENABLE_MPT
+        hash_t computed_root = evm_state_compute_mpt_root(runner->state, prune);
+#else
         hash_t computed_root = evm_state_compute_state_root_ex(runner->state, prune);
+#endif
         hash_t *expected_root = (hash_t *)&block->header.state_root;
         if (!hash_equals(&computed_root, expected_root)) {
             char *expected_str = hash_to_hex_string(expected_root);

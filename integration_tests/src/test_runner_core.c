@@ -49,6 +49,7 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
     test_config.fork_blocks.cancun = UINT64_MAX;
     test_config.fork_blocks.prague = UINT64_MAX;
     test_config.fork_blocks.osaka = UINT64_MAX;
+    test_config.fork_blocks.verkle = UINT64_MAX;
 
     // Enable forks cumulatively up to the target fork.
     // Fork chronology: Frontier → Homestead → Tangerine Whistle → Spurious Dragon
@@ -357,12 +358,8 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
 #else
         NULL,
 #endif
-#ifdef ENABLE_MPT
-        "/tmp/test_runner_mpt",
-#else
-        NULL,
-#endif
-        NULL  /* no code_store for tests */
+        NULL,  /* no mpt_store for tests — use in-memory batch rebuild */
+        NULL   /* no code_store for tests */
     );
     if (!runner->state) {
 #ifdef ENABLE_VERKLE
@@ -443,12 +440,8 @@ void test_runner_reset(test_runner_t *runner) {
 #else
             NULL,
 #endif
-#ifdef ENABLE_MPT
-            "/tmp/test_runner_mpt",
-#else
-            NULL,
-#endif
-            NULL  /* no code_store for tests */
+            NULL,  /* no mpt_store for tests — use in-memory batch rebuild */
+            NULL   /* no code_store for tests */
         );
         if (runner->state) {
             runner->evm = evm_create(runner->state, NULL);
@@ -511,7 +504,11 @@ bool test_runner_verify_state_root(evm_state_t *state,
                                    hash_t *actual_root) {
     if (!state || !expected_root) return false;
 
+#ifdef ENABLE_MPT
+    hash_t computed_root = evm_state_compute_mpt_root(state, true);
+#else
     hash_t computed_root = evm_state_compute_state_root_ex(state, true);
+#endif
 
     if (actual_root) {
         *actual_root = computed_root;
