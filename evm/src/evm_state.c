@@ -3,8 +3,10 @@
 #include "keccak256.h"
 #ifdef ENABLE_MPT
 #include "mpt_store.h"
-#include "mem_mpt.h"
 #include "code_store.h"
+#ifdef ENABLE_MEM_MPT
+#include "mem_mpt.h"
+#endif
 #endif
 #include <stdlib.h>
 #include <string.h>
@@ -1555,24 +1557,21 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     mem_art_foreach(&es->storage, flush_all_storage_cb, &ctx);
 
     // Commit block in flat backend (processes buffered writes, updates commitments).
-    // No-op for in-memory tree backend.
     verkle_state_commit_block(es->vs);
 
     hash_t root;
     verkle_state_root_hash(es->vs, root.bytes);
-#else
-    // Promote block_dirty accounts to existed (equivalent of verkle flush
-    // setting existed=true, needed for MPT root computation)
-    mem_art_foreach(&es->accounts, promote_block_dirty_cb, &prune_empty);
-#endif
 
     // Clear block_dirty flags — next block starts fresh
     mem_art_foreach(&es->accounts, clear_block_dirty_account_cb, NULL);
     mem_art_foreach(&es->storage, clear_block_dirty_slot_cb, NULL);
 
-#ifdef ENABLE_VERKLE
     return root;
 #else
+    // MPT path: promotion and block_dirty clearing are handled inside
+    // evm_state_compute_mpt_root (folded into mpt_incr_update_cb and
+    // clear_mpt_dirty_cb), so this is a no-op.
+    (void)prune_empty;
     return hash_zero();
 #endif
 }
@@ -1769,7 +1768,8 @@ static bool mpt_collect_dirty_slot_cb(const uint8_t *key, size_t key_len,
         e->value_len = (uint8_t)mpt_rlp_be(vbe, 32, e->value_rlp);
     }
 
-    cs->mpt_dirty = false;  // clear only after successful collection
+    cs->mpt_dirty = false;   // clear only after successful collection
+    cs->block_dirty = false;  // block_dirty always set alongside mpt_dirty
     return true;
 }
 
@@ -1985,17 +1985,29 @@ typedef struct {
     size_t        deleted;
 } mpt_incr_ctx_t;
 
-// Callback: for each block-dirty account, update account_mpt.
+// Callback: for each mpt-dirty account, update account_mpt.
+// Also promotes block_dirty accounts to existed=true (handles miner reward,
+// uncle rewards, withdrawals — state changes that bypass commit_tx).
 static bool mpt_incr_update_cb(const uint8_t *key, size_t key_len,
                                 const void *value, size_t value_len,
                                 void *user_data) {
     (void)key_len; (void)value_len;
     mpt_incr_ctx_t *ctx = (mpt_incr_ctx_t *)user_data;
-    const cached_account_t *ca = (const cached_account_t *)value;
+    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
 
     // Only process accounts that were modified since last MPT root computation
     if (!ca->mpt_dirty)
         return true;
+
+    // Promote block_dirty accounts to existed (equivalent of commit_tx promotion
+    // for direct state changes like miner reward/withdrawals that skip commit_tx)
+    if (ca->block_dirty && !ca->self_destructed) {
+        bool is_empty_check = (ca->nonce == 0 &&
+                               uint256_is_zero(&ca->balance) &&
+                               !ca->has_code);
+        if (!(!ca->existed && !ca->created && is_empty_check && ctx->prune_empty))
+            ca->existed = true;
+    }
 
     // Compute keccak256(address) — the trie key
     hash_t addr_hash = hash_keccak256(ca->addr.bytes, 20);
@@ -2024,18 +2036,22 @@ static bool mpt_incr_update_cb(const uint8_t *key, size_t key_len,
     return true;
 }
 
-// Clear mpt_dirty flags after incremental MPT root computation.
+// Clear mpt_dirty and block_dirty flags after incremental MPT root computation.
+// block_dirty is always set alongside mpt_dirty, so clearing here covers both.
 static bool clear_mpt_dirty_cb(const uint8_t *key, size_t key_len,
                                 const void *value, size_t value_len,
                                 void *user_data) {
     (void)key; (void)key_len; (void)value_len; (void)user_data;
     cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
     ca->mpt_dirty = false;
+    ca->block_dirty = false;
+    ca->block_code_dirty = false;
     return true;
 }
 
+#ifdef ENABLE_MEM_MPT
 // ============================================================================
-// In-memory batch MPT fallback (no mpt_store on disk)
+// In-memory batch MPT fallback (no mpt_store — test runner only)
 // ============================================================================
 
 // Context for collecting storage entries for batch MPT
@@ -2176,15 +2192,11 @@ static bool batch_compute_storage_root_cb(const uint8_t *key, size_t key_len,
     ca->storage_root = batch_compute_storage_root(es, &ca->addr);
     return true;
 }
+#endif /* ENABLE_MEM_MPT */
 
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     hash_t root = hash_zero();
     if (!es) return root;
-
-    // Promote block_dirty accounts to existed (needed for MPT inclusion).
-    mem_art_foreach(&es->accounts, promote_block_dirty_cb, &prune_empty);
-    mem_art_foreach(&es->accounts, clear_block_dirty_account_cb, NULL);
-    mem_art_foreach(&es->storage, clear_block_dirty_slot_cb, NULL);
 
     // ── Incremental path (with mpt_store on disk) ──
     if (es->account_mpt) {
@@ -2211,7 +2223,13 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
         return root;
     }
 
-    // ── In-memory batch path (no mpt_store — used by test runner) ──
+#ifdef ENABLE_MEM_MPT
+    // ── In-memory batch path (no mpt_store — test runner only) ──
+    // Promote block_dirty accounts to existed (needed for batch MPT inclusion).
+    mem_art_foreach(&es->accounts, promote_block_dirty_cb, &prune_empty);
+    mem_art_foreach(&es->accounts, clear_block_dirty_account_cb, NULL);
+    mem_art_foreach(&es->storage, clear_block_dirty_slot_cb, NULL);
+
     // Compute all storage roots via batch MPT
     mem_art_foreach(&es->accounts, batch_compute_storage_root_cb, es);
 
@@ -2228,6 +2246,9 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     free(ctx.rlp_bufs);
 
     mem_art_foreach(&es->accounts, clear_mpt_dirty_cb, NULL);
+#else
+    fprintf(stderr, "FATAL: compute_mpt_root called without mpt_store (ENABLE_MEM_MPT not compiled)\n");
+#endif
     return root;
 }
 #endif /* ENABLE_MPT */
