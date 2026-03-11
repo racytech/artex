@@ -806,6 +806,10 @@ if(CJSON_FOUND)
     )
     target_link_libraries(engine engine_http engine_jwt engine_rpc engine_handlers engine_store engine_types ${CJSON_LIBRARIES})
 
+    # Standalone Engine API server (for mock CL testing)
+    add_executable(engine_server tools/engine_server.c)
+    target_link_libraries(engine_server engine)
+
     #==============================================================================
     # Tests — Engine API (cJSON-dependent)
     #==============================================================================
