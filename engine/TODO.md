@@ -34,11 +34,37 @@
 - [x] Validate uncle depth before reward arithmetic (`executor/src/block_executor.c`)
   - Skip uncles where `uncle_hdr.number >= header->number` or depth > 7
 
-## P1: Functional Gaps (features that must work for a real node)
+## P1: Sync Mode (receive blocks from CL)
+
+### Engine Configuration
+- [ ] Add `chain_id`, `fork_schedule`, `genesis_hash` to `engine_config_t` (`engine/include/engine.h`)
+  - Fork schedule determines which Engine API version rules apply per block
+  - Genesis hash needed to seed canonical chain in the store
+
+### State Persistence
+- [ ] Persist fork choice state (head/safe/finalized hashes) across restarts
+  - Currently all state is in-memory (`engine/src/engine_store.c`); lost on process exit
+  - On restart, engine responds SYNCING to all forkchoiceUpdated until CL re-submits
+- [ ] Persist blockhash ring buffer or reconstruct from block DB on startup
+
+## P1.5: Block Production (propose blocks as validator — future work)
+
+### Transaction Pool
+- [ ] Implement txpool module (`txpool/`)
+  - `eth_sendRawTransaction` JSON-RPC handler to accept transactions
+  - Per-sender nonce queue (reject gaps, buffer future nonces)
+  - Price-sorted index (effective priority fee, descending)
+  - Eviction policy (drop lowest-paying txs when pool is full)
+  - No formal spec — this is an implementation detail, not consensus-critical
+- [ ] Transaction selection: `txpool_select(gas_limit)` → ordered list of txs
+  - Sort by effective priority fee (descending)
+  - Respect per-sender nonce ordering (nonce N before nonce N+1)
+  - Greedy packing up to block gas limit
+  - Skip txs that exceed remaining gas
 
 ### Payload Building (getPayload)
 - [ ] Implement block building in `forkchoiceUpdated` when `payloadAttributes` is non-null
-  - Select transactions from mempool (requires mempool/txpool module)
+  - Select transactions from txpool
   - Execute them, compute all roots, assemble `execution_payload_t`
   - Call `engine_store_set_pending()` with the built payload
 - [ ] Currently `engine_store_set_pending()` is never called — `getPayload` always returns `-38001 unknown payload`
@@ -53,17 +79,6 @@
 - [ ] Replace `timestamp ^ 0xDEADBEEF` with proper unique ID (`engine/src/engine_handlers.c:545`)
   - Should incorporate: timestamp, prevRandao, fee_recipient, withdrawals hash
   - Two payloads with same timestamp but different attributes currently collide
-
-### Engine Configuration
-- [ ] Add `chain_id`, `fork_schedule`, `genesis_hash` to `engine_config_t` (`engine/include/engine.h`)
-  - Fork schedule determines which Engine API version rules apply per block
-  - Genesis hash needed to seed canonical chain in the store
-
-### State Persistence
-- [ ] Persist fork choice state (head/safe/finalized hashes) across restarts
-  - Currently all state is in-memory (`engine/src/engine_store.c`); lost on process exit
-  - On restart, engine responds SYNCING to all forkchoiceUpdated until CL re-submits
-- [ ] Persist blockhash ring buffer or reconstruct from block DB on startup
 
 ## P2: Robustness (won't crash a production node but will cause issues under load)
 
