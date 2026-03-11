@@ -378,9 +378,10 @@ def main():
     parser.add_argument("--art", required=True, help="Path to art's evm_t8n binary")
     parser.add_argument("--geth", required=True, help="Path to geth's evm binary")
     parser.add_argument("--fork", default="Cancun", help="Fork name (default: Cancun)")
-    parser.add_argument("--iterations", type=int, default=1000, help="Number of iterations")
+    parser.add_argument("--iterations", type=int, default=1000, help="Number of iterations (0 = infinite)")
     parser.add_argument("--work-dir", default="/tmp/fuzz_work", help="Working directory")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--fail-fast", action="store_true", help="Stop on first mismatch")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     args = parser.parse_args()
 
@@ -416,11 +417,14 @@ def main():
     print(f"  art:    {args.art}")
     print(f"  geth:   {args.geth}")
     print(f"  fork:   {args.fork}")
-    print(f"  iters:  {args.iterations}")
+    print(f"  iters:  {'infinite' if args.iterations == 0 else args.iterations}")
     print(f"  seed:   {args.seed}")
-    print()
+    if args.fail_fast:
+        print(f"  mode:   fail-fast (stop on first mismatch)")
+    print(flush=True)
 
-    for i in range(args.iterations):
+    i = 0
+    while args.iterations == 0 or i < args.iterations:
         total += 1
 
         # Generate and write test case
@@ -446,18 +450,24 @@ def main():
             )
             if args.verbose:
                 print(f"  saved: {fail_dir}")
+            if args.fail_fast:
+                print(f"\nFail-fast: art error at iteration {i}")
+                break
+            i += 1
             continue
 
         if geth_error and not art_error:
             geth_errors += 1
             if args.verbose:
                 print(f"[{i}] geth error: {geth_error}")
+            i += 1
             continue
 
         if art_error and geth_error:
             # Both errored — skip (likely invalid test case)
             if args.verbose:
                 print(f"[{i}] both errored")
+            i += 1
             continue
 
         # Compare results
@@ -473,17 +483,23 @@ def main():
                 art_result, geth_result, diffs, None, None
             )
             print(f"  saved: {fail_dir}")
+            if args.fail_fast:
+                break
         else:
             matches += 1
+            iters_str = "inf" if args.iterations == 0 else str(args.iterations)
             if args.verbose or (i + 1) % 100 == 0:
                 elapsed = time.time() - start_time
                 rate = total / elapsed if elapsed > 0 else 0
                 print(
-                    f"[{i+1}/{args.iterations}] "
+                    f"[{i+1}/{iters_str}] "
                     f"match={matches} mismatch={mismatches} "
                     f"art_err={art_errors} geth_err={geth_errors} "
-                    f"({rate:.1f}/s)"
+                    f"({rate:.1f}/s)",
+                    flush=True
                 )
+
+        i += 1
 
     # Final summary
     elapsed = time.time() - start_time
