@@ -771,6 +771,14 @@ if(CJSON_FOUND)
 
         add_executable(test_runner_failfast integration_tests/test_runner_failfast_main.c)
         target_link_libraries(test_runner_failfast integration_tests)
+
+        # EVM t8n tool (state transition, geth-compatible)
+        add_executable(evm_t8n tools/evm_t8n.c)
+        target_include_directories(evm_t8n PRIVATE
+            ${CMAKE_SOURCE_DIR}/net/include
+            ${CMAKE_SOURCE_DIR}/third_party/secp256k1/include
+        )
+        target_link_libraries(evm_t8n integration_tests secp256k1_wrap)
     endif()
 else()
     message(STATUS "cJSON not found — skipping integration tests (install: sudo apt-get install libcjson-dev)")
