@@ -160,6 +160,17 @@ uint32_t mpt_store_get(const mpt_store_t *ms, const uint8_t key[32],
  */
 bool mpt_store_compact(mpt_store_t *ms);
 
+/**
+ * Compact a shared-mode store given multiple live trie roots.
+ * Walks all nodes reachable from any root, copies to a new store,
+ * then swaps files. Reclaims all orphaned nodes from prior updates.
+ * @param roots    Array of 32-byte root hashes
+ * @param n_roots  Number of roots
+ * Returns true on success.
+ */
+bool mpt_store_compact_roots(mpt_store_t *ms,
+                              const uint8_t (*roots)[32], size_t n_roots);
+
 /* =========================================================================
  * Node Cache
  * ========================================================================= */

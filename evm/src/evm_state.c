@@ -493,6 +493,53 @@ void evm_state_flush(evm_state_t *es) {
 #endif
 }
 
+#ifdef ENABLE_MPT
+// Callback: collect non-empty storage roots for compaction
+typedef struct {
+    uint8_t (*roots)[32];
+    size_t count;
+    size_t cap;
+} collect_roots_ctx_t;
+
+static bool collect_storage_roots_cb(const uint8_t *key, size_t key_len,
+                                      const void *value, size_t value_len,
+                                      void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    const cached_account_t *ca = (const cached_account_t *)value;
+    if (memcmp(ca->storage_root.bytes, HASH_EMPTY_STORAGE.bytes, 32) == 0)
+        return true;
+
+    collect_roots_ctx_t *ctx = (collect_roots_ctx_t *)user_data;
+    if (ctx->count >= ctx->cap) {
+        size_t nc = ctx->cap ? ctx->cap * 2 : 1024;
+        uint8_t (*nr)[32] = realloc(ctx->roots, nc * sizeof(*nr));
+        if (!nr) return false;
+        ctx->roots = nr; ctx->cap = nc;
+    }
+    memcpy(ctx->roots[ctx->count++], ca->storage_root.bytes, 32);
+    return true;
+}
+#endif
+
+void evm_state_compact_storage(evm_state_t *es) {
+#ifdef ENABLE_MPT
+    if (!es || !es->storage_mpt) return;
+
+    collect_roots_ctx_t ctx = {0};
+    mem_art_foreach(&es->accounts, collect_storage_roots_cb, &ctx);
+
+    if (ctx.count > 0) {
+        fprintf(stderr, "Compacting storage MPT: %zu live roots...\n", ctx.count);
+        mpt_store_compact_roots(es->storage_mpt,
+                                (const uint8_t (*)[32])ctx.roots, ctx.count);
+        fprintf(stderr, "Storage MPT compaction done\n");
+    }
+    free(ctx.roots);
+#else
+    (void)es;
+#endif
+}
+
 void evm_state_set_batch_mode(evm_state_t *es, bool enabled) {
     if (es) es->batch_mode = enabled;
 }

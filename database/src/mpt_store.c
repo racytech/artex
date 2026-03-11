@@ -397,6 +397,14 @@ struct mpt_store {
     size_t           dirty_cap;
     bool             batch_active;
 
+    /* Page-based arena for dirty entry values — bulk alloc/free.
+     * Pages are never realloc'd, so value pointers remain stable. */
+    uint8_t        **val_pages;       /* array of page pointers */
+    size_t           val_page_count;
+    size_t           val_page_cap;
+    size_t           val_page_used;   /* bytes used in current page */
+#define VAL_PAGE_SIZE 65536
+
     node_cache_t    *cache;          /* NULL = no caching */
 
     bool             shared;         /* multi-trie mode: skip node deletion */
@@ -1255,11 +1263,10 @@ void mpt_store_destroy(mpt_store_t *ms) {
     if (!ms) return;
 
     /* Free any pending batch entries */
-    if (ms->dirty) {
-        for (size_t i = 0; i < ms->dirty_count; i++)
-            free(ms->dirty[i].value);
-        free(ms->dirty);
-    }
+    free(ms->dirty);
+    for (size_t i = 0; i < ms->val_page_count; i++)
+        free(ms->val_pages[i]);
+    free(ms->val_pages);
 
     /* Free deferred write buffer */
     def_free_all(ms);
@@ -1342,10 +1349,39 @@ void mpt_store_set_shared(mpt_store_t *ms, bool shared) {
  * Batch staging
  * ========================================================================= */
 
+/* Allocate from the page-based dirty value arena. Never relocates. */
+static uint8_t *val_arena_alloc(mpt_store_t *ms, size_t len) {
+    /* Need a new page? */
+    if (ms->val_page_count == 0 || ms->val_page_used + len > VAL_PAGE_SIZE) {
+        if (ms->val_page_count >= ms->val_page_cap) {
+            size_t nc = ms->val_page_cap ? ms->val_page_cap * 2 : 8;
+            uint8_t **np = realloc(ms->val_pages, nc * sizeof(*np));
+            if (!np) return NULL;
+            ms->val_pages = np;
+            ms->val_page_cap = nc;
+        }
+        size_t psz = len > VAL_PAGE_SIZE ? len : VAL_PAGE_SIZE;
+        ms->val_pages[ms->val_page_count] = malloc(psz);
+        if (!ms->val_pages[ms->val_page_count]) return NULL;
+        ms->val_page_count++;
+        ms->val_page_used = 0;
+    }
+    uint8_t *ptr = ms->val_pages[ms->val_page_count - 1] + ms->val_page_used;
+    ms->val_page_used += len;
+    return ptr;
+}
+
 bool mpt_store_begin_batch(mpt_store_t *ms) {
     if (!ms || ms->batch_active) return false;
-    ms->batch_active = true;
-    ms->dirty_count  = 0;
+    ms->batch_active   = true;
+    ms->dirty_count    = 0;
+    /* Reset arena: reuse first page, free extras */
+    if (ms->val_page_count > 1) {
+        for (size_t i = 1; i < ms->val_page_count; i++)
+            free(ms->val_pages[i]);
+        ms->val_page_count = 1;
+    }
+    ms->val_page_used = 0;
     return true;
 }
 
@@ -1365,7 +1401,7 @@ bool mpt_store_update(mpt_store_t *ms, const uint8_t key[32],
 
     dirty_entry_t *e = &ms->dirty[ms->dirty_count];
     bytes_to_nibbles(key, 32, e->nibbles);
-    e->value = malloc(value_len);
+    e->value = val_arena_alloc(ms, value_len);
     if (!e->value) return false;
     memcpy(e->value, value, value_len);
     e->value_len = value_len;
@@ -1396,9 +1432,13 @@ bool mpt_store_delete(mpt_store_t *ms, const uint8_t key[32]) {
 
 void mpt_store_discard_batch(mpt_store_t *ms) {
     if (!ms) return;
-    for (size_t i = 0; i < ms->dirty_count; i++)
-        free(ms->dirty[i].value);
     ms->dirty_count  = 0;
+    ms->val_page_used = 0;
+    if (ms->val_page_count > 1) {
+        for (size_t i = 1; i < ms->val_page_count; i++)
+            free(ms->val_pages[i]);
+        ms->val_page_count = 1;
+    }
     ms->batch_active = false;
 }
 
@@ -1679,7 +1719,9 @@ static node_ref_t merge_leaf(mpt_store_t *ms, const node_ref_t *old_ref,
     /* Need to merge: create a synthetic entry for the existing leaf,
      * then build a fresh subtrie from all entries combined */
     size_t total = (end - start) + 1;
-    dirty_entry_t *merged = malloc(total * sizeof(*merged));
+    dirty_entry_t stack_buf[8];  /* stack fast path for small merges */
+    dirty_entry_t *merged = (total <= 8) ? stack_buf
+                            : malloc(total * sizeof(*merged));
     if (!merged) return *old_ref;  /* allocation failed — keep trie unchanged */
 
     delete_ref(ms, old_ref);
@@ -1726,7 +1768,7 @@ static node_ref_t merge_leaf(mpt_store_t *ms, const node_ref_t *old_ref,
     }
 
     node_ref_t result = build_fresh(ms, merged, 0, total, depth);
-    free(merged);
+    if (merged != stack_buf) free(merged);
     return result;
 }
 
@@ -1956,8 +1998,7 @@ bool mpt_store_commit_batch(mpt_store_t *ms) {
         for (size_t r = 1; r < ms->dirty_count; r++) {
             if (memcmp(ms->dirty[w].nibbles, ms->dirty[r].nibbles,
                        MAX_NIBBLES) == 0) {
-                /* Duplicate key — free the earlier value, keep the later */
-                free(ms->dirty[w].value);
+                /* Duplicate key — overwrite (old value dead in arena) */
                 ms->dirty[w] = ms->dirty[r];
             } else {
                 w++;
@@ -1990,10 +2031,14 @@ bool mpt_store_commit_batch(mpt_store_t *ms) {
         keccak(new_root.raw.data, new_root.raw.len, ms->root_hash);
     }
 
-    /* Free dirty values and reset */
-    for (size_t i = 0; i < ms->dirty_count; i++)
-        free(ms->dirty[i].value);
-    ms->dirty_count  = 0;
+    /* Reset dirty state — arena pages kept for reuse */
+    ms->dirty_count   = 0;
+    ms->val_page_used = 0;
+    if (ms->val_page_count > 1) {
+        for (size_t i = 1; i < ms->val_page_count; i++)
+            free(ms->val_pages[i]);
+        ms->val_page_count = 1;
+    }
     ms->batch_active = false;
 
     return true;
@@ -2215,6 +2260,92 @@ bool mpt_store_compact(mpt_store_t *ms) {
     ms->dat_path = old_dat;
 
     free(tmp_path);
+    free(tmp_base);
+    return ms->index != NULL && ms->data_fd >= 0;
+}
+
+bool mpt_store_compact_roots(mpt_store_t *ms,
+                              const uint8_t (*roots)[32], size_t n_roots) {
+    if (!ms || ms->batch_active || n_roots == 0) return false;
+
+    /* Create temp paths */
+    size_t base_len = strlen(ms->dat_path) - 4; /* remove ".dat" */
+    char *tmp_base = malloc(base_len + 9);
+    if (!tmp_base) return false;
+    memcpy(tmp_base, ms->dat_path, base_len);
+    memcpy(tmp_base + base_len, ".compact", 9);
+
+    mpt_store_t *new_ms = mpt_store_create(tmp_base, disk_hash_count(ms->index));
+    if (!new_ms) { free(tmp_base); return false; }
+    mpt_store_set_cache(new_ms, 0);
+
+    /* Walk all roots, copying reachable nodes.
+     * compact_walk + write_node naturally dedup — if a node hash already
+     * exists in new_ms, write_node is a no-op.  So shared subtrees across
+     * different roots are only copied once. */
+    bool ok = true;
+    for (size_t i = 0; i < n_roots && ok; i++) {
+        if (memcmp(roots[i], EMPTY_ROOT, 32) == 0) continue;
+        node_ref_t ref = { .type = REF_HASH };
+        memcpy(ref.hash, roots[i], 32);
+        ok = compact_walk(ms, new_ms, &ref);
+    }
+
+    if (!ok) {
+        char *fail_idx = new_ms->idx_path;
+        char *fail_dat = new_ms->dat_path;
+        new_ms->idx_path = NULL;
+        new_ms->dat_path = NULL;
+        mpt_store_destroy(new_ms);
+        unlink(fail_idx);
+        unlink(fail_dat);
+        free(fail_idx); free(fail_dat);
+        free(tmp_base);
+        return false;
+    }
+
+    mpt_store_sync(new_ms);
+
+    /* Swap files */
+    char *old_idx = ms->idx_path;
+    char *old_dat = ms->dat_path;
+    char *new_idx = new_ms->idx_path;
+    char *new_dat = new_ms->dat_path;
+
+    disk_hash_destroy(ms->index);
+    close(ms->data_fd);
+
+    rename(new_idx, old_idx);
+    rename(new_dat, old_dat);
+
+    ms->index = disk_hash_open(old_idx);
+    ms->data_fd = open(old_dat, O_RDWR);
+    ms->data_size  = new_ms->data_size;
+    ms->live_bytes = new_ms->live_bytes;
+
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
+        free_list_clear(&ms->free_lists[i]);
+    ms->free_slot_bytes = 0;
+
+    if (ms->cache) {
+        uint32_t cap = ms->cache->capacity;
+        ncache_destroy(ms->cache);
+        ms->cache = ncache_create(cap);
+    }
+
+    close(new_ms->data_fd);
+    disk_hash_destroy(new_ms->index);
+    new_ms->idx_path = NULL;
+    new_ms->dat_path = NULL;
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
+        free_list_destroy(&new_ms->free_lists[i]);
+    ncache_destroy(new_ms->cache);
+    free(new_ms->dirty);
+    free(new_ms);
+
+    ms->idx_path = old_idx;
+    ms->dat_path = old_dat;
+
     free(tmp_base);
     return ms->index != NULL && ms->data_fd >= 0;
 }

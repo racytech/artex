@@ -93,6 +93,13 @@ void evm_state_flush_verkle(evm_state_t *es);
  */
 void evm_state_evict_cache(evm_state_t *es);
 
+/**
+ * Compact the shared storage MPT by collecting all live storage roots
+ * and rewriting the store with only reachable nodes. Reclaims orphaned
+ * nodes from prior incremental updates. Call at checkpoint boundaries.
+ */
+void evm_state_compact_storage(evm_state_t *es);
+
 // ============================================================================
 // Account Existence
 // ============================================================================
