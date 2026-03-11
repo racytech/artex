@@ -187,15 +187,17 @@ def generate_test_case(fork="Cancun"):
         "currentTimestamp": hex(random.randint(1000, 2000000000)),
         "currentGasLimit": "0x1000000",
         "currentBaseFee": hex(random.randint(1, 10**10)),
-        "currentRandom": random_hex(32),
     }
 
-    # Pre-Paris forks need currentDifficulty
+    # Pre-Paris forks: use currentDifficulty, NOT currentRandom
+    # (geth overrides DIFFICULTY opcode with currentRandom when present)
     PRE_PARIS_FORKS = ("Frontier", "Homestead", "Tangerine Whistle", "Spurious Dragon",
                        "Byzantium", "Constantinople", "Istanbul", "Berlin", "London",
                        "Arrow Glacier", "Gray Glacier")
     if fork in PRE_PARIS_FORKS:
         env["currentDifficulty"] = hex(random.randint(1, 2**20))
+    else:
+        env["currentRandom"] = random_hex(32)
 
     # Shanghai+ needs withdrawals in env
     SHANGHAI_PLUS = ("Shanghai", "Cancun", "Prague")
