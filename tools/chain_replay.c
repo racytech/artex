@@ -372,7 +372,7 @@ int main(int argc, char **argv) {
                 char got_hex[67], exp_hex[67];
                 hash_to_hex(&result.actual_root, got_hex);
                 hash_to_hex(&result.expected_root, exp_hex);
-                fprintf(stderr, "Block %lu: STATE ROOT MISMATCH\n"
+                fprintf(stderr, "Block %lu: STATE ROOT MISMATCH (at batch checkpoint)\n"
                         "  got:      %s\n  expected: %s\n",
                         bn, got_hex, exp_hex);
             }

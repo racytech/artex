@@ -2,7 +2,17 @@
  * Sync Engine — block execution + validation + checkpointing.
  *
  * Owns the full state lifecycle (evm_state, evm, verkle_state).
- * Callers provide decoded block headers and bodies.
+ * Callers provide decoded block headers and bodies from any source.
+ *
+ * Two-phase sync:
+ *   1. Era1 replay (blocks 0 → Paris): batched root validation at checkpoint
+ *      boundaries (every N blocks). No per-block response needed.
+ *   2. CL client (Paris → head): per-block root validation required
+ *      (engine_newPayload needs VALID/INVALID response).
+ *
+ * At the era1 → CL transition point, the feeder must call sync_checkpoint()
+ * to flush all state before switching to per-block validation mode
+ * (checkpoint_interval = 1 or a dedicated per-block validate API).
  */
 
 #include "sync.h"
@@ -74,6 +84,11 @@ struct sync {
     uint64_t last_checkpoint_block;
     uint64_t resumed_block;   /* block number from checkpoint (0 if fresh) */
     bool     genesis_loaded;
+
+    /* Batched MPT root validation: root is computed at checkpoint boundaries,
+     * not per-block. We remember the last block's expected root for validation. */
+    hash_t   pending_expected_root;
+    bool     batch_root_computed;
 };
 
 // ============================================================================
@@ -376,20 +391,13 @@ fail:
 void sync_destroy(sync_t *sync) {
     if (!sync) return;
 
-    /* Final checkpoint if we have unsaved progress */
+    /* Final checkpoint if we have unsaved progress.
+     * Routes through sync_checkpoint() to ensure MPT root is computed
+     * before eviction (needed for SIGINT / graceful shutdown paths). */
     if (sync->blocks_fail == 0 &&
         sync->last_block > sync->last_checkpoint_block &&
         sync->config.checkpoint_path) {
-#ifdef ENABLE_VERKLE
-        if (sync->vs) verkle_state_sync(sync->vs);
-#endif
-#ifdef ENABLE_MPT
-        if (sync->cs) code_store_flush(sync->cs);
-#endif
-        checkpoint_save_internal(sync->config.checkpoint_path,
-                                 sync->last_block, sync->block_hashes,
-                                 sync->total_gas, sync->blocks_ok,
-                                 sync->blocks_fail);
+        sync_checkpoint(sync);
         printf("Checkpoint saved at block %lu\n", sync->last_block);
     }
 
@@ -452,6 +460,36 @@ bool sync_load_genesis(sync_t *sync, const char *genesis_json_path,
 }
 
 // ============================================================================
+// Batch MPT root validation (internal)
+// ============================================================================
+
+#ifdef ENABLE_MPT
+/**
+ * Compute MPT state root and validate against the pending expected root
+ * (saved from the last block's header). Called at checkpoint boundaries.
+ *
+ * Sets sync->batch_root_computed = true on success.
+ * Returns true if root matches (or validation is disabled).
+ * On mismatch, populates actual/expected in sync for the caller to report.
+ */
+static bool sync_validate_batch_root(sync_t *sync,
+                                     hash_t *actual_out,
+                                     hash_t *expected_out) {
+    bool prune_empty = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
+    hash_t actual = evm_state_compute_mpt_root(sync->state, prune_empty);
+    sync->batch_root_computed = true;
+
+    if (actual_out)   *actual_out   = actual;
+    if (expected_out)  *expected_out = sync->pending_expected_root;
+
+    if (!sync->config.validate_state_root)
+        return true;
+
+    return memcmp(actual.bytes, sync->pending_expected_root.bytes, 32) == 0;
+}
+#endif
+
+// ============================================================================
 // Block Execution
 // ============================================================================
 
@@ -481,26 +519,18 @@ bool sync_execute_block(sync_t *sync,
     result->expected_gas = header->gas_used;
     result->actual_gas   = br.gas_used;
 
-    /* Validate state root */
-    bool root_match = true;
+    /* MPT root: deferred to checkpoint boundaries (not per-block).
+     * Save the expected root from each block header — at checkpoint time
+     * we validate against the last block's root. */
 #ifdef ENABLE_MPT
-    if (sync->config.validate_state_root) {
-        bool prune = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
-        hash_t mpt_root = evm_state_compute_mpt_root(sync->state, prune);
-        root_match = (memcmp(mpt_root.bytes, header->state_root.bytes, 32) == 0);
-        result->actual_root   = mpt_root;
-        result->expected_root = header->state_root;
-    }
+    if (sync->config.validate_state_root)
+        sync->pending_expected_root = header->state_root;
 #endif
 
-    /* Determine outcome */
+    /* Determine outcome (gas only — root validated at checkpoint) */
     if (!gas_match) {
         result->ok    = false;
         result->error = SYNC_GAS_MISMATCH;
-        sync->blocks_fail++;
-    } else if (!root_match) {
-        result->ok    = false;
-        result->error = SYNC_ROOT_MISMATCH;
         sync->blocks_fail++;
     } else {
         result->ok    = true;
@@ -531,11 +561,26 @@ bool sync_execute_block(sync_t *sync,
         }
     }
 
-    /* Auto-checkpoint on interval */
+    /* Auto-checkpoint on interval — validate batch root, then save */
     if (result->ok &&
         sync->config.checkpoint_interval > 0 &&
         sync->blocks_fail == 0 &&
         bn - sync->last_checkpoint_block >= sync->config.checkpoint_interval) {
+#ifdef ENABLE_MPT
+        /* Validate MPT root at checkpoint boundary */
+        hash_t actual_root, expected_root;
+        if (!sync_validate_batch_root(sync, &actual_root, &expected_root)) {
+            /* Root mismatch — report failure */
+            result->ok    = false;
+            result->error = SYNC_ROOT_MISMATCH;
+            result->actual_root   = actual_root;
+            result->expected_root = expected_root;
+            sync->blocks_ok--;      /* undo the ok count from above */
+            sync->blocks_fail++;
+            block_result_free(&br);
+            return true;
+        }
+#endif
         sync_checkpoint(sync);
     }
 
@@ -549,6 +594,17 @@ bool sync_execute_block(sync_t *sync,
 
 bool sync_checkpoint(sync_t *sync) {
     if (!sync || !sync->config.checkpoint_path) return false;
+
+#ifdef ENABLE_MPT
+    /* Compute MPT root before flush/eviction if not already done.
+     * This ensures dirty flags are cleared before eviction (which
+     * drops cache entries — dirty data would be lost). */
+    if (!sync->batch_root_computed) {
+        bool prune_empty = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
+        evm_state_compute_mpt_root(sync->state, prune_empty);
+        sync->batch_root_computed = true;
+    }
+#endif
 
     /* Flush all stores to disk */
 #ifdef ENABLE_VERKLE
@@ -568,6 +624,9 @@ bool sync_checkpoint(sync_t *sync) {
 
     /* Evict cache to bound memory — data is on disk, read-through reloads */
     evm_state_evict_cache(sync->state);
+
+    /* Reset for next batch */
+    sync->batch_root_computed = false;
 
     return ok;
 }
