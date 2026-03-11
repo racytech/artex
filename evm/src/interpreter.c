@@ -45,19 +45,42 @@
 // Inline helpers for inlined opcodes
 //==============================================================================
 
-// Convert big-endian 32-byte buffer to uint256 (avoids function call)
+// Convert big-endian 32-byte buffer to uint256 using bswap64 (4 swaps vs 32 shifts)
 static inline uint256_t bytes32_to_uint256(const uint8_t buf[32]) {
-    uint128_t hi = 0, lo = 0;
-    for (int i = 0; i < 16; i++) hi = (hi << 8) | buf[i];
-    for (int i = 16; i < 32; i++) lo = (lo << 8) | buf[i];
-    return (uint256_t){ lo, hi };
+    uint64_t w0, w1, w2, w3;
+    memcpy(&w3, buf +  0, 8);
+    memcpy(&w2, buf +  8, 8);
+    memcpy(&w1, buf + 16, 8);
+    memcpy(&w0, buf + 24, 8);
+    w0 = __builtin_bswap64(w0);
+    w1 = __builtin_bswap64(w1);
+    w2 = __builtin_bswap64(w2);
+    w3 = __builtin_bswap64(w3);
+    return (uint256_t){
+        ((__uint128_t)w1 << 64) | w0,
+        ((__uint128_t)w3 << 64) | w2
+    };
 }
 
-// Convert 20-byte address to uint256 (avoids address_to_uint256 function call)
+// Convert 20-byte address to uint256 directly (no intermediate buffer)
 static inline uint256_t addr_to_u256(const address_t *addr) {
-    uint8_t buf[32] = {0};
-    memcpy(buf + 12, addr->bytes, 20);
-    return bytes32_to_uint256(buf);
+    const uint8_t *b = addr->bytes;
+    /* Address is 20 bytes big-endian → fits in low 160 bits.
+     * high = top 4 bytes of address (bytes 0-3), zero-extended
+     * low  = remaining 16 bytes (bytes 4-19) */
+    uint64_t w2 = 0;
+    /* Only 4 bytes go into w2 (bytes 0-3 of address = bits 128-159) */
+    w2 = ((uint64_t)b[0] << 24) | ((uint64_t)b[1] << 16) |
+         ((uint64_t)b[2] <<  8) | (uint64_t)b[3];
+    uint64_t w1, w0;
+    memcpy(&w1, b + 4, 8);
+    memcpy(&w0, b + 12, 8);
+    w1 = __builtin_bswap64(w1);
+    w0 = __builtin_bswap64(w0);
+    return (uint256_t){
+        ((__uint128_t)w1 << 64) | w0,
+        (__uint128_t)w2
+    };
 }
 
 // Verkle witness gas for PUSH data bytes (cold path, only called in Verkle mode)
@@ -970,15 +993,48 @@ op_pop:
     NEXT();
 
 op_mload:
-    status = op_mload(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (__builtin_expect(evm->stack->size < 1, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *top = &evm->stack->items[evm->stack->size - 1];
+        if (top->high != 0 || (uint64_t)(top->low >> 64) != 0)
+            { status = EVM_OUT_OF_GAS; goto error; }
+        uint64_t off = (uint64_t)top->low;
+        uint64_t mem_gas = evm_memory_access_cost(evm->memory, off, 32);
+        if (!evm_use_gas(evm, GAS_VERY_LOW + mem_gas)) goto done_oog;
+        if (!evm_memory_expand(evm->memory, off, 32))
+            { status = EVM_INVALID_MEMORY_ACCESS; goto error; }
+        /* Read 32 big-endian bytes directly into stack slot */
+        const uint8_t *src = evm->memory->data + off;
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w3, src +  0, 8); memcpy(&w2, src +  8, 8);
+        memcpy(&w1, src + 16, 8); memcpy(&w0, src + 24, 8);
+        top->low  = ((__uint128_t)__builtin_bswap64(w1) << 64) | __builtin_bswap64(w0);
+        top->high = ((__uint128_t)__builtin_bswap64(w3) << 64) | __builtin_bswap64(w2);
+    }
     NEXT();
 
 op_mstore:
-    status = op_mstore(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        if (s[t].high != 0 || (uint64_t)(s[t].low >> 64) != 0)
+            { status = EVM_OUT_OF_GAS; goto error; }
+        uint64_t off = (uint64_t)s[t].low;
+        uint64_t mem_gas = evm_memory_access_cost(evm->memory, off, 32);
+        if (!evm_use_gas(evm, GAS_VERY_LOW + mem_gas)) goto done_oog;
+        if (!evm_memory_expand(evm->memory, off, 32))
+            { status = EVM_INVALID_MEMORY_ACCESS; goto error; }
+        /* Write 32 big-endian bytes directly from stack value */
+        uint8_t *dst = evm->memory->data + off;
+        uint64_t w0 = __builtin_bswap64((uint64_t)s[t-1].low);
+        uint64_t w1 = __builtin_bswap64((uint64_t)(s[t-1].low >> 64));
+        uint64_t w2 = __builtin_bswap64((uint64_t)s[t-1].high);
+        uint64_t w3 = __builtin_bswap64((uint64_t)(s[t-1].high >> 64));
+        memcpy(dst +  0, &w3, 8); memcpy(dst +  8, &w2, 8);
+        memcpy(dst + 16, &w1, 8); memcpy(dst + 24, &w0, 8);
+        evm->stack->size = t - 1;
+    }
     NEXT();
 
 op_mstore8:

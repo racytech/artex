@@ -402,21 +402,29 @@ uint256_t uint256_from_hex(const char* hex_str) {
 
 uint256_t uint256_from_bytes(const uint8_t* bytes, size_t len) {
     uint256_t result = {UINT128_ZERO, UINT128_ZERO};
-    
+
     if (!bytes || len == 0) return result;
-    if (len > 32) len = 32; // Max 32 bytes for 256 bits
-    
+    if (len > 32) len = 32;
+
+    /* Fast path: full 32 bytes (MLOAD always passes 32) */
+    if (len == 32) {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w3, bytes +  0, 8);
+        memcpy(&w2, bytes +  8, 8);
+        memcpy(&w1, bytes + 16, 8);
+        memcpy(&w0, bytes + 24, 8);
+        result.low  = ((__uint128_t)__builtin_bswap64(w1) << 64) | __builtin_bswap64(w0);
+        result.high = ((__uint128_t)__builtin_bswap64(w3) << 64) | __builtin_bswap64(w2);
+        return result;
+    }
+
+    /* Slow path: partial (rare — only for short from_bytes calls) */
     uint64_t words[4] = {0, 0, 0, 0};
-    
     for (size_t i = 0; i < len; i++) {
         size_t word_idx = i / 8;
         size_t byte_pos = i % 8;
-        
-        if (word_idx < 4) {
-            words[word_idx] |= ((uint64_t)bytes[len - 1 - i] << (byte_pos * 8));
-        }
+        words[word_idx] |= ((uint64_t)bytes[len - 1 - i] << (byte_pos * 8));
     }
-    
     return uint256_from_words(words);
 }
 
@@ -448,27 +456,33 @@ char* uint256_to_hex(const uint256_t* a) {
 void uint256_to_bytes(const uint256_t* a, uint8_t* bytes) {
     if (!a || !bytes) return;
 
-    uint64_t words[4];
-    uint256_to_words(a, words);
-
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 8; j++) {
-            bytes[31 - (i * 8 + j)] = (words[i] >> (j * 8)) & 0xFF;
-        }
-    }
+    /* bswap64 each word and store in reverse order (big-endian output) */
+    uint64_t w0 = (uint64_t)a->low;
+    uint64_t w1 = (uint64_t)(a->low >> 64);
+    uint64_t w2 = (uint64_t)a->high;
+    uint64_t w3 = (uint64_t)(a->high >> 64);
+    w0 = __builtin_bswap64(w0);
+    w1 = __builtin_bswap64(w1);
+    w2 = __builtin_bswap64(w2);
+    w3 = __builtin_bswap64(w3);
+    memcpy(bytes +  0, &w3, 8);
+    memcpy(bytes +  8, &w2, 8);
+    memcpy(bytes + 16, &w1, 8);
+    memcpy(bytes + 24, &w0, 8);
 }
 
 void uint256_to_bytes_le(const uint256_t* a, uint8_t* bytes) {
     if (!a || !bytes) return;
 
-    uint64_t words[4];
-    uint256_to_words(a, words);
-
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 8; j++) {
-            bytes[i * 8 + j] = (words[i] >> (j * 8)) & 0xFF;
-        }
-    }
+    /* Little-endian: native byte order on x86_64 — direct copy */
+    uint64_t w0 = (uint64_t)a->low;
+    uint64_t w1 = (uint64_t)(a->low >> 64);
+    uint64_t w2 = (uint64_t)a->high;
+    uint64_t w3 = (uint64_t)(a->high >> 64);
+    memcpy(bytes +  0, &w0, 8);
+    memcpy(bytes +  8, &w1, 8);
+    memcpy(bytes + 16, &w2, 8);
+    memcpy(bytes + 24, &w3, 8);
 }
 
 uint256_t uint256_from_bytes_le(const uint8_t* bytes, size_t len) {
