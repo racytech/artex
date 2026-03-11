@@ -4,7 +4,7 @@
  * Re-executes Ethereum blocks from Era1 archive files.
  * Uses the sync engine for execution, validation, and checkpointing.
  *
- * Usage: ./chain_replay [--clean] <era1_dir> <genesis.json> [start_block] [end_block]
+ * Usage: ./chain_replay [--clean] [--follow] <era1_dir> <genesis.json> [start_block] [end_block]
  */
 
 #include "sync.h"
@@ -117,8 +117,54 @@ static void archive_close(era1_archive_t *ar) {
     ar->current_idx = -1;
 }
 
-/* Ensure the correct era1 file is open for the given block */
-static bool archive_ensure(era1_archive_t *ar, uint64_t block_number) {
+/* Rescan the era1 directory for newly downloaded files */
+static bool archive_rescan(era1_archive_t *ar, const char *dir) {
+    /* Close current file */
+    if (ar->current_idx >= 0) {
+        era1_close(&ar->current);
+        ar->current_idx = -1;
+    }
+
+    /* Free old paths */
+    for (size_t i = 0; i < ar->count; i++)
+        free(ar->paths[i]);
+    free(ar->paths);
+    ar->paths = NULL;
+    ar->count = 0;
+
+    /* Re-open directory */
+    DIR *d = opendir(dir);
+    if (!d) return false;
+
+    size_t cap = 64;
+    ar->paths = malloc(cap * sizeof(char *));
+    if (!ar->paths) { closedir(d); return false; }
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        size_t nlen = strlen(ent->d_name);
+        if (nlen < 5 || strcmp(ent->d_name + nlen - 5, ".era1") != 0)
+            continue;
+        if (ar->count >= cap) {
+            cap *= 2;
+            ar->paths = realloc(ar->paths, cap * sizeof(char *));
+        }
+        size_t pathlen = strlen(dir) + 1 + nlen + 1;
+        ar->paths[ar->count] = malloc(pathlen);
+        snprintf(ar->paths[ar->count], pathlen, "%s/%s", dir, ent->d_name);
+        ar->count++;
+    }
+    closedir(d);
+
+    if (ar->count > 0)
+        qsort(ar->paths, ar->count, sizeof(char *), cmp_strings);
+    return true;
+}
+
+/* Ensure the correct era1 file is open for the given block.
+ * If follow=true and the file isn't available yet, poll until it appears. */
+static bool archive_ensure(era1_archive_t *ar, uint64_t block_number,
+                           bool follow, const char *dir) {
     /* Check if current file contains this block */
     if (ar->current_idx >= 0 && era1_contains(&ar->current, block_number))
         return true;
@@ -131,10 +177,19 @@ static bool archive_ensure(era1_archive_t *ar, uint64_t block_number) {
 
     /* Find the right file */
     int file_idx = (int)(block_number / ERA1_BLOCKS_PER_FILE);
-    if ((size_t)file_idx >= ar->count) {
-        fprintf(stderr, "No era1 file for block %lu (have %zu files)\n",
-                block_number, ar->count);
-        return false;
+
+    /* If file not available, either fail or wait */
+    while ((size_t)file_idx >= ar->count) {
+        if (!follow) {
+            fprintf(stderr, "No era1 file for block %lu (have %zu files)\n",
+                    block_number, ar->count);
+            return false;
+        }
+        if (g_shutdown) return false;
+        printf("Waiting for era1 file %05d (block %lu)...\n",
+               file_idx, block_number);
+        sleep(5);
+        archive_rescan(ar, dir);
     }
 
     if (!era1_open(&ar->current, ar->paths[file_idx])) {
@@ -164,11 +219,15 @@ static bool archive_ensure(era1_archive_t *ar, uint64_t block_number) {
 int main(int argc, char **argv) {
     /* Parse flags */
     bool force_clean = false;
+    bool follow_mode = false;
     uint64_t trace_block = UINT64_MAX;  /* UINT64_MAX = no tracing */
     int arg_offset = 0;
     while (arg_offset + 1 < argc && argv[1 + arg_offset][0] == '-') {
         if (strcmp(argv[1 + arg_offset], "--clean") == 0) {
             force_clean = true;
+            arg_offset++;
+        } else if (strcmp(argv[1 + arg_offset], "--follow") == 0) {
+            follow_mode = true;
             arg_offset++;
         } else if (strcmp(argv[1 + arg_offset], "--trace-block") == 0 && arg_offset + 2 < argc) {
             trace_block = (uint64_t)atoll(argv[2 + arg_offset]);
@@ -180,10 +239,11 @@ int main(int argc, char **argv) {
 
     if (argc - arg_offset < 3) {
         fprintf(stderr,
-            "Usage: %s [--clean] [--trace-block N] <era1_dir> <genesis.json> [start_block] [end_block]\n"
+            "Usage: %s [--clean] [--follow] [--trace-block N] <era1_dir> <genesis.json> [start_block] [end_block]\n"
             "\n"
             "Options:\n"
             "  --clean           Delete existing checkpoint and state, start from genesis\n"
+            "  --follow          Wait for new era1 files instead of stopping (run alongside downloader)\n"
             "  --trace-block N   Enable EIP-3155 EVM trace for block N (to stderr)\n"
             "\n"
             "Checkpoints every %d blocks to %s\n",
@@ -264,7 +324,7 @@ int main(int argc, char **argv) {
     } else {
         /* Read genesis block hash from era1 */
         hash_t gen_hash = {0};
-        if (archive_ensure(&archive, 0)) {
+        if (archive_ensure(&archive, 0, false, era1_dir)) {
             uint8_t *hdr_rlp, *body_rlp;
             size_t hdr_len, body_len;
             if (era1_read_block(&archive.current, 0,
@@ -306,7 +366,7 @@ int main(int argc, char **argv) {
             break;
         }
 
-        if (!archive_ensure(&archive, bn))
+        if (!archive_ensure(&archive, bn, follow_mode, era1_dir))
             break;
 
         /* Read block from era1 */
