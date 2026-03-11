@@ -450,6 +450,10 @@ block_result_t block_execute(evm_t *evm,
             /* Uncle miner gets base_reward * (uncle_num + 8 - block_num) / 8 */
             block_header_t uncle_hdr;
             if (block_body_get_uncle(body, u, &uncle_hdr)) {
+                /* Validate uncle depth: must be within 7 blocks */
+                if (uncle_hdr.number >= header->number ||
+                    header->number - uncle_hdr.number > 7)
+                    continue;
                 uint64_t depth = uncle_hdr.number + 8 - header->number;
                 if (g_trace_calls) {
                     fprintf(stderr, "UNCLE[%zu] number=%lu depth=%lu coinbase=%02x%02x..%02x%02x\n",

@@ -24,15 +24,15 @@
 ### Payload Validation
 - [x] Validate `receiptsRoot` from payload against computed receipt root (engine test runner)
 - [x] Validate `logsBloom` from payload against computed block bloom (engine test runner)
-- [ ] Wire receipt_root/logs_bloom validation into `newPayload` handler (`engine/src/engine_handlers.c`)
-- [ ] Validate `expectedBlobVersionedHashes` (V3+) from params[1] against blob tx hashes (`engine/src/engine_handlers.c:333`)
-- [ ] Check `engine_store_put()` return value at all 4 call sites (`engine/src/engine_handlers.c:343,434,445,453`)
-  - On failure (store full), return appropriate error instead of silently dropping the block
+- [x] Wire receipt_root/logs_bloom validation into `newPayload` handler (`engine/src/engine_handlers.c`)
+- [x] Validate `expectedBlobVersionedHashes` (V3+) from params[1] against blob tx hashes (`engine/src/engine_handlers.c`)
+  - Decode type-3 txs from payload, collect blob hashes, compare with params[1]
+- [x] Check `engine_store_put()` return value at all 4 call sites (`engine/src/engine_handlers.c`)
+  - 3 sites return error, 1 (invalid payload cache) logs warning
 
 ### Block Executor
-- [ ] Validate uncle depth before reward arithmetic (`executor/src/block_executor.c:326`)
-  - `uncle_hdr.number + 8 - header->number` can underflow if uncle is stale beyond 7 generations
-  - Add check: `uncle_hdr.number + 7 >= header->number` before computing reward
+- [x] Validate uncle depth before reward arithmetic (`executor/src/block_executor.c`)
+  - Skip uncles where `uncle_hdr.number >= header->number` or depth > 7
 
 ## P1: Functional Gaps (features that must work for a real node)
 

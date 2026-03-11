@@ -16,6 +16,7 @@
 #include "hash.h"
 #include "uint256.h"
 #include "mem_mpt.h"
+#include "tx_decoder.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -330,7 +331,93 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
                                                      parent_beacon_root);
     }
 
-    /* TODO: V3+: Validate expectedBlobVersionedHashes from params[1] */
+    /* V3+: Validate expectedBlobVersionedHashes from params[1] */
+    if (version >= ENGINE_V3) {
+        cJSON *blob_json = cJSON_GetArrayItem(params, 1);
+        if (!blob_json || !cJSON_IsArray(blob_json)) {
+            *err_code = RPC_ERR_INVALID_PARAMS;
+            *err_msg = "missing expectedBlobVersionedHashes array";
+            execution_payload_free(&payload);
+            return NULL;
+        }
+
+        /* Parse expected hashes from params[1] */
+        size_t expected_count = (size_t)cJSON_GetArraySize(blob_json);
+        hash_t *expected_hashes = NULL;
+        if (expected_count > 0) {
+            expected_hashes = calloc(expected_count, sizeof(hash_t));
+            size_t idx = 0;
+            cJSON *item;
+            cJSON_ArrayForEach(item, blob_json) {
+                if (!cJSON_IsString(item) ||
+                    !parse_hex_hash(item->valuestring, expected_hashes[idx].bytes)) {
+                    free(expected_hashes);
+                    *err_code = RPC_ERR_INVALID_PARAMS;
+                    *err_msg = "invalid blob versioned hash";
+                    execution_payload_free(&payload);
+                    return NULL;
+                }
+                idx++;
+            }
+        }
+
+        /* Collect actual blob hashes from type-3 transactions */
+        size_t actual_count = 0;
+        hash_t *actual_hashes = NULL;
+        size_t actual_cap = 0;
+        uint64_t chain_id = ctx->evm && ((evm_t *)ctx->evm)->chain_config
+                          ? ((evm_t *)ctx->evm)->chain_config->chain_id : 1;
+
+        for (size_t i = 0; i < payload.tx_count; i++) {
+            /* Quick check: type-3 tx starts with byte 0x03 */
+            if (payload.tx_lengths[i] == 0 || payload.transactions[i][0] != 0x03)
+                continue;
+
+            transaction_t tx;
+            memset(&tx, 0, sizeof(tx));
+            if (!tx_decode_raw(&tx, payload.transactions[i],
+                               payload.tx_lengths[i], chain_id)) {
+                tx_decoded_free(&tx);
+                continue;
+            }
+
+            for (size_t j = 0; j < tx.blob_versioned_hashes_count; j++) {
+                if (actual_count >= actual_cap) {
+                    actual_cap = actual_cap ? actual_cap * 2 : 8;
+                    actual_hashes = realloc(actual_hashes, actual_cap * sizeof(hash_t));
+                }
+                memcpy(actual_hashes[actual_count].bytes,
+                       tx.blob_versioned_hashes[j].bytes, 32);
+                actual_count++;
+            }
+            tx_decoded_free(&tx);
+        }
+
+        /* Compare expected vs actual */
+        bool blob_match = (expected_count == actual_count);
+        if (blob_match) {
+            for (size_t i = 0; i < expected_count; i++) {
+                if (memcmp(expected_hashes[i].bytes,
+                           actual_hashes[i].bytes, 32) != 0) {
+                    blob_match = false;
+                    break;
+                }
+            }
+        }
+        free(expected_hashes);
+        free(actual_hashes);
+
+        if (!blob_match) {
+            payload_status_t inv_status;
+            memset(&inv_status, 0, sizeof(inv_status));
+            inv_status.status = PAYLOAD_INVALID;
+            inv_status.has_latest_valid_hash = true;
+            memcpy(inv_status.latest_valid_hash, payload.parent_hash, 32);
+            inv_status.validation_error = "invalid blob versioned hashes";
+            execution_payload_free(&payload);
+            return payload_status_to_json(&inv_status);
+        }
+    }
 
     payload_status_t status;
     memset(&status, 0, sizeof(status));
@@ -431,6 +518,16 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
             status.has_latest_valid_hash = true;
             memcpy(status.latest_valid_hash, payload.parent_hash, 32);
             status.validation_error = "invalid gas used";
+        } else if (memcmp(result.receipt_root.bytes, payload.receipts_root, 32) != 0) {
+            status.status = PAYLOAD_INVALID;
+            status.has_latest_valid_hash = true;
+            memcpy(status.latest_valid_hash, payload.parent_hash, 32);
+            status.validation_error = "invalid receipt root";
+        } else if (memcmp(result.logs_bloom, payload.logs_bloom, 256) != 0) {
+            status.status = PAYLOAD_INVALID;
+            status.has_latest_valid_hash = true;
+            memcpy(status.latest_valid_hash, payload.parent_hash, 32);
+            status.validation_error = "invalid logs bloom";
         } else {
             /* Block is valid */
             status.status = PAYLOAD_VALID;
@@ -453,9 +550,10 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
         block_result_free(&result);
         block_body_free(&body);
 
-        /* If INVALID, store but mark as invalid */
+        /* If INVALID, store but mark as invalid (best-effort cache) */
         if (status.status == PAYLOAD_INVALID) {
-            engine_store_put(ctx->store, &payload, false);
+            if (!engine_store_put(ctx->store, &payload, false))
+                fprintf(stderr, "WARN: failed to store invalid payload (store full)\n");
         }
         execution_payload_free(&payload);
     } else {
