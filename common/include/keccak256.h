@@ -21,6 +21,7 @@
 #define __KECCAK256_H_
 
 #include <stdint.h>
+#include <stddef.h>
 
 #define sha3_max_permutation_size 25
 #define sha3_max_rate_in_qwords 24
@@ -44,6 +45,7 @@ extern "C"
 
     void keccak_init(SHA3_CTX *ctx);
     void keccak_update(SHA3_CTX *ctx, const unsigned char *msg, uint16_t size);
+    void keccak_update_long(SHA3_CTX *ctx, const unsigned char *msg, size_t size);
     void keccak_final(SHA3_CTX *ctx, unsigned char *result);
 
 #ifdef __cplusplus

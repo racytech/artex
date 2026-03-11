@@ -97,23 +97,11 @@ void hash_copy(hash_t* dest, const hash_t* src) {
 hash_t hash_keccak256(const uint8_t* data, size_t len) {
     hash_t result;
     SHA3_CTX ctx;
-    
+
     keccak_init(&ctx);
-    
-    if (data && len > 0) {
-        // Process data in chunks since keccak_update takes uint16_t size
-        size_t remaining = len;
-        const uint8_t* ptr = data;
-        
-        while (remaining > 0) {
-            uint16_t chunk = (remaining > UINT16_MAX) ? UINT16_MAX : (uint16_t)remaining;
-            keccak_update(&ctx, ptr, chunk);
-            ptr += chunk;
-            remaining -= chunk;
-        }
-    }
-    
+    if (data && len > 0)
+        keccak_update_long(&ctx, data, len);
     keccak_final(&ctx, result.bytes);
-    
+
     return result;
 }
