@@ -337,6 +337,9 @@ typedef struct {
 
     /* newPayloadVersion: 1-4 */
     int      new_payload_version;
+
+    /* Expected validation error (NULL if block is valid) */
+    char    *validation_error;
 } engine_test_payload_t;
 
 /**

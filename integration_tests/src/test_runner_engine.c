@@ -335,6 +335,9 @@ bool test_runner_run_engine_test(test_runner_t *runner,
             goto cleanup;
         }
 
+        /* Snapshot state before execution (for reverting invalid blocks) */
+        uint32_t pre_block_snap = evm_state_snapshot(runner->state);
+
         /* Execute block */
         block_result_t block_result = block_execute(runner->evm, &hdr, &body, block_hashes);
 
@@ -342,6 +345,20 @@ bool test_runner_run_engine_test(test_runner_t *runner,
             printf("    gas_used=%lu (expected=%lu), tx_count=%zu, success=%d\n",
                    block_result.gas_used, hdr.gas_used, block_result.tx_count,
                    block_result.success);
+        }
+
+        /* If the payload expects a validation error (invalid block),
+         * revert state and skip root/bloom checks. */
+        if (payload->validation_error != NULL) {
+            if (runner->config.verbose) {
+                printf("    Expected error: %s (reverting state)\n",
+                       payload->validation_error);
+            }
+            evm_state_revert(runner->state, pre_block_snap);
+            block_result_free(&block_result);
+            block_body_free(&body);
+            block_hashes[hdr.number % 256] = computed_hash;
+            continue;
         }
 
         /* Track statistics */

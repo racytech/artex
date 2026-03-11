@@ -105,6 +105,7 @@ void engine_test_free(engine_test_t *test) {
         free(p->transactions);
         free(p->tx_lengths);
         free(p->withdrawals);
+        free(p->validation_error);
     }
     free(test->payloads);
 

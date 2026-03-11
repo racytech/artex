@@ -401,6 +401,12 @@ static bool parse_engine_payload(const cJSON *entry, engine_test_payload_t *payl
         payload->new_payload_version = atoi(version_str);
     }
 
+    /* validationError: expected error for invalid blocks */
+    const char *val_err;
+    if (json_get_string(entry, "validationError", &val_err)) {
+        payload->validation_error = strdup(val_err);
+    }
+
     const cJSON *params = json_get_array(entry, "params");
     if (!params) return false;
 
