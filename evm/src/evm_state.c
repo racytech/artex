@@ -117,6 +117,7 @@ struct evm_state {
     mem_art_t         warm_addrs;   // key: addr[20], value: (none, 0 bytes)
     mem_art_t         warm_slots;   // key: skey[52], value: (none, 0 bytes)
     mem_art_t         transient;    // key: skey[52], value: uint256_t (EIP-1153)
+    bool              batch_mode;   // skip per-block verkle flush, defer to checkpoint
 #ifdef ENABLE_VERKLE
     witness_gas_t     witness_gas;  // EIP-4762 verkle witness gas tracker
 #endif
@@ -401,6 +402,31 @@ void evm_state_flush(evm_state_t *es) {
 #ifdef ENABLE_MPT
     if (es->account_mpt) mpt_store_flush(es->account_mpt);
     if (es->storage_mpt) mpt_store_flush(es->storage_mpt);
+#endif
+}
+
+void evm_state_set_batch_mode(evm_state_t *es, bool enabled) {
+    if (es) es->batch_mode = enabled;
+}
+
+void evm_state_flush_verkle(evm_state_t *es) {
+#ifdef ENABLE_VERKLE
+    if (!es || !es->vs) return;
+
+    // Flush accumulated block-dirty state to verkle backing store
+    finalize_ctx_t ctx = { .es = es, .ok = true, .prune_empty = false };
+    mem_art_foreach(&es->accounts, flush_all_accounts_cb, &ctx);
+    mem_art_foreach(&es->storage, flush_all_storage_cb, &ctx);
+
+    // Single begin/commit cycle for the entire batch
+    verkle_state_begin_block(es->vs, 0);
+    verkle_state_commit_block(es->vs);
+
+    // Clear block_dirty flags
+    mem_art_foreach(&es->accounts, clear_block_dirty_account_cb, NULL);
+    mem_art_foreach(&es->storage, clear_block_dirty_slot_cb, NULL);
+#else
+    (void)es;
 #endif
 }
 
@@ -1110,7 +1136,8 @@ void evm_state_begin_block(evm_state_t *es, uint64_t block_number) {
     if (!es) return;
 #ifdef ENABLE_VERKLE
     witness_gas_reset(&es->witness_gas);
-    verkle_state_begin_block(es->vs, block_number);
+    if (!es->batch_mode)
+        verkle_state_begin_block(es->vs, block_number);
 #else
     (void)block_number;
 #endif
@@ -1551,6 +1578,12 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     if (!es) return hash_zero();
 
 #ifdef ENABLE_VERKLE
+    // In batch mode, defer flush to checkpoint — block_dirty accumulates
+    if (es->batch_mode) {
+        (void)prune_empty;
+        return hash_zero();
+    }
+
     // Flush only block-dirty cached state to verkle
     finalize_ctx_t ctx = { .es = es, .ok = true, .prune_empty = prune_empty };
     mem_art_foreach(&es->accounts, flush_all_accounts_cb, &ctx);

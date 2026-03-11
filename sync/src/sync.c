@@ -364,6 +364,9 @@ sync_t *sync_create(const sync_config_t *config) {
         goto fail;
     }
 
+    /* Batch mode: defer per-block verkle/MPT flush to checkpoint boundaries */
+    evm_state_set_batch_mode(s->state, true);
+
     /* Create EVM */
     s->evm = evm_create(s->state, config->chain_config);
     if (!s->evm) {
@@ -606,8 +609,9 @@ bool sync_checkpoint(sync_t *sync) {
     }
 #endif
 
-    /* Flush all stores to disk */
+    /* Flush accumulated dirty state to backing stores */
 #ifdef ENABLE_VERKLE
+    evm_state_flush_verkle(sync->state);
     if (sync->vs) verkle_state_sync(sync->vs);
 #endif
 #ifdef ENABLE_MPT

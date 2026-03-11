@@ -67,9 +67,23 @@ void evm_state_destroy(evm_state_t *es);
 void evm_state_flush(evm_state_t *es);
 
 /**
+ * Enable/disable batch mode. In batch mode, per-block verkle flush
+ * is skipped — block_dirty flags accumulate across blocks.
+ * Call evm_state_flush_verkle() at checkpoint time to flush.
+ */
+void evm_state_set_batch_mode(evm_state_t *es, bool enabled);
+
+/**
+ * Flush accumulated block-dirty state to verkle backing store.
+ * Call at checkpoint boundaries when in batch mode.
+ * Clears block_dirty flags after flush.
+ */
+void evm_state_flush_verkle(evm_state_t *es);
+
+/**
  * Evict all cached accounts and storage slots.
- * Call ONLY after compute_mpt_root (all dirty flags cleared, data on disk).
- * Read-through cache will reload entries on demand from MPT store.
+ * Call ONLY after compute_mpt_root / flush_verkle (all dirty flags cleared,
+ * data on disk). Read-through cache will reload entries on demand.
  */
 void evm_state_evict_cache(evm_state_t *es);
 
