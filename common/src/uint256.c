@@ -193,7 +193,7 @@ static void uint256_divmod_internal(const uint256_t *a, const uint256_t *b,
             __uint128_t p = (__uint128_t)q_hat * vn[i];
             __int128_t t = (__int128_t)un[j + i] - (uint64_t)p - k;
             un[j + i] = (uint64_t)t;
-            k = (int64_t)(p >> 64) - (int64_t)(t >> 64);
+            k = (__int128_t)(p >> 64) - (t >> 64);
         }
         __int128_t t = (__int128_t)un[j + n] - k;
         un[j + n] = (uint64_t)t;
@@ -684,8 +684,8 @@ static uint256_t uint512_mod256(const uint512_t *num, const uint256_t *d) {
         for (int i = 0; i < n; i++) vn[i] = dw[i];
     }
 
-    /* Normalized numerator: up to 9 limbs */
-    uint64_t un[9] = {0};
+    /* Normalized numerator: up to 9 data limbs + 1 sentinel for Knuth D */
+    uint64_t un[10] = {0};
     if (s > 0) {
         un[8] = num->w[7] >> (64 - s);
         for (int i = 7; i > 0; i--)
@@ -723,7 +723,7 @@ static uint256_t uint512_mod256(const uint512_t *num, const uint256_t *d) {
             __uint128_t p = (__uint128_t)q_hat * vn[i];
             __int128_t t = (__int128_t)un[j + i] - (uint64_t)p - k;
             un[j + i] = (uint64_t)t;
-            k = (int64_t)(p >> 64) - (int64_t)(t >> 64);
+            k = (__int128_t)(p >> 64) - (t >> 64);
         }
         __int128_t t = (__int128_t)un[j + n] - k;
         un[j + n] = (uint64_t)t;
