@@ -19,6 +19,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "evm_tracer.h"
 
 bool g_trace_calls = false;  // Debug: trace CALL gas
 
@@ -161,20 +162,29 @@ static bool archive_ensure(era1_archive_t *ar, uint64_t block_number) {
  * ========================================================================= */
 
 int main(int argc, char **argv) {
-    /* Check for --clean flag */
+    /* Parse flags */
     bool force_clean = false;
+    uint64_t trace_block = UINT64_MAX;  /* UINT64_MAX = no tracing */
     int arg_offset = 0;
-    if (argc > 1 && strcmp(argv[1], "--clean") == 0) {
-        force_clean = true;
-        arg_offset = 1;
+    while (arg_offset + 1 < argc && argv[1 + arg_offset][0] == '-') {
+        if (strcmp(argv[1 + arg_offset], "--clean") == 0) {
+            force_clean = true;
+            arg_offset++;
+        } else if (strcmp(argv[1 + arg_offset], "--trace-block") == 0 && arg_offset + 2 < argc) {
+            trace_block = (uint64_t)atoll(argv[2 + arg_offset]);
+            arg_offset += 2;
+        } else {
+            break;
+        }
     }
 
     if (argc - arg_offset < 3) {
         fprintf(stderr,
-            "Usage: %s [--clean] <era1_dir> <genesis.json> [start_block] [end_block]\n"
+            "Usage: %s [--clean] [--trace-block N] <era1_dir> <genesis.json> [start_block] [end_block]\n"
             "\n"
             "Options:\n"
-            "  --clean   Delete existing checkpoint and state, start from genesis\n"
+            "  --clean           Delete existing checkpoint and state, start from genesis\n"
+            "  --trace-block N   Enable EIP-3155 EVM trace for block N (to stderr)\n"
             "\n"
             "Checkpoints every %d blocks to %s\n",
             argv[0], CHECKPOINT_INTERVAL, CKPT_PATH);
@@ -328,6 +338,14 @@ int main(int argc, char **argv) {
             break;
         }
 
+        /* Enable EVM tracing for the target block */
+#ifdef ENABLE_EVM_TRACE
+        if (bn == trace_block) {
+            evm_tracer_init(stderr);
+            fprintf(stderr, "=== EVM TRACE: block %lu ===\n", bn);
+        }
+#endif
+
         /* Execute + validate via sync engine */
         sync_block_result_t result;
         if (!sync_execute_block(sync, &header, &body, &blk_hash, &result)) {
@@ -337,6 +355,14 @@ int main(int argc, char **argv) {
             free(body_rlp);
             break;
         }
+
+        /* Disable tracing after the target block */
+#ifdef ENABLE_EVM_TRACE
+        if (bn == trace_block) {
+            g_evm_tracer.enabled = false;
+            fprintf(stderr, "=== END EVM TRACE: block %lu ===\n", bn);
+        }
+#endif
 
         window_txs += result.tx_count;
 

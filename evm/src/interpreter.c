@@ -835,12 +835,15 @@ op_calldataload:
     if (__builtin_expect(evm->stack->size < 1, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
     {
         uint256_t *top = &evm->stack->items[evm->stack->size - 1];
-        uint64_t offset = uint256_to_uint64(top);
         uint8_t _cdbuf[32] = {0};
-        if (offset < evm->msg.input_size) {
-            size_t avail = evm->msg.input_size - offset;
-            size_t n = avail < 32 ? avail : 32;
-            memcpy(_cdbuf, evm->msg.input_data + offset, n);
+        /* Only read if offset fits in 64 bits and is within calldata */
+        if (top->high == 0 && (uint64_t)top->low == top->low) {
+            uint64_t offset = uint256_to_uint64(top);
+            if (offset < evm->msg.input_size) {
+                size_t avail = evm->msg.input_size - offset;
+                size_t n = avail < 32 ? avail : 32;
+                memcpy(_cdbuf, evm->msg.input_data + offset, n);
+            }
         }
         *top = bytes32_to_uint256(_cdbuf);
     }
