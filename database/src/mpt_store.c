@@ -262,6 +262,18 @@ static void ncache_ht_remove(node_cache_t *c, uint32_t idx) {
 }
 
 /* Look up a node by hash. On hit, copies RLP to buf and moves to LRU front. */
+/* Lightweight existence check — no data copy, no LRU promotion. */
+static bool ncache_contains(const node_cache_t *c, const uint8_t hash[32]) {
+    uint32_t b = ncache_bucket(c, hash);
+    uint32_t idx = c->buckets[b];
+    while (idx != NCACHE_SENTINEL) {
+        if (memcmp(c->entries[idx].hash, hash, 32) == 0)
+            return true;
+        idx = c->entries[idx].ht_next;
+    }
+    return false;
+}
+
 static bool ncache_get(node_cache_t *c, const uint8_t hash[32],
                         uint8_t *buf, uint16_t *out_len) {
     uint32_t b = ncache_bucket(c, hash);
@@ -986,9 +998,10 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
                        uint8_t out_hash[32]) {
     keccak(rlp, rlp_len, out_hash);
 
-    /* Skip if already exists on disk (dedup — e.g., same branch structure) */
-    if (disk_hash_contains(ms->index, out_hash)) {
-        /* Cancel any pending delete — this node is still needed */
+    /* Skip if already exists — check LRU cache first (no syscall),
+     * fall back to disk_hash_contains (pread) on cache miss. */
+    if ((ms->cache && ncache_contains(ms->cache, out_hash)) ||
+        disk_hash_contains(ms->index, out_hash)) {
         def_del_cancel(ms, out_hash);
         return true;
     }
