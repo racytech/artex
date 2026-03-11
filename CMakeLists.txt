@@ -707,6 +707,18 @@ add_executable(test_uint256_div common/tests/test_uint256_div.c)
 target_link_libraries(test_uint256_div common)
 add_test(NAME test_uint256_div COMMAND test_uint256_div)
 
+add_executable(test_uint256_ops common/tests/test_uint256_ops.c)
+target_link_libraries(test_uint256_ops common)
+add_test(NAME test_uint256_ops COMMAND test_uint256_ops)
+
+add_executable(test_keccak256 common/tests/test_keccak256.c)
+target_link_libraries(test_keccak256 common)
+add_test(NAME test_keccak256 COMMAND test_keccak256)
+
+add_executable(test_byte_conv common/tests/test_byte_conv.c)
+target_link_libraries(test_byte_conv common)
+add_test(NAME test_byte_conv COMMAND test_byte_conv)
+
 #==============================================================================
 # cJSON detection (used by chain_replay + integration tests)
 #==============================================================================
