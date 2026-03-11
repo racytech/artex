@@ -127,14 +127,9 @@ typedef struct {
     address_t contract_address; // Created contract address (for CREATE)
     bool contract_created;      // True if contract was created
     
-    // TODO: Logs — needed for receipt RLP encoding and bloom filters
-    //
-    // After log capture is implemented in LOG0-LOG4 (see evm/src/opcodes/logging.c),
-    // uncomment these fields and populate them from the EVM log accumulator
-    // after each transaction_execute() call:
-    //
-    // log_t *logs;       // array of log entries emitted by this tx
-    // size_t log_count;  // number of log entries
+    // Logs emitted by this transaction (moved from EVM accumulator)
+    evm_log_t *logs;
+    size_t     log_count;
 } transaction_result_t;
 
 /**

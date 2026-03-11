@@ -13,65 +13,41 @@ extern "C" {
 #endif
 
 /**
- * Per-transaction receipt (simplified).
+ * Per-transaction receipt.
  *
- * TODO: Extend for full Ethereum receipt (needed for receiptsRoot, logsBloom):
- *
- *   1. Add tx_type (uint8_t) — needed for typed receipt RLP envelope
- *      (EIP-2718: type || RLP[status, cumGas, bloom, logs])
- *
- *   2. Add status_code (uint8_t) — 0=fail, 1=success
- *      (post-Byzantium; pre-Byzantium uses intermediate state root)
- *
- *   3. Add logs_bloom[256] — per-tx 2048-bit bloom filter
- *      Computed from tx logs: for each log, set 3 bit-pairs from
- *      keccak256(address) and keccak256(each topic)
- *
- *   4. Add log_t *logs + log_count — actual log entries from EVM
- *      (depends on log capture in LOG0-LOG4 opcodes, see evm/src/opcodes/logging.c)
- *
- *   5. Add receipt_encode_rlp(receipt) → bytes — RLP encode for trie insertion
- *
- * Once complete, block_execute() can:
- *   - Compute per-tx bloom from logs after each tx
- *   - OR all per-tx blooms → block logs_bloom (for header validation)
- *   - Build receipt trie via mpt_compute_root_batch() → receiptsRoot
+ * Contains all fields needed for receipt RLP encoding:
+ *   type || RLP([status, cumulative_gas, bloom, logs])
  */
 typedef struct {
-    bool      success;       /* true if tx succeeded (even if EVM reverted) */
-    uint64_t  gas_used;      /* gas consumed by this tx */
-    uint64_t  cumulative_gas; /* cumulative gas after this tx */
-    address_t contract_addr; /* created contract address (if applicable) */
+    bool      success;          /* true if tx executed without fatal error */
+    uint64_t  gas_used;         /* gas consumed by this tx */
+    uint64_t  cumulative_gas;   /* cumulative gas after this tx */
+    address_t contract_addr;    /* created contract address (if applicable) */
     bool      contract_created;
+    uint8_t   tx_type;          /* transaction type (0=legacy, 1=2930, 2=1559, 3=4844, 4=7702) */
+    uint8_t   status_code;      /* 0=fail, 1=success (post-Byzantium) */
+    uint8_t   logs_bloom[256];  /* per-tx 2048-bit bloom filter */
+    evm_log_t *logs;            /* log entries from this tx (caller must free) */
+    size_t    log_count;        /* number of log entries */
 } tx_receipt_t;
 
 /**
  * Block execution result.
- *
- * TODO: Add computed roots for Engine API validation:
- *
- *   1. receipt_root (hash_t) — MPT root of RLP-encoded receipts
- *      Build trie: key=RLP(tx_index), value=receipt_encode_rlp(receipt)
- *      Use mpt_compute_root_batch() from state/include/mpt.h
- *
- *   2. logs_bloom[256] — aggregate bloom = OR of all per-tx blooms
- *      Engine API provides logsBloom in payload; must match
- *
- *   3. tx_root (hash_t) — MPT root of RLP-encoded transactions
- *      Build trie: key=RLP(tx_index), value=raw tx RLP bytes
- *      Can compute from block_body transactions directly
  */
 typedef struct {
-    hash_t      state_root;    /* post-execution state root */
-    uint64_t    gas_used;      /* total gas used in the block */
-    size_t      tx_count;      /* number of transactions executed */
-    bool        success;       /* true if all txs processed without fatal error */
+    hash_t      state_root;      /* post-execution state root */
+    uint64_t    gas_used;        /* total gas used in the block */
+    size_t      tx_count;        /* number of transactions executed */
+    bool        success;         /* true if all txs processed without fatal error */
 
-    tx_receipt_t *receipts;    /* per-tx receipts (caller must free) */
+    tx_receipt_t *receipts;      /* per-tx receipts (caller must free) */
     size_t       receipt_count;
 
     /* Debugging: index of the first failed tx (-1 if all ok) */
     int          first_failure;
+
+    hash_t      receipt_root;    /* MPT root of RLP-encoded receipts */
+    uint8_t     logs_bloom[256]; /* aggregate bloom = OR of all per-tx blooms */
 } block_result_t;
 
 /**

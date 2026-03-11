@@ -139,14 +139,95 @@ static bool leaf_hash(const uint8_t *suffix, size_t suffix_len,
     uint8_t encoded_path[33];
     size_t encoded_len = hex_prefix_encode(suffix, suffix_len, true, encoded_path);
 
-    rlp_sbuf_t payload; sbuf_reset(&payload);
-    sbuf_encode_bytes(&payload, encoded_path, encoded_len);
-    sbuf_encode_bytes(&payload, value, value_len);
+    /* Fast path: small values fit in the stack buffer */
+    if (value_len + encoded_len + 16 <= sizeof(((rlp_sbuf_t *)0)->data)) {
+        rlp_sbuf_t payload; sbuf_reset(&payload);
+        sbuf_encode_bytes(&payload, encoded_path, encoded_len);
+        sbuf_encode_bytes(&payload, value, value_len);
 
-    rlp_sbuf_t node; sbuf_reset(&node);
-    sbuf_list_wrap(&node, &payload);
+        rlp_sbuf_t node; sbuf_reset(&node);
+        sbuf_list_wrap(&node, &payload);
 
-    keccak256(node.data, node.len, out->bytes);
+        keccak256(node.data, node.len, out->bytes);
+        return true;
+    }
+
+    /* Slow path: large values — build RLP manually with heap allocation */
+    /* RLP(encoded_path): header + data */
+    size_t path_rlp_len = encoded_len <= 55 ? 1 + encoded_len
+                        : encoded_len <= 0xFF ? 2 + encoded_len
+                        : 3 + encoded_len;
+    /* RLP(value): header + data */
+    size_t val_rlp_len;
+    if (value_len == 1 && value[0] < 0x80)
+        val_rlp_len = 1;
+    else if (value_len <= 55)
+        val_rlp_len = 1 + value_len;
+    else if (value_len <= 0xFF)
+        val_rlp_len = 2 + value_len;
+    else if (value_len <= 0xFFFF)
+        val_rlp_len = 3 + value_len;
+    else
+        val_rlp_len = 4 + value_len;
+
+    size_t payload_len = path_rlp_len + val_rlp_len;
+    /* List header: 1 byte if payload<=55, else 1 + length-of-length */
+    size_t list_hdr_len;
+    if (payload_len <= 55)
+        list_hdr_len = 1;
+    else if (payload_len <= 0xFF)
+        list_hdr_len = 2;
+    else if (payload_len <= 0xFFFF)
+        list_hdr_len = 3;
+    else
+        list_hdr_len = 4;
+
+    size_t total = list_hdr_len + payload_len;
+    uint8_t *buf = malloc(total);
+    if (!buf) return false;
+
+    size_t pos = 0;
+    /* Write list header */
+    if (payload_len <= 55) {
+        buf[pos++] = 0xc0 + (uint8_t)payload_len;
+    } else {
+        uint8_t lb[4]; size_t ll = 0;
+        size_t tmp = payload_len;
+        while (tmp > 0) { lb[ll++] = tmp & 0xFF; tmp >>= 8; }
+        buf[pos++] = 0xf7 + (uint8_t)ll;
+        for (int i = (int)ll - 1; i >= 0; i--) buf[pos++] = lb[i];
+    }
+    /* Write RLP(encoded_path) */
+    if (encoded_len <= 55) {
+        buf[pos++] = 0x80 + (uint8_t)encoded_len;
+    } else if (encoded_len <= 0xFF) {
+        buf[pos++] = 0xb8; buf[pos++] = (uint8_t)encoded_len;
+    } else {
+        buf[pos++] = 0xb9; buf[pos++] = (uint8_t)(encoded_len >> 8); buf[pos++] = (uint8_t)(encoded_len & 0xFF);
+    }
+    memcpy(buf + pos, encoded_path, encoded_len); pos += encoded_len;
+    /* Write RLP(value) */
+    if (value_len == 1 && value[0] < 0x80) {
+        buf[pos++] = value[0];
+    } else if (value_len <= 55) {
+        buf[pos++] = 0x80 + (uint8_t)value_len;
+        memcpy(buf + pos, value, value_len); pos += value_len;
+    } else if (value_len <= 0xFF) {
+        buf[pos++] = 0xb8; buf[pos++] = (uint8_t)value_len;
+        memcpy(buf + pos, value, value_len); pos += value_len;
+    } else if (value_len <= 0xFFFF) {
+        buf[pos++] = 0xb9; buf[pos++] = (uint8_t)(value_len >> 8); buf[pos++] = (uint8_t)(value_len & 0xFF);
+        memcpy(buf + pos, value, value_len); pos += value_len;
+    } else {
+        buf[pos++] = 0xba;
+        buf[pos++] = (uint8_t)(value_len >> 16);
+        buf[pos++] = (uint8_t)(value_len >> 8);
+        buf[pos++] = (uint8_t)(value_len & 0xFF);
+        memcpy(buf + pos, value, value_len); pos += value_len;
+    }
+
+    keccak256(buf, pos, out->bytes);
+    free(buf);
     return true;
 }
 

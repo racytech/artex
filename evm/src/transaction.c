@@ -460,6 +460,9 @@ bool transaction_execute(
     uint256_t gas_limit_u256 = uint256_from_uint64(tx->gas_limit);
     uint256_t gas_cost = uint256_mul(&effective_gas_price, &gas_limit_u256);
 
+    // Clear any leftover logs from previous transaction
+    evm_logs_clear(evm);
+
     // Create snapshot for potential rollback
     uint32_t snapshot = evm_state_snapshot(state);
 
@@ -878,6 +881,21 @@ bool transaction_execute(
         }
     }
 
+    // Transfer or discard logs based on final execution status.
+    // On success: move logs to result (zero-copy ownership transfer).
+    // On revert/error: logs are discarded per Ethereum spec.
+    if (result->status == EVM_SUCCESS) {
+        result->logs = evm->logs;
+        result->log_count = evm->log_count;
+        evm->logs = NULL;
+        evm->log_count = 0;
+        evm->log_cap = 0;
+    } else {
+        evm_logs_clear(evm);
+        result->logs = NULL;
+        result->log_count = 0;
+    }
+
     // Copy output data
     if (evm_result.output_data && evm_result.output_size > 0) {
         result->output_data = malloc(evm_result.output_size);
@@ -981,6 +999,11 @@ void transaction_result_free(transaction_result_t *result)
         free(result->output_data);
         result->output_data = NULL;
     }
-
     result->output_size = 0;
+
+    for (size_t i = 0; i < result->log_count; i++)
+        evm_log_free(&result->logs[i]);
+    free(result->logs);
+    result->logs = NULL;
+    result->log_count = 0;
 }

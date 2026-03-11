@@ -4,11 +4,150 @@
 #include "fork.h"
 #include "transaction.h"
 #include "verkle_key.h"
+#include "mem_mpt.h"
+#include "rlp.h"
+#include "hash.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 
 extern bool g_trace_calls __attribute__((weak));
+
+/* =========================================================================
+ * Bloom Filter (2048-bit / 256-byte Ethereum logs bloom)
+ * ========================================================================= */
+
+/** Add a single item (address or topic) to the bloom filter.
+ *  Ethereum bloom is big-endian: bit position b maps to byte 255 - b/8. */
+static void bloom_add(uint8_t bloom[256], const uint8_t *data, size_t len) {
+    hash_t h = hash_keccak256(data, len);
+    for (int i = 0; i < 6; i += 2) {
+        uint16_t bit = ((uint16_t)h.bytes[i] << 8 | h.bytes[i + 1]) & 0x7FF;
+        bloom[255 - bit / 8] |= (uint8_t)(1 << (bit % 8));
+    }
+}
+
+/** Compute bloom filter from a set of log entries. */
+static void bloom_from_logs(uint8_t bloom[256],
+                            const evm_log_t *logs, size_t log_count) {
+    memset(bloom, 0, 256);
+    for (size_t i = 0; i < log_count; i++) {
+        bloom_add(bloom, logs[i].address.bytes, 20);
+        for (uint8_t t = 0; t < logs[i].topic_count; t++)
+            bloom_add(bloom, logs[i].topics[t].bytes, 32);
+    }
+}
+
+/** OR src bloom into dst bloom. */
+static void bloom_or(uint8_t dst[256], const uint8_t src[256]) {
+    for (int i = 0; i < 256; i++) dst[i] |= src[i];
+}
+
+/* =========================================================================
+ * Receipt RLP Encoding
+ * ========================================================================= */
+
+/**
+ * Encode a transaction receipt as RLP bytes.
+ *
+ * Post-Byzantium: RLP([status, cumulative_gas, bloom, logs_list])
+ * For typed txs (type > 0): prepend type byte (EIP-2718 envelope).
+ *
+ * Caller must free returned bytes_t.data.
+ */
+static bytes_t receipt_encode_rlp(uint8_t tx_type, uint8_t status,
+                                   uint64_t cumulative_gas,
+                                   const uint8_t bloom[256],
+                                   const evm_log_t *logs, size_t log_count) {
+    rlp_item_t *receipt = rlp_list_new();
+
+    /* Status: 0 → empty byte string (0x80), 1 → single byte 0x01 */
+    if (status == 0)
+        rlp_list_append(receipt, rlp_string(NULL, 0));
+    else
+        rlp_list_append(receipt, rlp_string(&status, 1));
+
+    rlp_list_append(receipt, rlp_uint64(cumulative_gas));
+    rlp_list_append(receipt, rlp_string(bloom, 256));
+
+    rlp_item_t *logs_list = rlp_list_new();
+    for (size_t i = 0; i < log_count; i++) {
+        rlp_item_t *log_item = rlp_list_new();
+        rlp_list_append(log_item, rlp_string(logs[i].address.bytes, 20));
+
+        rlp_item_t *topics = rlp_list_new();
+        for (uint8_t t = 0; t < logs[i].topic_count; t++)
+            rlp_list_append(topics, rlp_string(logs[i].topics[t].bytes, 32));
+        rlp_list_append(log_item, topics);
+
+        rlp_list_append(log_item, rlp_string(logs[i].data, logs[i].data_len));
+        rlp_list_append(logs_list, log_item);
+    }
+    rlp_list_append(receipt, logs_list);
+
+    bytes_t rlp_bytes = rlp_encode(receipt);
+    rlp_item_free(receipt);
+
+    /* For typed tx (type > 0): prepend type byte (EIP-2718 envelope) */
+    if (tx_type > 0) {
+        uint8_t *typed = malloc(1 + rlp_bytes.len);
+        if (typed) {
+            typed[0] = tx_type;
+            memcpy(typed + 1, rlp_bytes.data, rlp_bytes.len);
+            free(rlp_bytes.data);
+            rlp_bytes.data = typed;
+            rlp_bytes.len += 1;
+        }
+    }
+    return rlp_bytes;
+}
+
+/**
+ * Compute receipt trie root from receipts array.
+ * Keys = RLP(index), values = receipt RLP bytes.
+ * Uses unsecured MPT (raw keys, not hashed).
+ */
+static hash_t compute_receipt_root(const tx_receipt_t *receipts, size_t count) {
+    hash_t root;
+    if (count == 0) {
+        /* Empty trie root = keccak256(0x80) */
+        const uint8_t empty_rlp[] = {0x80};
+        root = hash_keccak256(empty_rlp, 1);
+        return root;
+    }
+
+    mpt_unsecured_entry_t *entries = calloc(count, sizeof(*entries));
+    bytes_t *keys = calloc(count, sizeof(bytes_t));
+    bytes_t *values = calloc(count, sizeof(bytes_t));
+
+    for (size_t i = 0; i < count; i++) {
+        keys[i] = rlp_encode_uint64_direct(i);
+        entries[i].key = keys[i].data;
+        entries[i].key_len = keys[i].len;
+
+        values[i] = receipt_encode_rlp(
+            receipts[i].tx_type,
+            receipts[i].status_code,
+            receipts[i].cumulative_gas,
+            receipts[i].logs_bloom,
+            receipts[i].logs,
+            receipts[i].log_count);
+        entries[i].value = values[i].data;
+        entries[i].value_len = values[i].len;
+    }
+
+    mpt_compute_root_unsecured(entries, count, &root);
+
+    for (size_t i = 0; i < count; i++) {
+        free(keys[i].data);
+        free(values[i].data);
+    }
+    free(entries);
+    free(keys);
+    free(values);
+
+    return root;
+}
 
 /* =========================================================================
  * Build block_env_t from block_header_t
@@ -249,20 +388,35 @@ block_result_t block_execute(evm_t *evm,
         result.receipts[i].gas_used = ok ? tx_result.gas_used : 0;
         cumulative_gas += result.receipts[i].gas_used;
         result.receipts[i].cumulative_gas = cumulative_gas;
+        result.receipts[i].tx_type = (uint8_t)tx.type;
+        result.receipts[i].status_code = (ok && tx_result.status == EVM_SUCCESS) ? 1 : 0;
+
         if (ok && tx_result.contract_created) {
             result.receipts[i].contract_created = true;
             address_copy(&result.receipts[i].contract_addr,
                          &tx_result.contract_address);
         }
 
+        /* Transfer logs from tx result to receipt (move, not copy) */
         if (ok) {
+            result.receipts[i].logs = tx_result.logs;
+            result.receipts[i].log_count = tx_result.log_count;
+            tx_result.logs = NULL;
+            tx_result.log_count = 0;
             transaction_result_free(&tx_result);
         } else {
+            result.receipts[i].logs = NULL;
+            result.receipts[i].log_count = 0;
             if (result.first_failure < 0) result.first_failure = (int)i;
             /* Continue executing remaining txs — a single tx failure
              * doesn't abort the block (the tx is still included,
              * it just consumes all its gas). */
         }
+
+        /* Compute per-tx bloom from logs */
+        bloom_from_logs(result.receipts[i].logs_bloom,
+                        result.receipts[i].logs,
+                        result.receipts[i].log_count);
 
         tx_decoded_free(&tx);
 
@@ -271,6 +425,14 @@ block_result_t block_execute(evm_t *evm,
          * Must happen after each tx so the next tx sees clean state. */
         evm_state_commit_tx(evm->state);
     }
+
+    /* Compute aggregate bloom (OR of all per-tx blooms) */
+    memset(result.logs_bloom, 0, 256);
+    for (size_t i = 0; i < tx_count; i++)
+        bloom_or(result.logs_bloom, result.receipts[i].logs_bloom);
+
+    /* Compute receipt trie root */
+    result.receipt_root = compute_receipt_root(result.receipts, tx_count);
 
     /* Pay block reward (PoW only — zero after The Merge) */
     uint256_t base_reward = get_block_reward(evm->fork);
@@ -351,6 +513,11 @@ block_result_t block_execute(evm_t *evm,
 
 void block_result_free(block_result_t *result) {
     if (result) {
+        for (size_t i = 0; i < result->receipt_count; i++) {
+            for (size_t j = 0; j < result->receipts[i].log_count; j++)
+                evm_log_free(&result->receipts[i].logs[j]);
+            free(result->receipts[i].logs);
+        }
         free(result->receipts);
         result->receipts = NULL;
         result->receipt_count = 0;

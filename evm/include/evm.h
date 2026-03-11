@@ -155,6 +155,22 @@ typedef struct
 } evm_tx_context_t;
 
 //==============================================================================
+// EVM Log Entry
+//==============================================================================
+
+/**
+ * A single log entry emitted by LOG0-LOG4 opcodes.
+ * Accumulated per-transaction, discarded on revert.
+ */
+typedef struct {
+    address_t address;      // Contract that emitted the log
+    hash_t    topics[4];    // Topic values (32 bytes each, big-endian)
+    uint8_t   topic_count;  // Number of topics (0-4)
+    uint8_t  *data;         // Log data bytes (heap-allocated, NULL if empty)
+    size_t    data_len;     // Length of data
+} evm_log_t;
+
+//==============================================================================
 // EVM Execution Context
 //==============================================================================
 
@@ -191,6 +207,11 @@ struct evm_t
     // Execution flags
     bool stopped;     // Execution stopped (STOP, RETURN, REVERT)
     evm_status_t status; // Execution status
+
+    // Log accumulator (persists across subcalls, truncated on revert)
+    evm_log_t *logs;
+    size_t     log_count;
+    size_t     log_cap;
 
     // Access tracking (EIP-2929) is handled by evm_state internally
 };
@@ -395,6 +416,23 @@ evm_result_t evm_result_error(evm_status_t status, uint64_t gas_left);
  * @param result Result to free
  */
 void evm_result_free(evm_result_t *result);
+
+//==============================================================================
+// Log Helpers
+//==============================================================================
+
+/** Free a single log entry's data (does not free the struct itself). */
+void evm_log_free(evm_log_t *log);
+
+/** Free all logs in the EVM accumulator and reset count/cap. */
+void evm_logs_clear(evm_t *evm);
+
+/** Truncate log accumulator back to a saved position (revert logs). */
+static inline void evm_logs_truncate(evm_t *evm, size_t logs_before) {
+    for (size_t i = logs_before; i < evm->log_count; i++)
+        evm_log_free(&evm->logs[i]);
+    evm->log_count = logs_before;
+}
 
 //==============================================================================
 // Message Helpers

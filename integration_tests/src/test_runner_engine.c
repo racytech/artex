@@ -380,6 +380,43 @@ bool test_runner_run_engine_test(test_runner_t *runner,
             continue;
         }
 
+        /* Verify receipt root */
+        hash_t expected_receipt_root;
+        memcpy(expected_receipt_root.bytes, payload->receipts_root, 32);
+        if (!hash_equals(&block_result.receipt_root, &expected_receipt_root)) {
+            char *expected_str = hash_to_hex_string(&expected_receipt_root);
+            char *actual_str = hash_to_hex_string(&block_result.receipt_root);
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Receipt root mismatch after payload %zu (block %lu)",
+                     payload_idx, payload->block_number);
+            test_result_add_failure(result, "receipt_root",
+                                   expected_str, actual_str, msg);
+            free(expected_str);
+            free(actual_str);
+
+            block_result_free(&block_result);
+            block_body_free(&body);
+
+            if (runner->config.stop_on_fail) goto cleanup;
+            block_hashes[hdr.number % 256] = computed_hash;
+            continue;
+        }
+
+        /* Verify logs bloom */
+        if (memcmp(block_result.logs_bloom, payload->logs_bloom, 256) != 0) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Logs bloom mismatch after payload %zu (block %lu)",
+                     payload_idx, payload->block_number);
+            test_result_add_failure(result, "logs_bloom", NULL, NULL, msg);
+
+            block_result_free(&block_result);
+            block_body_free(&body);
+
+            if (runner->config.stop_on_fail) goto cleanup;
+            block_hashes[hdr.number % 256] = computed_hash;
+            continue;
+        }
+
         /* Store block hash for BLOCKHASH opcode */
         block_hashes[hdr.number % 256] = computed_hash;
 
