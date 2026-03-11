@@ -703,6 +703,10 @@ endif()
 target_link_libraries(test_block_executor ${TEST_BLOCK_EXEC_LIBS})
 add_test(NAME test_block_executor COMMAND test_block_executor)
 
+add_executable(test_uint256_div common/tests/test_uint256_div.c)
+target_link_libraries(test_uint256_div common)
+add_test(NAME test_uint256_div COMMAND test_uint256_div)
+
 #==============================================================================
 # cJSON detection (used by chain_replay + integration tests)
 #==============================================================================

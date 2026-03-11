@@ -144,8 +144,19 @@ char* uint256_to_hex(const uint256_t* a);
 void uint256_to_bytes(const uint256_t* a, uint8_t* bytes);
 void uint256_to_bytes_le(const uint256_t* a, uint8_t* bytes);
 uint256_t uint256_from_bytes_le(const uint8_t* bytes, size_t len);
-void uint256_to_words(const uint256_t* a, uint64_t words[4]);
-uint256_t uint256_from_words(const uint64_t words[4]);
+static inline void uint256_to_words(const uint256_t* a, uint64_t words[4]) {
+    words[0] = (uint64_t)a->low;
+    words[1] = (uint64_t)(a->low >> 64);
+    words[2] = (uint64_t)a->high;
+    words[3] = (uint64_t)(a->high >> 64);
+}
+
+static inline uint256_t uint256_from_words(const uint64_t words[4]) {
+    uint256_t r;
+    r.low  = ((__uint128_t)words[1] << 64) | words[0];
+    r.high = ((__uint128_t)words[3] << 64) | words[2];
+    return r;
+}
 
 // Additional utility functions
 int uint256_bit_length(const uint256_t* a);
