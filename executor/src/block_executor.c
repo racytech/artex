@@ -248,6 +248,8 @@ block_result_t block_execute(evm_t *evm,
         result.receipts[i].success = ok;
         result.receipts[i].gas_used = ok ? tx_result.gas_used : 0;
         cumulative_gas += result.receipts[i].gas_used;
+
+
         result.receipts[i].cumulative_gas = cumulative_gas;
         if (ok && tx_result.contract_created) {
             result.receipts[i].contract_created = true;

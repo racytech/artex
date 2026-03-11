@@ -62,6 +62,12 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
 void evm_state_destroy(evm_state_t *es);
 
 /**
+ * Mark state to discard pending writes on destroy.
+ * Call after a failed block to prevent corrupting the on-disk MPT state.
+ */
+void evm_state_discard_pending(evm_state_t *es);
+
+/**
  * Flush deferred MPT writes to disk. Call at checkpoint time.
  */
 void evm_state_flush(evm_state_t *es);

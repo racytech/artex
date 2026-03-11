@@ -404,6 +404,12 @@ void sync_destroy(sync_t *sync) {
         printf("Checkpoint saved at block %lu\n", sync->last_block);
     }
 
+    /* If any block failed, discard pending MPT writes to avoid corrupting
+     * the on-disk state.  The checkpoint file was already saved at the last
+     * good block, so the disk state must match that checkpoint. */
+    if (sync->blocks_fail > 0 && sync->state)
+        evm_state_discard_pending(sync->state);
+
     if (sync->evm) evm_destroy(sync->evm);
     if (sync->state) evm_state_destroy(sync->state);
 #ifdef ENABLE_VERKLE
@@ -544,24 +550,17 @@ bool sync_execute_block(sync_t *sync,
     sync->total_gas += br.gas_used;
     sync->last_block = bn;
 
-    /* Handle failure: revert verkle state for the bad block */
+    /* Handle failure: revert to last checkpoint boundary.
+     * The persistent MPT store is only flushed at checkpoint boundaries,
+     * so we must resume from there — not from last_good (which may be
+     * ahead of what the MPT store has committed). */
     if (!result->ok) {
 #ifdef ENABLE_VERKLE
         if (sync->vs) verkle_state_revert_block(sync->vs);
 #endif
-        /* Save checkpoint at the last good block */
-        uint64_t last_good = bn - 1;
-        if (last_good > sync->last_checkpoint_block &&
-            sync->config.checkpoint_path) {
-            uint64_t good_gas = sync->total_gas - br.gas_used;
-#ifdef ENABLE_VERKLE
-            if (sync->vs) verkle_state_sync(sync->vs);
-#endif
-            checkpoint_save_internal(sync->config.checkpoint_path,
-                                     last_good, sync->block_hashes,
-                                     good_gas, sync->blocks_ok, 0);
-            sync->last_checkpoint_block = last_good;
-        }
+        /* Keep checkpoint at last_checkpoint_block — don't advance it.
+         * On resume, blocks after last_checkpoint_block will be re-executed
+         * against the correct MPT state. */
     }
 
     /* Auto-checkpoint on interval — validate batch root, then save */

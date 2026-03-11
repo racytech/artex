@@ -118,6 +118,7 @@ struct evm_state {
     mem_art_t         warm_slots;   // key: skey[52], value: (none, 0 bytes)
     mem_art_t         transient;    // key: skey[52], value: uint256_t (EIP-1153)
     bool              batch_mode;   // skip per-block verkle flush, defer to checkpoint
+    bool              discard_on_destroy; // skip MPT flush on destroy (set after failed block)
 #ifdef ENABLE_VERKLE
     witness_gas_t     witness_gas;  // EIP-4762 verkle witness gas tracker
 #endif
@@ -434,13 +435,16 @@ void evm_state_destroy(evm_state_t *es) {
     if (!es) return;
 
 #ifdef ENABLE_MPT
-    // Flush deferred writes and destroy persistent MPT stores
+    // Flush deferred writes and destroy persistent MPT stores.
+    // Skip flush if discard_on_destroy is set (failed block — don't corrupt disk state).
     if (es->account_mpt) {
-        mpt_store_flush(es->account_mpt);
+        if (!es->discard_on_destroy)
+            mpt_store_flush(es->account_mpt);
         mpt_store_destroy(es->account_mpt);
     }
     if (es->storage_mpt) {
-        mpt_store_flush(es->storage_mpt);
+        if (!es->discard_on_destroy)
+            mpt_store_flush(es->storage_mpt);
         mpt_store_destroy(es->storage_mpt);
     }
 #endif
@@ -469,6 +473,10 @@ void evm_state_destroy(evm_state_t *es) {
 
     free(es->journal);
     free(es);
+}
+
+void evm_state_discard_pending(evm_state_t *es) {
+    if (es) es->discard_on_destroy = true;
 }
 
 // ============================================================================
