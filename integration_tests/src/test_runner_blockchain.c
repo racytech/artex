@@ -213,6 +213,10 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
             printf("    gas_used=%lu (expected=%lu), tx_count=%zu, success=%d\n",
                    block_result.gas_used, hdr.gas_used, block_result.tx_count,
                    block_result.success);
+            /* DEBUG: show root from block_execute */
+            char *be_root_str = hash_to_hex_string(&block_result.state_root);
+            printf("    block_execute root: %s\n", be_root_str);
+            free(be_root_str);
         }
 
         // Track statistics
@@ -227,6 +231,16 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
 #else
         hash_t computed_root = evm_state_compute_state_root_ex(runner->state, prune);
 #endif
+        /* DEBUG: show computed root and expected */
+        {
+            char *cr_str = hash_to_hex_string(&computed_root);
+            hash_t *er = (hash_t *)&block->header.state_root;
+            char *er_str = hash_to_hex_string(er);
+            printf("    computed_root:      %s\n", cr_str);
+            printf("    expected_root:      %s\n", er_str);
+            free(cr_str);
+            free(er_str);
+        }
         hash_t *expected_root = (hash_t *)&block->header.state_root;
         if (!hash_equals(&computed_root, expected_root)) {
             char *expected_str = hash_to_hex_string(expected_root);

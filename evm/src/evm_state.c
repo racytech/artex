@@ -409,27 +409,6 @@ void evm_state_set_batch_mode(evm_state_t *es, bool enabled) {
     if (es) es->batch_mode = enabled;
 }
 
-void evm_state_flush_verkle(evm_state_t *es) {
-#ifdef ENABLE_VERKLE
-    if (!es || !es->vs) return;
-
-    // Flush accumulated block-dirty state to verkle backing store
-    finalize_ctx_t ctx = { .es = es, .ok = true, .prune_empty = false };
-    mem_art_foreach(&es->accounts, flush_all_accounts_cb, &ctx);
-    mem_art_foreach(&es->storage, flush_all_storage_cb, &ctx);
-
-    // Single begin/commit cycle for the entire batch
-    verkle_state_begin_block(es->vs, 0);
-    verkle_state_commit_block(es->vs);
-
-    // Clear block_dirty flags
-    mem_art_foreach(&es->accounts, clear_block_dirty_account_cb, NULL);
-    mem_art_foreach(&es->storage, clear_block_dirty_slot_cb, NULL);
-#else
-    (void)es;
-#endif
-}
-
 void evm_state_destroy(evm_state_t *es) {
     if (!es) return;
 
@@ -1606,6 +1585,27 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     // clear_mpt_dirty_cb), so this is a no-op.
     (void)prune_empty;
     return hash_zero();
+#endif
+}
+
+void evm_state_flush_verkle(evm_state_t *es) {
+#ifdef ENABLE_VERKLE
+    if (!es || !es->vs) return;
+
+    // Flush accumulated block-dirty state to verkle backing store
+    finalize_ctx_t ctx = { .es = es, .ok = true, .prune_empty = false };
+    mem_art_foreach(&es->accounts, flush_all_accounts_cb, &ctx);
+    mem_art_foreach(&es->storage, flush_all_storage_cb, &ctx);
+
+    // Single begin/commit cycle for the entire batch
+    verkle_state_begin_block(es->vs, 0);
+    verkle_state_commit_block(es->vs);
+
+    // Clear block_dirty flags
+    mem_art_foreach(&es->accounts, clear_block_dirty_account_cb, NULL);
+    mem_art_foreach(&es->storage, clear_block_dirty_slot_cb, NULL);
+#else
+    (void)es;
 #endif
 }
 

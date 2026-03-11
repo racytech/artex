@@ -77,6 +77,9 @@ static void system_call(evm_t *evm, const uint8_t addr_bytes[20],
     /* Only call if contract has code */
     uint32_t code_len = 0;
     evm_state_get_code_ptr(evm->state, &contract_addr, &code_len);
+    printf("    system_call: addr=%02x%02x..%02x%02x code_len=%u calldata_len=%zu\n",
+           addr_bytes[0], addr_bytes[1], addr_bytes[18], addr_bytes[19],
+           code_len, calldata_len);
     if (code_len == 0) return;
 
     /* Set tx context for system call */
@@ -102,6 +105,8 @@ static void system_call(evm_t *evm, const uint8_t addr_bytes[20],
         calldata, calldata_len, 30000000, 0);
     evm_result_t result;
     evm_execute(evm, &msg, &result);
+    printf("    system_call result: status=%d gas_left=%lu output_len=%zu\n",
+           result.status, result.gas_left, result.output_size);
     evm_result_free(&result);
 
     /* Commit system call state changes (reset access lists, commit originals).
@@ -191,13 +196,20 @@ block_result_t block_execute(evm_t *evm,
                     header->parent_beacon_root.bytes, 32);
     }
 
-    /* EIP-2935: Store parent block hash in history contract (Prague+) */
+    /* EIP-2935 / EIP-7709: Store parent block hash in history contract (Prague+).
+     * Verkle uses 0xff..fe (EIP-7709), Prague uses 0x0000f908... (EIP-2935). */
     if (evm->fork >= FORK_PRAGUE) {
-        static const uint8_t HISTORY_ADDR[20] = {
+        static const uint8_t HISTORY_ADDR_PRAGUE[20] = {
             0x00, 0x00, 0xf9, 0x08, 0x27, 0xf1, 0xc5, 0x3a, 0x10, 0xcb,
             0x7a, 0x02, 0x33, 0x5b, 0x17, 0x53, 0x20, 0x00, 0x29, 0x35
         };
-        system_call(evm, HISTORY_ADDR,
+        static const uint8_t HISTORY_ADDR_VERKLE[20] = {
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe
+        };
+        const uint8_t *hist_addr = (evm->fork >= FORK_VERKLE)
+            ? HISTORY_ADDR_VERKLE : HISTORY_ADDR_PRAGUE;
+        system_call(evm, hist_addr,
                     header->parent_hash.bytes, 32);
     }
 
