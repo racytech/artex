@@ -205,9 +205,7 @@ add_library(evm STATIC
     evm/src/fork.c
     evm/src/transaction.c
     evm/src/opcodes/arithmetic.c
-    evm/src/opcodes/comparison.c
     evm/src/opcodes/crypto.c
-    evm/src/opcodes/stack.c
     evm/src/opcodes/memory.c
     evm/src/opcodes/logging.c
     evm/src/opcodes/storage.c

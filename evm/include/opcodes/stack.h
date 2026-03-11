@@ -1,11 +1,9 @@
 /**
  * EVM Stack Manipulation Opcodes
  *
- * Implements stack manipulation operations:
- * - POP
- * - PUSH1-PUSH32
- * - DUP1-DUP16
- * - SWAP1-SWAP16
+ * All stack manipulation opcodes (POP, PUSH0-32, DUP1-16, SWAP1-16) are
+ * inlined directly into interpreter.c dispatch labels. This header provides
+ * opcode definitions only.
  */
 
 #ifndef ART_EVM_OPCODES_STACK_H
@@ -93,48 +91,6 @@ extern "C"
 #define OP_SWAP14 0x9d
 #define OP_SWAP15 0x9e
 #define OP_SWAP16 0x9f
-
-//==============================================================================
-// Opcode Implementations
-//==============================================================================
-
-/**
- * POP - Remove item from stack
- * Stack: a =>
- * Gas: 2
- */
-evm_status_t op_pop(evm_t *evm);
-
-/**
- * PUSH - Push N-byte value onto stack
- * Stack: => value
- * Gas: 3
- * @param n Number of bytes to push (1-32)
- */
-evm_status_t op_push(evm_t *evm, uint8_t n);
-
-/**
- * PUSH0 - Push zero onto stack (EIP-3855, Shanghai+)
- * Stack: => 0
- * Gas: 2
- */
-evm_status_t op_push0(evm_t *evm);
-
-/**
- * DUP - Duplicate Nth stack item
- * Stack: ... N => ... N N
- * Gas: 3
- * @param n Position to duplicate (1-16)
- */
-evm_status_t op_dup(evm_t *evm, uint8_t n);
-
-/**
- * SWAP - Exchange 1st and (N+1)th stack items
- * Stack: ... N ... 1 => ... 1 ... N
- * Gas: 3
- * @param n Position to swap with (1-16)
- */
-evm_status_t op_swap(evm_t *evm, uint8_t n);
 
 #ifdef __cplusplus
 }

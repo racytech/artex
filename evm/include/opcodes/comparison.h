@@ -1,11 +1,8 @@
 /**
  * EVM Comparison & Bitwise Opcodes
  *
- * Implements comparison and bitwise operations:
- * - LT, GT, SLT, SGT, EQ
- * - ISZERO
- * - AND, OR, XOR, NOT
- * - BYTE, SHL, SHR, SAR
+ * All comparison and bitwise opcodes are inlined directly into
+ * interpreter.c dispatch labels. This header provides opcode definitions only.
  */
 
 #ifndef ART_EVM_OPCODES_COMPARISON_H
@@ -36,112 +33,6 @@ extern "C"
 #define OP_SHL 0x1b     // Shift left
 #define OP_SHR 0x1c     // Shift right (logical)
 #define OP_SAR 0x1d     // Shift right (arithmetic)
-
-//==============================================================================
-// Comparison Opcodes
-//==============================================================================
-
-/**
- * LT - Unsigned less than
- * Stack: a b => (a < b) ? 1 : 0
- * Gas: 3
- */
-evm_status_t op_lt(evm_t *evm);
-
-/**
- * GT - Unsigned greater than
- * Stack: a b => (a > b) ? 1 : 0
- * Gas: 3
- */
-evm_status_t op_gt(evm_t *evm);
-
-/**
- * SLT - Signed less than
- * Stack: a b => (a < b) ? 1 : 0 (signed)
- * Gas: 3
- */
-evm_status_t op_slt(evm_t *evm);
-
-/**
- * SGT - Signed greater than
- * Stack: a b => (a > b) ? 1 : 0 (signed)
- * Gas: 3
- */
-evm_status_t op_sgt(evm_t *evm);
-
-/**
- * EQ - Equality
- * Stack: a b => (a == b) ? 1 : 0
- * Gas: 3
- */
-evm_status_t op_eq(evm_t *evm);
-
-/**
- * ISZERO - Is zero
- * Stack: a => (a == 0) ? 1 : 0
- * Gas: 3
- */
-evm_status_t op_iszero(evm_t *evm);
-
-//==============================================================================
-// Bitwise Opcodes
-//==============================================================================
-
-/**
- * AND - Bitwise AND
- * Stack: a b => a & b
- * Gas: 3
- */
-evm_status_t op_and(evm_t *evm);
-
-/**
- * OR - Bitwise OR
- * Stack: a b => a | b
- * Gas: 3
- */
-evm_status_t op_or(evm_t *evm);
-
-/**
- * XOR - Bitwise XOR
- * Stack: a b => a ^ b
- * Gas: 3
- */
-evm_status_t op_xor(evm_t *evm);
-
-/**
- * NOT - Bitwise NOT
- * Stack: a => ~a
- * Gas: 3
- */
-evm_status_t op_not(evm_t *evm);
-
-/**
- * BYTE - Extract byte
- * Stack: i x => x[i] (or 0 if i >= 32)
- * Gas: 3
- */
-evm_status_t op_byte(evm_t *evm);
-
-/**
- * SHL - Shift left
- * Stack: shift value => value << shift
- * Gas: 3
- */
-evm_status_t op_shl(evm_t *evm);
-
-/**
- * SHR - Logical shift right
- * Stack: shift value => value >> shift
- * Gas: 3
- */
-evm_status_t op_shr(evm_t *evm);
-
-/**
- * SAR - Arithmetic shift right
- * Stack: shift value => value >> shift (with sign extension)
- * Gas: 3
- */
-evm_status_t op_sar(evm_t *evm);
 
 #ifdef __cplusplus
 }

@@ -1,5 +1,9 @@
 /**
  * EVM Control Flow Opcodes Implementation
+ *
+ * Simple control opcodes (STOP, JUMPDEST, PC, GAS) are inlined directly
+ * into interpreter.c dispatch labels. This file contains the remaining
+ * control flow opcodes that are still called as functions.
  */
 
 #include "opcodes/control.h"
@@ -15,88 +19,9 @@
 #include <stdlib.h>
 
 //==============================================================================
-// Simple Control Opcodes
+// INVALID - Invalid instruction (always fails)
 //==============================================================================
 
-/**
- * PC - Get program counter
- * Stack: => pc
- * Gas: 2
- */
-evm_status_t op_pc(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    // Push current PC value to stack
-    uint256_t pc_value = uint256_from_uint64(evm->pc);
-
-    if (!evm_stack_push(evm->stack, &pc_value))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * GAS - Get remaining gas
- * Stack: => gas
- * Gas: 2
- */
-evm_status_t op_gas(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    // Push current remaining gas to stack
-    uint256_t gas_value = uint256_from_uint64(evm->gas_left);
-
-    if (!evm_stack_push(evm->stack, &gas_value))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * STOP - Halt execution successfully
- * Stack: (no effect)
- * Gas: 0
- */
-evm_status_t op_stop(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    // STOP costs 0 gas
-    if (!evm_use_gas(evm, GAS_ZERO))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    // Set stopped flag
-    evm->stopped = true;
-
-    return EVM_SUCCESS;
-}
-
-/**
- * INVALID - Invalid instruction (always fails)
- * Stack: (no effect)
- * Gas: All remaining gas consumed
- */
 evm_status_t op_invalid(evm_t *evm)
 {
     if (!evm)
@@ -106,27 +31,6 @@ evm_status_t op_invalid(evm_t *evm)
     evm->gas_left = 0;
 
     return EVM_INVALID_OPCODE;
-}
-
-/**
- * JUMPDEST - Mark valid jump destination
- * Stack: (no effect)
- * Gas: 1
- */
-evm_status_t op_jumpdest(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, 1))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    // JUMPDEST is just a marker, does nothing during execution
-    // It's validated during the JUMP/JUMPI operations
-
-    return EVM_SUCCESS;
 }
 
 //==============================================================================
@@ -234,10 +138,10 @@ evm_status_t op_jumpi(evm_t *evm)
 
     // Pop destination and condition from stack
     uint256_t dest_256, cond_256;
-    
+
     if (!evm_stack_pop(evm->stack, &dest_256))
         return EVM_STACK_UNDERFLOW;
-    
+
     if (!evm_stack_pop(evm->stack, &cond_256))
         return EVM_STACK_UNDERFLOW;
 
@@ -286,10 +190,10 @@ evm_status_t op_return(evm_t *evm)
 
     // Pop offset and size from stack
     uint256_t offset_256, size_256;
-    
+
     if (!evm_stack_pop(evm->stack, &offset_256))
         return EVM_STACK_UNDERFLOW;
-    
+
     if (!evm_stack_pop(evm->stack, &size_256))
         return EVM_STACK_UNDERFLOW;
 
@@ -372,10 +276,10 @@ evm_status_t op_revert(evm_t *evm)
 
     // Pop offset and size from stack
     uint256_t offset_256, size_256;
-    
+
     if (!evm_stack_pop(evm->stack, &offset_256))
         return EVM_STACK_UNDERFLOW;
-    
+
     if (!evm_stack_pop(evm->stack, &size_256))
         return EVM_STACK_UNDERFLOW;
 
@@ -446,13 +350,6 @@ evm_status_t op_revert(evm_t *evm)
 // SELFDESTRUCT Opcode
 //==============================================================================
 
-/**
- * SELFDESTRUCT - Destroy current contract and send funds
- * Stack: beneficiary =>
- * 
- * Transfers contract balance to beneficiary and marks contract for deletion.
- * Note: EIP-6780 (Cancun) changes behavior - only deletes if created in same transaction.
- */
 evm_status_t op_selfdestruct(evm_t *evm)
 {
     if (!evm || !evm->stack)
@@ -487,7 +384,6 @@ evm_status_t op_selfdestruct(evm_t *evm)
     if (evm->fork >= FORK_VERKLE)
     {
         // EIP-4762: base cost (5000) + witness gas for self-destruct
-        // constantGas = SelfdestructGasEIP150 = 5000
         gas_cost = 5000;
         bool balance_is_zero = uint256_is_zero(&balance);
         bool same_addr = (memcmp(evm->msg.recipient.bytes, beneficiary_addr.bytes, 20) == 0);

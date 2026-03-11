@@ -1,9 +1,10 @@
 /**
  * EVM Block Information Opcodes
  *
- * Implements opcodes that provide information about the current block:
- * - BLOCKHASH, COINBASE, TIMESTAMP, NUMBER, DIFFICULTY/PREVRANDAO
- * - GASLIMIT, CHAINID, SELFBALANCE, BASEFEE
+ * Simple block opcodes (COINBASE, TIMESTAMP, NUMBER, DIFFICULTY, GASLIMIT,
+ * CHAINID, BASEFEE) are inlined directly into interpreter.c dispatch labels.
+ *
+ * This header declares the remaining opcodes that are still called as functions.
  */
 
 #ifndef ART_EVM_OPCODES_BLOCK_H
@@ -31,84 +32,12 @@ extern "C"
 #define OP_BASEFEE 0x48     // Base fee (EIP-1559)
 
 //==============================================================================
-// Opcode Implementations
+// Opcode Implementations (remaining non-inlined functions)
 //==============================================================================
 
-/**
- * BLOCKHASH - Get hash of one of the 256 most recent blocks
- * Stack: blockNumber => hash (or 0 if out of range)
- * Gas: 20
- */
 evm_status_t op_blockhash(evm_t *evm);
-
-/**
- * COINBASE - Get block beneficiary address
- * Stack: => coinbase
- * Gas: 2
- */
-evm_status_t op_coinbase(evm_t *evm);
-
-/**
- * TIMESTAMP - Get block timestamp
- * Stack: => timestamp
- * Gas: 2
- */
-evm_status_t op_timestamp(evm_t *evm);
-
-/**
- * NUMBER - Get block number
- * Stack: => number
- * Gas: 2
- */
-evm_status_t op_number(evm_t *evm);
-
-/**
- * DIFFICULTY - Get block difficulty (pre-merge) or PREVRANDAO (post-merge)
- * Stack: => difficulty
- * Gas: 2
- */
-evm_status_t op_difficulty(evm_t *evm);
-
-/**
- * GASLIMIT - Get block gas limit
- * Stack: => gas_limit
- * Gas: 2
- */
-evm_status_t op_gaslimit(evm_t *evm);
-
-/**
- * CHAINID - Get chain ID
- * Stack: => chain_id
- * Gas: 2
- */
-evm_status_t op_chainid(evm_t *evm);
-
-/**
- * SELFBALANCE - Get balance of current contract
- * Stack: => balance
- * Gas: 5
- */
 evm_status_t op_selfbalance(evm_t *evm);
-
-/**
- * BASEFEE - Get base fee (EIP-1559)
- * Stack: => base_fee
- * Gas: 2
- */
-evm_status_t op_basefee(evm_t *evm);
-
-/**
- * BLOBHASH - Get versioned hash at index (EIP-4844, Cancun+)
- * Stack: index => hash
- * Gas: 3
- */
 evm_status_t op_blobhash(evm_t *evm);
-
-/**
- * BLOBBASEFEE - Get blob base fee (EIP-7516, Cancun+)
- * Stack: => blob_base_fee
- * Gas: 2
- */
 evm_status_t op_blobbasefee(evm_t *evm);
 
 #ifdef __cplusplus

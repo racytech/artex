@@ -1,5 +1,11 @@
 /**
  * EVM Environmental Information Opcodes Implementation
+ *
+ * Simple environmental opcodes (ADDRESS, ORIGIN, CALLER, CALLVALUE,
+ * CALLDATALOAD, CALLDATASIZE, CODESIZE, GASPRICE, RETURNDATASIZE)
+ * are inlined directly into interpreter.c dispatch labels.
+ *
+ * This file contains the remaining opcodes that are still called as functions.
  */
 
 #include "opcodes/environmental.h"
@@ -27,41 +33,9 @@ static inline bool is_system_contract(const address_t *addr) {
 }
 
 //==============================================================================
-// Address & Value Opcodes
+// BALANCE - Get balance of an account
 //==============================================================================
 
-/**
- * ADDRESS - Get address of currently executing account
- * Stack: => address
- * Gas: 2
- */
-evm_status_t op_address(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    // Convert address to uint256 and push to stack
-    uint256_t addr_value;
-    address_to_uint256(&evm->msg.recipient, &addr_value);
-
-    if (!evm_stack_push(evm->stack, &addr_value))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * BALANCE - Get balance of an account
- * Stack: address => balance
- * Gas: 100 (warm) / 2600 (cold)
- */
 evm_status_t op_balance(evm_t *evm)
 {
     if (!evm)
@@ -116,163 +90,10 @@ evm_status_t op_balance(evm_t *evm)
     return EVM_SUCCESS;
 }
 
-/**
- * ORIGIN - Get transaction origin
- * Stack: => origin
- * Gas: 2
- */
-evm_status_t op_origin(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    // Convert address to uint256 and push to stack
-    uint256_t origin_value;
-    address_to_uint256(&evm->tx.origin, &origin_value);
-
-    if (!evm_stack_push(evm->stack, &origin_value))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * CALLER - Get caller address
- * Stack: => caller
- * Gas: 2
- */
-evm_status_t op_caller(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    // Convert address to uint256 and push to stack
-    uint256_t caller_value;
-    address_to_uint256(&evm->msg.caller, &caller_value);
-
-    if (!evm_stack_push(evm->stack, &caller_value))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * CALLVALUE - Get deposited value
- * Stack: => value
- * Gas: 2
- */
-evm_status_t op_callvalue(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    if (!evm_stack_push(evm->stack, &evm->msg.value))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
 //==============================================================================
-// Calldata Operations
+// CALLDATACOPY - Copy calldata to memory
 //==============================================================================
 
-/**
- * CALLDATALOAD - Load word from calldata
- * Stack: i => data[i:i+32]
- * Gas: 3
- */
-evm_status_t op_calldataload(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_VERY_LOW))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    // Pop offset from stack
-    uint256_t offset_256;
-    if (!evm_stack_pop(evm->stack, &offset_256))
-    {
-        return EVM_STACK_UNDERFLOW;
-    }
-
-    // Convert to uint64 (if offset is too large, we'll just get zeros)
-    uint64_t offset = uint256_to_uint64(&offset_256);
-
-    // Load 32 bytes from calldata (big-endian)
-    uint8_t data_bytes[32] = {0};
-    
-    if (offset < evm->msg.input_size)
-    {
-        size_t available = evm->msg.input_size - offset;
-        size_t to_copy = available < 32 ? available : 32;
-        memcpy(data_bytes, evm->msg.input_data + offset, to_copy);
-    }
-
-    // Convert bytes to uint256 (handles big-endian conversion)
-    uint256_t data = uint256_from_bytes(data_bytes, 32);
-
-    if (!evm_stack_push(evm->stack, &data))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * CALLDATASIZE - Get size of calldata
- * Stack: => size
- * Gas: 2
- */
-evm_status_t op_calldatasize(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    uint256_t size = uint256_from_uint64(evm->msg.input_size);
-
-    if (!evm_stack_push(evm->stack, &size))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * CALLDATACOPY - Copy calldata to memory
- * Stack: destOffset offset size =>
- * Gas: 3 + 3 * (size in words) + memory_expansion_cost
- */
 evm_status_t op_calldatacopy(evm_t *evm)
 {
     if (!evm)
@@ -280,7 +101,7 @@ evm_status_t op_calldatacopy(evm_t *evm)
 
     // Pop arguments from stack
     uint256_t dest_offset_256, offset_256, size_256;
-    
+
     if (!evm_stack_pop(evm->stack, &dest_offset_256))
         return EVM_STACK_UNDERFLOW;
     if (!evm_stack_pop(evm->stack, &offset_256))
@@ -341,39 +162,9 @@ evm_status_t op_calldatacopy(evm_t *evm)
 }
 
 //==============================================================================
-// Code Operations
+// CODECOPY - Copy code to memory
 //==============================================================================
 
-/**
- * CODESIZE - Get size of code running in current environment
- * Stack: => size
- * Gas: 2
- */
-evm_status_t op_codesize(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    uint256_t size = uint256_from_uint64(evm->code_size);
-
-    if (!evm_stack_push(evm->stack, &size))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * CODECOPY - Copy code to memory
- * Stack: destOffset offset size =>
- * Gas: 3 + 3 * (size in words) + memory_expansion_cost
- */
 evm_status_t op_codecopy(evm_t *evm)
 {
     if (!evm)
@@ -381,7 +172,7 @@ evm_status_t op_codecopy(evm_t *evm)
 
     // Pop arguments from stack
     uint256_t dest_offset_256, offset_256, size_256;
-    
+
     if (!evm_stack_pop(evm->stack, &dest_offset_256))
         return EVM_STACK_UNDERFLOW;
     if (!evm_stack_pop(evm->stack, &offset_256))
@@ -474,67 +265,10 @@ evm_status_t op_codecopy(evm_t *evm)
     return EVM_SUCCESS;
 }
 
-/**
- * GASPRICE - Get price of gas in current environment
- * Stack: => gas_price
- * Gas: 2
- */
-evm_status_t op_gasprice(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    if (!evm_stack_push(evm->stack, &evm->tx.gas_price))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
 //==============================================================================
-// Return Data Operations
+// RETURNDATACOPY - Copy output data from previous call to memory
 //==============================================================================
 
-/**
- * RETURNDATASIZE - Get size of output data from previous call
- * Stack: => size
- * Gas: 2
- */
-evm_status_t op_returndatasize(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    // EIP-211: RETURNDATASIZE introduced in Byzantium
-    if (evm->fork < FORK_BYZANTIUM)
-        return EVM_INVALID_OPCODE;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    uint256_t size = uint256_from_uint64(evm->return_data_size);
-
-    if (!evm_stack_push(evm->stack, &size))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * RETURNDATACOPY - Copy output data from previous call to memory
- * Stack: destOffset offset size =>
- * Gas: 3 + 3 * (size in words) + memory_expansion_cost
- */
 evm_status_t op_returndatacopy(evm_t *evm)
 {
     if (!evm)
@@ -546,7 +280,7 @@ evm_status_t op_returndatacopy(evm_t *evm)
 
     // Pop arguments from stack
     uint256_t dest_offset_256, offset_256, size_256;
-    
+
     if (!evm_stack_pop(evm->stack, &dest_offset_256))
         return EVM_STACK_UNDERFLOW;
     if (!evm_stack_pop(evm->stack, &offset_256))
@@ -605,13 +339,9 @@ evm_status_t op_returndatacopy(evm_t *evm)
 }
 
 //==============================================================================
-// External Code Opcodes (Stubs)
+// External Code Opcodes
 //==============================================================================
 
-/**
- * EXTCODESIZE - Get size of an account's code
- * Stack: address => size
- */
 evm_status_t op_extcodesize(evm_t *evm)
 {
     if (!evm || !evm->stack)
@@ -673,12 +403,6 @@ evm_status_t op_extcodesize(evm_t *evm)
     return EVM_SUCCESS;
 }
 
-/**
- * EXTCODECOPY - Copy an account's code to memory (stub)
- * Stack: address destOffset offset size =>
- * 
- * TODO: Requires StateDB code storage API
- */
 evm_status_t op_extcodecopy(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
@@ -816,13 +540,6 @@ evm_status_t op_extcodecopy(evm_t *evm)
     return EVM_SUCCESS;
 }
 
-/**
- * EXTCODEHASH - Get hash of an account's code
- * Stack: address => hash
- * 
- * Returns keccak256 hash of code, or 0 if account doesn't exist or is empty.
- * Empty account returns empty hash (0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470)
- */
 evm_status_t op_extcodehash(evm_t *evm)
 {
     if (!evm || !evm->stack)
@@ -889,7 +606,7 @@ evm_status_t op_extcodehash(evm_t *evm)
         return EVM_STACK_OVERFLOW;
     }
 
-    LOG_EVM_DEBUG("EXTCODEHASH: address=0x...%02x%02x", 
+    LOG_EVM_DEBUG("EXTCODEHASH: address=0x...%02x%02x",
                   addr.bytes[18], addr.bytes[19]);
 
     return EVM_SUCCESS;

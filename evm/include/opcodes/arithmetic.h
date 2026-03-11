@@ -1,11 +1,8 @@
 /**
  * EVM Arithmetic Opcodes
  *
- * Implements arithmetic operations on the EVM stack:
- * - ADD, MUL, SUB, DIV, SDIV, MOD, SMOD
- * - ADDMOD, MULMOD
- * - EXP
- * - SIGNEXTEND
+ * Most arithmetic opcodes are inlined directly into interpreter.c dispatch labels.
+ * Only op_exp remains as a function call (complex gas calculation).
  */
 
 #ifndef ART_EVM_OPCODES_ARITHMETIC_H
@@ -39,81 +36,11 @@ extern "C"
 //==============================================================================
 
 /**
- * ADD - Addition
- * Stack: a b => a + b
- * Gas: 3
- */
-evm_status_t op_add(evm_t *evm);
-
-/**
- * MUL - Multiplication
- * Stack: a b => a * b
- * Gas: 5
- */
-evm_status_t op_mul(evm_t *evm);
-
-/**
- * SUB - Subtraction
- * Stack: a b => a - b
- * Gas: 3
- */
-evm_status_t op_sub(evm_t *evm);
-
-/**
- * DIV - Unsigned division
- * Stack: a b => a / b (or 0 if b == 0)
- * Gas: 5
- */
-evm_status_t op_div(evm_t *evm);
-
-/**
- * SDIV - Signed division
- * Stack: a b => a / b (signed, or 0 if b == 0)
- * Gas: 5
- */
-evm_status_t op_sdiv(evm_t *evm);
-
-/**
- * MOD - Unsigned modulo
- * Stack: a b => a % b (or 0 if b == 0)
- * Gas: 5
- */
-evm_status_t op_mod(evm_t *evm);
-
-/**
- * SMOD - Signed modulo
- * Stack: a b => a % b (signed, or 0 if b == 0)
- * Gas: 5
- */
-evm_status_t op_smod(evm_t *evm);
-
-/**
- * ADDMOD - Modular addition
- * Stack: a b N => (a + b) % N (or 0 if N == 0)
- * Gas: 8
- */
-evm_status_t op_addmod(evm_t *evm);
-
-/**
- * MULMOD - Modular multiplication
- * Stack: a b N => (a * b) % N (or 0 if N == 0)
- * Gas: 8
- */
-evm_status_t op_mulmod(evm_t *evm);
-
-/**
  * EXP - Exponentiation
  * Stack: a b => a ^ b
  * Gas: 10 + 50 * (byte_length_of_exponent)
  */
 evm_status_t op_exp(evm_t *evm);
-
-/**
- * SIGNEXTEND - Sign extension
- * Stack: b x => sign_extended_x
- * Gas: 5
- */
-evm_status_t op_signextend(evm_t *evm);
 
 #ifdef __cplusplus
 }
