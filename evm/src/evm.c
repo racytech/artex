@@ -35,6 +35,7 @@ typedef struct {
     evm_status_t status;
     uint8_t *return_data;
     size_t return_data_size;
+    const uint8_t *jumpdest_bitmap;
 } evm_context_t;
 
 /**
@@ -54,7 +55,8 @@ static evm_context_t evm_save_context(evm_t *evm)
         .stopped = evm->stopped,
         .status = evm->status,
         .return_data = evm->return_data,
-        .return_data_size = evm->return_data_size
+        .return_data_size = evm->return_data_size,
+        .jumpdest_bitmap = evm->jumpdest_bitmap
     };
     return ctx;
 }
@@ -76,6 +78,7 @@ static void evm_restore_context(evm_t *evm, const evm_context_t *ctx)
     evm->status = ctx->status;
     evm->return_data = ctx->return_data;
     evm->return_data_size = ctx->return_data_size;
+    evm->jumpdest_bitmap = ctx->jumpdest_bitmap;
 }
 
 //==============================================================================

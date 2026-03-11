@@ -193,6 +193,9 @@ struct evm_t
     evm_status_t status; // Execution status
 
     // Access tracking (EIP-2929) is handled by evm_state internally
+
+    // Precomputed JUMPDEST bitmap (valid during evm_interpret, NULL otherwise)
+    const uint8_t *jumpdest_bitmap;
 };
 
 //==============================================================================

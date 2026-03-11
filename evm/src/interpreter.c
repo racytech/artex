@@ -175,6 +175,10 @@ evm_result_t evm_interpret(evm_t *evm)
     bool verkle_chunk_mode = (evm->fork >= FORK_VERKLE && !is_deployment && !is_system_call);
     address_t code_addr = evm->msg.code_addr;
 
+    // Build JUMPDEST bitmap for O(1) jump validation
+    uint8_t *jumpdest_bitmap = build_jumpdest_bitmap(evm->code, evm->code_size);
+    evm->jumpdest_bitmap = jumpdest_bitmap;
+
     // Computed goto dispatch table (GCC/Clang extension)
     static const void *dispatch_table[256] = {
         // 0x00-0x0f: Stop and Arithmetic
@@ -739,8 +743,15 @@ op_byte:
         if (s[t].high != 0 || s[t].low >= 32)
             s[t-1] = UINT256_ZERO;
         else {
-            uint64_t idx = (uint64_t)s[t].low;
-            uint8_t b = uint256_byte(&s[t-1], idx);
+            /* EVM BYTE: index 0 = MSB, index 31 = LSB.
+             * Extract directly from high/low without uint256_to_words. */
+            unsigned int idx = (unsigned int)s[t].low;
+            unsigned int bit_offset = (31 - idx) * 8;
+            uint8_t b;
+            if (bit_offset < 128)
+                b = (uint8_t)(s[t-1].low >> bit_offset);
+            else
+                b = (uint8_t)(s[t-1].high >> (bit_offset - 128));
             s[t-1] = (uint256_t){ (uint128_t)b, 0 };
         }
         evm->stack->size = t;
@@ -1316,6 +1327,9 @@ error:
 done:
     // Emit any remaining pending trace (e.g. when pc >= code_size)
     EVM_TRACE_EXIT(evm, NULL);
+    // Free JUMPDEST bitmap
+    free(jumpdest_bitmap);
+    evm->jumpdest_bitmap = NULL;
     // Create result with output data
     return evm_result_create(status, evm->gas_left, evm->gas_refund, evm->return_data, evm->return_data_size);
 }

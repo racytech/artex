@@ -316,46 +316,8 @@ bool evm_memory_is_empty(const evm_memory_t *mem)
 // Gas Cost Calculation
 //==============================================================================
 
-uint64_t evm_memory_expansion_cost(size_t current_size, size_t new_size)
-{
-    if (new_size <= current_size)
-    {
-        return 0; // No expansion needed
-    }
-
-    // Convert to words (round up)
-    size_t current_words = (current_size + EVM_MEMORY_WORD_SIZE - 1) / EVM_MEMORY_WORD_SIZE;
-    size_t new_words = (new_size + EVM_MEMORY_WORD_SIZE - 1) / EVM_MEMORY_WORD_SIZE;
-
-    // Calculate cost using Ethereum formula:
-    // memory_cost = (memory_size_word^2 / 512) + (3 * memory_size_word)
-    
-    uint64_t current_linear = 3 * current_words;
-    uint64_t current_quadratic = (current_words * current_words) / 512;
-    uint64_t current_cost = current_linear + current_quadratic;
-    
-    uint64_t new_linear = 3 * new_words;
-    uint64_t new_quadratic = (new_words * new_words) / 512;
-    uint64_t new_cost = new_linear + new_quadratic;
-
-    return new_cost - current_cost;
-}
-
-uint64_t evm_memory_access_cost(const evm_memory_t *mem, uint64_t offset, size_t size)
-{
-    if (!mem || size == 0)
-    {
-        return 0;
-    }
-
-    if (offset > UINT64_MAX - size)
-        return UINT64_MAX;
-
-    size_t current_size = mem->size;
-    size_t new_size = round_up_to_word(offset + size);
-
-    return evm_memory_expansion_cost(current_size, new_size);
-}
+// evm_memory_expansion_cost and evm_memory_access_cost are now
+// static inline in evm_memory.h for interpreter hot-path inlining.
 
 //==============================================================================
 // Utility Functions

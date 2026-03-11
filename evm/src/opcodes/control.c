@@ -38,45 +38,39 @@ static evm_status_t op_invalid(evm_t *evm)
 //==============================================================================
 
 /**
- * Helper function to validate jump destination
+ * Build a JUMPDEST bitmap for the given bytecode (one bit per byte offset).
+ * Bits set to 1 indicate valid JUMPDEST positions (not inside PUSH data).
+ * Caller must free() the returned bitmap.
  */
-static bool is_valid_jump_dest(const evm_t *evm, uint64_t dest)
+static uint8_t *build_jumpdest_bitmap(const uint8_t *code, size_t code_size)
 {
-    if (!evm || !evm->code)
-        return false;
+    size_t bitmap_bytes = (code_size + 7) / 8;
+    uint8_t *bitmap = (uint8_t *)calloc(bitmap_bytes, 1);
+    if (!bitmap) return NULL;
 
-    // Destination must be within code bounds
-    if (dest >= evm->code_size)
-        return false;
-
-    // Destination must point to a JUMPDEST instruction
-    if (evm->code[dest] != OP_JUMPDEST)
-        return false;
-
-    // Additional check: ensure we're not jumping into the middle of a PUSH instruction
-    // We need to scan from the beginning to track PUSH data bytes
     uint64_t pc = 0;
-    while (pc < evm->code_size)
-    {
-        uint8_t opcode = evm->code[pc];
-
-        // If we reached our destination and it's valid, return true
-        if (pc == dest)
-            return true;
-
-        // If this is a PUSH instruction, skip the immediate bytes
-        if (opcode >= 0x60 && opcode <= 0x7f)  // PUSH1 to PUSH32
-        {
-            uint8_t push_size = opcode - 0x60 + 1;
-            pc += 1 + push_size;
+    while (pc < code_size) {
+        uint8_t opcode = code[pc];
+        if (opcode == OP_JUMPDEST) {
+            bitmap[pc >> 3] |= (1u << (pc & 7));
         }
-        else
-        {
-            pc += 1;
+        if (opcode >= 0x60 && opcode <= 0x7f) {
+            pc += 1 + (opcode - 0x60 + 1);  // skip PUSH data
+        } else {
+            pc++;
         }
     }
+    return bitmap;
+}
 
-    return false;
+/**
+ * O(1) jump destination validation using precomputed bitmap.
+ */
+static inline bool is_valid_jump_dest_bitmap(const uint8_t *bitmap,
+                                              size_t code_size, uint64_t dest)
+{
+    if (dest >= code_size) return false;
+    return (bitmap[dest >> 3] >> (dest & 7)) & 1;
 }
 
 /**
@@ -109,15 +103,13 @@ static evm_status_t op_jump(evm_t *evm)
 
     uint64_t dest = uint256_to_uint64(&dest_256);
 
-    // Validate jump destination
-    if (!is_valid_jump_dest(evm, dest))
+    // Validate jump destination using precomputed bitmap (O(1))
+    if (!is_valid_jump_dest_bitmap(evm->jumpdest_bitmap, evm->code_size, dest))
     {
         return EVM_INVALID_JUMP;
     }
 
-    // Set PC to destination
     evm->pc = dest;
-
     return EVM_SUCCESS;
 }
 
@@ -132,11 +124,8 @@ static evm_status_t op_jumpi(evm_t *evm)
         return EVM_INTERNAL_ERROR;
 
     if (!evm_use_gas(evm, GAS_HIGH))
-    {
         return EVM_OUT_OF_GAS;
-    }
 
-    // Pop destination and condition from stack
     uint256_t dest_256, cond_256;
 
     if (!evm_stack_pop(evm->stack, &dest_256))
@@ -145,32 +134,20 @@ static evm_status_t op_jumpi(evm_t *evm)
     if (!evm_stack_pop(evm->stack, &cond_256))
         return EVM_STACK_UNDERFLOW;
 
-    // Check if condition is non-zero (true)
-    if (uint256_is_zero(&cond_256))
-    {
-        // Condition is false, don't jump - increment PC
+    if (uint256_is_zero(&cond_256)) {
         evm->pc++;
         return EVM_SUCCESS;
     }
 
-    // Condition is true, perform jump
-    // Destination must fit in code size — reject if high bits set
     if (dest_256.high != 0 || (uint64_t)(dest_256.low >> 64) != 0)
-    {
         return EVM_INVALID_JUMP;
-    }
 
     uint64_t dest = uint256_to_uint64(&dest_256);
 
-    // Validate jump destination
-    if (!is_valid_jump_dest(evm, dest))
-    {
+    if (!is_valid_jump_dest_bitmap(evm->jumpdest_bitmap, evm->code_size, dest))
         return EVM_INVALID_JUMP;
-    }
 
-    // Set PC to destination
     evm->pc = dest;
-
     return EVM_SUCCESS;
 }
 
@@ -236,23 +213,17 @@ static evm_status_t op_return(evm_t *evm)
         return EVM_INVALID_MEMORY_ACCESS;
     }
 
-    // Allocate return data buffer
+    // Allocate return data buffer and bulk-copy from memory
     evm->return_data = malloc(size);
     if (!evm->return_data)
-    {
         return EVM_INTERNAL_ERROR;
-    }
 
-    // Copy data from memory to return buffer
-    for (uint64_t i = 0; i < size; i++)
-    {
-        if (!evm_memory_read_byte(evm->memory, offset + i, &evm->return_data[i]))
-        {
-            free(evm->return_data);
-            evm->return_data = NULL;
-            return EVM_INVALID_MEMORY_ACCESS;
-        }
+    if (!evm_memory_expand(evm->memory, offset, size)) {
+        free(evm->return_data);
+        evm->return_data = NULL;
+        return EVM_INVALID_MEMORY_ACCESS;
     }
+    memcpy(evm->return_data, evm->memory->data + offset, size);
 
     evm->return_data_size = size;
     evm->stopped = true;
@@ -322,23 +293,17 @@ static evm_status_t op_revert(evm_t *evm)
         return EVM_INVALID_MEMORY_ACCESS;
     }
 
-    // Allocate return data buffer for revert data
+    // Allocate revert data buffer and bulk-copy from memory
     evm->return_data = malloc(size);
     if (!evm->return_data)
-    {
         return EVM_INTERNAL_ERROR;
-    }
 
-    // Copy data from memory to return buffer
-    for (uint64_t i = 0; i < size; i++)
-    {
-        if (!evm_memory_read_byte(evm->memory, offset + i, &evm->return_data[i]))
-        {
-            free(evm->return_data);
-            evm->return_data = NULL;
-            return EVM_INVALID_MEMORY_ACCESS;
-        }
+    if (!evm_memory_expand(evm->memory, offset, size)) {
+        free(evm->return_data);
+        evm->return_data = NULL;
+        return EVM_INVALID_MEMORY_ACCESS;
     }
+    memcpy(evm->return_data, evm->memory->data + offset, size);
 
     evm->return_data_size = size;
     evm->stopped = true;
