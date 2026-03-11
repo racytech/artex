@@ -156,6 +156,10 @@ bool forkchoice_state_from_json(const cJSON *json, forkchoice_state_t *out);
 /** Parse PayloadAttributes (defaults to V3). */
 bool payload_attributes_from_json(const cJSON *json, payload_attributes_t *out);
 
+/** Deep copy an execution payload (all dynamic fields are cloned). */
+void execution_payload_deep_copy(execution_payload_t *dst,
+                                 const execution_payload_t *src);
+
 /** Free dynamically allocated fields in execution_payload_t. */
 void execution_payload_free(execution_payload_t *payload);
 

@@ -13,7 +13,10 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <pthread.h>
+#include <time.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -26,7 +29,31 @@ struct engine_http {
     volatile int            stop_flag;
     engine_http_handler_fn  handler;
     void                   *userdata;
+
+    /* Worker thread for non-blocking request dispatch */
+    pthread_t       worker;
+    pthread_mutex_t mtx;
+    pthread_cond_t  cond_req;       /* "request available" */
+    pthread_cond_t  cond_done;      /* "response ready" */
+    char           *req_body;
+    size_t          req_len;
+    const char     *req_token;
+    size_t          req_token_len;
+    char           *resp_body;
+    size_t          resp_len;
+    int             resp_status;
+    bool            has_request;
+    bool            has_response;
+    bool            worker_running;
 };
+
+/* Forward declarations */
+static void worker_stop(engine_http_t *http);
+static bool dispatch_to_worker(engine_http_t *http,
+                                char *body, size_t body_len,
+                                const char *token, size_t token_len,
+                                int *out_status, const char **out_body,
+                                size_t *out_body_len);
 
 /* =========================================================================
  * Lifecycle
@@ -99,6 +126,7 @@ void engine_http_stop(engine_http_t *http) {
 
 void engine_http_destroy(engine_http_t *http) {
     if (!http) return;
+    worker_stop(http);
     if (http->listen_fd >= 0) close(http->listen_fd);
     free(http);
 }
@@ -131,6 +159,22 @@ static bool starts_with_ci(const char *line, const char *prefix) {
     return true;
 }
 
+/* Write all bytes to fd, retrying on short writes. Returns false on error. */
+static bool write_all(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t w = write(fd, p, remaining);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return false; /* EPIPE, ECONNRESET, etc. */
+        }
+        p += w;
+        remaining -= (size_t)w;
+    }
+    return true;
+}
+
 /* Send HTTP response */
 static void send_response(int fd, int status, const char *body, size_t body_len) {
     const char *reason;
@@ -141,6 +185,7 @@ static void send_response(int fd, int status, const char *body, size_t body_len)
         case 403: reason = "Forbidden"; break;
         case 405: reason = "Method Not Allowed"; break;
         case 500: reason = "Internal Server Error"; break;
+        case 503: reason = "Service Unavailable"; break;
         default:  reason = "Unknown"; break;
     }
 
@@ -153,9 +198,9 @@ static void send_response(int fd, int status, const char *body, size_t body_len)
         "\r\n",
         status, reason, body_len);
 
-    write(fd, header, (size_t)hlen);
+    if (!write_all(fd, header, (size_t)hlen)) return;
     if (body && body_len > 0)
-        write(fd, body, body_len);
+        write_all(fd, body, body_len);
 }
 
 /* =========================================================================
@@ -257,8 +302,23 @@ static void handle_connection(engine_http_t *http, int client_fd) {
         body[content_length] = '\0';
     }
 
-    /* Dispatch to handler */
-    if (http->handler) {
+    /* Dispatch to worker thread */
+    if (http->handler && http->worker_running) {
+        int status;
+        const char *resp_body;
+        size_t resp_len;
+
+        if (dispatch_to_worker(http, body, content_length,
+                                token_len > 0 ? bearer_token : NULL, token_len,
+                                &status, &resp_body, &resp_len)) {
+            send_response(client_fd, status, resp_body, resp_len);
+        } else {
+            /* Worker timed out */
+            send_response(client_fd, 503,
+                          "{\"error\":\"execution timeout\"}", 28);
+        }
+    } else if (http->handler) {
+        /* Fallback: direct call if worker not running */
         engine_http_request_t req = {
             .body = body ? body : "",
             .body_len = content_length,
@@ -285,6 +345,121 @@ done:
 }
 
 /* =========================================================================
+ * Worker Thread
+ * ========================================================================= */
+
+static void *worker_thread(void *arg) {
+    engine_http_t *http = (engine_http_t *)arg;
+
+    pthread_mutex_lock(&http->mtx);
+    while (!http->stop_flag) {
+        /* Wait for a request */
+        while (!http->has_request && !http->stop_flag)
+            pthread_cond_wait(&http->cond_req, &http->mtx);
+
+        if (http->stop_flag) break;
+
+        /* Build request/response structs and call handler */
+        engine_http_request_t req = {
+            .body       = http->req_body ? http->req_body : "",
+            .body_len   = http->req_len,
+            .bearer_token = http->req_token,
+            .token_len  = http->req_token_len,
+        };
+        engine_http_response_t resp = {
+            .status_code = 200,
+            .body = NULL,
+            .body_len = 0,
+        };
+
+        /* Release lock during handler execution so stop can be signalled */
+        pthread_mutex_unlock(&http->mtx);
+
+        if (http->handler)
+            http->handler(&req, &resp, http->userdata);
+
+        pthread_mutex_lock(&http->mtx);
+
+        /* Post response */
+        http->resp_body   = (char *)resp.body;
+        http->resp_len    = resp.body_len;
+        http->resp_status = resp.status_code;
+        http->has_request  = false;
+        http->has_response = true;
+        pthread_cond_signal(&http->cond_done);
+    }
+    pthread_mutex_unlock(&http->mtx);
+    return NULL;
+}
+
+static bool worker_start(engine_http_t *http) {
+    pthread_mutex_init(&http->mtx, NULL);
+    pthread_cond_init(&http->cond_req, NULL);
+    pthread_cond_init(&http->cond_done, NULL);
+    http->has_request  = false;
+    http->has_response = false;
+
+    if (pthread_create(&http->worker, NULL, worker_thread, http) != 0)
+        return false;
+    http->worker_running = true;
+    return true;
+}
+
+static void worker_stop(engine_http_t *http) {
+    if (!http->worker_running) return;
+
+    pthread_mutex_lock(&http->mtx);
+    http->stop_flag = 1;
+    pthread_cond_signal(&http->cond_req);
+    pthread_mutex_unlock(&http->mtx);
+
+    pthread_join(http->worker, NULL);
+    http->worker_running = false;
+
+    pthread_mutex_destroy(&http->mtx);
+    pthread_cond_destroy(&http->cond_req);
+    pthread_cond_destroy(&http->cond_done);
+}
+
+/* Dispatch request to worker thread with timeout.
+ * Returns true if worker responded in time, false on timeout/error. */
+static bool dispatch_to_worker(engine_http_t *http,
+                                char *body, size_t body_len,
+                                const char *token, size_t token_len,
+                                int *out_status, const char **out_body,
+                                size_t *out_body_len) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 30; /* 30-second timeout */
+
+    pthread_mutex_lock(&http->mtx);
+
+    http->req_body      = body;
+    http->req_len       = body_len;
+    http->req_token     = token;
+    http->req_token_len = token_len;
+    http->has_request   = true;
+    http->has_response  = false;
+    pthread_cond_signal(&http->cond_req);
+
+    /* Wait for response or timeout */
+    while (!http->has_response && !http->stop_flag) {
+        int rc = pthread_cond_timedwait(&http->cond_done, &http->mtx, &deadline);
+        if (rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&http->mtx);
+            return false;
+        }
+    }
+
+    *out_status   = http->resp_status;
+    *out_body     = http->resp_body;
+    *out_body_len = http->resp_len;
+
+    pthread_mutex_unlock(&http->mtx);
+    return true;
+}
+
+/* =========================================================================
  * Accept Loop
  * ========================================================================= */
 
@@ -293,6 +468,12 @@ int engine_http_run(engine_http_t *http) {
 
     /* Ignore SIGPIPE so broken client connections don't kill us */
     signal(SIGPIPE, SIG_IGN);
+
+    /* Start worker thread */
+    if (!worker_start(http)) {
+        fprintf(stderr, "engine_http: failed to start worker thread\n");
+        return -1;
+    }
 
     while (!http->stop_flag) {
         struct sockaddr_in client_addr;
@@ -304,11 +485,18 @@ int engine_http_run(engine_http_t *http) {
         if (client_fd < 0) {
             if (http->stop_flag) break;
             if (errno == EINTR) continue;
+            worker_stop(http);
             return -1;
         }
+
+        /* Set socket timeouts to prevent zombie connections */
+        struct timeval tv = { .tv_sec = 30 };
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
         handle_connection(http, client_fd);
     }
 
+    worker_stop(http);
     return 0;
 }

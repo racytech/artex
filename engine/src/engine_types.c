@@ -421,6 +421,52 @@ cJSON *execution_payload_to_json(const execution_payload_t *payload) {
     return execution_payload_to_json_v(payload, ENGINE_V4);
 }
 
+void execution_payload_deep_copy(execution_payload_t *dst,
+                                 const execution_payload_t *src) {
+    if (!dst || !src) return;
+
+    /* Copy all fixed fields */
+    *dst = *src;
+
+    /* Deep copy transactions */
+    dst->transactions = NULL;
+    dst->tx_lengths = NULL;
+    if (src->tx_count > 0) {
+        dst->transactions = calloc(src->tx_count, sizeof(uint8_t *));
+        dst->tx_lengths = calloc(src->tx_count, sizeof(size_t));
+        for (size_t i = 0; i < src->tx_count; i++) {
+            dst->tx_lengths[i] = src->tx_lengths[i];
+            if (src->tx_lengths[i] > 0) {
+                dst->transactions[i] = malloc(src->tx_lengths[i]);
+                memcpy(dst->transactions[i], src->transactions[i], src->tx_lengths[i]);
+            }
+        }
+    }
+
+    /* Deep copy withdrawals */
+    dst->withdrawals = NULL;
+    if (src->withdrawal_count > 0) {
+        dst->withdrawals = calloc(src->withdrawal_count, sizeof(engine_withdrawal_t));
+        memcpy(dst->withdrawals, src->withdrawals,
+               src->withdrawal_count * sizeof(engine_withdrawal_t));
+    }
+
+    /* Deep copy requests */
+    dst->requests = NULL;
+    dst->request_lengths = NULL;
+    if (src->request_count > 0) {
+        dst->requests = calloc(src->request_count, sizeof(uint8_t *));
+        dst->request_lengths = calloc(src->request_count, sizeof(size_t));
+        for (size_t i = 0; i < src->request_count; i++) {
+            dst->request_lengths[i] = src->request_lengths[i];
+            if (src->request_lengths[i] > 0) {
+                dst->requests[i] = malloc(src->request_lengths[i]);
+                memcpy(dst->requests[i], src->requests[i], src->request_lengths[i]);
+            }
+        }
+    }
+}
+
 void execution_payload_free(execution_payload_t *payload) {
     if (!payload) return;
     for (size_t i = 0; i < payload->tx_count; i++)

@@ -197,33 +197,67 @@ static const char *find_dot(const char *s, const char *end) {
     return NULL;
 }
 
-/* Simple JSON number extraction: find "key":value and parse integer */
-static bool json_get_int64(const char *json, size_t json_len,
-                           const char *key, int64_t *out) {
-    /* Build search pattern: "key": */
-    char pattern[64];
-    int plen = snprintf(pattern, sizeof(pattern), "\"%s\":", key);
-    if (plen < 0 || (size_t)plen >= sizeof(pattern)) return false;
+/*
+ * C99-portable JSON key finder.
+ * Scans for "key" at the top level, skipping over nested strings.
+ * Returns pointer to the character after the colon, or NULL.
+ */
+static const char *json_find_key(const char *json, size_t json_len,
+                                  const char *key) {
+    const char *end = json + json_len;
+    size_t key_len = strlen(key);
+    const char *p = json;
 
-    const char *p = memmem(json, json_len, pattern, (size_t)plen);
-    if (!p) return false;
+    while (p < end) {
+        if (*p == '"') {
+            /* Start of a string — check if it matches our key */
+            p++;
+            const char *str_start = p;
+            /* Scan to end of string, handling escapes */
+            while (p < end && *p != '"') {
+                if (*p == '\\' && p + 1 < end) p++; /* skip escaped char */
+                p++;
+            }
+            size_t str_len = (size_t)(p - str_start);
+            if (p < end) p++; /* skip closing quote */
 
-    p += plen;
-    /* Skip whitespace */
-    while (p < json + json_len && (*p == ' ' || *p == '\t')) p++;
-
-    char *endp;
-    *out = strtoll(p, &endp, 10);
-    return endp != p;
+            /* Check if this string matches the key and is followed by ':' */
+            if (str_len == key_len && memcmp(str_start, key, key_len) == 0) {
+                /* Skip whitespace after closing quote */
+                while (p < end && (*p == ' ' || *p == '\t')) p++;
+                if (p < end && *p == ':') {
+                    p++;
+                    while (p < end && (*p == ' ' || *p == '\t')) p++;
+                    return p;
+                }
+            }
+        } else {
+            p++;
+        }
+    }
+    return NULL;
 }
 
-/* Simple JSON string match: check if "key":"expected_value" exists */
+/* Extract integer value for "key" from JSON. */
+static bool json_get_int64(const char *json, size_t json_len,
+                           const char *key, int64_t *out) {
+    const char *val = json_find_key(json, json_len, key);
+    if (!val) return false;
+    char *endp;
+    *out = strtoll(val, &endp, 10);
+    return endp != val;
+}
+
+/* Check if "key" has string value "expected" in JSON. */
 static bool json_match_string(const char *json, size_t json_len,
                               const char *key, const char *expected) {
-    char pattern[128];
-    int plen = snprintf(pattern, sizeof(pattern), "\"%s\":\"%s\"", key, expected);
-    if (plen < 0 || (size_t)plen >= sizeof(pattern)) return false;
-    return memmem(json, json_len, pattern, (size_t)plen) != NULL;
+    const char *val = json_find_key(json, json_len, key);
+    if (!val || *val != '"') return false;
+    val++; /* skip opening quote */
+    size_t exp_len = strlen(expected);
+    const char *end = json + json_len;
+    if (val + exp_len >= end) return false;
+    return memcmp(val, expected, exp_len) == 0 && val[exp_len] == '"';
 }
 
 bool engine_jwt_validate(const engine_jwt_t *jwt, const char *token,
@@ -283,7 +317,7 @@ bool engine_jwt_validate(const engine_jwt_t *jwt, const char *token,
     }
 
     /* 2. Decode header and check alg */
-    uint8_t hdr_json[256];
+    uint8_t hdr_json[512];
     int hdr_len = base64url_decode(hdr_json, sizeof(hdr_json) - 1,
                                    hdr_b64, hdr_b64_len);
     if (hdr_len < 0) {
@@ -299,7 +333,7 @@ bool engine_jwt_validate(const engine_jwt_t *jwt, const char *token,
     }
 
     /* 3. Decode payload and check iat */
-    uint8_t pay_json[512];
+    uint8_t pay_json[1024];
     int pay_len = base64url_decode(pay_json, sizeof(pay_json) - 1,
                                    pay_b64, pay_b64_len);
     if (pay_len < 0) {

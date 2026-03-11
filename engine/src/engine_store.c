@@ -9,6 +9,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 /* =========================================================================
  * Lifecycle
@@ -51,6 +52,34 @@ static int find_free_slot(const engine_store_t *store) {
     return -1;
 }
 
+/* Check if a hash matches any of the protected fork choice hashes. */
+static bool is_protected(const engine_store_t *store, const uint8_t hash[32]) {
+    if (!store->has_head) return false;
+    return memcmp(hash, store->head_hash, 32) == 0 ||
+           memcmp(hash, store->safe_hash, 32) == 0 ||
+           memcmp(hash, store->finalized_hash, 32) == 0;
+}
+
+/* Evict the oldest non-protected block. Returns freed slot index or -1. */
+static int evict_oldest(engine_store_t *store) {
+    int best = -1;
+    uint64_t best_number = UINT64_MAX;
+    for (int i = 0; i < ENGINE_STORE_MAX_BLOCKS; i++) {
+        if (!store->blocks[i].occupied) continue;
+        if (is_protected(store, store->blocks[i].payload.block_hash)) continue;
+        if (store->blocks[i].payload.block_number < best_number) {
+            best_number = store->blocks[i].payload.block_number;
+            best = i;
+        }
+    }
+    if (best < 0) return -1;
+
+    execution_payload_free(&store->blocks[best].payload);
+    store->blocks[best].occupied = false;
+    store->block_count--;
+    return best;
+}
+
 bool engine_store_put(engine_store_t *store,
                       const execution_payload_t *payload,
                       bool valid) {
@@ -64,10 +93,17 @@ bool engine_store_put(engine_store_t *store,
     }
 
     int slot = find_free_slot(store);
-    if (slot < 0) return false;
+    if (slot < 0) {
+        /* Store full — evict oldest non-protected block */
+        slot = evict_oldest(store);
+        if (slot < 0) {
+            fprintf(stderr, "engine_store: full, all blocks protected\n");
+            return false;
+        }
+    }
 
-    /* Shallow copy — caller must not free the payload's dynamic fields */
-    store->blocks[slot].payload = *payload;
+    /* Deep copy — caller retains ownership and must free independently */
+    execution_payload_deep_copy(&store->blocks[slot].payload, payload);
     store->blocks[slot].occupied = true;
     store->blocks[slot].valid = valid;
     store->block_count++;
@@ -146,7 +182,7 @@ void engine_store_set_pending(engine_store_t *store,
     if (!store || !payload) return;
     if (store->has_pending)
         execution_payload_free(&store->pending_payload);
-    store->pending_payload = *payload;
+    execution_payload_deep_copy(&store->pending_payload, payload);
     store->pending_payload_id = payload_id;
     store->has_pending = true;
 }

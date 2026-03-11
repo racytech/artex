@@ -340,7 +340,13 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
         !engine_store_has(ctx->store, payload.parent_hash)) {
         status.status = PAYLOAD_SYNCING;
         status.has_latest_valid_hash = false;
-        engine_store_put(ctx->store, &payload, false);
+        if (!engine_store_put(ctx->store, &payload, false)) {
+            *err_code = -32603;
+            *err_msg = "engine store full";
+            execution_payload_free(&payload);
+            return NULL;
+        }
+        execution_payload_free(&payload);
     } else if (ctx->evm) {
         /* ----------------------------------------------------------------
          * Full validation mode — verify hash, execute block, compare state
@@ -431,7 +437,14 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
             status.has_latest_valid_hash = true;
             memcpy(status.latest_valid_hash, payload.block_hash, 32);
 
-            engine_store_put(ctx->store, &payload, true);
+            if (!engine_store_put(ctx->store, &payload, true)) {
+                *err_code = -32603;
+                *err_msg = "engine store full";
+                block_result_free(&result);
+                block_body_free(&body);
+                execution_payload_free(&payload);
+                return NULL;
+            }
             engine_store_record_blockhash(ctx->store,
                                            payload.block_number,
                                            payload.block_hash);
@@ -444,16 +457,23 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
         if (status.status == PAYLOAD_INVALID) {
             engine_store_put(ctx->store, &payload, false);
         }
+        execution_payload_free(&payload);
     } else {
         /* Stub mode (no EVM) — store without execution */
         status.status = PAYLOAD_VALID;
         status.has_latest_valid_hash = true;
         memcpy(status.latest_valid_hash, payload.block_hash, 32);
 
-        engine_store_put(ctx->store, &payload, true);
+        if (!engine_store_put(ctx->store, &payload, true)) {
+            *err_code = -32603;
+            *err_msg = "engine store full";
+            execution_payload_free(&payload);
+            return NULL;
+        }
         engine_store_record_blockhash(ctx->store,
                                        payload.block_number,
                                        payload.block_hash);
+        execution_payload_free(&payload);
     }
 
     return payload_status_to_json(&status);

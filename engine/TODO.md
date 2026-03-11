@@ -66,35 +66,32 @@
 ## P2: Robustness (won't crash a production node but will cause issues under load)
 
 ### HTTP Server
-- [ ] Add concurrency support to HTTP server (`engine/src/engine_http.c`)
-  - Currently single-threaded, one-request-at-a-time
-  - Slow block execution blocks all other Engine API calls (CL will timeout)
-  - Options: thread pool, async I/O, or at minimum a worker thread for execution
-- [ ] Check `write()` return values (`engine/src/engine_http.c:156-158`)
-  - Partial writes or broken pipe silently truncate responses
-  - CL receives malformed JSON-RPC and disconnects
-- [ ] Add connection timeout
-  - A slow/malicious client holding the connection blocks the entire server
+- [x] Add concurrency support to HTTP server (`engine/src/engine_http.c`)
+  - Worker thread dispatches handler calls, accept loop stays responsive
+  - 30-second timeout on worker — returns 503 on timeout
+- [x] Check `write()` return values (`engine/src/engine_http.c`)
+  - `write_all()` helper retries short writes, handles EPIPE/ECONNRESET
+- [x] Add connection timeout
+  - SO_RCVTIMEO/SO_SNDTIMEO set to 30s after accept()
 - [ ] Add request rate limiting or max concurrent connections
 
 ### Store Capacity
-- [ ] Handle store-full condition gracefully (`engine/src/engine_store.c:66-74`)
-  - Currently `find_free_slot()` returns -1 and block is silently dropped
-  - Consider: evict oldest non-finalized block, or grow the store dynamically
-  - `ENGINE_STORE_MAX_BLOCKS` is hardcoded to 1024
+- [x] Handle store-full condition gracefully (`engine/src/engine_store.c`)
+  - `evict_oldest()` removes oldest non-protected (non head/safe/finalized) block
+  - `engine_store_put()` auto-evicts on full, logs if all blocks protected
+- [x] Check `engine_store_put()` return value at all 4 call sites (`engine/src/engine_handlers.c`)
+  - On failure, return INTERNAL_ERROR JSON-RPC response
 
 ### Memory Management
-- [ ] Audit payload ownership model (`engine/src/engine_handlers.c`)
-  - `engine_store_put()` does shallow copy — takes ownership of heap pointers
-  - Fragile: any new error path risks double-free or leak
-  - Consider: deep copy in store_put so caller always frees, or explicit ownership transfer
+- [x] Audit payload ownership model (`engine/src/engine_handlers.c`)
+  - `engine_store_put()` now deep-copies via `execution_payload_deep_copy()`
+  - Callers always free their own payload — no ownership transfer ambiguity
 
 ### JWT Authentication
-- [ ] Replace `memmem()` with proper JSON parsing (`engine/src/engine_jwt.c:208,226`)
-  - `memmem()` is a GNU extension (not C99/C11), breaks on non-glibc systems
-  - Naive pattern matching could match inside string values
-- [ ] Increase JWT header buffer from 256 bytes (`engine/src/engine_jwt.c:286`)
-  - JWTs with extra claims or whitespace will be rejected
+- [x] Replace `memmem()` with proper JSON parsing (`engine/src/engine_jwt.c`)
+  - C99-portable `json_find_key()` scans for top-level keys, skips nested strings
+- [x] Increase JWT buffers (`engine/src/engine_jwt.c`)
+  - Header: 256 → 512, Payload: 512 → 1024
 
 ## P3: Nice to Have
 
