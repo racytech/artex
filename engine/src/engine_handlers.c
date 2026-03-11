@@ -15,7 +15,7 @@
 #include "rlp.h"
 #include "hash.h"
 #include "uint256.h"
-#include "mpt.h"
+#include "mem_mpt.h"
 
 #include <stdlib.h>
 #include <string.h>

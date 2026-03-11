@@ -71,6 +71,7 @@ Makefile
 Testing/
 *.cmake
 !CMakeLists.txt
+!config.cmake
 
 # Debug files
 *.dSYM/
@@ -125,6 +126,7 @@ __archive/
 # Test fixtures
 integration_tests/fixtures/
 integration_tests/fixtures_2/
+integration_tests/fixtures_3/
 
 # Block data
 data/era1/
@@ -150,3 +152,5 @@ reference/
 
 # Old checklist
 todo-checklist-old.md
+
+__archive/

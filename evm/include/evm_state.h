@@ -6,9 +6,21 @@
 #include "uint256.h"
 #include "address.h"
 #include "hash.h"
+
+#ifdef ENABLE_VERKLE
 #include "verkle_state.h"
 #include "witness_gas.h"
+#else
+/* Forward declaration for API compatibility when verkle is disabled */
+typedef struct verkle_state_fwd verkle_state_t;
+#endif
+
+#ifdef ENABLE_MPT
 #include "mpt_store.h"
+#endif
+
+/* Forward declaration — code_store lifecycle is managed by caller */
+typedef struct code_store code_store_t;
 
 /**
  * EVM State — Typed, in-memory state interface above verkle_state.
@@ -41,11 +53,39 @@ typedef struct evm_state evm_state_t;
  * Create EVM state over an existing verkle_state. vs is NOT owned.
  * mpt_path: if non-NULL, enables persistent incremental MPT for state root
  * computation. If NULL, falls back to batch root rebuild (slow at scale).
+ * cs: if non-NULL, enables read-through for contract bytecode (not owned).
  */
-evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path);
+evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
+                               code_store_t *cs);
 
 /** Destroy EVM state and free all in-memory caches. */
 void evm_state_destroy(evm_state_t *es);
+
+/**
+ * Flush deferred MPT writes to disk. Call at checkpoint time.
+ */
+void evm_state_flush(evm_state_t *es);
+
+/**
+ * Enable/disable batch mode. In batch mode, per-block verkle flush
+ * is skipped — block_dirty flags accumulate across blocks.
+ * Call evm_state_flush_verkle() at checkpoint time to flush.
+ */
+void evm_state_set_batch_mode(evm_state_t *es, bool enabled);
+
+/**
+ * Flush accumulated block-dirty state to verkle backing store.
+ * Call at checkpoint boundaries when in batch mode.
+ * Clears block_dirty flags after flush.
+ */
+void evm_state_flush_verkle(evm_state_t *es);
+
+/**
+ * Evict all cached accounts and storage slots.
+ * Call ONLY after compute_mpt_root / flush_verkle (all dirty flags cleared,
+ * data on disk). Read-through cache will reload entries on demand.
+ */
+void evm_state_evict_cache(evm_state_t *es);
 
 // ============================================================================
 // Account Existence
@@ -217,6 +257,7 @@ bool evm_state_finalize(evm_state_t *es);
  */
 hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
 
+#ifdef ENABLE_MPT
 /**
  * Compute MPT (Merkle Patricia Trie) state root from the in-memory caches.
  * Used for pre-Verkle block validation against block headers.
@@ -225,6 +266,7 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
  * @param prune_empty  If true (EIP-161+), exclude empty accounts from the trie.
  */
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty);
+#endif
 void evm_state_debug_dump(evm_state_t *es);
 
 #endif // EVM_STATE_H

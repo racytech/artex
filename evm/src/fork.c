@@ -241,43 +241,44 @@ evm_fork_t fork_get_active(uint64_t block_number, uint64_t timestamp, const chai
     const fork_schedule_t *forks = &config->fork_blocks;
 
     // Post-merge forks: check timestamps (Shanghai+)
-    if (timestamp >= forks->verkle)
+    // UINT64_MAX means "not activated" — never match, even if block timestamp equals UINT64_MAX
+    if (forks->verkle != UINT64_MAX && timestamp >= forks->verkle)
         return FORK_VERKLE;
-    if (timestamp >= forks->osaka)
+    if (forks->osaka != UINT64_MAX && timestamp >= forks->osaka)
         return FORK_OSAKA;
-    if (timestamp >= forks->prague)
+    if (forks->prague != UINT64_MAX && timestamp >= forks->prague)
         return FORK_PRAGUE;
-    if (timestamp >= forks->cancun)
+    if (forks->cancun != UINT64_MAX && timestamp >= forks->cancun)
         return FORK_CANCUN;
-    if (timestamp >= forks->shanghai)
+    if (forks->shanghai != UINT64_MAX && timestamp >= forks->shanghai)
         return FORK_SHANGHAI;
 
     // Pre-merge forks: check block numbers (Frontier-Paris)
-    if (block_number >= forks->paris)
+    if (forks->paris != UINT64_MAX && block_number >= forks->paris)
         return FORK_PARIS;
-    if (block_number >= forks->gray_glacier)
+    if (forks->gray_glacier != UINT64_MAX && block_number >= forks->gray_glacier)
         return FORK_GRAY_GLACIER;
-    if (block_number >= forks->arrow_glacier)
+    if (forks->arrow_glacier != UINT64_MAX && block_number >= forks->arrow_glacier)
         return FORK_ARROW_GLACIER;
-    if (block_number >= forks->london)
+    if (forks->london != UINT64_MAX && block_number >= forks->london)
         return FORK_LONDON;
-    if (block_number >= forks->berlin)
+    if (forks->berlin != UINT64_MAX && block_number >= forks->berlin)
         return FORK_BERLIN;
-    if (block_number >= forks->muir_glacier)
+    if (forks->muir_glacier != UINT64_MAX && block_number >= forks->muir_glacier)
         return FORK_MUIR_GLACIER;
-    if (block_number >= forks->istanbul)
+    if (forks->istanbul != UINT64_MAX && block_number >= forks->istanbul)
         return FORK_ISTANBUL;
-    if (block_number >= forks->petersburg)
+    if (forks->petersburg != UINT64_MAX && block_number >= forks->petersburg)
         return FORK_PETERSBURG;
-    if (block_number >= forks->constantinople)
+    if (forks->constantinople != UINT64_MAX && block_number >= forks->constantinople)
         return FORK_CONSTANTINOPLE;
-    if (block_number >= forks->byzantium)
+    if (forks->byzantium != UINT64_MAX && block_number >= forks->byzantium)
         return FORK_BYZANTIUM;
-    if (block_number >= forks->spurious_dragon)
+    if (forks->spurious_dragon != UINT64_MAX && block_number >= forks->spurious_dragon)
         return FORK_SPURIOUS_DRAGON;
-    if (block_number >= forks->tangerine_whistle)
+    if (forks->tangerine_whistle != UINT64_MAX && block_number >= forks->tangerine_whistle)
         return FORK_TANGERINE_WHISTLE;
-    if (block_number >= forks->homestead)
+    if (forks->homestead != UINT64_MAX && block_number >= forks->homestead)
         return FORK_HOMESTEAD;
 
     return FORK_FRONTIER;

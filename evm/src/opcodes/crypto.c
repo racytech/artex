@@ -21,7 +21,7 @@
  * Memory: Read from [offset:offset+size]
  * Gas: 30 + 6 * (size in words) + memory_expansion_cost
  */
-evm_status_t op_keccak256(evm_t *evm)
+static evm_status_t op_keccak256(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;

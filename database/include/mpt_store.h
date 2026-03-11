@@ -62,6 +62,13 @@ void mpt_store_destroy(mpt_store_t *ms);
  */
 void mpt_store_sync(mpt_store_t *ms);
 
+/**
+ * Flush deferred writes to disk. Writes all buffered nodes to .dat,
+ * applies pending deletes, syncs both files.
+ * Call at checkpoint time for transactional durability.
+ */
+void mpt_store_flush(mpt_store_t *ms);
+
 /* =========================================================================
  * Trie Root
  * ========================================================================= */
@@ -71,6 +78,20 @@ void mpt_store_sync(mpt_store_t *ms);
  * updates. After open(), this is the persisted root.
  */
 void mpt_store_root(const mpt_store_t *ms, uint8_t out[32]);
+
+/**
+ * Set the root hash for subsequent batch operations.
+ * Use this to switch between different tries stored in the same mpt_store
+ * (e.g., per-account storage tries sharing a single node store).
+ */
+void mpt_store_set_root(mpt_store_t *ms, const uint8_t root[32]);
+
+/**
+ * Enable shared (multi-trie) mode. When true, commit_batch skips deletion
+ * of old nodes — they may be referenced by other tries sharing this store.
+ * Orphaned nodes are reclaimed by mpt_store_compact().
+ */
+void mpt_store_set_shared(mpt_store_t *ms, bool shared);
 
 /* =========================================================================
  * Batch Update Interface
@@ -114,6 +135,18 @@ bool mpt_store_commit_batch(mpt_store_t *ms);
  * Discard the current batch without applying any changes.
  */
 void mpt_store_discard_batch(mpt_store_t *ms);
+
+/* =========================================================================
+ * Point Lookup
+ * ========================================================================= */
+
+/**
+ * Retrieve the value for a 32-byte key by walking the trie from root.
+ * Returns actual value length. 0 = key not found or empty trie.
+ * If buf_len < value length, returns required size, buf untouched.
+ */
+uint32_t mpt_store_get(const mpt_store_t *ms, const uint8_t key[32],
+                        uint8_t *buf, uint32_t buf_len);
 
 /* =========================================================================
  * Compaction

@@ -49,6 +49,7 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
     test_config.fork_blocks.cancun = UINT64_MAX;
     test_config.fork_blocks.prague = UINT64_MAX;
     test_config.fork_blocks.osaka = UINT64_MAX;
+    test_config.fork_blocks.verkle = UINT64_MAX;
 
     // Enable forks cumulatively up to the target fork.
     // Fork chronology: Frontier → Homestead → Tangerine Whistle → Spurious Dragon
@@ -293,6 +294,7 @@ uint64_t get_time_microseconds(void) {
 // Temp directory helpers (for flat verkle backend)
 //==============================================================================
 
+#ifdef ENABLE_VERKLE
 static void rm_rf(const char *path) {
     if (!path || !path[0]) return;
     char cmd[512];
@@ -317,6 +319,7 @@ static void cleanup_flat_dirs(void) {
     flat_value_dir[0] = '\0';
     flat_commit_dir[0] = '\0';
 }
+#endif /* ENABLE_VERKLE */
 
 //==============================================================================
 // Test Runner Lifecycle
@@ -339,19 +342,31 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
         runner->config.timeout_ms = 30000; // 30 second default timeout
     }
 
-    // Initialize Verkle State (flat/disk-backed) + EVM State
+    // Initialize state backends + EVM State
+#ifdef ENABLE_VERKLE
     make_flat_dirs();
     runner->vs = verkle_state_create_flat(flat_value_dir, flat_commit_dir);
     if (!runner->vs) {
         cleanup_flat_dirs();
         return false;
     }
+#endif
 
-    runner->state = evm_state_create(runner->vs, "/tmp/test_runner_mpt");
+    runner->state = evm_state_create(
+#ifdef ENABLE_VERKLE
+        runner->vs,
+#else
+        NULL,
+#endif
+        NULL,  /* no mpt_store for tests — use in-memory batch rebuild */
+        NULL   /* no code_store for tests */
+    );
     if (!runner->state) {
+#ifdef ENABLE_VERKLE
         verkle_state_destroy(runner->vs);
         runner->vs = NULL;
         cleanup_flat_dirs();
+#endif
         return false;
     }
 
@@ -359,10 +374,12 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
     runner->evm = evm_create(runner->state, NULL); // NULL = use default mainnet config
     if (!runner->evm) {
         evm_state_destroy(runner->state);
-        verkle_state_destroy(runner->vs);
         runner->state = NULL;
+#ifdef ENABLE_VERKLE
+        verkle_state_destroy(runner->vs);
         runner->vs = NULL;
         cleanup_flat_dirs();
+#endif
         return false;
     }
 
@@ -380,11 +397,13 @@ void test_runner_destroy(test_runner_t *runner) {
         evm_state_destroy(runner->state);
     }
 
+#ifdef ENABLE_VERKLE
     if (runner->vs) {
         verkle_state_destroy(runner->vs);
     }
 
     cleanup_flat_dirs();
+#endif
 
     memset(runner, 0, sizeof(*runner));
 }
@@ -401,21 +420,35 @@ void test_runner_reset(test_runner_t *runner) {
         evm_state_destroy(runner->state);
         runner->state = NULL;
     }
+#ifdef ENABLE_VERKLE
     if (runner->vs) {
         verkle_state_destroy(runner->vs);
         runner->vs = NULL;
     }
     cleanup_flat_dirs();
+#endif
 
-    // Recreate fresh with new flat dirs
+    // Recreate fresh
+#ifdef ENABLE_VERKLE
     make_flat_dirs();
     runner->vs = verkle_state_create_flat(flat_value_dir, flat_commit_dir);
     if (runner->vs) {
-        runner->state = evm_state_create(runner->vs, "/tmp/test_runner_mpt");
+#endif
+        runner->state = evm_state_create(
+#ifdef ENABLE_VERKLE
+            runner->vs,
+#else
+            NULL,
+#endif
+            NULL,  /* no mpt_store for tests — use in-memory batch rebuild */
+            NULL   /* no code_store for tests */
+        );
         if (runner->state) {
             runner->evm = evm_create(runner->state, NULL);
         }
+#ifdef ENABLE_VERKLE
     }
+#endif
 
     runner->total_gas_used = 0;
     runner->total_transactions = 0;
@@ -471,7 +504,11 @@ bool test_runner_verify_state_root(evm_state_t *state,
                                    hash_t *actual_root) {
     if (!state || !expected_root) return false;
 
+#ifdef ENABLE_MPT
+    hash_t computed_root = evm_state_compute_mpt_root(state, true);
+#else
     hash_t computed_root = evm_state_compute_state_root_ex(state, true);
+#endif
 
     if (actual_root) {
         *actual_root = computed_root;

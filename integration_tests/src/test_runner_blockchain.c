@@ -76,6 +76,16 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
     // Reset state
     test_runner_reset(runner);
 
+    // Skip Verkle tests when built without Verkle backend
+#ifndef ENABLE_VERKLE
+    if (test->network && strcasecmp(test->network, "Verkle") == 0) {
+        result->status = TEST_SKIP;
+        result->skip_reason = strdup("Verkle backend not enabled");
+        result->duration_us = get_time_microseconds() - start_time;
+        return true;
+    }
+#endif
+
     // Setup fork/chain config
     chain_config_t *fork_config = create_test_chain_config(test->network);
     if (!fork_config) {
@@ -114,7 +124,11 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
         if (fork >= FORK_SPURIOUS_DRAGON)
             prune_empty = true;
 
+#ifdef ENABLE_MPT
+        hash_t actual_genesis_root = evm_state_compute_mpt_root(runner->state, prune_empty);
+#else
         hash_t actual_genesis_root = evm_state_compute_state_root_ex(runner->state, prune_empty);
+#endif
 
         if (runner->config.verbose) {
             char *expected_str = hash_to_hex_string(&test->genesis_header.state_root);
@@ -208,7 +222,11 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
         // Verify state root against expected (from JSON block header)
         // Compute state root ourselves (block_execute's finalize may affect root)
         bool prune = (runner->evm->fork >= FORK_SPURIOUS_DRAGON);
+#ifdef ENABLE_MPT
+        hash_t computed_root = evm_state_compute_mpt_root(runner->state, prune);
+#else
         hash_t computed_root = evm_state_compute_state_root_ex(runner->state, prune);
+#endif
         hash_t *expected_root = (hash_t *)&block->header.state_root;
         if (!hash_equals(&computed_root, expected_root)) {
             char *expected_str = hash_to_hex_string(expected_root);

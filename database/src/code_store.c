@@ -58,6 +58,19 @@ _Static_assert(sizeof(code_record_t) == 12, "code_record_t must be 12 bytes");
  * In-memory structure
  * ========================================================================= */
 
+/* =========================================================================
+ * Deferred write buffer
+ * ========================================================================= */
+
+typedef struct {
+    uint8_t   hash[32];
+    uint8_t  *code;       /* malloc'd copy (NULL for zero-length code) */
+    uint32_t  code_len;
+    uint64_t  offset;     /* allocated position in data file */
+} code_deferred_t;
+
+#define CODE_DEF_INIT_CAP 32
+
 struct code_store {
     disk_hash_t     *index;         /* code_hash → code_record_t */
     int              data_fd;       /* append-only flat file */
@@ -65,6 +78,11 @@ struct code_store {
     pthread_mutex_t  write_lock;    /* serialize appends */
     char            *idx_path;      /* owned, for cleanup */
     char            *dat_path;      /* owned, for cleanup */
+
+    /* Deferred write buffer — flushed at checkpoint */
+    code_deferred_t *def_entries;
+    size_t           def_count;
+    size_t           def_cap;
 };
 
 /* =========================================================================
@@ -95,6 +113,60 @@ static bool read_data_header(int fd, code_store_header_t *hdr) {
     if (n < (ssize_t)sizeof(*hdr)) return false;
     return true;
 }
+
+/* =========================================================================
+ * Deferred buffer helpers
+ * ========================================================================= */
+
+static void def_init(code_store_t *cs) {
+    cs->def_entries = NULL;
+    cs->def_count   = 0;
+    cs->def_cap     = 0;
+}
+
+static const code_deferred_t *def_find(const code_store_t *cs,
+                                        const uint8_t hash[32]) {
+    for (size_t i = 0; i < cs->def_count; i++) {
+        if (memcmp(cs->def_entries[i].hash, hash, 32) == 0)
+            return &cs->def_entries[i];
+    }
+    return NULL;
+}
+
+static bool def_append(code_store_t *cs, const uint8_t hash[32],
+                        const uint8_t *code, uint32_t code_len,
+                        uint64_t offset) {
+    if (cs->def_count >= cs->def_cap) {
+        size_t new_cap = cs->def_cap ? cs->def_cap * 2 : CODE_DEF_INIT_CAP;
+        code_deferred_t *tmp = realloc(cs->def_entries,
+                                        new_cap * sizeof(code_deferred_t));
+        if (!tmp) return false;
+        cs->def_entries = tmp;
+        cs->def_cap     = new_cap;
+    }
+    code_deferred_t *e = &cs->def_entries[cs->def_count++];
+    memcpy(e->hash, hash, 32);
+    e->code_len = code_len;
+    e->offset   = offset;
+    if (code_len > 0 && code) {
+        e->code = malloc(code_len);
+        if (!e->code) { cs->def_count--; return false; }
+        memcpy(e->code, code, code_len);
+    } else {
+        e->code = NULL;
+    }
+    return true;
+}
+
+static void def_free_all(code_store_t *cs) {
+    for (size_t i = 0; i < cs->def_count; i++)
+        free(cs->def_entries[i].code);
+    free(cs->def_entries);
+    def_init(cs);
+}
+
+/* Forward declaration */
+void code_store_flush(code_store_t *cs);
 
 /* =========================================================================
  * Lifecycle
@@ -137,6 +209,7 @@ code_store_t *code_store_create(const char *path, uint64_t capacity_hint) {
     cs->idx_path  = idx_path;
     cs->dat_path  = dat_path;
     pthread_mutex_init(&cs->write_lock, NULL);
+    def_init(cs);
 
     return cs;
 }
@@ -185,12 +258,14 @@ code_store_t *code_store_open(const char *path) {
     cs->idx_path  = idx_path;
     cs->dat_path  = dat_path;
     pthread_mutex_init(&cs->write_lock, NULL);
+    def_init(cs);
 
     return cs;
 }
 
 void code_store_destroy(code_store_t *cs) {
     if (!cs) return;
+    code_store_flush(cs);
     pthread_mutex_destroy(&cs->write_lock);
     disk_hash_destroy(cs->index);
     close(cs->data_fd);
@@ -208,40 +283,27 @@ bool code_store_put(code_store_t *cs, const uint8_t code_hash[32],
     if (!cs || !code_hash) return false;
     if (code_len > 0 && !code) return false;
 
-    /* Fast path: already exists (dedup) */
+    /* Fast path: already exists in deferred buffer or on disk (dedup) */
+    if (def_find(cs, code_hash))
+        return true;
     if (disk_hash_contains(cs->index, code_hash))
         return true;
 
-    /* Slow path: acquire write lock, double-check, append */
+    /* Slow path: acquire write lock, double-check, defer */
     pthread_mutex_lock(&cs->write_lock);
 
-    /* Double-check after acquiring lock (another thread may have inserted) */
-    if (disk_hash_contains(cs->index, code_hash)) {
+    if (def_find(cs, code_hash) ||
+        disk_hash_contains(cs->index, code_hash)) {
         pthread_mutex_unlock(&cs->write_lock);
         return true;
     }
 
-    /* Step 1: Write code data (crash-safe: data before index) */
+    /* Allocate offset and buffer in deferred array (no disk I/O) */
     uint64_t offset = cs->data_size;
-    if (code_len > 0) {
-        ssize_t n = pwrite(cs->data_fd, code, code_len,
-                           (off_t)(PAGE_SIZE + offset));
-        if (n != (ssize_t)code_len) {
-            pthread_mutex_unlock(&cs->write_lock);
-            return false;
-        }
-    }
-
-    /* Step 2: Insert index entry */
-    code_record_t rec;
-    rec.offset = offset;
-    rec.length = code_len;
-
-    if (!disk_hash_put(cs->index, code_hash, &rec)) {
+    if (!def_append(cs, code_hash, code, code_len, offset)) {
         pthread_mutex_unlock(&cs->write_lock);
         return false;
     }
-
     cs->data_size += code_len;
 
     pthread_mutex_unlock(&cs->write_lock);
@@ -252,6 +314,17 @@ uint32_t code_store_get(const code_store_t *cs, const uint8_t code_hash[32],
                         uint8_t *buf, uint32_t buf_len) {
     if (!cs || !code_hash) return 0;
 
+    /* Check deferred buffer first */
+    const code_deferred_t *def = def_find(cs, code_hash);
+    if (def) {
+        if (buf_len < def->code_len)
+            return def->code_len;
+        if (def->code_len > 0 && buf && def->code)
+            memcpy(buf, def->code, def->code_len);
+        return def->code_len;
+    }
+
+    /* Fall back to disk */
     code_record_t rec;
     if (!disk_hash_get(cs->index, code_hash, &rec))
         return 0;
@@ -273,11 +346,15 @@ uint32_t code_store_get(const code_store_t *cs, const uint8_t code_hash[32],
 
 bool code_store_contains(const code_store_t *cs, const uint8_t code_hash[32]) {
     if (!cs || !code_hash) return false;
+    if (def_find(cs, code_hash)) return true;
     return disk_hash_contains(cs->index, code_hash);
 }
 
 uint32_t code_store_get_size(const code_store_t *cs, const uint8_t code_hash[32]) {
     if (!cs || !code_hash) return 0;
+
+    const code_deferred_t *def = def_find(cs, code_hash);
+    if (def) return def->code_len;
 
     code_record_t rec;
     if (!disk_hash_get(cs->index, code_hash, &rec))
@@ -296,6 +373,31 @@ void code_store_sync(code_store_t *cs) {
     fsync(cs->data_fd);
     /* Sync disk_hash index */
     disk_hash_sync(cs->index);
+}
+
+void code_store_flush(code_store_t *cs) {
+    if (!cs) return;
+
+    /* Write all deferred entries to disk */
+    for (size_t i = 0; i < cs->def_count; i++) {
+        code_deferred_t *e = &cs->def_entries[i];
+
+        /* Write code bytes to .dat */
+        if (e->code_len > 0 && e->code) {
+            pwrite(cs->data_fd, e->code, e->code_len,
+                   (off_t)(PAGE_SIZE + e->offset));
+        }
+
+        /* Insert index entry */
+        code_record_t rec = { .offset = e->offset, .length = e->code_len };
+        disk_hash_put(cs->index, e->hash, &rec);
+    }
+
+    /* Free deferred buffer */
+    def_free_all(cs);
+
+    /* Sync to disk */
+    code_store_sync(cs);
 }
 
 /* =========================================================================

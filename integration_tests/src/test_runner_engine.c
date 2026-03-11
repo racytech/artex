@@ -11,7 +11,7 @@
 #include "test_runner.h"
 #include "block.h"
 #include "block_executor.h"
-#include "mpt.h"
+#include "mem_mpt.h"
 #include "rlp.h"
 #include "fork.h"
 #include "uint256.h"

@@ -6,6 +6,8 @@
  */
 
 #include "interpreter.h"
+#include "evm_stack.h"
+#include "gas.h"
 #include "opcodes/arithmetic.h"
 #include "opcodes/comparison.h"
 #include "opcodes/stack.h"
@@ -20,12 +22,61 @@
 #include "opcodes/create.h"
 #include "verkle_key.h"
 #include "evm_state.h"
+#include "evm_tracer.h"
 #include "logger.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
-extern bool g_trace_calls __attribute__((weak));
+// Include opcode implementations directly — single translation unit allows
+// the compiler to inline all opcode functions into the dispatch loop.
+#include "opcodes/arithmetic.c"
+#include "opcodes/control.c"
+#include "opcodes/environmental.c"
+#include "opcodes/block.c"
+#include "opcodes/memory.c"
+#include "opcodes/storage.c"
+#include "opcodes/crypto.c"
+#include "opcodes/logging.c"
+#include "opcodes/call.c"
+#include "opcodes/create.c"
+
+//==============================================================================
+// Inline helpers for inlined opcodes
+//==============================================================================
+
+// Convert big-endian 32-byte buffer to uint256 (avoids function call)
+static inline uint256_t bytes32_to_uint256(const uint8_t buf[32]) {
+    uint128_t hi = 0, lo = 0;
+    for (int i = 0; i < 16; i++) hi = (hi << 8) | buf[i];
+    for (int i = 16; i < 32; i++) lo = (lo << 8) | buf[i];
+    return (uint256_t){ lo, hi };
+}
+
+// Convert 20-byte address to uint256 (avoids address_to_uint256 function call)
+static inline uint256_t addr_to_u256(const address_t *addr) {
+    uint8_t buf[32] = {0};
+    memcpy(buf + 12, addr->bytes, 20);
+    return bytes32_to_uint256(buf);
+}
+
+// Verkle witness gas for PUSH data bytes (cold path, only called in Verkle mode)
+static bool push_verkle_data_gas(evm_t *evm, uint8_t num_bytes,
+                                  const address_t *code_addr_p) {
+    uint64_t data_start = evm->pc + 1;
+    if (data_start >= evm->code_size) return true;
+    uint64_t data_end = data_start + num_bytes;
+    if (data_end > evm->code_size) data_end = evm->code_size;
+    uint32_t start_chunk = (uint32_t)(data_start / 31);
+    uint32_t end_chunk   = (uint32_t)((data_end - 1) / 31);
+    for (uint32_t c = start_chunk; c <= end_chunk; c++) {
+        uint8_t ck[32];
+        verkle_code_chunk_key(ck, code_addr_p->bytes, c);
+        uint64_t cwg = evm_state_witness_gas_access(evm->state, ck, false, false);
+        if (cwg > 0 && !evm_use_gas(evm, cwg)) return false;
+    }
+    return true;
+}
 
 //==============================================================================
 // Dispatch Table - Maps opcodes to label addresses
@@ -36,6 +87,7 @@ extern bool g_trace_calls __attribute__((weak));
     {                                                               \
         if (evm->pc >= evm->code_size)                              \
         {                                                           \
+            EVM_TRACE_IMPLICIT_STOP(evm);                           \
             goto done;                                              \
         }                                                           \
         if (verkle_chunk_mode) {                                    \
@@ -47,10 +99,7 @@ extern bool g_trace_calls __attribute__((weak));
             if (cwg > 0 && !evm_use_gas(evm, cwg))                  \
                 goto done_oog;                                      \
         }                                                           \
-        if (g_trace_calls && evm->msg.depth == 0) {                 \
-            fprintf(stderr, "  OP pc=%zu op=0x%02x gas=%lu\n",      \
-                    evm->pc, evm->code[evm->pc], evm->gas_left);   \
-        }                                                           \
+        EVM_TRACE_DISPATCH(evm);                                    \
         goto *dispatch_table[evm->code[evm->pc]];                  \
     } while (0)
 
@@ -418,64 +467,131 @@ evm_result_t evm_interpret(evm_t *evm)
     //==========================================================================
 
 op_stop:
-    status = op_stop(evm);
-    // STOP produces no output — clear stale return data from subcalls
+    EVM_TRACE_EXIT(evm, NULL);
+    evm->stopped = true;
     if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
     evm->return_data_size = 0;
     goto done;
 
 op_add:
-    status = op_add(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        uint128_t lo = s[t].low + s[t-1].low;
+        s[t-1].high = s[t].high + s[t-1].high + (uint128_t)(lo < s[t].low);
+        s[t-1].low = lo;
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_mul:
-    status = op_mul(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        s[t-1] = uint256_mul(&s[t], &s[t-1]);
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_sub:
-    status = op_sub(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        uint128_t borrow = (uint128_t)(s[t].low < s[t-1].low);
+        s[t-1].low = s[t].low - s[t-1].low;
+        s[t-1].high = s[t].high - s[t-1].high - borrow;
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_div:
-    status = op_div(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        if (uint256_is_zero(&s[t-1]))
+            s[t-1] = UINT256_ZERO;
+        else
+            s[t-1] = uint256_div(&s[t], &s[t-1]);
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_sdiv:
-    status = op_sdiv(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        if (uint256_is_zero(&s[t-1]))
+            s[t-1] = UINT256_ZERO;
+        else
+            s[t-1] = uint256_sdiv(&s[t], &s[t-1]);
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_mod:
-    status = op_mod(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        if (uint256_is_zero(&s[t-1]))
+            s[t-1] = UINT256_ZERO;
+        else
+            s[t-1] = uint256_mod(&s[t], &s[t-1]);
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_smod:
-    status = op_smod(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        if (uint256_is_zero(&s[t-1]))
+            s[t-1] = UINT256_ZERO;
+        else
+            s[t-1] = uint256_smod(&s[t], &s[t-1]);
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_addmod:
-    status = op_addmod(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_MID)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 3, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        if (uint256_is_zero(&s[t-2]))
+            s[t-2] = UINT256_ZERO;
+        else
+            s[t-2] = uint256_addmod(&s[t], &s[t-1], &s[t-2]);
+        evm->stack->size = t - 1;
+    }
     NEXT();
 
 op_mulmod:
-    status = op_mulmod(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_MID)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 3, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        if (uint256_is_zero(&s[t-2]))
+            s[t-2] = UINT256_ZERO;
+        else
+            s[t-2] = uint256_mulmod(&s[t], &s[t-1], &s[t-2]);
+        evm->stack->size = t - 1;
+    }
     NEXT();
 
 op_exp:
@@ -485,9 +601,18 @@ op_exp:
     NEXT();
 
 op_signextend:
-    status = op_signextend(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        if (s[t].high == 0 && s[t].low <= 30) {
+            unsigned int byte_num = (unsigned int)s[t].low;
+            s[t-1] = uint256_signextend(&s[t-1], byte_num);
+        }
+        // else b >= 31, value unchanged
+        evm->stack->size = t;
+    }
     NEXT();
 
     //==========================================================================
@@ -495,87 +620,176 @@ op_signextend:
     //==========================================================================
 
 op_lt:
-    status = op_lt(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        s[t-1] = uint256_lt(&s[t], &s[t-1]) ? UINT256_ONE : UINT256_ZERO;
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_gt:
-    status = op_gt(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        s[t-1] = uint256_gt(&s[t], &s[t-1]) ? UINT256_ONE : UINT256_ZERO;
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_slt:
-    status = op_slt(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        s[t-1] = uint256_slt(&s[t], &s[t-1]) ? UINT256_ONE : UINT256_ZERO;
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_sgt:
-    status = op_sgt(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        s[t-1] = uint256_sgt(&s[t], &s[t-1]) ? UINT256_ONE : UINT256_ZERO;
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_eq:
-    status = op_eq(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        s[t-1] = (s[t].low == s[t-1].low && s[t].high == s[t-1].high) ? UINT256_ONE : UINT256_ZERO;
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_iszero:
-    status = op_iszero(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 1, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *top = &evm->stack->items[evm->stack->size - 1];
+        *top = ((top->low | top->high) == 0) ? UINT256_ONE : UINT256_ZERO;
+    }
     NEXT();
 
 op_and:
-    status = op_and(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        s[t-1].low = s[t].low & s[t-1].low;
+        s[t-1].high = s[t].high & s[t-1].high;
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_or:
-    status = op_or(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        s[t-1].low = s[t].low | s[t-1].low;
+        s[t-1].high = s[t].high | s[t-1].high;
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_xor:
-    status = op_xor(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        s[t-1].low = s[t].low ^ s[t-1].low;
+        s[t-1].high = s[t].high ^ s[t-1].high;
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_not:
-    status = op_not(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 1, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *top = &evm->stack->items[evm->stack->size - 1];
+        top->low = ~top->low;
+        top->high = ~top->high;
+    }
     NEXT();
 
 op_byte:
-    status = op_byte(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        uint64_t idx = uint256_to_uint64(&s[t]);
+        if (idx >= 32)
+            s[t-1] = UINT256_ZERO;
+        else {
+            uint8_t b = uint256_byte(&s[t-1], idx);
+            s[t-1] = (uint256_t){ (uint128_t)b, 0 };
+        }
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_shl:
-    status = op_shl(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (evm->fork < FORK_CONSTANTINOPLE) { status = EVM_INVALID_OPCODE; goto error; }
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        if (s[t].high || (uint64_t)(s[t].low >> 64) || uint256_to_uint64(&s[t]) >= 256)
+            s[t-1] = UINT256_ZERO;
+        else
+            s[t-1] = uint256_shl(&s[t-1], (unsigned int)uint256_to_uint64(&s[t]));
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_shr:
-    status = op_shr(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (evm->fork < FORK_CONSTANTINOPLE) { status = EVM_INVALID_OPCODE; goto error; }
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        if (s[t].high || (uint64_t)(s[t].low >> 64) || uint256_to_uint64(&s[t]) >= 256)
+            s[t-1] = UINT256_ZERO;
+        else
+            s[t-1] = uint256_shr(&s[t-1], (unsigned int)uint256_to_uint64(&s[t]));
+        evm->stack->size = t;
+    }
     NEXT();
 
 op_sar:
-    status = op_sar(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (evm->fork < FORK_CONSTANTINOPLE) { status = EVM_INVALID_OPCODE; goto error; }
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 2, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *s = evm->stack->items;
+        size_t t = evm->stack->size - 1;
+        if (s[t].high || (uint64_t)(s[t].low >> 64) || uint256_to_uint64(&s[t]) >= 256) {
+            bool is_neg = (s[t-1].high >> 127) & 1;
+            s[t-1] = is_neg ? UINT256_MAX : UINT256_ZERO;
+        } else
+            s[t-1] = uint256_sar(&s[t-1], (unsigned int)uint256_to_uint64(&s[t]));
+        evm->stack->size = t;
+    }
     NEXT();
 
     //==========================================================================
@@ -592,180 +806,152 @@ op_keccak256:
     // 0x30-0x3f: Environmental Information
     //==========================================================================
 
-op_address:
-    status = op_address(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    // Simple push-one-value pattern: gas + overflow check + push
+#define PUSH_VAL(gas_cost, val)                                                \
+    if (!evm_use_gas(evm, (gas_cost))) goto done_oog;                          \
+    if (__builtin_expect(evm->stack->size >= EVM_STACK_MAX_DEPTH, 0))          \
+        { status = EVM_STACK_OVERFLOW; goto error; }                           \
+    evm->stack->items[evm->stack->size++] = (val);                             \
     NEXT();
 
+#define PUSH_ADDR(addr_ptr)                                                    \
+    if (!evm_use_gas(evm, GAS_BASE)) goto done_oog;                            \
+    if (__builtin_expect(evm->stack->size >= EVM_STACK_MAX_DEPTH, 0))          \
+        { status = EVM_STACK_OVERFLOW; goto error; }                           \
+    evm->stack->items[evm->stack->size++] = addr_to_u256(addr_ptr);            \
+    NEXT();
+
+op_address:   PUSH_ADDR(&evm->msg.recipient)
 op_balance:
     status = op_balance(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (status != EVM_SUCCESS) goto error;
     NEXT();
-
-op_origin:
-    status = op_origin(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-
-op_caller:
-    status = op_caller(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-
-op_callvalue:
-    status = op_callvalue(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
+op_origin:    PUSH_ADDR(&evm->tx.origin)
+op_caller:    PUSH_ADDR(&evm->msg.caller)
+op_callvalue: PUSH_VAL(GAS_BASE, evm->msg.value)
 
 op_calldataload:
-    status = op_calldataload(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 1, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *top = &evm->stack->items[evm->stack->size - 1];
+        uint64_t offset = uint256_to_uint64(top);
+        uint8_t _cdbuf[32] = {0};
+        if (offset < evm->msg.input_size) {
+            size_t avail = evm->msg.input_size - offset;
+            size_t n = avail < 32 ? avail : 32;
+            memcpy(_cdbuf, evm->msg.input_data + offset, n);
+        }
+        *top = bytes32_to_uint256(_cdbuf);
+    }
     NEXT();
 
-op_calldatasize:
-    status = op_calldatasize(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
+op_calldatasize: PUSH_VAL(GAS_BASE, ((uint256_t){ (uint128_t)evm->msg.input_size, 0 }))
 
 op_calldatacopy:
     status = op_calldatacopy(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (status != EVM_SUCCESS) goto error;
     NEXT();
 
-op_codesize:
-    status = op_codesize(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
+op_codesize: PUSH_VAL(GAS_BASE, ((uint256_t){ (uint128_t)evm->code_size, 0 }))
 
 op_codecopy:
     status = op_codecopy(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (status != EVM_SUCCESS) goto error;
     NEXT();
 
-op_gasprice:
-    status = op_gasprice(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
+op_gasprice: PUSH_VAL(GAS_BASE, evm->tx.gas_price)
 
 op_extcodesize:
     status = op_extcodesize(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (status != EVM_SUCCESS) goto error;
     NEXT();
 
 op_extcodecopy:
     status = op_extcodecopy(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (status != EVM_SUCCESS) goto error;
     NEXT();
 
 op_returndatasize:
-    status = op_returndatasize(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
+    if (evm->fork < FORK_BYZANTIUM) { status = EVM_INVALID_OPCODE; goto error; }
+    PUSH_VAL(GAS_BASE, ((uint256_t){ (uint128_t)evm->return_data_size, 0 }))
 
 op_returndatacopy:
     status = op_returndatacopy(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (status != EVM_SUCCESS) goto error;
     NEXT();
 
 op_extcodehash:
     status = op_extcodehash(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (status != EVM_SUCCESS) goto error;
     NEXT();
+
+#undef PUSH_VAL
+#undef PUSH_ADDR
 
     //==========================================================================
     // 0x40-0x4f: Block Information
     //==========================================================================
 
+    // Redefine PUSH_VAL/PUSH_ADDR for block info section
+#define PUSH_VAL(gas_cost, val)                                                \
+    if (!evm_use_gas(evm, (gas_cost))) goto done_oog;                          \
+    if (__builtin_expect(evm->stack->size >= EVM_STACK_MAX_DEPTH, 0))          \
+        { status = EVM_STACK_OVERFLOW; goto error; }                           \
+    evm->stack->items[evm->stack->size++] = (val);                             \
+    NEXT();
+
+#define PUSH_ADDR(addr_ptr)                                                    \
+    if (!evm_use_gas(evm, GAS_BASE)) goto done_oog;                            \
+    if (__builtin_expect(evm->stack->size >= EVM_STACK_MAX_DEPTH, 0))          \
+        { status = EVM_STACK_OVERFLOW; goto error; }                           \
+    evm->stack->items[evm->stack->size++] = addr_to_u256(addr_ptr);            \
+    NEXT();
+
 op_blockhash:
     status = op_blockhash(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (status != EVM_SUCCESS) goto error;
     NEXT();
 
-op_coinbase:
-    status = op_coinbase(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-
-op_timestamp:
-    status = op_timestamp(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-
-op_number:
-    status = op_number(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-
-op_difficulty:
-    status = op_difficulty(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-
-op_gaslimit:
-    status = op_gaslimit(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-
+op_coinbase:  PUSH_ADDR(&evm->block.coinbase)
+op_timestamp: PUSH_VAL(GAS_BASE, ((uint256_t){ (uint128_t)evm->block.timestamp, 0 }))
+op_number:    PUSH_VAL(GAS_BASE, ((uint256_t){ (uint128_t)evm->block.number, 0 }))
+op_difficulty: PUSH_VAL(GAS_BASE, evm->block.difficulty)
+op_gaslimit:  PUSH_VAL(GAS_BASE, ((uint256_t){ (uint128_t)evm->block.gas_limit, 0 }))
 op_chainid:
-    status = op_chainid(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
+    if (evm->fork < FORK_ISTANBUL) { status = EVM_INVALID_OPCODE; goto error; }
+    PUSH_VAL(GAS_BASE, evm->block.chain_id)
 
 op_selfbalance:
     status = op_selfbalance(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (status != EVM_SUCCESS) goto error;
     NEXT();
 
 op_basefee:
-    status = op_basefee(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
+    if (evm->fork < FORK_LONDON) { status = EVM_INVALID_OPCODE; goto error; }
+    PUSH_VAL(GAS_BASE, evm->block.base_fee)
 
 op_blobhash:
     status = op_blobhash(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (status != EVM_SUCCESS) goto error;
     NEXT();
 
 op_blobbasefee:
     status = op_blobbasefee(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (status != EVM_SUCCESS) goto error;
     NEXT();
+
+#undef PUSH_VAL
+#undef PUSH_ADDR
 
     //==========================================================================
     // 0x50-0x5f: Stack, Memory, Storage, and Flow Operations
     //==========================================================================
 
 op_pop:
-    status = op_pop(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_BASE)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 1, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    evm->stack->size--;
     NEXT();
 
 op_mload:
@@ -811,9 +997,9 @@ op_jumpi:
     DISPATCH(); // PC may have been updated by jumpi
 
 op_pc:
-    status = op_pc(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_BASE)) goto done_oog;
+    if (__builtin_expect(evm->stack->size >= EVM_STACK_MAX_DEPTH, 0)) { status = EVM_STACK_OVERFLOW; goto error; }
+    evm->stack->items[evm->stack->size++] = (uint256_t){ (uint128_t)evm->pc, 0 };
     NEXT();
 
 op_msize:
@@ -823,15 +1009,13 @@ op_msize:
     NEXT();
 
 op_gas:
-    status = op_gas(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_BASE)) goto done_oog;
+    if (__builtin_expect(evm->stack->size >= EVM_STACK_MAX_DEPTH, 0)) { status = EVM_STACK_OVERFLOW; goto error; }
+    evm->stack->items[evm->stack->size++] = (uint256_t){ (uint128_t)evm->gas_left, 0 };
     NEXT();
 
 op_jumpdest:
-    status = op_jumpdest(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, 1)) goto done_oog;
     NEXT();
 
 op_tload:
@@ -853,345 +1037,151 @@ op_mcopy:
     NEXT();
 
 op_push0:
-    status = op_push0(evm);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (evm->fork < FORK_SHANGHAI) { status = EVM_INVALID_OPCODE; goto error; }
+    if (!evm_use_gas(evm, GAS_BASE)) goto done_oog;
+    if (__builtin_expect(evm->stack->size >= EVM_STACK_MAX_DEPTH, 0)) { status = EVM_STACK_OVERFLOW; goto error; }
+    evm->stack->items[evm->stack->size++] = UINT256_ZERO;
     NEXT();
 
     //==========================================================================
     // 0x60-0x7f: Push Operations
     //==========================================================================
 
+    // PUSH1: ultra-tight specialization (most common opcode ~15%)
 op_push1:
-    status = op_push(evm, 1);
-    if (status != EVM_SUCCESS)
-        goto error;
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size >= EVM_STACK_MAX_DEPTH, 0))
+        { status = EVM_STACK_OVERFLOW; goto error; }
+    evm->stack->items[evm->stack->size++] = (uint256_t){
+        (evm->pc + 1 < evm->code_size) ? (uint128_t)evm->code[evm->pc + 1] : 0, 0
+    };
+    if (__builtin_expect(verkle_chunk_mode, 0))
+        if (!push_verkle_data_gas(evm, 1, &code_addr)) goto done_oog;
+    evm->pc += 2;
     DISPATCH();
-op_push2:
-    status = op_push(evm, 2);
-    if (status != EVM_SUCCESS)
-        goto error;
+
+    // PUSH2-32: general inline macro
+#define INLINE_PUSH(N)                                                         \
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;                        \
+    if (__builtin_expect(evm->stack->size >= EVM_STACK_MAX_DEPTH, 0))          \
+        { status = EVM_STACK_OVERFLOW; goto error; }                           \
+    {                                                                          \
+        uint8_t _buf[32] = {0};                                                \
+        uint64_t _avail = evm->code_size - evm->pc - 1;                        \
+        uint8_t _n = ((N) <= _avail) ? (N) : (uint8_t)_avail;                  \
+        memcpy(_buf + 32 - (N), evm->code + evm->pc + 1, _n);                  \
+        evm->stack->items[evm->stack->size++] = bytes32_to_uint256(_buf);      \
+        if (__builtin_expect(verkle_chunk_mode, 0))                            \
+            if (!push_verkle_data_gas(evm, (N), &code_addr)) goto done_oog;    \
+        evm->pc += 1 + (N);                                                    \
+    }                                                                          \
     DISPATCH();
-op_push3:
-    status = op_push(evm, 3);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push4:
-    status = op_push(evm, 4);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push5:
-    status = op_push(evm, 5);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push6:
-    status = op_push(evm, 6);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push7:
-    status = op_push(evm, 7);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push8:
-    status = op_push(evm, 8);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push9:
-    status = op_push(evm, 9);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push10:
-    status = op_push(evm, 10);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push11:
-    status = op_push(evm, 11);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push12:
-    status = op_push(evm, 12);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push13:
-    status = op_push(evm, 13);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push14:
-    status = op_push(evm, 14);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push15:
-    status = op_push(evm, 15);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push16:
-    status = op_push(evm, 16);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push17:
-    status = op_push(evm, 17);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push18:
-    status = op_push(evm, 18);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push19:
-    status = op_push(evm, 19);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push20:
-    status = op_push(evm, 20);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push21:
-    status = op_push(evm, 21);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push22:
-    status = op_push(evm, 22);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push23:
-    status = op_push(evm, 23);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push24:
-    status = op_push(evm, 24);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push25:
-    status = op_push(evm, 25);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push26:
-    status = op_push(evm, 26);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push27:
-    status = op_push(evm, 27);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push28:
-    status = op_push(evm, 28);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push29:
-    status = op_push(evm, 29);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push30:
-    status = op_push(evm, 30);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push31:
-    status = op_push(evm, 31);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
-op_push32:
-    status = op_push(evm, 32);
-    if (status != EVM_SUCCESS)
-        goto error;
-    DISPATCH();
+
+op_push2:  INLINE_PUSH(2)
+op_push3:  INLINE_PUSH(3)
+op_push4:  INLINE_PUSH(4)
+op_push5:  INLINE_PUSH(5)
+op_push6:  INLINE_PUSH(6)
+op_push7:  INLINE_PUSH(7)
+op_push8:  INLINE_PUSH(8)
+op_push9:  INLINE_PUSH(9)
+op_push10: INLINE_PUSH(10)
+op_push11: INLINE_PUSH(11)
+op_push12: INLINE_PUSH(12)
+op_push13: INLINE_PUSH(13)
+op_push14: INLINE_PUSH(14)
+op_push15: INLINE_PUSH(15)
+op_push16: INLINE_PUSH(16)
+op_push17: INLINE_PUSH(17)
+op_push18: INLINE_PUSH(18)
+op_push19: INLINE_PUSH(19)
+op_push20: INLINE_PUSH(20)
+op_push21: INLINE_PUSH(21)
+op_push22: INLINE_PUSH(22)
+op_push23: INLINE_PUSH(23)
+op_push24: INLINE_PUSH(24)
+op_push25: INLINE_PUSH(25)
+op_push26: INLINE_PUSH(26)
+op_push27: INLINE_PUSH(27)
+op_push28: INLINE_PUSH(28)
+op_push29: INLINE_PUSH(29)
+op_push30: INLINE_PUSH(30)
+op_push31: INLINE_PUSH(31)
+op_push32: INLINE_PUSH(32)
+
+#undef INLINE_PUSH
 
     //==========================================================================
     // 0x80-0x8f: Dup Operations
     //==========================================================================
 
-op_dup1:
-    status = op_dup(evm, 1);
-    if (status != EVM_SUCCESS)
-        goto error;
+#define INLINE_DUP(N)                                                          \
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;                        \
+    if (__builtin_expect(evm->stack->size < (N) ||                             \
+        evm->stack->size >= EVM_STACK_MAX_DEPTH, 0)) {                         \
+        status = (evm->stack->size >= EVM_STACK_MAX_DEPTH) ?                   \
+            EVM_STACK_OVERFLOW : EVM_STACK_UNDERFLOW;                          \
+        goto error;                                                            \
+    }                                                                          \
+    evm->stack->items[evm->stack->size] =                                      \
+        evm->stack->items[evm->stack->size - (N)];                             \
+    evm->stack->size++;                                                        \
     NEXT();
-op_dup2:
-    status = op_dup(evm, 2);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup3:
-    status = op_dup(evm, 3);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup4:
-    status = op_dup(evm, 4);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup5:
-    status = op_dup(evm, 5);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup6:
-    status = op_dup(evm, 6);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup7:
-    status = op_dup(evm, 7);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup8:
-    status = op_dup(evm, 8);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup9:
-    status = op_dup(evm, 9);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup10:
-    status = op_dup(evm, 10);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup11:
-    status = op_dup(evm, 11);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup12:
-    status = op_dup(evm, 12);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup13:
-    status = op_dup(evm, 13);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup14:
-    status = op_dup(evm, 14);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup15:
-    status = op_dup(evm, 15);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_dup16:
-    status = op_dup(evm, 16);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
+
+op_dup1:  INLINE_DUP(1)
+op_dup2:  INLINE_DUP(2)
+op_dup3:  INLINE_DUP(3)
+op_dup4:  INLINE_DUP(4)
+op_dup5:  INLINE_DUP(5)
+op_dup6:  INLINE_DUP(6)
+op_dup7:  INLINE_DUP(7)
+op_dup8:  INLINE_DUP(8)
+op_dup9:  INLINE_DUP(9)
+op_dup10: INLINE_DUP(10)
+op_dup11: INLINE_DUP(11)
+op_dup12: INLINE_DUP(12)
+op_dup13: INLINE_DUP(13)
+op_dup14: INLINE_DUP(14)
+op_dup15: INLINE_DUP(15)
+op_dup16: INLINE_DUP(16)
+
+#undef INLINE_DUP
 
     //==========================================================================
     // 0x90-0x9f: Swap Operations
     //==========================================================================
 
-op_swap1:
-    status = op_swap(evm, 1);
-    if (status != EVM_SUCCESS)
-        goto error;
+#define INLINE_SWAP(N)                                                         \
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;                        \
+    if (__builtin_expect(evm->stack->size < (size_t)((N) + 1), 0)) {           \
+        status = EVM_STACK_UNDERFLOW; goto error;                              \
+    }                                                                          \
+    {                                                                          \
+        size_t top_idx = evm->stack->size - 1;                                 \
+        uint256_t tmp = evm->stack->items[top_idx];                            \
+        evm->stack->items[top_idx] = evm->stack->items[top_idx - (N)];         \
+        evm->stack->items[top_idx - (N)] = tmp;                                \
+    }                                                                          \
     NEXT();
-op_swap2:
-    status = op_swap(evm, 2);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap3:
-    status = op_swap(evm, 3);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap4:
-    status = op_swap(evm, 4);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap5:
-    status = op_swap(evm, 5);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap6:
-    status = op_swap(evm, 6);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap7:
-    status = op_swap(evm, 7);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap8:
-    status = op_swap(evm, 8);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap9:
-    status = op_swap(evm, 9);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap10:
-    status = op_swap(evm, 10);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap11:
-    status = op_swap(evm, 11);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap12:
-    status = op_swap(evm, 12);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap13:
-    status = op_swap(evm, 13);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap14:
-    status = op_swap(evm, 14);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap15:
-    status = op_swap(evm, 15);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
-op_swap16:
-    status = op_swap(evm, 16);
-    if (status != EVM_SUCCESS)
-        goto error;
-    NEXT();
+
+op_swap1:  INLINE_SWAP(1)
+op_swap2:  INLINE_SWAP(2)
+op_swap3:  INLINE_SWAP(3)
+op_swap4:  INLINE_SWAP(4)
+op_swap5:  INLINE_SWAP(5)
+op_swap6:  INLINE_SWAP(6)
+op_swap7:  INLINE_SWAP(7)
+op_swap8:  INLINE_SWAP(8)
+op_swap9:  INLINE_SWAP(9)
+op_swap10: INLINE_SWAP(10)
+op_swap11: INLINE_SWAP(11)
+op_swap12: INLINE_SWAP(12)
+op_swap13: INLINE_SWAP(13)
+op_swap14: INLINE_SWAP(14)
+op_swap15: INLINE_SWAP(15)
+op_swap16: INLINE_SWAP(16)
+
+#undef INLINE_SWAP
 
     //==========================================================================
     // 0xa0-0xaf: Log Operations
@@ -1247,6 +1237,7 @@ op_callcode:
 
 op_return:
     status = op_return(evm);
+    EVM_TRACE_EXIT(evm, NULL);
     goto done;
 
 op_delegatecall:
@@ -1269,10 +1260,12 @@ op_staticcall:
 
 op_revert:
     status = op_revert(evm);
+    EVM_TRACE_EXIT(evm, NULL);
     goto done;
 
 op_selfdestruct:
     status = op_selfdestruct(evm);
+    EVM_TRACE_EXIT(evm, NULL);
     // SELFDESTRUCT produces no output — clear stale return data from subcalls
     if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
     evm->return_data_size = 0;
@@ -1292,9 +1285,13 @@ op_invalid:
 
 done_oog:
     status = EVM_OUT_OF_GAS;
+    EVM_TRACE_EXIT(evm, "out of gas");
     // Fall through to error
 
 error:
+    if (status != EVM_OUT_OF_GAS) {
+        EVM_TRACE_EXIT(evm, "execution error");
+    }
     LOG_EVM_DEBUG("Execution error at PC=%lu: status=%d", evm->pc, status);
     // All exceptional halts (non-REVERT) consume all remaining gas per EVM spec.
     // Only REVERT preserves remaining gas.
@@ -1313,6 +1310,8 @@ error:
     // Fall through to done
 
 done:
+    // Emit any remaining pending trace (e.g. when pc >= code_size)
+    EVM_TRACE_EXIT(evm, NULL);
     // Create result with output data
     return evm_result_create(status, evm->gas_left, evm->gas_refund, evm->return_data, evm->return_data_size);
 }

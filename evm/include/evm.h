@@ -271,13 +271,17 @@ void evm_set_tx_context(evm_t *evm, const evm_tx_context_t *tx);
 //==============================================================================
 
 /**
- * Use gas for an operation
- *
- * @param evm EVM instance
- * @param amount Amount of gas to use
- * @return true if sufficient gas available, false if out of gas
+ * Use gas for an operation (inline hot path)
  */
-bool evm_use_gas(evm_t *evm, uint64_t amount);
+static inline bool evm_use_gas(evm_t *evm, uint64_t amount) {
+    if (__builtin_expect(evm->gas_left < amount, 0)) {
+        evm->status = EVM_OUT_OF_GAS;
+        evm->gas_left = 0;
+        return false;
+    }
+    evm->gas_left -= amount;
+    return true;
+}
 
 /**
  * Refund gas (SSTORE, SELFDESTRUCT)

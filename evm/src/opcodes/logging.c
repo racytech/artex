@@ -120,27 +120,27 @@ static evm_status_t op_log_common(evm_t *evm, uint8_t num_topics)
 // LOG Opcodes
 //==============================================================================
 
-evm_status_t op_log0(evm_t *evm)
+static evm_status_t op_log0(evm_t *evm)
 {
     return op_log_common(evm, 0);
 }
 
-evm_status_t op_log1(evm_t *evm)
+static evm_status_t op_log1(evm_t *evm)
 {
     return op_log_common(evm, 1);
 }
 
-evm_status_t op_log2(evm_t *evm)
+static evm_status_t op_log2(evm_t *evm)
 {
     return op_log_common(evm, 2);
 }
 
-evm_status_t op_log3(evm_t *evm)
+static evm_status_t op_log3(evm_t *evm)
 {
     return op_log_common(evm, 3);
 }
 
-evm_status_t op_log4(evm_t *evm)
+static evm_status_t op_log4(evm_t *evm)
 {
     return op_log_common(evm, 4);
 }

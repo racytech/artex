@@ -1,20 +1,21 @@
-#ifndef MPT_H
-#define MPT_H
+#ifndef MEM_MPT_H
+#define MEM_MPT_H
+
+/**
+ * In-Memory Batch MPT Root Computation (testing only)
+ *
+ * Computes the Ethereum MPT state root from a set of key-value pairs in one
+ * pass. O(n log n) -- sort + recursive trie build with stack-allocated RLP.
+ *
+ * This is used exclusively by the integration test runner to verify post-state
+ * roots without requiring a disk-backed mpt_store. For production chain replay,
+ * use mpt_store (incremental, persistent) instead.
+ */
 
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include "hash.h"
-
-/**
- * Merkle Patricia Trie — Batch Root Computation
- *
- * Computes the Ethereum MPT state root from a set of key-value pairs in one
- * pass. O(n log n) — sort + recursive trie build with stack-allocated RLP.
- * No ART intermediary, no per-insert rebuilds.
- *
- * Used to verify our EVM state against block headers during chain replay.
- */
 
 /**
  * Batch entry for root computation.
@@ -65,4 +66,4 @@ typedef struct {
 bool mpt_compute_root_unsecured(mpt_unsecured_entry_t *entries,
                                  size_t count, hash_t *out_root);
 
-#endif // MPT_H
+#endif // MEM_MPT_H

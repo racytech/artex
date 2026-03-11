@@ -27,18 +27,12 @@ extern const uint256_t UINT256_MAX;
 #define UINT256_ONE_INIT  ((uint256_t){UINT128_ONE, UINT128_ZERO})
 #define UINT256_MAX_INIT  ((uint256_t){UINT128_MAX, UINT128_MAX})
 
-// Arithmetic operations
-uint256_t uint256_add(const uint256_t* a, const uint256_t* b);
-uint256_t uint256_sub(const uint256_t* a, const uint256_t* b);
+// Arithmetic operations (mul/div/mod stay in uint256.c — complex, less frequent)
 uint256_t uint256_mul(const uint256_t* a, const uint256_t* b);
 uint256_t uint256_div(const uint256_t* a, const uint256_t* b);
 uint256_t uint256_mod(const uint256_t* a, const uint256_t* b);
 
-// Bitwise operations
-uint256_t uint256_and(const uint256_t* a, const uint256_t* b);
-uint256_t uint256_or(const uint256_t* a, const uint256_t* b);
-uint256_t uint256_xor(const uint256_t* a, const uint256_t* b);
-uint256_t uint256_not(const uint256_t* a);
+// Shift operations (stay in uint256.c — multi-branch)
 uint256_t uint256_shl(const uint256_t* a, unsigned int shift);
 uint256_t uint256_shr(const uint256_t* a, unsigned int shift);
 
@@ -47,25 +41,97 @@ bool uint256_add_overflow(const uint256_t* a, const uint256_t* b, uint256_t* res
 bool uint256_sub_overflow(const uint256_t* a, const uint256_t* b, uint256_t* result);
 bool uint256_mul_overflow(const uint256_t* a, const uint256_t* b, uint256_t* result);
 
-// Comparison functions
-int uint256_compare(const uint256_t* a, const uint256_t* b);
-bool uint256_is_equal(const uint256_t* a, const uint256_t* b);
-bool uint256_is_less(const uint256_t* a, const uint256_t* b);
-bool uint256_is_less_equal(const uint256_t* a, const uint256_t* b);
-bool uint256_is_greater(const uint256_t* a, const uint256_t* b);
-bool uint256_is_greater_equal(const uint256_t* a, const uint256_t* b);
+// Inline arithmetic (hot path)
+static inline uint256_t uint256_add(const uint256_t* a, const uint256_t* b) {
+    uint256_t r;
+    r.low = a->low + b->low;
+    r.high = a->high + b->high + (uint128_t)(r.low < a->low);
+    return r;
+}
 
-// Alternative comparison functions (for convenience)
-bool uint256_eq(const uint256_t* a, const uint256_t* b);
-bool uint256_ne(const uint256_t* a, const uint256_t* b);
-bool uint256_lt(const uint256_t* a, const uint256_t* b);
-bool uint256_le(const uint256_t* a, const uint256_t* b);
-bool uint256_gt(const uint256_t* a, const uint256_t* b);
-bool uint256_ge(const uint256_t* a, const uint256_t* b);
+static inline uint256_t uint256_sub(const uint256_t* a, const uint256_t* b) {
+    uint256_t r;
+    r.low = a->low - b->low;
+    r.high = a->high - b->high - (uint128_t)(a->low < b->low);
+    return r;
+}
 
-// Test functions
-bool uint256_is_zero(const uint256_t* a);
-bool uint256_is_one(const uint256_t* a);
+// Inline bitwise operations (hot path)
+static inline uint256_t uint256_and(const uint256_t* a, const uint256_t* b) {
+    return (uint256_t){ a->low & b->low, a->high & b->high };
+}
+
+static inline uint256_t uint256_or(const uint256_t* a, const uint256_t* b) {
+    return (uint256_t){ a->low | b->low, a->high | b->high };
+}
+
+static inline uint256_t uint256_xor(const uint256_t* a, const uint256_t* b) {
+    return (uint256_t){ a->low ^ b->low, a->high ^ b->high };
+}
+
+static inline uint256_t uint256_not(const uint256_t* a) {
+    return (uint256_t){ ~a->low, ~a->high };
+}
+
+// Inline test functions (hot path)
+static inline bool uint256_is_zero(const uint256_t* a) {
+    return (a->low | a->high) == 0;
+}
+
+static inline bool uint256_is_one(const uint256_t* a) {
+    return a->low == 1 && a->high == 0;
+}
+
+// Inline comparison functions (hot path)
+static inline int uint256_compare(const uint256_t* a, const uint256_t* b) {
+    if (a->high != b->high) return (a->high > b->high) ? 1 : -1;
+    if (a->low != b->low)   return (a->low > b->low) ? 1 : -1;
+    return 0;
+}
+
+static inline bool uint256_is_equal(const uint256_t* a, const uint256_t* b) {
+    return a->low == b->low && a->high == b->high;
+}
+
+static inline bool uint256_is_less(const uint256_t* a, const uint256_t* b) {
+    return (a->high < b->high) || (a->high == b->high && a->low < b->low);
+}
+
+static inline bool uint256_is_less_equal(const uint256_t* a, const uint256_t* b) {
+    return (a->high < b->high) || (a->high == b->high && a->low <= b->low);
+}
+
+static inline bool uint256_is_greater(const uint256_t* a, const uint256_t* b) {
+    return (a->high > b->high) || (a->high == b->high && a->low > b->low);
+}
+
+static inline bool uint256_is_greater_equal(const uint256_t* a, const uint256_t* b) {
+    return (a->high > b->high) || (a->high == b->high && a->low >= b->low);
+}
+
+static inline bool uint256_eq(const uint256_t* a, const uint256_t* b) {
+    return a->low == b->low && a->high == b->high;
+}
+
+static inline bool uint256_ne(const uint256_t* a, const uint256_t* b) {
+    return a->low != b->low || a->high != b->high;
+}
+
+static inline bool uint256_lt(const uint256_t* a, const uint256_t* b) {
+    return (a->high < b->high) || (a->high == b->high && a->low < b->low);
+}
+
+static inline bool uint256_le(const uint256_t* a, const uint256_t* b) {
+    return (a->high < b->high) || (a->high == b->high && a->low <= b->low);
+}
+
+static inline bool uint256_gt(const uint256_t* a, const uint256_t* b) {
+    return (a->high > b->high) || (a->high == b->high && a->low > b->low);
+}
+
+static inline bool uint256_ge(const uint256_t* a, const uint256_t* b) {
+    return (a->high > b->high) || (a->high == b->high && a->low >= b->low);
+}
 
 // Creation and conversion functions
 uint256_t uint256_from_uint64(uint64_t value);

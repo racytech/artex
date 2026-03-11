@@ -1,5 +1,10 @@
 /**
  * EVM Block Information Opcodes Implementation
+ *
+ * Simple block opcodes (COINBASE, TIMESTAMP, NUMBER, DIFFICULTY, GASLIMIT,
+ * CHAINID, BASEFEE) are inlined directly into interpreter.c dispatch labels.
+ *
+ * This file contains the remaining opcodes that are still called as functions.
  */
 
 #include "opcodes/block.h"
@@ -13,15 +18,10 @@
 #include <string.h>
 
 //==============================================================================
-// Block Information Opcodes
+// BLOCKHASH - Get hash of one of the 256 most recent blocks
 //==============================================================================
 
-/**
- * BLOCKHASH - Get hash of one of the 256 most recent blocks
- * Stack: blockNumber => hash (or 0 if out of range)
- * Gas: 20
- */
-evm_status_t op_blockhash(evm_t *evm)
+static evm_status_t op_blockhash(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
@@ -106,164 +106,11 @@ evm_status_t op_blockhash(evm_t *evm)
     return EVM_SUCCESS;
 }
 
-/**
- * COINBASE - Get block beneficiary address
- * Stack: => coinbase
- * Gas: 2
- */
-evm_status_t op_coinbase(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
+//==============================================================================
+// SELFBALANCE - Get balance of current contract
+//==============================================================================
 
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    // Convert address to uint256 and push to stack
-    uint256_t coinbase;
-    address_to_uint256(&evm->block.coinbase, &coinbase);
-
-    if (!evm_stack_push(evm->stack, &coinbase))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * TIMESTAMP - Get block timestamp
- * Stack: => timestamp
- * Gas: 2
- */
-evm_status_t op_timestamp(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    uint256_t timestamp = uint256_from_uint64(evm->block.timestamp);
-
-    if (!evm_stack_push(evm->stack, &timestamp))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * NUMBER - Get block number
- * Stack: => number
- * Gas: 2
- */
-evm_status_t op_number(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    uint256_t number = uint256_from_uint64(evm->block.number);
-
-    if (!evm_stack_push(evm->stack, &number))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * DIFFICULTY - Get block difficulty (pre-merge) or PREVRANDAO (post-merge)
- * Stack: => difficulty
- * Gas: 2
- */
-evm_status_t op_difficulty(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    if (!evm_stack_push(evm->stack, &evm->block.difficulty))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * GASLIMIT - Get block gas limit
- * Stack: => gas_limit
- * Gas: 2
- */
-evm_status_t op_gaslimit(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    uint256_t gas_limit = uint256_from_uint64(evm->block.gas_limit);
-
-    if (!evm_stack_push(evm->stack, &gas_limit))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * CHAINID - Get chain ID
- * Stack: => chain_id
- * Gas: 2
- */
-evm_status_t op_chainid(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
-
-    // EIP-1344: CHAINID introduced in Istanbul
-    if (evm->fork < FORK_ISTANBUL)
-        return EVM_INVALID_OPCODE;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    if (!evm_stack_push(evm->stack, &evm->block.chain_id))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * SELFBALANCE - Get balance of current contract
- * Stack: => balance
- * Gas: 5
- */
-evm_status_t op_selfbalance(evm_t *evm)
+static evm_status_t op_selfbalance(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
@@ -288,39 +135,11 @@ evm_status_t op_selfbalance(evm_t *evm)
     return EVM_SUCCESS;
 }
 
-/**
- * BASEFEE - Get base fee (EIP-1559)
- * Stack: => base_fee
- * Gas: 2
- */
-evm_status_t op_basefee(evm_t *evm)
-{
-    if (!evm)
-        return EVM_INTERNAL_ERROR;
+//==============================================================================
+// BLOBHASH - Get versioned hash at index (EIP-4844, Cancun+)
+//==============================================================================
 
-    // EIP-3198: BASEFEE introduced in London
-    if (evm->fork < FORK_LONDON)
-        return EVM_INVALID_OPCODE;
-
-    if (!evm_use_gas(evm, GAS_BASE))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    if (!evm_stack_push(evm->stack, &evm->block.base_fee))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-/**
- * BLOBHASH - Get versioned hash at index (EIP-4844, Cancun+)
- * Stack: index => hash
- * Gas: 3
- */
-evm_status_t op_blobhash(evm_t *evm)
+static evm_status_t op_blobhash(evm_t *evm)
 {
     if (!evm || !evm->stack)
         return EVM_INTERNAL_ERROR;
@@ -352,12 +171,11 @@ evm_status_t op_blobhash(evm_t *evm)
     return EVM_SUCCESS;
 }
 
-/**
- * BLOBBASEFEE - Get blob base fee (EIP-7516, Cancun+)
- * Stack: => blob_base_fee
- * Gas: 2
- */
-evm_status_t op_blobbasefee(evm_t *evm)
+//==============================================================================
+// BLOBBASEFEE - Get blob base fee (EIP-7516, Cancun+)
+//==============================================================================
+
+static evm_status_t op_blobbasefee(evm_t *evm)
 {
     if (!evm || !evm->stack)
         return EVM_INTERNAL_ERROR;

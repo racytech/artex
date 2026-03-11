@@ -36,6 +36,8 @@
 #define MAX_NIBBLES        64           /* 32-byte key = 64 nibbles */
 #define MAX_NODE_RLP       1024         /* generous upper bound for node RLP */
 #define DIRTY_INIT_CAP     256
+#define DEFERRED_INIT_CAP  256
+#define DEFERRED_BUCKETS   4096   /* hash table buckets for deferred node index */
 
 /* Size-class slot allocator: nodes are padded to the smallest class that fits.
  * Freed slots form intrusive linked lists (next-pointer stored in first 8B). */
@@ -370,6 +372,15 @@ typedef struct {
  * Main struct
  * ========================================================================= */
 
+/* Deferred write buffer entry — node not yet written to disk */
+typedef struct {
+    uint8_t  hash[32];
+    uint8_t *rlp;        /* malloc'd copy of node RLP */
+    uint32_t rlp_len;
+    uint64_t offset;     /* allocated slot (in-memory alloc_slot result) */
+    int      ht_next;    /* next index in hash chain, -1 = end */
+} deferred_entry_t;
+
 struct mpt_store {
     disk_hash_t     *index;
     int              data_fd;
@@ -387,6 +398,20 @@ struct mpt_store {
     bool             batch_active;
 
     node_cache_t    *cache;          /* NULL = no caching */
+
+    bool             shared;         /* multi-trie mode: skip node deletion */
+
+    /* Deferred write buffer: nodes allocated but not yet pwrite'd to disk.
+     * Flushed to disk on mpt_store_flush() at checkpoint time. */
+    deferred_entry_t *def_entries;
+    size_t            def_count;
+    size_t            def_cap;
+    int               def_ht[DEFERRED_BUCKETS]; /* hash table heads, -1 = empty */
+
+    /* Pending deletes: on-disk node hashes to delete at flush time */
+    uint8_t         (*def_deletes)[32];
+    size_t            def_del_count;
+    size_t            def_del_cap;
 
     char            *idx_path;
     char            *dat_path;
@@ -771,6 +796,138 @@ static bool decode_node(const uint8_t *rlp, size_t rlp_len, mpt_node_t *node) {
 }
 
 /* =========================================================================
+ * Deferred write buffer helpers
+ * ========================================================================= */
+
+static void def_init(mpt_store_t *ms) {
+    memset(ms->def_ht, 0xff, sizeof(ms->def_ht));  /* -1 = empty */
+    ms->def_count = 0;
+}
+
+static uint32_t def_bucket(const uint8_t hash[32]) {
+    uint32_t h;
+    memcpy(&h, hash, 4);
+    return h % DEFERRED_BUCKETS;
+}
+
+static bool def_contains(const mpt_store_t *ms, const uint8_t hash[32]) {
+    uint32_t b = def_bucket(hash);
+    int idx = ms->def_ht[b];
+    while (idx >= 0) {
+        if (memcmp(ms->def_entries[idx].hash, hash, 32) == 0 &&
+            ms->def_entries[idx].rlp != NULL)
+            return true;
+        idx = ms->def_entries[idx].ht_next;
+    }
+    return false;
+}
+
+/* Find deferred entry by hash. Returns NULL if not found or removed. */
+static const deferred_entry_t *def_find(const mpt_store_t *ms,
+                                         const uint8_t hash[32]) {
+    uint32_t b = def_bucket(hash);
+    int idx = ms->def_ht[b];
+    while (idx >= 0) {
+        if (memcmp(ms->def_entries[idx].hash, hash, 32) == 0 &&
+            ms->def_entries[idx].rlp != NULL)
+            return &ms->def_entries[idx];
+        idx = ms->def_entries[idx].ht_next;
+    }
+    return NULL;
+}
+
+static bool def_append(mpt_store_t *ms, const uint8_t hash[32],
+                        const uint8_t *rlp, uint32_t rlp_len, uint64_t offset) {
+    if (ms->def_count >= ms->def_cap) {
+        size_t new_cap = ms->def_cap ? ms->def_cap * 2 : DEFERRED_INIT_CAP;
+        deferred_entry_t *p = realloc(ms->def_entries,
+                                       new_cap * sizeof(deferred_entry_t));
+        if (!p) return false;
+        ms->def_entries = p;
+        ms->def_cap = new_cap;
+    }
+    deferred_entry_t *e = &ms->def_entries[ms->def_count];
+    memcpy(e->hash, hash, 32);
+    e->rlp = malloc(rlp_len);
+    if (!e->rlp) return false;
+    memcpy(e->rlp, rlp, rlp_len);
+    e->rlp_len = rlp_len;
+    e->offset = offset;
+
+    uint32_t b = def_bucket(hash);
+    e->ht_next = ms->def_ht[b];
+    ms->def_ht[b] = (int)ms->def_count;
+    ms->def_count++;
+    return true;
+}
+
+/* Remove a deferred entry. Returns true if found and removed.
+ * Returns the slot to the free list. */
+static bool def_remove(mpt_store_t *ms, const uint8_t hash[32]) {
+    uint32_t b = def_bucket(hash);
+    int idx = ms->def_ht[b];
+    int *prev = &ms->def_ht[b];
+    while (idx >= 0) {
+        deferred_entry_t *e = &ms->def_entries[idx];
+        if (memcmp(e->hash, hash, 32) == 0 && e->rlp != NULL) {
+            /* Unlink from hash chain */
+            *prev = e->ht_next;
+            /* Return slot to free list */
+            int sc = size_class_for(e->rlp_len);
+            free_list_push(&ms->free_lists[sc], e->offset);
+            ms->free_slot_bytes += SIZE_CLASSES[sc];
+            /* Free RLP data and mark as removed */
+            free(e->rlp);
+            e->rlp = NULL;
+            return true;
+        }
+        prev = &e->ht_next;
+        idx = e->ht_next;
+    }
+    return false;
+}
+
+/* Pending deletes for on-disk nodes */
+static bool def_del_append(mpt_store_t *ms, const uint8_t hash[32]) {
+    if (ms->def_del_count >= ms->def_del_cap) {
+        size_t new_cap = ms->def_del_cap ? ms->def_del_cap * 2 : 64;
+        void *p = realloc(ms->def_deletes, new_cap * 32);
+        if (!p) return false;
+        ms->def_deletes = p;
+        ms->def_del_cap = new_cap;
+    }
+    memcpy(ms->def_deletes[ms->def_del_count], hash, 32);
+    ms->def_del_count++;
+    return true;
+}
+
+/* Cancel a pending delete (when dedup detects the node is still needed). */
+static void def_del_cancel(mpt_store_t *ms, const uint8_t hash[32]) {
+    for (size_t i = 0; i < ms->def_del_count; i++) {
+        if (memcmp(ms->def_deletes[i], hash, 32) == 0) {
+            /* Swap with last and shrink */
+            if (i < ms->def_del_count - 1)
+                memcpy(ms->def_deletes[i],
+                       ms->def_deletes[ms->def_del_count - 1], 32);
+            ms->def_del_count--;
+            return;
+        }
+    }
+}
+
+static void def_free_all(mpt_store_t *ms) {
+    for (size_t i = 0; i < ms->def_count; i++)
+        free(ms->def_entries[i].rlp);
+    free(ms->def_entries);
+    ms->def_entries = NULL;
+    ms->def_count = ms->def_cap = 0;
+    free(ms->def_deletes);
+    ms->def_deletes = NULL;
+    ms->def_del_count = ms->def_del_cap = 0;
+    def_init(ms);
+}
+
+/* =========================================================================
  * Node I/O
  * ========================================================================= */
 
@@ -783,6 +940,18 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
         uint16_t cached_len;
         if (ncache_get(ms->cache, hash, buf, &cached_len))
             return cached_len;
+    }
+
+    /* Check deferred buffer (for cache-evicted deferred entries) */
+    const deferred_entry_t *de = def_find(ms, hash);
+    if (de) {
+        if (de->rlp_len <= MAX_NODE_RLP) {
+            memcpy(buf, de->rlp, de->rlp_len);
+            /* Re-populate cache */
+            if (ms->cache)
+                ncache_put(ms->cache, hash, buf, (uint16_t)de->rlp_len);
+        }
+        return de->rlp_len;
     }
 
     node_record_t rec;
@@ -809,8 +978,15 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
                        uint8_t out_hash[32]) {
     keccak(rlp, rlp_len, out_hash);
 
-    /* Skip if already exists (dedup — e.g., same branch structure) */
-    if (disk_hash_contains(ms->index, out_hash))
+    /* Skip if already exists on disk (dedup — e.g., same branch structure) */
+    if (disk_hash_contains(ms->index, out_hash)) {
+        /* Cancel any pending delete — this node is still needed */
+        def_del_cancel(ms, out_hash);
+        return true;
+    }
+
+    /* Skip if already in deferred buffer */
+    if (def_contains(ms, out_hash))
         return true;
 
     /* Allocate a slot: try free list first, then append */
@@ -827,39 +1003,31 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         ms->data_size += slot_size;
     }
 
-    ssize_t n = pwrite(ms->data_fd, rlp, rlp_len,
-                       (off_t)(PAGE_SIZE + write_offset));
-    if (n != (ssize_t)rlp_len)
-        return false;
-
-    /* Insert index entry (stores actual RLP length, not slot size) */
-    node_record_t rec = { .offset = write_offset, .length = (uint32_t)rlp_len };
-    if (!disk_hash_put(ms->index, out_hash, &rec))
+    /* Buffer in deferred write buffer (no pwrite, no disk_hash_put) */
+    if (!def_append(ms, out_hash, rlp, (uint32_t)rlp_len, write_offset))
         return false;
 
     ms->live_bytes += rlp_len;
 
-    /* Cache newly written node — very likely to be read next block */
+    /* Cache for fast reads within this checkpoint interval */
     if (ms->cache && rlp_len <= MAX_NODE_RLP)
         ncache_put(ms->cache, out_hash, rlp, (uint16_t)rlp_len);
 
     return true;
 }
 
-/* Delete a node: remove from index and push its slot onto the free list */
+/* Delete a node: buffer the delete for flush time */
 static void delete_node(mpt_store_t *ms, const uint8_t hash[32]) {
-    /* Look up the record to get offset and size before deleting */
-    node_record_t rec;
-    if (disk_hash_get(ms->index, hash, &rec)) {
-        if (ms->live_bytes >= rec.length)
-            ms->live_bytes -= rec.length;
-
-        /* Push slot onto its size-class free list (in-memory, no disk I/O) */
-        int sc = size_class_for(rec.length);
-        free_list_push(&ms->free_lists[sc], rec.offset);
-        ms->free_slot_bytes += SIZE_CLASSES[sc];
+    /* Check if this is a deferred entry (not on disk yet) */
+    if (def_remove(ms, hash)) {
+        /* Was in deferred buffer — removed, slot returned to free list */
+        if (ms->cache)
+            ncache_delete(ms->cache, hash);
+        return;
     }
-    disk_hash_delete(ms->index, hash);
+
+    /* On-disk node: defer the actual delete until flush */
+    def_del_append(ms, hash);
 
     /* Evict from cache */
     if (ms->cache)
@@ -1011,6 +1179,7 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
     ms->idx_path  = idx_path;
     ms->dat_path  = dat_path;
     /* free_heads and free_slot_bytes zeroed by calloc */
+    def_init(ms);
 
     write_header(data_fd, ms);
 
@@ -1074,6 +1243,7 @@ mpt_store_t *mpt_store_open(const char *path) {
     }
     ms->idx_path  = idx_path;
     ms->dat_path  = dat_path;
+    def_init(ms);
 
     /* Enable default LRU cache */
     mpt_store_set_cache_mb(ms, MPT_DEFAULT_CACHE_MB);
@@ -1090,6 +1260,9 @@ void mpt_store_destroy(mpt_store_t *ms) {
             free(ms->dirty[i].value);
         free(ms->dirty);
     }
+
+    /* Free deferred write buffer */
+    def_free_all(ms);
 
     ncache_destroy(ms->cache);
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
@@ -1108,6 +1281,44 @@ void mpt_store_sync(mpt_store_t *ms) {
     disk_hash_sync(ms->index);
 }
 
+void mpt_store_flush(mpt_store_t *ms) {
+    if (!ms) return;
+
+    /* 1. Write all deferred nodes to .dat + .idx */
+    for (size_t i = 0; i < ms->def_count; i++) {
+        deferred_entry_t *e = &ms->def_entries[i];
+        if (!e->rlp) continue;  /* removed entry (hole) */
+
+        pwrite(ms->data_fd, e->rlp, e->rlp_len,
+               (off_t)(PAGE_SIZE + e->offset));
+
+        node_record_t rec = { .offset = e->offset,
+                              .length = e->rlp_len };
+        disk_hash_put(ms->index, e->hash, &rec);
+    }
+
+    /* 2. Apply pending deletes */
+    for (size_t i = 0; i < ms->def_del_count; i++) {
+        node_record_t rec;
+        if (disk_hash_get(ms->index, ms->def_deletes[i], &rec)) {
+            if (ms->live_bytes >= rec.length)
+                ms->live_bytes -= rec.length;
+            int sc = size_class_for(rec.length);
+            free_list_push(&ms->free_lists[sc], rec.offset);
+            ms->free_slot_bytes += SIZE_CLASSES[sc];
+        }
+        disk_hash_delete(ms->index, ms->def_deletes[i]);
+    }
+
+    /* 3. Free deferred buffers */
+    def_free_all(ms);
+
+    /* 4. Sync header + fsync both files */
+    write_header(ms->data_fd, ms);
+    fsync(ms->data_fd);
+    disk_hash_sync(ms->index);
+}
+
 /* =========================================================================
  * Root hash
  * ========================================================================= */
@@ -1115,6 +1326,16 @@ void mpt_store_sync(mpt_store_t *ms) {
 void mpt_store_root(const mpt_store_t *ms, uint8_t out[32]) {
     if (!ms) { memset(out, 0, 32); return; }
     memcpy(out, ms->root_hash, 32);
+}
+
+void mpt_store_set_root(mpt_store_t *ms, const uint8_t root[32]) {
+    if (!ms) return;
+    memcpy(ms->root_hash, root, 32);
+}
+
+void mpt_store_set_shared(mpt_store_t *ms, bool shared) {
+    if (!ms) return;
+    ms->shared = shared;
 }
 
 /* =========================================================================
@@ -1210,12 +1431,17 @@ static node_ref_t build_fresh(mpt_store_t *ms, dirty_entry_t *entries,
                          entries[start].value, entries[start].value_len);
     }
 
-    /* Compact live entries to front (stable order) */
+    /* Compact live entries to front (stable order).
+     * NULL out moved entries' value pointers to prevent double-free
+     * when commit_batch frees all dirty[0..count-1].value pointers. */
     if (live < end - start) {
         size_t w = start;
         for (size_t r = start; r < end; r++) {
             if (entries[r].value != NULL) {
-                if (w != r) entries[w] = entries[r];
+                if (w != r) {
+                    entries[w] = entries[r];
+                    entries[r].value = NULL;
+                }
                 w++;
             }
         }
@@ -1305,8 +1531,11 @@ static int single_child_index(const node_ref_t children[16]) {
     return idx;
 }
 
-/* Delete a stored node referenced by a ref (no-op for inline/empty) */
+/* Delete a stored node referenced by a ref (no-op for inline/empty).
+ * In shared (multi-trie) mode, skip deletion entirely — nodes may be
+ * referenced by other tries. Orphaned nodes are reclaimed by compaction. */
 static void delete_ref(mpt_store_t *ms, const node_ref_t *ref) {
+    if (ms->shared) return;
     if (ref->type == REF_HASH)
         delete_node(ms, ref->hash);
     /* Inline nodes are embedded in parent — nothing to delete */
@@ -1423,9 +1652,6 @@ static node_ref_t merge_leaf(mpt_store_t *ms, const node_ref_t *old_ref,
     const uint8_t *leaf_suffix = leaf->leaf.path;
     size_t leaf_suffix_len = leaf->leaf.path_len;
 
-    /* Delete old leaf */
-    delete_ref(ms, old_ref);
-
     /* If only one dirty entry and it matches the leaf's key exactly */
     if (end - start == 1) {
         /* Check if the dirty key suffix matches */
@@ -1441,6 +1667,7 @@ static node_ref_t merge_leaf(mpt_store_t *ms, const node_ref_t *old_ref,
 
         if (match) {
             /* Update or delete the existing leaf */
+            delete_ref(ms, old_ref);
             if (entries[start].value == NULL) {
                 return (node_ref_t){ .type = REF_EMPTY };
             }
@@ -1453,7 +1680,9 @@ static node_ref_t merge_leaf(mpt_store_t *ms, const node_ref_t *old_ref,
      * then build a fresh subtrie from all entries combined */
     size_t total = (end - start) + 1;
     dirty_entry_t *merged = malloc(total * sizeof(*merged));
-    if (!merged) return (node_ref_t){ .type = REF_EMPTY };
+    if (!merged) return *old_ref;  /* allocation failed — keep trie unchanged */
+
+    delete_ref(ms, old_ref);
 
     /* Add existing leaf as first entry */
     memset(merged[0].nibbles, 0, MAX_NIBBLES);
@@ -1614,12 +1843,59 @@ static node_ref_t merge_extension(mpt_store_t *ms, const node_ref_t *old_ref,
         i = group_end;
     }
 
-    node_ref_t branch_ref = make_branch(ms, children);
+    /* Check if the branch is degenerate after processing dirty entries.
+     * Dirty entries that were deletes of non-existent keys produce REF_EMPTY
+     * children, so the branch may have fewer non-empty children than expected.
+     * A branch with 0 or 1 children is non-canonical and must be collapsed. */
+    int non_empty = count_children(children);
 
-    if (shared > 0) {
-        return make_extension(ms, ext_path, shared, &branch_ref);
+    if (non_empty == 0) {
+        return (node_ref_t){ .type = REF_EMPTY };
     }
-    return branch_ref;
+
+    node_ref_t subtrie_ref;
+    if (non_empty == 1) {
+        subtrie_ref = collapse_branch(ms, children);
+    } else {
+        subtrie_ref = make_branch(ms, children);
+    }
+
+    /* Prepend shared prefix (if any), maintaining canonical structure:
+     * ext + leaf → leaf, ext + ext → ext, ext + branch → ext(branch) */
+    if (shared > 0) {
+        if (subtrie_ref.type == REF_EMPTY)
+            return subtrie_ref;
+
+        uint8_t buf2[MAX_NODE_RLP];
+        size_t buf2_len;
+        mpt_node_t sub_node;
+        if (load_from_ref(ms, &subtrie_ref, buf2, &buf2_len, &sub_node)) {
+            if (sub_node.type == MPT_NODE_LEAF) {
+                /* ext(shared) + leaf(M) → leaf(shared+M) */
+                delete_ref(ms, &subtrie_ref);
+                uint8_t mp[MAX_NIBBLES];
+                memcpy(mp, ext_path, shared);
+                memcpy(mp + shared, sub_node.leaf.path,
+                       sub_node.leaf.path_len);
+                return make_leaf(ms, mp, shared + sub_node.leaf.path_len,
+                                 sub_node.leaf.value, sub_node.leaf.value_len);
+            }
+            if (sub_node.type == MPT_NODE_EXTENSION) {
+                /* ext(shared) + ext(M) → ext(shared+M) */
+                delete_ref(ms, &subtrie_ref);
+                uint8_t mp[MAX_NIBBLES];
+                memcpy(mp, ext_path, shared);
+                memcpy(mp + shared, sub_node.extension.path,
+                       sub_node.extension.path_len);
+                return make_extension(ms, mp,
+                                      shared + sub_node.extension.path_len,
+                                      &sub_node.extension.child);
+            }
+        }
+        return make_extension(ms, ext_path, shared, &subtrie_ref);
+    }
+
+    return subtrie_ref;
 }
 
 /* Core recursive function: update a subtrie with dirty entries */
@@ -1724,6 +2000,86 @@ bool mpt_store_commit_batch(mpt_store_t *ms) {
 }
 
 /* =========================================================================
+ * Point Lookup
+ * ========================================================================= */
+
+uint32_t mpt_store_get(const mpt_store_t *ms, const uint8_t key[32],
+                        uint8_t *buf, uint32_t buf_len) {
+    if (!ms) return 0;
+
+    /* Empty trie */
+    if (memcmp(ms->root_hash, EMPTY_ROOT, 32) == 0)
+        return 0;
+
+    /* Convert key to nibbles */
+    uint8_t key_nibs[MAX_NIBBLES];
+    bytes_to_nibbles(key, 32, key_nibs);
+    size_t depth = 0;
+
+    /* Start from root */
+    node_ref_t ref;
+    ref.type = REF_HASH;
+    memcpy(ref.hash, ms->root_hash, 32);
+
+    uint8_t node_buf[MAX_NODE_RLP];
+    size_t node_buf_len;
+    mpt_node_t node;
+
+    for (;;) {
+        if (!load_from_ref(ms, &ref, node_buf, &node_buf_len, &node))
+            return 0;
+
+        switch (node.type) {
+        case MPT_NODE_BRANCH: {
+            if (depth >= MAX_NIBBLES)
+                return 0;  /* consumed all nibbles at a branch = not found */
+            uint8_t nib = key_nibs[depth];
+            ref = node.branch.children[nib];
+            if (ref.type == REF_EMPTY)
+                return 0;  /* no child at this nibble */
+            depth++;
+            break;
+        }
+
+        case MPT_NODE_EXTENSION: {
+            /* Verify path nibbles match */
+            if (depth + node.extension.path_len > MAX_NIBBLES)
+                return 0;
+            if (memcmp(key_nibs + depth, node.extension.path,
+                       node.extension.path_len) != 0)
+                return 0;  /* path mismatch */
+            depth += node.extension.path_len;
+            ref = node.extension.child;
+            if (ref.type == REF_EMPTY)
+                return 0;
+            break;
+        }
+
+        case MPT_NODE_LEAF: {
+            /* Verify remaining key nibbles match leaf path */
+            size_t remaining = MAX_NIBBLES - depth;
+            if (node.leaf.path_len != remaining)
+                return 0;
+            if (memcmp(key_nibs + depth, node.leaf.path, remaining) != 0)
+                return 0;  /* key mismatch */
+
+            /* Found! Return value. */
+            uint32_t vlen = (uint32_t)node.leaf.value_len;
+            if (vlen == 0)
+                return 0;
+            if (buf_len < vlen)
+                return vlen;  /* caller buffer too small */
+            memcpy(buf, node.leaf.value, vlen);
+            return vlen;
+        }
+
+        default:
+            return 0;
+        }
+    }
+}
+
+/* =========================================================================
  * Compaction
  * ========================================================================= */
 
@@ -1763,6 +2119,7 @@ static bool compact_walk(const mpt_store_t *old_ms, mpt_store_t *new_ms,
 
 bool mpt_store_compact(mpt_store_t *ms) {
     if (!ms || ms->batch_active) return false;
+    if (ms->shared) return false;  /* unsafe: would delete other tries' nodes */
 
     /* Create temp paths */
     char *tmp_path = make_path(ms->dat_path, ".compact");
@@ -1793,9 +2150,16 @@ bool mpt_store_compact(mpt_store_t *ms) {
 
     bool ok = compact_walk(ms, new_ms, &root_ref);
     if (!ok) {
+        /* Save paths before destroy frees them */
+        char *fail_idx = new_ms->idx_path;
+        char *fail_dat = new_ms->dat_path;
+        new_ms->idx_path = NULL;
+        new_ms->dat_path = NULL;
         mpt_store_destroy(new_ms);
-        unlink(new_ms->idx_path);
-        unlink(new_ms->dat_path);
+        unlink(fail_idx);
+        unlink(fail_dat);
+        free(fail_idx);
+        free(fail_dat);
         free(tmp_path); free(tmp_base);
         return false;
     }
@@ -1837,9 +2201,10 @@ bool mpt_store_compact(mpt_store_t *ms) {
     }
 
     /* Cleanup new_ms (files already renamed, just free struct) */
+    close(new_ms->data_fd);
+    disk_hash_destroy(new_ms->index);
     new_ms->idx_path = NULL;
     new_ms->dat_path = NULL;
-    /* Can't use mpt_store_destroy since index/fd are stale */
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
         free_list_destroy(&new_ms->free_lists[i]);
     ncache_destroy(new_ms->cache);

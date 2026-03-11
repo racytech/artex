@@ -24,9 +24,11 @@
 #include "uint256.h"
 #include "evm.h"
 #include "evm_state.h"
+#ifdef ENABLE_VERKLE
 #include "verkle_state.h"
+#endif
 #include "fork.h"
-#include "mpt.h"
+#include "mem_mpt.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -272,11 +274,22 @@ static void test_executor_smoke(void) {
      */
 
     /* Create verkle state (in-memory tree) */
+#ifdef ENABLE_VERKLE
     verkle_state_t *vs = verkle_state_create();
     ASSERT(vs != NULL, "create verkle_state");
+#else
+    void *vs = NULL;
+#endif
 
     /* Create EVM state */
-    evm_state_t *state = evm_state_create(vs, "/tmp/test_block_executor_mpt");
+    evm_state_t *state = evm_state_create(vs,
+#ifdef ENABLE_MPT
+        "/tmp/test_block_executor_mpt",
+#else
+        NULL,
+#endif
+        NULL  /* no code_store for tests */
+    );
     ASSERT(state != NULL, "create evm_state");
 
     /* Create EVM */
@@ -356,7 +369,9 @@ static void test_executor_smoke(void) {
     rlp_item_free(body_rlp);
     evm_destroy(evm);
     evm_state_destroy(state);
+#ifdef ENABLE_VERKLE
     verkle_state_destroy(vs);
+#endif
 
     PASS();
 }
@@ -369,9 +384,20 @@ static void test_dao_fork(void) {
     TEST("DAO fork drain");
 
     /* Create verkle state + evm state (no EVM needed, just state) */
+#ifdef ENABLE_VERKLE
     verkle_state_t *vs = verkle_state_create();
     ASSERT(vs != NULL, "create verkle_state");
-    evm_state_t *state = evm_state_create(vs, "/tmp/test_block_executor_mpt");
+#else
+    void *vs = NULL;
+#endif
+    evm_state_t *state = evm_state_create(vs,
+#ifdef ENABLE_MPT
+        "/tmp/test_block_executor_mpt",
+#else
+        NULL,
+#endif
+        NULL  /* no code_store for tests */
+    );
     ASSERT(state != NULL, "create evm_state");
 
     /* Pick 3 drain addresses from the list and give them known balances */
@@ -416,7 +442,9 @@ static void test_dao_fork(void) {
 
     /* Cleanup */
     evm_state_destroy(state);
+#ifdef ENABLE_VERKLE
     verkle_state_destroy(vs);
+#endif
     PASS();
 }
 
@@ -428,9 +456,20 @@ static void test_dao_fork_block_check(void) {
     TEST("DAO fork block/chain gate");
 
     /* Create state with balance on a drain address */
+#ifdef ENABLE_VERKLE
     verkle_state_t *vs = verkle_state_create();
     ASSERT(vs != NULL, "create verkle_state");
-    evm_state_t *state = evm_state_create(vs, "/tmp/test_block_executor_mpt");
+#else
+    void *vs = NULL;
+#endif
+    evm_state_t *state = evm_state_create(vs,
+#ifdef ENABLE_MPT
+        "/tmp/test_block_executor_mpt",
+#else
+        NULL,
+#endif
+        NULL  /* no code_store for tests */
+    );
     ASSERT(state != NULL, "create evm_state");
     evm_t *evm = evm_create(state, chain_config_mainnet());
     ASSERT(evm != NULL, "create evm");
@@ -469,7 +508,9 @@ static void test_dao_fork_block_check(void) {
     rlp_item_free(body_rlp);
     evm_destroy(evm);
     evm_state_destroy(state);
+#ifdef ENABLE_VERKLE
     verkle_state_destroy(vs);
+#endif
     PASS();
 }
 

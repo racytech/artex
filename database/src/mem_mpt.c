@@ -1,14 +1,16 @@
-#include "mpt.h"
-#include "keccak256.h"
-#include <stdlib.h>
-#include <string.h>
-
 /**
- * Batch MPT Root Computation
+ * In-Memory Batch MPT Root Computation (testing only)
  *
  * Computes the Ethereum Merkle Patricia Trie root hash from sorted key-value
  * pairs. Stack-allocated RLP buffers, zero heap allocation in the hot path.
+ *
+ * For production use, see mpt_store.c (disk-backed, incremental updates).
  */
+
+#include "mem_mpt.h"
+#include "keccak256.h"
+#include <stdlib.h>
+#include <string.h>
 
 //==============================================================================
 // Nibble / Hex-prefix utilities
@@ -58,7 +60,7 @@ static void keccak256(const uint8_t *data, size_t len, uint8_t out[32]) {
 }
 
 //==============================================================================
-// Stack-based RLP buffer (768 bytes — fits branch nodes, ~532 bytes max)
+// Stack-based RLP buffer (768 bytes -- fits branch nodes, ~532 bytes max)
 //==============================================================================
 
 typedef struct {
@@ -175,7 +177,7 @@ static bool branch_hash(const hash_t children[16], hash_t *out) {
         else
             sbuf_encode_bytes(&payload, children[i].bytes, 32);
     }
-    sbuf_encode_empty(&payload);  // value slot — always empty for state/storage tries
+    sbuf_encode_empty(&payload);  // value slot -- always empty for state/storage tries
 
     rlp_sbuf_t node; sbuf_reset(&node);
     sbuf_list_wrap(&node, &payload);
@@ -228,7 +230,7 @@ static bool build_subtrie(batch_leaf_t *leaves, size_t start, size_t end,
         return extension_hash(&leaves[start].nibbles[depth], common_len, &child, out);
     }
 
-    // Branch node — group by nibble at current depth
+    // Branch node -- group by nibble at current depth
     hash_t children[16];
     memset(children, 0, sizeof(children));
 

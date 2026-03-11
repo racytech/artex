@@ -1,5 +1,38 @@
 cmake_minimum_required(VERSION 3.15)
+
+# Load project config if present (avoids -D flags on every cmake invocation)
+if(EXISTS "${CMAKE_SOURCE_DIR}/config.cmake")
+    include("${CMAKE_SOURCE_DIR}/config.cmake")
+endif()
+
 project(art_database C)
+
+# Backend options (overridable via config.cmake or -D flags)
+option(ENABLE_MPT "Enable MPT (Merkle Patricia Trie) state root" ON)
+option(ENABLE_VERKLE "Enable Verkle state root" OFF)
+option(ENABLE_MEM_MPT "Enable in-memory batch MPT for test runner (not needed for chain_replay)" OFF)
+option(ENABLE_EVM_TRACE "Enable EIP-3155 EVM execution tracing" OFF)
+
+if(NOT ENABLE_MPT AND NOT ENABLE_VERKLE)
+    message(FATAL_ERROR "At least one state backend must be enabled (ENABLE_MPT or ENABLE_VERKLE)")
+endif()
+
+# Tunable parameters (overridable via config.cmake or -D flags)
+if(NOT DEFINED MPT_ACCOUNT_CACHE_MB)
+    set(MPT_ACCOUNT_CACHE_MB 2048)
+endif()
+if(NOT DEFINED MPT_STORAGE_CACHE_MB)
+    set(MPT_STORAGE_CACHE_MB 2048)
+endif()
+if(NOT DEFINED MPT_ACCOUNT_CAPACITY)
+    set(MPT_ACCOUNT_CAPACITY 500000000)
+endif()
+if(NOT DEFINED MPT_STORAGE_CAPACITY)
+    set(MPT_STORAGE_CAPACITY 500000000)
+endif()
+if(NOT DEFINED CHECKPOINT_INTERVAL)
+    set(CHECKPOINT_INTERVAL 256)
+endif()
 
 # Set C standard
 set(CMAKE_C_STANDARD 11)
@@ -8,7 +41,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Compiler flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -g -msse4.2")
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -O0 -DDEBUG")
-set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG")
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG -flto -march=native")
 
 # Include directories
 include_directories(
@@ -135,17 +168,18 @@ add_library(verkle_flat STATIC
 )
 target_link_libraries(verkle_flat verkle_commit_store art_store disk_hash pedersen banderwagon)
 
-# MPT batch root computation (Ethereum MPT state root from sorted key-value pairs)
-add_library(mpt STATIC
-    state/src/mpt.c
+# In-Memory Batch MPT (testing only — used by test runner for state root verification)
+add_library(mem_mpt STATIC
+    database/src/mem_mpt.c
 )
-target_link_libraries(mpt common)
+target_link_libraries(mem_mpt common)
 
 # MPT Store (persistent Merkle Patricia Trie with incremental updates)
 add_library(mpt_store STATIC
     database/src/mpt_store.c
 )
 target_include_directories(mpt_store PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+target_compile_definitions(mpt_store PRIVATE MPT_DEFAULT_CACHE_MB=${MPT_ACCOUNT_CACHE_MB})
 target_link_libraries(mpt_store disk_hash common)
 
 #==============================================================================
@@ -162,6 +196,7 @@ set_target_properties(secp256k1 PROPERTIES
 add_library(evm STATIC
     evm/src/evm.c
     evm/src/evm_state.c
+    evm/src/evm_tracer.c
     evm/src/witness_gas.c
     evm/src/evm_stack.c
     evm/src/evm_memory.c
@@ -169,18 +204,6 @@ add_library(evm STATIC
     evm/src/interpreter.c
     evm/src/fork.c
     evm/src/transaction.c
-    evm/src/opcodes/arithmetic.c
-    evm/src/opcodes/comparison.c
-    evm/src/opcodes/crypto.c
-    evm/src/opcodes/stack.c
-    evm/src/opcodes/memory.c
-    evm/src/opcodes/logging.c
-    evm/src/opcodes/storage.c
-    evm/src/opcodes/environmental.c
-    evm/src/opcodes/call.c
-    evm/src/opcodes/control.c
-    evm/src/opcodes/block.c
-    evm/src/opcodes/create.c
     evm/src/precompile.c
     evm/vendor/mini-gmp.c
     evm/vendor/bn256.c
@@ -189,7 +212,34 @@ target_include_directories(evm PUBLIC
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/evm/vendor
 )
-target_link_libraries(evm verkle_state art_database mpt mpt_store common ssl crypto secp256k1 blst)
+set(EVM_LINK_LIBS verkle_key pedersen banderwagon art_database common ssl crypto secp256k1 blst)
+if(ENABLE_MEM_MPT)
+    list(APPEND EVM_LINK_LIBS mem_mpt)
+endif()
+if(ENABLE_VERKLE)
+    list(APPEND EVM_LINK_LIBS verkle_state)
+endif()
+if(ENABLE_MPT)
+    list(APPEND EVM_LINK_LIBS mpt_store code_store)
+endif()
+target_link_libraries(evm ${EVM_LINK_LIBS})
+if(ENABLE_MPT)
+    target_compile_definitions(evm PUBLIC ENABLE_MPT=1)
+endif()
+if(ENABLE_VERKLE)
+    target_compile_definitions(evm PUBLIC ENABLE_VERKLE=1)
+endif()
+if(ENABLE_MEM_MPT)
+    target_compile_definitions(evm PUBLIC ENABLE_MEM_MPT=1)
+endif()
+if(ENABLE_EVM_TRACE)
+    target_compile_definitions(evm PUBLIC ENABLE_EVM_TRACE=1)
+endif()
+target_compile_definitions(evm PRIVATE
+    MPT_STORAGE_CACHE_MB=${MPT_STORAGE_CACHE_MB}
+    MPT_ACCOUNT_CAPACITY=${MPT_ACCOUNT_CAPACITY}
+    MPT_STORAGE_CAPACITY=${MPT_STORAGE_CAPACITY}
+)
 
 #==============================================================================
 # Libraries — Block Executor
@@ -205,7 +255,7 @@ add_library(block_executor STATIC
 target_include_directories(block_executor PUBLIC
     ${CMAKE_SOURCE_DIR}/executor/include
 )
-target_link_libraries(block_executor evm mpt common secp256k1)
+target_link_libraries(block_executor evm mem_mpt common secp256k1)
 
 #==============================================================================
 # Libraries — Networking / Portal
@@ -451,15 +501,12 @@ add_test(NAME test_verkle_snapshot COMMAND test_verkle_snapshot)
 add_executable(test_evm_state_audit
     evm/tests/test_evm_state_audit.c
 )
-target_link_libraries(test_evm_state_audit evm verkle_state)
+set(TEST_EVM_AUDIT_LIBS evm)
+if(ENABLE_VERKLE)
+    list(APPEND TEST_EVM_AUDIT_LIBS verkle_state)
+endif()
+target_link_libraries(test_evm_state_audit ${TEST_EVM_AUDIT_LIBS})
 add_test(NAME test_evm_state_audit COMMAND test_evm_state_audit)
-
-# Test: MPT Store (persistent trie with incremental updates)
-add_executable(test_mpt_store
-    database/tests/test_mpt_store.c
-)
-target_link_libraries(test_mpt_store mpt_store mpt common)
-add_test(NAME test_mpt_store COMMAND test_mpt_store)
 
 # Test: MPT Store cross-validation against Python reference vectors
 add_executable(test_mpt_store_vectors
@@ -649,7 +696,11 @@ add_test(NAME test_loopback COMMAND test_loopback)
 add_executable(test_block_executor
     executor/tests/test_block_executor.c
 )
-target_link_libraries(test_block_executor block_executor evm verkle_state common)
+set(TEST_BLOCK_EXEC_LIBS block_executor evm common)
+if(ENABLE_VERKLE)
+    list(APPEND TEST_BLOCK_EXEC_LIBS verkle_state)
+endif()
+target_link_libraries(test_block_executor ${TEST_BLOCK_EXEC_LIBS})
 add_test(NAME test_block_executor COMMAND test_block_executor)
 
 #==============================================================================
@@ -781,10 +832,23 @@ if(CJSON_FOUND)
     target_link_libraries(test_engine_handlers engine_rpc engine_handlers engine_types engine_store block_executor ${CJSON_LIBRARIES})
     add_test(NAME test_engine_handlers COMMAND test_engine_handlers)
 
+    # Sync engine (reusable block execution + validation + checkpointing)
+    add_library(sync STATIC sync/src/sync.c)
+    target_include_directories(sync PUBLIC ${CMAKE_SOURCE_DIR}/sync/include)
+    target_include_directories(sync PRIVATE ${CJSON_INCLUDE_DIRS})
+    set(SYNC_LIBS block_executor evm common ${CJSON_LIBRARIES})
+    if(ENABLE_VERKLE)
+        list(APPEND SYNC_LIBS verkle_state)
+    endif()
+    if(ENABLE_MPT)
+        list(APPEND SYNC_LIBS code_store)
+    endif()
+    target_link_libraries(sync ${SYNC_LIBS})
+
     # Chain replay tool
     add_executable(chain_replay tools/chain_replay.c)
-    target_include_directories(chain_replay PRIVATE ${CJSON_INCLUDE_DIRS})
-    target_link_libraries(chain_replay block_executor evm verkle_state mpt common ${CJSON_LIBRARIES})
+    target_compile_definitions(chain_replay PRIVATE CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL})
+    target_link_libraries(chain_replay sync)
 
     #==============================================================================
     # Integration Tests (Ethereum test vectors)
@@ -798,13 +862,11 @@ if(CJSON_FOUND)
             executor/include
             ${CJSON_INCLUDE_DIRS}
         )
-        target_link_libraries(integration_tests PUBLIC
-            evm
-            block_executor
-            verkle_state
-            common
-            ${CJSON_LIBRARIES}
-        )
+        set(INTEG_TEST_LIBS evm block_executor common ${CJSON_LIBRARIES})
+        if(ENABLE_VERKLE)
+            list(APPEND INTEG_TEST_LIBS verkle_state)
+        endif()
+        target_link_libraries(integration_tests PUBLIC ${INTEG_TEST_LIBS})
 
         add_executable(test_parser_verify integration_tests/test_parser_verify.c)
         target_link_libraries(test_parser_verify integration_tests)
@@ -817,6 +879,14 @@ if(CJSON_FOUND)
 
         add_executable(test_runner_failfast integration_tests/test_runner_failfast_main.c)
         target_link_libraries(test_runner_failfast integration_tests)
+
+        # EVM t8n tool (state transition, geth-compatible)
+        add_executable(evm_t8n tools/evm_t8n.c)
+        target_include_directories(evm_t8n PRIVATE
+            ${CMAKE_SOURCE_DIR}/net/include
+            ${CMAKE_SOURCE_DIR}/third_party/secp256k1/include
+        )
+        target_link_libraries(evm_t8n integration_tests secp256k1_wrap)
     endif()
 else()
     message(STATUS "cJSON not found — skipping integration tests (install: sudo apt-get install libcjson-dev)")
@@ -833,6 +903,15 @@ message(STATUS "========================================")
 message(STATUS "Build type:        ${CMAKE_BUILD_TYPE}")
 message(STATUS "C Compiler:        ${CMAKE_C_COMPILER}")
 message(STATUS "C Flags:           ${CMAKE_C_FLAGS}")
+message(STATUS "MPT backend:       ${ENABLE_MPT}")
+message(STATUS "Verkle backend:    ${ENABLE_VERKLE}")
+message(STATUS "")
+message(STATUS "Tuning:")
+message(STATUS "  Account cache:   ${MPT_ACCOUNT_CACHE_MB} MB")
+message(STATUS "  Storage cache:   ${MPT_STORAGE_CACHE_MB} MB")
+message(STATUS "  Account capacity:${MPT_ACCOUNT_CAPACITY}")
+message(STATUS "  Storage capacity:${MPT_STORAGE_CAPACITY}")
+message(STATUS "  Checkpoint every:${CHECKPOINT_INTERVAL} blocks")
 message(STATUS "")
 message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
@@ -843,6 +922,7 @@ message(STATUS "  - code_store (content-addressed bytecode storage)")
 message(STATUS "  - verkle (verkle tree with Pedersen commitments)")
 message(STATUS "  - evm (Ethereum Virtual Machine)")
 message(STATUS "  - block_executor (block decode + execution)")
+message(STATUS "  - sync (block execution + validation + checkpointing)")
 message(STATUS "  - portal (Portal Network stack)")
 message(STATUS "========================================")
 message(STATUS "")

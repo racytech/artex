@@ -8,6 +8,7 @@
 #include "evm_state.h"
 #include "evm_stack.h"
 #include "evm_memory.h"
+#include "evm_tracer.h"
 #include "uint256.h"
 #include "gas.h"
 #include "verkle_key.h"
@@ -280,7 +281,7 @@ static evm_status_t prepare_call(
  * CALL - Message call into an account
  * Stack: gas addr value argsOffset argsSize retOffset retSize => success
  */
-evm_status_t op_call(evm_t *evm)
+static evm_status_t op_call(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
         return EVM_INTERNAL_ERROR;
@@ -381,6 +382,9 @@ evm_status_t op_call(evm_t *evm)
     if (!exec_ok)
         return EVM_INTERNAL_ERROR;
 
+    EVM_TRACE_RETURN(subcall_result.output_data, subcall_result.output_size,
+                     gas_forwarded - subcall_result.gas_left, NULL);
+
     // Copy return data to memory
     if (ret_size_u64 > 0 && subcall_result.output_size > 0)
     {
@@ -425,7 +429,7 @@ evm_status_t op_call(evm_t *evm)
  * Stack: gas addr value argsOffset argsSize retOffset retSize => success
  * NOTE: Deprecated, use DELEGATECALL instead
  */
-evm_status_t op_callcode(evm_t *evm)
+static evm_status_t op_callcode(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
     {
@@ -541,6 +545,9 @@ evm_status_t op_callcode(evm_t *evm)
         return EVM_INTERNAL_ERROR;
     }
 
+    EVM_TRACE_RETURN(subcall_result.output_data, subcall_result.output_size,
+                     gas_forwarded - subcall_result.gas_left, NULL);
+
     if (ret_size_u64 > 0 && subcall_result.output_size > 0)
     {
         size_t copy_size = ret_size_u64 < subcall_result.output_size ? 
@@ -593,7 +600,7 @@ evm_status_t op_callcode(evm_t *evm)
  * Stack: gas addr argsOffset argsSize retOffset retSize => success
  * NOTE: No value parameter - delegates with caller's value
  */
-evm_status_t op_delegatecall(evm_t *evm)
+static evm_status_t op_delegatecall(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
     {
@@ -715,6 +722,9 @@ evm_status_t op_delegatecall(evm_t *evm)
         return EVM_INTERNAL_ERROR;
     }
 
+    EVM_TRACE_RETURN(subcall_result.output_data, subcall_result.output_size,
+                     gas_forwarded - subcall_result.gas_left, NULL);
+
     if (ret_size_u64 > 0 && subcall_result.output_size > 0)
     {
         size_t copy_size = ret_size_u64 < subcall_result.output_size ? 
@@ -755,7 +765,7 @@ evm_status_t op_delegatecall(evm_t *evm)
  * Stack: gas addr argsOffset argsSize retOffset retSize => success
  * NOTE: No value parameter - static calls cannot transfer value
  */
-evm_status_t op_staticcall(evm_t *evm)
+static evm_status_t op_staticcall(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
     {
@@ -875,6 +885,9 @@ evm_status_t op_staticcall(evm_t *evm)
         LOG_EVM_ERROR("STATICCALL: Subcall execution failed internally");
         return EVM_INTERNAL_ERROR;
     }
+
+    EVM_TRACE_RETURN(subcall_result.output_data, subcall_result.output_size,
+                     gas_forwarded - subcall_result.gas_left, NULL);
 
     if (ret_size_u64 > 0 && subcall_result.output_size > 0)
     {
