@@ -735,10 +735,11 @@ op_byte:
     {
         uint256_t *s = evm->stack->items;
         size_t t = evm->stack->size - 1;
-        uint64_t idx = uint256_to_uint64(&s[t]);
-        if (idx >= 32)
+        /* If index >= 32 (or has high bits set), result is zero */
+        if (s[t].high != 0 || s[t].low >= 32)
             s[t-1] = UINT256_ZERO;
         else {
+            uint64_t idx = (uint64_t)s[t].low;
             uint8_t b = uint256_byte(&s[t-1], idx);
             s[t-1] = (uint256_t){ (uint128_t)b, 0 };
         }

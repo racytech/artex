@@ -342,6 +342,8 @@ uint64_t gas_sha3_cost(uint64_t size)
 uint64_t gas_log_cost(uint8_t topic_count, uint64_t data_size)
 {
     // 375 gas base + 375 per topic + 8 per data byte
+    if (data_size > UINT64_MAX / 8)
+        return UINT64_MAX;
     return 375 + (375 * topic_count) + (8 * data_size);
 }
 

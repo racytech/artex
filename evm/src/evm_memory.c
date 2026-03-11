@@ -348,6 +348,9 @@ uint64_t evm_memory_access_cost(const evm_memory_t *mem, uint64_t offset, size_t
         return 0;
     }
 
+    if (offset > UINT64_MAX - size)
+        return UINT64_MAX;
+
     size_t current_size = mem->size;
     size_t new_size = round_up_to_word(offset + size);
 

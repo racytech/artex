@@ -496,6 +496,8 @@ static evm_status_t op_create(evm_t *evm)
     uint64_t mem_expansion_cost = 0;
 
     if (size_u64 > 0) {
+        if (offset_u64 > UINT64_MAX - size_u64)
+            return EVM_OUT_OF_GAS;
         mem_expansion_cost = evm_memory_expansion_cost(evm->memory->size, offset_u64 + size_u64);
     }
 
@@ -607,6 +609,8 @@ static evm_status_t op_create2(evm_t *evm)
     // Memory expansion cost
     uint64_t mem_expansion_cost = 0;
     if (size_u64 > 0) {
+        if (offset_u64 > UINT64_MAX - size_u64)
+            return EVM_OUT_OF_GAS;
         mem_expansion_cost = evm_memory_expansion_cost(evm->memory->size, offset_u64 + size_u64);
     }
 
