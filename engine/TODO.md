@@ -3,26 +3,28 @@
 ## P0: Correctness (blocks will be rejected or wrongly accepted without these)
 
 ### Log Capture Pipeline
-- [ ] Implement log capture in LOG0-LOG4 opcodes (`evm/src/opcodes/logging.c`)
-  - Define `log_t` struct (address, topics[0..4], topic_count, data, data_len)
-  - Add log accumulator to `evm_t` or transaction context
+- [x] Implement log capture in LOG0-LOG4 opcodes (`evm/src/opcodes/logging.c`)
+  - `evm_log_t` struct (address, topics[4], topic_count, data, data_len) in `evm/include/evm.h`
+  - Log accumulator on `evm_t` (logs, log_count, log_cap)
   - Copy contract address, memory data, and topics into log entry
-  - On REVERT: discard logs since snapshot (depth-aware)
-- [ ] Add `log_t *logs` + `log_count` fields to `transaction_result_t` (`evm/include/transaction.h`)
-  - Populate from EVM log accumulator after each `transaction_execute()`
-- [ ] Extend `tx_receipt_t` (`executor/include/block_executor.h`)
-  - Add `tx_type` (uint8_t) for typed receipt RLP envelope (EIP-2718)
-  - Add `status_code` (uint8_t) — 0=fail, 1=success (post-Byzantium)
-  - Add `logs_bloom[256]` — per-tx 2048-bit bloom filter
-  - Add `log_t *logs` + `log_count`
-  - Add `receipt_encode_rlp()` function
-- [ ] Add computed fields to `block_result_t` (`executor/include/block_executor.h`)
+  - On REVERT: truncate logs since snapshot (subcalls + CREATE/CREATE2)
+- [x] Add `evm_log_t *logs` + `log_count` fields to `transaction_result_t` (`evm/include/transaction.h`)
+  - Zero-copy ownership transfer from EVM accumulator after `transaction_execute()`
+- [x] Extend `tx_receipt_t` (`executor/include/block_executor.h`)
+  - `tx_type` (uint8_t) for typed receipt RLP envelope (EIP-2718)
+  - `status_code` (uint8_t) — 0=fail, 1=success (post-Byzantium)
+  - `logs_bloom[256]` — per-tx 2048-bit bloom filter (big-endian)
+  - `evm_log_t *logs` + `log_count`
+  - `receipt_encode_rlp()` in `executor/src/block_executor.c`
+- [x] Add computed fields to `block_result_t` (`executor/include/block_executor.h`)
   - `receipt_root` (hash_t) — MPT root of RLP-encoded receipts
   - `logs_bloom[256]` — aggregate bloom = OR of all per-tx blooms
+- [x] Fix `mpt_compute_root_unsecured()` leaf_hash overflow for large receipt values (`database/src/mem_mpt.c`)
 
 ### Payload Validation
-- [ ] Validate `receiptsRoot` from payload against computed receipt root (`engine/src/engine_handlers.c`)
-- [ ] Validate `logsBloom` from payload against computed block bloom (`engine/src/engine_handlers.c`)
+- [x] Validate `receiptsRoot` from payload against computed receipt root (engine test runner)
+- [x] Validate `logsBloom` from payload against computed block bloom (engine test runner)
+- [ ] Wire receipt_root/logs_bloom validation into `newPayload` handler (`engine/src/engine_handlers.c`)
 - [ ] Validate `expectedBlobVersionedHashes` (V3+) from params[1] against blob tx hashes (`engine/src/engine_handlers.c:333`)
 - [ ] Check `engine_store_put()` return value at all 4 call sites (`engine/src/engine_handlers.c:343,434,445,453`)
   - On failure (store full), return appropriate error instead of silently dropping the block
