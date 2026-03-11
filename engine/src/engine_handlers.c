@@ -12,6 +12,8 @@
 #include "engine_rpc.h"
 #include "block.h"
 #include "block_executor.h"
+#include "evm.h"
+#include "evm_state.h"
 #include "rlp.h"
 #include "hash.h"
 #include "uint256.h"
@@ -502,7 +504,17 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
         block_result_t result = block_execute(
             (evm_t *)ctx->evm, &header, &body, block_hashes);
 
-        /* Step 8: Validate results */
+        /* Step 8: Compute state root (MPT path returns zero from block_execute) */
+#ifdef ENABLE_MPT
+        if (result.success && ctx->state) {
+            evm_t *e = (evm_t *)ctx->evm;
+            bool prune = (e->fork >= FORK_SPURIOUS_DRAGON);
+            result.state_root = evm_state_compute_mpt_root(
+                (evm_state_t *)ctx->state, prune);
+        }
+#endif
+
+        /* Step 9: Validate results */
         if (!result.success) {
             status.status = PAYLOAD_INVALID;
             status.has_latest_valid_hash = true;

@@ -808,7 +808,12 @@ if(CJSON_FOUND)
 
     # Standalone Engine API server (for mock CL testing)
     add_executable(engine_server tools/engine_server.c)
-    target_link_libraries(engine_server engine)
+    target_include_directories(engine_server PRIVATE
+        integration_tests/include
+        executor/include
+        ${CJSON_INCLUDE_DIRS}
+    )
+    target_link_libraries(engine_server engine integration_tests block_executor evm ${CJSON_LIBRARIES})
 
     #==============================================================================
     # Tests — Engine API (cJSON-dependent)
