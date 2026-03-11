@@ -26,8 +26,6 @@
 #include <string.h>
 #include <stdio.h>
 
-extern bool g_trace_calls __attribute__((weak));
-
 //==============================================================================
 // Dispatch Table - Maps opcodes to label addresses
 //==============================================================================
@@ -50,10 +48,6 @@ extern bool g_trace_calls __attribute__((weak));
                 goto done_oog;                                      \
         }                                                           \
         EVM_TRACE_DISPATCH(evm);                                    \
-        if (g_trace_calls && evm->msg.depth == 0) {                 \
-            fprintf(stderr, "  OP pc=%zu op=0x%02x gas=%lu\n",      \
-                    evm->pc, evm->code[evm->pc], evm->gas_left);   \
-        }                                                           \
         goto *dispatch_table[evm->code[evm->pc]];                  \
     } while (0)
 

@@ -225,24 +225,6 @@ void evm_set_tx_context(evm_t *evm, const evm_tx_context_t *tx)
 // Gas Operations
 //==============================================================================
 
-bool evm_use_gas(evm_t *evm, uint64_t amount)
-{
-    if (!evm)
-    {
-        return false;
-    }
-
-    if (evm->gas_left < amount)
-    {
-        evm->status = EVM_OUT_OF_GAS;
-        evm->gas_left = 0;
-        return false;
-    }
-
-    evm->gas_left -= amount;
-    return true;
-}
-
 void evm_refund_gas(evm_t *evm, uint64_t amount)
 {
     if (!evm)
