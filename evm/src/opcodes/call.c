@@ -93,7 +93,7 @@ static evm_status_t prepare_call(
     }
 
     //==========================================================================
-    // Balance Check
+    // Balance Check (deferred — used after gas deduction, matching geth)
     //==========================================================================
 
     bool balance_sufficient = true;
@@ -213,32 +213,12 @@ static evm_status_t prepare_call(
     }
 
     //==========================================================================
-    // Graceful Failure Checks
-    //==========================================================================
-
-    // Per the Yellow Paper: when a CALL fails gracefully (depth or balance),
-    // the child never executes but would have returned all gas including the
-    // stipend. So the caller gains the stipend: μ'_g = μ_g - c_EXTRA + G_STIPEND
-    *graceful_failure = false;
-    if (evm->msg.depth >= 1024)
-    {
-        evm->gas_left += stipend;
-        *gas_forwarded = 0;
-        *graceful_failure = true;
-        return EVM_SUCCESS;
-    }
-
-    if (!balance_sufficient)
-    {
-        evm->gas_left += stipend;
-        *gas_forwarded = 0;
-        *graceful_failure = true;
-        return EVM_SUCCESS;
-    }
-
-    //==========================================================================
     // Gas Forwarding
     //==========================================================================
+    // Compute gas to forward BEFORE graceful failure checks. In geth, the gas
+    // table deducts overhead + callGasTemp + stipend all at once. If this total
+    // exceeds available gas, the instruction OOGs before balance/depth checks.
+    // We check for that OOG condition first, then handle graceful failure.
 
     uint64_t gas_requested = uint256_to_uint64(gas_param);
     uint64_t gas_to_forward;
@@ -264,17 +244,47 @@ static evm_status_t prepare_call(
                 gas_requested, gas_to_forward, stipend, evm->gas_left);
     }
 
-    // Deduct the forwarded gas from caller
-    if (!evm_use_gas(evm, gas_to_forward))
+    // Pre-EIP-150: OOG if requested gas exceeds available gas.
+    // This check must happen BEFORE the graceful failure (balance/depth) checks
+    // to match geth, where the gas table deducts gas before the opcode executes.
+    // Post-EIP-150: gas_to_forward is capped at 63/64, so it always fits.
+    if (evm->fork < FORK_TANGERINE_WHISTLE && gas_to_forward > evm->gas_left)
     {
         if (g_trace_calls) {
-            fprintf(stderr, "    OOG: need %lu, have %lu\n", gas_to_forward, evm->gas_left);
+            fprintf(stderr, "    OOG: need %lu, have %lu\n",
+                    gas_to_forward, evm->gas_left);
         }
+        evm->gas_left = 0;
         *gas_forwarded = 0;
         return EVM_OUT_OF_GAS;
     }
 
-    // Callee receives forwarded gas + stipend (stipend is free bonus, not deducted from caller)
+    //==========================================================================
+    // Graceful Failure Checks
+    //==========================================================================
+
+    // Graceful failure: depth >= 1024 or insufficient balance.
+    // The child would have received gas_to_forward + stipend but never executes,
+    // so all of it (including stipend) is returned. Since we haven't deducted
+    // gas_to_forward yet, we only credit the stipend.
+    *graceful_failure = false;
+    if (evm->msg.depth >= 1024 || !balance_sufficient)
+    {
+        evm->gas_left += stipend;
+        *gas_forwarded = 0;
+        *graceful_failure = true;
+        return EVM_SUCCESS;
+    }
+
+    // Deduct the forwarded gas from caller (stipend is NOT deducted — it's a
+    // free bonus to the child that "leaks" back to the caller via gas refund)
+    if (!evm_use_gas(evm, gas_to_forward))
+    {
+        *gas_forwarded = 0;
+        return EVM_OUT_OF_GAS;
+    }
+
+    // Callee receives forwarded gas + stipend (stipend is free bonus)
     *gas_forwarded = gas_to_forward + stipend;
 
     return EVM_SUCCESS;

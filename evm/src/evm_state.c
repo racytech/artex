@@ -767,11 +767,16 @@ void evm_state_set_code(evm_state_t *es, const address_t *addr,
             .old_code_size = ca->code_size
         }
     };
-    journal_push(es, &je);
-
-    // Old code ownership transferred to journal — don't free
-    ca->code = NULL;
-    ca->code_size = 0;
+    if (!journal_push(es, &je)) {
+        // journal_push failed — ownership was NOT transferred, free old code
+        free(ca->code);
+        ca->code = NULL;
+        ca->code_size = 0;
+    } else {
+        // Old code ownership transferred to journal — don't free
+        ca->code = NULL;
+        ca->code_size = 0;
+    }
 
     if (code && len > 0) {
         ca->code = malloc(len);
@@ -849,6 +854,15 @@ void evm_state_set_storage(evm_state_t *es, const address_t *addr,
 
 bool evm_state_has_storage(evm_state_t *es, const address_t *addr) {
     if (!es || !addr) return false;
+
+#ifdef ENABLE_MPT
+    // Fast path: check cached storage_root from the account.
+    // After cache eviction, in-memory slots are gone but the account's
+    // storage_root (loaded from the MPT) tells us if storage exists on disk.
+    cached_account_t *ca = ensure_account(es, addr);
+    if (ca && memcmp(ca->storage_root.bytes, HASH_EMPTY_STORAGE.bytes, 32) != 0)
+        return true;
+#endif
 
     // Scan the storage cache for any entry belonging to this address
     mem_art_iterator_t *iter = mem_art_iterator_create(&es->storage);
@@ -949,7 +963,10 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
             .old_storage_dirty  = ca->storage_dirty,
         },
     };
-    journal_push(es, &je);
+    if (!journal_push(es, &je)) {
+        // journal_push failed — ownership NOT transferred, free old code
+        free(ca->code);
+    }
 
     // Reset account: preserve existing balance per Ethereum spec.
     // CREATE/CREATE2 preserves any pre-existing ether at the target address.
@@ -958,7 +975,7 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
     ca->balance = existing_balance;
     ca->code_hash = hash_zero();
     ca->has_code = false;
-    ca->code = NULL;          // ownership moved to journal entry
+    ca->code = NULL;          // ownership moved to journal entry (or freed above)
     ca->code_size = 0;
     ca->created = true;
     ca->dirty = true;
