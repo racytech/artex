@@ -455,7 +455,7 @@ static evm_status_t execute_create(evm_t *evm,
  * CREATE - Create new contract
  * Stack: value offset size => address
  */
-evm_status_t op_create(evm_t *evm)
+static evm_status_t op_create(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory || !evm->state)
         return EVM_INTERNAL_ERROR;
@@ -554,7 +554,7 @@ evm_status_t op_create(evm_t *evm)
  * CREATE2 - Create new contract with deterministic address
  * Stack: value offset size salt => address
  */
-evm_status_t op_create2(evm_t *evm)
+static evm_status_t op_create2(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory || !evm->state)
     {

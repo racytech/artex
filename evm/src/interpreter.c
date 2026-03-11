@@ -28,6 +28,19 @@
 #include <string.h>
 #include <stdio.h>
 
+// Include opcode implementations directly — single translation unit allows
+// the compiler to inline all opcode functions into the dispatch loop.
+#include "opcodes/arithmetic.c"
+#include "opcodes/control.c"
+#include "opcodes/environmental.c"
+#include "opcodes/block.c"
+#include "opcodes/memory.c"
+#include "opcodes/storage.c"
+#include "opcodes/crypto.c"
+#include "opcodes/logging.c"
+#include "opcodes/call.c"
+#include "opcodes/create.c"
+
 //==============================================================================
 // Inline helpers for inlined opcodes
 //==============================================================================

@@ -134,7 +134,7 @@ static uint64_t calculate_sstore_gas(
 //==============================================================================
 
 // SLOAD (0x54): Load word from storage
-evm_status_t op_sload(evm_t *evm)
+static evm_status_t op_sload(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->state)
     {
@@ -215,7 +215,7 @@ evm_status_t op_sload(evm_t *evm)
 }
 
 // SSTORE (0x55): Store word to storage
-evm_status_t op_sstore(evm_t *evm)
+static evm_status_t op_sstore(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->state)
     {
@@ -292,7 +292,7 @@ evm_status_t op_sstore(evm_t *evm)
 }
 
 // TLOAD (0x5c): Load from transient storage (EIP-1153, Cancun+)
-evm_status_t op_tload(evm_t *evm)
+static evm_status_t op_tload(evm_t *evm)
 {
     if (!evm || !evm->stack)
         return EVM_INTERNAL_ERROR;
@@ -315,7 +315,7 @@ evm_status_t op_tload(evm_t *evm)
 }
 
 // TSTORE (0x5d): Store to transient storage (EIP-1153, Cancun+)
-evm_status_t op_tstore(evm_t *evm)
+static evm_status_t op_tstore(evm_t *evm)
 {
     if (!evm || !evm->stack)
         return EVM_INTERNAL_ERROR;

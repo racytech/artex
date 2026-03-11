@@ -14,7 +14,7 @@
 // EXP - Exponentiation
 //==============================================================================
 
-evm_status_t op_exp(evm_t *evm)
+static evm_status_t op_exp(evm_t *evm)
 {
     if (!evm || !evm->stack)
     {

@@ -11,7 +11,7 @@
 #include <string.h>
 
 // MLOAD (0x51): Load word from memory
-evm_status_t op_mload(evm_t *evm)
+static evm_status_t op_mload(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
     {
@@ -57,7 +57,7 @@ evm_status_t op_mload(evm_t *evm)
 }
 
 // MSTORE (0x52): Store word to memory
-evm_status_t op_mstore(evm_t *evm)
+static evm_status_t op_mstore(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
     {
@@ -98,7 +98,7 @@ evm_status_t op_mstore(evm_t *evm)
 }
 
 // MSTORE8 (0x53): Store byte to memory
-evm_status_t op_mstore8(evm_t *evm)
+static evm_status_t op_mstore8(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
     {
@@ -142,7 +142,7 @@ evm_status_t op_mstore8(evm_t *evm)
 }
 
 // MSIZE (0x59): Get memory size
-evm_status_t op_msize(evm_t *evm)
+static evm_status_t op_msize(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
     {
@@ -168,7 +168,7 @@ evm_status_t op_msize(evm_t *evm)
 }
 
 // MCOPY (0x5e): Copy memory areas (EIP-5656, Cancun+)
-evm_status_t op_mcopy(evm_t *evm)
+static evm_status_t op_mcopy(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
         return EVM_INTERNAL_ERROR;

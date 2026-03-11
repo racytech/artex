@@ -36,7 +36,7 @@ static inline bool is_system_contract(const address_t *addr) {
 // BALANCE - Get balance of an account
 //==============================================================================
 
-evm_status_t op_balance(evm_t *evm)
+static evm_status_t op_balance(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
@@ -94,7 +94,7 @@ evm_status_t op_balance(evm_t *evm)
 // CALLDATACOPY - Copy calldata to memory
 //==============================================================================
 
-evm_status_t op_calldatacopy(evm_t *evm)
+static evm_status_t op_calldatacopy(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
@@ -165,7 +165,7 @@ evm_status_t op_calldatacopy(evm_t *evm)
 // CODECOPY - Copy code to memory
 //==============================================================================
 
-evm_status_t op_codecopy(evm_t *evm)
+static evm_status_t op_codecopy(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
@@ -269,7 +269,7 @@ evm_status_t op_codecopy(evm_t *evm)
 // RETURNDATACOPY - Copy output data from previous call to memory
 //==============================================================================
 
-evm_status_t op_returndatacopy(evm_t *evm)
+static evm_status_t op_returndatacopy(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
@@ -342,7 +342,7 @@ evm_status_t op_returndatacopy(evm_t *evm)
 // External Code Opcodes
 //==============================================================================
 
-evm_status_t op_extcodesize(evm_t *evm)
+static evm_status_t op_extcodesize(evm_t *evm)
 {
     if (!evm || !evm->stack)
     {
@@ -403,7 +403,7 @@ evm_status_t op_extcodesize(evm_t *evm)
     return EVM_SUCCESS;
 }
 
-evm_status_t op_extcodecopy(evm_t *evm)
+static evm_status_t op_extcodecopy(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
     {
@@ -540,7 +540,7 @@ evm_status_t op_extcodecopy(evm_t *evm)
     return EVM_SUCCESS;
 }
 
-evm_status_t op_extcodehash(evm_t *evm)
+static evm_status_t op_extcodehash(evm_t *evm)
 {
     if (!evm || !evm->stack)
     {

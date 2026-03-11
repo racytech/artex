@@ -21,7 +21,7 @@
 // BLOCKHASH - Get hash of one of the 256 most recent blocks
 //==============================================================================
 
-evm_status_t op_blockhash(evm_t *evm)
+static evm_status_t op_blockhash(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
@@ -110,7 +110,7 @@ evm_status_t op_blockhash(evm_t *evm)
 // SELFBALANCE - Get balance of current contract
 //==============================================================================
 
-evm_status_t op_selfbalance(evm_t *evm)
+static evm_status_t op_selfbalance(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
@@ -139,7 +139,7 @@ evm_status_t op_selfbalance(evm_t *evm)
 // BLOBHASH - Get versioned hash at index (EIP-4844, Cancun+)
 //==============================================================================
 
-evm_status_t op_blobhash(evm_t *evm)
+static evm_status_t op_blobhash(evm_t *evm)
 {
     if (!evm || !evm->stack)
         return EVM_INTERNAL_ERROR;
@@ -175,7 +175,7 @@ evm_status_t op_blobhash(evm_t *evm)
 // BLOBBASEFEE - Get blob base fee (EIP-7516, Cancun+)
 //==============================================================================
 
-evm_status_t op_blobbasefee(evm_t *evm)
+static evm_status_t op_blobbasefee(evm_t *evm)
 {
     if (!evm || !evm->stack)
         return EVM_INTERNAL_ERROR;

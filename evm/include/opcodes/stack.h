@@ -1,28 +1,13 @@
 /**
- * EVM Stack Manipulation Opcodes
- *
- * All stack manipulation opcodes (POP, PUSH0-32, DUP1-16, SWAP1-16) are
- * inlined directly into interpreter.c dispatch labels. This header provides
- * opcode definitions only.
+ * EVM Stack Manipulation Opcodes — opcode definitions only.
+ * Implementations are inlined directly into interpreter.c dispatch labels.
  */
 
 #ifndef ART_EVM_OPCODES_STACK_H
 #define ART_EVM_OPCODES_STACK_H
 
-#include "../evm.h"
+#define OP_POP 0x50
 
-#ifdef __cplusplus
-extern "C"
-{
-#endif
-
-//==============================================================================
-// Opcode Definitions
-//==============================================================================
-
-#define OP_POP 0x50 // Remove item from stack
-
-// PUSH opcodes: 0x60-0x7f
 #define OP_PUSH1 0x60
 #define OP_PUSH2 0x61
 #define OP_PUSH3 0x62
@@ -56,7 +41,6 @@ extern "C"
 #define OP_PUSH31 0x7e
 #define OP_PUSH32 0x7f
 
-// DUP opcodes: 0x80-0x8f
 #define OP_DUP1 0x80
 #define OP_DUP2 0x81
 #define OP_DUP3 0x82
@@ -74,7 +58,6 @@ extern "C"
 #define OP_DUP15 0x8e
 #define OP_DUP16 0x8f
 
-// SWAP opcodes: 0x90-0x9f
 #define OP_SWAP1 0x90
 #define OP_SWAP2 0x91
 #define OP_SWAP3 0x92
@@ -91,9 +74,5 @@ extern "C"
 #define OP_SWAP14 0x9d
 #define OP_SWAP15 0x9e
 #define OP_SWAP16 0x9f
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* ART_EVM_OPCODES_STACK_H */

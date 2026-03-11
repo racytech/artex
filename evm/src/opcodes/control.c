@@ -22,7 +22,7 @@
 // INVALID - Invalid instruction (always fails)
 //==============================================================================
 
-evm_status_t op_invalid(evm_t *evm)
+static evm_status_t op_invalid(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
@@ -84,7 +84,7 @@ static bool is_valid_jump_dest(const evm_t *evm, uint64_t dest)
  * Stack: dest =>
  * Gas: 8
  */
-evm_status_t op_jump(evm_t *evm)
+static evm_status_t op_jump(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
@@ -126,7 +126,7 @@ evm_status_t op_jump(evm_t *evm)
  * Stack: dest cond =>
  * Gas: 10
  */
-evm_status_t op_jumpi(evm_t *evm)
+static evm_status_t op_jumpi(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
@@ -183,7 +183,7 @@ evm_status_t op_jumpi(evm_t *evm)
  * Stack: offset size =>
  * Gas: 0 + memory_expansion_cost
  */
-evm_status_t op_return(evm_t *evm)
+static evm_status_t op_return(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
@@ -265,7 +265,7 @@ evm_status_t op_return(evm_t *evm)
  * Stack: offset size =>
  * Gas: 0 + memory_expansion_cost
  */
-evm_status_t op_revert(evm_t *evm)
+static evm_status_t op_revert(evm_t *evm)
 {
     if (!evm)
         return EVM_INTERNAL_ERROR;
@@ -350,7 +350,7 @@ evm_status_t op_revert(evm_t *evm)
 // SELFDESTRUCT Opcode
 //==============================================================================
 
-evm_status_t op_selfdestruct(evm_t *evm)
+static evm_status_t op_selfdestruct(evm_t *evm)
 {
     if (!evm || !evm->stack)
     {

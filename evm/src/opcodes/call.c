@@ -281,7 +281,7 @@ static evm_status_t prepare_call(
  * CALL - Message call into an account
  * Stack: gas addr value argsOffset argsSize retOffset retSize => success
  */
-evm_status_t op_call(evm_t *evm)
+static evm_status_t op_call(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
         return EVM_INTERNAL_ERROR;
@@ -429,7 +429,7 @@ evm_status_t op_call(evm_t *evm)
  * Stack: gas addr value argsOffset argsSize retOffset retSize => success
  * NOTE: Deprecated, use DELEGATECALL instead
  */
-evm_status_t op_callcode(evm_t *evm)
+static evm_status_t op_callcode(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
     {
@@ -600,7 +600,7 @@ evm_status_t op_callcode(evm_t *evm)
  * Stack: gas addr argsOffset argsSize retOffset retSize => success
  * NOTE: No value parameter - delegates with caller's value
  */
-evm_status_t op_delegatecall(evm_t *evm)
+static evm_status_t op_delegatecall(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
     {
@@ -765,7 +765,7 @@ evm_status_t op_delegatecall(evm_t *evm)
  * Stack: gas addr argsOffset argsSize retOffset retSize => success
  * NOTE: No value parameter - static calls cannot transfer value
  */
-evm_status_t op_staticcall(evm_t *evm)
+static evm_status_t op_staticcall(evm_t *evm)
 {
     if (!evm || !evm->stack || !evm->memory)
     {

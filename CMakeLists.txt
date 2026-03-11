@@ -204,16 +204,6 @@ add_library(evm STATIC
     evm/src/interpreter.c
     evm/src/fork.c
     evm/src/transaction.c
-    evm/src/opcodes/arithmetic.c
-    evm/src/opcodes/crypto.c
-    evm/src/opcodes/memory.c
-    evm/src/opcodes/logging.c
-    evm/src/opcodes/storage.c
-    evm/src/opcodes/environmental.c
-    evm/src/opcodes/call.c
-    evm/src/opcodes/control.c
-    evm/src/opcodes/block.c
-    evm/src/opcodes/create.c
     evm/src/precompile.c
     evm/vendor/mini-gmp.c
     evm/vendor/bn256.c
