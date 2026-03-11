@@ -420,9 +420,14 @@ bool transaction_execute(
         }
     }
 
-    // Reject transaction if sender nonce is at max (overflow protection)
+    // Validate sender nonce
     {
         uint64_t sender_nonce = evm_state_get_nonce(state, &tx->sender);
+        if (tx->nonce != sender_nonce) {
+            LOG_EVM_ERROR("Transaction nonce mismatch: expected %lu, got %lu",
+                     sender_nonce, tx->nonce);
+            return false;
+        }
         if (sender_nonce == UINT64_MAX) {
             LOG_EVM_ERROR("Sender nonce at maximum, cannot increment");
             return false;
