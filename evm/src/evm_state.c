@@ -616,6 +616,20 @@ uint32_t evm_state_get_code_size(evm_state_t *es, const address_t *addr) {
 #ifdef ENABLE_VERKLE
     // Load code size from verkle_state
     ca->code_size = (uint32_t)verkle_state_get_code_size(es->vs, addr->bytes);
+#elif defined(ENABLE_MPT)
+    // Load code from code_store to get the size (also caches the code)
+    if (es->code_store && ca->code_size == 0) {
+        uint32_t size = code_store_get_size(es->code_store,
+                                             ca->code_hash.bytes);
+        if (size > 0) {
+            ca->code = malloc(size);
+            if (ca->code) {
+                code_store_get(es->code_store, ca->code_hash.bytes,
+                               ca->code, size);
+                ca->code_size = size;
+            }
+        }
+    }
 #endif
     return ca->code_size;
 }

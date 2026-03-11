@@ -100,6 +100,13 @@ static evm_status_t prepare_call(
     if (has_value)
     {
         uint256_t caller_balance = evm_state_get_balance(evm->state, &evm->msg.recipient);
+        if (g_trace_calls) {
+            fprintf(stderr, "    balance_check: caller=%02x%02x..%02x%02x bal=%016lx_%016lx val=%016lx_%016lx\n",
+                    evm->msg.recipient.bytes[0], evm->msg.recipient.bytes[1],
+                    evm->msg.recipient.bytes[18], evm->msg.recipient.bytes[19],
+                    (unsigned long)(caller_balance.low >> 64), (unsigned long)caller_balance.low,
+                    (unsigned long)(value->low >> 64), (unsigned long)value->low);
+        }
         if (uint256_lt(&caller_balance, value))
             balance_sufficient = false;
     }
