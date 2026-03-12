@@ -911,6 +911,13 @@ if(CJSON_FOUND)
     target_compile_definitions(chain_replay PRIVATE CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL})
     target_link_libraries(chain_replay sync)
 
+    # Art Node (full execution client)
+    add_executable(art_node tools/node.c)
+    target_include_directories(art_node PRIVATE
+        ${CMAKE_SOURCE_DIR}/database/include
+    )
+    target_link_libraries(art_node chain_tip engine block_store sync)
+
     #==============================================================================
     # Integration Tests (Ethereum test vectors)
     #==============================================================================
