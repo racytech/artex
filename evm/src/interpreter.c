@@ -171,21 +171,9 @@ evm_result_t evm_interpret(evm_t *evm)
 {
     if (!evm || !evm->code || !evm->stack || !evm->memory)
     {
-        LOG_EVM_ERROR("Invalid EVM state");
+        LOG_EVM_DEBUG("Invalid EVM state");
         return evm_result_create(EVM_INTERNAL_ERROR, 0, 0, NULL, 0);
     }
-
-    if (0) { // Debug output disabled
-    printf("DEBUG INTERPRETER: Starting execution\n");
-    printf("  Code size: %zu bytes\n", evm->code_size);
-    printf("  Gas available: %lu\n", evm->gas_left);
-    printf("  PC: %zu\n", evm->pc);
-    printf("  First 10 bytes: ");
-    for (size_t i = 0; i < 10 && i < evm->code_size; i++) {
-        printf("%02x ", evm->code[i]);
-    }
-    printf("\n");
-    } // end debug output
 
     // EIP-4762 (Verkle): code chunk witness gas per instruction.
     // Skip for deployment (initcode) and system calls.

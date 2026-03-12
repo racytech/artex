@@ -143,7 +143,7 @@ static evm_status_t op_sload(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 1))
     {
-        LOG_EVM_ERROR("SLOAD: Stack underflow");
+        LOG_EVM_DEBUG("SLOAD: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -225,13 +225,13 @@ static evm_status_t op_sstore(evm_t *evm)
     // Check if we're in a static call (no state modifications allowed)
     if (evm->msg.is_static)
     {
-        LOG_EVM_ERROR("SSTORE: State modification in static call");
+        LOG_EVM_DEBUG("SSTORE: State modification in static call");
         return EVM_STATIC_CALL_VIOLATION;
     }
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_EVM_ERROR("SSTORE: Stack underflow");
+        LOG_EVM_DEBUG("SSTORE: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 

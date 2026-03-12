@@ -454,7 +454,7 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
 {
     if (!evm || !msg || !result)
     {
-        LOG_EVM_ERROR("Invalid arguments to evm_execute");
+        LOG_EVM_DEBUG("Invalid arguments to evm_execute");
         return false;
     }
 
@@ -462,7 +462,7 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     // Reference: process_message() uses "depth > STACK_DEPTH_LIMIT" where limit=1024
     if (msg->depth > 1024)
     {
-        LOG_EVM_ERROR("Call depth limit exceeded (depth=%d, max=1024)", msg->depth);
+        LOG_EVM_DEBUG("Call depth limit exceeded (depth=%d, max=1024)", msg->depth);
         *result = evm_result_error(EVM_CALL_DEPTH_EXCEEDED, msg->gas);
         return true; // Not an internal error, just depth exceeded
     }
@@ -788,15 +788,4 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     return true;
 }
 
-evm_status_t evm_run(evm_t *evm)
-{
-    if (!evm)
-    {
-        return EVM_INTERNAL_ERROR;
-    }
 
-    // TODO: This will be replaced by evm_interpret() or integrated with it
-    LOG_EVM_DEBUG("evm_run stub - not yet implemented");
-    
-    return EVM_INTERNAL_ERROR;
-}

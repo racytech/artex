@@ -525,13 +525,13 @@ static evm_status_t op_callcode(evm_t *evm)
         call_args = malloc(args_size_u64);
         if (!call_args)
         {
-            LOG_EVM_ERROR("CALLCODE: Failed to allocate call arguments");
+            LOG_EVM_DEBUG("CALLCODE: Failed to allocate call arguments");
             return EVM_INTERNAL_ERROR;
         }
         
         if (!evm_memory_read(evm->memory, args_offset_u64, call_args, args_size_u64))
         {
-            LOG_EVM_ERROR("CALLCODE: Failed to read call arguments from memory");
+            LOG_EVM_DEBUG("CALLCODE: Failed to read call arguments from memory");
             free(call_args);
             return EVM_INVALID_MEMORY_ACCESS;
         }
@@ -558,7 +558,7 @@ static evm_status_t op_callcode(evm_t *evm)
 
     if (!exec_ok)
     {
-        LOG_EVM_ERROR("CALLCODE: Subcall execution failed internally");
+        LOG_EVM_DEBUG("CALLCODE: Subcall execution failed internally");
         return EVM_INTERNAL_ERROR;
     }
 
@@ -702,13 +702,13 @@ static evm_status_t op_delegatecall(evm_t *evm)
         call_args = malloc(args_size_u64);
         if (!call_args)
         {
-            LOG_EVM_ERROR("DELEGATECALL: Failed to allocate call arguments");
+            LOG_EVM_DEBUG("DELEGATECALL: Failed to allocate call arguments");
             return EVM_INTERNAL_ERROR;
         }
         
         if (!evm_memory_read(evm->memory, args_offset_u64, call_args, args_size_u64))
         {
-            LOG_EVM_ERROR("DELEGATECALL: Failed to read call arguments from memory");
+            LOG_EVM_DEBUG("DELEGATECALL: Failed to read call arguments from memory");
             free(call_args);
             return EVM_INVALID_MEMORY_ACCESS;
         }
@@ -735,7 +735,7 @@ static evm_status_t op_delegatecall(evm_t *evm)
 
     if (!exec_ok)
     {
-        LOG_EVM_ERROR("DELEGATECALL: Subcall execution failed internally");
+        LOG_EVM_DEBUG("DELEGATECALL: Subcall execution failed internally");
         return EVM_INTERNAL_ERROR;
     }
 
@@ -866,13 +866,13 @@ static evm_status_t op_staticcall(evm_t *evm)
         call_args = malloc(args_size_u64);
         if (!call_args)
         {
-            LOG_EVM_ERROR("STATICCALL: Failed to allocate call arguments");
+            LOG_EVM_DEBUG("STATICCALL: Failed to allocate call arguments");
             return EVM_INTERNAL_ERROR;
         }
         
         if (!evm_memory_read(evm->memory, args_offset_u64, call_args, args_size_u64))
         {
-            LOG_EVM_ERROR("STATICCALL: Failed to read call arguments from memory");
+            LOG_EVM_DEBUG("STATICCALL: Failed to read call arguments from memory");
             free(call_args);
             return EVM_INVALID_MEMORY_ACCESS;
         }
@@ -899,7 +899,7 @@ static evm_status_t op_staticcall(evm_t *evm)
 
     if (!exec_ok)
     {
-        LOG_EVM_ERROR("STATICCALL: Subcall execution failed internally");
+        LOG_EVM_DEBUG("STATICCALL: Subcall execution failed internally");
         return EVM_INTERNAL_ERROR;
     }
 

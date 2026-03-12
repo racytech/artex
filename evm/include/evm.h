@@ -240,15 +240,6 @@ void evm_reset(evm_t *evm);
  */
 bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result);
 
-/**
- * Execute bytecode in current context
- * Main interpreter loop
- *
- * @param evm EVM instance
- * @return Execution status
- */
-evm_status_t evm_run(evm_t *evm);
-
 //==============================================================================
 // Context Setup
 //==============================================================================

@@ -52,8 +52,6 @@ uint64_t witness_gas_access_event(witness_gas_t *wg,
         if (!mem_art_contains(&wg->edited_leaves, key, 32)) {
             gas += CHUNK_EDIT_COST;
             mem_art_insert(&wg->edited_leaves, key, 32, NULL, 0);
-            /* Note: CHUNK_FILL_COST is not charged in go-ethereum's current
-             * implementation (chunkFill is declared but never set to true). */
         }
     }
 

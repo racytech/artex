@@ -533,13 +533,13 @@ static evm_status_t op_create(evm_t *evm)
         init_code = malloc(size_u64);
         if (!init_code)
         {
-            LOG_EVM_ERROR("CREATE: Failed to allocate init code");
+            LOG_EVM_DEBUG("CREATE: Failed to allocate init code");
             return EVM_INTERNAL_ERROR;
         }
 
         if (!evm_memory_read(evm->memory, offset_u64, init_code, size_u64))
         {
-            LOG_EVM_ERROR("CREATE: Failed to read init code from memory");
+            LOG_EVM_DEBUG("CREATE: Failed to read init code from memory");
             free(init_code);
             return EVM_INVALID_MEMORY_ACCESS;
         }
@@ -570,7 +570,7 @@ static evm_status_t op_create2(evm_t *evm)
     // Check for static call violation
     if (evm->msg.is_static)
     {
-        LOG_EVM_ERROR("CREATE2: Cannot create contract in static call");
+        LOG_EVM_DEBUG("CREATE2: Cannot create contract in static call");
         return EVM_STATIC_CALL_VIOLATION;
     }
 
@@ -647,13 +647,13 @@ static evm_status_t op_create2(evm_t *evm)
         init_code = malloc(size_u64);
         if (!init_code)
         {
-            LOG_EVM_ERROR("CREATE2: Failed to allocate init code");
+            LOG_EVM_DEBUG("CREATE2: Failed to allocate init code");
             return EVM_INTERNAL_ERROR;
         }
 
         if (!evm_memory_read(evm->memory, offset_u64, init_code, size_u64))
         {
-            LOG_EVM_ERROR("CREATE2: Failed to read init code from memory");
+            LOG_EVM_DEBUG("CREATE2: Failed to read init code from memory");
             free(init_code);
             return EVM_INVALID_MEMORY_ACCESS;
         }

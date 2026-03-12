@@ -10,92 +10,7 @@
 #include "logger.h"
 #include <string.h>
 
-// MLOAD (0x51): Load word from memory
-static evm_status_t op_mload(evm_t *evm)
-{
-    if (!evm || !evm->stack || !evm->memory)
-    {
-        return EVM_INTERNAL_ERROR;
-    }
-
-    if (!evm_stack_require(evm->stack, 1))
-    {
-        LOG_EVM_ERROR("MLOAD: Stack underflow");
-        return EVM_STACK_UNDERFLOW;
-    }
-
-    uint256_t offset;
-    evm_stack_pop(evm->stack, &offset);
-
-    // Impossibly large offset — guaranteed OOG
-    if (offset.high != 0 || (uint64_t)(offset.low >> 64) != 0)
-        return EVM_OUT_OF_GAS;
-
-    uint64_t mem_offset = uint256_to_uint64(&offset);
-
-    // Calculate memory expansion gas cost
-    uint64_t mem_gas = evm_memory_access_cost(evm->memory, mem_offset, 32);
-    if (!evm_use_gas(evm, GAS_VERY_LOW + mem_gas))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    // Read 32 bytes from memory
-    uint256_t value;
-    if (!evm_memory_read_word(evm->memory, mem_offset, &value))
-    {
-        LOG_EVM_ERROR("MLOAD: Failed to read from memory at offset %lu", mem_offset);
-        return EVM_INVALID_MEMORY_ACCESS;
-    }
-
-    if (!evm_stack_push(evm->stack, &value))
-    {
-        return EVM_STACK_OVERFLOW;
-    }
-
-    return EVM_SUCCESS;
-}
-
-// MSTORE (0x52): Store word to memory
-static evm_status_t op_mstore(evm_t *evm)
-{
-    if (!evm || !evm->stack || !evm->memory)
-    {
-        return EVM_INTERNAL_ERROR;
-    }
-
-    if (!evm_stack_require(evm->stack, 2))
-    {
-        LOG_EVM_ERROR("MSTORE: Stack underflow");
-        return EVM_STACK_UNDERFLOW;
-    }
-
-    uint256_t offset, value;
-    evm_stack_pop(evm->stack, &offset);
-    evm_stack_pop(evm->stack, &value);
-
-    // Impossibly large offset — guaranteed OOG
-    if (offset.high != 0 || (uint64_t)(offset.low >> 64) != 0)
-        return EVM_OUT_OF_GAS;
-
-    uint64_t mem_offset = uint256_to_uint64(&offset);
-
-    // Calculate memory expansion gas cost
-    uint64_t mem_gas = evm_memory_access_cost(evm->memory, mem_offset, 32);
-    if (!evm_use_gas(evm, GAS_VERY_LOW + mem_gas))
-    {
-        return EVM_OUT_OF_GAS;
-    }
-
-    // Write 32 bytes to memory
-    if (!evm_memory_write_word(evm->memory, mem_offset, &value))
-    {
-        LOG_EVM_ERROR("MSTORE: Failed to write to memory at offset %lu", mem_offset);
-        return EVM_INVALID_MEMORY_ACCESS;
-    }
-
-    return EVM_SUCCESS;
-}
+// MLOAD and MSTORE are inlined in interpreter.c for performance
 
 // MSTORE8 (0x53): Store byte to memory
 static evm_status_t op_mstore8(evm_t *evm)
@@ -107,7 +22,7 @@ static evm_status_t op_mstore8(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_EVM_ERROR("MSTORE8: Stack underflow");
+        LOG_EVM_DEBUG("MSTORE8: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -134,7 +49,7 @@ static evm_status_t op_mstore8(evm_t *evm)
     // Write 1 byte to memory
     if (!evm_memory_write_byte(evm->memory, mem_offset, byte_value))
     {
-        LOG_EVM_ERROR("MSTORE8: Failed to write to memory at offset %lu", mem_offset);
+        LOG_EVM_DEBUG("MSTORE8: Failed to write to memory at offset %lu", mem_offset);
         return EVM_INVALID_MEMORY_ACCESS;
     }
 

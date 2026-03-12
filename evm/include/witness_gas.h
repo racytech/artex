@@ -19,7 +19,6 @@
 #define WITNESS_CHUNK_COST     200
 #define SUBTREE_EDIT_COST     3000
 #define CHUNK_EDIT_COST        500
-#define CHUNK_FILL_COST       6200
 
 typedef struct {
     mem_art_t accessed_subtrees;  /* key = stem[31] */
@@ -44,7 +43,6 @@ void witness_gas_reset(witness_gas_t *wg);
  * @param key            Full 32-byte verkle key (key[0:31] = stem)
  * @param is_write       true if this is a write access
  * @param value_was_empty true if the tree value at this key was zero/absent
- *                        (only relevant for writes — triggers CHUNK_FILL_COST)
  * @return Gas to charge (0 if all components already accessed/edited)
  */
 uint64_t witness_gas_access_event(witness_gas_t *wg,
