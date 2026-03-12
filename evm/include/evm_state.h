@@ -104,6 +104,9 @@ void evm_state_compact_storage(evm_state_t *es);
 // Account Existence
 // ============================================================================
 
+/** Prefetch account ART path into CPU cache (non-blocking hint). */
+void evm_state_prefetch_account(evm_state_t *es, const address_t *addr);
+
 /** Check if account exists (has been touched or loaded from disk). */
 bool evm_state_exists(evm_state_t *es, const address_t *addr);
 

@@ -1106,6 +1106,35 @@ void *mem_art_upsert(mem_art_t *tree, const uint8_t *key, size_t key_len,
     return (void *)leaf_value(tree, leaf_ref, NULL);
 }
 
+void mem_art_prefetch(const mem_art_t *tree, const uint8_t *key, size_t key_len) {
+    if (!tree || !key || key_len == 0) return;
+    mem_ref_t ref = tree->root;
+    size_t depth = 0;
+    while (ref != MEM_REF_NULL) {
+        if (MEM_IS_LEAF(ref)) {
+            /* Prefetch leaf value data */
+            void *leaf = ref_ptr(tree, ref);
+            __builtin_prefetch(leaf, 0, 1);
+            return;
+        }
+        void *node = ref_ptr(tree, ref);
+        __builtin_prefetch(node, 0, 1);
+
+        uint8_t plen = node_partial_len(node);
+        if (plen > 0) {
+            int prefix_len = check_prefix(tree, ref, node, key, key_len, depth);
+            if (prefix_len != (int)plen) return;
+            depth += plen;
+        }
+
+        uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
+        mem_ref_t *child_ptr = find_child_ptr(tree, ref, byte);
+        if (!child_ptr) return;
+        ref = *child_ptr;
+        depth++;
+    }
+}
+
 bool mem_art_contains(const mem_art_t *tree, const uint8_t *key, size_t key_len) {
     return mem_art_get(tree, key, key_len, NULL) != NULL;
 }

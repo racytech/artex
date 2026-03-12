@@ -646,6 +646,11 @@ void evm_state_discard_pending(evm_state_t *es) {
 // Account Existence
 // ============================================================================
 
+void evm_state_prefetch_account(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return;
+    mem_art_prefetch(&es->accounts, addr->bytes, ADDRESS_SIZE);
+}
+
 bool evm_state_exists(evm_state_t *es, const address_t *addr) {
     if (!es || !addr) return false;
     cached_account_t *ca = ensure_account(es, addr);

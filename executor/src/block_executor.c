@@ -4,6 +4,7 @@
 #include "fork.h"
 #include "transaction.h"
 #include "verkle_key.h"
+#include "evm_state.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -210,22 +211,55 @@ block_result_t block_execute(evm_t *evm,
                 (unsigned long)header->difficulty.low, (unsigned long)header->difficulty.high);
     }
 
+    /* Prefetch: decode first tx early so its sender/receiver are in cache
+     * before execution starts. Subsequent txs are prefetched via lookahead. */
+    transaction_t next_tx;
+    bool next_valid = false;
+    if (tx_count > 0) {
+        const rlp_item_t *first_item = block_body_tx(body, 0);
+        if (first_item && tx_decode_rlp(&next_tx, first_item, chain_id)) {
+            next_valid = true;
+            evm_state_prefetch_account(evm->state, &next_tx.sender);
+            if (!next_tx.is_create)
+                evm_state_prefetch_account(evm->state, &next_tx.to);
+        }
+    }
+
     for (size_t i = 0; i < tx_count; i++) {
-        const rlp_item_t *tx_item = block_body_tx(body, i);
-        if (!tx_item) {
-            fprintf(stderr, "block_execute: failed to get tx %zu\n", i);
-            result.success = false;
-            if (result.first_failure < 0) result.first_failure = (int)i;
-            break;
+        /* Use pre-decoded tx if available, otherwise decode now */
+        transaction_t tx;
+        bool need_decode = true;
+        if (next_valid) {
+            tx = next_tx;
+            next_valid = false;
+            need_decode = false;
         }
 
-        /* Decode transaction */
-        transaction_t tx;
-        if (!tx_decode_rlp(&tx, tx_item, chain_id)) {
-            fprintf(stderr, "block_execute: failed to decode tx %zu\n", i);
-            result.success = false;
-            if (result.first_failure < 0) result.first_failure = (int)i;
-            break;
+        if (need_decode) {
+            const rlp_item_t *tx_item = block_body_tx(body, i);
+            if (!tx_item) {
+                fprintf(stderr, "block_execute: failed to get tx %zu\n", i);
+                result.success = false;
+                if (result.first_failure < 0) result.first_failure = (int)i;
+                break;
+            }
+            if (!tx_decode_rlp(&tx, tx_item, chain_id)) {
+                fprintf(stderr, "block_execute: failed to decode tx %zu\n", i);
+                result.success = false;
+                if (result.first_failure < 0) result.first_failure = (int)i;
+                break;
+            }
+        }
+
+        /* Lookahead: decode next tx and prefetch its accounts */
+        if (i + 1 < tx_count) {
+            const rlp_item_t *next_item = block_body_tx(body, i + 1);
+            if (next_item && tx_decode_rlp(&next_tx, next_item, chain_id)) {
+                next_valid = true;
+                evm_state_prefetch_account(evm->state, &next_tx.sender);
+                if (!next_tx.is_create)
+                    evm_state_prefetch_account(evm->state, &next_tx.to);
+            }
         }
 
         /* Trace transaction details when debugging */
@@ -272,6 +306,10 @@ block_result_t block_execute(evm_t *evm,
          * Must happen after each tx so the next tx sees clean state. */
         evm_state_commit_tx(evm->state);
     }
+
+    /* Free leftover pre-decoded tx on early break */
+    if (next_valid)
+        tx_decoded_free(&next_tx);
 
     /* Pay block reward (PoW only — zero after The Merge) */
     uint256_t base_reward = get_block_reward(evm->fork);

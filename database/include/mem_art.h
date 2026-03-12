@@ -80,6 +80,9 @@ void *mem_art_upsert(mem_art_t *tree, const uint8_t *key, size_t key_len,
 
 bool mem_art_delete(mem_art_t *tree, const uint8_t *key, size_t key_len);
 bool mem_art_contains(const mem_art_t *tree, const uint8_t *key, size_t key_len);
+
+/** Prefetch ART tree path for key into CPU cache (non-blocking). */
+void mem_art_prefetch(const mem_art_t *tree, const uint8_t *key, size_t key_len);
 size_t mem_art_size(const mem_art_t *tree);
 bool mem_art_is_empty(const mem_art_t *tree);
 
