@@ -108,12 +108,12 @@ static bool push_verkle_data_gas(evm_t *evm, uint8_t num_bytes,
 #define DISPATCH()                                                  \
     do                                                              \
     {                                                               \
-        if (evm->pc >= evm->code_size)                              \
+        if (__builtin_expect(evm->pc >= evm->code_size, 0))          \
         {                                                           \
             EVM_TRACE_IMPLICIT_STOP(evm);                           \
             goto done;                                              \
         }                                                           \
-        if (verkle_chunk_mode) {                                    \
+        if (__builtin_expect(verkle_chunk_mode, 0)) {                \
             uint8_t ck[32];                                         \
             verkle_code_chunk_key(ck, code_addr.bytes,              \
                                  (uint32_t)(evm->pc / 31));         \

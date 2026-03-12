@@ -162,7 +162,19 @@ bool evm_memory_write(evm_memory_t *mem, uint64_t offset, const uint8_t *data, s
  * @param size Number of bytes needed
  * @return true on success, false on allocation failure
  */
-bool evm_memory_expand(evm_memory_t *mem, uint64_t offset, size_t size);
+bool evm_memory_expand_slow(evm_memory_t *mem, uint64_t offset, size_t size);
+
+/**
+ * Inline fast path: skip function call when memory is already large enough
+ */
+static inline bool evm_memory_expand(evm_memory_t *mem, uint64_t offset, size_t size) {
+    if (size == 0) return true;
+    uint64_t end = offset + size;
+    if (__builtin_expect(end < offset, 0)) return false; /* overflow */
+    size_t new_size = (end + EVM_MEMORY_WORD_SIZE - 1) & ~(size_t)(EVM_MEMORY_WORD_SIZE - 1);
+    if (__builtin_expect(new_size <= mem->size, 1)) return true;
+    return evm_memory_expand_slow(mem, offset, size);
+}
 
 /**
  * Ensure memory has at least the given size

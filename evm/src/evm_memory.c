@@ -210,7 +210,7 @@ bool evm_memory_write(evm_memory_t *mem, uint64_t offset, const uint8_t *data, s
 // Memory Expansion
 //==============================================================================
 
-bool evm_memory_expand(evm_memory_t *mem, uint64_t offset, size_t size)
+bool evm_memory_expand_slow(evm_memory_t *mem, uint64_t offset, size_t size)
 {
     if (!mem)
     {

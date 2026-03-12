@@ -75,26 +75,8 @@ static evm_status_t op_keccak256(evm_t *evm)
         return EVM_INVALID_MEMORY_ACCESS;
     }
 
-    // Allocate buffer to read memory data
-    uint8_t *data = malloc(size);
-    if (!data)
-    {
-        return EVM_INTERNAL_ERROR;
-    }
-
-    // Read data from memory
-    for (uint64_t i = 0; i < size; i++)
-    {
-        if (!evm_memory_read_byte(evm->memory, offset + i, &data[i]))
-        {
-            free(data);
-            return EVM_INVALID_MEMORY_ACCESS;
-        }
-    }
-
-    // Compute Keccak-256 hash
-    hash_t hash = hash_keccak256(data, size);
-    free(data);
+    // Hash directly from memory — expand already done above
+    hash_t hash = hash_keccak256(evm->memory->data + offset, size);
 
     // Convert hash (big-endian) to uint256
     uint256_t hash_value = uint256_from_bytes(hash.bytes, HASH_SIZE);
