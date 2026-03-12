@@ -538,13 +538,71 @@ payload_status_t chain_tip_forkchoice_updated(chain_tip_t *tip,
         return status;
     }
 
-    /* TODO Phase 6: detect reorg (new head not descendant of current head) */
+    /* Look up the new head block */
+    const engine_stored_block_t *new_head =
+        engine_store_get(tip->store, fc->head_block_hash);
+    if (!new_head) {
+        status.status = PAYLOAD_SYNCING;
+        status.has_latest_valid_hash = false;
+        return status;
+    }
+
+    /* Reorg detection: is the new head a continuation of the current head?
+     * If new head's parent != current head, a reorg occurred. */
+    if (tip->has_head &&
+        memcmp(fc->head_block_hash, tip->head_hash.bytes, 32) != 0) {
+
+        bool is_child = (memcmp(new_head->payload.parent_hash,
+                                tip->head_hash.bytes, 32) == 0);
+
+        if (!is_child) {
+            /* Reorg detected. Find common ancestor depth. */
+            const engine_stored_block_t *walk = new_head;
+            int depth = 0;
+            bool found_ancestor = false;
+
+            /* Walk the new chain backwards looking for the old head's parent
+             * or any block on the old chain. Limit walk to engine_store. */
+            while (walk && depth < 64) {
+                /* Check if this block's parent is on the old chain
+                 * (i.e., the old head is a sibling — depth-1 reorg) */
+                if (tip->head_number > 0 &&
+                    walk->payload.block_number <= tip->head_number) {
+                    found_ancestor = true;
+                    break;
+                }
+                /* Walk back via parent */
+                const engine_stored_block_t *parent =
+                    engine_store_get(tip->store, walk->payload.parent_hash);
+                if (!parent) break;
+                walk = parent;
+                depth++;
+            }
+
+            if (!found_ancestor || depth > 1) {
+                /* Deep reorg (>1 block) or can't find ancestor.
+                 * Return SYNCING — CL will re-send blocks. */
+                if (tip->verbose)
+                    printf("Chain tip: deep reorg detected (depth>%d), "
+                           "returning SYNCING\n", depth);
+                status.status = PAYLOAD_SYNCING;
+                status.has_latest_valid_hash = false;
+                return status;
+            }
+
+            if (tip->verbose)
+                printf("Chain tip: reorg detected (depth=%d), switching head "
+                       "%lu → %lu\n", depth,
+                       tip->head_number, new_head->payload.block_number);
+        }
+    }
 
     /* Update fork choice state */
     memcpy(tip->head_hash.bytes,      fc->head_block_hash,      32);
     memcpy(tip->safe_hash.bytes,      fc->safe_block_hash,      32);
     memcpy(tip->finalized_hash.bytes, fc->finalized_block_hash, 32);
-    tip->has_head = true;
+    tip->has_head    = true;
+    tip->head_number = new_head->payload.block_number;
 
     /* Update engine store fork choice (for pruning/eviction) */
     engine_store_set_forkchoice(tip->store,
@@ -552,12 +610,6 @@ payload_status_t chain_tip_forkchoice_updated(chain_tip_t *tip,
                                  fc->safe_block_hash,
                                  fc->finalized_block_hash);
     engine_store_prune(tip->store);
-
-    /* Look up head block number */
-    const engine_stored_block_t *head_block =
-        engine_store_get(tip->store, fc->head_block_hash);
-    if (head_block)
-        tip->head_number = head_block->payload.block_number;
 
     /* Look up finalized block number */
     if (!is_zero_hash(fc->finalized_block_hash)) {
