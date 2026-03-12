@@ -26,6 +26,10 @@
 #include <sys/stat.h>
 #include <pthread.h>
 
+#ifdef USE_IO_URING
+#include <liburing.h>
+#endif
+
 /* =========================================================================
  * Constants
  * ========================================================================= */
@@ -1441,6 +1445,10 @@ void mpt_store_sync(mpt_store_t *ms) {
     disk_hash_sync(ms->index);
 }
 
+#ifdef USE_IO_URING
+static bool flush_dat_uring(int fd, deferred_entry_t *entries, size_t count);
+#endif
+
 void mpt_store_flush(mpt_store_t *ms) {
     if (!ms) return;
 
@@ -1448,9 +1456,20 @@ void mpt_store_flush(mpt_store_t *ms) {
     mpt_store_flush_wait(ms);
 
     /* 1. Write all deferred nodes to .dat + .idx */
+#ifdef USE_IO_URING
+    if (flush_dat_uring(ms->data_fd, ms->def_entries, ms->def_count)) {
+        for (size_t i = 0; i < ms->def_count; i++) {
+            deferred_entry_t *e = &ms->def_entries[i];
+            if (!e->rlp) continue;
+            node_record_t rec = { .offset = e->offset,
+                                  .length = e->rlp_len };
+            disk_hash_put(ms->index, e->hash, &rec);
+        }
+    } else
+#endif
     for (size_t i = 0; i < ms->def_count; i++) {
         deferred_entry_t *e = &ms->def_entries[i];
-        if (!e->rlp) continue;  /* removed entry (hole) */
+        if (!e->rlp) continue;
 
         pwrite(ms->data_fd, e->rlp, e->rlp_len,
                (off_t)(PAGE_SIZE + e->offset));
@@ -1491,20 +1510,94 @@ void mpt_store_flush(mpt_store_t *ms) {
  * continues executing. load_node_rlp reads through the snapshot.
  * ========================================================================= */
 
+#ifdef USE_IO_URING
+/* Batch pwrite calls to .dat using io_uring.
+ * Reduces ~N syscalls to 1 submit + drain.  Falls back to pwrite loop
+ * if ring init fails.  Returns true if io_uring was used. */
+static bool flush_dat_uring(int fd, deferred_entry_t *entries, size_t count) {
+    /* Count live entries for ring sizing */
+    size_t live = 0;
+    for (size_t i = 0; i < count; i++)
+        if (entries[i].rlp) live++;
+    if (live == 0) return true;
+
+    /* Ring depth: min(live, 4096) — kernel caps at hardware queue depth */
+    unsigned depth = live < 4096 ? (unsigned)live : 4096;
+    struct io_uring ring;
+    if (io_uring_queue_init(depth, &ring, 0) < 0)
+        return false;
+
+    bool ok = true;
+    size_t pending = 0;
+    for (size_t i = 0; i < count && ok; i++) {
+        deferred_entry_t *e = &entries[i];
+        if (!e->rlp) continue;
+
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+        if (!sqe) {
+            /* SQ full — submit and drain before continuing */
+            io_uring_submit(&ring);
+            struct io_uring_cqe *cqe;
+            while (pending > 0) {
+                io_uring_wait_cqe(&ring, &cqe);
+                if (cqe->res < 0) ok = false;
+                io_uring_cqe_seen(&ring, cqe);
+                pending--;
+            }
+            sqe = io_uring_get_sqe(&ring);
+        }
+        io_uring_prep_write(sqe, fd, e->rlp, e->rlp_len,
+                            (uint64_t)(PAGE_SIZE + e->offset));
+        pending++;
+    }
+
+    /* Submit remaining and drain all completions */
+    if (pending > 0) {
+        io_uring_submit(&ring);
+        struct io_uring_cqe *cqe;
+        while (pending > 0) {
+            io_uring_wait_cqe(&ring, &cqe);
+            if (cqe->res < 0) ok = false;
+            io_uring_cqe_seen(&ring, cqe);
+            pending--;
+        }
+    }
+
+    io_uring_queue_exit(&ring);
+    return ok;
+}
+#endif /* USE_IO_URING */
+
 static void *flush_thread_fn(void *arg) {
     flush_snapshot_t *snap = (flush_snapshot_t *)arg;
 
-    /* 1. Write all deferred entries to .dat + .idx */
-    for (size_t i = 0; i < snap->count; i++) {
-        deferred_entry_t *e = &snap->entries[i];
-        if (!e->rlp) continue;
+    /* 1. Write all deferred entries to .dat, then update .idx */
+#ifdef USE_IO_URING
+    /* Try batched io_uring writes to .dat first */
+    if (flush_dat_uring(snap->data_fd, snap->entries, snap->count)) {
+        /* .dat writes done — now update index entries */
+        for (size_t i = 0; i < snap->count; i++) {
+            deferred_entry_t *e = &snap->entries[i];
+            if (!e->rlp) continue;
+            node_record_t rec = { .offset = e->offset,
+                                  .length = e->rlp_len };
+            disk_hash_put(snap->index, e->hash, &rec);
+        }
+    } else
+#endif
+    {
+        /* Fallback: interleaved pwrite + disk_hash_put */
+        for (size_t i = 0; i < snap->count; i++) {
+            deferred_entry_t *e = &snap->entries[i];
+            if (!e->rlp) continue;
 
-        pwrite(snap->data_fd, e->rlp, e->rlp_len,
-               (off_t)(PAGE_SIZE + e->offset));
+            pwrite(snap->data_fd, e->rlp, e->rlp_len,
+                   (off_t)(PAGE_SIZE + e->offset));
 
-        node_record_t rec = { .offset = e->offset,
-                              .length = e->rlp_len };
-        disk_hash_put(snap->index, e->hash, &rec);
+            node_record_t rec = { .offset = e->offset,
+                                  .length = e->rlp_len };
+            disk_hash_put(snap->index, e->hash, &rec);
+        }
     }
 
     /* 2. Process deletes — collect freed slots for merge at join time.

@@ -13,6 +13,7 @@ option(ENABLE_VERKLE "Enable Verkle state root" OFF)
 option(ENABLE_MEM_MPT "Enable in-memory batch MPT for test runner (not needed for chain_replay)" OFF)
 option(ENABLE_COMPACTION "Enable periodic storage MPT compaction during chain replay" OFF)
 option(ENABLE_EVM_TRACE "Enable EIP-3155 EVM execution tracing" OFF)
+option(ENABLE_IO_URING "Enable io_uring for batched async I/O (requires liburing-dev)" OFF)
 
 if(NOT ENABLE_MPT AND NOT ENABLE_VERKLE)
     message(FATAL_ERROR "At least one state backend must be enabled (ENABLE_MPT or ENABLE_VERKLE)")
@@ -182,6 +183,10 @@ add_library(mpt_store STATIC
 target_include_directories(mpt_store PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 target_compile_definitions(mpt_store PRIVATE MPT_DEFAULT_CACHE_MB=${MPT_ACCOUNT_CACHE_MB})
 target_link_libraries(mpt_store disk_hash common pthread)
+if(ENABLE_IO_URING)
+    target_compile_definitions(mpt_store PRIVATE USE_IO_URING=1)
+    target_link_libraries(mpt_store uring)
+endif()
 
 #==============================================================================
 # Libraries — EVM
