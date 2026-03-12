@@ -18,15 +18,41 @@ extern bool g_trace_calls __attribute__((weak));
 //==============================================================================
 
 /**
- * Calculate intrinsic gas for a transaction
- *
- * Intrinsic gas includes:
- * - Base transaction cost (21000 gas)
- * - Cost for calldata (4 gas per zero byte, 16 gas per non-zero byte)
- * - Cost for contract creation (32000 gas if creating contract)
- * - Cost for access list entries (EIP-2930)
+ * Count zero bytes in calldata using 8-byte chunks.
+ * Collapses each byte to a 0/1 indicator via bit folding, then sums
+ * with the multiply-and-shift trick for SWAR byte reduction.
  */
-static uint64_t calculate_intrinsic_gas(const transaction_t *tx, evm_fork_t fork) {
+static inline size_t count_zero_bytes(const uint8_t *data, size_t len) {
+    size_t zeros = 0;
+    size_t i = 0;
+
+    for (; i + 8 <= len; i += 8) {
+        uint64_t w;
+        memcpy(&w, data + i, 8);
+        if (w == 0) { zeros += 8; continue; }
+        /* Fold each byte's bits into its LSB: 1 = nonzero, 0 = zero */
+        uint64_t t = w;
+        t |= (t >> 4);
+        t |= (t >> 2);
+        t |= (t >> 1);
+        t &= 0x0101010101010101ULL;
+        /* Sum 8 indicator bytes via multiply-shift */
+        size_t nonzero = (t * 0x0101010101010101ULL) >> 56;
+        zeros += 8 - nonzero;
+    }
+
+    for (; i < len; i++)
+        if (data[i] == 0) zeros++;
+
+    return zeros;
+}
+
+/**
+ * Calculate intrinsic gas and floor data gas in a single pass over calldata.
+ * Counts zero bytes once, derives both values from the count.
+ */
+static void calculate_gas_pair(const transaction_t *tx, evm_fork_t fork,
+                                uint64_t *out_intrinsic, uint64_t *out_floor) {
     const uint64_t G_TRANSACTION = 21000;
     const uint64_t G_TX_DATA_ZERO = 4;
     const uint64_t G_TX_DATA_NONZERO_ISTANBUL = 16;   // EIP-2028 (Istanbul+)
@@ -51,15 +77,13 @@ static uint64_t calculate_intrinsic_gas(const transaction_t *tx, evm_fork_t fork
         }
     }
 
-    // Add cost for calldata
+    // Count zero bytes once, derive both intrinsic gas and floor data gas
+    size_t zero_bytes = 0;
+    size_t nonzero_bytes = 0;
     if (tx->data && tx->data_size > 0) {
-        for (size_t i = 0; i < tx->data_size; i++) {
-            if (tx->data[i] == 0) {
-                gas += G_TX_DATA_ZERO;
-            } else {
-                gas += g_tx_data_nonzero;
-            }
-        }
+        zero_bytes = count_zero_bytes(tx->data, tx->data_size);
+        nonzero_bytes = tx->data_size - zero_bytes;
+        gas += zero_bytes * G_TX_DATA_ZERO + nonzero_bytes * g_tx_data_nonzero;
     }
 
     // Add cost for access list (EIP-2930)
@@ -77,30 +101,17 @@ static uint64_t calculate_intrinsic_gas(const transaction_t *tx, evm_fork_t fork
         gas += tx->authorization_list_count * PER_AUTH_BASE_COST;
     }
 
-    return gas;
-}
+    *out_intrinsic = gas;
 
-/**
- * EIP-7623 (Prague+): Calculate floor data gas cost
- * floor_gas = tokens_in_calldata * FLOOR_CALLDATA_COST + TX_BASE_COST
- * tokens = zero_bytes * 1 + non_zero_bytes * 4
- */
-static uint64_t calculate_floor_data_gas(const transaction_t *tx, evm_fork_t fork) {
-    /* EIP-7623 applies to Prague only.
-     * Verkle test config (ethereum/tests) does not activate Prague/Cancun. */
-    if (fork < FORK_PRAGUE || fork >= FORK_VERKLE) return 0;
-
-    const uint64_t FLOOR_CALLDATA_COST = 10;
-    const uint64_t TX_BASE_COST = 21000;
-
-    uint64_t tokens = 0;
-    if (tx->data && tx->data_size > 0) {
-        for (size_t i = 0; i < tx->data_size; i++) {
-            tokens += (tx->data[i] == 0) ? 1 : 4;
-        }
+    // EIP-7623 (Prague+): floor data gas
+    if (fork >= FORK_PRAGUE && fork < FORK_VERKLE && tx->data_size > 0) {
+        const uint64_t FLOOR_CALLDATA_COST = 10;
+        /* tokens = zero_bytes * 1 + non_zero_bytes * 4 */
+        uint64_t tokens = zero_bytes + nonzero_bytes * 4;
+        *out_floor = tokens * FLOOR_CALLDATA_COST + G_TRANSACTION;
+    } else {
+        *out_floor = 0;
     }
-
-    return tokens * FLOOR_CALLDATA_COST + TX_BASE_COST;
 }
 
 /**
@@ -669,11 +680,9 @@ bool transaction_execute(
     // EVM Execution
     //==========================================================================
 
-    // Calculate intrinsic gas
-    uint64_t intrinsic_gas = calculate_intrinsic_gas(tx, evm->fork);
-
-    // EIP-7623 (Prague+): floor data gas
-    uint64_t floor_data_gas = calculate_floor_data_gas(tx, evm->fork);
+    // Calculate intrinsic gas and floor data gas in a single calldata pass
+    uint64_t intrinsic_gas, floor_data_gas;
+    calculate_gas_pair(tx, evm->fork, &intrinsic_gas, &floor_data_gas);
 
     // Check if transaction has enough gas for intrinsic cost
     // EIP-7623: must also have enough for floor data gas

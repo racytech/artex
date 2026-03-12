@@ -625,13 +625,15 @@ bool sync_checkpoint(sync_t *sync) {
                                        sync->blocks_fail);
     if (ok) sync->last_checkpoint_block = sync->last_block;
 
+#ifdef ENABLE_COMPACTION
     /* Compact shared storage MPT periodically — reclaim orphaned nodes.
-     * Every 32 checkpoints (~262K blocks) to avoid stalling during
-     * high-throughput periods (e.g. Shanghai DoS attack blocks). */
+     * Every 256 checkpoints (~65K blocks) to limit I/O overhead from
+     * walking the full account trie to collect live storage roots. */
     if (sync->last_block > 0 &&
-        (sync->last_block / sync->config.checkpoint_interval) % 32 == 0) {
+        (sync->last_block / sync->config.checkpoint_interval) % 256 == 0) {
         evm_state_compact_storage(sync->state);
     }
+#endif
 
     /* Evict cache to bound memory — data is on disk, read-through reloads */
     evm_state_evict_cache(sync->state);

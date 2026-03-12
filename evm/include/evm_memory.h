@@ -219,8 +219,8 @@ static inline uint64_t evm_memory_expansion_cost(size_t current_size, size_t new
     size_t current_words = (current_size + EVM_MEMORY_WORD_SIZE - 1) / EVM_MEMORY_WORD_SIZE;
     size_t new_words = (new_size + EVM_MEMORY_WORD_SIZE - 1) / EVM_MEMORY_WORD_SIZE;
 
-    uint64_t current_cost = 3 * current_words + (current_words * current_words) / 512;
-    uint64_t new_cost = 3 * new_words + (new_words * new_words) / 512;
+    uint64_t current_cost = 3 * current_words + ((current_words * current_words) >> 9);
+    uint64_t new_cost = 3 * new_words + ((new_words * new_words) >> 9);
 
     return new_cost - current_cost;
 }
