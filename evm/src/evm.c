@@ -295,46 +295,28 @@ bool evm_resolve_delegation(evm_state_t *state, const address_t *addr, address_t
 // Result Helpers
 //==============================================================================
 
-evm_result_t evm_result_success(uint64_t gas_left, const uint8_t *output_data, size_t output_size)
+evm_result_t evm_result_success(uint64_t gas_left, uint8_t *output_data, size_t output_size)
 {
     evm_result_t result = {
         .status = EVM_SUCCESS,
         .gas_left = gas_left,
         .gas_refund = 0,
-        .output_data = NULL,
+        .output_data = (output_data && output_size > 0) ? output_data : NULL,
         .output_size = output_size
     };
-
-    if (output_data && output_size > 0)
-    {
-        result.output_data = malloc(output_size);
-        if (result.output_data)
-        {
-            memcpy(result.output_data, output_data, output_size);
-        }
-    }
 
     return result;
 }
 
-evm_result_t evm_result_revert(uint64_t gas_left, const uint8_t *output_data, size_t output_size)
+evm_result_t evm_result_revert(uint64_t gas_left, uint8_t *output_data, size_t output_size)
 {
     evm_result_t result = {
         .status = EVM_REVERT,
         .gas_left = gas_left,
         .gas_refund = 0,
-        .output_data = NULL,
+        .output_data = (output_data && output_size > 0) ? output_data : NULL,
         .output_size = output_size
     };
-
-    if (output_data && output_size > 0)
-    {
-        result.output_data = malloc(output_size);
-        if (result.output_data)
-        {
-            memcpy(result.output_data, output_data, output_size);
-        }
-    }
 
     return result;
 }
@@ -634,15 +616,15 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         if (is_subcall && pc_status != EVM_SUCCESS)
             evm_state_revert(evm->state, subcall_snapshot);
 
-        // Build result
+        // Build result — takes ownership of pc_output
         if (pc_status == EVM_SUCCESS)
             *result = evm_result_success(gas_remaining, pc_output, pc_output_size);
         else if (pc_status == EVM_REVERT)
             *result = evm_result_revert(gas_remaining, pc_output, pc_output_size);
-        else
+        else {
             *result = evm_result_error(pc_status, 0);
-
-        if (pc_output) free(pc_output);
+            if (pc_output) free(pc_output);
+        }
 
         // Cleanup subcall context and set return data on parent
         if (is_subcall)
@@ -651,27 +633,11 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
             evm_memory_destroy(evm->memory);
             evm_restore_context(evm, &saved_context);
 
-            // Update parent's return data so RETURNDATASIZE/RETURNDATACOPY work
+            // Transfer result's output buffer to parent's return_data
             if (evm->return_data)
                 free(evm->return_data);
-            if (result->output_size > 0 && result->output_data)
-            {
-                evm->return_data = malloc(result->output_size);
-                if (evm->return_data)
-                {
-                    memcpy(evm->return_data, result->output_data, result->output_size);
-                    evm->return_data_size = result->output_size;
-                }
-                else
-                {
-                    evm->return_data_size = 0;
-                }
-            }
-            else
-            {
-                evm->return_data = NULL;
-                evm->return_data_size = 0;
-            }
+            evm->return_data = result->output_data;
+            evm->return_data_size = result->output_size;
         }
 
         return true;
@@ -764,10 +730,6 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
 
     if (is_subcall)
     {
-        // Save subcall's return data before destroying its context
-        uint8_t *subcall_return_data = evm->return_data;
-        size_t subcall_return_size = evm->return_data_size;
-
         // Destroy subcall's stack and memory
         evm_stack_destroy(evm->stack);
         evm_memory_destroy(evm->memory);
@@ -775,14 +737,13 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         // Restore parent's context
         evm_restore_context(evm, &saved_context);
 
-        // Update parent's return data with subcall's output
-        // (This makes it available for RETURNDATASIZE/RETURNDATACOPY)
+        // Transfer result's output buffer to parent's return_data.
+        // Caller (CALL/CREATE opcodes) must NOT free result->output_data —
+        // it is now owned by evm->return_data and freed on next call or cleanup.
         if (evm->return_data)
-        {
             free(evm->return_data);
-        }
-        evm->return_data = subcall_return_data;
-        evm->return_data_size = subcall_return_size;
+        evm->return_data = result->output_data;
+        evm->return_data_size = result->output_size;
     }
     
     return true;

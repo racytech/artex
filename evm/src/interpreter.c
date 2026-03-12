@@ -148,18 +148,8 @@ evm_result_t evm_result_create(evm_status_t status,
     result.gas_left = gas_left;
     result.gas_refund = gas_refund;
     result.output_size = output_size;
-    result.output_data = NULL;
-    
-    // Allocate and copy output data to avoid double-free issues
-    if (output_data && output_size > 0)
-    {
-        result.output_data = malloc(output_size);
-        if (result.output_data)
-        {
-            memcpy(result.output_data, output_data, output_size);
-        }
-    }
-    
+    /* Take ownership of output_data — caller must not free it */
+    result.output_data = (output_data && output_size > 0) ? output_data : NULL;
     return result;
 }
 
@@ -1386,6 +1376,9 @@ done:
     // Free JUMPDEST bitmap
     free(jumpdest_bitmap);
     evm->jumpdest_bitmap = NULL;
-    // Create result with output data
-    return evm_result_create(status, evm->gas_left, evm->gas_refund, evm->return_data, evm->return_data_size);
+    // Create result — transfers ownership of return_data to result
+    evm_result_t res = evm_result_create(status, evm->gas_left, evm->gas_refund, evm->return_data, evm->return_data_size);
+    evm->return_data = NULL;  /* ownership transferred */
+    evm->return_data_size = 0;
+    return res;
 }

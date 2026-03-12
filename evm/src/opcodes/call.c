@@ -438,7 +438,7 @@ static evm_status_t op_call(evm_t *evm)
             evm->gas_refund += subcall_result.gas_refund;
     }
 
-    if (subcall_result.output_data) free(subcall_result.output_data);
+    /* output_data ownership transferred to evm->return_data by evm_execute */
 
     uint256_t result = call_succeeded ? uint256_from_uint64(1) : UINT256_ZERO;
     if (!evm_stack_push(evm->stack, &result))
@@ -581,7 +581,7 @@ static evm_status_t op_callcode(evm_t *evm)
         if (!evm_memory_write(evm->memory, ret_offset_u64, 
                              subcall_result.output_data, copy_size))
         {
-            if (subcall_result.output_data) free(subcall_result.output_data);
+            /* output_data ownership transferred to evm->return_data by evm_execute */
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -608,7 +608,7 @@ static evm_status_t op_callcode(evm_t *evm)
             evm->gas_refund += subcall_result.gas_refund;
     }
 
-    if (subcall_result.output_data) free(subcall_result.output_data);
+    /* output_data ownership transferred to evm->return_data by evm_execute */
 
     uint256_t result = call_succeeded ? uint256_from_uint64(1) : UINT256_ZERO;
 
@@ -760,7 +760,7 @@ static evm_status_t op_delegatecall(evm_t *evm)
         if (!evm_memory_write(evm->memory, ret_offset_u64, 
                              subcall_result.output_data, copy_size))
         {
-            if (subcall_result.output_data) free(subcall_result.output_data);
+            /* output_data ownership transferred to evm->return_data by evm_execute */
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -775,7 +775,7 @@ static evm_status_t op_delegatecall(evm_t *evm)
             evm->gas_refund += subcall_result.gas_refund;
     }
 
-    if (subcall_result.output_data) free(subcall_result.output_data);
+    /* output_data ownership transferred to evm->return_data by evm_execute */
 
     uint256_t result = call_succeeded ? uint256_from_uint64(1) : UINT256_ZERO;
 
@@ -926,7 +926,7 @@ static evm_status_t op_staticcall(evm_t *evm)
         if (!evm_memory_write(evm->memory, ret_offset_u64, 
                              subcall_result.output_data, copy_size))
         {
-            if (subcall_result.output_data) free(subcall_result.output_data);
+            /* output_data ownership transferred to evm->return_data by evm_execute */
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -941,7 +941,7 @@ static evm_status_t op_staticcall(evm_t *evm)
             evm->gas_refund += subcall_result.gas_refund;
     }
 
-    if (subcall_result.output_data) free(subcall_result.output_data);
+    /* output_data ownership transferred to evm->return_data by evm_execute */
 
     uint256_t result = call_succeeded ? uint256_from_uint64(1) : UINT256_ZERO;
 

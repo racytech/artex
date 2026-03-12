@@ -398,9 +398,7 @@ static evm_status_t execute_create(evm_t *evm,
             evm->gas_refund += init_result.gas_refund;
         }
 
-        if (init_result.output_data) {
-            free(init_result.output_data);
-        }
+        /* output_data ownership transferred to evm->return_data by evm_execute */
 
         // CREATE return data handling:
         // - Success: return_data = empty (deployed code is NOT return data)
