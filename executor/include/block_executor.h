@@ -13,30 +13,41 @@ extern "C" {
 #endif
 
 /**
- * Per-transaction receipt (simplified).
+ * Per-transaction receipt.
+ *
+ * Contains all fields needed for receipt RLP encoding:
+ *   type || RLP([status, cumulative_gas, bloom, logs])
  */
 typedef struct {
-    bool      success;       /* true if tx succeeded (even if EVM reverted) */
-    uint64_t  gas_used;      /* gas consumed by this tx */
-    uint64_t  cumulative_gas; /* cumulative gas after this tx */
-    address_t contract_addr; /* created contract address (if applicable) */
+    bool      success;          /* true if tx executed without fatal error */
+    uint64_t  gas_used;         /* gas consumed by this tx */
+    uint64_t  cumulative_gas;   /* cumulative gas after this tx */
+    address_t contract_addr;    /* created contract address (if applicable) */
     bool      contract_created;
+    uint8_t   tx_type;          /* transaction type (0=legacy, 1=2930, 2=1559, 3=4844, 4=7702) */
+    uint8_t   status_code;      /* 0=fail, 1=success (post-Byzantium) */
+    uint8_t   logs_bloom[256];  /* per-tx 2048-bit bloom filter */
+    evm_log_t *logs;            /* log entries from this tx (caller must free) */
+    size_t    log_count;        /* number of log entries */
 } tx_receipt_t;
 
 /**
  * Block execution result.
  */
 typedef struct {
-    hash_t      state_root;    /* post-execution state root */
-    uint64_t    gas_used;      /* total gas used in the block */
-    size_t      tx_count;      /* number of transactions executed */
-    bool        success;       /* true if all txs processed without fatal error */
+    hash_t      state_root;      /* post-execution state root */
+    uint64_t    gas_used;        /* total gas used in the block */
+    size_t      tx_count;        /* number of transactions executed */
+    bool        success;         /* true if all txs processed without fatal error */
 
-    tx_receipt_t *receipts;    /* per-tx receipts (caller must free) */
+    tx_receipt_t *receipts;      /* per-tx receipts (caller must free) */
     size_t       receipt_count;
 
     /* Debugging: index of the first failed tx (-1 if all ok) */
     int          first_failure;
+
+    hash_t      receipt_root;    /* MPT root of RLP-encoded receipts */
+    uint8_t     logs_bloom[256]; /* aggregate bloom = OR of all per-tx blooms */
 } block_result_t;
 
 /**

@@ -1,4 +1,5 @@
 #include "block.h"
+#include "mem_mpt.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -345,4 +346,213 @@ hash_t block_hash_from_rlp(const uint8_t *data, size_t len) {
     hash_t result = hash_keccak256(hdr_encoded.data, hdr_encoded.len);
     free(hdr_encoded.data);
     return result;
+}
+
+/* =========================================================================
+ * Block header RLP encode (reverse of decode)
+ * ========================================================================= */
+
+/** Encode uint256 as RLP string with leading zeros stripped. */
+static rlp_item_t *rlp_uint256(const uint256_t *v) {
+    uint8_t buf[32];
+    uint256_to_bytes(v, buf);
+    size_t off = 0;
+    while (off < 32 && buf[off] == 0) off++;
+    return rlp_string(buf + off, 32 - off);
+}
+
+bytes_t block_header_encode_rlp(const block_header_t *hdr) {
+    bytes_t empty = {NULL, 0, 0};
+    if (!hdr) return empty;
+
+    rlp_item_t *list = rlp_list_new();
+    if (!list) return empty;
+
+    /* [0]  parentHash */
+    rlp_list_append(list, rlp_string(hdr->parent_hash.bytes, 32));
+    /* [1]  uncleHash */
+    rlp_list_append(list, rlp_string(hdr->uncle_hash.bytes, 32));
+    /* [2]  coinbase */
+    rlp_list_append(list, rlp_string(hdr->coinbase.bytes, 20));
+    /* [3]  stateRoot */
+    rlp_list_append(list, rlp_string(hdr->state_root.bytes, 32));
+    /* [4]  txRoot */
+    rlp_list_append(list, rlp_string(hdr->tx_root.bytes, 32));
+    /* [5]  receiptRoot */
+    rlp_list_append(list, rlp_string(hdr->receipt_root.bytes, 32));
+    /* [6]  logsBloom */
+    rlp_list_append(list, rlp_string(hdr->logs_bloom, 256));
+    /* [7]  difficulty */
+    rlp_list_append(list, rlp_uint256(&hdr->difficulty));
+    /* [8]  number */
+    rlp_list_append(list, rlp_uint64(hdr->number));
+    /* [9]  gasLimit */
+    rlp_list_append(list, rlp_uint64(hdr->gas_limit));
+    /* [10] gasUsed */
+    rlp_list_append(list, rlp_uint64(hdr->gas_used));
+    /* [11] timestamp */
+    rlp_list_append(list, rlp_uint64(hdr->timestamp));
+    /* [12] extraData */
+    rlp_list_append(list, rlp_string(hdr->extra_data, hdr->extra_data_len));
+    /* [13] mixHash */
+    rlp_list_append(list, rlp_string(hdr->mix_hash.bytes, 32));
+    /* [14] nonce (8 bytes big-endian, preserved in full) */
+    {
+        uint8_t nonce_be[8];
+        for (int i = 7; i >= 0; i--) {
+            nonce_be[i] = (uint8_t)(hdr->nonce & 0xFF);
+            /* shift only for i > 0 to avoid shifting a 0 value on last iter */
+        }
+        nonce_be[0] = (uint8_t)((hdr->nonce >> 56) & 0xFF);
+        nonce_be[1] = (uint8_t)((hdr->nonce >> 48) & 0xFF);
+        nonce_be[2] = (uint8_t)((hdr->nonce >> 40) & 0xFF);
+        nonce_be[3] = (uint8_t)((hdr->nonce >> 32) & 0xFF);
+        nonce_be[4] = (uint8_t)((hdr->nonce >> 24) & 0xFF);
+        nonce_be[5] = (uint8_t)((hdr->nonce >> 16) & 0xFF);
+        nonce_be[6] = (uint8_t)((hdr->nonce >>  8) & 0xFF);
+        nonce_be[7] = (uint8_t)((hdr->nonce      ) & 0xFF);
+        rlp_list_append(list, rlp_string(nonce_be, 8));
+    }
+
+    /* [15] baseFeePerGas (London+) */
+    if (hdr->has_base_fee)
+        rlp_list_append(list, rlp_uint256(&hdr->base_fee));
+
+    /* [16] withdrawalsRoot (Shanghai+) */
+    if (hdr->has_withdrawals_root)
+        rlp_list_append(list, rlp_string(hdr->withdrawals_root.bytes, 32));
+
+    /* [17-18] blobGasUsed, excessBlobGas (Cancun+) */
+    if (hdr->has_blob_gas) {
+        rlp_list_append(list, rlp_uint64(hdr->blob_gas_used));
+        rlp_list_append(list, rlp_uint64(hdr->excess_blob_gas));
+    }
+
+    /* [19] parentBeaconBlockRoot (Cancun+) */
+    if (hdr->has_parent_beacon_root)
+        rlp_list_append(list, rlp_string(hdr->parent_beacon_root.bytes, 32));
+
+    bytes_t encoded = rlp_encode(list);
+    rlp_item_free(list);
+    return encoded;
+}
+
+hash_t block_header_hash(const block_header_t *hdr) {
+    hash_t zero = {0};
+    bytes_t encoded = block_header_encode_rlp(hdr);
+    if (!encoded.data) return zero;
+    hash_t h = hash_keccak256(encoded.data, encoded.len);
+    free(encoded.data);
+    return h;
+}
+
+/* =========================================================================
+ * Transaction root computation
+ * ========================================================================= */
+
+hash_t block_compute_tx_root(const block_body_t *body) {
+    hash_t root = {0};
+
+    if (!body || body->tx_count == 0) {
+        /* Empty trie root = keccak256(0x80) */
+        const uint8_t empty_rlp[] = {0x80};
+        hash_t empty = hash_keccak256(empty_rlp, 1);
+        return empty;
+    }
+
+    size_t n = body->tx_count;
+    mpt_unsecured_entry_t *entries = calloc(n, sizeof(*entries));
+    if (!entries) return root;
+
+    /* Temporary arrays to hold allocated key/value buffers */
+    bytes_t *keys   = calloc(n, sizeof(bytes_t));
+    bytes_t *values = calloc(n, sizeof(bytes_t));
+    if (!keys || !values) goto cleanup;
+
+    for (size_t i = 0; i < n; i++) {
+        /* Key: RLP-encoded transaction index */
+        keys[i] = rlp_encode_uint64_direct(i);
+        if (!keys[i].data) goto cleanup;
+
+        /* Value: RLP-encoded transaction */
+        const rlp_item_t *tx = block_body_tx(body, i);
+        if (!tx) goto cleanup;
+        values[i] = rlp_encode(tx);
+        if (!values[i].data) goto cleanup;
+
+        entries[i].key       = keys[i].data;
+        entries[i].key_len   = keys[i].len;
+        entries[i].value     = values[i].data;
+        entries[i].value_len = values[i].len;
+    }
+
+    mpt_compute_root_unsecured(entries, n, &root);
+
+cleanup:
+    if (keys) {
+        for (size_t i = 0; i < n; i++) free(keys[i].data);
+        free(keys);
+    }
+    if (values) {
+        for (size_t i = 0; i < n; i++) free(values[i].data);
+        free(values);
+    }
+    free(entries);
+    return root;
+}
+
+/* =========================================================================
+ * Withdrawals root computation (EIP-4895)
+ * ========================================================================= */
+
+hash_t block_compute_withdrawals_root(const withdrawal_t *withdrawals,
+                                       size_t count) {
+    hash_t root = {0};
+
+    if (count == 0) {
+        const uint8_t empty_rlp[] = {0x80};
+        return hash_keccak256(empty_rlp, 1);
+    }
+    if (!withdrawals) return root;
+
+    mpt_unsecured_entry_t *entries = calloc(count, sizeof(*entries));
+    bytes_t *keys   = calloc(count, sizeof(bytes_t));
+    bytes_t *values = calloc(count, sizeof(bytes_t));
+    if (!entries || !keys || !values) goto cleanup;
+
+    for (size_t i = 0; i < count; i++) {
+        /* Key: RLP-encoded withdrawal index in list */
+        keys[i] = rlp_encode_uint64_direct(i);
+        if (!keys[i].data) goto cleanup;
+
+        /* Value: RLP([index, validator_index, address, amount]) */
+        rlp_item_t *list = rlp_list_new();
+        if (!list) goto cleanup;
+        rlp_list_append(list, rlp_uint64(withdrawals[i].index));
+        rlp_list_append(list, rlp_uint64(withdrawals[i].validator_index));
+        rlp_list_append(list, rlp_string(withdrawals[i].address.bytes, 20));
+        rlp_list_append(list, rlp_uint64(withdrawals[i].amount_gwei));
+        values[i] = rlp_encode(list);
+        rlp_item_free(list);
+        if (!values[i].data) goto cleanup;
+
+        entries[i].key       = keys[i].data;
+        entries[i].key_len   = keys[i].len;
+        entries[i].value     = values[i].data;
+        entries[i].value_len = values[i].len;
+    }
+
+    mpt_compute_root_unsecured(entries, count, &root);
+
+cleanup:
+    if (keys) {
+        for (size_t i = 0; i < count; i++) free(keys[i].data);
+        free(keys);
+    }
+    if (values) {
+        for (size_t i = 0; i < count; i++) free(values[i].data);
+        free(values);
+    }
+    free(entries);
+    return root;
 }

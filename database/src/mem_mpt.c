@@ -139,14 +139,95 @@ static bool leaf_hash(const uint8_t *suffix, size_t suffix_len,
     uint8_t encoded_path[33];
     size_t encoded_len = hex_prefix_encode(suffix, suffix_len, true, encoded_path);
 
-    rlp_sbuf_t payload; sbuf_reset(&payload);
-    sbuf_encode_bytes(&payload, encoded_path, encoded_len);
-    sbuf_encode_bytes(&payload, value, value_len);
+    /* Fast path: small values fit in the stack buffer */
+    if (value_len + encoded_len + 16 <= sizeof(((rlp_sbuf_t *)0)->data)) {
+        rlp_sbuf_t payload; sbuf_reset(&payload);
+        sbuf_encode_bytes(&payload, encoded_path, encoded_len);
+        sbuf_encode_bytes(&payload, value, value_len);
 
-    rlp_sbuf_t node; sbuf_reset(&node);
-    sbuf_list_wrap(&node, &payload);
+        rlp_sbuf_t node; sbuf_reset(&node);
+        sbuf_list_wrap(&node, &payload);
 
-    keccak256(node.data, node.len, out->bytes);
+        keccak256(node.data, node.len, out->bytes);
+        return true;
+    }
+
+    /* Slow path: large values — build RLP manually with heap allocation */
+    /* RLP(encoded_path): header + data */
+    size_t path_rlp_len = encoded_len <= 55 ? 1 + encoded_len
+                        : encoded_len <= 0xFF ? 2 + encoded_len
+                        : 3 + encoded_len;
+    /* RLP(value): header + data */
+    size_t val_rlp_len;
+    if (value_len == 1 && value[0] < 0x80)
+        val_rlp_len = 1;
+    else if (value_len <= 55)
+        val_rlp_len = 1 + value_len;
+    else if (value_len <= 0xFF)
+        val_rlp_len = 2 + value_len;
+    else if (value_len <= 0xFFFF)
+        val_rlp_len = 3 + value_len;
+    else
+        val_rlp_len = 4 + value_len;
+
+    size_t payload_len = path_rlp_len + val_rlp_len;
+    /* List header: 1 byte if payload<=55, else 1 + length-of-length */
+    size_t list_hdr_len;
+    if (payload_len <= 55)
+        list_hdr_len = 1;
+    else if (payload_len <= 0xFF)
+        list_hdr_len = 2;
+    else if (payload_len <= 0xFFFF)
+        list_hdr_len = 3;
+    else
+        list_hdr_len = 4;
+
+    size_t total = list_hdr_len + payload_len;
+    uint8_t *buf = malloc(total);
+    if (!buf) return false;
+
+    size_t pos = 0;
+    /* Write list header */
+    if (payload_len <= 55) {
+        buf[pos++] = 0xc0 + (uint8_t)payload_len;
+    } else {
+        uint8_t lb[4]; size_t ll = 0;
+        size_t tmp = payload_len;
+        while (tmp > 0) { lb[ll++] = tmp & 0xFF; tmp >>= 8; }
+        buf[pos++] = 0xf7 + (uint8_t)ll;
+        for (int i = (int)ll - 1; i >= 0; i--) buf[pos++] = lb[i];
+    }
+    /* Write RLP(encoded_path) */
+    if (encoded_len <= 55) {
+        buf[pos++] = 0x80 + (uint8_t)encoded_len;
+    } else if (encoded_len <= 0xFF) {
+        buf[pos++] = 0xb8; buf[pos++] = (uint8_t)encoded_len;
+    } else {
+        buf[pos++] = 0xb9; buf[pos++] = (uint8_t)(encoded_len >> 8); buf[pos++] = (uint8_t)(encoded_len & 0xFF);
+    }
+    memcpy(buf + pos, encoded_path, encoded_len); pos += encoded_len;
+    /* Write RLP(value) */
+    if (value_len == 1 && value[0] < 0x80) {
+        buf[pos++] = value[0];
+    } else if (value_len <= 55) {
+        buf[pos++] = 0x80 + (uint8_t)value_len;
+        memcpy(buf + pos, value, value_len); pos += value_len;
+    } else if (value_len <= 0xFF) {
+        buf[pos++] = 0xb8; buf[pos++] = (uint8_t)value_len;
+        memcpy(buf + pos, value, value_len); pos += value_len;
+    } else if (value_len <= 0xFFFF) {
+        buf[pos++] = 0xb9; buf[pos++] = (uint8_t)(value_len >> 8); buf[pos++] = (uint8_t)(value_len & 0xFF);
+        memcpy(buf + pos, value, value_len); pos += value_len;
+    } else {
+        buf[pos++] = 0xba;
+        buf[pos++] = (uint8_t)(value_len >> 16);
+        buf[pos++] = (uint8_t)(value_len >> 8);
+        buf[pos++] = (uint8_t)(value_len & 0xFF);
+        memcpy(buf + pos, value, value_len); pos += value_len;
+    }
+
+    keccak256(buf, pos, out->bytes);
+    free(buf);
     return true;
 }
 
@@ -285,6 +366,125 @@ bool mpt_compute_root_batch(mpt_batch_entry_t *entries, size_t count,
     }
 
     bool ok = build_subtrie(leaves, 0, count, 0, out_root);
+
+    free(leaves);
+    return ok;
+}
+
+//==============================================================================
+// Unsecured trie (variable-length raw keys)
+//==============================================================================
+
+typedef struct {
+    uint8_t nibbles[64];      // max 32 bytes = 64 nibbles
+    size_t  nibble_count;
+    const uint8_t *value;
+    size_t value_len;
+} batch_leaf_var_t;
+
+static bool build_subtrie_var(batch_leaf_var_t *leaves, size_t start, size_t end,
+                               size_t depth, hash_t *out) {
+    size_t count = end - start;
+
+    if (count == 0) {
+        const uint8_t empty_rlp[] = {0x80};
+        keccak256(empty_rlp, sizeof(empty_rlp), out->bytes);
+        return true;
+    }
+
+    if (count == 1) {
+        size_t remaining = leaves[start].nibble_count - depth;
+        return leaf_hash(&leaves[start].nibbles[depth], remaining,
+                         leaves[start].value, leaves[start].value_len, out);
+    }
+
+    /* Find minimum remaining nibble count across all leaves */
+    size_t min_remaining = leaves[start].nibble_count - depth;
+    for (size_t i = start + 1; i < end; i++) {
+        size_t rem = leaves[i].nibble_count - depth;
+        if (rem < min_remaining) min_remaining = rem;
+    }
+
+    /* Find common prefix (bounded by shortest remaining path) */
+    size_t common_len = min_remaining;
+    for (size_t i = start + 1; i < end && common_len > 0; i++) {
+        for (size_t j = 0; j < common_len; j++) {
+            if (leaves[start].nibbles[depth + j] != leaves[i].nibbles[depth + j]) {
+                common_len = j;
+                break;
+            }
+        }
+    }
+
+    if (common_len > 0) {
+        hash_t child;
+        if (!build_subtrie_var(leaves, start, end, depth + common_len, &child))
+            return false;
+        return extension_hash(&leaves[start].nibbles[depth], common_len, &child, out);
+    }
+
+    /* Branch node */
+    hash_t children[16];
+    memset(children, 0, sizeof(children));
+
+    size_t i = start;
+    while (i < end) {
+        uint8_t nibble = leaves[i].nibbles[depth];
+        size_t group_end = i + 1;
+        while (group_end < end && leaves[group_end].nibbles[depth] == nibble)
+            group_end++;
+
+        if (!build_subtrie_var(leaves, i, group_end, depth + 1, &children[nibble]))
+            return false;
+
+        i = group_end;
+    }
+
+    return branch_hash(children, out);
+}
+
+static int compare_unsecured_entries(const void *a, const void *b) {
+    const mpt_unsecured_entry_t *ea = (const mpt_unsecured_entry_t *)a;
+    const mpt_unsecured_entry_t *eb = (const mpt_unsecured_entry_t *)b;
+    size_t min_len = ea->key_len < eb->key_len ? ea->key_len : eb->key_len;
+    int cmp = min_len > 0 ? memcmp(ea->key, eb->key, min_len) : 0;
+    if (cmp != 0) return cmp;
+    return (ea->key_len < eb->key_len) ? -1 :
+           (ea->key_len > eb->key_len) ?  1 : 0;
+}
+
+bool mpt_compute_root_unsecured(mpt_unsecured_entry_t *entries,
+                                 size_t count, hash_t *out_root) {
+    if (!out_root) return false;
+
+    if (count == 0) {
+        const uint8_t empty_rlp[] = {0x80};
+        keccak256(empty_rlp, sizeof(empty_rlp), out_root->bytes);
+        return true;
+    }
+    if (!entries) return false;
+
+    /* Sort by raw key bytes */
+    qsort(entries, count, sizeof(mpt_unsecured_entry_t),
+          compare_unsecured_entries);
+
+    /* Expand keys to nibbles */
+    batch_leaf_var_t *leaves = malloc(count * sizeof(batch_leaf_var_t));
+    if (!leaves) return false;
+
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].key_len > 32) {
+            free(leaves);
+            return false;
+        }
+        bytes_to_nibbles(entries[i].key, entries[i].key_len,
+                         leaves[i].nibbles);
+        leaves[i].nibble_count = entries[i].key_len * 2;
+        leaves[i].value        = entries[i].value;
+        leaves[i].value_len    = entries[i].value_len;
+    }
+
+    bool ok = build_subtrie_var(leaves, 0, count, 0, out_root);
 
     free(leaves);
     return ok;

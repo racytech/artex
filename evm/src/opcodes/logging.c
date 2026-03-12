@@ -1,8 +1,8 @@
 /**
  * EVM Logging Opcodes Implementation
  *
- * Stub implementations for event logging operations.
- * These will be fully implemented when log storage infrastructure is added.
+ * LOG0-LOG4 capture log entries into the EVM's log accumulator.
+ * Logs are discarded on REVERT (handled by evm_execute/create).
  */
 
 #include "opcodes/logging.h"
@@ -11,6 +11,7 @@
 #include "uint256.h"
 #include "gas.h"
 #include "logger.h"
+#include <stdlib.h>
 #include <string.h>
 
 //==============================================================================
@@ -18,11 +19,11 @@
 //==============================================================================
 
 /**
- * Generic LOG implementation (stub)
- * 
+ * Generic LOG implementation
+ *
  * @param evm EVM instance
  * @param num_topics Number of topics (0-4)
- * @return EVM_SUCCESS (stub - always succeeds)
+ * @return EVM_SUCCESS on success, error status otherwise
  */
 static evm_status_t op_log_common(evm_t *evm, uint8_t num_topics)
 {
@@ -86,10 +87,38 @@ static evm_status_t op_log_common(evm_t *evm, uint8_t num_topics)
         }
     }
 
-    // TODO: Store log entry in evm->logs array
-    // For now, just log to debug output
-    LOG_EVM_DEBUG("LOG%u: offset=%lu, size=%lu (stub - not stored)", 
-                  num_topics, offset, size);
+    // Grow log accumulator if needed
+    if (evm->log_count >= evm->log_cap)
+    {
+        size_t new_cap = evm->log_cap ? evm->log_cap * 2 : 8;
+        evm_log_t *new_logs = realloc(evm->logs, new_cap * sizeof(evm_log_t));
+        if (!new_logs) return EVM_INTERNAL_ERROR;
+        evm->logs = new_logs;
+        evm->log_cap = new_cap;
+    }
+
+    evm_log_t *log = &evm->logs[evm->log_count++];
+    address_copy(&log->address, &evm->msg.recipient);
+    log->topic_count = num_topics;
+    for (uint8_t i = 0; i < num_topics; i++)
+        uint256_to_bytes(&topics[i], log->topics[i].bytes);
+
+    log->data = NULL;
+    log->data_len = (size_t)size;
+    if (size > 0)
+    {
+        log->data = malloc((size_t)size);
+        if (!log->data)
+        {
+            evm->log_count--;
+            return EVM_INTERNAL_ERROR;
+        }
+        const uint8_t *mem_ptr = evm_memory_get_ptr(evm->memory, offset);
+        memcpy(log->data, mem_ptr, (size_t)size);
+    }
+
+    LOG_EVM_DEBUG("LOG%u: offset=%lu, size=%lu, %zu logs total",
+                  num_topics, offset, size, evm->log_count);
 
     return EVM_SUCCESS;
 }

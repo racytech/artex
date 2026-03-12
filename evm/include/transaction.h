@@ -127,9 +127,9 @@ typedef struct {
     address_t contract_address; // Created contract address (for CREATE)
     bool contract_created;      // True if contract was created
     
-    // Logs (not yet implemented)
-    // log_t *logs;
-    // size_t log_count;
+    // Logs emitted by this transaction (moved from EVM accumulator)
+    evm_log_t *logs;
+    size_t     log_count;
 } transaction_result_t;
 
 /**

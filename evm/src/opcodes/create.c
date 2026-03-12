@@ -228,6 +228,7 @@ static evm_status_t execute_create(evm_t *evm,
     // Take snapshot AFTER nonce increment but BEFORE account creation/value transfer
     // Revert undoes contract creation and value transfer but preserves sender nonce
     uint32_t snapshot = evm_state_snapshot(evm->state);
+    size_t logs_before_create = evm->log_count;
 
     // EIP-4762 (Verkle): ContractCreateInitGas — write basic_data + code_hash
     // Charged from forwarded gas.
@@ -242,6 +243,7 @@ static evm_status_t execute_create(evm_t *evm,
             // OOG: consume all forwarded gas, revert, push 0
             if (init_code) free(init_code);
             evm_state_revert(evm->state, snapshot);
+            evm_logs_truncate(evm, logs_before_create);
             if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
             evm->return_data_size = 0;
             uint256_t zero = UINT256_ZERO;
@@ -430,6 +432,7 @@ static evm_status_t execute_create(evm_t *evm,
 
     if (!success) {
         evm_state_revert(evm->state, snapshot);
+        evm_logs_truncate(evm, logs_before_create);
     }
 
     //==========================================================================

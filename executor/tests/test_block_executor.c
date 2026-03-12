@@ -6,6 +6,12 @@
  *  2. Legacy transaction RLP decode + sender recovery (EIP-155 test vector)
  *  3. Block body RLP decode
  *  4. Block executor smoke test (value transfer)
+ *  5. DAO fork drain
+ *  6. DAO fork block/chain gate
+ *  7. Block header encode → decode round-trip
+ *  8. Block header hash consistency
+ *  9. Empty transaction root
+ * 10. Transaction root from body with one tx
  */
 
 #include "block.h"
@@ -22,6 +28,7 @@
 #include "verkle_state.h"
 #endif
 #include "fork.h"
+#include "mem_mpt.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -508,6 +515,221 @@ static void test_dao_fork_block_check(void) {
 }
 
 /* =========================================================================
+ * Test 7: Block header encode → decode round-trip
+ * ========================================================================= */
+
+static void test_header_encode_roundtrip(void) {
+    TEST("Block header encode → decode round-trip");
+
+    /* Build a header struct (London+ with baseFee) */
+    block_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    memset(hdr.parent_hash.bytes, 0x11, 32);
+    memset(hdr.uncle_hash.bytes, 0x22, 32);
+    memset(hdr.coinbase.bytes, 0x33, 20);
+    memset(hdr.state_root.bytes, 0x44, 32);
+    memset(hdr.tx_root.bytes, 0x55, 32);
+    memset(hdr.receipt_root.bytes, 0x66, 32);
+    memset(hdr.logs_bloom, 0, 256);
+    hdr.difficulty = uint256_from_uint64(0x20000);
+    hdr.number = 42;
+    hdr.gas_limit = 8000000;
+    hdr.gas_used = 21000;
+    hdr.timestamp = 1638360000;
+    hdr.extra_data[0] = 0xCA;
+    hdr.extra_data[1] = 0xFE;
+    hdr.extra_data_len = 2;
+    memset(hdr.mix_hash.bytes, 0x77, 32);
+    hdr.nonce = 0;
+    hdr.has_base_fee = true;
+    hdr.base_fee = uint256_from_uint64(7);
+
+    /* Encode */
+    bytes_t encoded = block_header_encode_rlp(&hdr);
+    ASSERT(encoded.data && encoded.len > 0, "encode header");
+
+    /* Decode back */
+    block_header_t decoded;
+    ASSERT(block_header_decode_rlp(&decoded, encoded.data, encoded.len),
+           "decode round-trip");
+
+    /* Verify all fields */
+    ASSERT(memcmp(decoded.parent_hash.bytes, hdr.parent_hash.bytes, 32) == 0,
+           "parentHash round-trip");
+    ASSERT(memcmp(decoded.uncle_hash.bytes, hdr.uncle_hash.bytes, 32) == 0,
+           "uncleHash round-trip");
+    ASSERT(memcmp(decoded.coinbase.bytes, hdr.coinbase.bytes, 20) == 0,
+           "coinbase round-trip");
+    ASSERT(memcmp(decoded.state_root.bytes, hdr.state_root.bytes, 32) == 0,
+           "stateRoot round-trip");
+    ASSERT(decoded.number == hdr.number, "number round-trip");
+    ASSERT(decoded.gas_limit == hdr.gas_limit, "gasLimit round-trip");
+    ASSERT(decoded.gas_used == hdr.gas_used, "gasUsed round-trip");
+    ASSERT(decoded.timestamp == hdr.timestamp, "timestamp round-trip");
+    ASSERT(decoded.extra_data_len == hdr.extra_data_len, "extraData len round-trip");
+    ASSERT(decoded.extra_data[0] == 0xCA && decoded.extra_data[1] == 0xFE,
+           "extraData round-trip");
+    ASSERT(memcmp(decoded.mix_hash.bytes, hdr.mix_hash.bytes, 32) == 0,
+           "mixHash round-trip");
+    ASSERT(decoded.nonce == hdr.nonce, "nonce round-trip");
+    ASSERT(decoded.has_base_fee, "has_base_fee round-trip");
+    ASSERT(uint256_to_uint64(&decoded.base_fee) == 7, "baseFee round-trip");
+
+    free(encoded.data);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 8: Block header hash consistency
+ * ========================================================================= */
+
+static void test_header_hash(void) {
+    TEST("Block header hash consistency");
+
+    /* Build header */
+    block_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    memset(hdr.parent_hash.bytes, 0xAA, 32);
+    memset(hdr.uncle_hash.bytes, 0xBB, 32);
+    memset(hdr.coinbase.bytes, 0xCC, 20);
+    memset(hdr.state_root.bytes, 0xDD, 32);
+    memset(hdr.tx_root.bytes, 0xEE, 32);
+    memset(hdr.receipt_root.bytes, 0xFF, 32);
+    memset(hdr.logs_bloom, 0, 256);
+    hdr.difficulty = uint256_from_uint64(0x100);
+    hdr.number = 1000;
+    hdr.gas_limit = 30000000;
+    hdr.gas_used = 100000;
+    hdr.timestamp = 1700000000;
+    hdr.extra_data_len = 0;
+    memset(hdr.mix_hash.bytes, 0x11, 32);
+    hdr.nonce = 0;
+    hdr.has_base_fee = true;
+    hdr.base_fee = uint256_from_uint64(1000000000); /* 1 gwei */
+
+    /* Compute hash via block_header_hash */
+    hash_t hash1 = block_header_hash(&hdr);
+    ASSERT(!hash_is_zero(&hash1), "hash non-zero");
+
+    /* Encode header, wrap in block RLP [header, [], []], compute via block_hash_from_rlp */
+    bytes_t hdr_rlp = block_header_encode_rlp(&hdr);
+    ASSERT(hdr_rlp.data != NULL, "encode header");
+
+    /* Wrap: [[header_fields], [], []] */
+    rlp_item_t *hdr_decoded = rlp_decode(hdr_rlp.data, hdr_rlp.len);
+    ASSERT(hdr_decoded != NULL, "decode header RLP");
+
+    rlp_item_t *block = rlp_list_new();
+    rlp_list_append(block, hdr_decoded);
+    rlp_list_append(block, rlp_list_new()); /* uncles */
+    rlp_list_append(block, rlp_list_new()); /* txs */
+    bytes_t block_rlp = rlp_encode(block);
+    ASSERT(block_rlp.data != NULL, "encode block");
+
+    hash_t hash2 = block_hash_from_rlp(block_rlp.data, block_rlp.len);
+
+    /* Both methods should produce the same hash */
+    ASSERT(memcmp(hash1.bytes, hash2.bytes, 32) == 0,
+           "block_header_hash == block_hash_from_rlp");
+
+    /* Same header should produce same hash (deterministic) */
+    hash_t hash3 = block_header_hash(&hdr);
+    ASSERT(memcmp(hash1.bytes, hash3.bytes, 32) == 0, "deterministic");
+
+    free(hdr_rlp.data);
+    free(block_rlp.data);
+    rlp_item_free(block);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 9: Empty transaction root
+ * ========================================================================= */
+
+static void test_empty_tx_root(void) {
+    TEST("Empty transaction root");
+
+    /* Build empty body */
+    rlp_item_t *body_rlp = rlp_list_new();
+    rlp_list_append(body_rlp, rlp_list_new()); /* empty txs */
+    rlp_list_append(body_rlp, rlp_list_new()); /* empty uncles */
+    bytes_t encoded = rlp_encode(body_rlp);
+    ASSERT(encoded.data != NULL, "encode body");
+
+    block_body_t body;
+    ASSERT(block_body_decode_rlp(&body, encoded.data, encoded.len), "decode body");
+    ASSERT(body.tx_count == 0, "empty body");
+
+    hash_t root = block_compute_tx_root(&body);
+
+    /* Empty trie root = keccak256(0x80) =
+     * 0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421 */
+    uint8_t expected[32];
+    hex_to_bytes("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+                 expected, 32);
+    ASSERT(memcmp(root.bytes, expected, 32) == 0, "empty trie root");
+
+    block_body_free(&body);
+    free(encoded.data);
+    rlp_item_free(body_rlp);
+    PASS();
+}
+
+/* =========================================================================
+ * Test 10: Transaction root from body with one tx
+ * ========================================================================= */
+
+static void test_single_tx_root(void) {
+    TEST("Single tx root");
+
+    /* Build body with one legacy tx */
+    rlp_item_t *body_list = rlp_list_new();
+    rlp_item_t *txs_list = rlp_list_new();
+
+    rlp_item_t *tx = rlp_list_new();
+    rlp_list_append(tx, rlp_uint64(0));               /* nonce */
+    rlp_list_append(tx, rlp_uint64(20000000000ULL));   /* gasPrice */
+    rlp_list_append(tx, rlp_uint64(21000));            /* gasLimit */
+    uint8_t to[20]; memset(to, 0xAA, 20);
+    rlp_list_append(tx, rlp_string(to, 20));           /* to */
+    rlp_list_append(tx, rlp_uint64(1000));             /* value */
+    rlp_list_append(tx, rlp_string(NULL, 0));          /* data */
+    rlp_list_append(tx, rlp_uint64(27));               /* v */
+    uint8_t zero32[32]; memset(zero32, 0, 32);
+    rlp_list_append(tx, rlp_string(zero32, 32));       /* r */
+    rlp_list_append(tx, rlp_string(zero32, 32));       /* s */
+
+    rlp_list_append(txs_list, tx);
+    rlp_list_append(body_list, txs_list);
+    rlp_list_append(body_list, rlp_list_new()); /* empty uncles */
+
+    bytes_t encoded = rlp_encode(body_list);
+    ASSERT(encoded.data != NULL, "encode body");
+
+    block_body_t body;
+    ASSERT(block_body_decode_rlp(&body, encoded.data, encoded.len), "decode body");
+    ASSERT(body.tx_count == 1, "1 tx");
+
+    hash_t root = block_compute_tx_root(&body);
+
+    /* Root should be non-zero and different from empty trie root */
+    uint8_t empty_root[32];
+    hex_to_bytes("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+                 empty_root, 32);
+    ASSERT(memcmp(root.bytes, empty_root, 32) != 0, "not empty root");
+    ASSERT(!hash_is_zero(&root), "non-zero root");
+
+    /* Compute again — should be deterministic */
+    hash_t root2 = block_compute_tx_root(&body);
+    ASSERT(memcmp(root.bytes, root2.bytes, 32) == 0, "deterministic");
+
+    block_body_free(&body);
+    free(encoded.data);
+    rlp_item_free(body_list);
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -520,6 +742,10 @@ int main(void) {
     test_executor_smoke();
     test_dao_fork();
     test_dao_fork_block_check();
+    test_header_encode_roundtrip();
+    test_header_hash();
+    test_empty_tx_root();
+    test_single_tx_root();
 
     printf("\n=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);

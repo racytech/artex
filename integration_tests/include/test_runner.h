@@ -167,12 +167,12 @@ bool test_runner_run_state_test(test_runner_t *runner,
 
 /**
  * Execute a blockchain test
- * 
+ *
  * Blockchain test: multi-block execution with state transitions
  * - Setup genesis state
  * - Process blocks sequentially
  * - Verify final state and block hashes
- * 
+ *
  * @param runner Test runner instance
  * @param test Blockchain test to execute
  * @param result Output result (allocated)
@@ -181,6 +181,23 @@ bool test_runner_run_state_test(test_runner_t *runner,
 bool test_runner_run_blockchain_test(test_runner_t *runner,
                                      const blockchain_test_t *test,
                                      test_result_t *result);
+
+/**
+ * Execute an engine test (blockchain_tests_engine format)
+ *
+ * Engine test: blocks delivered as Engine API newPayload calls
+ * - Setup genesis pre-state
+ * - For each payload: convert to block header+body, execute, verify state root
+ * - Verify post-state accounts
+ *
+ * @param runner Test runner instance
+ * @param test Engine test to execute
+ * @param result Output result (allocated)
+ * @return true on success, false on error
+ */
+bool test_runner_run_engine_test(test_runner_t *runner,
+                                 const engine_test_t *test,
+                                 test_result_t *result);
 
 //==============================================================================
 // Transaction Test Execution

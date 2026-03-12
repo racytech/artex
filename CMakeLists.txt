@@ -261,7 +261,7 @@ add_library(block_executor STATIC
 target_include_directories(block_executor PUBLIC
     ${CMAKE_SOURCE_DIR}/executor/include
 )
-target_link_libraries(block_executor evm common secp256k1)
+target_link_libraries(block_executor evm mem_mpt common secp256k1)
 
 #==============================================================================
 # Libraries — Networking / Portal
@@ -726,7 +726,35 @@ target_link_libraries(test_byte_conv common)
 add_test(NAME test_byte_conv COMMAND test_byte_conv)
 
 #==============================================================================
-# cJSON detection (used by chain_replay + integration tests)
+# Libraries — Engine API (JWT — no cJSON dependency)
+#==============================================================================
+
+# Engine JWT (HS256 authentication for Engine API)
+add_library(engine_jwt STATIC
+    engine/src/engine_jwt.c
+)
+target_include_directories(engine_jwt PUBLIC
+    ${CMAKE_SOURCE_DIR}/engine/include
+    ${CMAKE_SOURCE_DIR}/net/include
+)
+target_link_libraries(engine_jwt hkdf)
+
+# Engine HTTP (minimal TCP server — no cJSON dependency)
+add_library(engine_http STATIC
+    engine/src/engine_http.c
+)
+target_include_directories(engine_http PUBLIC ${CMAKE_SOURCE_DIR}/engine/include)
+
+# Test: Engine JWT (HS256 generate/validate/reject)
+add_executable(test_engine_jwt
+    engine/tests/test_engine_jwt.c
+)
+target_include_directories(test_engine_jwt PRIVATE ${CMAKE_SOURCE_DIR}/engine/include)
+target_link_libraries(test_engine_jwt engine_jwt)
+add_test(NAME test_engine_jwt COMMAND test_engine_jwt)
+
+#==============================================================================
+# cJSON detection (used by chain_replay + engine API + integration tests)
 #==============================================================================
 
 find_package(PkgConfig QUIET)
@@ -745,6 +773,95 @@ endif()
 
 if(CJSON_FOUND)
     message(STATUS "Found cJSON: ${CJSON_LIBRARIES}")
+
+    #==============================================================================
+    # Libraries — Engine API (cJSON-dependent)
+    #==============================================================================
+
+    # Engine RPC (JSON-RPC 2.0 dispatcher)
+    add_library(engine_rpc STATIC
+        engine/src/engine_rpc.c
+    )
+    target_include_directories(engine_rpc PUBLIC
+        ${CMAKE_SOURCE_DIR}/engine/include
+        ${CJSON_INCLUDE_DIRS}
+    )
+    target_link_libraries(engine_rpc ${CJSON_LIBRARIES})
+
+    # Engine Types (ExecutionPayload, PayloadStatus, ForkchoiceState)
+    add_library(engine_types STATIC
+        engine/src/engine_types.c
+    )
+    target_include_directories(engine_types PUBLIC
+        ${CMAKE_SOURCE_DIR}/engine/include
+        ${CJSON_INCLUDE_DIRS}
+    )
+    target_link_libraries(engine_types ${CJSON_LIBRARIES})
+
+    # Engine Store (in-memory block storage + fork choice)
+    add_library(engine_store STATIC
+        engine/src/engine_store.c
+    )
+    target_include_directories(engine_store PUBLIC
+        ${CMAKE_SOURCE_DIR}/engine/include
+        ${CJSON_INCLUDE_DIRS}
+    )
+    target_link_libraries(engine_store engine_types)
+
+    # Engine Handlers (newPayloadV4, forkchoiceUpdatedV3, getPayloadV4)
+    add_library(engine_handlers STATIC
+        engine/src/engine_handlers.c
+    )
+    target_include_directories(engine_handlers PUBLIC
+        ${CMAKE_SOURCE_DIR}/engine/include
+        ${CJSON_INCLUDE_DIRS}
+    )
+    target_link_libraries(engine_handlers engine_rpc engine_types engine_store block_executor ${CJSON_LIBRARIES})
+
+    # Engine (top-level orchestrator)
+    add_library(engine STATIC
+        engine/src/engine.c
+    )
+    target_include_directories(engine PUBLIC
+        ${CMAKE_SOURCE_DIR}/engine/include
+        ${CJSON_INCLUDE_DIRS}
+    )
+    target_link_libraries(engine engine_http engine_jwt engine_rpc engine_handlers engine_store engine_types ${CJSON_LIBRARIES})
+
+    # Standalone Engine API server (for mock CL testing)
+    add_executable(engine_server tools/engine_server.c)
+    target_include_directories(engine_server PRIVATE
+        integration_tests/include
+        executor/include
+        ${CJSON_INCLUDE_DIRS}
+    )
+    target_link_libraries(engine_server engine integration_tests block_executor evm ${CJSON_LIBRARIES})
+
+    #==============================================================================
+    # Tests — Engine API (cJSON-dependent)
+    #==============================================================================
+
+    # Test: Engine RPC + Types + Store
+    add_executable(test_engine_rpc
+        engine/tests/test_engine_rpc.c
+    )
+    target_include_directories(test_engine_rpc PRIVATE
+        ${CMAKE_SOURCE_DIR}/engine/include
+        ${CJSON_INCLUDE_DIRS}
+    )
+    target_link_libraries(test_engine_rpc engine_rpc engine_types engine_store ${CJSON_LIBRARIES})
+    add_test(NAME test_engine_rpc COMMAND test_engine_rpc)
+
+    # Test: Engine Handlers (full integration)
+    add_executable(test_engine_handlers
+        engine/tests/test_engine_handlers.c
+    )
+    target_include_directories(test_engine_handlers PRIVATE
+        ${CMAKE_SOURCE_DIR}/engine/include
+        ${CJSON_INCLUDE_DIRS}
+    )
+    target_link_libraries(test_engine_handlers engine_rpc engine_handlers engine_types engine_store block_executor ${CJSON_LIBRARIES})
+    add_test(NAME test_engine_handlers COMMAND test_engine_handlers)
 
     # Sync engine (reusable block execution + validation + checkpointing)
     add_library(sync STATIC sync/src/sync.c)

@@ -150,6 +150,8 @@ void evm_destroy(evm_t *evm)
         free(evm->return_data);
     }
 
+    evm_logs_clear(evm);
+
     free(evm);
 }
 
@@ -185,6 +187,9 @@ void evm_reset(evm_t *evm)
     evm->gas_refund = 0;
     evm->stopped = false;
     evm->status = EVM_SUCCESS;
+
+    // Clear log accumulator
+    evm_logs_clear(evm);
 
     // Note: Don't reset chain_config or fork - those are set externally
 }
@@ -366,6 +371,29 @@ void evm_result_free(evm_result_t *result)
     }
 
     result->output_size = 0;
+}
+
+//==============================================================================
+// Log Helpers
+//==============================================================================
+
+void evm_log_free(evm_log_t *log)
+{
+    if (!log) return;
+    free(log->data);
+    log->data = NULL;
+    log->data_len = 0;
+}
+
+void evm_logs_clear(evm_t *evm)
+{
+    if (!evm) return;
+    for (size_t i = 0; i < evm->log_count; i++)
+        evm_log_free(&evm->logs[i]);
+    free(evm->logs);
+    evm->logs = NULL;
+    evm->log_count = 0;
+    evm->log_cap = 0;
 }
 
 //==============================================================================
@@ -552,6 +580,7 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
 
     // Subcalls need a state snapshot so we can revert on error/REVERT
     uint32_t subcall_snapshot = 0;
+    size_t logs_before = evm->log_count;
     if (is_subcall)
     {
         subcall_snapshot = evm_state_snapshot(evm->state);
@@ -576,6 +605,7 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
             uint64_t wgas = evm_state_witness_gas_access(evm->state, vk, true, false);
             if (wgas > 0 && !evm_use_gas(evm, wgas)) {
                 evm_state_revert(evm->state, subcall_snapshot);
+                evm_logs_truncate(evm, logs_before);
                 evm_stack_destroy(evm->stack);
                 evm_memory_destroy(evm->memory);
                 evm_restore_context(evm, &saved_context);
@@ -631,8 +661,10 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
             evm->fork);
 
         // Revert state on precompile failure (subcalls only)
-        if (is_subcall && pc_status != EVM_SUCCESS)
+        if (is_subcall && pc_status != EVM_SUCCESS) {
             evm_state_revert(evm->state, subcall_snapshot);
+            evm_logs_truncate(evm, logs_before);
+        }
 
         // Build result
         if (pc_status == EVM_SUCCESS)
@@ -756,6 +788,7 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     {
         // Revert all state changes (value transfer, SSTORE, etc.)
         evm_state_revert(evm->state, subcall_snapshot);
+        evm_logs_truncate(evm, logs_before);
     }
 
     //==========================================================================

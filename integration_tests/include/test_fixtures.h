@@ -13,6 +13,7 @@
 #include "uint256.h"
 #include "hash.h"
 #include "address.h"
+#include "block.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -292,6 +293,79 @@ typedef struct {
 } transaction_test_t;
 
 //==============================================================================
+// Engine Test Format (blockchain_tests_engine)
+//==============================================================================
+
+/**
+ * Engine test payload — one engineNewPayloads entry
+ * Contains the ExecutionPayload fields + version metadata
+ */
+typedef struct {
+    /* Fields from params[0] (ExecutionPayload) */
+    uint8_t  parent_hash[32];
+    uint8_t  fee_recipient[20];
+    uint8_t  state_root[32];
+    uint8_t  receipts_root[32];
+    uint8_t  logs_bloom[256];
+    uint8_t  prev_randao[32];
+    uint64_t block_number;
+    uint64_t gas_limit;
+    uint64_t gas_used;
+    uint64_t timestamp;
+    uint8_t  extra_data[32];
+    size_t   extra_data_len;
+    uint8_t  base_fee_per_gas[32];  /* uint256 big-endian */
+    uint8_t  block_hash[32];
+
+    /* Transactions (raw RLP bytes) */
+    uint8_t **transactions;
+    size_t   *tx_lengths;
+    size_t    tx_count;
+
+    /* Withdrawals — Shanghai+ (V2) */
+    withdrawal_t *withdrawals;
+    size_t        withdrawal_count;
+
+    /* Cancun+ (V3) */
+    uint64_t blob_gas_used;
+    uint64_t excess_blob_gas;
+    bool     has_blob_gas;
+
+    /* Parent beacon block root — from params[2], Cancun+ */
+    hash_t   parent_beacon_root;
+    bool     has_parent_beacon_root;
+
+    /* newPayloadVersion: 1-4 */
+    int      new_payload_version;
+
+    /* Expected validation error (NULL if block is valid) */
+    char    *validation_error;
+} engine_test_payload_t;
+
+/**
+ * Complete engine test case
+ * Sequence of Engine API payloads with pre/post state verification
+ */
+typedef struct {
+    char *name;
+    char *network;
+
+    test_block_header_t genesis_header;
+
+    test_account_t *pre_state;
+    size_t pre_state_count;
+
+    test_account_t *post_state;
+    size_t post_state_count;
+
+    engine_test_payload_t *payloads;
+    size_t payload_count;
+
+    hash_t last_block_hash;
+    uint256_t chain_id;
+} engine_test_t;
+
+//==============================================================================
 // Lifecycle Functions
 //==============================================================================
 
@@ -309,6 +383,11 @@ void state_test_free(state_test_t *test);
  * Free transaction test and all allocated resources
  */
 void transaction_test_free(transaction_test_t *test);
+
+/**
+ * Free engine test and all allocated resources
+ */
+void engine_test_free(engine_test_t *test);
 
 /**
  * Free test account and its resources
