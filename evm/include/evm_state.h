@@ -154,6 +154,10 @@ uint256_t evm_state_get_storage(evm_state_t *es, const address_t *addr,
 /** Get committed (original/pre-transaction) storage value. For EIP-2200. */
 uint256_t evm_state_get_committed_storage(evm_state_t *es, const address_t *addr,
                                           const uint256_t *key);
+/** Get current + committed storage in a single lookup (avoids double ensure_slot). */
+void      evm_state_get_storage_pair(evm_state_t *es, const address_t *addr,
+                                     const uint256_t *key,
+                                     uint256_t *current, uint256_t *original);
 void      evm_state_set_storage(evm_state_t *es, const address_t *addr,
                                 const uint256_t *key, const uint256_t *value);
 

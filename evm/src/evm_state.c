@@ -985,6 +985,24 @@ uint256_t evm_state_get_committed_storage(evm_state_t *es, const address_t *addr
     return cs->original;
 }
 
+void evm_state_get_storage_pair(evm_state_t *es, const address_t *addr,
+                                const uint256_t *key,
+                                uint256_t *current, uint256_t *original) {
+    if (!es || !addr || !key) {
+        if (current) *current = UINT256_ZERO_INIT;
+        if (original) *original = UINT256_ZERO_INIT;
+        return;
+    }
+    cached_slot_t *cs = ensure_slot(es, addr, key);
+    if (!cs) {
+        if (current) *current = UINT256_ZERO_INIT;
+        if (original) *original = UINT256_ZERO_INIT;
+        return;
+    }
+    if (current) *current = cs->current;
+    if (original) *original = cs->original;
+}
+
 void evm_state_set_storage(evm_state_t *es, const address_t *addr,
                            const uint256_t *key, const uint256_t *value) {
     if (!es || !addr || !key || !value) return;

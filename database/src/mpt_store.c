@@ -433,6 +433,13 @@ struct mpt_store {
     size_t            def_cap;
     int               def_ht[DEFERRED_BUCKETS]; /* hash table heads, -1 = empty */
 
+    /* Page-based arena for deferred RLP data — eliminates per-node malloc */
+    uint8_t        **def_rlp_pages;
+    size_t           def_rlp_page_count;
+    size_t           def_rlp_page_cap;
+    size_t           def_rlp_page_used;
+#define DEF_RLP_PAGE_SIZE 65536
+
     /* Pending deletes: on-disk node hashes to delete at flush time */
     del_entry_t      *def_deletes;
     size_t            def_del_count;
@@ -863,6 +870,28 @@ static const deferred_entry_t *def_find(const mpt_store_t *ms,
     return NULL;
 }
 
+static uint8_t *def_rlp_arena_alloc(mpt_store_t *ms, size_t len) {
+    if (ms->def_rlp_page_count == 0 ||
+        ms->def_rlp_page_used + len > DEF_RLP_PAGE_SIZE) {
+        if (ms->def_rlp_page_count >= ms->def_rlp_page_cap) {
+            size_t nc = ms->def_rlp_page_cap ? ms->def_rlp_page_cap * 2 : 8;
+            uint8_t **np = realloc(ms->def_rlp_pages, nc * sizeof(*np));
+            if (!np) return NULL;
+            ms->def_rlp_pages = np;
+            ms->def_rlp_page_cap = nc;
+        }
+        size_t psz = len > DEF_RLP_PAGE_SIZE ? len : DEF_RLP_PAGE_SIZE;
+        ms->def_rlp_pages[ms->def_rlp_page_count] = malloc(psz);
+        if (!ms->def_rlp_pages[ms->def_rlp_page_count]) return NULL;
+        ms->def_rlp_page_count++;
+        ms->def_rlp_page_used = 0;
+    }
+    uint8_t *ptr = ms->def_rlp_pages[ms->def_rlp_page_count - 1] +
+                   ms->def_rlp_page_used;
+    ms->def_rlp_page_used += len;
+    return ptr;
+}
+
 static bool def_append(mpt_store_t *ms, const uint8_t hash[32],
                         const uint8_t *rlp, uint32_t rlp_len, uint64_t offset) {
     if (ms->def_count >= ms->def_cap) {
@@ -875,7 +904,7 @@ static bool def_append(mpt_store_t *ms, const uint8_t hash[32],
     }
     deferred_entry_t *e = &ms->def_entries[ms->def_count];
     memcpy(e->hash, hash, 32);
-    e->rlp = malloc(rlp_len);
+    e->rlp = def_rlp_arena_alloc(ms, rlp_len);
     if (!e->rlp) return false;
     memcpy(e->rlp, rlp, rlp_len);
     e->rlp_len = rlp_len;
@@ -903,8 +932,7 @@ static bool def_remove(mpt_store_t *ms, const uint8_t hash[32]) {
             int sc = size_class_for(e->rlp_len);
             free_list_push(&ms->free_lists[sc], e->offset);
             ms->free_slot_bytes += SIZE_CLASSES[sc];
-            /* Free RLP data and mark as removed */
-            free(e->rlp);
+            /* Mark as removed (RLP lives in arena, freed in bulk) */
             e->rlp = NULL;
             return true;
         }
@@ -963,11 +991,17 @@ static void def_del_cancel(mpt_store_t *ms, const uint8_t hash[32]) {
 }
 
 static void def_free_all(mpt_store_t *ms) {
-    for (size_t i = 0; i < ms->def_count; i++)
-        free(ms->def_entries[i].rlp);
     free(ms->def_entries);
     ms->def_entries = NULL;
     ms->def_count = ms->def_cap = 0;
+    /* Free deferred RLP arena pages */
+    for (size_t i = 0; i < ms->def_rlp_page_count; i++)
+        free(ms->def_rlp_pages[i]);
+    free(ms->def_rlp_pages);
+    ms->def_rlp_pages = NULL;
+    ms->def_rlp_page_count = ms->def_rlp_page_cap = 0;
+    ms->def_rlp_page_used = 0;
+    /* Free pending deletes */
     free(ms->def_deletes);
     ms->def_deletes = NULL;
     ms->def_del_count = ms->def_del_cap = 0;
@@ -1328,13 +1362,37 @@ void mpt_store_sync(mpt_store_t *ms) {
     disk_hash_sync(ms->index);
 }
 
+static int def_offset_cmp(const void *a, const void *b) {
+    const deferred_entry_t *ea = *(const deferred_entry_t *const *)a;
+    const deferred_entry_t *eb = *(const deferred_entry_t *const *)b;
+    return (ea->offset > eb->offset) - (ea->offset < eb->offset);
+}
+
 void mpt_store_flush(mpt_store_t *ms) {
     if (!ms) return;
 
-    /* 1. Write all deferred nodes to .dat + .idx */
-    for (size_t i = 0; i < ms->def_count; i++) {
-        deferred_entry_t *e = &ms->def_entries[i];
-        if (!e->rlp) continue;  /* removed entry (hole) */
+    /* 1. Collect live entries and sort by offset for sequential I/O */
+    size_t live = 0;
+    for (size_t i = 0; i < ms->def_count; i++)
+        if (ms->def_entries[i].rlp) live++;
+
+    deferred_entry_t **sorted = NULL;
+    if (live > 0) {
+        sorted = malloc(live * sizeof(*sorted));
+        if (sorted) {
+            size_t j = 0;
+            for (size_t i = 0; i < ms->def_count; i++)
+                if (ms->def_entries[i].rlp)
+                    sorted[j++] = &ms->def_entries[i];
+            qsort(sorted, live, sizeof(*sorted), def_offset_cmp);
+        }
+    }
+
+    /* Write sorted entries — sequential offsets reduce disk seeks */
+    size_t n = sorted ? live : ms->def_count;
+    for (size_t i = 0; i < n; i++) {
+        deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
+        if (!e->rlp) continue;
 
         pwrite(ms->data_fd, e->rlp, e->rlp_len,
                (off_t)(PAGE_SIZE + e->offset));
@@ -1343,6 +1401,7 @@ void mpt_store_flush(mpt_store_t *ms) {
                               .length = e->rlp_len };
         disk_hash_put(ms->index, e->hash, &rec);
     }
+    free(sorted);
 
     /* 2. Apply pending deletes */
     for (size_t i = 0; i < ms->def_del_count; i++) {

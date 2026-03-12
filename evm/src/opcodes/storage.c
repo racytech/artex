@@ -246,9 +246,10 @@ static evm_status_t op_sstore(evm_t *evm)
     evm_stack_pop(evm->stack, &key);
     evm_stack_pop(evm->stack, &value);
 
-    // Get current and original (committed) values from storage
-    uint256_t current_value = evm_state_get_storage(evm->state, &evm->msg.recipient, &key);
-    uint256_t original_value = evm_state_get_committed_storage(evm->state, &evm->msg.recipient, &key);
+    // Get current and original (committed) values in a single lookup
+    uint256_t current_value, original_value;
+    evm_state_get_storage_pair(evm->state, &evm->msg.recipient, &key,
+                               &current_value, &original_value);
 
     if (evm->fork >= FORK_VERKLE) {
         // EIP-4762 (Verkle): witness gas is the COMPLETE SSTORE cost.
