@@ -2175,6 +2175,50 @@ static bool compact_walk(const mpt_store_t *old_ms, mpt_store_t *new_ms,
     return true;
 }
 
+/* Walk all leaves reachable from a node ref, calling cb for each leaf value. */
+static bool walk_leaves_ref(const mpt_store_t *ms, const node_ref_t *ref,
+                             mpt_leaf_cb_t cb, void *user_data) {
+    uint8_t buf[MAX_NODE_RLP];
+    size_t buf_len;
+    mpt_node_t node;
+
+    if (ref->type == REF_EMPTY) return true;
+
+    if (ref->type == REF_INLINE) {
+        if (!decode_node(ref->raw.data, ref->raw.len, &node))
+            return false;
+    } else {
+        /* REF_HASH */
+        buf_len = load_node_rlp(ms, ref->hash, buf);
+        if (buf_len == 0) return false;
+        if (!decode_node(buf, buf_len, &node))
+            return false;
+    }
+
+    if (node.type == MPT_NODE_LEAF) {
+        return cb(node.leaf.value, node.leaf.value_len, user_data);
+    } else if (node.type == MPT_NODE_BRANCH) {
+        for (int i = 0; i < 16; i++) {
+            if (!walk_leaves_ref(ms, &node.branch.children[i], cb, user_data))
+                return false;
+        }
+    } else if (node.type == MPT_NODE_EXTENSION) {
+        if (!walk_leaves_ref(ms, &node.extension.child, cb, user_data))
+            return false;
+    }
+    return true;
+}
+
+bool mpt_store_walk_leaves(const mpt_store_t *ms, mpt_leaf_cb_t cb,
+                            void *user_data) {
+    if (!ms || !cb) return false;
+    if (memcmp(ms->root_hash, EMPTY_ROOT, 32) == 0) return true;
+
+    node_ref_t root = { .type = REF_HASH };
+    memcpy(root.hash, ms->root_hash, 32);
+    return walk_leaves_ref(ms, &root, cb, user_data);
+}
+
 bool mpt_store_compact(mpt_store_t *ms) {
     if (!ms || ms->batch_active) return false;
     if (ms->shared) return false;  /* unsafe: would delete other tries' nodes */

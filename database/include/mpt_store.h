@@ -171,6 +171,16 @@ bool mpt_store_compact(mpt_store_t *ms);
 bool mpt_store_compact_roots(mpt_store_t *ms,
                               const uint8_t (*roots)[32], size_t n_roots);
 
+/**
+ * Walk all leaf nodes reachable from the current root.
+ * Calls cb(value, value_len, user_data) for each leaf.
+ * Returns true if the walk completed without error.
+ */
+typedef bool (*mpt_leaf_cb_t)(const uint8_t *value, size_t value_len,
+                               void *user_data);
+bool mpt_store_walk_leaves(const mpt_store_t *ms, mpt_leaf_cb_t cb,
+                            void *user_data);
+
 /* =========================================================================
  * Node Cache
  * ========================================================================= */

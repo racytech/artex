@@ -22,6 +22,10 @@ extern bool g_trace_calls __attribute__((weak));
 #define SLOT_KEY_SIZE      52   // addr[20] + slot[32]
 #define MAX_CODE_SIZE      (24 * 1024 + 1)  // EIP-170: 24576 bytes
 
+// Forward declarations for RLP helpers (defined later, needed by compaction)
+static size_t rlp_byte_hdr(const uint8_t *buf, size_t buf_len, size_t *data_len);
+static size_t rlp_list_hdr(const uint8_t *buf, size_t buf_len, size_t *payload_len);
+
 // ============================================================================
 // Internal types
 // ============================================================================
@@ -494,19 +498,42 @@ void evm_state_flush(evm_state_t *es) {
 }
 
 #ifdef ENABLE_MPT
-// Callback: collect non-empty storage roots for compaction
+// Collect non-empty storage roots from account trie leaves (RLP-encoded accounts)
 typedef struct {
     uint8_t (*roots)[32];
     size_t count;
     size_t cap;
 } collect_roots_ctx_t;
 
-static bool collect_storage_roots_cb(const uint8_t *key, size_t key_len,
-                                      const void *value, size_t value_len,
-                                      void *user_data) {
-    (void)key; (void)key_len; (void)value_len;
-    const cached_account_t *ca = (const cached_account_t *)value;
-    if (memcmp(ca->storage_root.bytes, HASH_EMPTY_STORAGE.bytes, 32) == 0)
+static bool collect_storage_root_from_leaf(const uint8_t *value, size_t value_len,
+                                            void *user_data) {
+    /* Account RLP: [nonce, balance, storage_root, code_hash]
+     * storage_root is 32 bytes preceded by 0xa0. We need to find it
+     * by skipping nonce and balance fields. */
+    size_t payload_len;
+    size_t hdr = rlp_list_hdr(value, value_len, &payload_len);
+    if (hdr == 0 || hdr + payload_len > value_len) return true; /* skip malformed */
+
+    const uint8_t *p = value + hdr;
+    const uint8_t *end = p + payload_len;
+
+    /* Skip nonce */
+    size_t item_len;
+    size_t off = rlp_byte_hdr(p, (size_t)(end - p), &item_len);
+    p += off + item_len;
+    if (p >= end) return true;
+
+    /* Skip balance */
+    off = rlp_byte_hdr(p, (size_t)(end - p), &item_len);
+    p += off + item_len;
+    if (p + 33 > end) return true;
+
+    /* storage_root: 0xa0 + 32 bytes */
+    if (p[0] != 0xa0) return true;
+    const uint8_t *sr = p + 1;
+
+    /* Skip empty storage root */
+    if (memcmp(sr, HASH_EMPTY_STORAGE.bytes, 32) == 0)
         return true;
 
     collect_roots_ctx_t *ctx = (collect_roots_ctx_t *)user_data;
@@ -516,17 +543,21 @@ static bool collect_storage_roots_cb(const uint8_t *key, size_t key_len,
         if (!nr) return false;
         ctx->roots = nr; ctx->cap = nc;
     }
-    memcpy(ctx->roots[ctx->count++], ca->storage_root.bytes, 32);
+    memcpy(ctx->roots[ctx->count++], sr, 32);
     return true;
 }
 #endif
 
 void evm_state_compact_storage(evm_state_t *es) {
 #ifdef ENABLE_MPT
-    if (!es || !es->storage_mpt) return;
+    if (!es || !es->storage_mpt || !es->account_mpt) return;
 
+    /* Walk ALL account trie leaves on disk to collect every live storage root.
+     * The in-memory cache may not contain all accounts (evicted at checkpoints),
+     * so we must walk the persisted account trie to avoid deleting live storage
+     * nodes during compaction. */
     collect_roots_ctx_t ctx = {0};
-    mem_art_foreach(&es->accounts, collect_storage_roots_cb, &ctx);
+    mpt_store_walk_leaves(es->account_mpt, collect_storage_root_from_leaf, &ctx);
 
     if (ctx.count > 0) {
         fprintf(stderr, "Compacting storage MPT: %zu live roots...\n", ctx.count);
