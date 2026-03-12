@@ -293,4 +293,12 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty);
 #endif
 void evm_state_debug_dump(evm_state_t *es);
 
+/**
+ * Walk every node in the account MPT from root to all leaves.
+ * Returns the number of reachable leaves, or -1 if a node is missing
+ * (i.e., load_from_ref fails during the walk).
+ * Prints diagnostics for missing nodes to stderr.
+ */
+int64_t evm_state_mpt_integrity_check(evm_state_t *es);
+
 #endif // EVM_STATE_H

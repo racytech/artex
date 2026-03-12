@@ -2461,7 +2461,6 @@ static node_ref_t update_subtrie(mpt_store_t *ms, const node_ref_t *current,
     mpt_node_t node;
 
     if (!load_from_ref(ms, current, buf, &buf_len, &node)) {
-        /* Can't load — treat as empty */
         return build_fresh(ms, entries, start, end, depth);
     }
 
@@ -2582,22 +2581,21 @@ uint32_t mpt_store_get(const mpt_store_t *ms, const uint8_t key[32],
         switch (node.type) {
         case MPT_NODE_BRANCH: {
             if (depth >= MAX_NIBBLES)
-                return 0;  /* consumed all nibbles at a branch = not found */
+                return 0;
             uint8_t nib = key_nibs[depth];
             ref = node.branch.children[nib];
             if (ref.type == REF_EMPTY)
-                return 0;  /* no child at this nibble */
+                return 0;
             depth++;
             break;
         }
 
         case MPT_NODE_EXTENSION: {
-            /* Verify path nibbles match */
             if (depth + node.extension.path_len > MAX_NIBBLES)
                 return 0;
             if (memcmp(key_nibs + depth, node.extension.path,
                        node.extension.path_len) != 0)
-                return 0;  /* path mismatch */
+                return 0;
             depth += node.extension.path_len;
             ref = node.extension.child;
             if (ref.type == REF_EMPTY)
@@ -2606,19 +2604,17 @@ uint32_t mpt_store_get(const mpt_store_t *ms, const uint8_t key[32],
         }
 
         case MPT_NODE_LEAF: {
-            /* Verify remaining key nibbles match leaf path */
             size_t remaining = MAX_NIBBLES - depth;
             if (node.leaf.path_len != remaining)
                 return 0;
             if (memcmp(key_nibs + depth, node.leaf.path, remaining) != 0)
-                return 0;  /* key mismatch */
+                return 0;
 
-            /* Found! Return value. */
             uint32_t vlen = (uint32_t)node.leaf.value_len;
             if (vlen == 0)
                 return 0;
             if (buf_len < vlen)
-                return vlen;  /* caller buffer too small */
+                return vlen;
             memcpy(buf, node.leaf.value, vlen);
             return vlen;
         }

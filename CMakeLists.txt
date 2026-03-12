@@ -536,6 +536,12 @@ add_executable(test_mpt_store_flush
 target_link_libraries(test_mpt_store_flush mpt_store common)
 add_test(NAME test_mpt_store_flush COMMAND test_mpt_store_flush)
 
+add_executable(test_mpt_store_stress
+    database/tests/test_mpt_store_stress.c
+)
+target_link_libraries(test_mpt_store_stress mpt_store common)
+add_test(NAME test_mpt_store_stress COMMAND test_mpt_store_stress)
+
 # Test: Block Store (append-only block index)
 add_executable(test_block_store
     database/tests/test_block_store.c

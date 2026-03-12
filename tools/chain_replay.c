@@ -8,6 +8,7 @@
  */
 
 #include "sync.h"
+#include "evm_state.h"
 #include "era1.h"
 #include "block.h"
 #include "hash.h"
@@ -345,6 +346,21 @@ int main(int argc, char **argv) {
         start_block = (user_start > 0) ? user_start : 1;
     }
 
+    /* MPT integrity check on resume */
+    if (resumed > 0) {
+        evm_state_t *es = sync_get_state(sync);
+        int64_t leaves = evm_state_mpt_integrity_check(es);
+        if (leaves < 0) {
+            fprintf(stderr, "MPT integrity check FAILED at checkpoint %lu — aborting\n",
+                    resumed);
+            sync_destroy(sync);
+            archive_close(&archive);
+            return 1;
+        }
+        fprintf(stderr, "MPT integrity check passed: %ld leaves at checkpoint %lu\n",
+                (long)leaves, resumed);
+    }
+
     /* Progress tracking */
     struct timespec t_start, t_now;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
@@ -405,6 +421,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "=== EVM TRACE: block %lu ===\n", bn);
         }
 #endif
+        if (bn == trace_block) {
+            g_trace_calls = true;
+        }
 
         /* Execute + validate via sync engine */
         sync_block_result_t result;
@@ -423,6 +442,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "=== END EVM TRACE: block %lu ===\n", bn);
         }
 #endif
+        if (bn == trace_block) {
+            g_trace_calls = false;
+        }
 
         window_txs += result.tx_count;
 

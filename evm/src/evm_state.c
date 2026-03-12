@@ -13,7 +13,6 @@
 #include <stdio.h>
 #include <pthread.h>
 
-extern bool g_trace_calls __attribute__((weak));
 
 // ============================================================================
 // Internal constants
@@ -1667,15 +1666,6 @@ static bool flush_all_accounts_cb(const uint8_t *key, size_t key_len,
     // Skip accounts not modified during this block
     if (!ca->block_dirty && !ca->block_code_dirty) return true;
 
-    if (g_trace_calls) {
-        fprintf(stderr, "FLUSH_ACCT %02x%02x..%02x%02x nonce=%lu has_code=%d existed=%d created=%d self_destructed=%d bal=",
-                key[0], key[1], key[18], key[19],
-                ca->nonce, ca->has_code, ca->existed, ca->created, ca->self_destructed);
-        uint8_t balbuf[32]; uint256_to_bytes(&ca->balance, balbuf);
-        for (int bi = 0; bi < 32; bi++) fprintf(stderr, "%02x", balbuf[bi]);
-        fprintf(stderr, "\n");
-    }
-
     if (ca->self_destructed) {
         verkle_state_set_nonce(ctx->es->vs, ca->addr.bytes, 0);
         uint8_t zero32[32] = {0};
@@ -2616,6 +2606,41 @@ uint64_t evm_state_witness_gas_access(evm_state_t *es,
     return witness_gas_access_event(&es->witness_gas, key, is_write, value_was_empty);
 #else
     (void)es; (void)key; (void)is_write; (void)value_was_empty;
+    return 0;
+#endif
+}
+
+// ============================================================================
+// MPT Integrity Check
+// ============================================================================
+
+#ifdef ENABLE_MPT
+static bool integrity_count_cb(const uint8_t *value, size_t value_len,
+                                void *user_data) {
+    (void)value; (void)value_len;
+    int64_t *count = (int64_t *)user_data;
+    (*count)++;
+    return true;
+}
+#endif
+
+int64_t evm_state_mpt_integrity_check(evm_state_t *es) {
+#ifdef ENABLE_MPT
+    if (!es || !es->account_mpt) return 0;
+
+    int64_t leaf_count = 0;
+    bool ok = mpt_store_walk_leaves(es->account_mpt, integrity_count_cb, &leaf_count);
+    if (!ok) {
+        fprintf(stderr, "MPT INTEGRITY CHECK: FAILED — missing node detected "
+                "after walking %ld leaves\n", (long)leaf_count);
+        return -1;
+    }
+
+    fprintf(stderr, "MPT INTEGRITY CHECK: OK — %ld leaves reachable\n",
+            (long)leaf_count);
+    return leaf_count;
+#else
+    (void)es;
     return 0;
 #endif
 }
