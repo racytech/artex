@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <openssl/sha.h>
 
 //==============================================================================
 // Blockchain Test Parsing
@@ -519,6 +520,43 @@ static bool parse_engine_payload(const cJSON *entry, engine_test_payload_t *payl
         if (parse_hash(param2->valuestring, &payload->parent_beacon_root)) {
             payload->has_parent_beacon_root = true;
         }
+    }
+
+    /* params[3] = execution requests (Prague+, array of hex strings)
+     * requestsHash = sha256(sha256(req[0]) || sha256(req[1]) || ...)
+     * For empty array: sha256("") */
+    const cJSON *param3 = cJSON_GetArrayItem((cJSON *)params, 3);
+    if (param3 && cJSON_IsArray(param3)) {
+        int req_count = cJSON_GetArraySize(param3);
+        if (req_count == 0) {
+            /* Empty requests: sha256("") */
+            SHA256((const unsigned char *)"", 0, payload->requests_hash.bytes);
+        } else {
+            /* Concatenate sha256 of each request */
+            uint8_t *concat = malloc(32 * (size_t)req_count);
+            if (concat) {
+                int i = 0;
+                const cJSON *req_item;
+                cJSON_ArrayForEach(req_item, param3) {
+                    if (cJSON_IsString(req_item)) {
+                        size_t req_len;
+                        uint8_t *req_bytes = parse_hex_alloc(req_item->valuestring, &req_len);
+                        if (req_bytes) {
+                            SHA256(req_bytes, req_len, concat + 32 * i);
+                            free(req_bytes);
+                        } else {
+                            SHA256(NULL, 0, concat + 32 * i);
+                        }
+                    } else {
+                        SHA256(NULL, 0, concat + 32 * i);
+                    }
+                    i++;
+                }
+                SHA256(concat, 32 * (size_t)req_count, payload->requests_hash.bytes);
+                free(concat);
+            }
+        }
+        payload->has_requests_hash = true;
     }
 
     return true;

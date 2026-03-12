@@ -55,6 +55,10 @@ typedef struct {
 
     bool      has_parent_beacon_root;
     hash_t    parent_beacon_root;
+
+    /* Prague+ (EIP-7685) */
+    bool      has_requests_hash;
+    hash_t    requests_hash;
 } block_header_t;
 
 /**

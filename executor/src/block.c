@@ -148,6 +148,12 @@ bool block_header_decode_rlp(block_header_t *hdr,
         rlp_get_hash(rlp_get_list_item(root, 19), &hdr->parent_beacon_root);
     }
 
+    /* Field 20: requestsHash (Prague+, EIP-7685) */
+    if (count > 20) {
+        hdr->has_requests_hash = true;
+        rlp_get_hash(rlp_get_list_item(root, 20), &hdr->requests_hash);
+    }
+
     rlp_item_free(root);
     return true;
 }
@@ -431,6 +437,10 @@ bytes_t block_header_encode_rlp(const block_header_t *hdr) {
     /* [19] parentBeaconBlockRoot (Cancun+) */
     if (hdr->has_parent_beacon_root)
         rlp_list_append(list, rlp_string(hdr->parent_beacon_root.bytes, 32));
+
+    /* [20] requestsHash (Prague+, EIP-7685) */
+    if (hdr->has_requests_hash)
+        rlp_list_append(list, rlp_string(hdr->requests_hash.bytes, 32));
 
     bytes_t encoded = rlp_encode(list);
     rlp_item_free(list);

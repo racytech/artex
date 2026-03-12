@@ -338,6 +338,10 @@ typedef struct {
     /* newPayloadVersion: 1-4 */
     int      new_payload_version;
 
+    /* Prague+ (EIP-7685): requests hash computed from params[3] */
+    hash_t   requests_hash;
+    bool     has_requests_hash;
+
     /* Expected validation error (NULL if block is valid) */
     char    *validation_error;
 } engine_test_payload_t;
