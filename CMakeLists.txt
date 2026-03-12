@@ -213,7 +213,7 @@ target_include_directories(evm PUBLIC
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/evm/vendor
 )
-set(EVM_LINK_LIBS verkle_key pedersen banderwagon art_database common ssl crypto secp256k1 blst)
+set(EVM_LINK_LIBS verkle_key pedersen banderwagon art_database common ssl crypto secp256k1 blst pthread)
 if(ENABLE_MEM_MPT)
     list(APPEND EVM_LINK_LIBS mem_mpt)
 endif()

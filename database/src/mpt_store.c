@@ -476,6 +476,10 @@ struct mpt_store {
     /* Background flush: snapshot of previous batch's deferred writes
      * being flushed to disk by a background thread. NULL if idle. */
     flush_snapshot_t *bg_flush;
+
+    /* Forked context: parent store for read-through during parallel
+     * batch operations.  NULL for normal (non-forked) stores. */
+    mpt_store_t     *parent;
 };
 
 /* =========================================================================
@@ -1061,16 +1065,30 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
         return de->rlp_len;
     }
 
-    /* Check background flush snapshot (previous batch, being flushed) */
-    if (ms->bg_flush) {
-        de = snap_find(ms->bg_flush, hash);
+    /* Check parent's deferred buffer (forked context read-through) */
+    if (ms->parent) {
+        de = def_find(ms->parent, hash);
         if (de) {
-            if (de->rlp_len <= MAX_NODE_RLP) {
+            if (de->rlp_len <= MAX_NODE_RLP)
                 memcpy(buf, de->rlp, de->rlp_len);
-                if (ms->cache)
-                    ncache_put(ms->cache, hash, buf, (uint16_t)de->rlp_len);
-            }
             return de->rlp_len;
+        }
+    }
+
+    /* Check background flush snapshot (previous batch, being flushed) */
+    {
+        const flush_snapshot_t *snap = ms->bg_flush;
+        if (!snap && ms->parent) snap = ms->parent->bg_flush;
+        if (snap) {
+            de = snap_find(snap, hash);
+            if (de) {
+                if (de->rlp_len <= MAX_NODE_RLP) {
+                    memcpy(buf, de->rlp, de->rlp_len);
+                    if (ms->cache)
+                        ncache_put(ms->cache, hash, buf, (uint16_t)de->rlp_len);
+                }
+                return de->rlp_len;
+            }
         }
     }
 
@@ -1115,9 +1133,17 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
     if (def_contains(ms, out_hash))
         return true;
 
-    /* Skip if in background flush snapshot (previous batch) */
-    if (ms->bg_flush && snap_contains(ms->bg_flush, out_hash))
+    /* Skip if in parent's deferred buffer (forked context) */
+    if (ms->parent && def_contains(ms->parent, out_hash))
         return true;
+
+    /* Skip if in background flush snapshot (previous batch) */
+    {
+        const flush_snapshot_t *snap = ms->bg_flush;
+        if (!snap && ms->parent) snap = ms->parent->bg_flush;
+        if (snap && snap_contains(snap, out_hash))
+            return true;
+    }
 
 create_new:;
 
@@ -1612,6 +1638,101 @@ void mpt_store_flush_bg(mpt_store_t *ms) {
         free(snap);
         mpt_store_flush(ms);
     }
+}
+
+/* =========================================================================
+ * Forked Batch Context (for parallel storage root computation)
+ *
+ * A fork is a lightweight clone of an mpt_store that shares the parent's
+ * disk files and index (read-only) but has its own deferred write buffer,
+ * batch state, and allocation cursor.  Multiple forks can run commit_batch
+ * concurrently on different storage tries.
+ *
+ * Reads: own def_entries → parent def_entries → parent bg_flush → disk
+ * Writes: own def_entries only (thread-local, no locks)
+ * Allocation: own data_size cursor, remapped at merge time
+ * ========================================================================= */
+
+mpt_store_t *mpt_store_fork(mpt_store_t *parent) {
+    mpt_store_t *f = calloc(1, sizeof(mpt_store_t));
+    if (!f) return NULL;
+
+    f->parent   = parent;
+    f->index    = parent->index;    /* shared, thread-safe (rwlock) */
+    f->data_fd  = parent->data_fd;  /* shared, pread is thread-safe */
+    f->shared   = parent->shared;
+    f->cache    = NULL;             /* no cache in forked context */
+
+    /* Start with empty deferred buffers */
+    def_init(f);
+
+    /* Own allocation cursor — starts at 0, remapped at merge */
+    f->data_size      = 0;
+    f->live_bytes     = 0;
+    f->free_slot_bytes = 0;
+    /* Empty free lists — forks only allocate by appending */
+
+    return f;
+}
+
+void mpt_store_merge_fork(mpt_store_t *parent, mpt_store_t *fork) {
+    if (!parent || !fork) return;
+
+    /* Remap fork's allocation offsets to the parent's address space */
+    uint64_t base = parent->data_size;
+    parent->data_size += fork->data_size;
+    parent->live_bytes += fork->live_bytes;
+
+    for (size_t i = 0; i < fork->def_count; i++) {
+        deferred_entry_t *e = &fork->def_entries[i];
+        if (!e->rlp) continue;
+        e->offset += base;  /* remap to global offset */
+
+        /* Transfer to parent's deferred buffer — takes ownership of rlp */
+        if (parent->def_count >= parent->def_cap) {
+            size_t nc = parent->def_cap ? parent->def_cap * 2 : DEFERRED_INIT_CAP;
+            deferred_entry_t *p = realloc(parent->def_entries,
+                                           nc * sizeof(deferred_entry_t));
+            if (!p) { free(e->rlp); continue; }
+            parent->def_entries = p;
+            parent->def_cap = nc;
+        }
+        deferred_entry_t *pe = &parent->def_entries[parent->def_count];
+        memcpy(pe->hash, e->hash, 32);
+        pe->rlp     = e->rlp;      /* transfer ownership */
+        pe->rlp_len = e->rlp_len;
+        pe->offset  = e->offset;
+        e->rlp = NULL;              /* prevent double-free */
+
+        /* Insert into parent's hash table */
+        uint32_t b = def_bucket(pe->hash);
+        pe->ht_next = parent->def_ht[b];
+        parent->def_ht[b] = (int)parent->def_count;
+        parent->def_count++;
+    }
+
+    /* Transfer pending deletes (rare for shared-mode stores) */
+    for (size_t i = 0; i < fork->def_del_count; i++)
+        def_del_append(parent, fork->def_deletes[i]);
+}
+
+void mpt_store_destroy_fork(mpt_store_t *fork) {
+    if (!fork) return;
+
+    /* Free batch state */
+    free(fork->dirty);
+    for (size_t i = 0; i < fork->val_page_count; i++)
+        free(fork->val_pages[i]);
+    free(fork->val_pages);
+
+    /* Free any remaining deferred entries (not transferred) */
+    for (size_t i = 0; i < fork->def_count; i++)
+        free(fork->def_entries[i].rlp);
+    free(fork->def_entries);
+    free(fork->def_deletes);
+
+    /* Do NOT close data_fd, destroy index, or free paths — owned by parent */
+    free(fork);
 }
 
 /* =========================================================================

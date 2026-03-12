@@ -84,6 +84,26 @@ void mpt_store_flush_bg(mpt_store_t *ms);
  */
 void mpt_store_flush_wait(mpt_store_t *ms);
 
+/**
+ * Create a lightweight fork for parallel batch operations.
+ * The fork shares the parent's disk files (read-only) but has its own
+ * deferred write buffer and batch state.  Safe for concurrent use by
+ * multiple threads (each thread gets its own fork).
+ */
+mpt_store_t *mpt_store_fork(mpt_store_t *parent);
+
+/**
+ * Merge a fork's deferred writes into the parent store.
+ * Remaps allocation offsets and transfers ownership of buffered nodes.
+ * Must be called from a single thread after all forks have completed.
+ */
+void mpt_store_merge_fork(mpt_store_t *parent, mpt_store_t *fork);
+
+/**
+ * Destroy a forked store.  Does NOT close shared files or free the parent.
+ */
+void mpt_store_destroy_fork(mpt_store_t *fork);
+
 /* =========================================================================
  * Trie Root
  * ========================================================================= */

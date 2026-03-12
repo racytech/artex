@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
 
 extern bool g_trace_calls __attribute__((weak));
 
@@ -2132,6 +2133,61 @@ void evm_state_dump_mpt(evm_state_t *es, const char *path) {
 
 // Compute storage roots incrementally using shared storage mpt_store.
 // Iterates the dirty_slots list (O(dirty)) instead of scanning all cached slots.
+/* =========================================================================
+ * Parallel Storage Root Computation
+ *
+ * Each dirty account's storage root can be computed independently.
+ * We fork the shared storage_mpt into per-thread contexts, distribute
+ * account groups across threads, and merge the results.
+ * ========================================================================= */
+
+#define PARALLEL_STORAGE_MIN_ACCOUNTS 8
+#define PARALLEL_STORAGE_MAX_THREADS  4
+
+/* An account group: contiguous range of sorted storage entries for one address */
+typedef struct {
+    size_t    start;         /* index into sorted entries array */
+    size_t    end;           /* one past last entry */
+    uint8_t   addr[20];     /* account address */
+    uint8_t   storage_root_in[32];   /* storage root before update */
+    uint8_t   storage_root_out[32];  /* storage root after update (output) */
+} account_group_t;
+
+typedef struct {
+    mpt_store_t           *fork;     /* thread-local forked store */
+    mpt_storage_entry_t   *entries;  /* shared sorted entries array (read-only) */
+    account_group_t       *groups;   /* groups assigned to this thread */
+    size_t                 n_groups;
+} storage_worker_t;
+
+static void *storage_root_worker(void *arg) {
+    storage_worker_t *job = (storage_worker_t *)arg;
+
+    for (size_t g = 0; g < job->n_groups; g++) {
+        account_group_t *grp = &job->groups[g];
+
+        mpt_store_set_root(job->fork, grp->storage_root_in);
+        if (!mpt_store_begin_batch(job->fork))
+            continue;
+
+        for (size_t j = grp->start; j < grp->end; j++) {
+            if (job->entries[j].value_len == 0)
+                mpt_store_delete(job->fork, job->entries[j].slot_hash);
+            else
+                mpt_store_update(job->fork, job->entries[j].slot_hash,
+                                 job->entries[j].value_rlp,
+                                 job->entries[j].value_len);
+        }
+
+        if (!mpt_store_commit_batch(job->fork))
+            continue;
+
+        mpt_store_root(job->fork, grp->storage_root_out);
+    }
+
+    return NULL;
+}
+
 static void compute_all_storage_roots(evm_state_t *es) {
     // 1. Resolve dirty slot keys to mpt_storage_entry_t for sorting/grouping
     mpt_storage_vec_t sv = {0};
@@ -2172,41 +2228,119 @@ static void compute_all_storage_roots(evm_state_t *es) {
     // 2. Sort by address for grouping
     qsort(sv.entries, sv.count, sizeof(mpt_storage_entry_t), cmp_storage_by_addr);
 
-    // 3. Process each account group
-    size_t i = 0;
-    while (i < sv.count) {
-        size_t start = i;
-        while (i < sv.count && memcmp(sv.entries[i].addr, sv.entries[start].addr, 20) == 0)
-            i++;
+    // 3. Identify account groups
+    size_t n_groups = 0, groups_cap = 0;
+    account_group_t *groups = NULL;
+    {
+        size_t i = 0;
+        while (i < sv.count) {
+            size_t start = i;
+            while (i < sv.count &&
+                   memcmp(sv.entries[i].addr, sv.entries[start].addr, 20) == 0)
+                i++;
 
-        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
-            &es->accounts, sv.entries[start].addr, 20, NULL);
-        if (!ca) continue;
+            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+                &es->accounts, sv.entries[start].addr, 20, NULL);
+            if (!ca) continue;
 
-        // Load this account's storage root into the shared store
-        mpt_store_set_root(es->storage_mpt, ca->storage_root.bytes);
-        if (!mpt_store_begin_batch(es->storage_mpt)) {
-            fprintf(stderr, "FATAL: mpt_store_begin_batch failed for storage trie\n");
-            free(sv.entries);
-            goto clear;
+            if (n_groups >= groups_cap) {
+                size_t nc = groups_cap ? groups_cap * 2 : 32;
+                account_group_t *ng = realloc(groups, nc * sizeof(*ng));
+                if (!ng) break;
+                groups = ng;
+                groups_cap = nc;
+            }
+            account_group_t *g = &groups[n_groups++];
+            g->start = start;
+            g->end   = i;
+            memcpy(g->addr, sv.entries[start].addr, 20);
+            memcpy(g->storage_root_in, ca->storage_root.bytes, 32);
+        }
+    }
+
+    // 4. Process groups — parallel if enough, sequential otherwise
+    if (n_groups >= PARALLEL_STORAGE_MIN_ACCOUNTS && es->storage_mpt) {
+        int n_threads = (int)n_groups;
+        if (n_threads > PARALLEL_STORAGE_MAX_THREADS)
+            n_threads = PARALLEL_STORAGE_MAX_THREADS;
+
+        /* Create forked stores and distribute groups */
+        storage_worker_t *workers = calloc(n_threads, sizeof(storage_worker_t));
+        pthread_t *threads = calloc(n_threads, sizeof(pthread_t));
+        if (!workers || !threads) goto sequential;
+
+        for (int t = 0; t < n_threads; t++) {
+            workers[t].fork = mpt_store_fork(es->storage_mpt);
+            if (!workers[t].fork) {
+                /* Cleanup and fall back to sequential */
+                for (int u = 0; u < t; u++)
+                    mpt_store_destroy_fork(workers[u].fork);
+                free(workers);
+                free(threads);
+                goto sequential;
+            }
+            workers[t].entries  = sv.entries;
+            workers[t].groups   = groups + (n_groups * t / n_threads);
+            workers[t].n_groups = (n_groups * (t + 1) / n_threads)
+                                - (n_groups * t / n_threads);
         }
 
-        for (size_t j = start; j < i; j++) {
+        /* Spawn worker threads */
+        for (int t = 0; t < n_threads; t++)
+            pthread_create(&threads[t], NULL, storage_root_worker, &workers[t]);
+
+        /* Wait for all threads */
+        for (int t = 0; t < n_threads; t++)
+            pthread_join(threads[t], NULL);
+
+        /* Merge results: transfer deferred writes + update storage roots */
+        for (int t = 0; t < n_threads; t++) {
+            mpt_store_merge_fork(es->storage_mpt, workers[t].fork);
+            mpt_store_destroy_fork(workers[t].fork);
+        }
+
+        /* Apply computed storage roots to cached accounts */
+        for (size_t g = 0; g < n_groups; g++) {
+            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+                &es->accounts, groups[g].addr, 20, NULL);
+            if (ca)
+                memcpy(ca->storage_root.bytes, groups[g].storage_root_out, 32);
+        }
+
+        free(workers);
+        free(threads);
+        goto done;
+    }
+
+sequential:
+    /* Sequential path — fewer accounts or fork failed */
+    for (size_t g = 0; g < n_groups; g++) {
+        mpt_store_set_root(es->storage_mpt, groups[g].storage_root_in);
+        if (!mpt_store_begin_batch(es->storage_mpt)) {
+            fprintf(stderr, "FATAL: mpt_store_begin_batch failed for storage trie\n");
+            break;
+        }
+        for (size_t j = groups[g].start; j < groups[g].end; j++) {
             if (sv.entries[j].value_len == 0)
                 mpt_store_delete(es->storage_mpt, sv.entries[j].slot_hash);
             else
                 mpt_store_update(es->storage_mpt, sv.entries[j].slot_hash,
                                  sv.entries[j].value_rlp, sv.entries[j].value_len);
         }
-
         if (!mpt_store_commit_batch(es->storage_mpt)) {
-            fprintf(stderr, "FATAL: mpt_store_commit_batch failed for storage trie\n");
-            free(sv.entries);
-            goto clear;
+            fprintf(stderr, "FATAL: mpt_store_commit_batch failed\n");
+            break;
         }
-        mpt_store_root(es->storage_mpt, ca->storage_root.bytes);
+        mpt_store_root(es->storage_mpt, groups[g].storage_root_out);
+
+        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+            &es->accounts, groups[g].addr, 20, NULL);
+        if (ca)
+            memcpy(ca->storage_root.bytes, groups[g].storage_root_out, 32);
     }
 
+done:
+    free(groups);
     free(sv.entries);
 
 clear:
