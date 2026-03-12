@@ -23,20 +23,27 @@ extern "C" {
  * The ctx pointer is an engine_handler_ctx_t.
  */
 
-/* Forward declarations for EVM/executor types */
+/* Forward declarations */
 struct evm;
 struct evm_state;
+struct chain_tip;
 
 typedef struct {
-    engine_store_t *store;
-    struct evm     *evm;        /* for block execution */
-    struct evm_state *state;    /* EVM state handle */
+    engine_store_t   *store;
+    struct evm       *evm;        /* for inline block execution (legacy) */
+    struct evm_state *state;      /* EVM state handle (legacy) */
+    struct chain_tip *tip;        /* chain tip orchestrator (production) */
 } engine_handler_ctx_t;
 
-/** Create handler context. Does NOT take ownership of store/evm/state. */
+/** Create handler context with raw EVM/state handles (legacy/test path).
+ *  Does NOT take ownership of store/evm/state. */
 engine_handler_ctx_t *engine_handler_ctx_create(engine_store_t *store,
                                                  struct evm *evm,
                                                  struct evm_state *state);
+
+/** Create handler context with chain_tip (production path).
+ *  Does NOT take ownership of tip. Store is obtained from chain_tip. */
+engine_handler_ctx_t *engine_handler_ctx_create_with_tip(struct chain_tip *tip);
 
 /** Destroy handler context. */
 void engine_handler_ctx_destroy(engine_handler_ctx_t *ctx);

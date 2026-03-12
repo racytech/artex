@@ -10,6 +10,7 @@
 
 #include "engine_handlers.h"
 #include "engine_rpc.h"
+#include "chain_tip.h"
 #include "block.h"
 #include "block_executor.h"
 #include "evm.h"
@@ -36,6 +37,20 @@ engine_handler_ctx_t *engine_handler_ctx_create(engine_store_t *store,
     ctx->store = store;
     ctx->evm = evm;
     ctx->state = state;
+    return ctx;
+}
+
+engine_handler_ctx_t *engine_handler_ctx_create_with_tip(struct chain_tip *tip) {
+    if (!tip) return NULL;
+    engine_handler_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) return NULL;
+    ctx->tip   = tip;
+    ctx->store = chain_tip_get_store(tip);
+    /* evm/state obtained from sync engine via chain_tip when needed */
+    struct evm *e = (struct evm *)sync_get_evm(chain_tip_get_sync(tip));
+    struct evm_state *s = (struct evm_state *)sync_get_state(chain_tip_get_sync(tip));
+    ctx->evm   = e;
+    ctx->state = s;
     return ctx;
 }
 
@@ -421,6 +436,19 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
         }
     }
 
+    /* -----------------------------------------------------------------
+     * Chain tip path: delegate execution to chain_tip (production mode)
+     * ----------------------------------------------------------------- */
+    if (ctx->tip) {
+        payload_status_t tip_status = chain_tip_new_payload(
+            (chain_tip_t *)ctx->tip, &payload, version);
+        execution_payload_free(&payload);
+        return payload_status_to_json(&tip_status);
+    }
+
+    /* -----------------------------------------------------------------
+     * Legacy path: inline execution (test mode, no chain_tip)
+     * ----------------------------------------------------------------- */
     payload_status_t status;
     memset(&status, 0, sizeof(status));
 
@@ -646,6 +674,42 @@ static cJSON *forkchoice_updated_common(const cJSON *params, void *ctx_ptr,
         return NULL;
     }
 
+    /* Parse optional PayloadAttributes (needed by both paths) */
+    cJSON *attr_json = cJSON_GetArrayItem(params, 1);
+    payload_attributes_t attrs;
+    bool has_attrs = false;
+    if (attr_json && !cJSON_IsNull(attr_json))
+        has_attrs = payload_attributes_from_json_v(attr_json, &attrs, version);
+
+    /* -----------------------------------------------------------------
+     * Chain tip path: delegate to chain_tip (production mode)
+     * ----------------------------------------------------------------- */
+    if (ctx->tip) {
+        payload_status_t tip_ps = chain_tip_forkchoice_updated(
+            (chain_tip_t *)ctx->tip, &fc,
+            has_attrs ? &attrs : NULL, version);
+
+        cJSON *result = cJSON_CreateObject();
+        cJSON_AddItemToObject(result, "payloadStatus",
+                              payload_status_to_json(&tip_ps));
+
+        if (has_attrs && tip_ps.status == PAYLOAD_VALID) {
+            uint64_t payload_id = attrs.timestamp ^ 0xDEADBEEF;
+            char id_hex[19];
+            snprintf(id_hex, sizeof(id_hex), "0x%016llx",
+                     (unsigned long long)payload_id);
+            cJSON_AddStringToObject(result, "payloadId", id_hex);
+        } else {
+            cJSON_AddNullToObject(result, "payloadId");
+        }
+
+        if (has_attrs) payload_attributes_free(&attrs);
+        return result;
+    }
+
+    /* -----------------------------------------------------------------
+     * Legacy path: inline fork choice (test mode, no chain_tip)
+     * ----------------------------------------------------------------- */
     payload_status_t ps;
     memset(&ps, 0, sizeof(ps));
 
@@ -667,24 +731,17 @@ static cJSON *forkchoice_updated_common(const cJSON *params, void *ctx_ptr,
     cJSON *result = cJSON_CreateObject();
     cJSON_AddItemToObject(result, "payloadStatus", payload_status_to_json(&ps));
 
-    /* Handle optional PayloadAttributes */
-    cJSON *attr_json = cJSON_GetArrayItem(params, 1);
-    if (attr_json && !cJSON_IsNull(attr_json) && ps.status == PAYLOAD_VALID) {
-        payload_attributes_t attrs;
-        if (payload_attributes_from_json_v(attr_json, &attrs, version)) {
-            uint64_t payload_id = attrs.timestamp ^ 0xDEADBEEF;
-            char id_hex[19];
-            snprintf(id_hex, sizeof(id_hex), "0x%016llx",
-                     (unsigned long long)payload_id);
-            cJSON_AddStringToObject(result, "payloadId", id_hex);
-            payload_attributes_free(&attrs);
-        } else {
-            cJSON_AddNullToObject(result, "payloadId");
-        }
+    if (has_attrs && ps.status == PAYLOAD_VALID) {
+        uint64_t payload_id = attrs.timestamp ^ 0xDEADBEEF;
+        char id_hex[19];
+        snprintf(id_hex, sizeof(id_hex), "0x%016llx",
+                 (unsigned long long)payload_id);
+        cJSON_AddStringToObject(result, "payloadId", id_hex);
     } else {
         cJSON_AddNullToObject(result, "payloadId");
     }
 
+    if (has_attrs) payload_attributes_free(&attrs);
     return result;
 }
 

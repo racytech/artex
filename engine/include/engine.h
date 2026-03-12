@@ -25,13 +25,17 @@ extern "C" {
  *   engine_destroy(eng);
  */
 
+struct chain_tip;
+
 typedef struct {
     const char *host;           /* Listen address (default "127.0.0.1") */
     uint16_t    port;           /* Listen port (default 8551) */
     const char *jwt_secret_path;/* Path to hex-encoded JWT secret file */
-    /* EVM/state handles (optional, for block execution) */
+    /* EVM/state handles (optional, for inline block execution — legacy/test) */
     void       *evm;
     void       *evm_state;
+    /* Chain tip (optional, for production — takes precedence over evm/state) */
+    struct chain_tip *tip;
 } engine_config_t;
 
 typedef struct engine engine_t;

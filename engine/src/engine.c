@@ -106,10 +106,15 @@ engine_t *engine_create(const engine_config_t *config) {
     if (!eng->store) goto fail;
 
     /* Handler context */
-    eng->handler_ctx = engine_handler_ctx_create(
-        eng->store,
-        (struct evm *)config->evm,
-        (struct evm_state *)config->evm_state);
+    if (config->tip) {
+        eng->handler_ctx = engine_handler_ctx_create_with_tip(
+            (struct chain_tip *)config->tip);
+    } else {
+        eng->handler_ctx = engine_handler_ctx_create(
+            eng->store,
+            (struct evm *)config->evm,
+            (struct evm_state *)config->evm_state);
+    }
     if (!eng->handler_ctx) goto fail;
 
     /* RPC */

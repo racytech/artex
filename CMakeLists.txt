@@ -823,7 +823,7 @@ if(CJSON_FOUND)
         ${CMAKE_SOURCE_DIR}/engine/include
         ${CJSON_INCLUDE_DIRS}
     )
-    target_link_libraries(engine_handlers engine_rpc engine_types engine_store block_executor ${CJSON_LIBRARIES})
+    target_link_libraries(engine_handlers engine_rpc engine_types engine_store block_executor chain_tip ${CJSON_LIBRARIES})
 
     # Engine (top-level orchestrator)
     add_library(engine STATIC
@@ -833,7 +833,7 @@ if(CJSON_FOUND)
         ${CMAKE_SOURCE_DIR}/engine/include
         ${CJSON_INCLUDE_DIRS}
     )
-    target_link_libraries(engine engine_http engine_jwt engine_rpc engine_handlers engine_store engine_types ${CJSON_LIBRARIES})
+    target_link_libraries(engine engine_http engine_jwt engine_rpc engine_handlers engine_store engine_types chain_tip ${CJSON_LIBRARIES})
 
     # Standalone Engine API server (for mock CL testing)
     add_executable(engine_server tools/engine_server.c)
