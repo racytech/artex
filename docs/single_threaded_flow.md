@@ -138,7 +138,7 @@ O(1) JUMPDEST bitmap, pre-allocated 32KB stack (fits L1), `__builtin_expect` on
 gas checks. Single translation unit for full inlining. Not much to improve
 without JIT/AOT.
 
-### State Access (evm/src/evm_state.c) — Partially Optimized
+### State Access (evm/src/evm_state.c) — Mostly Optimized
 
 **`cached_account_t` layout (DONE — reordered for cache-line alignment):**
 ```
@@ -171,32 +171,41 @@ line. Every state mutation touches 1 cache line instead of 3.
 - Single ART traversal: `mem_art_upsert()` combines insert + get_mut.
   Eliminates the previous double lookup (`mem_art_insert` + `mem_art_get_mut`).
 
+**`mem_art_upsert` (DONE — single-traversal with `out_leaf_ref`):**
+- Was: `insert_recursive()` then `search()` — two full tree traversals.
+  Now: `insert_recursive()` captures leaf ref via output parameter,
+  `upsert` returns value pointer directly without re-traversing.
+
 **`ensure_slot` (DONE — uses `mem_art_upsert`):**
 - Same pattern applied to slot cache lookups.
 
-**`ensure_slot` always builds full 52-byte key:**
-- `make_slot_key(addr, slot, skey)` runs before cache lookup.
-  Could check cache with addr prefix first, build full key only on miss.
+**SSTORE dual-load (DONE — `evm_state_get_storage_pair`):**
+- Was: two separate calls to `get_storage` + `get_committed_storage`,
+  each doing `ensure_slot` with `make_slot_key` + ART lookup.
+  Now: single `evm_state_get_storage_pair()` call returns both current
+  and original values from one `ensure_slot` invocation.
 
 **Dirty tracking is good:**
 - Idempotent push to dirty vectors, O(dirty) not O(total) at
   compute_mpt_root time.
 
-### MPT Store (database/src/mpt_store.c) — Several Bottlenecks
+### MPT Store (database/src/mpt_store.c) — Mostly Optimized
 
 **`def_del_cancel` (DONE — hash-indexed O(1) lookup):**
 - Was O(N) linear scan, causing O(N²) total in commit_batch.
   Now uses bucket-chained hash table (`def_del_ht[]`) matching the
   `def_ht` pattern. Cancel is O(1) with swap-and-shrink compaction.
 
-**Individual malloc per deferred node RLP:**
-- `def_append` calls `malloc(rlp_len)` + `memcpy` for each node.
-  1000 nodes per commit = 1000 malloc calls. Arena bump allocator
-  would eliminate this — one bulk free at flush time.
+**Deferred RLP allocation (DONE — page-based arena):**
+- Was individual `malloc(rlp_len)` per node (~1000 per checkpoint).
+  Now uses `def_rlp_arena_alloc()` — 64KB page-based bump allocator
+  matching the existing `val_arena_alloc` pattern. One bulk free at
+  flush time instead of N individual malloc/free calls.
 
-**Individual pwrite per node in flush (lines 1304-1340):**
-- Each deferred entry gets its own `pwrite()` syscall.
-  Could batch with `writev()` or io_uring.
+**Flush I/O ordering (DONE — sorted by offset):**
+- Was writing deferred entries in insertion order (random offsets).
+  Now sorts entries by file offset before pwrite for sequential I/O,
+  improving page cache behavior and reducing disk seeks on HDD/NVMe.
 
 **`dirty_cmp` (DONE — bswap64 prefix comparison):**
 - Was `memcmp(a->nibbles, b->nibbles, 64)` for every comparison.
@@ -214,12 +223,13 @@ line. Every state mutation touches 1 cache line instead of 3.
 | Priority | Change | Impact | Complexity | Status |
 |----------|--------|--------|------------|--------|
 | 1 | `def_del_cancel` → hash set | Eliminates O(N²) in commit_batch | Low | **DONE** |
-| 2 | Arena for deferred RLP | Eliminates ~1000 malloc/free per flush | Medium | TODO |
+| 2 | Arena for deferred RLP | Eliminates ~1000 malloc/free per flush | Medium | **DONE** |
 | 3 | Reorder `cached_account_t` | Pack hot fields in 1 cache line | Low | **DONE** |
 | 4 | Insert-or-get in ensure_account | Eliminates double ART lookup on miss | Low | **DONE** |
-| 5 | Batch pwrite in flush | `writev` or io_uring, ~1000→1 syscalls | Medium | TODO |
-| 6 | Lazy slot key build | Skip 52-byte concat on cache hit | Low | TODO |
+| 5 | Sorted flush writes | Sequential I/O via offset-sorted pwrite | Medium | **DONE** |
+| 6 | `mem_art_upsert` single traversal | Return leaf pointer from insert directly | Low | **DONE** |
 | 7 | Faster dirty_cmp | uint64 prefix compare before full memcmp | Low | **DONE** |
+| 8 | SSTORE dual-load | Single ensure_slot for current + committed | Low | **DONE** |
 
 ## Chain Replay Metrics
 

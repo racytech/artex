@@ -448,6 +448,7 @@ struct mpt_store {
 
     char            *idx_path;
     char            *dat_path;
+    char            *free_path;   /* overflow free list file (.free) */
 };
 
 /* =========================================================================
@@ -509,6 +510,66 @@ static int size_class_for(uint32_t len) {
     return NUM_SIZE_CLASSES - 1; /* shouldn't happen: MAX_NODE_RLP == 1024 */
 }
 
+/* Write overflow free list offsets to .free file.
+ * Format: [uint32_t count_per_class × 5] [uint64_t offsets...] */
+static void write_free_overflow(const char *path, const mpt_store_t *ms,
+                                const uint32_t hdr_counts[NUM_SIZE_CLASSES]) {
+    uint32_t overflow_total = 0;
+    uint32_t overflow_counts[NUM_SIZE_CLASSES];
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+        overflow_counts[i] = ms->free_lists[i].count > hdr_counts[i]
+                           ? ms->free_lists[i].count - hdr_counts[i] : 0;
+        overflow_total += overflow_counts[i];
+    }
+
+    if (overflow_total == 0) {
+        /* No overflow — remove stale file if present */
+        unlink(path);
+        return;
+    }
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+
+    /* Write counts header */
+    (void)write(fd, overflow_counts, sizeof(overflow_counts));
+
+    /* Write overflow offsets per class (skip the first hdr_counts[i] already in header) */
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+        if (overflow_counts[i] > 0) {
+            (void)write(fd, ms->free_lists[i].offsets + hdr_counts[i],
+                        overflow_counts[i] * sizeof(uint64_t));
+        }
+    }
+    fsync(fd);
+    close(fd);
+}
+
+/* Read overflow free list offsets from .free file */
+static void read_free_overflow(const char *path, mpt_store_t *ms) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+
+    uint32_t counts[NUM_SIZE_CLASSES];
+    if (read(fd, counts, sizeof(counts)) != sizeof(counts)) {
+        close(fd);
+        return;
+    }
+
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+        if (counts[i] == 0) continue;
+        uint64_t *buf = malloc(counts[i] * sizeof(uint64_t));
+        if (!buf) break;
+        ssize_t got = read(fd, buf, counts[i] * sizeof(uint64_t));
+        if (got == (ssize_t)(counts[i] * sizeof(uint64_t))) {
+            for (uint32_t j = 0; j < counts[i]; j++)
+                free_list_push(&ms->free_lists[i], buf[j]);
+        }
+        free(buf);
+    }
+    close(fd);
+}
+
 static void write_header(int fd, const mpt_store_t *ms) {
     mpt_store_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
@@ -517,11 +578,6 @@ static void write_header(int fd, const mpt_store_t *ms) {
     hdr.data_size = ms->data_size;
     memcpy(hdr.root_hash, ms->root_hash, 32);
     hdr.free_slot_bytes = ms->free_slot_bytes;
-
-    /* Serialize in-memory free lists into header */
-    uint32_t total = 0;
-    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
-        total += ms->free_lists[i].count;
 
     /* Pack offsets sequentially: class 0, class 1, ... Truncate if overflow */
     size_t pos = 0;
@@ -537,6 +593,10 @@ static void write_header(int fd, const mpt_store_t *ms) {
     }
 
     (void)pwrite(fd, &hdr, PAGE_SIZE, 0);
+
+    /* Write overflow to .free file */
+    if (ms->free_path)
+        write_free_overflow(ms->free_path, ms, hdr.free_counts);
 }
 
 static bool read_header(int fd, mpt_store_header_t *hdr) {
@@ -1258,8 +1318,9 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
     ms->data_size  = 0;
     ms->live_bytes = 0;
     memcpy(ms->root_hash, EMPTY_ROOT, 32);
-    ms->idx_path  = idx_path;
-    ms->dat_path  = dat_path;
+    ms->idx_path   = idx_path;
+    ms->dat_path   = dat_path;
+    ms->free_path  = make_path(path, ".free");
     /* free_heads and free_slot_bytes zeroed by calloc */
     def_init(ms);
 
@@ -1323,9 +1384,14 @@ mpt_store_t *mpt_store_open(const char *path) {
                 free_list_push(&ms->free_lists[i], src[pos++]);
         }
     }
-    ms->idx_path  = idx_path;
-    ms->dat_path  = dat_path;
+    ms->idx_path   = idx_path;
+    ms->dat_path   = dat_path;
+    ms->free_path  = make_path(path, ".free");
     def_init(ms);
+
+    /* Load overflow free offsets from .free file */
+    if (ms->free_path)
+        read_free_overflow(ms->free_path, ms);
 
     /* Enable default LRU cache */
     mpt_store_set_cache_mb(ms, MPT_DEFAULT_CACHE_MB);
@@ -1352,6 +1418,7 @@ void mpt_store_destroy(mpt_store_t *ms) {
     close(ms->data_fd);
     free(ms->idx_path);
     free(ms->dat_path);
+    free(ms->free_path);
     free(ms);
 }
 
@@ -2351,13 +2418,17 @@ bool mpt_store_compact(mpt_store_t *ms) {
         /* Save paths before destroy frees them */
         char *fail_idx = new_ms->idx_path;
         char *fail_dat = new_ms->dat_path;
+        char *fail_free = new_ms->free_path;
         new_ms->idx_path = NULL;
         new_ms->dat_path = NULL;
+        new_ms->free_path = NULL;
         mpt_store_destroy(new_ms);
         unlink(fail_idx);
         unlink(fail_dat);
+        if (fail_free) unlink(fail_free);
         free(fail_idx);
         free(fail_dat);
+        free(fail_free);
         free(tmp_path); free(tmp_base);
         return false;
     }
@@ -2398,9 +2469,14 @@ bool mpt_store_compact(mpt_store_t *ms) {
         ms->cache = ncache_create(cap);
     }
 
+    /* Remove overflow file — compacted store has no free slots */
+    if (ms->free_path) unlink(ms->free_path);
+
     /* Cleanup new_ms (files already renamed, just free struct) */
     close(new_ms->data_fd);
     disk_hash_destroy(new_ms->index);
+    if (new_ms->free_path) unlink(new_ms->free_path);
+    free(new_ms->free_path);
     new_ms->idx_path = NULL;
     new_ms->dat_path = NULL;
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
@@ -2447,12 +2523,15 @@ bool mpt_store_compact_roots(mpt_store_t *ms,
     if (!ok) {
         char *fail_idx = new_ms->idx_path;
         char *fail_dat = new_ms->dat_path;
+        char *fail_free = new_ms->free_path;
         new_ms->idx_path = NULL;
         new_ms->dat_path = NULL;
+        new_ms->free_path = NULL;
         mpt_store_destroy(new_ms);
         unlink(fail_idx);
         unlink(fail_dat);
-        free(fail_idx); free(fail_dat);
+        if (fail_free) unlink(fail_free);
+        free(fail_idx); free(fail_dat); free(fail_free);
         free(tmp_base);
         return false;
     }
@@ -2489,8 +2568,13 @@ bool mpt_store_compact_roots(mpt_store_t *ms,
         ms->cache = ncache_create(cap);
     }
 
+    /* Remove overflow file — compacted store has no free slots */
+    if (ms->free_path) unlink(ms->free_path);
+
     close(new_ms->data_fd);
     disk_hash_destroy(new_ms->index);
+    if (new_ms->free_path) unlink(new_ms->free_path);
+    free(new_ms->free_path);
     new_ms->idx_path = NULL;
     new_ms->dat_path = NULL;
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
