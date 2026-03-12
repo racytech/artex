@@ -21,6 +21,10 @@
 // Debug: set to true to trace CALL gas
 bool g_trace_calls __attribute__((weak)) = false;
 
+/* Stack buffer for small CALL input data — avoids malloc in the common case.
+ * 2 KB covers most contract calls. Max call depth 1024 × 2 KB = 2 MB stack. */
+#define CALLDATA_STACK_SIZE 2048
+
 //==============================================================================
 // Helper Functions
 //==============================================================================
@@ -364,16 +368,18 @@ static evm_status_t op_call(evm_t *evm)
         return EVM_SUCCESS;
     }
 
-    // Extract call arguments from memory
+    // Extract call arguments from memory (stack buffer for small inputs)
+    uint8_t stack_buf[CALLDATA_STACK_SIZE];
     uint8_t *call_args = NULL;
     if (args_size_u64 > 0)
     {
-        call_args = malloc(args_size_u64);
+        call_args = (args_size_u64 <= CALLDATA_STACK_SIZE)
+                    ? stack_buf : malloc(args_size_u64);
         if (!call_args)
             return EVM_INTERNAL_ERROR;
         if (!evm_memory_read(evm->memory, args_offset_u64, call_args, args_size_u64))
         {
-            free(call_args);
+            if (call_args != stack_buf) free(call_args);
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -394,7 +400,7 @@ static evm_status_t op_call(evm_t *evm)
 
     evm_result_t subcall_result;
     bool exec_ok = evm_execute(evm, &subcall_msg, &subcall_result);
-    if (call_args) free(call_args);
+    if (call_args && call_args != stack_buf) free(call_args);
 
     if (!exec_ok)
         return EVM_INTERNAL_ERROR;
@@ -518,21 +524,23 @@ static evm_status_t op_callcode(evm_t *evm)
         return EVM_SUCCESS;
     }
 
-    // Extract call arguments from memory
+    // Extract call arguments from memory (stack buffer for small inputs)
+    uint8_t stack_buf[CALLDATA_STACK_SIZE];
     uint8_t *call_args = NULL;
     if (args_size_u64 > 0)
     {
-        call_args = malloc(args_size_u64);
+        call_args = (args_size_u64 <= CALLDATA_STACK_SIZE)
+                    ? stack_buf : malloc(args_size_u64);
         if (!call_args)
         {
             LOG_EVM_ERROR("CALLCODE: Failed to allocate call arguments");
             return EVM_INTERNAL_ERROR;
         }
-        
+
         if (!evm_memory_read(evm->memory, args_offset_u64, call_args, args_size_u64))
         {
             LOG_EVM_ERROR("CALLCODE: Failed to read call arguments from memory");
-            free(call_args);
+            if (call_args != stack_buf) free(call_args);
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -554,7 +562,7 @@ static evm_status_t op_callcode(evm_t *evm)
     evm_result_t subcall_result;
     bool exec_ok = evm_execute(evm, &subcall_msg, &subcall_result);
     
-    if (call_args) free(call_args);
+    if (call_args && call_args != stack_buf) free(call_args);
 
     if (!exec_ok)
     {
@@ -695,21 +703,23 @@ static evm_status_t op_delegatecall(evm_t *evm)
         return EVM_SUCCESS;
     }
 
-    // Extract call arguments from memory
+    // Extract call arguments from memory (stack buffer for small inputs)
+    uint8_t stack_buf[CALLDATA_STACK_SIZE];
     uint8_t *call_args = NULL;
     if (args_size_u64 > 0)
     {
-        call_args = malloc(args_size_u64);
+        call_args = (args_size_u64 <= CALLDATA_STACK_SIZE)
+                    ? stack_buf : malloc(args_size_u64);
         if (!call_args)
         {
             LOG_EVM_ERROR("DELEGATECALL: Failed to allocate call arguments");
             return EVM_INTERNAL_ERROR;
         }
-        
+
         if (!evm_memory_read(evm->memory, args_offset_u64, call_args, args_size_u64))
         {
             LOG_EVM_ERROR("DELEGATECALL: Failed to read call arguments from memory");
-            free(call_args);
+            if (call_args != stack_buf) free(call_args);
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -731,7 +741,7 @@ static evm_status_t op_delegatecall(evm_t *evm)
     evm_result_t subcall_result;
     bool exec_ok = evm_execute(evm, &subcall_msg, &subcall_result);
     
-    if (call_args) free(call_args);
+    if (call_args && call_args != stack_buf) free(call_args);
 
     if (!exec_ok)
     {
@@ -859,21 +869,23 @@ static evm_status_t op_staticcall(evm_t *evm)
         return EVM_SUCCESS;
     }
 
-    // Extract call arguments from memory
+    // Extract call arguments from memory (stack buffer for small inputs)
+    uint8_t stack_buf[CALLDATA_STACK_SIZE];
     uint8_t *call_args = NULL;
     if (args_size_u64 > 0)
     {
-        call_args = malloc(args_size_u64);
+        call_args = (args_size_u64 <= CALLDATA_STACK_SIZE)
+                    ? stack_buf : malloc(args_size_u64);
         if (!call_args)
         {
             LOG_EVM_ERROR("STATICCALL: Failed to allocate call arguments");
             return EVM_INTERNAL_ERROR;
         }
-        
+
         if (!evm_memory_read(evm->memory, args_offset_u64, call_args, args_size_u64))
         {
             LOG_EVM_ERROR("STATICCALL: Failed to read call arguments from memory");
-            free(call_args);
+            if (call_args != stack_buf) free(call_args);
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -895,7 +907,7 @@ static evm_status_t op_staticcall(evm_t *evm)
     evm_result_t subcall_result;
     bool exec_ok = evm_execute(evm, &subcall_msg, &subcall_result);
     
-    if (call_args) free(call_args);
+    if (call_args && call_args != stack_buf) free(call_args);
 
     if (!exec_ok)
     {

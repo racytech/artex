@@ -216,6 +216,8 @@ typedef struct {
     uint64_t cache_misses;    /** Cache miss count (0 if no cache) */
     uint32_t cache_count;     /** Current entries in cache */
     uint32_t cache_capacity;  /** Max cache entries */
+    uint64_t cache_evict_skipped; /** Times eviction skipped a pinned node */
+    uint32_t cache_pinned;    /** Pinned entries (depth <= PIN_DEPTH) */
 } mpt_store_stats_t;
 
 /**

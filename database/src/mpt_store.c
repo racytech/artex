@@ -178,6 +178,8 @@ typedef struct {
     uint32_t        free_head;      /* free list (uses lru_next for chain) */
     uint64_t        hits;
     uint64_t        misses;
+    uint64_t        evict_skipped;  /* times eviction skipped a pinned node */
+    uint32_t        pinned_count;   /* entries with depth <= PIN_DEPTH */
 } node_cache_t;
 
 static inline uint32_t ncache_bucket(const node_cache_t *c,
@@ -336,6 +338,7 @@ static void ncache_put(node_cache_t *c, const uint8_t hash[32],
         slot = c->lru_tail;
         while (slot != NCACHE_SENTINEL &&
                c->entries[slot].depth <= NCACHE_PIN_DEPTH) {
+            c->evict_skipped++;
             slot = c->entries[slot].lru_prev;
         }
         if (slot == NCACHE_SENTINEL) {
@@ -343,6 +346,9 @@ static void ncache_put(node_cache_t *c, const uint8_t hash[32],
              * This can only happen if cache is undersized for the trie. */
             slot = c->lru_tail;
         }
+        /* Track pinned count change for evicted entry */
+        if (c->entries[slot].depth <= NCACHE_PIN_DEPTH && c->pinned_count > 0)
+            c->pinned_count--;
         ncache_lru_remove(c, slot);
         ncache_ht_remove(c, slot);
         c->count--;
@@ -354,6 +360,7 @@ static void ncache_put(node_cache_t *c, const uint8_t hash[32],
     memcpy(e->rlp, rlp, rlp_len);
     e->rlp_len = rlp_len;
     e->depth = depth;
+    if (depth <= NCACHE_PIN_DEPTH) c->pinned_count++;
 
     /* Insert into hash bucket */
     b = ncache_bucket(c, hash);
@@ -377,6 +384,8 @@ static void ncache_delete(node_cache_t *c, const uint8_t hash[32]) {
             *prev = e->ht_next;
             /* Remove from LRU */
             ncache_lru_remove(c, idx);
+            if (e->depth <= NCACHE_PIN_DEPTH && c->pinned_count > 0)
+                c->pinned_count--;
             /* Return to free list */
             e->lru_next = c->free_head;
             c->free_head = idx;
@@ -2702,10 +2711,12 @@ mpt_store_stats_t mpt_store_stats(const mpt_store_t *ms) {
                      ? ms->data_size - ms->live_bytes - ms->free_slot_bytes : 0;
 
     if (ms->cache) {
-        st.cache_hits     = ms->cache->hits;
-        st.cache_misses   = ms->cache->misses;
-        st.cache_count    = ms->cache->count;
-        st.cache_capacity = ms->cache->capacity;
+        st.cache_hits          = ms->cache->hits;
+        st.cache_misses        = ms->cache->misses;
+        st.cache_count         = ms->cache->count;
+        st.cache_capacity      = ms->cache->capacity;
+        st.cache_evict_skipped = ms->cache->evict_skipped;
+        st.cache_pinned        = ms->cache->pinned_count;
     }
 
     return st;

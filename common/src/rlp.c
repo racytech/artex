@@ -220,6 +220,20 @@ static bool decode_length(const uint8_t* data, size_t data_len, size_t* out_len,
     }
 }
 
+/**
+ * Compute total encoded size of the RLP element at data[0..data_len-1].
+ * Returns 0 on error (malformed RLP).
+ */
+static size_t rlp_encoded_size(const uint8_t *data, size_t data_len) {
+    if (data_len == 0) return 0;
+    uint8_t prefix = data[0];
+    if (prefix < 0x80) return 1;  /* single byte */
+    size_t content_len, header_len;
+    if (!decode_length(data, data_len, &content_len, &header_len))
+        return 0;
+    return header_len + content_len;
+}
+
 // Decode RLP bytes to item
 rlp_item_t* rlp_decode(const uint8_t* data, size_t len) {
     if (!data || len == 0) return NULL;
@@ -266,10 +280,14 @@ rlp_item_t* rlp_decode(const uint8_t* data, size_t len) {
                 return NULL;
             }
             
-            // Calculate item size to advance position
-            bytes_t encoded = rlp_encode(item);
-            pos += encoded.len;
-            bytes_free(&encoded);
+            // Advance position by parsing the RLP header directly
+            size_t item_size = rlp_encoded_size(data + pos, end - pos);
+            if (item_size == 0) {
+                rlp_item_free(item);
+                rlp_item_free(list);
+                return NULL;
+            }
+            pos += item_size;
             
             rlp_list_append(list, item);
         }

@@ -2071,6 +2071,31 @@ static bool debug_dump_all_slot_cb(const uint8_t *key, size_t key_len,
     fprintf(stderr, "\n");
     return true;
 }
+void evm_state_print_mpt_stats(evm_state_t *es) {
+#ifdef ENABLE_MPT
+    if (!es) return;
+    const char *names[] = {"account", "storage"};
+    mpt_store_t *stores[] = {es->account_mpt, es->storage_mpt};
+    for (int i = 0; i < 2; i++) {
+        if (!stores[i]) continue;
+        mpt_store_stats_t st = mpt_store_stats(stores[i]);
+        uint64_t total = st.cache_hits + st.cache_misses;
+        double hit_rate = total > 0 ? 100.0 * st.cache_hits / total : 0;
+        fprintf(stderr,
+            "  %s MPT: %llu nodes, cache %u/%u (%.1f%% hit), "
+            "pinned=%u, evict_skipped=%llu, free=%llu B\n",
+            names[i],
+            (unsigned long long)st.node_count,
+            st.cache_count, st.cache_capacity, hit_rate,
+            st.cache_pinned,
+            (unsigned long long)st.cache_evict_skipped,
+            (unsigned long long)st.free_bytes);
+    }
+#else
+    (void)es;
+#endif
+}
+
 void evm_state_debug_dump(evm_state_t *es) {
     fprintf(stderr, "=== EVM STATE DUMP (all non-trivial accounts) ===\n");
     mem_art_foreach(&es->accounts, debug_dump_all_acct_cb, NULL);

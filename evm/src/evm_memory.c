@@ -68,12 +68,12 @@ void evm_memory_reset(evm_memory_t *mem)
     if (!mem)
         return;
 
-    mem->size = 0;
-    // Zero out the memory for security
-    if (mem->data)
+    // Zero only the used portion (capacity may be much larger)
+    if (mem->data && mem->size > 0)
     {
-        memset(mem->data, 0, mem->capacity);
+        memset(mem->data, 0, mem->size);
     }
+    mem->size = 0;
 }
 
 void evm_memory_clear(evm_memory_t *mem)

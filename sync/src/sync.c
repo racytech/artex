@@ -634,6 +634,9 @@ bool sync_checkpoint(sync_t *sync) {
     }
 #endif
 
+    /* Print MPT cache stats before eviction */
+    evm_state_print_mpt_stats(sync->state);
+
     /* Evict cache to bound memory — data is on disk, read-through reloads */
     evm_state_evict_cache(sync->state);
 
