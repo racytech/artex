@@ -47,6 +47,12 @@ static const uint16_t SIZE_CLASSES[NUM_SIZE_CLASSES] = {64, 128, 256, 512, 1024}
 /* Default LRU cache: 2 GB */
 #define MPT_DEFAULT_CACHE_MB 2048
 
+/* Depth pinning: nodes at trie depth <= this threshold are never evicted.
+ * depth 0 = root (1 node), depth 1 = 16, depth 2 = 256, depth 3 = 4096,
+ * depth 4 = 65536. Total pinned ~70K nodes × ~1KB = ~70MB — negligible. */
+#define NCACHE_PIN_DEPTH 4
+#define NCACHE_DEPTH_UNKNOWN 0xFF  /* for nodes inserted without depth info */
+
 /* Empty trie root = keccak256(RLP("")) = keccak256(0x80) */
 static const uint8_t EMPTY_ROOT[32] = {
     0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
@@ -154,6 +160,7 @@ typedef struct {
     uint8_t  hash[32];
     uint8_t  rlp[MAX_NODE_RLP];
     uint16_t rlp_len;
+    uint8_t  depth;         /* trie depth (for pin eviction policy) */
     uint32_t ht_next;       /* next in hash bucket chain */
     uint32_t lru_prev;      /* doubly-linked LRU list */
     uint32_t lru_next;
@@ -295,9 +302,10 @@ static bool ncache_get(node_cache_t *c, const uint8_t hash[32],
     return false;
 }
 
-/* Insert or update a node in the cache. Evicts LRU tail if full. */
+/* Insert or update a node in the cache. Evicts LRU tail if full.
+ * depth = trie depth of this node (used for pin policy). */
 static void ncache_put(node_cache_t *c, const uint8_t hash[32],
-                        const uint8_t *rlp, uint16_t rlp_len) {
+                        const uint8_t *rlp, uint16_t rlp_len, uint8_t depth) {
     if (rlp_len > MAX_NODE_RLP) return;
 
     /* Check if already present — update in place */
@@ -308,6 +316,8 @@ static void ncache_put(node_cache_t *c, const uint8_t hash[32],
         if (memcmp(e->hash, hash, 32) == 0) {
             memcpy(e->rlp, rlp, rlp_len);
             e->rlp_len = rlp_len;
+            /* Update depth if we now have better info */
+            if (depth < e->depth) e->depth = depth;
             ncache_lru_remove(c, idx);
             ncache_lru_push_front(c, idx);
             return;
@@ -321,8 +331,17 @@ static void ncache_put(node_cache_t *c, const uint8_t hash[32],
         slot = c->free_head;
         c->free_head = c->entries[slot].lru_next;
     } else {
-        /* Evict LRU tail */
+        /* Evict LRU tail — skip pinned entries (depth <= PIN_DEPTH) */
         slot = c->lru_tail;
+        while (slot != NCACHE_SENTINEL &&
+               c->entries[slot].depth <= NCACHE_PIN_DEPTH) {
+            slot = c->entries[slot].lru_prev;
+        }
+        if (slot == NCACHE_SENTINEL) {
+            /* All entries are pinned — fall back to true LRU tail.
+             * This can only happen if cache is undersized for the trie. */
+            slot = c->lru_tail;
+        }
         ncache_lru_remove(c, slot);
         ncache_ht_remove(c, slot);
         c->count--;
@@ -333,6 +352,7 @@ static void ncache_put(node_cache_t *c, const uint8_t hash[32],
     memcpy(e->hash, hash, 32);
     memcpy(e->rlp, rlp, rlp_len);
     e->rlp_len = rlp_len;
+    e->depth = depth;
 
     /* Insert into hash bucket */
     b = ncache_bucket(c, hash);
@@ -1073,9 +1093,10 @@ static void def_free_all(mpt_store_t *ms) {
  * ========================================================================= */
 
 /* Load a node from disk by its hash. buf must be MAX_NODE_RLP bytes.
+ * depth = trie depth for cache pin policy.
  * Returns the RLP length, or 0 on failure. */
 static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
-                            uint8_t *buf) {
+                            uint8_t *buf, uint8_t depth) {
     /* Check cache first */
     if (ms->cache) {
         uint16_t cached_len;
@@ -1090,7 +1111,7 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
             memcpy(buf, de->rlp, de->rlp_len);
             /* Re-populate cache */
             if (ms->cache)
-                ncache_put(ms->cache, hash, buf, (uint16_t)de->rlp_len);
+                ncache_put(ms->cache, hash, buf, (uint16_t)de->rlp_len, depth);
         }
         return de->rlp_len;
     }
@@ -1107,7 +1128,7 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
 
     /* Populate cache on miss */
     if (ms->cache)
-        ncache_put(ms->cache, hash, buf, (uint16_t)rec.length);
+        ncache_put(ms->cache, hash, buf, (uint16_t)rec.length, depth);
 
     return rec.length;
 }
@@ -1153,7 +1174,7 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
 
     /* Cache for fast reads within this checkpoint interval */
     if (ms->cache && rlp_len <= MAX_NODE_RLP)
-        ncache_put(ms->cache, out_hash, rlp, (uint16_t)rlp_len);
+        ncache_put(ms->cache, out_hash, rlp, (uint16_t)rlp_len, NCACHE_DEPTH_UNKNOWN);
 
     return true;
 }
@@ -1700,9 +1721,10 @@ static node_ref_t build_fresh(mpt_store_t *ms, dirty_entry_t *entries,
 }
 
 /* Load a node from a ref (hash or inline). Returns false if empty.
- * buf must be MAX_NODE_RLP bytes. */
+ * buf must be MAX_NODE_RLP bytes. depth = trie depth for cache pin policy. */
 static bool load_from_ref(const mpt_store_t *ms, const node_ref_t *ref,
-                          uint8_t *buf, size_t *buf_len, mpt_node_t *node) {
+                          uint8_t *buf, size_t *buf_len, mpt_node_t *node,
+                          uint8_t depth) {
     if (ref->type == REF_EMPTY) return false;
 
     if (ref->type == REF_INLINE) {
@@ -1712,7 +1734,7 @@ static bool load_from_ref(const mpt_store_t *ms, const node_ref_t *ref,
     }
 
     /* REF_HASH */
-    *buf_len = load_node_rlp(ms, ref->hash, buf);
+    *buf_len = load_node_rlp(ms, ref->hash, buf, depth);
     if (*buf_len == 0) return false;
     return decode_node(buf, *buf_len, node);
 }
@@ -1764,7 +1786,8 @@ static node_ref_t collapse_branch(mpt_store_t *ms, node_ref_t children[16]) {
     size_t buf_len;
     mpt_node_t child_node;
 
-    if (!load_from_ref(ms, &child_ref, buf, &buf_len, &child_node)) {
+    if (!load_from_ref(ms, &child_ref, buf, &buf_len, &child_node,
+                        NCACHE_DEPTH_UNKNOWN)) {
         /* Can't load child — just make an extension with 1-nibble path */
         return make_extension(ms, &prefix_nibble, 1, &child_ref);
     }
@@ -1984,7 +2007,8 @@ static node_ref_t merge_extension(mpt_store_t *ms, const node_ref_t *old_ref,
         uint8_t buf[MAX_NODE_RLP];
         size_t buf_len;
         mpt_node_t child_node;
-        if (load_from_ref(ms, &new_child, buf, &buf_len, &child_node)) {
+        if (load_from_ref(ms, &new_child, buf, &buf_len, &child_node,
+                          (uint8_t)depth)) {
             if (child_node.type == MPT_NODE_LEAF) {
                 /* ext(N) + leaf(M) → leaf(N+M) */
                 delete_ref(ms, &new_child);
@@ -2077,7 +2101,8 @@ static node_ref_t merge_extension(mpt_store_t *ms, const node_ref_t *old_ref,
         uint8_t buf2[MAX_NODE_RLP];
         size_t buf2_len;
         mpt_node_t sub_node;
-        if (load_from_ref(ms, &subtrie_ref, buf2, &buf2_len, &sub_node)) {
+        if (load_from_ref(ms, &subtrie_ref, buf2, &buf2_len, &sub_node,
+                          (uint8_t)depth)) {
             if (sub_node.type == MPT_NODE_LEAF) {
                 /* ext(shared) + leaf(M) → leaf(shared+M) */
                 delete_ref(ms, &subtrie_ref);
@@ -2121,7 +2146,7 @@ static node_ref_t update_subtrie(mpt_store_t *ms, const node_ref_t *current,
     size_t buf_len;
     mpt_node_t node;
 
-    if (!load_from_ref(ms, current, buf, &buf_len, &node)) {
+    if (!load_from_ref(ms, current, buf, &buf_len, &node, (uint8_t)depth)) {
         /* Can't load — treat as empty */
         return build_fresh(ms, entries, start, end, depth);
     }
@@ -2247,7 +2272,8 @@ uint32_t mpt_store_get(const mpt_store_t *ms, const uint8_t key[32],
     mpt_node_t node;
 
     for (;;) {
-        if (!load_from_ref(ms, &ref, node_buf, &node_buf_len, &node))
+        if (!load_from_ref(ms, &ref, node_buf, &node_buf_len, &node,
+                          (uint8_t)depth))
             return 0;
 
         switch (node.type) {
@@ -2311,7 +2337,7 @@ static bool compact_walk(const mpt_store_t *old_ms, mpt_store_t *new_ms,
 
     /* Load node from old store */
     uint8_t buf[MAX_NODE_RLP];
-    size_t buf_len = load_node_rlp(old_ms, ref->hash, buf);
+    size_t buf_len = load_node_rlp(old_ms, ref->hash, buf, NCACHE_DEPTH_UNKNOWN);
     if (buf_len == 0) return false;
 
     /* Write to new store */
@@ -2352,7 +2378,7 @@ static bool walk_leaves_ref(const mpt_store_t *ms, const node_ref_t *ref,
             return false;
     } else {
         /* REF_HASH */
-        buf_len = load_node_rlp(ms, ref->hash, buf);
+        buf_len = load_node_rlp(ms, ref->hash, buf, NCACHE_DEPTH_UNKNOWN);
         if (buf_len == 0) return false;
         if (!decode_node(buf, buf_len, &node))
             return false;
