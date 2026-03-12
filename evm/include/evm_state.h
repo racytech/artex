@@ -73,6 +73,17 @@ void evm_state_discard_pending(evm_state_t *es);
 void evm_state_flush(evm_state_t *es);
 
 /**
+ * Start background flush: rotate deferred buffers and flush to disk
+ * in a background thread. Main thread continues with empty buffers.
+ */
+void evm_state_flush_bg(evm_state_t *es);
+
+/**
+ * Wait for background flush to complete and merge results.
+ */
+void evm_state_flush_wait(evm_state_t *es);
+
+/**
  * Enable/disable batch mode. In batch mode, per-block verkle flush
  * is skipped — block_dirty flags accumulate across blocks.
  * Call evm_state_flush_verkle() at checkpoint time to flush.

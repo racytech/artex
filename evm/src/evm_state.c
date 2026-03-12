@@ -497,6 +497,22 @@ void evm_state_flush(evm_state_t *es) {
 #endif
 }
 
+void evm_state_flush_bg(evm_state_t *es) {
+    if (!es) return;
+#ifdef ENABLE_MPT
+    if (es->account_mpt) mpt_store_flush_bg(es->account_mpt);
+    if (es->storage_mpt) mpt_store_flush_bg(es->storage_mpt);
+#endif
+}
+
+void evm_state_flush_wait(evm_state_t *es) {
+    if (!es) return;
+#ifdef ENABLE_MPT
+    if (es->account_mpt) mpt_store_flush_wait(es->account_mpt);
+    if (es->storage_mpt) mpt_store_flush_wait(es->storage_mpt);
+#endif
+}
+
 #ifdef ENABLE_MPT
 // Collect non-empty storage roots from account trie leaves (RLP-encoded accounts)
 typedef struct {

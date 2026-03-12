@@ -181,7 +181,7 @@ add_library(mpt_store STATIC
 )
 target_include_directories(mpt_store PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 target_compile_definitions(mpt_store PRIVATE MPT_DEFAULT_CACHE_MB=${MPT_ACCOUNT_CACHE_MB})
-target_link_libraries(mpt_store disk_hash common)
+target_link_libraries(mpt_store disk_hash common pthread)
 
 #==============================================================================
 # Libraries — EVM

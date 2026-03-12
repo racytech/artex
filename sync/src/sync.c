@@ -614,28 +614,41 @@ bool sync_checkpoint(sync_t *sync) {
     if (sync->vs) verkle_state_sync(sync->vs);
 #endif
 #ifdef ENABLE_MPT
-    evm_state_flush(sync->state);
+    /* Wait for previous background flush (if any) before saving checkpoint.
+     * This ensures the previous batch's data is fully on disk. */
+    evm_state_flush_wait(sync->state);
+
+    /* Start background flush: rotate deferred buffers into snapshot,
+     * spawn thread to write to disk. Main thread continues executing
+     * next batch with fresh empty buffers. */
+    evm_state_flush_bg(sync->state);
     if (sync->cs) code_store_flush(sync->cs);
+
+#ifdef ENABLE_COMPACTION
+    /* Compact shared storage MPT periodically — reclaim orphaned nodes.
+     * Must happen after flush (all deferred nodes on disk) and before
+     * eviction. Wait for bg flush first since compaction reads disk. */
+    if (sync->last_block > 0 &&
+        (sync->last_block / sync->config.checkpoint_interval) % 256 == 0) {
+        evm_state_flush_wait(sync->state);
+        evm_state_compact_storage(sync->state);
+    }
+#endif
 #endif
 
-    /* Write checkpoint marker — the commit point */
+    /* Write checkpoint marker — the commit point.
+     * Note: current batch's data may still be flushing in background.
+     * On crash, we re-execute from the previous checkpoint (256 blocks).
+     * For chain replay this is acceptable; production engine API would
+     * use synchronous flush (mpt_store_flush). */
     bool ok = checkpoint_save_internal(sync->config.checkpoint_path,
                                        sync->last_block, sync->block_hashes,
                                        sync->total_gas, sync->blocks_ok,
                                        sync->blocks_fail);
     if (ok) sync->last_checkpoint_block = sync->last_block;
 
-#ifdef ENABLE_COMPACTION
-    /* Compact shared storage MPT periodically — reclaim orphaned nodes.
-     * Every 256 checkpoints (~65K blocks) to limit I/O overhead from
-     * walking the full account trie to collect live storage roots. */
-    if (sync->last_block > 0 &&
-        (sync->last_block / sync->config.checkpoint_interval) % 256 == 0) {
-        evm_state_compact_storage(sync->state);
-    }
-#endif
-
-    /* Evict cache to bound memory — data is on disk, read-through reloads */
+    /* Evict cache to bound memory — data is on disk (or in snapshot),
+     * read-through reloads from snapshot or disk as needed. */
     evm_state_evict_cache(sync->state);
 
     /* Reset for next batch */

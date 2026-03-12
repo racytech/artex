@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 /* =========================================================================
  * Constants
@@ -393,6 +394,42 @@ typedef struct {
     int      ht_next;    /* next index in hash chain, -1 = end */
 } deferred_entry_t;
 
+/* Record of a slot freed during background flush (merged at join time) */
+typedef struct {
+    int      size_class;
+    uint64_t offset;
+} freed_slot_t;
+
+/* Background flush snapshot — immutable view of deferred writes being
+ * flushed to disk by a background thread. The main thread can read
+ * from this snapshot (snap_find) while the bg thread writes to disk. */
+typedef struct {
+    /* Owned data (moved from parent store at rotation time) */
+    deferred_entry_t *entries;
+    size_t            count;
+    int               ht[DEFERRED_BUCKETS];
+
+    uint8_t         (*deletes)[32];
+    size_t            del_count;
+
+    /* Parent references (shared, disk_hash is already thread-safe) */
+    int               data_fd;
+    disk_hash_t      *index;
+    bool              shared;    /* skip deletes for shared (multi-trie) stores */
+
+    /* Results from delete processing (merged into parent at join time) */
+    freed_slot_t     *freed;
+    size_t            freed_count;
+    size_t            freed_cap;
+    uint64_t          freed_live_bytes;
+
+    /* Synchronization */
+    pthread_t         thread;
+    pthread_mutex_t   mutex;
+    pthread_cond_t    cond;
+    bool              done;
+} flush_snapshot_t;
+
 struct mpt_store {
     disk_hash_t     *index;
     int              data_fd;
@@ -435,6 +472,10 @@ struct mpt_store {
 
     char            *idx_path;
     char            *dat_path;
+
+    /* Background flush: snapshot of previous batch's deferred writes
+     * being flushed to disk by a background thread. NULL if idle. */
+    flush_snapshot_t *bg_flush;
 };
 
 /* =========================================================================
@@ -948,6 +989,53 @@ static void def_free_all(mpt_store_t *ms) {
 }
 
 /* =========================================================================
+ * Background flush snapshot helpers
+ * ========================================================================= */
+
+/* Find a node in the background flush snapshot by hash.
+ * The snapshot is read-only for the main thread — no locks needed. */
+static const deferred_entry_t *snap_find(const flush_snapshot_t *snap,
+                                          const uint8_t hash[32]) {
+    uint32_t b = def_bucket(hash);
+    int idx = snap->ht[b];
+    while (idx >= 0) {
+        if (memcmp(snap->entries[idx].hash, hash, 32) == 0 &&
+            snap->entries[idx].rlp != NULL)
+            return &snap->entries[idx];
+        idx = snap->entries[idx].ht_next;
+    }
+    return NULL;
+}
+
+static bool snap_contains(const flush_snapshot_t *snap,
+                           const uint8_t hash[32]) {
+    return snap_find(snap, hash) != NULL;
+}
+
+/* Check if a hash is in the snapshot's pending deletes.
+ * Needed to guard against a race: disk_hash_contains may return true
+ * for a node that the bg thread will shortly delete. */
+static bool snap_del_contains(const flush_snapshot_t *snap,
+                                const uint8_t hash[32]) {
+    for (size_t i = 0; i < snap->del_count; i++) {
+        if (memcmp(snap->deletes[i], hash, 32) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void snap_free(flush_snapshot_t *snap) {
+    for (size_t i = 0; i < snap->count; i++)
+        free(snap->entries[i].rlp);
+    free(snap->entries);
+    free(snap->deletes);
+    free(snap->freed);
+    pthread_mutex_destroy(&snap->mutex);
+    pthread_cond_destroy(&snap->cond);
+    free(snap);
+}
+
+/* =========================================================================
  * Node I/O
  * ========================================================================= */
 
@@ -967,11 +1055,23 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
     if (de) {
         if (de->rlp_len <= MAX_NODE_RLP) {
             memcpy(buf, de->rlp, de->rlp_len);
-            /* Re-populate cache */
             if (ms->cache)
                 ncache_put(ms->cache, hash, buf, (uint16_t)de->rlp_len);
         }
         return de->rlp_len;
+    }
+
+    /* Check background flush snapshot (previous batch, being flushed) */
+    if (ms->bg_flush) {
+        de = snap_find(ms->bg_flush, hash);
+        if (de) {
+            if (de->rlp_len <= MAX_NODE_RLP) {
+                memcpy(buf, de->rlp, de->rlp_len);
+                if (ms->cache)
+                    ncache_put(ms->cache, hash, buf, (uint16_t)de->rlp_len);
+            }
+            return de->rlp_len;
+        }
     }
 
     node_record_t rec;
@@ -1002,6 +1102,11 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
      * fall back to disk_hash_contains (pread) on cache miss. */
     if ((ms->cache && ncache_contains(ms->cache, out_hash)) ||
         disk_hash_contains(ms->index, out_hash)) {
+        /* Race guard: if bg flush snapshot has this hash in its pending
+         * deletes, the bg thread will delete it from disk_hash.
+         * Don't dedup — we must recreate the node in our def_entries. */
+        if (ms->bg_flush && snap_del_contains(ms->bg_flush, out_hash))
+            goto create_new;
         def_del_cancel(ms, out_hash);
         return true;
     }
@@ -1009,6 +1114,12 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
     /* Skip if already in deferred buffer */
     if (def_contains(ms, out_hash))
         return true;
+
+    /* Skip if in background flush snapshot (previous batch) */
+    if (ms->bg_flush && snap_contains(ms->bg_flush, out_hash))
+        return true;
+
+create_new:;
 
     /* Allocate a slot: try free list first, then append */
     int sc = size_class_for((uint32_t)rlp_len);
@@ -1275,6 +1386,9 @@ mpt_store_t *mpt_store_open(const char *path) {
 void mpt_store_destroy(mpt_store_t *ms) {
     if (!ms) return;
 
+    /* Wait for any in-flight background flush */
+    mpt_store_flush_wait(ms);
+
     /* Free any pending batch entries */
     free(ms->dirty);
     for (size_t i = 0; i < ms->val_page_count; i++)
@@ -1303,6 +1417,9 @@ void mpt_store_sync(mpt_store_t *ms) {
 
 void mpt_store_flush(mpt_store_t *ms) {
     if (!ms) return;
+
+    /* Wait for any in-flight background flush first */
+    mpt_store_flush_wait(ms);
 
     /* 1. Write all deferred nodes to .dat + .idx */
     for (size_t i = 0; i < ms->def_count; i++) {
@@ -1337,6 +1454,164 @@ void mpt_store_flush(mpt_store_t *ms) {
     write_header(ms->data_fd, ms);
     fsync(ms->data_fd);
     disk_hash_sync(ms->index);
+}
+
+/* =========================================================================
+ * Background Flush
+ *
+ * Overlaps disk I/O with next batch's execution. The deferred write
+ * buffer is "rotated" into an immutable snapshot, and a background thread
+ * flushes it to disk. The main thread gets fresh empty buffers and
+ * continues executing. load_node_rlp reads through the snapshot.
+ * ========================================================================= */
+
+static void *flush_thread_fn(void *arg) {
+    flush_snapshot_t *snap = (flush_snapshot_t *)arg;
+
+    /* 1. Write all deferred entries to .dat + .idx */
+    for (size_t i = 0; i < snap->count; i++) {
+        deferred_entry_t *e = &snap->entries[i];
+        if (!e->rlp) continue;
+
+        pwrite(snap->data_fd, e->rlp, e->rlp_len,
+               (off_t)(PAGE_SIZE + e->offset));
+
+        node_record_t rec = { .offset = e->offset,
+                              .length = e->rlp_len };
+        disk_hash_put(snap->index, e->hash, &rec);
+    }
+
+    /* 2. Process deletes — collect freed slots for merge at join time.
+     * disk_hash_get/delete are thread-safe (rwlock). Free list updates
+     * are deferred to avoid contention with main thread's write_node. */
+    if (!snap->shared) {
+        for (size_t i = 0; i < snap->del_count; i++) {
+            node_record_t rec;
+            if (disk_hash_get(snap->index, snap->deletes[i], &rec)) {
+                /* Collect freed slot for merge */
+                if (snap->freed_count >= snap->freed_cap) {
+                    size_t nc = snap->freed_cap ? snap->freed_cap * 2 : 64;
+                    freed_slot_t *p = realloc(snap->freed,
+                                               nc * sizeof(freed_slot_t));
+                    if (p) {
+                        snap->freed = p;
+                        snap->freed_cap = nc;
+                    }
+                }
+                if (snap->freed_count < snap->freed_cap) {
+                    snap->freed[snap->freed_count].size_class =
+                        size_class_for(rec.length);
+                    snap->freed[snap->freed_count].offset = rec.offset;
+                    snap->freed_count++;
+                }
+                snap->freed_live_bytes += rec.length;
+            }
+            disk_hash_delete(snap->index, snap->deletes[i]);
+        }
+    }
+
+    /* 3. fsync data + index files */
+    fsync(snap->data_fd);
+    disk_hash_sync(snap->index);
+
+    /* 4. Signal completion */
+    pthread_mutex_lock(&snap->mutex);
+    snap->done = true;
+    pthread_cond_signal(&snap->cond);
+    pthread_mutex_unlock(&snap->mutex);
+
+    return NULL;
+}
+
+void mpt_store_flush_wait(mpt_store_t *ms) {
+    if (!ms || !ms->bg_flush) return;
+
+    flush_snapshot_t *snap = ms->bg_flush;
+
+    /* Wait for background thread to finish */
+    pthread_mutex_lock(&snap->mutex);
+    while (!snap->done)
+        pthread_cond_wait(&snap->cond, &snap->mutex);
+    pthread_mutex_unlock(&snap->mutex);
+    pthread_join(snap->thread, NULL);
+
+    /* Merge freed slots into main store's free lists */
+    for (size_t i = 0; i < snap->freed_count; i++) {
+        free_list_push(&ms->free_lists[snap->freed[i].size_class],
+                       snap->freed[i].offset);
+        ms->free_slot_bytes += SIZE_CLASSES[snap->freed[i].size_class];
+    }
+    if (ms->live_bytes >= snap->freed_live_bytes)
+        ms->live_bytes -= snap->freed_live_bytes;
+
+    /* Write header with merged state + fsync */
+    write_header(ms->data_fd, ms);
+    fsync(ms->data_fd);
+
+    /* Free snapshot */
+    snap_free(snap);
+    ms->bg_flush = NULL;
+}
+
+void mpt_store_flush_bg(mpt_store_t *ms) {
+    if (!ms) return;
+
+    /* Wait for any previous background flush */
+    mpt_store_flush_wait(ms);
+
+    /* Nothing to flush? */
+    if (ms->def_count == 0 && ms->def_del_count == 0)
+        return;
+
+    /* Create snapshot — move ownership of def_entries/def_deletes */
+    flush_snapshot_t *snap = calloc(1, sizeof(flush_snapshot_t));
+    if (!snap) {
+        /* Fallback: synchronous flush */
+        mpt_store_flush(ms);
+        return;
+    }
+
+    snap->entries   = ms->def_entries;
+    snap->count     = ms->def_count;
+    memcpy(snap->ht, ms->def_ht, sizeof(ms->def_ht));
+    snap->deletes   = ms->def_deletes;
+    snap->del_count = ms->def_del_count;
+    snap->data_fd   = ms->data_fd;
+    snap->index     = ms->index;
+    snap->shared    = ms->shared;
+
+    pthread_mutex_init(&snap->mutex, NULL);
+    pthread_cond_init(&snap->cond, NULL);
+    snap->done = false;
+
+    /* Reset main store's deferred buffers (fresh empty) */
+    ms->def_entries   = NULL;
+    ms->def_count     = 0;
+    ms->def_cap       = 0;
+    ms->def_deletes   = NULL;
+    ms->def_del_count = 0;
+    ms->def_del_cap   = 0;
+    def_init(ms);
+
+    ms->bg_flush = snap;
+
+    /* Spawn background flush thread */
+    if (pthread_create(&snap->thread, NULL, flush_thread_fn, snap) != 0) {
+        /* Thread creation failed — flush synchronously */
+        ms->bg_flush = NULL;
+        /* Restore buffers */
+        ms->def_entries   = snap->entries;
+        ms->def_count     = snap->count;
+        memcpy(ms->def_ht, snap->ht, sizeof(snap->ht));
+        ms->def_deletes   = snap->deletes;
+        ms->def_del_count = snap->del_count;
+        ms->def_cap       = snap->count;
+        ms->def_del_cap   = snap->del_count;
+        pthread_mutex_destroy(&snap->mutex);
+        pthread_cond_destroy(&snap->cond);
+        free(snap);
+        mpt_store_flush(ms);
+    }
 }
 
 /* =========================================================================

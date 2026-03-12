@@ -69,6 +69,21 @@ void mpt_store_sync(mpt_store_t *ms);
  */
 void mpt_store_flush(mpt_store_t *ms);
 
+/**
+ * Start a background flush: rotate deferred buffers into an immutable
+ * snapshot and flush to disk in a background thread. The main thread
+ * gets fresh empty buffers and can continue executing immediately.
+ * load_node_rlp reads through the snapshot during the overlap window.
+ * Call mpt_store_flush_wait() before the next checkpoint.
+ */
+void mpt_store_flush_bg(mpt_store_t *ms);
+
+/**
+ * Wait for a background flush to complete and merge results.
+ * No-op if no background flush is active.
+ */
+void mpt_store_flush_wait(mpt_store_t *ms);
+
 /* =========================================================================
  * Trie Root
  * ========================================================================= */
