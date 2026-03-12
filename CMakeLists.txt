@@ -886,6 +886,14 @@ if(CJSON_FOUND)
     endif()
     target_link_libraries(sync ${SYNC_LIBS})
 
+    # Chain tip (orchestration between Engine API and Sync Engine)
+    add_library(chain_tip STATIC sync/src/chain_tip.c)
+    target_include_directories(chain_tip PUBLIC
+        ${CMAKE_SOURCE_DIR}/sync/include
+        ${CMAKE_SOURCE_DIR}/engine/include
+    )
+    target_link_libraries(chain_tip sync engine_store engine_types block_executor evm common)
+
     # Chain replay tool
     add_executable(chain_replay tools/chain_replay.c)
     target_compile_definitions(chain_replay PRIVATE CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL})

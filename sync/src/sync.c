@@ -657,6 +657,111 @@ bool sync_checkpoint(sync_t *sync) {
     return ok;
 }
 
+// ============================================================================
+// Live Mode (per-block validation)
+// ============================================================================
+
+bool sync_execute_block_live(sync_t *sync,
+                              const block_header_t *header,
+                              const block_body_t *body,
+                              const hash_t *block_hash,
+                              sync_block_result_t *result) {
+    if (!sync || !header || !body || !block_hash || !result) return false;
+
+    memset(result, 0, sizeof(*result));
+
+    uint64_t bn = header->number;
+
+    /* Store block hash in ring buffer */
+    sync->block_hashes[bn % BLOCK_HASH_WINDOW] = *block_hash;
+
+    /* Execute block */
+    block_result_t br = block_execute(sync->evm, header, body,
+                                      sync->block_hashes);
+
+    result->gas_used     = br.gas_used;
+    result->tx_count     = br.tx_count;
+    result->expected_gas = header->gas_used;
+    result->actual_gas   = br.gas_used;
+
+    /* Validate gas */
+    if (br.gas_used != header->gas_used) {
+        result->ok    = false;
+        result->error = SYNC_GAS_MISMATCH;
+        sync->blocks_fail++;
+        sync->total_gas += br.gas_used;
+        sync->last_block = bn;
+        block_result_free(&br);
+        return true;
+    }
+
+    /* Immediate state root validation (the key difference from batch mode) */
+#ifdef ENABLE_MPT
+    {
+        bool prune = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
+        hash_t actual_root = evm_state_compute_mpt_root(sync->state, prune);
+        result->actual_root   = actual_root;
+        result->expected_root = header->state_root;
+
+        if (sync->config.validate_state_root &&
+            memcmp(actual_root.bytes, header->state_root.bytes, 32) != 0) {
+            result->ok    = false;
+            result->error = SYNC_ROOT_MISMATCH;
+            sync->blocks_fail++;
+            sync->total_gas += br.gas_used;
+            sync->last_block = bn;
+            block_result_free(&br);
+            return true;
+        }
+    }
+#endif
+
+    /* Block is valid */
+    result->ok    = true;
+    result->error = SYNC_OK;
+    sync->blocks_ok++;
+    sync->total_gas += br.gas_used;
+    sync->last_block = bn;
+
+    /* Synchronous flush — data fully on disk before returning VALID */
+#ifdef ENABLE_MPT
+    evm_state_flush_wait(sync->state);  /* wait for any prior bg flush */
+    evm_state_flush(sync->state);       /* synchronous flush */
+    if (sync->cs) code_store_flush(sync->cs);
+#endif
+#ifdef ENABLE_VERKLE
+    evm_state_flush_verkle(sync->state);
+    if (sync->vs) verkle_state_sync(sync->vs);
+#endif
+
+    /* Save checkpoint */
+    if (sync->config.checkpoint_path) {
+        sync->batch_root_computed = true;  /* root already computed above */
+        checkpoint_save_internal(sync->config.checkpoint_path,
+                                 sync->last_block, sync->block_hashes,
+                                 sync->total_gas, sync->blocks_ok,
+                                 sync->blocks_fail);
+        sync->last_checkpoint_block = sync->last_block;
+    }
+
+    block_result_free(&br);
+    return true;
+}
+
+void sync_set_live_mode(sync_t *sync, bool live) {
+    if (!sync) return;
+    /* In live mode, disable batch mode so state is flushed per-block */
+    evm_state_set_batch_mode(sync->state, !live);
+}
+
+struct evm *sync_get_evm(const sync_t *sync) {
+    return sync ? (struct evm *)sync->evm : NULL;
+}
+
+struct evm_state *sync_get_state(const sync_t *sync) {
+    return sync ? (struct evm_state *)sync->state : NULL;
+}
+
 uint64_t sync_resumed_from(const sync_t *sync) {
     return sync ? sync->resumed_block : 0;
 }

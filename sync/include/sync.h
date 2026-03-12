@@ -67,8 +67,10 @@ typedef struct {
     uint64_t blocks_fail;
 } sync_status_t;
 
-/* Opaque handle */
+/* Opaque handles */
 typedef struct sync sync_t;
+struct evm;
+struct evm_state;
 
 // ============================================================================
 // Lifecycle
@@ -121,6 +123,57 @@ bool sync_execute_block(sync_t *sync,
                         const block_body_t *body,
                         const hash_t *block_hash,
                         sync_block_result_t *result);
+
+// ============================================================================
+// Live Mode (per-block validation for CL sync)
+// ============================================================================
+
+/**
+ * Execute a block with immediate per-block validation.
+ *
+ * Unlike sync_execute_block() (which defers root validation to checkpoint
+ * boundaries), this function:
+ *   1. Executes the block
+ *   2. Computes the MPT state root immediately
+ *   3. Validates gas, state root, receipt root, and logs bloom
+ *   4. Flushes state synchronously on success
+ *
+ * Designed for CL-driven sync where each newPayload needs a VALID/INVALID
+ * response. The 12-second block interval gives ample time for synchronous
+ * root computation and flush.
+ *
+ * Returns false only on fatal error. Check result->ok for validation outcome.
+ */
+bool sync_execute_block_live(sync_t *sync,
+                              const block_header_t *header,
+                              const block_body_t *body,
+                              const hash_t *block_hash,
+                              sync_block_result_t *result);
+
+/**
+ * Switch between batch and live modes.
+ *
+ * Batch mode (live=false): root validated at checkpoint boundaries,
+ *   background MPT flush, good for era1 replay (~2000+ blk/s).
+ *
+ * Live mode (live=true): root validated per block, synchronous flush,
+ *   required for CL sync (VALID/INVALID response per newPayload).
+ *
+ * Call sync_checkpoint() before switching to flush pending state.
+ */
+void sync_set_live_mode(sync_t *sync, bool live);
+
+/**
+ * Get the EVM instance owned by the sync engine.
+ * Returns NULL if sync is NULL or not initialized.
+ */
+struct evm *sync_get_evm(const sync_t *sync);
+
+/**
+ * Get the EVM state instance owned by the sync engine.
+ * Returns NULL if sync is NULL or not initialized.
+ */
+struct evm_state *sync_get_state(const sync_t *sync);
 
 // ============================================================================
 // Checkpoint
