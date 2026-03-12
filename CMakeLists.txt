@@ -89,6 +89,11 @@ add_library(code_store STATIC
 )
 target_link_libraries(code_store disk_hash pthread)
 
+add_library(block_store STATIC
+    database/src/block_store.c
+)
+target_include_directories(block_store PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+
 #==============================================================================
 # Libraries — Common
 #==============================================================================
@@ -530,6 +535,13 @@ add_executable(test_mpt_store_flush
 )
 target_link_libraries(test_mpt_store_flush mpt_store common)
 add_test(NAME test_mpt_store_flush COMMAND test_mpt_store_flush)
+
+# Test: Block Store (append-only block index)
+add_executable(test_block_store
+    database/tests/test_block_store.c
+)
+target_link_libraries(test_block_store block_store)
+add_test(NAME test_block_store COMMAND test_block_store)
 
 # Benchmark: MPT Store at scale (realistic Ethereum workload)
 add_executable(bench_mpt_store
