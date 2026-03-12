@@ -38,37 +38,20 @@ negligible vs 2 GB cache. Upper branch nodes stay hot across blocks.
 
 ---
 
-## 5. io_uring for Flush
+## 5. ~~io_uring for Flush~~ — SKIPPED
 
-**Problem:** Flush does N individual `pwrite()` syscalls (now sorted by
-offset, but still one syscall each). Each syscall has ~200ns overhead.
-
-**Approach:** Batch all writes into a single io_uring submission queue.
-Submit once, reap completions. Already partially implemented
-(`USE_IO_URING` flag exists).
-
-**Impact:** Medium — ~200ns × 1000 nodes = ~200μs saved per flush.
-More impactful at tip where flush count and node count are higher.
-
-**Complexity:** Medium — io_uring API, error handling, fallback for
-older kernels. Ring setup/teardown lifecycle.
+Sorted pwrite already ensures sequential I/O. Syscall overhead is ~1ms
+per checkpoint flush (~5K entries × 200ns) — dwarfed by actual disk I/O.
+Not worth ~200 lines of io_uring setup/teardown + kernel fallback path.
 
 ---
 
-## 6. Batch Keccak
+## 6. ~~Batch Keccak~~ — SKIPPED
 
-**Problem:** Each trie node is hashed individually. Keccak's internal
-state setup is amortized poorly for small inputs (32-64 byte nodes).
-
-**Approach:** Collect multiple nodes to hash, process in pipeline.
-The fused permutation with precomputed round constants (already done)
-is the baseline — batching adds input-level parallelism.
-
-**Impact:** Low-Medium — keccak is already well-optimized. Batching
-helps most during commit_batch where thousands of nodes are hashed.
-
-**Complexity:** Medium — requires restructuring commit_batch to
-collect nodes before hashing rather than hash-as-you-go.
+Not possible for commit path. Each node's hash is needed immediately
+to build the parent's RLP (bottom-up dependency chain). Can't defer
+or batch. Keccak itself already uses fused permutation with precomputed
+round constants.
 
 ---
 
