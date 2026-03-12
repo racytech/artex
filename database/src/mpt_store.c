@@ -85,9 +85,10 @@ _Static_assert(sizeof(mpt_store_header_t) == PAGE_SIZE,
 typedef struct __attribute__((packed)) {
     uint64_t offset;
     uint32_t length;
+    uint32_t refcount;   /* shared-mode reference count (0 = free) */
 } node_record_t;
 
-_Static_assert(sizeof(node_record_t) == 12, "node_record_t must be 12 bytes");
+_Static_assert(sizeof(node_record_t) == 16, "node_record_t must be 16 bytes");
 
 /* =========================================================================
  * Dirty entry (staged update/delete)
@@ -410,6 +411,7 @@ typedef struct {
     uint8_t *rlp;        /* malloc'd copy of node RLP */
     uint32_t rlp_len;
     uint64_t offset;     /* allocated slot (in-memory alloc_slot result) */
+    uint32_t refcount;   /* shared-mode reference count */
     int      ht_next;    /* next index in hash chain, -1 = end */
 } deferred_entry_t;
 
@@ -950,6 +952,20 @@ static const deferred_entry_t *def_find(const mpt_store_t *ms,
     return NULL;
 }
 
+/* Mutable version of def_find — for refcount updates. */
+static deferred_entry_t *def_find_mut(mpt_store_t *ms,
+                                       const uint8_t hash[32]) {
+    uint32_t b = def_bucket(hash);
+    int idx = ms->def_ht[b];
+    while (idx >= 0) {
+        if (memcmp(ms->def_entries[idx].hash, hash, 32) == 0 &&
+            ms->def_entries[idx].rlp != NULL)
+            return &ms->def_entries[idx];
+        idx = ms->def_entries[idx].ht_next;
+    }
+    return NULL;
+}
+
 static uint8_t *def_rlp_arena_alloc(mpt_store_t *ms, size_t len) {
     if (ms->def_rlp_page_count == 0 ||
         ms->def_rlp_page_used + len > DEF_RLP_PAGE_SIZE) {
@@ -989,6 +1005,7 @@ static bool def_append(mpt_store_t *ms, const uint8_t hash[32],
     memcpy(e->rlp, rlp, rlp_len);
     e->rlp_len = rlp_len;
     e->offset = offset;
+    e->refcount = 1;
 
     uint32_t b = def_bucket(hash);
     e->ht_next = ms->def_ht[b];
@@ -1140,17 +1157,33 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
                        uint8_t out_hash[32]) {
     keccak(rlp, rlp_len, out_hash);
 
-    /* Skip if already exists — check LRU cache first (no syscall),
-     * fall back to disk_hash_contains (pread) on cache miss. */
-    if ((ms->cache && ncache_contains(ms->cache, out_hash)) ||
-        disk_hash_contains(ms->index, out_hash)) {
-        def_del_cancel(ms, out_hash);
-        return true;
+    /* Check if already exists */
+    if (ms->shared) {
+        /* Shared mode: need refcount — read full record from disk */
+        node_record_t existing;
+        if (disk_hash_get(ms->index, out_hash, &existing)) {
+            def_del_cancel(ms, out_hash);
+            existing.refcount++;
+            disk_hash_put(ms->index, out_hash, &existing);
+            return true;
+        }
+        /* Check deferred buffer */
+        deferred_entry_t *def = def_find_mut(ms, out_hash);
+        if (def) {
+            def_del_cancel(ms, out_hash);
+            def->refcount++;
+            return true;
+        }
+    } else {
+        /* Non-shared: refcount always 1 — fast existence check */
+        if ((ms->cache && ncache_contains(ms->cache, out_hash)) ||
+            disk_hash_contains(ms->index, out_hash)) {
+            def_del_cancel(ms, out_hash);
+            return true;
+        }
+        if (def_contains(ms, out_hash))
+            return true;
     }
-
-    /* Skip if already in deferred buffer */
-    if (def_contains(ms, out_hash))
-        return true;
 
     /* Allocate a slot: try free list first, then append */
     int sc = size_class_for((uint32_t)rlp_len);
@@ -1182,8 +1215,15 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
 /* Delete a node: buffer the delete for flush time */
 static void delete_node(mpt_store_t *ms, const uint8_t hash[32]) {
     /* Check if this is a deferred entry (not on disk yet) */
-    if (def_remove(ms, hash)) {
-        /* Was in deferred buffer — removed, slot returned to free list */
+    deferred_entry_t *def = def_find_mut(ms, hash);
+    if (def) {
+        if (def->refcount > 1) {
+            /* Other references remain — decrement only */
+            def->refcount--;
+            return;
+        }
+        /* Last reference — remove entirely */
+        def_remove(ms, hash);
         if (ms->cache)
             ncache_delete(ms->cache, hash);
         return;
@@ -1486,22 +1526,30 @@ void mpt_store_flush(mpt_store_t *ms) {
                (off_t)(PAGE_SIZE + e->offset));
 
         node_record_t rec = { .offset = e->offset,
-                              .length = e->rlp_len };
+                              .length = e->rlp_len,
+                              .refcount = e->refcount };
         disk_hash_put(ms->index, e->hash, &rec);
     }
     free(sorted);
 
-    /* 2. Apply pending deletes */
+    /* 2. Apply pending deletes (refcount-aware) */
     for (size_t i = 0; i < ms->def_del_count; i++) {
         node_record_t rec;
         if (disk_hash_get(ms->index, ms->def_deletes[i].hash, &rec)) {
-            if (ms->live_bytes >= rec.length)
-                ms->live_bytes -= rec.length;
-            int sc = size_class_for(rec.length);
-            free_list_push(&ms->free_lists[sc], rec.offset);
-            ms->free_slot_bytes += SIZE_CLASSES[sc];
+            if (rec.refcount > 1) {
+                /* Other references remain — decrement, keep node */
+                rec.refcount--;
+                disk_hash_put(ms->index, ms->def_deletes[i].hash, &rec);
+            } else {
+                /* Last reference — free the slot */
+                if (ms->live_bytes >= rec.length)
+                    ms->live_bytes -= rec.length;
+                int sc = size_class_for(rec.length);
+                free_list_push(&ms->free_lists[sc], rec.offset);
+                ms->free_slot_bytes += SIZE_CLASSES[sc];
+                disk_hash_delete(ms->index, ms->def_deletes[i].hash);
+            }
         }
-        disk_hash_delete(ms->index, ms->def_deletes[i].hash);
     }
 
     /* 3. Free deferred buffers */
@@ -1760,10 +1808,9 @@ static int single_child_index(const node_ref_t children[16]) {
 }
 
 /* Delete a stored node referenced by a ref (no-op for inline/empty).
- * In shared (multi-trie) mode, skip deletion entirely — nodes may be
- * referenced by other tries. Orphaned nodes are reclaimed by compaction. */
+ * In shared mode, refcounting ensures nodes with multiple references
+ * are only freed when the last reference is removed. */
 static void delete_ref(mpt_store_t *ms, const node_ref_t *ref) {
-    if (ms->shared) return;
     if (ref->type == REF_HASH)
         delete_node(ms, ref->hash);
     /* Inline nodes are embedded in parent — nothing to delete */
