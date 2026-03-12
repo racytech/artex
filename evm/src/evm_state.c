@@ -33,24 +33,26 @@ static size_t rlp_list_hdr(const uint8_t *buf, size_t buf_len, size_t *payload_l
 // --- Account cache ---
 
 typedef struct cached_account {
-    address_t  addr;            // key (20 bytes) — kept for finalize/revert
+    /* --- Cache line 1: hot fields (accessed every tx) --- */
     uint64_t   nonce;
-    uint256_t  balance;
-    hash_t     code_hash;
-    bool       has_code;
+    uint256_t  balance;         // 32 bytes
+    bool dirty;
+    bool block_dirty;           // survives commit_tx, cleared at block end
+    bool existed;               // existed in backing store before
+    bool mpt_dirty;             // needs update in account_mpt
+    bool storage_dirty;         // any storage slot changed (for mpt_store)
+    bool has_code;
+    bool created;               // newly created this execution
+    bool self_destructed;
+    bool code_dirty;
+    bool block_code_dirty;      // same for code
     uint8_t   *code;            // loaded bytecode (NULL until needed)
     uint32_t   code_size;
-    bool dirty;
-    bool code_dirty;
-    bool block_dirty;           // survives commit_tx, cleared at block end
-    bool block_code_dirty;      // same for code
-    bool created;               // newly created this execution
-    bool existed;               // existed in backing store before
-    bool self_destructed;
-    bool storage_dirty;         // any storage slot changed (for mpt_store)
-    bool mpt_dirty;             // needs update in account_mpt (cleared after compute_mpt_root)
-    hash_t storage_root;        // cached storage root (avoids recomputation for clean accounts)
-    hash_t addr_hash;           // cached keccak256(addr) — computed once on first load
+    /* --- Cache line 2+: cold fields --- */
+    address_t  addr;            // key (20 bytes) — kept for finalize/revert
+    hash_t     code_hash;       // 32 bytes
+    hash_t     storage_root;    // cached storage root (avoids recomputation for clean accounts)
+    hash_t     addr_hash;       // cached keccak256(addr) — computed once on first load
 } cached_account_t;
 
 // --- Storage cache ---
@@ -303,12 +305,9 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
     }
 #endif
 
-    if (!mem_art_insert(&es->accounts, addr->bytes, ADDRESS_SIZE,
-                        &ca_local, sizeof(cached_account_t)))
-        return NULL;
-
-    return (cached_account_t *)mem_art_get_mut(
-        &es->accounts, addr->bytes, ADDRESS_SIZE, NULL);
+    return (cached_account_t *)mem_art_upsert(
+        &es->accounts, addr->bytes, ADDRESS_SIZE,
+        &ca_local, sizeof(cached_account_t));
 }
 
 // Load storage slot into cache. From verkle_state if enabled, else zero.
@@ -359,12 +358,9 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
     }
 #endif
 
-    if (!mem_art_insert(&es->storage, skey, SLOT_KEY_SIZE,
-                        &cs_local, sizeof(cached_slot_t)))
-        return NULL;
-
-    return (cached_slot_t *)mem_art_get_mut(
-        &es->storage, skey, SLOT_KEY_SIZE, NULL);
+    return (cached_slot_t *)mem_art_upsert(
+        &es->storage, skey, SLOT_KEY_SIZE,
+        &cs_local, sizeof(cached_slot_t));
 }
 
 // ============================================================================

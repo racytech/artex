@@ -431,9 +431,9 @@ int main(int argc, char **argv) {
             clock_gettime(CLOCK_MONOTONIC, &t_now);
             double elapsed = (t_now.tv_sec - t_start.tv_sec) +
                              (t_now.tv_nsec - t_start.tv_nsec) / 1e9;
-            double bps = (bn - start_block + 1) / (elapsed > 0 ? elapsed : 1);
             double win_secs = (t_now.tv_sec - t_window.tv_sec) +
                               (t_now.tv_nsec - t_window.tv_nsec) / 1e9;
+            double bps = CHECKPOINT_INTERVAL / (win_secs > 0 ? win_secs : 1);
             double tps = window_txs / (win_secs > 0 ? win_secs : 1);
             sync_status_t st = sync_get_status(sync);
             printf("Block %lu | %lu txs | %.0f tps | gas %lu | %.0f blk/s | ok %lu fail %lu\n",

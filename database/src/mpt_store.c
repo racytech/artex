@@ -393,6 +393,11 @@ typedef struct {
     int      ht_next;    /* next index in hash chain, -1 = end */
 } deferred_entry_t;
 
+typedef struct {
+    uint8_t hash[32];
+    int     ht_next;    /* next index in hash chain, -1 = end */
+} del_entry_t;
+
 struct mpt_store {
     disk_hash_t     *index;
     int              data_fd;
@@ -429,9 +434,10 @@ struct mpt_store {
     int               def_ht[DEFERRED_BUCKETS]; /* hash table heads, -1 = empty */
 
     /* Pending deletes: on-disk node hashes to delete at flush time */
-    uint8_t         (*def_deletes)[32];
+    del_entry_t      *def_deletes;
     size_t            def_del_count;
     size_t            def_del_cap;
+    int               def_del_ht[DEFERRED_BUCKETS]; /* hash table for O(1) cancel */
 
     char            *idx_path;
     char            *dat_path;
@@ -821,6 +827,7 @@ static bool decode_node(const uint8_t *rlp, size_t rlp_len, mpt_node_t *node) {
 
 static void def_init(mpt_store_t *ms) {
     memset(ms->def_ht, 0xff, sizeof(ms->def_ht));  /* -1 = empty */
+    memset(ms->def_del_ht, 0xff, sizeof(ms->def_del_ht));
     ms->def_count = 0;
 }
 
@@ -907,31 +914,51 @@ static bool def_remove(mpt_store_t *ms, const uint8_t hash[32]) {
     return false;
 }
 
-/* Pending deletes for on-disk nodes */
+/* Pending deletes for on-disk nodes — hash-indexed for O(1) cancel */
 static bool def_del_append(mpt_store_t *ms, const uint8_t hash[32]) {
     if (ms->def_del_count >= ms->def_del_cap) {
         size_t new_cap = ms->def_del_cap ? ms->def_del_cap * 2 : 64;
-        void *p = realloc(ms->def_deletes, new_cap * 32);
+        del_entry_t *p = realloc(ms->def_deletes, new_cap * sizeof(del_entry_t));
         if (!p) return false;
         ms->def_deletes = p;
         ms->def_del_cap = new_cap;
     }
-    memcpy(ms->def_deletes[ms->def_del_count], hash, 32);
-    ms->def_del_count++;
+    size_t idx = ms->def_del_count++;
+    memcpy(ms->def_deletes[idx].hash, hash, 32);
+    uint32_t bkt = def_bucket(hash);
+    ms->def_deletes[idx].ht_next = ms->def_del_ht[bkt];
+    ms->def_del_ht[bkt] = (int)idx;
     return true;
 }
 
 /* Cancel a pending delete (when dedup detects the node is still needed). */
 static void def_del_cancel(mpt_store_t *ms, const uint8_t hash[32]) {
-    for (size_t i = 0; i < ms->def_del_count; i++) {
-        if (memcmp(ms->def_deletes[i], hash, 32) == 0) {
-            /* Swap with last and shrink */
-            if (i < ms->def_del_count - 1)
-                memcpy(ms->def_deletes[i],
-                       ms->def_deletes[ms->def_del_count - 1], 32);
+    uint32_t bkt = def_bucket(hash);
+    int *prev = &ms->def_del_ht[bkt];
+    int idx = *prev;
+    while (idx >= 0) {
+        del_entry_t *e = &ms->def_deletes[idx];
+        if (memcmp(e->hash, hash, 32) == 0) {
+            *prev = e->ht_next;
+            /* Swap with last entry to keep array packed */
+            size_t last = ms->def_del_count - 1;
+            if ((size_t)idx != last) {
+                del_entry_t *tail = &ms->def_deletes[last];
+                /* Fix chain pointing to 'last' before overwriting */
+                uint32_t tail_bkt = def_bucket(tail->hash);
+                int *tp = &ms->def_del_ht[tail_bkt];
+                while (*tp >= 0) {
+                    if (*tp == (int)last) { *tp = idx; break; }
+                    tp = &ms->def_deletes[*tp].ht_next;
+                }
+                memcpy(e->hash, tail->hash, 32);
+                e->ht_next = tail->ht_next;
+            }
             ms->def_del_count--;
             return;
         }
+        prev = &e->ht_next;
+        idx = e->ht_next;
     }
 }
 
@@ -1320,14 +1347,14 @@ void mpt_store_flush(mpt_store_t *ms) {
     /* 2. Apply pending deletes */
     for (size_t i = 0; i < ms->def_del_count; i++) {
         node_record_t rec;
-        if (disk_hash_get(ms->index, ms->def_deletes[i], &rec)) {
+        if (disk_hash_get(ms->index, ms->def_deletes[i].hash, &rec)) {
             if (ms->live_bytes >= rec.length)
                 ms->live_bytes -= rec.length;
             int sc = size_class_for(rec.length);
             free_list_push(&ms->free_lists[sc], rec.offset);
             ms->free_slot_bytes += SIZE_CLASSES[sc];
         }
-        disk_hash_delete(ms->index, ms->def_deletes[i]);
+        disk_hash_delete(ms->index, ms->def_deletes[i].hash);
     }
 
     /* 3. Free deferred buffers */
@@ -1990,8 +2017,18 @@ static node_ref_t update_subtrie(mpt_store_t *ms, const node_ref_t *current,
  * ========================================================================= */
 
 static int dirty_cmp(const void *a, const void *b) {
-    return memcmp(((const dirty_entry_t *)a)->nibbles,
-                  ((const dirty_entry_t *)b)->nibbles, MAX_NIBBLES);
+    const uint8_t *na = ((const dirty_entry_t *)a)->nibbles;
+    const uint8_t *nb = ((const dirty_entry_t *)b)->nibbles;
+    /* Fast path: compare first 8 nibbles as big-endian uint64 */
+    uint64_t pa, pb;
+    memcpy(&pa, na, 8);
+    memcpy(&pb, nb, 8);
+    if (pa != pb) {
+        pa = __builtin_bswap64(pa);
+        pb = __builtin_bswap64(pb);
+        return pa < pb ? -1 : 1;
+    }
+    return memcmp(na + 8, nb + 8, MAX_NIBBLES - 8);
 }
 
 bool mpt_store_commit_batch(mpt_store_t *ms) {

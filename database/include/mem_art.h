@@ -72,6 +72,12 @@ const void *mem_art_get(const mem_art_t *tree, const uint8_t *key, size_t key_le
 void *mem_art_get_mut(mem_art_t *tree, const uint8_t *key, size_t key_len,
                       size_t *value_len);
 
+/** Insert (or update) and return mutable pointer to the stored value.
+ *  Combines insert + get_mut in a single call (one tree traversal for insert,
+ *  one for pointer lookup — but avoids caller doing two separate calls). */
+void *mem_art_upsert(mem_art_t *tree, const uint8_t *key, size_t key_len,
+                     const void *value, size_t value_len);
+
 bool mem_art_delete(mem_art_t *tree, const uint8_t *key, size_t key_len);
 bool mem_art_contains(const mem_art_t *tree, const uint8_t *key, size_t key_len);
 size_t mem_art_size(const mem_art_t *tree);

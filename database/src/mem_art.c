@@ -1080,6 +1080,13 @@ bool mem_art_delete(mem_art_t *tree, const uint8_t *key, size_t key_len) {
     return deleted;
 }
 
+void *mem_art_upsert(mem_art_t *tree, const uint8_t *key, size_t key_len,
+                     const void *value, size_t value_len) {
+    if (!mem_art_insert(tree, key, key_len, value, value_len))
+        return NULL;
+    return (void *)search(tree, tree->root, key, key_len, 0, NULL);
+}
+
 bool mem_art_contains(const mem_art_t *tree, const uint8_t *key, size_t key_len) {
     return mem_art_get(tree, key, key_len, NULL) != NULL;
 }
