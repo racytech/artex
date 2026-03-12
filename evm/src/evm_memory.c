@@ -90,7 +90,7 @@ bool evm_memory_read_byte(evm_memory_t *mem, uint64_t offset, uint8_t *value)
 {
     if (!mem || !value)
     {
-        LOG_EVM_ERROR("Invalid parameters");
+        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -108,7 +108,7 @@ bool evm_memory_write_byte(evm_memory_t *mem, uint64_t offset, uint8_t value)
 {
     if (!mem)
     {
-        LOG_EVM_ERROR("Invalid memory");
+        LOG_EVM_DEBUG("Invalid memory");
         return false;
     }
 
@@ -126,7 +126,7 @@ bool evm_memory_read_word(evm_memory_t *mem, uint64_t offset, uint256_t *value)
 {
     if (!mem || !value)
     {
-        LOG_EVM_ERROR("Invalid parameters");
+        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -145,7 +145,7 @@ bool evm_memory_write_word(evm_memory_t *mem, uint64_t offset, const uint256_t *
 {
     if (!mem || !value)
     {
-        LOG_EVM_ERROR("Invalid parameters");
+        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -164,7 +164,7 @@ bool evm_memory_read(evm_memory_t *mem, uint64_t offset, uint8_t *data, size_t s
 {
     if (!mem || !data)
     {
-        LOG_EVM_ERROR("Invalid parameters");
+        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -187,7 +187,7 @@ bool evm_memory_write(evm_memory_t *mem, uint64_t offset, const uint8_t *data, s
 {
     if (!mem || !data)
     {
-        LOG_EVM_ERROR("Invalid parameters");
+        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -214,7 +214,7 @@ bool evm_memory_expand_slow(evm_memory_t *mem, uint64_t offset, size_t size)
 {
     if (!mem)
     {
-        LOG_EVM_ERROR("Invalid memory");
+        LOG_EVM_DEBUG("Invalid memory");
         return false;
     }
 
@@ -227,7 +227,7 @@ bool evm_memory_expand_slow(evm_memory_t *mem, uint64_t offset, size_t size)
     uint64_t end = offset + size;
     if (end < offset)
     {
-        LOG_EVM_ERROR("Memory offset overflow");
+        LOG_EVM_DEBUG("Memory offset overflow");
         return false;
     }
 
@@ -247,7 +247,7 @@ bool evm_memory_ensure_size(evm_memory_t *mem, size_t min_size)
 {
     if (!mem)
     {
-        LOG_EVM_ERROR("Invalid memory");
+        LOG_EVM_DEBUG("Invalid memory");
         return false;
     }
 
@@ -327,7 +327,7 @@ bool evm_memory_copy(evm_memory_t *mem, uint64_t dest_offset, uint64_t src_offse
 {
     if (!mem)
     {
-        LOG_EVM_ERROR("Invalid memory");
+        LOG_EVM_DEBUG("Invalid memory");
         return false;
     }
 

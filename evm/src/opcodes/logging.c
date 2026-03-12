@@ -34,7 +34,7 @@ static evm_status_t op_log_common(evm_t *evm, uint8_t num_topics)
     // Check for static call violation (logs modify state)
     if (evm->msg.is_static)
     {
-        LOG_EVM_ERROR("LOG%u: Cannot emit log in static call", num_topics);
+        LOG_EVM_DEBUG("LOG%u: Cannot emit log in static call", num_topics);
         return EVM_STATIC_CALL_VIOLATION;
     }
 

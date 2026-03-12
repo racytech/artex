@@ -20,7 +20,7 @@ static evm_status_t op_mload(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 1))
     {
-        LOG_EVM_ERROR("MLOAD: Stack underflow");
+        LOG_EVM_DEBUG("MLOAD: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -44,7 +44,7 @@ static evm_status_t op_mload(evm_t *evm)
     uint256_t value;
     if (!evm_memory_read_word(evm->memory, mem_offset, &value))
     {
-        LOG_EVM_ERROR("MLOAD: Failed to read from memory at offset %lu", mem_offset);
+        LOG_EVM_DEBUG("MLOAD: Failed to read from memory at offset %lu", mem_offset);
         return EVM_INVALID_MEMORY_ACCESS;
     }
 
@@ -66,7 +66,7 @@ static evm_status_t op_mstore(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_EVM_ERROR("MSTORE: Stack underflow");
+        LOG_EVM_DEBUG("MSTORE: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -90,7 +90,7 @@ static evm_status_t op_mstore(evm_t *evm)
     // Write 32 bytes to memory
     if (!evm_memory_write_word(evm->memory, mem_offset, &value))
     {
-        LOG_EVM_ERROR("MSTORE: Failed to write to memory at offset %lu", mem_offset);
+        LOG_EVM_DEBUG("MSTORE: Failed to write to memory at offset %lu", mem_offset);
         return EVM_INVALID_MEMORY_ACCESS;
     }
 
@@ -107,7 +107,7 @@ static evm_status_t op_mstore8(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_EVM_ERROR("MSTORE8: Stack underflow");
+        LOG_EVM_DEBUG("MSTORE8: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -134,7 +134,7 @@ static evm_status_t op_mstore8(evm_t *evm)
     // Write 1 byte to memory
     if (!evm_memory_write_byte(evm->memory, mem_offset, byte_value))
     {
-        LOG_EVM_ERROR("MSTORE8: Failed to write to memory at offset %lu", mem_offset);
+        LOG_EVM_DEBUG("MSTORE8: Failed to write to memory at offset %lu", mem_offset);
         return EVM_INVALID_MEMORY_ACCESS;
     }
 
