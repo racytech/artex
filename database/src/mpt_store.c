@@ -1159,10 +1159,12 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
 
     /* Check if already exists */
     if (ms->shared) {
-        /* Shared mode: need refcount — read full record from disk */
+        /* Shared mode: increment refcount. Do NOT cancel pending deletes —
+         * the delete will correctly decrement at flush time.
+         * Example: refcount=1, delete queued (-1), write increments (+1)
+         *   → at flush: refcount goes 2→1. Net = 1. Correct. */
         node_record_t existing;
         if (disk_hash_get(ms->index, out_hash, &existing)) {
-            def_del_cancel(ms, out_hash);
             existing.refcount++;
             disk_hash_put(ms->index, out_hash, &existing);
             return true;
@@ -1170,7 +1172,6 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         /* Check deferred buffer */
         deferred_entry_t *def = def_find_mut(ms, out_hash);
         if (def) {
-            def_del_cancel(ms, out_hash);
             def->refcount++;
             return true;
         }
