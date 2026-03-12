@@ -2266,9 +2266,9 @@ bool mpt_store_compact(mpt_store_t *ms) {
         return false;
     }
 
-    /* Copy root hash */
+    /* Copy root hash and flush deferred writes to disk */
     memcpy(new_ms->root_hash, ms->root_hash, 32);
-    mpt_store_sync(new_ms);
+    mpt_store_flush(new_ms);
 
     /* Swap files: rename new over old */
     char *old_idx = ms->idx_path;
@@ -2361,7 +2361,10 @@ bool mpt_store_compact_roots(mpt_store_t *ms,
         return false;
     }
 
-    mpt_store_sync(new_ms);
+    /* Flush deferred writes to disk before swapping files.
+     * write_node() buffers all nodes in def_entries — mpt_store_sync()
+     * only writes the header, so nodes would be lost on file swap. */
+    mpt_store_flush(new_ms);
 
     /* Swap files */
     char *old_idx = ms->idx_path;
