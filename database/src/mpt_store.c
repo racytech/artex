@@ -1471,8 +1471,9 @@ void mpt_store_flush(mpt_store_t *ms) {
         deferred_entry_t *e = &ms->def_entries[i];
         if (!e->rlp) continue;
 
-        pwrite(ms->data_fd, e->rlp, e->rlp_len,
-               (off_t)(PAGE_SIZE + e->offset));
+        ssize_t n = pwrite(ms->data_fd, e->rlp, e->rlp_len,
+                           (off_t)(PAGE_SIZE + e->offset));
+        if (n != (ssize_t)e->rlp_len) continue;  /* skip index on short write */
 
         node_record_t rec = { .offset = e->offset,
                               .length = e->rlp_len };
@@ -1540,7 +1541,7 @@ static bool flush_dat_uring(int fd, deferred_entry_t *entries, size_t count) {
             struct io_uring_cqe *cqe;
             while (pending > 0) {
                 io_uring_wait_cqe(&ring, &cqe);
-                if (cqe->res < 0) ok = false;
+                if (cqe->res < 0 || (uint32_t)cqe->res < cqe->user_data) ok = false;
                 io_uring_cqe_seen(&ring, cqe);
                 pending--;
             }
@@ -1548,6 +1549,7 @@ static bool flush_dat_uring(int fd, deferred_entry_t *entries, size_t count) {
         }
         io_uring_prep_write(sqe, fd, e->rlp, e->rlp_len,
                             (uint64_t)(PAGE_SIZE + e->offset));
+        sqe->user_data = e->rlp_len;
         pending++;
     }
 
@@ -1557,7 +1559,7 @@ static bool flush_dat_uring(int fd, deferred_entry_t *entries, size_t count) {
         struct io_uring_cqe *cqe;
         while (pending > 0) {
             io_uring_wait_cqe(&ring, &cqe);
-            if (cqe->res < 0) ok = false;
+            if (cqe->res < 0 || (uint32_t)cqe->res < cqe->user_data) ok = false;
             io_uring_cqe_seen(&ring, cqe);
             pending--;
         }
@@ -1591,8 +1593,9 @@ static void *flush_thread_fn(void *arg) {
             deferred_entry_t *e = &snap->entries[i];
             if (!e->rlp) continue;
 
-            pwrite(snap->data_fd, e->rlp, e->rlp_len,
-                   (off_t)(PAGE_SIZE + e->offset));
+            ssize_t n = pwrite(snap->data_fd, e->rlp, e->rlp_len,
+                               (off_t)(PAGE_SIZE + e->offset));
+            if (n != (ssize_t)e->rlp_len) continue;  /* skip index on short write */
 
             node_record_t rec = { .offset = e->offset,
                                   .length = e->rlp_len };

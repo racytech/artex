@@ -524,6 +524,13 @@ add_test(NAME test_mpt_store_vectors
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+# Test: MPT Store flush roundtrip (sync + bg flush → reopen → verify)
+add_executable(test_mpt_store_flush
+    database/tests/test_mpt_store_flush.c
+)
+target_link_libraries(test_mpt_store_flush mpt_store common)
+add_test(NAME test_mpt_store_flush COMMAND test_mpt_store_flush)
+
 # Benchmark: MPT Store at scale (realistic Ethereum workload)
 add_executable(bench_mpt_store
     tools/bench_mpt_store.c
