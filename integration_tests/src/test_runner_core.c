@@ -552,11 +552,6 @@ bool test_runner_setup_state(evm_state_t *state,
     for (size_t i = 0; i < count; i++) {
         const test_account_t *acc = &accounts[i];
 
-        // (Debug output removed)
-
-        // Ensure account exists in state
-        evm_state_create_account(state, &acc->address);
-
         // Set nonce (convert uint256 to uint64)
         uint64_t nonce = uint256_to_uint64(&acc->nonce);
         evm_state_set_nonce(state, &acc->address, nonce);
@@ -569,11 +564,16 @@ bool test_runner_setup_state(evm_state_t *state,
             evm_state_set_code(state, &acc->address, acc->code, (uint32_t)acc->code_len);
         }
 
-        // Set storage slots
+        // Set storage slots (skip zero-value entries — not part of trie)
         for (size_t j = 0; j < acc->storage_count; j++) {
             const test_storage_entry_t *entry = &acc->storage[j];
+            if (uint256_is_zero(&entry->value)) continue;
             evm_state_set_storage(state, &acc->address, &entry->key, &entry->value);
         }
+
+        // Mark as existing in pre-state — even empty accounts must persist
+        // in the trie unless touched and pruned by EIP-161 during execution.
+        evm_state_mark_existed(state, &acc->address);
     }
 
     return true;

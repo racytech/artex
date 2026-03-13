@@ -111,6 +111,9 @@ static bool push_verkle_data_gas(evm_t *evm, uint8_t num_bytes,
         if (__builtin_expect(evm->pc >= evm->code_size, 0))          \
         {                                                           \
             EVM_TRACE_IMPLICIT_STOP(evm);                           \
+            if (evm->return_data) { free(evm->return_data);         \
+                                    evm->return_data = NULL; }      \
+            evm->return_data_size = 0;                              \
             goto done;                                              \
         }                                                           \
         if (__builtin_expect(verkle_chunk_mode, 0)) {                \

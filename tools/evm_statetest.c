@@ -195,6 +195,7 @@ static int run_statetest_file(const char *filepath, const statetest_args_t *args
             /* Setup pre-state */
             test_runner_setup_state(state, test->pre_state, test->pre_state_count);
             evm_state_commit(state);
+            evm_state_clear_prestate_dirty(state);
 
             /* Set block environment */
             evm_block_env_t evm_block = {

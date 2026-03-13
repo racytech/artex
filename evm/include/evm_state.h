@@ -173,6 +173,8 @@ bool evm_state_has_storage(evm_state_t *es, const address_t *addr);
 
 /** Create or reset account: nonce=0, balance=0, no code, clear storage. */
 void evm_state_create_account(evm_state_t *es, const address_t *addr);
+void evm_state_mark_existed(evm_state_t *es, const address_t *addr);
+void evm_state_clear_prestate_dirty(evm_state_t *es);
 
 // ============================================================================
 // Self-Destruct
