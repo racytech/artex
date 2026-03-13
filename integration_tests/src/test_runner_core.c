@@ -98,6 +98,16 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.constantinople = 0;
         test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
+    } else if (strcmp(fork_name, "MuirGlacier") == 0) {
+        // Difficulty bomb delay only — no EVM changes vs Istanbul
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
     } else if (strcmp(fork_name, "Berlin") == 0) {
         test_config.fork_blocks.homestead = 0;
         test_config.fork_blocks.tangerine_whistle = 0;
@@ -106,6 +116,7 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.constantinople = 0;
         test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
         test_config.fork_blocks.berlin = 0;
     } else if (strcmp(fork_name, "London") == 0) {
         test_config.fork_blocks.homestead = 0;
@@ -115,8 +126,36 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.constantinople = 0;
         test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
         test_config.fork_blocks.berlin = 0;
         test_config.fork_blocks.london = 0;
+    } else if (strcmp(fork_name, "ArrowGlacier") == 0) {
+        // Difficulty bomb delay only — no EVM changes vs London
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
+        test_config.fork_blocks.berlin = 0;
+        test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.arrow_glacier = 0;
+    } else if (strcmp(fork_name, "GrayGlacier") == 0) {
+        // Difficulty bomb delay only — no EVM changes vs London
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
+        test_config.fork_blocks.berlin = 0;
+        test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.arrow_glacier = 0;
+        test_config.fork_blocks.gray_glacier = 0;
     } else if (strcmp(fork_name, "Paris") == 0 ||
                strcmp(fork_name, "Merge") == 0) {
         test_config.fork_blocks.homestead = 0;
@@ -126,8 +165,11 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.constantinople = 0;
         test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
         test_config.fork_blocks.berlin = 0;
         test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.arrow_glacier = 0;
+        test_config.fork_blocks.gray_glacier = 0;
         test_config.fork_blocks.paris = 0;
     } else if (strcmp(fork_name, "Shanghai") == 0) {
         test_config.fork_blocks.homestead = 0;
@@ -137,8 +179,11 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.constantinople = 0;
         test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
         test_config.fork_blocks.berlin = 0;
         test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.arrow_glacier = 0;
+        test_config.fork_blocks.gray_glacier = 0;
         test_config.fork_blocks.paris = 0;
         test_config.fork_blocks.shanghai = 0;
     } else if (strcmp(fork_name, "Cancun") == 0) {
@@ -149,8 +194,11 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.constantinople = 0;
         test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
         test_config.fork_blocks.berlin = 0;
         test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.arrow_glacier = 0;
+        test_config.fork_blocks.gray_glacier = 0;
         test_config.fork_blocks.paris = 0;
         test_config.fork_blocks.shanghai = 0;
         test_config.fork_blocks.cancun = 0;
@@ -162,8 +210,11 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.constantinople = 0;
         test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
         test_config.fork_blocks.berlin = 0;
         test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.arrow_glacier = 0;
+        test_config.fork_blocks.gray_glacier = 0;
         test_config.fork_blocks.paris = 0;
         test_config.fork_blocks.shanghai = 0;
         test_config.fork_blocks.cancun = 0;
@@ -176,8 +227,11 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.constantinople = 0;
         test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
         test_config.fork_blocks.berlin = 0;
         test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.arrow_glacier = 0;
+        test_config.fork_blocks.gray_glacier = 0;
         test_config.fork_blocks.paris = 0;
         test_config.fork_blocks.shanghai = 0;
         test_config.fork_blocks.cancun = 0;
@@ -191,8 +245,11 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.constantinople = 0;
         test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
         test_config.fork_blocks.berlin = 0;
         test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.arrow_glacier = 0;
+        test_config.fork_blocks.gray_glacier = 0;
         test_config.fork_blocks.paris = 0;
         test_config.fork_blocks.shanghai = 0;
         test_config.fork_blocks.cancun = 0;
@@ -207,8 +264,11 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.constantinople = 0;
         test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
         test_config.fork_blocks.berlin = 0;
         test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.arrow_glacier = 0;
+        test_config.fork_blocks.gray_glacier = 0;
         test_config.fork_blocks.paris = 0;
         test_config.fork_blocks.shanghai = 15000; // timestamp
     } else if (strcmp(fork_name, "ShanghaiToCancunAtTime15k") == 0) {
@@ -219,8 +279,11 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.constantinople = 0;
         test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
         test_config.fork_blocks.berlin = 0;
         test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.arrow_glacier = 0;
+        test_config.fork_blocks.gray_glacier = 0;
         test_config.fork_blocks.paris = 0;
         test_config.fork_blocks.shanghai = 0;
         test_config.fork_blocks.cancun = 15000; // timestamp
@@ -232,8 +295,11 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.constantinople = 0;
         test_config.fork_blocks.petersburg = 0;
         test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
         test_config.fork_blocks.berlin = 0;
         test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.arrow_glacier = 0;
+        test_config.fork_blocks.gray_glacier = 0;
         test_config.fork_blocks.paris = 0;
         test_config.fork_blocks.shanghai = 0;
         test_config.fork_blocks.cancun = 0;
