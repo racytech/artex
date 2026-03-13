@@ -227,7 +227,7 @@ evm_result_t evm_interpret(evm_t *evm)
         &&op_shl,
         &&op_shr,
         &&op_sar,
-        &&op_invalid,
+        &&op_clz,
         &&op_invalid,
 
         // 0x20-0x2f: Keccak256
@@ -814,6 +814,21 @@ op_sar:
         } else
             s[t-1] = uint256_sar(&s[t-1], (unsigned int)uint256_to_uint64(&s[t]));
         evm->stack->size = t;
+    }
+    NEXT();
+
+    //==========================================================================
+    // 0x1e: CLZ (EIP-7939, Osaka+)
+    //==========================================================================
+
+op_clz:
+    if (evm->fork < FORK_OSAKA) { status = EVM_INVALID_OPCODE; goto error; }
+    if (!evm_use_gas(evm, GAS_LOW)) goto done_oog;
+    if (__builtin_expect(evm->stack->size < 1, 0)) { status = EVM_STACK_UNDERFLOW; goto error; }
+    {
+        uint256_t *top = &evm->stack->items[evm->stack->size - 1];
+        unsigned int bit_len = (unsigned int)uint256_bit_length(top);
+        *top = uint256_from_uint64(256 - bit_len);
     }
     NEXT();
 

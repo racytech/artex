@@ -535,6 +535,14 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
                 evm_mark_address_warm(evm, &precompile_addr);
             }
 
+            // EIP-7212 (Osaka+): P256VERIFY at 0x0100
+            if (evm->fork >= FORK_OSAKA)
+            {
+                address_t p256_addr = {0};
+                p256_addr.bytes[18] = 0x01;
+                evm_mark_address_warm(evm, &p256_addr);
+            }
+
             // EIP-3651 (Shanghai+): coinbase is warm from start of transaction
             if (evm->fork >= FORK_SHANGHAI)
             {

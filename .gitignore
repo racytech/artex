@@ -152,6 +152,9 @@ failure.txt
 
 reference/
 
+# Fuzz reports
+fuzz_report/
+
 # Old checklist
 todo-checklist-old.md
 

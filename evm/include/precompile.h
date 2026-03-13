@@ -14,7 +14,8 @@
  *   0x08  BN256_PAIRING    Byzantium+    (EIP-197)
  *   0x09  BLAKE2F          Istanbul+     (EIP-152)
  *   0x0A  POINT_EVAL       Cancun+       (EIP-4844)
- *   0x0B–0x13  BLS12-381   Prague+       (EIP-2537)
+ *   0x0B–0x11  BLS12-381   Prague+       (EIP-2537)
+ *   0x0100     P256VERIFY  Osaka+        (EIP-7212)
  */
 
 #ifndef ART_EVM_PRECOMPILE_H
@@ -54,6 +55,9 @@ extern "C" {
 #define PRECOMPILE_BLS_PAIRING     0x0F
 #define PRECOMPILE_BLS_MAP_G1      0x10
 #define PRECOMPILE_BLS_MAP_G2      0x11
+
+// P256VERIFY precompile (Osaka+, EIP-7212) — secp256r1 signature verification
+#define PRECOMPILE_P256VERIFY      0x0100
 
 //==============================================================================
 // Precompile Interface

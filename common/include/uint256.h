@@ -27,10 +27,36 @@ extern const uint256_t UINT256_MAX;
 #define UINT256_ONE_INIT  ((uint256_t){UINT128_ONE, UINT128_ZERO})
 #define UINT256_MAX_INIT  ((uint256_t){UINT128_MAX, UINT128_MAX})
 
-// Arithmetic operations (mul/div/mod stay in uint256.c — complex, less frequent)
-uint256_t uint256_mul(const uint256_t* a, const uint256_t* b);
+// Arithmetic operations (div/mod stay in uint256.c — complex, less frequent)
 uint256_t uint256_div(const uint256_t* a, const uint256_t* b);
 uint256_t uint256_mod(const uint256_t* a, const uint256_t* b);
+
+// Inline multiplication (hot path — 257k calls in snailtracer)
+static inline uint256_t uint256_mul(const uint256_t* a, const uint256_t* b) {
+    uint256_t result;
+
+    // Full 128×128→256 for low×low using 4 partial 64×64→128 products
+    uint64_t al = (uint64_t)a->low, ah = (uint64_t)(a->low >> 64);
+    uint64_t bl = (uint64_t)b->low, bh = (uint64_t)(b->low >> 64);
+
+    __uint128_t p0 = (__uint128_t)al * bl;
+    __uint128_t p1 = (__uint128_t)al * bh;
+    __uint128_t p2 = (__uint128_t)ah * bl;
+    __uint128_t p3 = (__uint128_t)ah * bh;
+
+    // Combine: result = p3*2^128 + (p1+p2)*2^64 + p0
+    __uint128_t mid = p1 + p2;
+    __uint128_t carry_mid = (mid < p1) ? ((__uint128_t)1 << 64) : 0;
+
+    result.low = p0 + (mid << 64);
+    result.high = p3 + (mid >> 64) + carry_mid +
+                  ((__uint128_t)(result.low < p0));
+
+    // Cross terms: a_high*b_low + a_low*b_high (only low 128 bits matter)
+    result.high += a->high * b->low + a->low * b->high;
+
+    return result;
+}
 
 // Shift operations (stay in uint256.c — multi-branch)
 uint256_t uint256_shl(const uint256_t* a, unsigned int shift);

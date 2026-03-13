@@ -106,6 +106,17 @@ void code_store_sync(code_store_t *cs);
 void code_store_flush(code_store_t *cs);
 
 /* =========================================================================
+ * Code Cache
+ * ========================================================================= */
+
+/**
+ * Configure in-memory LRU cache for hot contract bytecode.
+ * Default: enabled on create/open with 8192 entries (~80MB).
+ * Call with 0 to disable.
+ */
+void code_store_set_cache(code_store_t *cs, uint32_t capacity);
+
+/* =========================================================================
  * Stats
  * ========================================================================= */
 
@@ -113,5 +124,17 @@ void code_store_flush(code_store_t *cs);
  * Number of unique codes stored.
  */
 uint64_t code_store_count(const code_store_t *cs);
+
+/**
+ * Code cache statistics.
+ */
+typedef struct {
+    uint32_t count;
+    uint32_t capacity;
+    uint64_t hits;
+    uint64_t misses;
+} code_store_cache_stats_t;
+
+code_store_cache_stats_t code_store_cache_stats(const code_store_t *cs);
 
 #endif /* CODE_STORE_H */

@@ -39,8 +39,10 @@ static uint64_t calculate_sstore_gas(
     bool current_is_zero = uint256_is_zero(current_value);
     bool new_is_zero     = uint256_is_zero(new_value);
 
-    // ── Pre-Istanbul: simple model ──────────────────────────────────────
-    if (evm->fork < FORK_ISTANBUL)
+    // ── Pre-EIP-1283: simple model ──────────────────────────────────────
+    // Constantinople introduced EIP-1283 (net gas metering).
+    // Petersburg reverted it. Istanbul re-introduced as EIP-2200.
+    if (evm->fork < FORK_CONSTANTINOPLE || evm->fork == FORK_PETERSBURG)
     {
         if (current_is_zero && !new_is_zero)
             return GAS_SSTORE_SET;       // 20000
@@ -72,9 +74,17 @@ static uint64_t calculate_sstore_gas(
         }
     }
 
-    // EIP-2200 gas constants depend on fork
-    // Verkle keeps SLOAD_GAS (100) per EIP-4762: "remove EIP-2200 costs except SLOAD_GAS"
-    uint64_t sload_gas = (evm->fork >= FORK_BERLIN) ? GAS_SLOAD_WARM : GAS_SLOAD_ISTANBUL;
+    // EIP-1283/2200 gas constants depend on fork
+    // Constantinople (EIP-1283): SSTORE_NOOP = 200
+    // Istanbul (EIP-2200): SLOAD = 800 (EIP-1884)
+    // Berlin+ (EIP-2929): SLOAD_WARM = 100
+    uint64_t sload_gas;
+    if (evm->fork >= FORK_BERLIN)
+        sload_gas = GAS_SLOAD_WARM;         // 100
+    else if (evm->fork >= FORK_ISTANBUL)
+        sload_gas = GAS_SLOAD_ISTANBUL;     // 800
+    else
+        sload_gas = 200;                    // EIP-1283 (Constantinople)
     uint64_t sstore_reset = (evm->fork >= FORK_BERLIN) ? (GAS_SSTORE_RESET - GAS_SLOAD_COLD) : GAS_SSTORE_RESET;
     int64_t  clear_refund = (evm->fork >= FORK_LONDON) ? 4800 : GAS_SSTORE_REFUND;
 
