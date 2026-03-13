@@ -531,6 +531,40 @@ add_executable(bench_mpt_store
 )
 target_link_libraries(bench_mpt_store mpt_store common)
 
+# Shared library for Python differential fuzzing (mpt_store + mem_mpt)
+# Build PIC versions of dependencies for the shared library
+add_library(mpt_store_pic STATIC database/src/mpt_store.c)
+target_include_directories(mpt_store_pic PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+target_compile_definitions(mpt_store_pic PRIVATE MPT_DEFAULT_CACHE_MB=64)
+set_target_properties(mpt_store_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(mpt_store_pic disk_hash common)
+
+add_library(mem_mpt_pic STATIC database/src/mem_mpt.c)
+set_target_properties(mem_mpt_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(mem_mpt_pic common)
+
+add_library(common_pic STATIC
+    common/src/keccak256.c common/src/hash.c common/src/rlp.c
+    common/src/bytes.c common/src/uint256.c common/src/address.c
+    common/src/logger.c common/src/snappy_decode.c)
+set_target_properties(common_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(common_pic snappy)
+
+add_library(disk_hash_pic STATIC database/src/disk_hash.c)
+set_target_properties(disk_hash_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(disk_hash_pic pthread)
+
+# Benchmark: profile MPT root computation phases
+add_executable(profile_mpt_root tools/profile_mpt_root.c)
+target_link_libraries(profile_mpt_root mpt_store common)
+
+add_library(mpt_fuzz SHARED tools/mpt_fuzz_lib.c)
+target_link_libraries(mpt_fuzz
+    -Wl,--whole-archive
+    mpt_store_pic mem_mpt_pic common_pic disk_hash_pic
+    -Wl,--no-whole-archive
+    pthread snappy)
+
 # Test: Verkle journal (block revert + crash recovery + checkpoint)
 add_executable(test_verkle_journal
     state/tests/test_verkle_journal.c

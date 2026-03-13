@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+// #include <time.h>  // uncomment for MPT root profiling
 
 extern bool g_trace_calls __attribute__((weak));
 
@@ -2409,7 +2410,18 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
 
     // ── Incremental path (with mpt_store on disk) ──
     if (es->account_mpt) {
+        // struct timespec t0, t1, t2, t3, t4;
+        // clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        // // Snapshot cache stats before to measure hits/misses during this root
+        // mpt_store_stats_t acct_before = mpt_store_stats(es->account_mpt);
+        // mpt_store_stats_t stor_before = mpt_store_stats(es->storage_mpt);
+
+        // size_t dirty_accounts_count = es->dirty_accounts.count;
+        // size_t dirty_slots_count = es->dirty_slots.count;
+
         compute_all_storage_roots(es);
+        // clock_gettime(CLOCK_MONOTONIC, &t1);
 
         if (!mpt_store_begin_batch(es->account_mpt)) {
             fprintf(stderr, "FATAL: mpt_store_begin_batch failed for account trie\n");
@@ -2454,13 +2466,46 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
             ca->block_code_dirty = false;
         }
         dirty_account_clear(&es->dirty_accounts);
+        // clock_gettime(CLOCK_MONOTONIC, &t2);
 
         if (!mpt_store_commit_batch(es->account_mpt)) {
             fprintf(stderr, "FATAL: mpt_store_commit_batch failed for account trie\n");
             return root;
         }
+        // clock_gettime(CLOCK_MONOTONIC, &t3);
 
         mpt_store_root(es->account_mpt, root.bytes);
+        // clock_gettime(CLOCK_MONOTONIC, &t4);
+
+        // // Snapshot cache stats after
+        // mpt_store_stats_t acct_after = mpt_store_stats(es->account_mpt);
+        // mpt_store_stats_t stor_after = mpt_store_stats(es->storage_mpt);
+
+        // double storage_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+        //                     (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        // double stage_ms   = (t2.tv_sec - t1.tv_sec) * 1000.0 +
+        //                     (t2.tv_nsec - t1.tv_nsec) / 1e6;
+        // double commit_ms  = (t3.tv_sec - t2.tv_sec) * 1000.0 +
+        //                     (t3.tv_nsec - t2.tv_nsec) / 1e6;
+        // double total_ms   = (t4.tv_sec - t0.tv_sec) * 1000.0 +
+        //                     (t4.tv_nsec - t0.tv_nsec) / 1e6;
+
+        // uint64_t s_hits   = stor_after.cache_hits - stor_before.cache_hits;
+        // uint64_t s_misses = stor_after.cache_misses - stor_before.cache_misses;
+        // uint64_t a_hits   = acct_after.cache_hits - acct_before.cache_hits;
+        // uint64_t a_misses = acct_after.cache_misses - acct_before.cache_misses;
+
+        // fprintf(stderr,
+        //     "  MPT root: %.1f ms (storage=%.1f stage=%.1f commit=%.1f) "
+        //     "dirty_acct=%zu dirty_slot=%zu "
+        //     "stor_cache=%llu/%llu (%.0f%%) acct_cache=%llu/%llu (%.0f%%)\n",
+        //     total_ms, storage_ms, stage_ms, commit_ms,
+        //     dirty_accounts_count, dirty_slots_count,
+        //     (unsigned long long)s_hits, (unsigned long long)(s_hits + s_misses),
+        //     (s_hits + s_misses) > 0 ? 100.0 * s_hits / (s_hits + s_misses) : 0,
+        //     (unsigned long long)a_hits, (unsigned long long)(a_hits + a_misses),
+        //     (a_hits + a_misses) > 0 ? 100.0 * a_hits / (a_hits + a_misses) : 0);
+
         return root;
     }
 
