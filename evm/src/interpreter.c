@@ -1298,6 +1298,7 @@ op_callcode:
 
 op_return:
     status = op_return(evm);
+    if (status != EVM_SUCCESS) goto error;
     EVM_TRACE_EXIT(evm, NULL);
     goto done;
 
@@ -1321,6 +1322,7 @@ op_staticcall:
 
 op_revert:
     status = op_revert(evm);
+    if (status != EVM_REVERT) goto error;
     EVM_TRACE_EXIT(evm, NULL);
     goto done;
 

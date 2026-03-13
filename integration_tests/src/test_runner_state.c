@@ -5,6 +5,7 @@
 #include "test_runner.h"
 #include "transaction.h"
 #include "evm.h"
+#include "hash.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -253,7 +254,18 @@ bool test_runner_run_state_test(test_runner_t *runner,
                 .chain_id = uint256_from_uint64(runner->evm->chain_config->chain_id),
                 .excess_blob_gas = block_env.excess_blob_gas,
             };
-            /* Populate block_hash from previousHash for BLOCKHASH opcode */
+            /* Populate block_hash for BLOCKHASH opcode.
+             * State tests use synthetic hashes: hash(n) = keccak256(decimal_string(n))
+             * matching go-ethereum's vmTestBlockHash convention. */
+            {
+                uint64_t start = (evm_block.number > 256) ? evm_block.number - 256 : 0;
+                for (uint64_t bn = start; bn < evm_block.number; bn++) {
+                    char numstr[21];
+                    int len = snprintf(numstr, sizeof(numstr), "%lu", (unsigned long)bn);
+                    hash_t h = hash_keccak256((const uint8_t *)numstr, (size_t)len);
+                    evm_block.block_hash[bn % 256] = h;
+                }
+            }
             if (test->env.has_previous_hash && evm_block.number > 0) {
                 uint64_t parent_idx = (evm_block.number - 1) % 256;
                 evm_block.block_hash[parent_idx] = test->env.previous_hash;
