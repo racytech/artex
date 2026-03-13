@@ -355,6 +355,7 @@ int main(int argc, char **argv) {
                : end_block);
 
     uint64_t window_txs = 0;
+    uint64_t window_gas = 0;
     struct timespec t_window;
     clock_gettime(CLOCK_MONOTONIC, &t_window);
 
@@ -425,6 +426,7 @@ int main(int argc, char **argv) {
 #endif
 
         window_txs += result.tx_count;
+        window_gas += result.gas_used;
 
         /* Progress every CHECKPOINT_INTERVAL blocks, on failure, or last block */
         if (bn % CHECKPOINT_INTERVAL == 0 || !result.ok || bn == end_block) {
@@ -435,11 +437,13 @@ int main(int argc, char **argv) {
                               (t_now.tv_nsec - t_window.tv_nsec) / 1e9;
             double bps = CHECKPOINT_INTERVAL / (win_secs > 0 ? win_secs : 1);
             double tps = window_txs / (win_secs > 0 ? win_secs : 1);
+            double mgps = (window_gas / 1e6) / (win_secs > 0 ? win_secs : 1);
             sync_status_t st = sync_get_status(sync);
-            printf("Block %lu | %lu txs | %.0f tps | gas %lu | %.0f blk/s | ok %lu fail %lu\n",
-                   bn, window_txs, tps, result.gas_used, bps,
+            printf("Block %lu | %lu txs | %.0f tps | %.1f Mgas/s | %.0f blk/s | ok %lu fail %lu\n",
+                   bn, window_txs, tps, mgps, bps,
                    st.blocks_ok, st.blocks_fail);
             window_txs = 0;
+            window_gas = 0;
             clock_gettime(CLOCK_MONOTONIC, &t_window);
         }
 

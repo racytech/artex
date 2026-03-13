@@ -63,12 +63,14 @@ _Static_assert(sizeof(code_record_t) == 12, "code_record_t must be 12 bytes");
  * Layout: flat pre-allocated entry array + hash table + doubly-linked
  * LRU list. All operations O(1). Variable-length code via malloc'd buffers.
  *
- * Default 8192 entries — covers the hot set at chain tip (~30M blocks).
- * At ~10KB average code size, that's ~80MB memory.
+ * Default 32768 entries — covers the hot set through late mainnet.
+ * At ~10KB average code size, that's ~320MB memory.
  * ========================================================================= */
 
 #define CCACHE_SENTINEL 0xFFFFFFFFU
-#define CCACHE_DEFAULT_CAP 8192
+#ifndef CCACHE_DEFAULT_CAP
+#define CCACHE_DEFAULT_CAP 32768
+#endif
 
 typedef struct {
     uint8_t   hash[32];

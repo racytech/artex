@@ -285,7 +285,7 @@ int main(int argc, char **argv) {
     FILE *fp = fopen(vecpath, "rb");
     if (!fp) {
         /* Try relative to source dir */
-        fp = fopen("state/tests/verkle_vectors.bin", "rb");
+        fp = fopen("verkle/tests/verkle_vectors.bin", "rb");
     }
     if (!fp) {
         fprintf(stderr, "Cannot open %s (run gen_verkle_vectors first)\n", vecpath);

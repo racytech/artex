@@ -11,7 +11,6 @@ project(art_database C)
 option(ENABLE_MPT "Enable MPT (Merkle Patricia Trie) state root" ON)
 option(ENABLE_VERKLE "Enable Verkle state root" OFF)
 option(ENABLE_MEM_MPT "Enable in-memory batch MPT for test runner (not needed for chain_replay)" OFF)
-option(ENABLE_COMPACTION "Enable periodic storage MPT compaction during chain replay" OFF)
 option(ENABLE_EVM_TRACE "Enable EIP-3155 EVM execution tracing" OFF)
 
 if(NOT ENABLE_MPT AND NOT ENABLE_VERKLE)
@@ -31,6 +30,9 @@ endif()
 if(NOT DEFINED MPT_STORAGE_CAPACITY)
     set(MPT_STORAGE_CAPACITY 500000000)
 endif()
+if(NOT DEFINED CODE_CACHE_ENTRIES)
+    set(CODE_CACHE_ENTRIES 32768)
+endif()
 if(NOT DEFINED CHECKPOINT_INTERVAL)
     set(CHECKPOINT_INTERVAL 256)
 endif()
@@ -47,7 +49,7 @@ set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG -flto -march=na
 # Include directories
 include_directories(
     ${CMAKE_SOURCE_DIR}/database/include
-    ${CMAKE_SOURCE_DIR}/state/include
+    ${CMAKE_SOURCE_DIR}/verkle/include
     ${CMAKE_SOURCE_DIR}/common/include
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/executor/include
@@ -86,6 +88,7 @@ target_link_libraries(disk_hash pthread)
 add_library(code_store STATIC
     database/src/code_store.c
 )
+target_compile_definitions(code_store PRIVATE CCACHE_DEFAULT_CAP=${CODE_CACHE_ENTRIES})
 target_link_libraries(code_store disk_hash pthread)
 
 #==============================================================================
@@ -117,55 +120,55 @@ set_target_properties(blst PROPERTIES
 
 # Banderwagon curve arithmetic (twisted Edwards over blst_fr)
 add_library(banderwagon STATIC
-    state/src/banderwagon.c
+    verkle/src/banderwagon.c
 )
 target_link_libraries(banderwagon blst)
 
 # Pedersen commitment (CRS + vector commitment over banderwagon)
 add_library(pedersen STATIC
-    state/src/pedersen.c
+    verkle/src/pedersen.c
 )
 target_link_libraries(pedersen banderwagon blst)
 
 # Verkle tree (in-memory width-256 trie with Pedersen commitments)
 add_library(verkle STATIC
-    state/src/verkle.c
+    verkle/src/verkle.c
 )
 target_link_libraries(verkle pedersen banderwagon)
 
 # Verkle key derivation (pedersen hash for address/storage → tree key mapping)
 add_library(verkle_key STATIC
-    state/src/verkle_key.c
+    verkle/src/verkle_key.c
 )
 target_link_libraries(verkle_key pedersen)
 
 # Verkle state (typed account/storage interface over verkle tree)
 add_library(verkle_state STATIC
-    state/src/verkle_state.c
+    verkle/src/verkle_state.c
 )
 target_link_libraries(verkle_state verkle verkle_key verkle_flat)
 
 # Verkle commitment store (art_store-backed commitment persistence)
 add_library(verkle_commit_store STATIC
-    state/src/verkle_commit_store.c
+    verkle/src/verkle_commit_store.c
 )
 target_link_libraries(verkle_commit_store verkle banderwagon art_store)
 
 # Verkle snapshot (binary tree serialization/deserialization)
 add_library(verkle_snapshot STATIC
-    state/src/verkle_snapshot.c
+    verkle/src/verkle_snapshot.c
 )
 target_link_libraries(verkle_snapshot verkle banderwagon)
 
 # Verkle journal (block revert + crash recovery + background checkpoint)
 add_library(verkle_journal STATIC
-    state/src/verkle_journal.c
+    verkle/src/verkle_journal.c
 )
 target_link_libraries(verkle_journal verkle verkle_snapshot banderwagon)
 
 # Verkle flat updater (disk-backed commitment updates, O(block) RAM)
 add_library(verkle_flat STATIC
-    state/src/verkle_flat.c
+    verkle/src/verkle_flat.c
 )
 target_link_libraries(verkle_flat verkle_commit_store art_store disk_hash pedersen banderwagon)
 
@@ -452,49 +455,49 @@ add_test(NAME test_code_store COMMAND test_code_store)
 
 # Test: Banderwagon curve arithmetic (twisted Edwards + blst)
 add_executable(test_banderwagon
-    state/tests/test_banderwagon.c
+    verkle/tests/test_banderwagon.c
 )
 target_link_libraries(test_banderwagon banderwagon)
 add_test(NAME test_banderwagon COMMAND test_banderwagon)
 
 # Test: Pedersen commitment (CRS generation + commit/update)
 add_executable(test_pedersen
-    state/tests/test_pedersen.c
+    verkle/tests/test_pedersen.c
 )
 target_link_libraries(test_pedersen pedersen)
 add_test(NAME test_pedersen COMMAND test_pedersen)
 
 # Test: Verkle tree (in-memory trie with Pedersen commitments)
 add_executable(test_verkle
-    state/tests/test_verkle.c
+    verkle/tests/test_verkle.c
 )
 target_link_libraries(test_verkle verkle)
 add_test(NAME test_verkle COMMAND test_verkle)
 
 # Test: Verkle key derivation (pedersen hash → tree key mapping)
 add_executable(test_verkle_key
-    state/tests/test_verkle_key.c
+    verkle/tests/test_verkle_key.c
 )
 target_link_libraries(test_verkle_key verkle_key)
 add_test(NAME test_verkle_key COMMAND test_verkle_key)
 
 # Test: Verkle state (typed account/storage interface)
 add_executable(test_verkle_state
-    state/tests/test_verkle_state.c
+    verkle/tests/test_verkle_state.c
 )
 target_link_libraries(test_verkle_state verkle_state)
 add_test(NAME test_verkle_state COMMAND test_verkle_state)
 
 # Test: Verkle commitment store (art_store-backed persistence)
 add_executable(test_verkle_commit_store
-    state/tests/test_verkle_commit_store.c
+    verkle/tests/test_verkle_commit_store.c
 )
 target_link_libraries(test_verkle_commit_store verkle_commit_store verkle)
 add_test(NAME test_verkle_commit_store COMMAND test_verkle_commit_store)
 
 # Test: Verkle snapshot (binary tree serialization/deserialization)
 add_executable(test_verkle_snapshot
-    state/tests/test_verkle_snapshot.c
+    verkle/tests/test_verkle_snapshot.c
 )
 target_link_libraries(test_verkle_snapshot verkle_snapshot verkle_state)
 add_test(NAME test_verkle_snapshot COMMAND test_verkle_snapshot)
@@ -568,39 +571,39 @@ target_link_libraries(mpt_fuzz
 
 # Test: Verkle journal (block revert + crash recovery + checkpoint)
 add_executable(test_verkle_journal
-    state/tests/test_verkle_journal.c
+    verkle/tests/test_verkle_journal.c
 )
 target_link_libraries(test_verkle_journal verkle_journal verkle_state)
 add_test(NAME test_verkle_journal COMMAND test_verkle_journal)
 
 # Benchmark: Verkle state scale (block simulation)
 add_executable(bench_verkle_state
-    state/tests/bench_verkle_state.c
+    verkle/tests/bench_verkle_state.c
 )
 target_link_libraries(bench_verkle_state verkle_journal verkle_state verkle_snapshot)
 
 # Test: Verkle flat updater (disk-backed commitment updates)
 add_executable(test_verkle_flat
-    state/tests/test_verkle_flat.c
+    verkle/tests/test_verkle_flat.c
 )
 target_link_libraries(test_verkle_flat verkle_flat verkle)
 add_test(NAME test_verkle_flat COMMAND test_verkle_flat)
 
 # Stress Test: Verkle flat updater (cross-validated, fail-fast)
 add_executable(test_stress_verkle_flat
-    state/tests/test_stress_verkle_flat.c
+    verkle/tests/test_stress_verkle_flat.c
 )
 target_link_libraries(test_stress_verkle_flat verkle_flat verkle verkle_commit_store)
 
 # Benchmark: Verkle flat scale (disk-backed block simulation)
 add_executable(bench_verkle_flat
-    state/tests/bench_verkle_flat.c
+    verkle/tests/bench_verkle_flat.c
 )
 target_link_libraries(bench_verkle_flat verkle_state)
 
 # Test: Verkle cross-validation (go-verkle reference vectors)
 add_executable(test_verkle_cross_validation
-    state/tests/test_verkle_cross_validation.c
+    verkle/tests/test_verkle_cross_validation.c
 )
 target_link_libraries(test_verkle_cross_validation verkle_flat verkle)
 add_test(NAME test_verkle_cross_validation
@@ -910,9 +913,6 @@ if(CJSON_FOUND)
     if(ENABLE_MPT)
         list(APPEND SYNC_LIBS code_store)
     endif()
-    if(ENABLE_COMPACTION)
-        target_compile_definitions(sync PRIVATE ENABLE_COMPACTION=1)
-    endif()
     target_link_libraries(sync ${SYNC_LIBS})
 
     # Chain replay tool
@@ -983,13 +983,13 @@ message(STATUS "C Compiler:        ${CMAKE_C_COMPILER}")
 message(STATUS "C Flags:           ${CMAKE_C_FLAGS}")
 message(STATUS "MPT backend:       ${ENABLE_MPT}")
 message(STATUS "Verkle backend:    ${ENABLE_VERKLE}")
-message(STATUS "Compaction:        ${ENABLE_COMPACTION}")
 message(STATUS "")
 message(STATUS "Tuning:")
 message(STATUS "  Account cache:   ${MPT_ACCOUNT_CACHE_MB} MB")
 message(STATUS "  Storage cache:   ${MPT_STORAGE_CACHE_MB} MB")
 message(STATUS "  Account capacity:${MPT_ACCOUNT_CAPACITY}")
 message(STATUS "  Storage capacity:${MPT_STORAGE_CAPACITY}")
+message(STATUS "  Code cache:      ${CODE_CACHE_ENTRIES} entries")
 message(STATUS "  Checkpoint every:${CHECKPOINT_INTERVAL} blocks")
 message(STATUS "")
 message(STATUS "Libraries:")

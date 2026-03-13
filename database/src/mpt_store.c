@@ -644,7 +644,7 @@ static void bytes_to_nibbles(const uint8_t *bytes, size_t byte_len,
 }
 
 /* =========================================================================
- * RLP encoding helpers (stack-allocated, same approach as state/src/mpt.c)
+ * RLP encoding helpers (stack-allocated, same approach as verkle/src/mpt.c)
  * ========================================================================= */
 
 typedef struct {
