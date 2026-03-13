@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <stdatomic.h>
 
 /* =========================================================================
  * Constants
@@ -476,6 +477,11 @@ struct mpt_store {
     size_t            def_del_count;
     size_t            def_del_cap;
     int               def_del_ht[DEFERRED_BUCKETS]; /* hash table for O(1) cancel */
+
+    /* Shared atomic offset counter for parallel worker clones.
+     * NULL for normal stores. When non-NULL, write_node uses atomic
+     * fetch-add instead of ms->data_size for slot allocation. */
+    _Atomic(uint64_t) *shared_data_size;
 
     char            *idx_path;
     char            *dat_path;
@@ -1203,6 +1209,10 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
     if (free_list_pop(&ms->free_lists[sc], &write_offset)) {
         /* Reusing a freed slot — no disk I/O needed */
         ms->free_slot_bytes -= slot_size;
+    } else if (ms->shared_data_size) {
+        /* Worker clone: use shared atomic counter for contention-free appends */
+        write_offset = atomic_fetch_add(ms->shared_data_size, slot_size);
+        ms->data_size = write_offset + slot_size; /* track local view */
     } else {
         /* Append at end of data area */
         write_offset = ms->data_size;
@@ -2693,6 +2703,132 @@ void mpt_store_set_cache_mb(mpt_store_t *ms, uint32_t megabytes) {
         (uint64_t)megabytes * 1024 * 1024 / sizeof(ncache_entry_t));
     if (entries == 0) entries = 1;
     mpt_store_set_cache(ms, entries);
+}
+
+/* =========================================================================
+ * Worker Clones (for parallel storage trie commits)
+ * ========================================================================= */
+
+void mpt_store_enable_parallel(mpt_store_t *ms) {
+    if (!ms || ms->shared_data_size) return;
+    _Atomic(uint64_t) *p = malloc(sizeof(*p));
+    if (!p) return;
+    atomic_init(p, ms->data_size);
+    ms->shared_data_size = p;
+}
+
+void mpt_store_disable_parallel(mpt_store_t *ms) {
+    if (!ms || !ms->shared_data_size) return;
+    ms->data_size = atomic_load(ms->shared_data_size);
+    free(ms->shared_data_size);
+    ms->shared_data_size = NULL;
+}
+
+mpt_store_t *mpt_store_clone_worker(const mpt_store_t *parent, uint32_t cache_mb) {
+    if (!parent) return NULL;
+
+    mpt_store_t *w = calloc(1, sizeof(*w));
+    if (!w) return NULL;
+
+    /* Share parent's index and fd (pread is thread-safe) */
+    w->index   = parent->index;    /* read-only during batch */
+    w->data_fd = parent->data_fd;  /* pread only */
+
+    /* Copy current state */
+    w->data_size       = parent->data_size;
+    w->live_bytes      = 0;  /* worker only tracks its own delta */
+    w->free_slot_bytes = 0;  /* workers don't use parent's free lists */
+    memcpy(w->root_hash, parent->root_hash, 32);
+    w->shared = parent->shared;
+
+    /* Workers get empty free lists — they append-only via shared_data_size.
+     * Parent's free list offsets are preserved and reused on next block. */
+
+    /* Share the parent's atomic offset counter for contention-free appends.
+     * The parent must have set this up before creating workers. */
+    w->shared_data_size = parent->shared_data_size;
+
+    /* Worker owns its own batch/dirty buffers (start empty) */
+    /* (calloc already zeroed everything) */
+
+    /* Worker owns its own deferred write buffer */
+    def_init(w);
+
+    /* No paths — worker does NOT own files */
+
+    /* Independent cache */
+    if (cache_mb > 0)
+        mpt_store_set_cache_mb(w, cache_mb);
+
+    return w;
+}
+
+bool mpt_store_merge_writes(mpt_store_t *parent, mpt_store_t *worker) {
+    if (!parent || !worker) return false;
+
+    /* Transfer deferred entries from worker to parent */
+    for (size_t i = 0; i < worker->def_count; i++) {
+        deferred_entry_t *we = &worker->def_entries[i];
+        if (!we->rlp) continue;  /* removed entry */
+
+        if (!def_append(parent, we->hash, we->rlp, we->rlp_len, we->offset)) {
+            return false;
+        }
+        /* Set refcount from worker (def_append defaults to 1) */
+        if (we->refcount != 1) {
+            deferred_entry_t *pe = def_find_mut(parent, we->hash);
+            if (pe) pe->refcount = we->refcount;
+        }
+
+        /* Populate parent cache */
+        if (parent->cache && we->rlp_len <= MAX_NODE_RLP)
+            ncache_put(parent->cache, we->hash, we->rlp,
+                       (uint16_t)we->rlp_len, NCACHE_DEPTH_UNKNOWN);
+    }
+
+    /* Transfer pending deletes */
+    for (size_t i = 0; i < worker->def_del_count; i++) {
+        def_del_append(parent, worker->def_deletes[i].hash);
+        if (parent->cache)
+            ncache_delete(parent->cache, worker->def_deletes[i].hash);
+    }
+
+    /* Update parent data_size: use shared atomic if available, else take max */
+    if (parent->shared_data_size)
+        parent->data_size = atomic_load(parent->shared_data_size);
+    else if (worker->data_size > parent->data_size)
+        parent->data_size = worker->data_size;
+
+    parent->live_bytes += worker->live_bytes;
+
+    /* Clear worker's deferred buffers (data was copied by def_append) */
+    worker->def_count     = 0;
+    worker->def_del_count = 0;
+
+    return true;
+}
+
+void mpt_store_destroy_worker(mpt_store_t *worker) {
+    if (!worker) return;
+
+    /* Free batch buffers */
+    free(worker->dirty);
+    for (size_t i = 0; i < worker->val_page_count; i++)
+        free(worker->val_pages[i]);
+    free(worker->val_pages);
+
+    /* Free deferred buffers */
+    def_free_all(worker);
+
+    /* Free cache */
+    ncache_destroy(worker->cache);
+
+    /* Free any remaining free list memory */
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
+        free_list_destroy(&worker->free_lists[i]);
+
+    /* Do NOT close data_fd, destroy index, or free paths — parent owns those */
+    free(worker);
 }
 
 mpt_store_stats_t mpt_store_stats(const mpt_store_t *ms) {

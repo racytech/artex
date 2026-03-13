@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
 // #include <time.h>  // uncomment for MPT root profiling
 
 extern bool g_trace_calls __attribute__((weak));
@@ -2161,6 +2162,59 @@ void evm_state_dump_mpt(evm_state_t *es, const char *path) {
 
 // Compute storage roots incrementally using shared storage mpt_store.
 // Iterates the dirty_slots list (O(dirty)) instead of scanning all cached slots.
+// When multiple accounts have dirty storage, dispatches to parallel workers.
+
+// Account group descriptor for parallel storage trie commits
+typedef struct {
+    size_t              start;      // index into sv.entries
+    size_t              end;        // exclusive end
+    uint8_t             root[32];   // storage root (in: old, out: new)
+    cached_account_t   *ca;         // pointer to cached account (for writeback)
+} acct_group_t;
+
+#define MPT_WORKER_COUNT 2
+#define MPT_WORKER_CACHE_MB 64
+
+// Per-worker thread context
+typedef struct {
+    mpt_store_t               *worker;
+    const mpt_storage_entry_t *entries;
+    acct_group_t              *groups;
+    size_t                     group_start;
+    size_t                     group_end;
+    bool                       ok;
+} storage_worker_ctx_t;
+
+static void *storage_worker_thread(void *arg) {
+    storage_worker_ctx_t *ctx = arg;
+    ctx->ok = true;
+
+    for (size_t g = ctx->group_start; g < ctx->group_end; g++) {
+        acct_group_t *grp = &ctx->groups[g];
+
+        mpt_store_set_root(ctx->worker, grp->root);
+        if (!mpt_store_begin_batch(ctx->worker)) {
+            ctx->ok = false;
+            return NULL;
+        }
+
+        for (size_t j = grp->start; j < grp->end; j++) {
+            if (ctx->entries[j].value_len == 0)
+                mpt_store_delete(ctx->worker, ctx->entries[j].slot_hash);
+            else
+                mpt_store_update(ctx->worker, ctx->entries[j].slot_hash,
+                                 ctx->entries[j].value_rlp, ctx->entries[j].value_len);
+        }
+
+        if (!mpt_store_commit_batch(ctx->worker)) {
+            ctx->ok = false;
+            return NULL;
+        }
+        mpt_store_root(ctx->worker, grp->root);
+    }
+    return NULL;
+}
+
 static void compute_all_storage_roots(evm_state_t *es) {
     // 1. Resolve dirty slot keys to mpt_storage_entry_t for sorting/grouping
     mpt_storage_vec_t sv = {0};
@@ -2201,41 +2255,111 @@ static void compute_all_storage_roots(evm_state_t *es) {
     // 2. Sort by address for grouping
     qsort(sv.entries, sv.count, sizeof(mpt_storage_entry_t), cmp_storage_by_addr);
 
-    // 3. Process each account group
-    size_t i = 0;
-    while (i < sv.count) {
-        size_t start = i;
-        while (i < sv.count && memcmp(sv.entries[i].addr, sv.entries[start].addr, 20) == 0)
-            i++;
+    // 3. Build account groups in a single pass
+    acct_group_t *groups = NULL;
+    size_t n_groups = 0, groups_cap = 0;
+    {
+        size_t i = 0;
+        while (i < sv.count) {
+            size_t start = i;
+            while (i < sv.count && memcmp(sv.entries[i].addr, sv.entries[start].addr, 20) == 0)
+                i++;
 
-        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
-            &es->accounts, sv.entries[start].addr, 20, NULL);
-        if (!ca) continue;
+            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+                &es->accounts, sv.entries[start].addr, 20, NULL);
+            if (!ca) continue;
 
-        // Load this account's storage root into the shared store
-        mpt_store_set_root(es->storage_mpt, ca->storage_root.bytes);
-        if (!mpt_store_begin_batch(es->storage_mpt)) {
-            fprintf(stderr, "FATAL: mpt_store_begin_batch failed for storage trie\n");
-            free(sv.entries);
-            goto clear;
+            if (n_groups >= groups_cap) {
+                size_t nc = groups_cap ? groups_cap * 2 : 16;
+                acct_group_t *ng = realloc(groups, nc * sizeof(*ng));
+                if (!ng) break;
+                groups = ng; groups_cap = nc;
+            }
+            acct_group_t *g = &groups[n_groups++];
+            g->start = start;
+            g->end   = i;
+            g->ca    = ca;
+            memcpy(g->root, ca->storage_root.bytes, 32);
         }
-
-        for (size_t j = start; j < i; j++) {
-            if (sv.entries[j].value_len == 0)
-                mpt_store_delete(es->storage_mpt, sv.entries[j].slot_hash);
-            else
-                mpt_store_update(es->storage_mpt, sv.entries[j].slot_hash,
-                                 sv.entries[j].value_rlp, sv.entries[j].value_len);
-        }
-
-        if (!mpt_store_commit_batch(es->storage_mpt)) {
-            fprintf(stderr, "FATAL: mpt_store_commit_batch failed for storage trie\n");
-            free(sv.entries);
-            goto clear;
-        }
-        mpt_store_root(es->storage_mpt, ca->storage_root.bytes);
     }
 
+    if (n_groups == 0) {
+        free(groups);
+        free(sv.entries);
+        goto clear;
+    }
+
+    // 4. Serial or parallel dispatch
+    if (n_groups < MPT_WORKER_COUNT * 2) {
+        // Serial path — use parent store directly
+        for (size_t g = 0; g < n_groups; g++) {
+            acct_group_t *grp = &groups[g];
+            mpt_store_set_root(es->storage_mpt, grp->root);
+            if (!mpt_store_begin_batch(es->storage_mpt)) {
+                fprintf(stderr, "FATAL: mpt_store_begin_batch failed for storage trie\n");
+                free(groups);
+                free(sv.entries);
+                goto clear;
+            }
+            for (size_t j = grp->start; j < grp->end; j++) {
+                if (sv.entries[j].value_len == 0)
+                    mpt_store_delete(es->storage_mpt, sv.entries[j].slot_hash);
+                else
+                    mpt_store_update(es->storage_mpt, sv.entries[j].slot_hash,
+                                     sv.entries[j].value_rlp, sv.entries[j].value_len);
+            }
+            if (!mpt_store_commit_batch(es->storage_mpt)) {
+                fprintf(stderr, "FATAL: mpt_store_commit_batch failed for storage trie\n");
+                free(groups);
+                free(sv.entries);
+                goto clear;
+            }
+            mpt_store_root(es->storage_mpt, grp->root);
+            memcpy(grp->ca->storage_root.bytes, grp->root, 32);
+        }
+    } else {
+        // Parallel path — flush + single worker for all groups
+        mpt_store_flush(es->storage_mpt);
+        mpt_store_enable_parallel(es->storage_mpt);
+
+        mpt_store_t *worker = mpt_store_clone_worker(es->storage_mpt, MPT_WORKER_CACHE_MB);
+        if (!worker) {
+            fprintf(stderr, "FATAL: clone failed\n");
+            mpt_store_disable_parallel(es->storage_mpt);
+            free(groups); free(sv.entries);
+            goto clear;
+        }
+
+        bool all_ok = true;
+        for (size_t g = 0; g < n_groups; g++) {
+            acct_group_t *grp = &groups[g];
+            mpt_store_set_root(worker, grp->root);
+            if (!mpt_store_begin_batch(worker)) { all_ok = false; break; }
+            for (size_t j = grp->start; j < grp->end; j++) {
+                if (sv.entries[j].value_len == 0)
+                    mpt_store_delete(worker, sv.entries[j].slot_hash);
+                else
+                    mpt_store_update(worker, sv.entries[j].slot_hash,
+                                     sv.entries[j].value_rlp, sv.entries[j].value_len);
+            }
+            if (!mpt_store_commit_batch(worker)) { all_ok = false; break; }
+            mpt_store_root(worker, grp->root);
+        }
+
+        mpt_store_merge_writes(es->storage_mpt, worker);
+        mpt_store_destroy_worker(worker);
+        mpt_store_disable_parallel(es->storage_mpt);
+
+        if (!all_ok)
+            fprintf(stderr, "FATAL: worker failed\n");
+
+        // Write back updated roots to cached accounts
+        for (size_t g = 0; g < n_groups; g++) {
+            memcpy(groups[g].ca->storage_root.bytes, groups[g].root, 32);
+        }
+    }
+
+    free(groups);
     free(sv.entries);
 
 clear:

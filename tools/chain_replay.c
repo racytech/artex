@@ -30,11 +30,11 @@ bool g_trace_calls = false;  // Debug: trace CALL gas
 #endif
 
 /* Persistent store paths */
-static const char *VALUE_DIR  = "/home/racytech/workspace/art/data/chain_replay_values";
-static const char *COMMIT_DIR = "/home/racytech/workspace/art/data/chain_replay_commits";
-static const char *CKPT_PATH  = "/home/racytech/workspace/art/data/chain_replay.ckpt";
-static const char *MPT_PATH   = "/home/racytech/workspace/art/data/chain_replay_mpt";
-static const char *CODE_PATH  = "/home/racytech/workspace/art/data/chain_replay_code";
+static const char *VALUE_DIR  = "/tmp/pipeline_replay_values";
+static const char *COMMIT_DIR = "/tmp/pipeline_replay_commits";
+static const char *CKPT_PATH  = "/tmp/pipeline_replay.ckpt";
+static const char *MPT_PATH   = "/tmp/pipeline_replay_mpt";
+static const char *CODE_PATH  = "/tmp/pipeline_replay_code";
 
 /* =========================================================================
  * Graceful shutdown via SIGINT

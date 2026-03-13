@@ -203,6 +203,57 @@ void mpt_store_set_cache(mpt_store_t *ms, uint32_t max_entries);
 void mpt_store_set_cache_mb(mpt_store_t *ms, uint32_t megabytes);
 
 /* =========================================================================
+ * Worker Clones (for parallel storage trie commits)
+ * ========================================================================= */
+
+/**
+ * Create a lightweight worker clone for parallel trie operations.
+ *
+ * The clone shares the parent's file descriptors (pread is thread-safe)
+ * and disk_hash index (read-only during batch), but has its own:
+ *   - root hash, batch/dirty buffers
+ *   - deferred write list
+ *   - node cache (smaller, independent)
+ *
+ * The clone MUST only be used for begin_batch / update / delete /
+ * commit_batch / root operations. Do NOT call flush/sync/destroy on it.
+ *
+ * @param parent   The parent mpt_store to clone from
+ * @param cache_mb Cache size for the worker (e.g., 64 MB)
+ * @return Worker clone, or NULL on failure
+ */
+/**
+ * Enable parallel mode: allocates a shared atomic offset counter for
+ * contention-free slot allocation across worker clones.
+ * Must be called before mpt_store_clone_worker().
+ * Call mpt_store_disable_parallel() after all workers are merged.
+ */
+void mpt_store_enable_parallel(mpt_store_t *ms);
+
+/**
+ * Disable parallel mode: syncs the shared counter back to data_size
+ * and frees it. Must be called after all workers are destroyed.
+ */
+void mpt_store_disable_parallel(mpt_store_t *ms);
+
+mpt_store_t *mpt_store_clone_worker(const mpt_store_t *parent, uint32_t cache_mb);
+
+/**
+ * Merge deferred writes from a worker clone into the parent store.
+ * Transfers all deferred entries and pending deletes. After merge,
+ * the worker's deferred buffers are empty.
+ *
+ * Must be called from a single thread (after worker join).
+ */
+bool mpt_store_merge_writes(mpt_store_t *parent, mpt_store_t *worker);
+
+/**
+ * Destroy a worker clone. Does NOT close file descriptors (owned by parent).
+ * Must be called after mpt_store_merge_writes().
+ */
+void mpt_store_destroy_worker(mpt_store_t *worker);
+
+/* =========================================================================
  * Stats
  * ========================================================================= */
 
