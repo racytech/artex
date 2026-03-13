@@ -1174,6 +1174,41 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
     ca->storage_dirty = true;
 }
 
+void evm_state_mark_existed(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return;
+    cached_account_t *ca = ensure_account(es, addr);
+    if (ca) ca->existed = true;
+}
+
+static bool clear_prestate_account_cb(const uint8_t *key, size_t key_len,
+                                       const void *value, size_t value_len,
+                                       void *user_data) {
+    (void)key; (void)key_len; (void)value_len; (void)user_data;
+    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
+    ca->block_dirty = false;
+    ca->block_code_dirty = false;
+    ca->mpt_dirty = false;
+    return true;
+}
+
+static bool clear_prestate_slot_cb(const uint8_t *key, size_t key_len,
+                                    const void *value, size_t value_len,
+                                    void *user_data) {
+    (void)key; (void)key_len; (void)value_len; (void)user_data;
+    cached_slot_t *cs = (cached_slot_t *)(uintptr_t)value;
+    cs->block_dirty = false;
+    cs->mpt_dirty = false;
+    return true;
+}
+
+void evm_state_clear_prestate_dirty(evm_state_t *es) {
+    if (!es) return;
+    mem_art_foreach(&es->accounts, clear_prestate_account_cb, NULL);
+    mem_art_foreach(&es->storage, clear_prestate_slot_cb, NULL);
+    dirty_account_clear(&es->dirty_accounts);
+    dirty_slot_clear(&es->dirty_slots);
+}
+
 // ============================================================================
 // Self-Destruct
 // ============================================================================
@@ -2348,7 +2383,10 @@ static bool batch_collect_account_cb(const uint8_t *key, size_t key_len,
                      !ca->has_code &&
                      memcmp(sr, HASH_EMPTY_STORAGE.bytes, 32) == 0);
 
-    if (is_empty && ctx->prune_empty) return true;
+    // EIP-161: only prune empty accounts that were touched during execution
+    // (mpt_dirty set). Pre-state empty accounts that were never touched must
+    // remain in the trie.
+    if (is_empty && ctx->prune_empty && ca->mpt_dirty) return true;
 
     if (ctx->count >= ctx->cap) {
         size_t nc = ctx->cap ? ctx->cap * 2 : 16;
