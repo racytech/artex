@@ -47,6 +47,12 @@ static const uint16_t SIZE_CLASSES[NUM_SIZE_CLASSES] = {64, 128, 256, 512, 1024}
 /* Default LRU cache: 2 GB */
 #define MPT_DEFAULT_CACHE_MB 2048
 
+/* Depth pinning: nodes at trie depth <= this threshold are never evicted.
+ * depth 0 = root (1 node), depth 1 = 16, depth 2 = 256, depth 3 = 4096,
+ * depth 4 = 65536. Total pinned ~70K nodes × ~1KB = ~70MB — negligible. */
+#define NCACHE_PIN_DEPTH 4
+#define NCACHE_DEPTH_UNKNOWN 0xFF  /* for nodes inserted without depth info */
+
 /* Empty trie root = keccak256(RLP("")) = keccak256(0x80) */
 static const uint8_t EMPTY_ROOT[32] = {
     0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
@@ -79,9 +85,10 @@ _Static_assert(sizeof(mpt_store_header_t) == PAGE_SIZE,
 typedef struct __attribute__((packed)) {
     uint64_t offset;
     uint32_t length;
+    uint32_t refcount;   /* shared-mode reference count (0 = free) */
 } node_record_t;
 
-_Static_assert(sizeof(node_record_t) == 12, "node_record_t must be 12 bytes");
+_Static_assert(sizeof(node_record_t) == 16, "node_record_t must be 16 bytes");
 
 /* =========================================================================
  * Dirty entry (staged update/delete)
@@ -154,6 +161,7 @@ typedef struct {
     uint8_t  hash[32];
     uint8_t  rlp[MAX_NODE_RLP];
     uint16_t rlp_len;
+    uint8_t  depth;         /* trie depth (for pin eviction policy) */
     uint32_t ht_next;       /* next in hash bucket chain */
     uint32_t lru_prev;      /* doubly-linked LRU list */
     uint32_t lru_next;
@@ -170,6 +178,8 @@ typedef struct {
     uint32_t        free_head;      /* free list (uses lru_next for chain) */
     uint64_t        hits;
     uint64_t        misses;
+    uint64_t        evict_skipped;  /* times eviction skipped a pinned node */
+    uint32_t        pinned_count;   /* entries with depth <= PIN_DEPTH */
 } node_cache_t;
 
 static inline uint32_t ncache_bucket(const node_cache_t *c,
@@ -262,6 +272,18 @@ static void ncache_ht_remove(node_cache_t *c, uint32_t idx) {
 }
 
 /* Look up a node by hash. On hit, copies RLP to buf and moves to LRU front. */
+/* Lightweight existence check — no data copy, no LRU promotion. */
+static bool ncache_contains(const node_cache_t *c, const uint8_t hash[32]) {
+    uint32_t b = ncache_bucket(c, hash);
+    uint32_t idx = c->buckets[b];
+    while (idx != NCACHE_SENTINEL) {
+        if (memcmp(c->entries[idx].hash, hash, 32) == 0)
+            return true;
+        idx = c->entries[idx].ht_next;
+    }
+    return false;
+}
+
 static bool ncache_get(node_cache_t *c, const uint8_t hash[32],
                         uint8_t *buf, uint16_t *out_len) {
     uint32_t b = ncache_bucket(c, hash);
@@ -283,9 +305,10 @@ static bool ncache_get(node_cache_t *c, const uint8_t hash[32],
     return false;
 }
 
-/* Insert or update a node in the cache. Evicts LRU tail if full. */
+/* Insert or update a node in the cache. Evicts LRU tail if full.
+ * depth = trie depth of this node (used for pin policy). */
 static void ncache_put(node_cache_t *c, const uint8_t hash[32],
-                        const uint8_t *rlp, uint16_t rlp_len) {
+                        const uint8_t *rlp, uint16_t rlp_len, uint8_t depth) {
     if (rlp_len > MAX_NODE_RLP) return;
 
     /* Check if already present — update in place */
@@ -296,6 +319,8 @@ static void ncache_put(node_cache_t *c, const uint8_t hash[32],
         if (memcmp(e->hash, hash, 32) == 0) {
             memcpy(e->rlp, rlp, rlp_len);
             e->rlp_len = rlp_len;
+            /* Update depth if we now have better info */
+            if (depth < e->depth) e->depth = depth;
             ncache_lru_remove(c, idx);
             ncache_lru_push_front(c, idx);
             return;
@@ -309,8 +334,21 @@ static void ncache_put(node_cache_t *c, const uint8_t hash[32],
         slot = c->free_head;
         c->free_head = c->entries[slot].lru_next;
     } else {
-        /* Evict LRU tail */
+        /* Evict LRU tail — skip pinned entries (depth <= PIN_DEPTH) */
         slot = c->lru_tail;
+        while (slot != NCACHE_SENTINEL &&
+               c->entries[slot].depth <= NCACHE_PIN_DEPTH) {
+            c->evict_skipped++;
+            slot = c->entries[slot].lru_prev;
+        }
+        if (slot == NCACHE_SENTINEL) {
+            /* All entries are pinned — fall back to true LRU tail.
+             * This can only happen if cache is undersized for the trie. */
+            slot = c->lru_tail;
+        }
+        /* Track pinned count change for evicted entry */
+        if (c->entries[slot].depth <= NCACHE_PIN_DEPTH && c->pinned_count > 0)
+            c->pinned_count--;
         ncache_lru_remove(c, slot);
         ncache_ht_remove(c, slot);
         c->count--;
@@ -321,6 +359,8 @@ static void ncache_put(node_cache_t *c, const uint8_t hash[32],
     memcpy(e->hash, hash, 32);
     memcpy(e->rlp, rlp, rlp_len);
     e->rlp_len = rlp_len;
+    e->depth = depth;
+    if (depth <= NCACHE_PIN_DEPTH) c->pinned_count++;
 
     /* Insert into hash bucket */
     b = ncache_bucket(c, hash);
@@ -344,6 +384,8 @@ static void ncache_delete(node_cache_t *c, const uint8_t hash[32]) {
             *prev = e->ht_next;
             /* Remove from LRU */
             ncache_lru_remove(c, idx);
+            if (e->depth <= NCACHE_PIN_DEPTH && c->pinned_count > 0)
+                c->pinned_count--;
             /* Return to free list */
             e->lru_next = c->free_head;
             c->free_head = idx;
@@ -378,8 +420,14 @@ typedef struct {
     uint8_t *rlp;        /* malloc'd copy of node RLP */
     uint32_t rlp_len;
     uint64_t offset;     /* allocated slot (in-memory alloc_slot result) */
+    uint32_t refcount;   /* shared-mode reference count */
     int      ht_next;    /* next index in hash chain, -1 = end */
 } deferred_entry_t;
+
+typedef struct {
+    uint8_t hash[32];
+    int     ht_next;    /* next index in hash chain, -1 = end */
+} del_entry_t;
 
 struct mpt_store {
     disk_hash_t     *index;
@@ -397,6 +445,14 @@ struct mpt_store {
     size_t           dirty_cap;
     bool             batch_active;
 
+    /* Page-based arena for dirty entry values — bulk alloc/free.
+     * Pages are never realloc'd, so value pointers remain stable. */
+    uint8_t        **val_pages;       /* array of page pointers */
+    size_t           val_page_count;
+    size_t           val_page_cap;
+    size_t           val_page_used;   /* bytes used in current page */
+#define VAL_PAGE_SIZE 65536
+
     node_cache_t    *cache;          /* NULL = no caching */
 
     bool             shared;         /* multi-trie mode: skip node deletion */
@@ -408,13 +464,22 @@ struct mpt_store {
     size_t            def_cap;
     int               def_ht[DEFERRED_BUCKETS]; /* hash table heads, -1 = empty */
 
+    /* Page-based arena for deferred RLP data — eliminates per-node malloc */
+    uint8_t        **def_rlp_pages;
+    size_t           def_rlp_page_count;
+    size_t           def_rlp_page_cap;
+    size_t           def_rlp_page_used;
+#define DEF_RLP_PAGE_SIZE 65536
+
     /* Pending deletes: on-disk node hashes to delete at flush time */
-    uint8_t         (*def_deletes)[32];
+    del_entry_t      *def_deletes;
     size_t            def_del_count;
     size_t            def_del_cap;
+    int               def_del_ht[DEFERRED_BUCKETS]; /* hash table for O(1) cancel */
 
     char            *idx_path;
     char            *dat_path;
+    char            *free_path;   /* overflow free list file (.free) */
 };
 
 /* =========================================================================
@@ -476,6 +541,66 @@ static int size_class_for(uint32_t len) {
     return NUM_SIZE_CLASSES - 1; /* shouldn't happen: MAX_NODE_RLP == 1024 */
 }
 
+/* Write overflow free list offsets to .free file.
+ * Format: [uint32_t count_per_class × 5] [uint64_t offsets...] */
+static void write_free_overflow(const char *path, const mpt_store_t *ms,
+                                const uint32_t hdr_counts[NUM_SIZE_CLASSES]) {
+    uint32_t overflow_total = 0;
+    uint32_t overflow_counts[NUM_SIZE_CLASSES];
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+        overflow_counts[i] = ms->free_lists[i].count > hdr_counts[i]
+                           ? ms->free_lists[i].count - hdr_counts[i] : 0;
+        overflow_total += overflow_counts[i];
+    }
+
+    if (overflow_total == 0) {
+        /* No overflow — remove stale file if present */
+        unlink(path);
+        return;
+    }
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+
+    /* Write counts header */
+    (void)write(fd, overflow_counts, sizeof(overflow_counts));
+
+    /* Write overflow offsets per class (skip the first hdr_counts[i] already in header) */
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+        if (overflow_counts[i] > 0) {
+            (void)write(fd, ms->free_lists[i].offsets + hdr_counts[i],
+                        overflow_counts[i] * sizeof(uint64_t));
+        }
+    }
+    fsync(fd);
+    close(fd);
+}
+
+/* Read overflow free list offsets from .free file */
+static void read_free_overflow(const char *path, mpt_store_t *ms) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+
+    uint32_t counts[NUM_SIZE_CLASSES];
+    if (read(fd, counts, sizeof(counts)) != sizeof(counts)) {
+        close(fd);
+        return;
+    }
+
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+        if (counts[i] == 0) continue;
+        uint64_t *buf = malloc(counts[i] * sizeof(uint64_t));
+        if (!buf) break;
+        ssize_t got = read(fd, buf, counts[i] * sizeof(uint64_t));
+        if (got == (ssize_t)(counts[i] * sizeof(uint64_t))) {
+            for (uint32_t j = 0; j < counts[i]; j++)
+                free_list_push(&ms->free_lists[i], buf[j]);
+        }
+        free(buf);
+    }
+    close(fd);
+}
+
 static void write_header(int fd, const mpt_store_t *ms) {
     mpt_store_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
@@ -484,11 +609,6 @@ static void write_header(int fd, const mpt_store_t *ms) {
     hdr.data_size = ms->data_size;
     memcpy(hdr.root_hash, ms->root_hash, 32);
     hdr.free_slot_bytes = ms->free_slot_bytes;
-
-    /* Serialize in-memory free lists into header */
-    uint32_t total = 0;
-    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
-        total += ms->free_lists[i].count;
 
     /* Pack offsets sequentially: class 0, class 1, ... Truncate if overflow */
     size_t pos = 0;
@@ -504,6 +624,10 @@ static void write_header(int fd, const mpt_store_t *ms) {
     }
 
     (void)pwrite(fd, &hdr, PAGE_SIZE, 0);
+
+    /* Write overflow to .free file */
+    if (ms->free_path)
+        write_free_overflow(ms->free_path, ms, hdr.free_counts);
 }
 
 static bool read_header(int fd, mpt_store_header_t *hdr) {
@@ -801,6 +925,7 @@ static bool decode_node(const uint8_t *rlp, size_t rlp_len, mpt_node_t *node) {
 
 static void def_init(mpt_store_t *ms) {
     memset(ms->def_ht, 0xff, sizeof(ms->def_ht));  /* -1 = empty */
+    memset(ms->def_del_ht, 0xff, sizeof(ms->def_del_ht));
     ms->def_count = 0;
 }
 
@@ -836,6 +961,42 @@ static const deferred_entry_t *def_find(const mpt_store_t *ms,
     return NULL;
 }
 
+/* Mutable version of def_find — for refcount updates. */
+static deferred_entry_t *def_find_mut(mpt_store_t *ms,
+                                       const uint8_t hash[32]) {
+    uint32_t b = def_bucket(hash);
+    int idx = ms->def_ht[b];
+    while (idx >= 0) {
+        if (memcmp(ms->def_entries[idx].hash, hash, 32) == 0 &&
+            ms->def_entries[idx].rlp != NULL)
+            return &ms->def_entries[idx];
+        idx = ms->def_entries[idx].ht_next;
+    }
+    return NULL;
+}
+
+static uint8_t *def_rlp_arena_alloc(mpt_store_t *ms, size_t len) {
+    if (ms->def_rlp_page_count == 0 ||
+        ms->def_rlp_page_used + len > DEF_RLP_PAGE_SIZE) {
+        if (ms->def_rlp_page_count >= ms->def_rlp_page_cap) {
+            size_t nc = ms->def_rlp_page_cap ? ms->def_rlp_page_cap * 2 : 8;
+            uint8_t **np = realloc(ms->def_rlp_pages, nc * sizeof(*np));
+            if (!np) return NULL;
+            ms->def_rlp_pages = np;
+            ms->def_rlp_page_cap = nc;
+        }
+        size_t psz = len > DEF_RLP_PAGE_SIZE ? len : DEF_RLP_PAGE_SIZE;
+        ms->def_rlp_pages[ms->def_rlp_page_count] = malloc(psz);
+        if (!ms->def_rlp_pages[ms->def_rlp_page_count]) return NULL;
+        ms->def_rlp_page_count++;
+        ms->def_rlp_page_used = 0;
+    }
+    uint8_t *ptr = ms->def_rlp_pages[ms->def_rlp_page_count - 1] +
+                   ms->def_rlp_page_used;
+    ms->def_rlp_page_used += len;
+    return ptr;
+}
+
 static bool def_append(mpt_store_t *ms, const uint8_t hash[32],
                         const uint8_t *rlp, uint32_t rlp_len, uint64_t offset) {
     if (ms->def_count >= ms->def_cap) {
@@ -848,11 +1009,12 @@ static bool def_append(mpt_store_t *ms, const uint8_t hash[32],
     }
     deferred_entry_t *e = &ms->def_entries[ms->def_count];
     memcpy(e->hash, hash, 32);
-    e->rlp = malloc(rlp_len);
+    e->rlp = def_rlp_arena_alloc(ms, rlp_len);
     if (!e->rlp) return false;
     memcpy(e->rlp, rlp, rlp_len);
     e->rlp_len = rlp_len;
     e->offset = offset;
+    e->refcount = 1;
 
     uint32_t b = def_bucket(hash);
     e->ht_next = ms->def_ht[b];
@@ -876,8 +1038,7 @@ static bool def_remove(mpt_store_t *ms, const uint8_t hash[32]) {
             int sc = size_class_for(e->rlp_len);
             free_list_push(&ms->free_lists[sc], e->offset);
             ms->free_slot_bytes += SIZE_CLASSES[sc];
-            /* Free RLP data and mark as removed */
-            free(e->rlp);
+            /* Mark as removed (RLP lives in arena, freed in bulk) */
             e->rlp = NULL;
             return true;
         }
@@ -887,40 +1048,66 @@ static bool def_remove(mpt_store_t *ms, const uint8_t hash[32]) {
     return false;
 }
 
-/* Pending deletes for on-disk nodes */
+/* Pending deletes for on-disk nodes — hash-indexed for O(1) cancel */
 static bool def_del_append(mpt_store_t *ms, const uint8_t hash[32]) {
     if (ms->def_del_count >= ms->def_del_cap) {
         size_t new_cap = ms->def_del_cap ? ms->def_del_cap * 2 : 64;
-        void *p = realloc(ms->def_deletes, new_cap * 32);
+        del_entry_t *p = realloc(ms->def_deletes, new_cap * sizeof(del_entry_t));
         if (!p) return false;
         ms->def_deletes = p;
         ms->def_del_cap = new_cap;
     }
-    memcpy(ms->def_deletes[ms->def_del_count], hash, 32);
-    ms->def_del_count++;
+    size_t idx = ms->def_del_count++;
+    memcpy(ms->def_deletes[idx].hash, hash, 32);
+    uint32_t bkt = def_bucket(hash);
+    ms->def_deletes[idx].ht_next = ms->def_del_ht[bkt];
+    ms->def_del_ht[bkt] = (int)idx;
     return true;
 }
 
 /* Cancel a pending delete (when dedup detects the node is still needed). */
 static void def_del_cancel(mpt_store_t *ms, const uint8_t hash[32]) {
-    for (size_t i = 0; i < ms->def_del_count; i++) {
-        if (memcmp(ms->def_deletes[i], hash, 32) == 0) {
-            /* Swap with last and shrink */
-            if (i < ms->def_del_count - 1)
-                memcpy(ms->def_deletes[i],
-                       ms->def_deletes[ms->def_del_count - 1], 32);
+    uint32_t bkt = def_bucket(hash);
+    int *prev = &ms->def_del_ht[bkt];
+    int idx = *prev;
+    while (idx >= 0) {
+        del_entry_t *e = &ms->def_deletes[idx];
+        if (memcmp(e->hash, hash, 32) == 0) {
+            *prev = e->ht_next;
+            /* Swap with last entry to keep array packed */
+            size_t last = ms->def_del_count - 1;
+            if ((size_t)idx != last) {
+                del_entry_t *tail = &ms->def_deletes[last];
+                /* Fix chain pointing to 'last' before overwriting */
+                uint32_t tail_bkt = def_bucket(tail->hash);
+                int *tp = &ms->def_del_ht[tail_bkt];
+                while (*tp >= 0) {
+                    if (*tp == (int)last) { *tp = idx; break; }
+                    tp = &ms->def_deletes[*tp].ht_next;
+                }
+                memcpy(e->hash, tail->hash, 32);
+                e->ht_next = tail->ht_next;
+            }
             ms->def_del_count--;
             return;
         }
+        prev = &e->ht_next;
+        idx = e->ht_next;
     }
 }
 
 static void def_free_all(mpt_store_t *ms) {
-    for (size_t i = 0; i < ms->def_count; i++)
-        free(ms->def_entries[i].rlp);
     free(ms->def_entries);
     ms->def_entries = NULL;
     ms->def_count = ms->def_cap = 0;
+    /* Free deferred RLP arena pages */
+    for (size_t i = 0; i < ms->def_rlp_page_count; i++)
+        free(ms->def_rlp_pages[i]);
+    free(ms->def_rlp_pages);
+    ms->def_rlp_pages = NULL;
+    ms->def_rlp_page_count = ms->def_rlp_page_cap = 0;
+    ms->def_rlp_page_used = 0;
+    /* Free pending deletes */
     free(ms->def_deletes);
     ms->def_deletes = NULL;
     ms->def_del_count = ms->def_del_cap = 0;
@@ -932,9 +1119,10 @@ static void def_free_all(mpt_store_t *ms) {
  * ========================================================================= */
 
 /* Load a node from disk by its hash. buf must be MAX_NODE_RLP bytes.
+ * depth = trie depth for cache pin policy.
  * Returns the RLP length, or 0 on failure. */
 static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
-                            uint8_t *buf) {
+                            uint8_t *buf, uint8_t depth) {
     /* Check cache first */
     if (ms->cache) {
         uint16_t cached_len;
@@ -949,7 +1137,7 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
             memcpy(buf, de->rlp, de->rlp_len);
             /* Re-populate cache */
             if (ms->cache)
-                ncache_put(ms->cache, hash, buf, (uint16_t)de->rlp_len);
+                ncache_put(ms->cache, hash, buf, (uint16_t)de->rlp_len, depth);
         }
         return de->rlp_len;
     }
@@ -966,7 +1154,7 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
 
     /* Populate cache on miss */
     if (ms->cache)
-        ncache_put(ms->cache, hash, buf, (uint16_t)rec.length);
+        ncache_put(ms->cache, hash, buf, (uint16_t)rec.length, depth);
 
     return rec.length;
 }
@@ -978,16 +1166,34 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
                        uint8_t out_hash[32]) {
     keccak(rlp, rlp_len, out_hash);
 
-    /* Skip if already exists on disk (dedup — e.g., same branch structure) */
-    if (disk_hash_contains(ms->index, out_hash)) {
-        /* Cancel any pending delete — this node is still needed */
-        def_del_cancel(ms, out_hash);
-        return true;
+    /* Check if already exists */
+    if (ms->shared) {
+        /* Shared mode: increment refcount. Do NOT cancel pending deletes —
+         * the delete will correctly decrement at flush time.
+         * Example: refcount=1, delete queued (-1), write increments (+1)
+         *   → at flush: refcount goes 2→1. Net = 1. Correct. */
+        node_record_t existing;
+        if (disk_hash_get(ms->index, out_hash, &existing)) {
+            existing.refcount++;
+            disk_hash_put(ms->index, out_hash, &existing);
+            return true;
+        }
+        /* Check deferred buffer */
+        deferred_entry_t *def = def_find_mut(ms, out_hash);
+        if (def) {
+            def->refcount++;
+            return true;
+        }
+    } else {
+        /* Non-shared: refcount always 1 — fast existence check */
+        if ((ms->cache && ncache_contains(ms->cache, out_hash)) ||
+            disk_hash_contains(ms->index, out_hash)) {
+            def_del_cancel(ms, out_hash);
+            return true;
+        }
+        if (def_contains(ms, out_hash))
+            return true;
     }
-
-    /* Skip if already in deferred buffer */
-    if (def_contains(ms, out_hash))
-        return true;
 
     /* Allocate a slot: try free list first, then append */
     int sc = size_class_for((uint32_t)rlp_len);
@@ -1011,7 +1217,7 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
 
     /* Cache for fast reads within this checkpoint interval */
     if (ms->cache && rlp_len <= MAX_NODE_RLP)
-        ncache_put(ms->cache, out_hash, rlp, (uint16_t)rlp_len);
+        ncache_put(ms->cache, out_hash, rlp, (uint16_t)rlp_len, NCACHE_DEPTH_UNKNOWN);
 
     return true;
 }
@@ -1019,8 +1225,15 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
 /* Delete a node: buffer the delete for flush time */
 static void delete_node(mpt_store_t *ms, const uint8_t hash[32]) {
     /* Check if this is a deferred entry (not on disk yet) */
-    if (def_remove(ms, hash)) {
-        /* Was in deferred buffer — removed, slot returned to free list */
+    deferred_entry_t *def = def_find_mut(ms, hash);
+    if (def) {
+        if (def->refcount > 1) {
+            /* Other references remain — decrement only */
+            def->refcount--;
+            return;
+        }
+        /* Last reference — remove entirely */
+        def_remove(ms, hash);
         if (ms->cache)
             ncache_delete(ms->cache, hash);
         return;
@@ -1176,8 +1389,9 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
     ms->data_size  = 0;
     ms->live_bytes = 0;
     memcpy(ms->root_hash, EMPTY_ROOT, 32);
-    ms->idx_path  = idx_path;
-    ms->dat_path  = dat_path;
+    ms->idx_path   = idx_path;
+    ms->dat_path   = dat_path;
+    ms->free_path  = make_path(path, ".free");
     /* free_heads and free_slot_bytes zeroed by calloc */
     def_init(ms);
 
@@ -1241,9 +1455,14 @@ mpt_store_t *mpt_store_open(const char *path) {
                 free_list_push(&ms->free_lists[i], src[pos++]);
         }
     }
-    ms->idx_path  = idx_path;
-    ms->dat_path  = dat_path;
+    ms->idx_path   = idx_path;
+    ms->dat_path   = dat_path;
+    ms->free_path  = make_path(path, ".free");
     def_init(ms);
+
+    /* Load overflow free offsets from .free file */
+    if (ms->free_path)
+        read_free_overflow(ms->free_path, ms);
 
     /* Enable default LRU cache */
     mpt_store_set_cache_mb(ms, MPT_DEFAULT_CACHE_MB);
@@ -1255,11 +1474,10 @@ void mpt_store_destroy(mpt_store_t *ms) {
     if (!ms) return;
 
     /* Free any pending batch entries */
-    if (ms->dirty) {
-        for (size_t i = 0; i < ms->dirty_count; i++)
-            free(ms->dirty[i].value);
-        free(ms->dirty);
-    }
+    free(ms->dirty);
+    for (size_t i = 0; i < ms->val_page_count; i++)
+        free(ms->val_pages[i]);
+    free(ms->val_pages);
 
     /* Free deferred write buffer */
     def_free_all(ms);
@@ -1271,6 +1489,7 @@ void mpt_store_destroy(mpt_store_t *ms) {
     close(ms->data_fd);
     free(ms->idx_path);
     free(ms->dat_path);
+    free(ms->free_path);
     free(ms);
 }
 
@@ -1281,33 +1500,66 @@ void mpt_store_sync(mpt_store_t *ms) {
     disk_hash_sync(ms->index);
 }
 
+static int def_offset_cmp(const void *a, const void *b) {
+    const deferred_entry_t *ea = *(const deferred_entry_t *const *)a;
+    const deferred_entry_t *eb = *(const deferred_entry_t *const *)b;
+    return (ea->offset > eb->offset) - (ea->offset < eb->offset);
+}
+
 void mpt_store_flush(mpt_store_t *ms) {
     if (!ms) return;
 
-    /* 1. Write all deferred nodes to .dat + .idx */
-    for (size_t i = 0; i < ms->def_count; i++) {
-        deferred_entry_t *e = &ms->def_entries[i];
-        if (!e->rlp) continue;  /* removed entry (hole) */
+    /* 1. Collect live entries and sort by offset for sequential I/O */
+    size_t live = 0;
+    for (size_t i = 0; i < ms->def_count; i++)
+        if (ms->def_entries[i].rlp) live++;
+
+    deferred_entry_t **sorted = NULL;
+    if (live > 0) {
+        sorted = malloc(live * sizeof(*sorted));
+        if (sorted) {
+            size_t j = 0;
+            for (size_t i = 0; i < ms->def_count; i++)
+                if (ms->def_entries[i].rlp)
+                    sorted[j++] = &ms->def_entries[i];
+            qsort(sorted, live, sizeof(*sorted), def_offset_cmp);
+        }
+    }
+
+    /* Write sorted entries — sequential offsets reduce disk seeks */
+    size_t n = sorted ? live : ms->def_count;
+    for (size_t i = 0; i < n; i++) {
+        deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
+        if (!e->rlp) continue;
 
         pwrite(ms->data_fd, e->rlp, e->rlp_len,
                (off_t)(PAGE_SIZE + e->offset));
 
         node_record_t rec = { .offset = e->offset,
-                              .length = e->rlp_len };
+                              .length = e->rlp_len,
+                              .refcount = e->refcount };
         disk_hash_put(ms->index, e->hash, &rec);
     }
+    free(sorted);
 
-    /* 2. Apply pending deletes */
+    /* 2. Apply pending deletes (refcount-aware) */
     for (size_t i = 0; i < ms->def_del_count; i++) {
         node_record_t rec;
-        if (disk_hash_get(ms->index, ms->def_deletes[i], &rec)) {
-            if (ms->live_bytes >= rec.length)
-                ms->live_bytes -= rec.length;
-            int sc = size_class_for(rec.length);
-            free_list_push(&ms->free_lists[sc], rec.offset);
-            ms->free_slot_bytes += SIZE_CLASSES[sc];
+        if (disk_hash_get(ms->index, ms->def_deletes[i].hash, &rec)) {
+            if (rec.refcount > 1) {
+                /* Other references remain — decrement, keep node */
+                rec.refcount--;
+                disk_hash_put(ms->index, ms->def_deletes[i].hash, &rec);
+            } else {
+                /* Last reference — free the slot */
+                if (ms->live_bytes >= rec.length)
+                    ms->live_bytes -= rec.length;
+                int sc = size_class_for(rec.length);
+                free_list_push(&ms->free_lists[sc], rec.offset);
+                ms->free_slot_bytes += SIZE_CLASSES[sc];
+                disk_hash_delete(ms->index, ms->def_deletes[i].hash);
+            }
         }
-        disk_hash_delete(ms->index, ms->def_deletes[i]);
     }
 
     /* 3. Free deferred buffers */
@@ -1342,10 +1594,39 @@ void mpt_store_set_shared(mpt_store_t *ms, bool shared) {
  * Batch staging
  * ========================================================================= */
 
+/* Allocate from the page-based dirty value arena. Never relocates. */
+static uint8_t *val_arena_alloc(mpt_store_t *ms, size_t len) {
+    /* Need a new page? */
+    if (ms->val_page_count == 0 || ms->val_page_used + len > VAL_PAGE_SIZE) {
+        if (ms->val_page_count >= ms->val_page_cap) {
+            size_t nc = ms->val_page_cap ? ms->val_page_cap * 2 : 8;
+            uint8_t **np = realloc(ms->val_pages, nc * sizeof(*np));
+            if (!np) return NULL;
+            ms->val_pages = np;
+            ms->val_page_cap = nc;
+        }
+        size_t psz = len > VAL_PAGE_SIZE ? len : VAL_PAGE_SIZE;
+        ms->val_pages[ms->val_page_count] = malloc(psz);
+        if (!ms->val_pages[ms->val_page_count]) return NULL;
+        ms->val_page_count++;
+        ms->val_page_used = 0;
+    }
+    uint8_t *ptr = ms->val_pages[ms->val_page_count - 1] + ms->val_page_used;
+    ms->val_page_used += len;
+    return ptr;
+}
+
 bool mpt_store_begin_batch(mpt_store_t *ms) {
     if (!ms || ms->batch_active) return false;
-    ms->batch_active = true;
-    ms->dirty_count  = 0;
+    ms->batch_active   = true;
+    ms->dirty_count    = 0;
+    /* Reset arena: reuse first page, free extras */
+    if (ms->val_page_count > 1) {
+        for (size_t i = 1; i < ms->val_page_count; i++)
+            free(ms->val_pages[i]);
+        ms->val_page_count = 1;
+    }
+    ms->val_page_used = 0;
     return true;
 }
 
@@ -1365,7 +1646,7 @@ bool mpt_store_update(mpt_store_t *ms, const uint8_t key[32],
 
     dirty_entry_t *e = &ms->dirty[ms->dirty_count];
     bytes_to_nibbles(key, 32, e->nibbles);
-    e->value = malloc(value_len);
+    e->value = val_arena_alloc(ms, value_len);
     if (!e->value) return false;
     memcpy(e->value, value, value_len);
     e->value_len = value_len;
@@ -1396,9 +1677,13 @@ bool mpt_store_delete(mpt_store_t *ms, const uint8_t key[32]) {
 
 void mpt_store_discard_batch(mpt_store_t *ms) {
     if (!ms) return;
-    for (size_t i = 0; i < ms->dirty_count; i++)
-        free(ms->dirty[i].value);
     ms->dirty_count  = 0;
+    ms->val_page_used = 0;
+    if (ms->val_page_count > 1) {
+        for (size_t i = 1; i < ms->val_page_count; i++)
+            free(ms->val_pages[i]);
+        ms->val_page_count = 1;
+    }
     ms->batch_active = false;
 }
 
@@ -1494,9 +1779,10 @@ static node_ref_t build_fresh(mpt_store_t *ms, dirty_entry_t *entries,
 }
 
 /* Load a node from a ref (hash or inline). Returns false if empty.
- * buf must be MAX_NODE_RLP bytes. */
+ * buf must be MAX_NODE_RLP bytes. depth = trie depth for cache pin policy. */
 static bool load_from_ref(const mpt_store_t *ms, const node_ref_t *ref,
-                          uint8_t *buf, size_t *buf_len, mpt_node_t *node) {
+                          uint8_t *buf, size_t *buf_len, mpt_node_t *node,
+                          uint8_t depth) {
     if (ref->type == REF_EMPTY) return false;
 
     if (ref->type == REF_INLINE) {
@@ -1506,7 +1792,7 @@ static bool load_from_ref(const mpt_store_t *ms, const node_ref_t *ref,
     }
 
     /* REF_HASH */
-    *buf_len = load_node_rlp(ms, ref->hash, buf);
+    *buf_len = load_node_rlp(ms, ref->hash, buf, depth);
     if (*buf_len == 0) return false;
     return decode_node(buf, *buf_len, node);
 }
@@ -1532,10 +1818,9 @@ static int single_child_index(const node_ref_t children[16]) {
 }
 
 /* Delete a stored node referenced by a ref (no-op for inline/empty).
- * In shared (multi-trie) mode, skip deletion entirely — nodes may be
- * referenced by other tries. Orphaned nodes are reclaimed by compaction. */
+ * In shared mode, refcounting ensures nodes with multiple references
+ * are only freed when the last reference is removed. */
 static void delete_ref(mpt_store_t *ms, const node_ref_t *ref) {
-    if (ms->shared) return;
     if (ref->type == REF_HASH)
         delete_node(ms, ref->hash);
     /* Inline nodes are embedded in parent — nothing to delete */
@@ -1558,7 +1843,8 @@ static node_ref_t collapse_branch(mpt_store_t *ms, node_ref_t children[16]) {
     size_t buf_len;
     mpt_node_t child_node;
 
-    if (!load_from_ref(ms, &child_ref, buf, &buf_len, &child_node)) {
+    if (!load_from_ref(ms, &child_ref, buf, &buf_len, &child_node,
+                        NCACHE_DEPTH_UNKNOWN)) {
         /* Can't load child — just make an extension with 1-nibble path */
         return make_extension(ms, &prefix_nibble, 1, &child_ref);
     }
@@ -1679,7 +1965,9 @@ static node_ref_t merge_leaf(mpt_store_t *ms, const node_ref_t *old_ref,
     /* Need to merge: create a synthetic entry for the existing leaf,
      * then build a fresh subtrie from all entries combined */
     size_t total = (end - start) + 1;
-    dirty_entry_t *merged = malloc(total * sizeof(*merged));
+    dirty_entry_t stack_buf[8];  /* stack fast path for small merges */
+    dirty_entry_t *merged = (total <= 8) ? stack_buf
+                            : malloc(total * sizeof(*merged));
     if (!merged) return *old_ref;  /* allocation failed — keep trie unchanged */
 
     delete_ref(ms, old_ref);
@@ -1726,7 +2014,7 @@ static node_ref_t merge_leaf(mpt_store_t *ms, const node_ref_t *old_ref,
     }
 
     node_ref_t result = build_fresh(ms, merged, 0, total, depth);
-    free(merged);
+    if (merged != stack_buf) free(merged);
     return result;
 }
 
@@ -1776,7 +2064,8 @@ static node_ref_t merge_extension(mpt_store_t *ms, const node_ref_t *old_ref,
         uint8_t buf[MAX_NODE_RLP];
         size_t buf_len;
         mpt_node_t child_node;
-        if (load_from_ref(ms, &new_child, buf, &buf_len, &child_node)) {
+        if (load_from_ref(ms, &new_child, buf, &buf_len, &child_node,
+                          (uint8_t)depth)) {
             if (child_node.type == MPT_NODE_LEAF) {
                 /* ext(N) + leaf(M) → leaf(N+M) */
                 delete_ref(ms, &new_child);
@@ -1869,7 +2158,8 @@ static node_ref_t merge_extension(mpt_store_t *ms, const node_ref_t *old_ref,
         uint8_t buf2[MAX_NODE_RLP];
         size_t buf2_len;
         mpt_node_t sub_node;
-        if (load_from_ref(ms, &subtrie_ref, buf2, &buf2_len, &sub_node)) {
+        if (load_from_ref(ms, &subtrie_ref, buf2, &buf2_len, &sub_node,
+                          (uint8_t)depth)) {
             if (sub_node.type == MPT_NODE_LEAF) {
                 /* ext(shared) + leaf(M) → leaf(shared+M) */
                 delete_ref(ms, &subtrie_ref);
@@ -1913,7 +2203,7 @@ static node_ref_t update_subtrie(mpt_store_t *ms, const node_ref_t *current,
     size_t buf_len;
     mpt_node_t node;
 
-    if (!load_from_ref(ms, current, buf, &buf_len, &node)) {
+    if (!load_from_ref(ms, current, buf, &buf_len, &node, (uint8_t)depth)) {
         /* Can't load — treat as empty */
         return build_fresh(ms, entries, start, end, depth);
     }
@@ -1935,8 +2225,18 @@ static node_ref_t update_subtrie(mpt_store_t *ms, const node_ref_t *current,
  * ========================================================================= */
 
 static int dirty_cmp(const void *a, const void *b) {
-    return memcmp(((const dirty_entry_t *)a)->nibbles,
-                  ((const dirty_entry_t *)b)->nibbles, MAX_NIBBLES);
+    const uint8_t *na = ((const dirty_entry_t *)a)->nibbles;
+    const uint8_t *nb = ((const dirty_entry_t *)b)->nibbles;
+    /* Fast path: compare first 8 nibbles as big-endian uint64 */
+    uint64_t pa, pb;
+    memcpy(&pa, na, 8);
+    memcpy(&pb, nb, 8);
+    if (pa != pb) {
+        pa = __builtin_bswap64(pa);
+        pb = __builtin_bswap64(pb);
+        return pa < pb ? -1 : 1;
+    }
+    return memcmp(na + 8, nb + 8, MAX_NIBBLES - 8);
 }
 
 bool mpt_store_commit_batch(mpt_store_t *ms) {
@@ -1956,8 +2256,7 @@ bool mpt_store_commit_batch(mpt_store_t *ms) {
         for (size_t r = 1; r < ms->dirty_count; r++) {
             if (memcmp(ms->dirty[w].nibbles, ms->dirty[r].nibbles,
                        MAX_NIBBLES) == 0) {
-                /* Duplicate key — free the earlier value, keep the later */
-                free(ms->dirty[w].value);
+                /* Duplicate key — overwrite (old value dead in arena) */
                 ms->dirty[w] = ms->dirty[r];
             } else {
                 w++;
@@ -1990,10 +2289,14 @@ bool mpt_store_commit_batch(mpt_store_t *ms) {
         keccak(new_root.raw.data, new_root.raw.len, ms->root_hash);
     }
 
-    /* Free dirty values and reset */
-    for (size_t i = 0; i < ms->dirty_count; i++)
-        free(ms->dirty[i].value);
-    ms->dirty_count  = 0;
+    /* Reset dirty state — arena pages kept for reuse */
+    ms->dirty_count   = 0;
+    ms->val_page_used = 0;
+    if (ms->val_page_count > 1) {
+        for (size_t i = 1; i < ms->val_page_count; i++)
+            free(ms->val_pages[i]);
+        ms->val_page_count = 1;
+    }
     ms->batch_active = false;
 
     return true;
@@ -2026,7 +2329,8 @@ uint32_t mpt_store_get(const mpt_store_t *ms, const uint8_t key[32],
     mpt_node_t node;
 
     for (;;) {
-        if (!load_from_ref(ms, &ref, node_buf, &node_buf_len, &node))
+        if (!load_from_ref(ms, &ref, node_buf, &node_buf_len, &node,
+                          (uint8_t)depth))
             return 0;
 
         switch (node.type) {
@@ -2090,7 +2394,7 @@ static bool compact_walk(const mpt_store_t *old_ms, mpt_store_t *new_ms,
 
     /* Load node from old store */
     uint8_t buf[MAX_NODE_RLP];
-    size_t buf_len = load_node_rlp(old_ms, ref->hash, buf);
+    size_t buf_len = load_node_rlp(old_ms, ref->hash, buf, NCACHE_DEPTH_UNKNOWN);
     if (buf_len == 0) return false;
 
     /* Write to new store */
@@ -2115,6 +2419,50 @@ static bool compact_walk(const mpt_store_t *old_ms, mpt_store_t *new_ms,
     /* Leaf — no children to recurse */
 
     return true;
+}
+
+/* Walk all leaves reachable from a node ref, calling cb for each leaf value. */
+static bool walk_leaves_ref(const mpt_store_t *ms, const node_ref_t *ref,
+                             mpt_leaf_cb_t cb, void *user_data) {
+    uint8_t buf[MAX_NODE_RLP];
+    size_t buf_len;
+    mpt_node_t node;
+
+    if (ref->type == REF_EMPTY) return true;
+
+    if (ref->type == REF_INLINE) {
+        if (!decode_node(ref->raw.data, ref->raw.len, &node))
+            return false;
+    } else {
+        /* REF_HASH */
+        buf_len = load_node_rlp(ms, ref->hash, buf, NCACHE_DEPTH_UNKNOWN);
+        if (buf_len == 0) return false;
+        if (!decode_node(buf, buf_len, &node))
+            return false;
+    }
+
+    if (node.type == MPT_NODE_LEAF) {
+        return cb(node.leaf.value, node.leaf.value_len, user_data);
+    } else if (node.type == MPT_NODE_BRANCH) {
+        for (int i = 0; i < 16; i++) {
+            if (!walk_leaves_ref(ms, &node.branch.children[i], cb, user_data))
+                return false;
+        }
+    } else if (node.type == MPT_NODE_EXTENSION) {
+        if (!walk_leaves_ref(ms, &node.extension.child, cb, user_data))
+            return false;
+    }
+    return true;
+}
+
+bool mpt_store_walk_leaves(const mpt_store_t *ms, mpt_leaf_cb_t cb,
+                            void *user_data) {
+    if (!ms || !cb) return false;
+    if (memcmp(ms->root_hash, EMPTY_ROOT, 32) == 0) return true;
+
+    node_ref_t root = { .type = REF_HASH };
+    memcpy(root.hash, ms->root_hash, 32);
+    return walk_leaves_ref(ms, &root, cb, user_data);
 }
 
 bool mpt_store_compact(mpt_store_t *ms) {
@@ -2153,20 +2501,24 @@ bool mpt_store_compact(mpt_store_t *ms) {
         /* Save paths before destroy frees them */
         char *fail_idx = new_ms->idx_path;
         char *fail_dat = new_ms->dat_path;
+        char *fail_free = new_ms->free_path;
         new_ms->idx_path = NULL;
         new_ms->dat_path = NULL;
+        new_ms->free_path = NULL;
         mpt_store_destroy(new_ms);
         unlink(fail_idx);
         unlink(fail_dat);
+        if (fail_free) unlink(fail_free);
         free(fail_idx);
         free(fail_dat);
+        free(fail_free);
         free(tmp_path); free(tmp_base);
         return false;
     }
 
-    /* Copy root hash */
+    /* Copy root hash and flush deferred writes to disk */
     memcpy(new_ms->root_hash, ms->root_hash, 32);
-    mpt_store_sync(new_ms);
+    mpt_store_flush(new_ms);
 
     /* Swap files: rename new over old */
     char *old_idx = ms->idx_path;
@@ -2200,9 +2552,14 @@ bool mpt_store_compact(mpt_store_t *ms) {
         ms->cache = ncache_create(cap);
     }
 
+    /* Remove overflow file — compacted store has no free slots */
+    if (ms->free_path) unlink(ms->free_path);
+
     /* Cleanup new_ms (files already renamed, just free struct) */
     close(new_ms->data_fd);
     disk_hash_destroy(new_ms->index);
+    if (new_ms->free_path) unlink(new_ms->free_path);
+    free(new_ms->free_path);
     new_ms->idx_path = NULL;
     new_ms->dat_path = NULL;
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
@@ -2215,6 +2572,103 @@ bool mpt_store_compact(mpt_store_t *ms) {
     ms->dat_path = old_dat;
 
     free(tmp_path);
+    free(tmp_base);
+    return ms->index != NULL && ms->data_fd >= 0;
+}
+
+bool mpt_store_compact_roots(mpt_store_t *ms,
+                              const uint8_t (*roots)[32], size_t n_roots) {
+    if (!ms || ms->batch_active || n_roots == 0) return false;
+
+    /* Create temp paths */
+    size_t base_len = strlen(ms->dat_path) - 4; /* remove ".dat" */
+    char *tmp_base = malloc(base_len + 9);
+    if (!tmp_base) return false;
+    memcpy(tmp_base, ms->dat_path, base_len);
+    memcpy(tmp_base + base_len, ".compact", 9);
+
+    mpt_store_t *new_ms = mpt_store_create(tmp_base, disk_hash_count(ms->index));
+    if (!new_ms) { free(tmp_base); return false; }
+    mpt_store_set_cache(new_ms, 0);
+
+    /* Walk all roots, copying reachable nodes.
+     * compact_walk + write_node naturally dedup — if a node hash already
+     * exists in new_ms, write_node is a no-op.  So shared subtrees across
+     * different roots are only copied once. */
+    bool ok = true;
+    for (size_t i = 0; i < n_roots && ok; i++) {
+        if (memcmp(roots[i], EMPTY_ROOT, 32) == 0) continue;
+        node_ref_t ref = { .type = REF_HASH };
+        memcpy(ref.hash, roots[i], 32);
+        ok = compact_walk(ms, new_ms, &ref);
+    }
+
+    if (!ok) {
+        char *fail_idx = new_ms->idx_path;
+        char *fail_dat = new_ms->dat_path;
+        char *fail_free = new_ms->free_path;
+        new_ms->idx_path = NULL;
+        new_ms->dat_path = NULL;
+        new_ms->free_path = NULL;
+        mpt_store_destroy(new_ms);
+        unlink(fail_idx);
+        unlink(fail_dat);
+        if (fail_free) unlink(fail_free);
+        free(fail_idx); free(fail_dat); free(fail_free);
+        free(tmp_base);
+        return false;
+    }
+
+    /* Flush deferred writes to disk before swapping files.
+     * write_node() buffers all nodes in def_entries — mpt_store_sync()
+     * only writes the header, so nodes would be lost on file swap. */
+    mpt_store_flush(new_ms);
+
+    /* Swap files */
+    char *old_idx = ms->idx_path;
+    char *old_dat = ms->dat_path;
+    char *new_idx = new_ms->idx_path;
+    char *new_dat = new_ms->dat_path;
+
+    disk_hash_destroy(ms->index);
+    close(ms->data_fd);
+
+    rename(new_idx, old_idx);
+    rename(new_dat, old_dat);
+
+    ms->index = disk_hash_open(old_idx);
+    ms->data_fd = open(old_dat, O_RDWR);
+    ms->data_size  = new_ms->data_size;
+    ms->live_bytes = new_ms->live_bytes;
+
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
+        free_list_clear(&ms->free_lists[i]);
+    ms->free_slot_bytes = 0;
+
+    if (ms->cache) {
+        uint32_t cap = ms->cache->capacity;
+        ncache_destroy(ms->cache);
+        ms->cache = ncache_create(cap);
+    }
+
+    /* Remove overflow file — compacted store has no free slots */
+    if (ms->free_path) unlink(ms->free_path);
+
+    close(new_ms->data_fd);
+    disk_hash_destroy(new_ms->index);
+    if (new_ms->free_path) unlink(new_ms->free_path);
+    free(new_ms->free_path);
+    new_ms->idx_path = NULL;
+    new_ms->dat_path = NULL;
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
+        free_list_destroy(&new_ms->free_lists[i]);
+    ncache_destroy(new_ms->cache);
+    free(new_ms->dirty);
+    free(new_ms);
+
+    ms->idx_path = old_idx;
+    ms->dat_path = old_dat;
+
     free(tmp_base);
     return ms->index != NULL && ms->data_fd >= 0;
 }
@@ -2257,10 +2711,12 @@ mpt_store_stats_t mpt_store_stats(const mpt_store_t *ms) {
                      ? ms->data_size - ms->live_bytes - ms->free_slot_bytes : 0;
 
     if (ms->cache) {
-        st.cache_hits     = ms->cache->hits;
-        st.cache_misses   = ms->cache->misses;
-        st.cache_count    = ms->cache->count;
-        st.cache_capacity = ms->cache->capacity;
+        st.cache_hits          = ms->cache->hits;
+        st.cache_misses        = ms->cache->misses;
+        st.cache_count         = ms->cache->count;
+        st.cache_capacity      = ms->cache->capacity;
+        st.cache_evict_skipped = ms->cache->evict_skipped;
+        st.cache_pinned        = ms->cache->pinned_count;
     }
 
     return st;

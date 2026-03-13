@@ -162,7 +162,19 @@ bool evm_memory_write(evm_memory_t *mem, uint64_t offset, const uint8_t *data, s
  * @param size Number of bytes needed
  * @return true on success, false on allocation failure
  */
-bool evm_memory_expand(evm_memory_t *mem, uint64_t offset, size_t size);
+bool evm_memory_expand_slow(evm_memory_t *mem, uint64_t offset, size_t size);
+
+/**
+ * Inline fast path: skip function call when memory is already large enough
+ */
+static inline bool evm_memory_expand(evm_memory_t *mem, uint64_t offset, size_t size) {
+    if (size == 0) return true;
+    uint64_t end = offset + size;
+    if (__builtin_expect(end < offset, 0)) return false; /* overflow */
+    size_t new_size = (end + EVM_MEMORY_WORD_SIZE - 1) & ~(size_t)(EVM_MEMORY_WORD_SIZE - 1);
+    if (__builtin_expect(new_size <= mem->size, 1)) return true;
+    return evm_memory_expand_slow(mem, offset, size);
+}
 
 /**
  * Ensure memory has at least the given size
@@ -207,26 +219,39 @@ bool evm_memory_is_empty(const evm_memory_t *mem);
 //==============================================================================
 
 /**
- * Calculate gas cost for memory expansion
+ * Calculate gas cost for memory expansion (inline for interpreter hot path)
  * Uses the Ethereum memory expansion formula:
  *   cost = (memory_size_word^2 / 512) + (3 * memory_size_word)
- *
- * @param current_size Current memory size in bytes
- * @param new_size New memory size in bytes (after expansion)
- * @return Gas cost for expansion
  */
-uint64_t evm_memory_expansion_cost(size_t current_size, size_t new_size);
+static inline uint64_t evm_memory_expansion_cost(size_t current_size, size_t new_size)
+{
+    if (new_size <= current_size)
+        return 0;
+
+    size_t current_words = (current_size + EVM_MEMORY_WORD_SIZE - 1) / EVM_MEMORY_WORD_SIZE;
+    size_t new_words = (new_size + EVM_MEMORY_WORD_SIZE - 1) / EVM_MEMORY_WORD_SIZE;
+
+    uint64_t current_cost = 3 * current_words + ((current_words * current_words) >> 9);
+    uint64_t new_cost = 3 * new_words + ((new_words * new_words) >> 9);
+
+    return new_cost - current_cost;
+}
 
 /**
- * Calculate gas cost for accessing memory at offset with given size
- * Returns the incremental gas cost (difference from current cost)
- *
- * @param mem Memory instance
- * @param offset Access offset
- * @param size Access size
- * @return Incremental gas cost for this access
+ * Calculate gas cost for accessing memory at offset with given size (inline)
  */
-uint64_t evm_memory_access_cost(const evm_memory_t *mem, uint64_t offset, size_t size);
+static inline uint64_t evm_memory_access_cost(const evm_memory_t *mem, uint64_t offset, size_t size)
+{
+    if (!mem || size == 0)
+        return 0;
+
+    if (offset > UINT64_MAX - size)
+        return UINT64_MAX;
+
+    size_t new_size = ((offset + size) + EVM_MEMORY_WORD_SIZE - 1) & ~(size_t)(EVM_MEMORY_WORD_SIZE - 1);
+
+    return evm_memory_expansion_cost(mem->size, new_size);
+}
 
 //==============================================================================
 // Utility Functions

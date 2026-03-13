@@ -718,11 +718,14 @@ static const void *search(const mem_art_t *tree, mem_ref_t ref,
 static mem_ref_t insert_recursive(mem_art_t *tree, mem_ref_t ref,
                                   const uint8_t *key, size_t key_len,
                                   size_t depth, const void *value,
-                                  size_t value_len, bool *inserted) {
+                                  size_t value_len, bool *inserted,
+                                  mem_ref_t *out_leaf_ref) {
     // Base case: empty slot → create leaf
     if (ref == MEM_REF_NULL) {
         *inserted = true;
-        return alloc_leaf(tree, key, key_len, value, value_len);
+        mem_ref_t leaf = alloc_leaf(tree, key, key_len, value, value_len);
+        if (out_leaf_ref) *out_leaf_ref = leaf;
+        return leaf;
     }
 
     // Leaf node
@@ -732,6 +735,7 @@ static mem_ref_t insert_recursive(mem_art_t *tree, mem_ref_t ref,
             mem_ref_t new_leaf = alloc_leaf(tree, key, key_len, value, value_len);
             if (new_leaf == MEM_REF_NULL) return ref;
             *inserted = false;
+            if (out_leaf_ref) *out_leaf_ref = new_leaf;
             return new_leaf;
         }
 
@@ -739,6 +743,7 @@ static mem_ref_t insert_recursive(mem_art_t *tree, mem_ref_t ref,
         *inserted = true;
         mem_ref_t new_leaf = alloc_leaf(tree, key, key_len, value, value_len);
         if (new_leaf == MEM_REF_NULL) return ref;
+        if (out_leaf_ref) *out_leaf_ref = new_leaf;
 
         // Find longest common prefix
         const uint8_t *lk = leaf_key(tree, ref);
@@ -848,6 +853,7 @@ static mem_ref_t insert_recursive(mem_art_t *tree, mem_ref_t ref,
             // Create leaf for new key
             mem_ref_t leaf_ref = alloc_leaf(tree, key, key_len, value, value_len);
             if (leaf_ref == MEM_REF_NULL) return ref;
+            if (out_leaf_ref) *out_leaf_ref = leaf_ref;
 
             uint8_t new_byte = (depth + prefix_len < key_len) ?
                                key[depth + prefix_len] : 0x00;
@@ -876,6 +882,7 @@ static mem_ref_t insert_recursive(mem_art_t *tree, mem_ref_t ref,
                     child_ptr = find_child_ptr(tree, ref, byte);
                     *child_ptr = new_leaf;
                     *inserted = false;
+                    if (out_leaf_ref) *out_leaf_ref = new_leaf;
                 }
             }
             return ref;
@@ -883,7 +890,7 @@ static mem_ref_t insert_recursive(mem_art_t *tree, mem_ref_t ref,
         mem_ref_t old_child = *child_ptr;
         mem_ref_t new_child = insert_recursive(tree, old_child, key, key_len,
                                                depth + 1, value, value_len,
-                                               inserted);
+                                               inserted, out_leaf_ref);
         if (new_child != old_child) {
             // Re-resolve child_ptr after potential realloc
             child_ptr = find_child_ptr(tree, ref, byte);
@@ -893,6 +900,7 @@ static mem_ref_t insert_recursive(mem_art_t *tree, mem_ref_t ref,
         *inserted = true;
         mem_ref_t leaf_ref = alloc_leaf(tree, key, key_len, value, value_len);
         if (leaf_ref != MEM_REF_NULL) {
+            if (out_leaf_ref) *out_leaf_ref = leaf_ref;
             ref = add_child(tree, ref, byte, leaf_ref);
         }
     }
@@ -1052,7 +1060,7 @@ bool mem_art_insert(mem_art_t *tree, const uint8_t *key, size_t key_len,
 
     bool inserted = false;
     mem_ref_t new_root = insert_recursive(tree, tree->root, key, key_len, 0,
-                                          value, value_len, &inserted);
+                                          value, value_len, &inserted, NULL);
     if (new_root == MEM_REF_NULL && tree->root != MEM_REF_NULL) return false;
 
     tree->root = new_root;
@@ -1078,6 +1086,53 @@ bool mem_art_delete(mem_art_t *tree, const uint8_t *key, size_t key_len) {
     tree->root = delete_recursive(tree, tree->root, key, key_len, 0, &deleted);
     if (deleted) tree->size--;
     return deleted;
+}
+
+void *mem_art_upsert(mem_art_t *tree, const uint8_t *key, size_t key_len,
+                     const void *value, size_t value_len) {
+    if (!tree || !key || key_len == 0) return NULL;
+
+    bool inserted = false;
+    mem_ref_t leaf_ref = MEM_REF_NULL;
+    mem_ref_t new_root = insert_recursive(tree, tree->root, key, key_len, 0,
+                                          value, value_len, &inserted,
+                                          &leaf_ref);
+    if (new_root == MEM_REF_NULL && tree->root != MEM_REF_NULL) return NULL;
+
+    tree->root = new_root;
+    if (inserted) tree->size++;
+
+    if (leaf_ref == MEM_REF_NULL) return NULL;
+    return (void *)leaf_value(tree, leaf_ref, NULL);
+}
+
+void mem_art_prefetch(const mem_art_t *tree, const uint8_t *key, size_t key_len) {
+    if (!tree || !key || key_len == 0) return;
+    mem_ref_t ref = tree->root;
+    size_t depth = 0;
+    while (ref != MEM_REF_NULL) {
+        if (MEM_IS_LEAF(ref)) {
+            /* Prefetch leaf value data */
+            void *leaf = ref_ptr(tree, ref);
+            __builtin_prefetch(leaf, 0, 1);
+            return;
+        }
+        void *node = ref_ptr(tree, ref);
+        __builtin_prefetch(node, 0, 1);
+
+        uint8_t plen = node_partial_len(node);
+        if (plen > 0) {
+            int prefix_len = check_prefix(tree, ref, node, key, key_len, depth);
+            if (prefix_len != (int)plen) return;
+            depth += plen;
+        }
+
+        uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
+        mem_ref_t *child_ptr = find_child_ptr(tree, ref, byte);
+        if (!child_ptr) return;
+        ref = *child_ptr;
+        depth++;
+    }
 }
 
 bool mem_art_contains(const mem_art_t *tree, const uint8_t *key, size_t key_len) {

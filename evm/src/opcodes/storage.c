@@ -143,7 +143,7 @@ static evm_status_t op_sload(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 1))
     {
-        LOG_EVM_ERROR("SLOAD: Stack underflow");
+        LOG_EVM_DEBUG("SLOAD: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -225,13 +225,13 @@ static evm_status_t op_sstore(evm_t *evm)
     // Check if we're in a static call (no state modifications allowed)
     if (evm->msg.is_static)
     {
-        LOG_EVM_ERROR("SSTORE: State modification in static call");
+        LOG_EVM_DEBUG("SSTORE: State modification in static call");
         return EVM_STATIC_CALL_VIOLATION;
     }
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_EVM_ERROR("SSTORE: Stack underflow");
+        LOG_EVM_DEBUG("SSTORE: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -246,9 +246,10 @@ static evm_status_t op_sstore(evm_t *evm)
     evm_stack_pop(evm->stack, &key);
     evm_stack_pop(evm->stack, &value);
 
-    // Get current and original (committed) values from storage
-    uint256_t current_value = evm_state_get_storage(evm->state, &evm->msg.recipient, &key);
-    uint256_t original_value = evm_state_get_committed_storage(evm->state, &evm->msg.recipient, &key);
+    // Get current and original (committed) values in a single lookup
+    uint256_t current_value, original_value;
+    evm_state_get_storage_pair(evm->state, &evm->msg.recipient, &key,
+                               &current_value, &original_value);
 
     if (evm->fork >= FORK_VERKLE) {
         // EIP-4762 (Verkle): witness gas is the COMPLETE SSTORE cost.

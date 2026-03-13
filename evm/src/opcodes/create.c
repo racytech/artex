@@ -400,9 +400,7 @@ static evm_status_t execute_create(evm_t *evm,
             evm->gas_refund += init_result.gas_refund;
         }
 
-        if (init_result.output_data) {
-            free(init_result.output_data);
-        }
+        /* output_data ownership transferred to evm->return_data by evm_execute */
 
         // CREATE return data handling:
         // - Success: return_data = empty (deployed code is NOT return data)
@@ -499,6 +497,8 @@ static evm_status_t op_create(evm_t *evm)
     uint64_t mem_expansion_cost = 0;
 
     if (size_u64 > 0) {
+        if (offset_u64 > UINT64_MAX - size_u64)
+            return EVM_OUT_OF_GAS;
         mem_expansion_cost = evm_memory_expansion_cost(evm->memory->size, offset_u64 + size_u64);
     }
 
@@ -540,7 +540,7 @@ static evm_status_t op_create(evm_t *evm)
 
         if (!evm_memory_read(evm->memory, offset_u64, init_code, size_u64))
         {
-            LOG_EVM_ERROR("CREATE: Failed to read init code from memory");
+            LOG_EVM_DEBUG("CREATE: Failed to read init code from memory");
             free(init_code);
             return EVM_INVALID_MEMORY_ACCESS;
         }
@@ -571,7 +571,7 @@ static evm_status_t op_create2(evm_t *evm)
     // Check for static call violation
     if (evm->msg.is_static)
     {
-        LOG_EVM_ERROR("CREATE2: Cannot create contract in static call");
+        LOG_EVM_DEBUG("CREATE2: Cannot create contract in static call");
         return EVM_STATIC_CALL_VIOLATION;
     }
 
@@ -610,6 +610,8 @@ static evm_status_t op_create2(evm_t *evm)
     // Memory expansion cost
     uint64_t mem_expansion_cost = 0;
     if (size_u64 > 0) {
+        if (offset_u64 > UINT64_MAX - size_u64)
+            return EVM_OUT_OF_GAS;
         mem_expansion_cost = evm_memory_expansion_cost(evm->memory->size, offset_u64 + size_u64);
     }
 
@@ -652,7 +654,7 @@ static evm_status_t op_create2(evm_t *evm)
 
         if (!evm_memory_read(evm->memory, offset_u64, init_code, size_u64))
         {
-            LOG_EVM_ERROR("CREATE2: Failed to read init code from memory");
+            LOG_EVM_DEBUG("CREATE2: Failed to read init code from memory");
             free(init_code);
             return EVM_INVALID_MEMORY_ACCESS;
         }

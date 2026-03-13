@@ -62,6 +62,12 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
 void evm_state_destroy(evm_state_t *es);
 
 /**
+ * Mark state to discard pending writes on destroy.
+ * Call after a failed block to prevent corrupting the on-disk MPT state.
+ */
+void evm_state_discard_pending(evm_state_t *es);
+
+/**
  * Flush deferred MPT writes to disk. Call at checkpoint time.
  */
 void evm_state_flush(evm_state_t *es);
@@ -87,9 +93,19 @@ void evm_state_flush_verkle(evm_state_t *es);
  */
 void evm_state_evict_cache(evm_state_t *es);
 
+/**
+ * Compact the shared storage MPT by collecting all live storage roots
+ * and rewriting the store with only reachable nodes. Reclaims orphaned
+ * nodes from prior incremental updates. Call at checkpoint boundaries.
+ */
+void evm_state_compact_storage(evm_state_t *es);
+
 // ============================================================================
 // Account Existence
 // ============================================================================
+
+/** Prefetch account ART path into CPU cache (non-blocking hint). */
+void evm_state_prefetch_account(evm_state_t *es, const address_t *addr);
 
 /** Check if account exists (has been touched or loaded from disk). */
 bool evm_state_exists(evm_state_t *es, const address_t *addr);
@@ -141,6 +157,10 @@ uint256_t evm_state_get_storage(evm_state_t *es, const address_t *addr,
 /** Get committed (original/pre-transaction) storage value. For EIP-2200. */
 uint256_t evm_state_get_committed_storage(evm_state_t *es, const address_t *addr,
                                           const uint256_t *key);
+/** Get current + committed storage in a single lookup (avoids double ensure_slot). */
+void      evm_state_get_storage_pair(evm_state_t *es, const address_t *addr,
+                                     const uint256_t *key,
+                                     uint256_t *current, uint256_t *original);
 void      evm_state_set_storage(evm_state_t *es, const address_t *addr,
                                 const uint256_t *key, const uint256_t *value);
 
@@ -267,6 +287,8 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
  */
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty);
 #endif
+/** Print MPT cache stats (hit rate, pinned nodes, eviction skips) to stderr. */
+void evm_state_print_mpt_stats(evm_state_t *es);
 void evm_state_debug_dump(evm_state_t *es);
 
 #endif // EVM_STATE_H

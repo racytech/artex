@@ -80,94 +80,175 @@ static uint256_t uint128_mul_to_uint256(uint128_t a, uint128_t b) {
 
 uint256_t uint256_mul(const uint256_t* a, const uint256_t* b) {
     uint256_t result;
-    
-    // Use 2×2 multiplication approach:
-    // (a_high * 2^128 + a_low) × (b_high * 2^128 + b_low)
-    // = a_high*b_high*2^256 + (a_high*b_low + a_low*b_high)*2^128 + a_low*b_low
-    // 
-    // Since we only want the lower 256 bits, we can ignore the a_high*b_high*2^256 term
-    // Result = (a_high*b_low + a_low*b_high)*2^128 + a_low*b_low
-    
-    // Compute a_low × b_low (contributes to all 256 bits)
-    uint256_t low_product = uint128_mul_to_uint256(a->low, b->low);
-    
-    // Compute a_high × b_low (contributes to upper 128 bits when shifted)
-    uint256_t high_low_product = uint128_mul_to_uint256(a->high, b->low);
-    
-    // Compute a_low × b_high (contributes to upper 128 bits when shifted)  
-    uint256_t low_high_product = uint128_mul_to_uint256(a->low, b->high);
-    
-    // Start with a_low × b_low
-    result = low_product;
-    
-    // Add (a_high × b_low) << 128
-    // This means adding high_low_product.low to result.high
-    result.high += high_low_product.low;
-    // Note: high_low_product.high would contribute to bits beyond 256, so we ignore it
-    
-    // Add (a_low × b_high) << 128  
-    // This means adding low_high_product.low to result.high
-    result.high += low_high_product.low;
-    // Note: low_high_product.high would contribute to bits beyond 256, so we ignore it
-    
+
+    // (a_high*2^128 + a_low) × (b_high*2^128 + b_low) mod 2^256
+    // = a_low*b_low + (a_high*b_low + a_low*b_high)*2^128
+    // (a_high*b_high*2^256 overflows, ignored)
+
+    // Full 128×128→256 for low×low (needs both halves)
+    result = uint128_mul_to_uint256(a->low, b->low);
+
+    // Cross terms only contribute their low 128 bits to result.high
+    // (their high 128 bits would land at bit 256+, overflow)
+    // Use truncated 128-bit multiply — compiler emits a single mul instruction
+    result.high += a->high * b->low + a->low * b->high;
+
     return result;
 }
 
+/**
+ * Internal combined divmod: *q = a / b, *r = a % b.
+ * Precondition: b != 0, a > b (caller handles trivial cases).
+ */
+static void uint256_divmod_internal(const uint256_t *a, const uint256_t *b,
+                                     uint256_t *q, uint256_t *r)
+{
+    /* Fast path 1: both operands fit in native 128 bits */
+    if (a->high == 0 && b->high == 0) {
+        q->low  = a->low / b->low;
+        q->high = 0;
+        r->low  = a->low % b->low;
+        r->high = 0;
+        return;
+    }
+
+    /* Fast path 2: divisor fits in a single 64-bit limb — schoolbook 256÷64 */
+    if (b->high == 0 && (b->low >> 64) == 0) {
+        uint64_t d = (uint64_t)b->low;
+        uint64_t aw[4], qw[4];
+        uint256_to_words(a, aw);
+        uint64_t rem = 0;
+        for (int i = 3; i >= 0; i--) {
+            __uint128_t cur = ((__uint128_t)rem << 64) | aw[i];
+            qw[i] = (uint64_t)(cur / d);
+            rem   = (uint64_t)(cur % d);
+        }
+        *q = uint256_from_words(qw);
+        r->low  = (uint128_t)rem;
+        r->high = 0;
+        return;
+    }
+
+    /* General: Knuth Algorithm D with base-2^64 limbs */
+    uint64_t aw[4], bw[4];
+    uint256_to_words(a, aw);
+    uint256_to_words(b, bw);
+
+    /* n = significant limbs in divisor (>= 2 here) */
+    int n = 4;
+    while (n > 0 && bw[n - 1] == 0) n--;
+
+    int an = 4;
+    while (an > 0 && aw[an - 1] == 0) an--;
+
+    int m = an - n; /* quotient has at most m+1 limbs */
+    if (m < 0) {
+        *q = UINT256_ZERO;
+        *r = *a;
+        return;
+    }
+
+    /* Normalize: shift left so v[n-1] has its MSB set */
+    unsigned s = (unsigned)__builtin_clzll(bw[n - 1]);
+
+    uint64_t vn[4] = {0};
+    if (s > 0) {
+        for (int i = n - 1; i > 0; i--)
+            vn[i] = (bw[i] << s) | (bw[i - 1] >> (64 - s));
+        vn[0] = bw[0] << s;
+    } else {
+        for (int i = 0; i < n; i++) vn[i] = bw[i];
+    }
+
+    uint64_t un[5] = {0}; /* normalized dividend, up to 5 limbs */
+    if (s > 0) {
+        un[an] = aw[an - 1] >> (64 - s);
+        for (int i = an - 1; i > 0; i--)
+            un[i] = (aw[i] << s) | (aw[i - 1] >> (64 - s));
+        un[0] = aw[0] << s;
+    } else {
+        for (int i = 0; i < an; i++) un[i] = aw[i];
+    }
+
+    uint64_t qw[4] = {0};
+
+    for (int j = m; j >= 0; j--) {
+        /* Trial quotient: q_hat ≈ (un[j+n]*B + un[j+n-1]) / vn[n-1] */
+        __uint128_t num = ((__uint128_t)un[j + n] << 64) | un[j + n - 1];
+        __uint128_t q_hat = num / vn[n - 1];
+        __uint128_t r_hat = num % vn[n - 1];
+
+        /* Refine (at most 2 corrections) */
+        while (q_hat >= ((__uint128_t)1 << 64) ||
+               (n >= 2 && q_hat * vn[n - 2] >
+                   ((r_hat << 64) | un[j + n - 2]))) {
+            q_hat--;
+            r_hat += vn[n - 1];
+            if (r_hat >= ((__uint128_t)1 << 64)) break;
+        }
+
+        /* Multiply and subtract: un[j..j+n] -= q_hat * vn[0..n-1] */
+        __int128_t k = 0;
+        for (int i = 0; i < n; i++) {
+            __uint128_t p = (__uint128_t)q_hat * vn[i];
+            __int128_t t = (__int128_t)un[j + i] - (uint64_t)p - k;
+            un[j + i] = (uint64_t)t;
+            k = (__int128_t)(p >> 64) - (t >> 64);
+        }
+        __int128_t t = (__int128_t)un[j + n] - k;
+        un[j + n] = (uint64_t)t;
+
+        qw[j] = (uint64_t)q_hat;
+
+        /* Add back if we subtracted too much */
+        if (t < 0) {
+            qw[j]--;
+            uint64_t carry = 0;
+            for (int i = 0; i < n; i++) {
+                __uint128_t sum = (__uint128_t)un[j + i] + vn[i] + carry;
+                un[j + i] = (uint64_t)sum;
+                carry = (uint64_t)(sum >> 64);
+            }
+            un[j + n] += carry;
+        }
+    }
+
+    *q = uint256_from_words(qw);
+
+    /* De-normalize remainder */
+    uint64_t rw[4] = {0};
+    if (s > 0) {
+        for (int i = 0; i < n - 1; i++)
+            rw[i] = (un[i] >> s) | (un[i + 1] << (64 - s));
+        rw[n - 1] = un[n - 1] >> s;
+    } else {
+        for (int i = 0; i < n; i++) rw[i] = un[i];
+    }
+    *r = uint256_from_words(rw);
+}
+
 uint256_t uint256_div(const uint256_t* a, const uint256_t* b) {
-    if (!a || !b || uint256_is_zero(b)) {
-        return UINT256_ZERO; // Division by zero
-    }
-    
-    if (uint256_is_zero(a)) {
-        return UINT256_ZERO;
-    }
-    
-    if (uint256_is_one(b)) {
-        return *a;
-    }
-    
-    // If dividend is smaller than divisor, result is 0
-    if (uint256_is_less(a, b)) {
-        return UINT256_ZERO;
-    }
-    
-    // If they're equal, result is 1
-    if (uint256_is_equal(a, b)) {
-        return UINT256_ONE;
-    }
-    
-    // Long division algorithm with optimizations
-    uint256_t quotient = UINT256_ZERO;
-    uint256_t remainder = UINT256_ZERO;
-    
-    // Find the most significant bit to avoid unnecessary iterations
-    int msb = uint256_bit_length(a) - 1;
-    
-    // Process from most significant bit to least significant bit
-    for (int i = msb; i >= 0; i--) {
-        // Shift remainder left by 1 bit
-        remainder = uint256_shl(&remainder, 1);
-        
-        // Set the least significant bit of remainder to the current bit of dividend
-        if (uint256_get_bit(a, i)) {
-            remainder = uint256_set_bit(&remainder, 0);
-        }
-        
-        // If remainder >= divisor, subtract divisor from remainder and set quotient bit
-        if (uint256_is_greater_equal(&remainder, b)) {
-            remainder = uint256_sub(&remainder, b);
-            quotient = uint256_set_bit(&quotient, i);
-        }
-    }
-    
-    return quotient;
+    if (!a || !b || uint256_is_zero(b)) return UINT256_ZERO;
+    if (uint256_is_zero(a))             return UINT256_ZERO;
+    if (uint256_is_one(b))              return *a;
+    if (uint256_is_less(a, b))          return UINT256_ZERO;
+    if (uint256_is_equal(a, b))         return UINT256_ONE;
+
+    uint256_t q, r;
+    uint256_divmod_internal(a, b, &q, &r);
+    return q;
 }
 
 uint256_t uint256_mod(const uint256_t* a, const uint256_t* b) {
-    // Simple modulo algorithm
-    uint256_t quotient = uint256_div(a, b);
-    uint256_t product = uint256_mul(&quotient, b);
-    return uint256_sub(a, &product);
+    if (!a || !b || uint256_is_zero(b)) return UINT256_ZERO;
+    if (uint256_is_zero(a))             return UINT256_ZERO;
+    if (uint256_is_one(b))              return UINT256_ZERO;
+    if (uint256_is_less(a, b))          return *a;
+    if (uint256_is_equal(a, b))         return UINT256_ZERO;
+
+    uint256_t q, r;
+    uint256_divmod_internal(a, b, &q, &r);
+    return r;
 }
 
 // ============================================================================
@@ -321,21 +402,29 @@ uint256_t uint256_from_hex(const char* hex_str) {
 
 uint256_t uint256_from_bytes(const uint8_t* bytes, size_t len) {
     uint256_t result = {UINT128_ZERO, UINT128_ZERO};
-    
+
     if (!bytes || len == 0) return result;
-    if (len > 32) len = 32; // Max 32 bytes for 256 bits
-    
+    if (len > 32) len = 32;
+
+    /* Fast path: full 32 bytes (MLOAD always passes 32) */
+    if (len == 32) {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w3, bytes +  0, 8);
+        memcpy(&w2, bytes +  8, 8);
+        memcpy(&w1, bytes + 16, 8);
+        memcpy(&w0, bytes + 24, 8);
+        result.low  = ((__uint128_t)__builtin_bswap64(w1) << 64) | __builtin_bswap64(w0);
+        result.high = ((__uint128_t)__builtin_bswap64(w3) << 64) | __builtin_bswap64(w2);
+        return result;
+    }
+
+    /* Slow path: partial (rare — only for short from_bytes calls) */
     uint64_t words[4] = {0, 0, 0, 0};
-    
     for (size_t i = 0; i < len; i++) {
         size_t word_idx = i / 8;
         size_t byte_pos = i % 8;
-        
-        if (word_idx < 4) {
-            words[word_idx] |= ((uint64_t)bytes[len - 1 - i] << (byte_pos * 8));
-        }
+        words[word_idx] |= ((uint64_t)bytes[len - 1 - i] << (byte_pos * 8));
     }
-    
     return uint256_from_words(words);
 }
 
@@ -367,27 +456,33 @@ char* uint256_to_hex(const uint256_t* a) {
 void uint256_to_bytes(const uint256_t* a, uint8_t* bytes) {
     if (!a || !bytes) return;
 
-    uint64_t words[4];
-    uint256_to_words(a, words);
-
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 8; j++) {
-            bytes[31 - (i * 8 + j)] = (words[i] >> (j * 8)) & 0xFF;
-        }
-    }
+    /* bswap64 each word and store in reverse order (big-endian output) */
+    uint64_t w0 = (uint64_t)a->low;
+    uint64_t w1 = (uint64_t)(a->low >> 64);
+    uint64_t w2 = (uint64_t)a->high;
+    uint64_t w3 = (uint64_t)(a->high >> 64);
+    w0 = __builtin_bswap64(w0);
+    w1 = __builtin_bswap64(w1);
+    w2 = __builtin_bswap64(w2);
+    w3 = __builtin_bswap64(w3);
+    memcpy(bytes +  0, &w3, 8);
+    memcpy(bytes +  8, &w2, 8);
+    memcpy(bytes + 16, &w1, 8);
+    memcpy(bytes + 24, &w0, 8);
 }
 
 void uint256_to_bytes_le(const uint256_t* a, uint8_t* bytes) {
     if (!a || !bytes) return;
 
-    uint64_t words[4];
-    uint256_to_words(a, words);
-
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 8; j++) {
-            bytes[i * 8 + j] = (words[i] >> (j * 8)) & 0xFF;
-        }
-    }
+    /* Little-endian: native byte order on x86_64 — direct copy */
+    uint64_t w0 = (uint64_t)a->low;
+    uint64_t w1 = (uint64_t)(a->low >> 64);
+    uint64_t w2 = (uint64_t)a->high;
+    uint64_t w3 = (uint64_t)(a->high >> 64);
+    memcpy(bytes +  0, &w0, 8);
+    memcpy(bytes +  8, &w1, 8);
+    memcpy(bytes + 16, &w2, 8);
+    memcpy(bytes + 24, &w3, 8);
 }
 
 uint256_t uint256_from_bytes_le(const uint8_t* bytes, size_t len) {
@@ -410,22 +505,7 @@ uint256_t uint256_from_bytes_le(const uint8_t* bytes, size_t len) {
     return uint256_from_words(words);
 }
 
-void uint256_to_words(const uint256_t* a, uint64_t words[4]) {
-    uint64_t low_high, low_low, high_high, high_low;
-    uint128_to_words(a->low, &low_high, &low_low);
-    uint128_to_words(a->high, &high_high, &high_low);
-    words[0] = low_low;
-    words[1] = low_high;
-    words[2] = high_low;
-    words[3] = high_high;
-}
-
-uint256_t uint256_from_words(const uint64_t words[4]) {
-    uint256_t result;
-    result.low = uint128_from_words(words[1], words[0]);
-    result.high = uint128_from_words(words[3], words[2]);
-    return result;
-}
+// uint256_to_words and uint256_from_words are now static inline in uint256.h
 
 // ============================================================================
 // Additional utility functions
@@ -502,149 +582,190 @@ uint256_t uint256_clear_bit(const uint256_t* a, unsigned int bit_index) {
 
 uint256_t uint256_exp(const uint256_t* base, const uint256_t* exponent) {
     if (!base || !exponent) return UINT256_ZERO;
-    
+
     if (uint256_is_zero(exponent)) return UINT256_ONE;
     if (uint256_is_zero(base)) return UINT256_ZERO;
-    
+
+    // Find highest set bit to avoid unnecessary squarings
+    int exp_bits = uint256_bit_length(exponent);
+
     uint256_t result = UINT256_ONE;
-    uint256_t base_copy = *base;
-    uint256_t exp_copy = *exponent;
-    
-    // Binary exponentiation
-    while (!uint256_is_zero(&exp_copy)) {
-        if (uint256_get_bit(&exp_copy, 0)) {
-            result = uint256_mul(&result, &base_copy);
-        }
-        base_copy = uint256_mul(&base_copy, &base_copy);
-        exp_copy = uint256_shr(&exp_copy, 1);
+    uint256_t b = *base;
+
+    // Binary exponentiation — iterate over 64-bit words directly
+    uint64_t ew[4];
+    uint256_to_words(exponent, ew);
+
+    for (int bit = 0; bit < exp_bits; bit++) {
+        if (ew[bit >> 6] & (1ULL << (bit & 63)))
+            result = uint256_mul(&result, &b);
+        if (bit + 1 < exp_bits)
+            b = uint256_mul(&b, &b);
     }
-    
+
     return result;
 }
 
 uint256_t uint256_addmod(const uint256_t* a, const uint256_t* b, const uint256_t* mod) {
     if (!a || !b || !mod || uint256_is_zero(mod)) return UINT256_ZERO;
-    
-    // Reduce inputs first
+
+    // Reduce inputs
     uint256_t a_mod = uint256_mod(a, mod);
     uint256_t b_mod = uint256_mod(b, mod);
-    
-    // Try to add them
+
     uint256_t sum;
     bool overflow = uint256_add_overflow(&a_mod, &b_mod, &sum);
-    
-    if (!overflow) {
-        // No overflow, just return sum % mod
-        return uint256_mod(&sum, mod);
+
+    if (!overflow && uint256_is_less(&sum, mod))
+        return sum;
+
+    // Either overflow (true sum = sum + 2^256) or sum >= mod.
+    // Since a_mod, b_mod < mod: true sum < 2*mod, so one subtraction suffices.
+    // When overflow: sum = true_sum mod 2^256, and sum - mod wraps correctly
+    // in unsigned 256-bit arithmetic (gives true_sum - mod).
+    return uint256_sub(&sum, mod);
+}
+
+/**
+ * 512-bit unsigned integer for mulmod intermediate product.
+ * Represented as 8 × 64-bit limbs, little-endian.
+ */
+typedef struct { uint64_t w[8]; } uint512_t;
+
+static uint512_t uint512_from_mul256(const uint256_t *a, const uint256_t *b) {
+    uint64_t aw[4], bw[4];
+    uint256_to_words(a, aw);
+    uint256_to_words(b, bw);
+
+    uint512_t r = {.w = {0}};
+    for (int i = 0; i < 4; i++) {
+        uint64_t carry = 0;
+        for (int j = 0; j < 4; j++) {
+            __uint128_t p = (__uint128_t)aw[i] * bw[j] + r.w[i + j] + carry;
+            r.w[i + j] = (uint64_t)p;
+            carry = (uint64_t)(p >> 64);
+        }
+        r.w[i + 4] = carry;
     }
-    
-    // Overflow occurred. Since a_mod < mod and b_mod < mod,
-    // the mathematical sum a_mod + b_mod is in the range [2^256, 2*mod).
-    // Since overflow occurred, we have: sum = (a_mod + b_mod) mod 2^256
-    // The true mathematical sum is: a_mod + b_mod = sum + 2^256
-    // We want: (a_mod + b_mod) mod mod = (sum + 2^256) mod mod
-    //
-    // Since a_mod + b_mod >= 2^256 and a_mod + b_mod < 2*mod,
-    // and we know that 2^256 > mod (for any reasonable EVM-style mod),
-    // we have (a_mod + b_mod) mod mod = (a_mod + b_mod) - mod
-    //
-    // So we need: (sum + 2^256) - mod = sum + (2^256 - mod)
-    //
-    // Since we can't easily compute 2^256 - mod directly without risking
-    // overflow again, we use a different approach:
-    //
-    // We know that:
-    // - sum = (a_mod + b_mod) mod 2^256 (the truncated result)
-    // - a_mod + b_mod = sum + 2^256 (the true mathematical sum)
-    // - We want (a_mod + b_mod) mod mod = (sum + 2^256) mod mod
-    //
-    // Since a_mod + b_mod < 2*mod and a_mod + b_mod >= 2^256 > mod,
-    // the result is simply (a_mod + b_mod) - mod.
-    //
-    // We can compute this safely:
-    // result = sum + (2^256 mod mod) - mod
-    // But instead of computing 2^256 mod mod explicitly, we use the fact that:
-    // if the sum overflowed, and both operands were < mod, then the
-    // mathematical result modulo mod is: sum + (what we lost due to overflow) mod mod.
-    //
-    // The "what we lost" is 2^256, so we need (sum + 2^256) mod mod.
-    // Since 2^256 ≡ 2^256 mod mod, we need: sum + (2^256 mod mod) mod mod.
-    //
-    // But there's a simpler way. Since both operands are < mod, their sum
-    // is < 2*mod. When overflow occurs, the sum is >= 2^256. Since 2^256 > mod,
-    // the result is (mathematical sum) - mod.
-    //
-    // We compute this by recognizing that the overflow "wraps around":
-    // Since the true sum = sum + 2^256, and we want (true sum) mod mod,
-    // and since true sum >= 2^256 > mod and true sum < 2*mod,
-    // the result is true sum - mod = (sum + 2^256) - mod.
-    //
-    // Now, to compute this without overflow:
-    // We want sum + 2^256 - mod.
-    // Since 2^256 ≡ 0 (mod 2^256), we have 2^256 - mod ≡ -mod (mod 2^256).
-    // In unsigned arithmetic, -mod = 2^256 - mod.
-    // So we want sum + (2^256 - mod) = sum - mod + 2^256.
-    // Since we're working mod 2^256, this becomes sum - mod.
-    // But if sum < mod, this underflows, giving us sum - mod + 2^256,
-    // which is exactly what we want!
-    
-    // Simple approach: compute sum - mod with underflow handling
-    if (uint256_is_greater_equal(&sum, mod)) {
-        // sum >= mod, so sum - mod doesn't underflow
-        return uint256_sub(&sum, mod);
+    return r;
+}
+
+/**
+ * 512-bit mod 256-bit using Knuth schoolbook division.
+ * Only the remainder is needed. Divisor d has at least 1 significant limb.
+ */
+static uint256_t uint512_mod256(const uint512_t *num, const uint256_t *d) {
+    uint64_t dw[4];
+    uint256_to_words(d, dw);
+
+    int n = 4;
+    while (n > 0 && dw[n - 1] == 0) n--;
+
+    /* Divisor fits in 64 bits — fast schoolbook 512÷64 for remainder only */
+    if (n == 1) {
+        uint64_t div = dw[0];
+        uint64_t rem = 0;
+        for (int i = 7; i >= 0; i--) {
+            __uint128_t cur = ((__uint128_t)rem << 64) | num->w[i];
+            rem = (uint64_t)(cur % div);
+        }
+        return uint256_from_uint64(rem);
+    }
+
+    /* General: Knuth Algorithm D, 512÷256 */
+    unsigned s = (unsigned)__builtin_clzll(dw[n - 1]);
+
+    uint64_t vn[4] = {0};
+    if (s > 0) {
+        for (int i = n - 1; i > 0; i--)
+            vn[i] = (dw[i] << s) | (dw[i - 1] >> (64 - s));
+        vn[0] = dw[0] << s;
     } else {
-        // sum < mod, so sum - mod would underflow to sum - mod + 2^256
-        // This is exactly the correction we need!
-        // In two's complement, this is handled automatically
-        uint256_t result = uint256_sub(&sum, mod);
-        return result;
+        for (int i = 0; i < n; i++) vn[i] = dw[i];
     }
+
+    /* Normalized numerator: up to 9 data limbs + 1 sentinel for Knuth D */
+    uint64_t un[10] = {0};
+    if (s > 0) {
+        un[8] = num->w[7] >> (64 - s);
+        for (int i = 7; i > 0; i--)
+            un[i] = (num->w[i] << s) | (num->w[i - 1] >> (64 - s));
+        un[0] = num->w[0] << s;
+    } else {
+        for (int i = 0; i < 8; i++) un[i] = num->w[i];
+    }
+
+    int an = 9;
+    while (an > 0 && un[an - 1] == 0) an--;
+
+    int m = an - n;
+    if (m < 0) {
+        /* num < d — just return num mod 2^256 */
+        uint64_t rw[4] = { num->w[0], num->w[1], num->w[2], num->w[3] };
+        return uint256_from_words(rw);
+    }
+
+    for (int j = m; j >= 0; j--) {
+        __uint128_t numj = ((__uint128_t)un[j + n] << 64) | un[j + n - 1];
+        __uint128_t q_hat = numj / vn[n - 1];
+        __uint128_t r_hat = numj % vn[n - 1];
+
+        while (q_hat >= ((__uint128_t)1 << 64) ||
+               (n >= 2 && q_hat * vn[n - 2] >
+                   ((r_hat << 64) | un[j + n - 2]))) {
+            q_hat--;
+            r_hat += vn[n - 1];
+            if (r_hat >= ((__uint128_t)1 << 64)) break;
+        }
+
+        __int128_t k = 0;
+        for (int i = 0; i < n; i++) {
+            __uint128_t p = (__uint128_t)q_hat * vn[i];
+            __int128_t t = (__int128_t)un[j + i] - (uint64_t)p - k;
+            un[j + i] = (uint64_t)t;
+            k = (__int128_t)(p >> 64) - (t >> 64);
+        }
+        __int128_t t = (__int128_t)un[j + n] - k;
+        un[j + n] = (uint64_t)t;
+
+        if (t < 0) {
+            uint64_t carry = 0;
+            for (int i = 0; i < n; i++) {
+                __uint128_t sum = (__uint128_t)un[j + i] + vn[i] + carry;
+                un[j + i] = (uint64_t)sum;
+                carry = (uint64_t)(sum >> 64);
+            }
+            un[j + n] += carry;
+        }
+    }
+
+    /* De-normalize remainder */
+    uint64_t rw[4] = {0};
+    if (s > 0) {
+        for (int i = 0; i < n - 1; i++)
+            rw[i] = (un[i] >> s) | (un[i + 1] << (64 - s));
+        rw[n - 1] = un[n - 1] >> s;
+    } else {
+        for (int i = 0; i < n; i++) rw[i] = un[i];
+    }
+    return uint256_from_words(rw);
 }
 
 uint256_t uint256_mulmod(const uint256_t* a, const uint256_t* b, const uint256_t* mod) {
     if (!a || !b || !mod || uint256_is_zero(mod)) return UINT256_ZERO;
-    
-    // Handle simple cases
     if (uint256_is_zero(a) || uint256_is_zero(b)) return UINT256_ZERO;
     if (uint256_is_one(a)) return uint256_mod(b, mod);
     if (uint256_is_one(b)) return uint256_mod(a, mod);
-    
-    // For small values where multiplication won't overflow, use direct approach
+
+    // For small values where multiplication won't overflow
     if (a->high == 0 && b->high == 0) {
-        // Both values fit in 128 bits, so their product fits in 256 bits
         uint256_t product = uint128_mul_to_uint256(a->low, b->low);
         return uint256_mod(&product, mod);
     }
-    
-    // For EVM compatibility with large values, use the binary multiplication approach
-    // but we need to be more careful. Let's use the Montgomery-style approach:
-    // We compute (a * b) % mod by simulating the multiplication bit by bit.
-    // 
-    // The key insight is that for a*b, we can represent b in binary and compute:
-    // a * b = a * (b₀ + b₁*2 + b₂*2² + ... + b₂₅₅*2²⁵⁵)
-    //       = a*b₀ + a*b₁*2 + a*b₂*2² + ... + a*b₂₅₅*2²⁵⁵
-    // 
-    // We can compute this by iterating through the bits of b from LSB to MSB,
-    // maintaining a running result and a running "shifted a" value.
-    
-    uint256_t result = UINT256_ZERO;
-    uint256_t shifted_a = uint256_mod(a, mod);  // Start with a reduced modulo mod
-    uint256_t temp_b = *b;
-    
-    while (!uint256_is_zero(&temp_b)) {
-        // If the current bit of b is set, add the current shifted_a to result
-        if (temp_b.low & 1) {
-            result = uint256_addmod(&result, &shifted_a, mod);
-        }
-        
-        // Shift to the next bit: shift b right by 1, and double shifted_a (mod mod)
-        temp_b = uint256_shr(&temp_b, 1);
-        if (!uint256_is_zero(&temp_b)) {  // Only compute if we'll use it
-            shifted_a = uint256_addmod(&shifted_a, &shifted_a, mod);
-        }
-    }
-    
-    return result;
+
+    // Full 512-bit product, then mod
+    uint512_t full = uint512_from_mul256(a, b);
+    return uint512_mod256(&full, mod);
 }
 
 // ============================================================================
@@ -696,25 +817,28 @@ uint256_t uint256_sdiv(const uint256_t* a, const uint256_t* b) {
 
 uint256_t uint256_smod(const uint256_t* a, const uint256_t* b) {
     if (!a || !b || uint256_is_zero(b) || uint256_is_zero(a)) {
-        return UINT256_ZERO; // Division by zero or 0 % anything = 0
+        return UINT256_ZERO;
     }
-    
-    // Check sign bits efficiently  
+
     bool a_negative = (a->high >> 127) & 1;
     bool b_negative = (b->high >> 127) & 1;
-    
-    // Handle the special overflow case: (-2^255) % (-1) = 0
-    if (a_negative && b_negative && 
+
+    // (-2^255) % (-1) = 0
+    if (a_negative && b_negative &&
         a->high == ((uint128_t)1 << 127) && a->low == 0 &&
         b->high == UINT128_MAX && b->low == UINT128_MAX) {
         return UINT256_ZERO;
     }
-    
-    // EVM SMOD semantics: a - (a SDIV b) * b
-    // This is more efficient than converting to absolute values twice
-    uint256_t quotient = uint256_sdiv(a, b);
-    uint256_t product = uint256_mul(&quotient, b);
-    return uint256_sub(a, &product);
+
+    // Convert to absolute values
+    uint256_t abs_a = a_negative ? uint256_sub(&UINT256_ZERO, a) : *a;
+    uint256_t abs_b = b_negative ? uint256_sub(&UINT256_ZERO, b) : *b;
+
+    // Compute remainder directly via unsigned mod (avoids sdiv + mul + sub)
+    uint256_t r = uint256_mod(&abs_a, &abs_b);
+
+    // Result sign follows dividend sign (EVM SMOD semantics)
+    return a_negative ? uint256_sub(&UINT256_ZERO, &r) : r;
 }
 
 bool uint256_slt(const uint256_t* a, const uint256_t* b) {

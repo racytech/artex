@@ -130,6 +130,8 @@ integration_tests/fixtures_3/
 
 # Block data
 data/era1/
+data/chain_replay_*
+data/chain_replay.ckpt
 
 # Root directory test/benchmark files
 /*.c

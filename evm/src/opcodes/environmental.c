@@ -136,25 +136,20 @@ static evm_status_t op_calldatacopy(evm_t *evm)
         return EVM_INVALID_MEMORY_ACCESS;
     }
 
-    // Check if offset is beyond calldata using 256-bit comparison.
-    // This prevents uint64 truncation from causing overflow in offset + i.
+    // Bulk copy into memory — expand already done above
+    uint8_t *dst = evm->memory->data + dest_offset;
     uint256_t input_size_256 = uint256_from_uint64(evm->msg.input_size);
     if (!uint256_lt(&offset_256, &input_size_256)) {
         // Offset >= input_size: all bytes are zero
-        for (uint64_t i = 0; i < size; i++) {
-            evm_memory_write_byte(evm->memory, dest_offset + i, 0);
-        }
+        memset(dst, 0, size);
     } else {
-        // Offset < input_size: safe to convert to uint64
         uint64_t offset = uint256_to_uint64(&offset_256);
-        for (uint64_t i = 0; i < size; i++)
-        {
-            uint8_t byte = 0;
-            if (offset + i < evm->msg.input_size)
-            {
-                byte = evm->msg.input_data[offset + i];
-            }
-            evm_memory_write_byte(evm->memory, dest_offset + i, byte);
+        uint64_t avail = evm->msg.input_size - offset;
+        if (avail >= size) {
+            memcpy(dst, evm->msg.input_data + offset, size);
+        } else {
+            memcpy(dst, evm->msg.input_data + offset, avail);
+            memset(dst + avail, 0, size - avail);
         }
     }
 
@@ -246,19 +241,18 @@ static evm_status_t op_codecopy(evm_t *evm)
                                 (uint64_t)(offset_256.low >> 64) != 0 ||
                                 uint256_to_uint64(&offset_256) >= evm->code_size);
 
+    // Bulk copy into memory — expand already done above
+    uint8_t *dst = evm->memory->data + dest_offset;
     if (offset_out_of_range) {
-        // All bytes are zero — just zero-fill destination
-        for (uint64_t i = 0; i < size; i++) {
-            evm_memory_write_byte(evm->memory, dest_offset + i, 0);
-        }
+        memset(dst, 0, size);
     } else {
         uint64_t offset = uint256_to_uint64(&offset_256);
-        for (uint64_t i = 0; i < size; i++) {
-            uint8_t byte = 0;
-            if (offset + i < evm->code_size) {
-                byte = evm->code[offset + i];
-            }
-            evm_memory_write_byte(evm->memory, dest_offset + i, byte);
+        uint64_t avail = evm->code_size - offset;
+        if (avail >= size) {
+            memcpy(dst, evm->code + offset, size);
+        } else {
+            memcpy(dst, evm->code + offset, avail);
+            memset(dst + avail, 0, size - avail);
         }
     }
 
@@ -288,6 +282,17 @@ static evm_status_t op_returndatacopy(evm_t *evm)
     if (!evm_stack_pop(evm->stack, &size_256))
         return EVM_STACK_UNDERFLOW;
 
+    // EIP-211: check offset + size against RETURNDATASIZE using full uint256
+    // arithmetic BEFORE any truncation. This must revert even when size == 0
+    // if offset > RETURNDATASIZE.
+    {
+        uint256_t rds = uint256_from_uint64(evm->return_data_size);
+        uint256_t end = uint256_add(&offset_256, &size_256);
+        // Check for uint256 overflow or end > return_data_size
+        if (uint256_lt(&end, &offset_256) || uint256_gt(&end, &rds))
+            return EVM_INVALID_MEMORY_ACCESS;
+    }
+
     // Overflow check: impossibly large size or dest_offset means OOG
     if (size_256.high != 0 || (uint64_t)(size_256.low >> 64) != 0)
         return EVM_OUT_OF_GAS;
@@ -297,13 +302,6 @@ static evm_status_t op_returndatacopy(evm_t *evm)
 
     uint64_t dest_offset = uint256_to_uint64(&dest_offset_256);
     uint64_t size = uint256_to_uint64(&size_256);
-
-    // For RETURNDATACOPY, offset must also be checked for bounds against return_data_size.
-    // If offset overflows uint64 but size > 0, it's definitely out of bounds.
-    if (!uint256_is_zero(&size_256) &&
-        (offset_256.high != 0 || (uint64_t)(offset_256.low >> 64) != 0))
-        return EVM_INVALID_MEMORY_ACCESS;
-
     uint64_t offset = uint256_to_uint64(&offset_256);
 
     // Calculate dynamic gas: base + copy cost + memory expansion
@@ -312,12 +310,6 @@ static evm_status_t op_returndatacopy(evm_t *evm)
     if (!evm_use_gas(evm, GAS_VERY_LOW + copy_gas + mem_gas))
     {
         return EVM_OUT_OF_GAS;
-    }
-
-    // Check for overflow and bounds (EIP-211: revert if out of bounds even for size==0)
-    if (offset + size < offset || offset + size > evm->return_data_size)
-    {
-        return EVM_INVALID_MEMORY_ACCESS;
     }
 
     if (size == 0)
@@ -329,11 +321,8 @@ static evm_status_t op_returndatacopy(evm_t *evm)
         return EVM_INVALID_MEMORY_ACCESS;
     }
 
-    // Copy data from return data to memory
-    for (uint64_t i = 0; i < size; i++)
-    {
-        evm_memory_write_byte(evm->memory, dest_offset + i, evm->return_data[offset + i]);
-    }
+    // Bulk copy return data — expand already done above
+    memcpy(evm->memory->data + dest_offset, evm->return_data + offset, size);
 
     return EVM_SUCCESS;
 }
@@ -511,28 +500,20 @@ static evm_status_t op_extcodecopy(evm_t *evm)
         uint32_t code_size = 0;
         const uint8_t *code = evm_state_get_code_ptr(evm->state, &addr, &code_size);
 
-        // Copy code to memory (out of bounds reads return 0)
-        // Check if offset overflows uint64 — if so, all bytes are zero-padded
+        // Bulk copy code to memory — expand already done above
+        uint8_t *dst = evm->memory->data + dest_offset;
         bool offset_out_of_range = (offset_u256.high != 0 ||
                                     (uint64_t)(offset_u256.low >> 64) != 0);
-        if (offset_out_of_range)
-        {
-            for (uint64_t i = 0; i < size; i++)
-                evm_memory_write_byte(evm->memory, dest_offset + i, 0);
-        }
-        else
-        {
+        if (offset_out_of_range || !code) {
+            memset(dst, 0, size);
+        } else {
             uint64_t code_offset = uint256_to_uint64(&offset_u256);
-            for (uint64_t i = 0; i < size; i++)
-            {
-                uint8_t byte = 0;
-                uint64_t src_idx = code_offset + i;
-                // Guard against uint64 overflow wrap-around
-                if (code && src_idx >= code_offset && src_idx < code_size)
-                {
-                    byte = code[src_idx];
-                }
-                evm_memory_write_byte(evm->memory, dest_offset + i, byte);
+            uint64_t avail = (code_offset < code_size) ? code_size - code_offset : 0;
+            if (avail >= size) {
+                memcpy(dst, code + code_offset, size);
+            } else {
+                if (avail > 0) memcpy(dst, code + code_offset, avail);
+                memset(dst + avail, 0, size - avail);
             }
         }
     }

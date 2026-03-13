@@ -22,6 +22,10 @@ extern bool g_trace_calls __attribute__((weak));
 #define SLOT_KEY_SIZE      52   // addr[20] + slot[32]
 #define MAX_CODE_SIZE      (24 * 1024 + 1)  // EIP-170: 24576 bytes
 
+// Forward declarations for RLP helpers (defined later, needed by compaction)
+static size_t rlp_byte_hdr(const uint8_t *buf, size_t buf_len, size_t *data_len);
+static size_t rlp_list_hdr(const uint8_t *buf, size_t buf_len, size_t *payload_len);
+
 // ============================================================================
 // Internal types
 // ============================================================================
@@ -29,23 +33,26 @@ extern bool g_trace_calls __attribute__((weak));
 // --- Account cache ---
 
 typedef struct cached_account {
-    address_t  addr;            // key (20 bytes) — kept for finalize/revert
+    /* --- Cache line 1: hot fields (accessed every tx) --- */
     uint64_t   nonce;
-    uint256_t  balance;
-    hash_t     code_hash;
-    bool       has_code;
+    uint256_t  balance;         // 32 bytes
+    bool dirty;
+    bool block_dirty;           // survives commit_tx, cleared at block end
+    bool existed;               // existed in backing store before
+    bool mpt_dirty;             // needs update in account_mpt
+    bool storage_dirty;         // any storage slot changed (for mpt_store)
+    bool has_code;
+    bool created;               // newly created this execution
+    bool self_destructed;
+    bool code_dirty;
+    bool block_code_dirty;      // same for code
     uint8_t   *code;            // loaded bytecode (NULL until needed)
     uint32_t   code_size;
-    bool dirty;
-    bool code_dirty;
-    bool block_dirty;           // survives commit_tx, cleared at block end
-    bool block_code_dirty;      // same for code
-    bool created;               // newly created this execution
-    bool existed;               // existed in backing store before
-    bool self_destructed;
-    bool storage_dirty;         // any storage slot changed (for mpt_store)
-    bool mpt_dirty;             // needs update in account_mpt (cleared after compute_mpt_root)
-    hash_t storage_root;        // cached storage root (avoids recomputation for clean accounts)
+    /* --- Cache line 2+: cold fields --- */
+    address_t  addr;            // key (20 bytes) — kept for finalize/revert
+    hash_t     code_hash;       // 32 bytes
+    hash_t     storage_root;    // cached storage root (avoids recomputation for clean accounts)
+    hash_t     addr_hash;       // cached keccak256(addr) — computed once on first load
 } cached_account_t;
 
 // --- Storage cache ---
@@ -57,6 +64,7 @@ typedef struct cached_slot {
     bool dirty;
     bool block_dirty;           // survives commit_tx, cleared at block end
     bool mpt_dirty;             // needs update in storage mpt_store (cleared after storage root compute)
+    hash_t slot_hash;           // cached keccak256(slot_be) — computed once on first load
 } cached_slot_t;
 
 // --- Journal ---
@@ -103,6 +111,67 @@ typedef struct {
     } data;
 } journal_entry_t;
 
+// --- Dirty tracking lists (avoid full cache scan at compute_mpt_root time) ---
+// Store keys (not pointers) because mem_art uses a realloc'd arena — pointers
+// become dangling when the arena grows.
+
+typedef struct {
+    uint8_t  *keys;       // packed addr[20] keys
+    size_t    count;
+    size_t    cap;
+} dirty_account_vec_t;
+
+typedef struct {
+    uint8_t  *keys;       // packed skey[52] keys (addr[20] || slot[32])
+    size_t    count;
+    size_t    cap;
+} dirty_slot_vec_t;
+
+#define DIRTY_VEC_INIT_CAP 64
+#define ADDRESS_KEY_SIZE 20
+
+static inline void dirty_account_push(dirty_account_vec_t *v, const uint8_t *addr) {
+    if (v->count >= v->cap) {
+        size_t nc = v->cap ? v->cap * 2 : DIRTY_VEC_INIT_CAP;
+        uint8_t *nk = realloc(v->keys, nc * ADDRESS_KEY_SIZE);
+        if (!nk) return;
+        v->keys = nk; v->cap = nc;
+    }
+    memcpy(v->keys + v->count * ADDRESS_KEY_SIZE, addr, ADDRESS_KEY_SIZE);
+    v->count++;
+}
+
+static inline void dirty_slot_push(dirty_slot_vec_t *v, const uint8_t *skey) {
+    if (v->count >= v->cap) {
+        size_t nc = v->cap ? v->cap * 2 : DIRTY_VEC_INIT_CAP;
+        uint8_t *nk = realloc(v->keys, nc * SLOT_KEY_SIZE);
+        if (!nk) return;
+        v->keys = nk; v->cap = nc;
+    }
+    memcpy(v->keys + v->count * SLOT_KEY_SIZE, skey, SLOT_KEY_SIZE);
+    v->count++;
+}
+
+static inline void dirty_account_clear(dirty_account_vec_t *v) {
+    v->count = 0;  // keep allocation for reuse
+}
+
+static inline void dirty_slot_clear(dirty_slot_vec_t *v) {
+    v->count = 0;
+}
+
+static inline void dirty_account_free(dirty_account_vec_t *v) {
+    free(v->keys);
+    v->keys = NULL;
+    v->count = v->cap = 0;
+}
+
+static inline void dirty_slot_free(dirty_slot_vec_t *v) {
+    free(v->keys);
+    v->keys = NULL;
+    v->count = v->cap = 0;
+}
+
 // --- Main struct ---
 
 struct evm_state {
@@ -118,6 +187,7 @@ struct evm_state {
     mem_art_t         warm_slots;   // key: skey[52], value: (none, 0 bytes)
     mem_art_t         transient;    // key: skey[52], value: uint256_t (EIP-1153)
     bool              batch_mode;   // skip per-block verkle flush, defer to checkpoint
+    bool              discard_on_destroy; // skip MPT flush on destroy (set after failed block)
 #ifdef ENABLE_VERKLE
     witness_gas_t     witness_gas;  // EIP-4762 verkle witness gas tracker
 #endif
@@ -125,6 +195,8 @@ struct evm_state {
     mpt_store_t      *account_mpt;  // persistent incremental account trie
     mpt_store_t      *storage_mpt;  // shared store for all per-account storage tries
     code_store_t     *code_store;   // content-addressed bytecode store (not owned)
+    dirty_account_vec_t dirty_accounts; // accounts with mpt_dirty=true
+    dirty_slot_vec_t    dirty_slots;    // slots with mpt_dirty=true
 #endif
 };
 
@@ -135,6 +207,23 @@ struct evm_state {
 static bool mpt_rlp_decode_account(const uint8_t *rlp, size_t len,
                                      cached_account_t *ca);
 static uint256_t mpt_rlp_decode_storage_value(const uint8_t *rlp, size_t len);
+
+// Mark account as MPT-dirty and track it for fast iteration.
+// Only appends to the dirty list on the first mark (idempotent).
+static inline void mark_account_mpt_dirty(evm_state_t *es, cached_account_t *ca) {
+    if (!ca->mpt_dirty) {
+        ca->mpt_dirty = true;
+        dirty_account_push(&es->dirty_accounts, ca->addr.bytes);
+    }
+}
+
+// Mark slot as MPT-dirty and track it for fast iteration.
+static inline void mark_slot_mpt_dirty(evm_state_t *es, cached_slot_t *cs) {
+    if (!cs->mpt_dirty) {
+        cs->mpt_dirty = true;
+        dirty_slot_push(&es->dirty_slots, cs->key);
+    }
+}
 #endif
 
 // ============================================================================
@@ -202,13 +291,13 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
 #endif
 
     ca_local.storage_root = HASH_EMPTY_STORAGE;
+    ca_local.addr_hash = hash_keccak256(addr->bytes, 20);
 
 #ifdef ENABLE_MPT
     // Read-through: load account from persistent MPT store on cache miss
     if (es->account_mpt) {
-        hash_t addr_hash = hash_keccak256(addr->bytes, 20);
         uint8_t rlp_buf[256];
-        uint32_t rlp_len = mpt_store_get(es->account_mpt, addr_hash.bytes,
+        uint32_t rlp_len = mpt_store_get(es->account_mpt, ca_local.addr_hash.bytes,
                                           rlp_buf, sizeof(rlp_buf));
         if (rlp_len > 0 && rlp_len <= sizeof(rlp_buf)) {
             mpt_rlp_decode_account(rlp_buf, rlp_len, &ca_local);
@@ -216,12 +305,9 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
     }
 #endif
 
-    if (!mem_art_insert(&es->accounts, addr->bytes, ADDRESS_SIZE,
-                        &ca_local, sizeof(cached_account_t)))
-        return NULL;
-
-    return (cached_account_t *)mem_art_get_mut(
-        &es->accounts, addr->bytes, ADDRESS_SIZE, NULL);
+    return (cached_account_t *)mem_art_upsert(
+        &es->accounts, addr->bytes, ADDRESS_SIZE,
+        &ca_local, sizeof(cached_account_t));
 }
 
 // Load storage slot into cache. From verkle_state if enabled, else zero.
@@ -253,16 +339,16 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
 #endif
 
 #ifdef ENABLE_MPT
+    // Compute and cache keccak256(slot_be) — reused at MPT write time
+    cs_local.slot_hash = hash_keccak256(skey + 20, 32);
+
     // Read-through: load storage slot from persistent storage MPT on cache miss
     if (es->storage_mpt) {
         cached_account_t *ca = ensure_account(es, addr);
         if (ca && memcmp(ca->storage_root.bytes, HASH_EMPTY_STORAGE.bytes, 32) != 0) {
             mpt_store_set_root(es->storage_mpt, ca->storage_root.bytes);
-            uint8_t slot_be[32];
-            uint256_to_bytes(slot, slot_be);
-            hash_t slot_hash = hash_keccak256(slot_be, 32);
             uint8_t val_rlp[64];
-            uint32_t val_len = mpt_store_get(es->storage_mpt, slot_hash.bytes,
+            uint32_t val_len = mpt_store_get(es->storage_mpt, cs_local.slot_hash.bytes,
                                               val_rlp, sizeof(val_rlp));
             if (val_len > 0 && val_len <= sizeof(val_rlp)) {
                 cs_local.original = mpt_rlp_decode_storage_value(val_rlp, val_len);
@@ -272,12 +358,9 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
     }
 #endif
 
-    if (!mem_art_insert(&es->storage, skey, SLOT_KEY_SIZE,
-                        &cs_local, sizeof(cached_slot_t)))
-        return NULL;
-
-    return (cached_slot_t *)mem_art_get_mut(
-        &es->storage, skey, SLOT_KEY_SIZE, NULL);
+    return (cached_slot_t *)mem_art_upsert(
+        &es->storage, skey, SLOT_KEY_SIZE,
+        &cs_local, sizeof(cached_slot_t));
 }
 
 // ============================================================================
@@ -395,6 +478,11 @@ void evm_state_evict_cache(evm_state_t *es) {
     mem_art_destroy(&es->storage);
     mem_art_init(&es->accounts);
     mem_art_init(&es->storage);
+#ifdef ENABLE_MPT
+    /* Pointers into the old trees are now invalid */
+    dirty_account_clear(&es->dirty_accounts);
+    dirty_slot_clear(&es->dirty_slots);
+#endif
 }
 
 void evm_state_flush(evm_state_t *es) {
@@ -402,6 +490,80 @@ void evm_state_flush(evm_state_t *es) {
 #ifdef ENABLE_MPT
     if (es->account_mpt) mpt_store_flush(es->account_mpt);
     if (es->storage_mpt) mpt_store_flush(es->storage_mpt);
+#endif
+}
+
+#ifdef ENABLE_MPT
+// Collect non-empty storage roots from account trie leaves (RLP-encoded accounts)
+typedef struct {
+    uint8_t (*roots)[32];
+    size_t count;
+    size_t cap;
+} collect_roots_ctx_t;
+
+static bool collect_storage_root_from_leaf(const uint8_t *value, size_t value_len,
+                                            void *user_data) {
+    /* Account RLP: [nonce, balance, storage_root, code_hash]
+     * storage_root is 32 bytes preceded by 0xa0. We need to find it
+     * by skipping nonce and balance fields. */
+    size_t payload_len;
+    size_t hdr = rlp_list_hdr(value, value_len, &payload_len);
+    if (hdr == 0 || hdr + payload_len > value_len) return true; /* skip malformed */
+
+    const uint8_t *p = value + hdr;
+    const uint8_t *end = p + payload_len;
+
+    /* Skip nonce */
+    size_t item_len;
+    size_t off = rlp_byte_hdr(p, (size_t)(end - p), &item_len);
+    p += off + item_len;
+    if (p >= end) return true;
+
+    /* Skip balance */
+    off = rlp_byte_hdr(p, (size_t)(end - p), &item_len);
+    p += off + item_len;
+    if (p + 33 > end) return true;
+
+    /* storage_root: 0xa0 + 32 bytes */
+    if (p[0] != 0xa0) return true;
+    const uint8_t *sr = p + 1;
+
+    /* Skip empty storage root */
+    if (memcmp(sr, HASH_EMPTY_STORAGE.bytes, 32) == 0)
+        return true;
+
+    collect_roots_ctx_t *ctx = (collect_roots_ctx_t *)user_data;
+    if (ctx->count >= ctx->cap) {
+        size_t nc = ctx->cap ? ctx->cap * 2 : 1024;
+        uint8_t (*nr)[32] = realloc(ctx->roots, nc * sizeof(*nr));
+        if (!nr) return false;
+        ctx->roots = nr; ctx->cap = nc;
+    }
+    memcpy(ctx->roots[ctx->count++], sr, 32);
+    return true;
+}
+#endif
+
+void evm_state_compact_storage(evm_state_t *es) {
+#ifdef ENABLE_MPT
+    if (!es || !es->storage_mpt || !es->account_mpt) return;
+
+    /* Walk ALL account trie leaves on disk to collect every live storage root.
+     * The in-memory cache may not contain all accounts (evicted at checkpoints),
+     * so we must walk the persisted account trie to avoid deleting live storage
+     * nodes during compaction. */
+    collect_roots_ctx_t ctx = {0};
+    mpt_store_walk_leaves(es->account_mpt, collect_storage_root_from_leaf, &ctx);
+
+    if (ctx.count > 0) {
+        fprintf(stderr, "Compacting storage MPT: %zu live roots...\n", ctx.count);
+        mpt_store_compact_roots(es->storage_mpt,
+                                (const uint8_t (*)[32])ctx.roots, ctx.count);
+        fprintf(stderr, "Storage MPT compaction done\n");
+    }
+    free(ctx.roots);
+#else
+    (void)es;
 #endif
 }
 
@@ -434,15 +596,20 @@ void evm_state_destroy(evm_state_t *es) {
     if (!es) return;
 
 #ifdef ENABLE_MPT
-    // Flush deferred writes and destroy persistent MPT stores
+    // Flush deferred writes and destroy persistent MPT stores.
+    // Skip flush if discard_on_destroy is set (failed block — don't corrupt disk state).
     if (es->account_mpt) {
-        mpt_store_flush(es->account_mpt);
+        if (!es->discard_on_destroy)
+            mpt_store_flush(es->account_mpt);
         mpt_store_destroy(es->account_mpt);
     }
     if (es->storage_mpt) {
-        mpt_store_flush(es->storage_mpt);
+        if (!es->discard_on_destroy)
+            mpt_store_flush(es->storage_mpt);
         mpt_store_destroy(es->storage_mpt);
     }
+    dirty_account_free(&es->dirty_accounts);
+    dirty_slot_free(&es->dirty_slots);
 #endif
 
     // Free code pointers owned by cached accounts
@@ -471,9 +638,18 @@ void evm_state_destroy(evm_state_t *es) {
     free(es);
 }
 
+void evm_state_discard_pending(evm_state_t *es) {
+    if (es) es->discard_on_destroy = true;
+}
+
 // ============================================================================
 // Account Existence
 // ============================================================================
+
+void evm_state_prefetch_account(evm_state_t *es, const address_t *addr) {
+    if (!es || !addr) return;
+    mem_art_prefetch(&es->accounts, addr->bytes, ADDRESS_SIZE);
+}
 
 bool evm_state_exists(evm_state_t *es, const address_t *addr) {
     if (!es || !addr) return false;
@@ -525,7 +701,7 @@ void evm_state_set_nonce(evm_state_t *es, const address_t *addr, uint64_t nonce)
     ca->nonce = nonce;
     ca->dirty = true;
     ca->block_dirty = true;
-    ca->mpt_dirty = true;
+    mark_account_mpt_dirty(es, ca);
 }
 
 void evm_state_increment_nonce(evm_state_t *es, const address_t *addr) {
@@ -561,7 +737,7 @@ void evm_state_set_balance(evm_state_t *es, const address_t *addr,
     ca->balance = *balance;
     ca->dirty = true;
     ca->block_dirty = true;
-    ca->mpt_dirty = true;
+    mark_account_mpt_dirty(es, ca);
 }
 
 void evm_state_add_balance(evm_state_t *es, const address_t *addr,
@@ -608,6 +784,20 @@ uint32_t evm_state_get_code_size(evm_state_t *es, const address_t *addr) {
 #ifdef ENABLE_VERKLE
     // Load code size from verkle_state
     ca->code_size = (uint32_t)verkle_state_get_code_size(es->vs, addr->bytes);
+#elif defined(ENABLE_MPT)
+    // Load code from code_store to get the size (also caches the code)
+    if (es->code_store && ca->code_size == 0) {
+        uint32_t size = code_store_get_size(es->code_store,
+                                             ca->code_hash.bytes);
+        if (size > 0) {
+            ca->code = malloc(size);
+            if (ca->code) {
+                code_store_get(es->code_store, ca->code_hash.bytes,
+                               ca->code, size);
+                ca->code_size = size;
+            }
+        }
+    }
 #endif
     return ca->code_size;
 }
@@ -745,11 +935,16 @@ void evm_state_set_code(evm_state_t *es, const address_t *addr,
             .old_code_size = ca->code_size
         }
     };
-    journal_push(es, &je);
-
-    // Old code ownership transferred to journal — don't free
-    ca->code = NULL;
-    ca->code_size = 0;
+    if (!journal_push(es, &je)) {
+        // journal_push failed — ownership was NOT transferred, free old code
+        free(ca->code);
+        ca->code = NULL;
+        ca->code_size = 0;
+    } else {
+        // Old code ownership transferred to journal — don't free
+        ca->code = NULL;
+        ca->code_size = 0;
+    }
 
     if (code && len > 0) {
         ca->code = malloc(len);
@@ -772,7 +967,7 @@ void evm_state_set_code(evm_state_t *es, const address_t *addr,
     ca->code_dirty = true;
     ca->block_dirty = true;
     ca->block_code_dirty = true;
-    ca->mpt_dirty = true;
+    mark_account_mpt_dirty(es, ca);
 }
 
 // ============================================================================
@@ -795,6 +990,24 @@ uint256_t evm_state_get_committed_storage(evm_state_t *es, const address_t *addr
     return cs->original;
 }
 
+void evm_state_get_storage_pair(evm_state_t *es, const address_t *addr,
+                                const uint256_t *key,
+                                uint256_t *current, uint256_t *original) {
+    if (!es || !addr || !key) {
+        if (current) *current = UINT256_ZERO_INIT;
+        if (original) *original = UINT256_ZERO_INIT;
+        return;
+    }
+    cached_slot_t *cs = ensure_slot(es, addr, key);
+    if (!cs) {
+        if (current) *current = UINT256_ZERO_INIT;
+        if (original) *original = UINT256_ZERO_INIT;
+        return;
+    }
+    if (current) *current = cs->current;
+    if (original) *original = cs->original;
+}
+
 void evm_state_set_storage(evm_state_t *es, const address_t *addr,
                            const uint256_t *key, const uint256_t *value) {
     if (!es || !addr || !key || !value) return;
@@ -815,18 +1028,27 @@ void evm_state_set_storage(evm_state_t *es, const address_t *addr,
     cs->current = *value;
     cs->dirty = true;
     cs->block_dirty = true;
-    cs->mpt_dirty = true;
+    mark_slot_mpt_dirty(es, cs);
 
     // Mark the owning account as having dirty storage (for mpt_store)
     cached_account_t *ca = ensure_account(es, addr);
     if (ca) {
         ca->storage_dirty = true;
-        ca->mpt_dirty = true;
+        mark_account_mpt_dirty(es, ca);
     }
 }
 
 bool evm_state_has_storage(evm_state_t *es, const address_t *addr) {
     if (!es || !addr) return false;
+
+#ifdef ENABLE_MPT
+    // Fast path: check cached storage_root from the account.
+    // After cache eviction, in-memory slots are gone but the account's
+    // storage_root (loaded from the MPT) tells us if storage exists on disk.
+    cached_account_t *ca = ensure_account(es, addr);
+    if (ca && memcmp(ca->storage_root.bytes, HASH_EMPTY_STORAGE.bytes, 32) != 0)
+        return true;
+#endif
 
     // Scan the storage cache for any entry belonging to this address
     mem_art_iterator_t *iter = mem_art_iterator_create(&es->storage);
@@ -927,7 +1149,10 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
             .old_storage_dirty  = ca->storage_dirty,
         },
     };
-    journal_push(es, &je);
+    if (!journal_push(es, &je)) {
+        // journal_push failed — ownership NOT transferred, free old code
+        free(ca->code);
+    }
 
     // Reset account: preserve existing balance per Ethereum spec.
     // CREATE/CREATE2 preserves any pre-existing ether at the target address.
@@ -936,12 +1161,12 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
     ca->balance = existing_balance;
     ca->code_hash = hash_zero();
     ca->has_code = false;
-    ca->code = NULL;          // ownership moved to journal entry
+    ca->code = NULL;          // ownership moved to journal entry (or freed above)
     ca->code_size = 0;
     ca->created = true;
     ca->dirty = true;
     ca->block_dirty = true;
-    ca->mpt_dirty = true;
+    mark_account_mpt_dirty(es, ca);
     ca->code_dirty = false;
     ca->self_destructed = false;
     ca->storage_root = HASH_EMPTY_STORAGE;
@@ -967,7 +1192,7 @@ void evm_state_self_destruct(evm_state_t *es, const address_t *addr) {
     ca->self_destructed = true;
     ca->dirty = true;
     ca->block_dirty = true;
-    ca->mpt_dirty = true;
+    mark_account_mpt_dirty(es, ca);
 }
 
 bool evm_state_is_self_destructed(evm_state_t *es, const address_t *addr) {
@@ -1772,40 +1997,6 @@ typedef struct {
     size_t count, cap;
 } mpt_storage_vec_t;
 
-// Collect mpt_dirty slots for incremental storage root computation.
-// Clears mpt_dirty during collection.
-static bool mpt_collect_dirty_slot_cb(const uint8_t *key, size_t key_len,
-                                       const void *value, size_t value_len,
-                                       void *user_data) {
-    (void)key_len; (void)value_len;
-    cached_slot_t *cs = (cached_slot_t *)(uintptr_t)value;
-    if (!cs->mpt_dirty) return true;
-
-    mpt_storage_vec_t *v = (mpt_storage_vec_t *)user_data;
-    if (v->count >= v->cap) {
-        size_t nc = v->cap ? v->cap * 2 : 256;
-        mpt_storage_entry_t *ne = realloc(v->entries, nc * sizeof(*ne));
-        if (!ne) return false;
-        v->entries = ne; v->cap = nc;
-    }
-    mpt_storage_entry_t *e = &v->entries[v->count++];
-    memcpy(e->addr, key, 20);
-    hash_t h = hash_keccak256(key + 20, 32);
-    memcpy(e->slot_hash, h.bytes, 32);
-
-    if (uint256_is_zero(&cs->current)) {
-        e->value_len = 0;  // delete from trie
-    } else {
-        uint8_t vbe[32];
-        uint256_to_bytes(&cs->current, vbe);
-        e->value_len = (uint8_t)mpt_rlp_be(vbe, 32, e->value_rlp);
-    }
-
-    cs->mpt_dirty = false;   // clear only after successful collection
-    cs->block_dirty = false;  // block_dirty always set alongside mpt_dirty
-    return true;
-}
-
 static int cmp_storage_by_addr(const void *a, const void *b) {
     return memcmp(((const mpt_storage_entry_t *)a)->addr,
                   ((const mpt_storage_entry_t *)b)->addr, 20);
@@ -1880,6 +2071,31 @@ static bool debug_dump_all_slot_cb(const uint8_t *key, size_t key_len,
     fprintf(stderr, "\n");
     return true;
 }
+void evm_state_print_mpt_stats(evm_state_t *es) {
+#ifdef ENABLE_MPT
+    if (!es) return;
+    const char *names[] = {"account", "storage"};
+    mpt_store_t *stores[] = {es->account_mpt, es->storage_mpt};
+    for (int i = 0; i < 2; i++) {
+        if (!stores[i]) continue;
+        mpt_store_stats_t st = mpt_store_stats(stores[i]);
+        uint64_t total = st.cache_hits + st.cache_misses;
+        double hit_rate = total > 0 ? 100.0 * st.cache_hits / total : 0;
+        fprintf(stderr,
+            "  %s MPT: %llu nodes, cache %u/%u (%.1f%% hit), "
+            "pinned=%u, evict_skipped=%llu, free=%llu B\n",
+            names[i],
+            (unsigned long long)st.node_count,
+            st.cache_count, st.cache_capacity, hit_rate,
+            st.cache_pinned,
+            (unsigned long long)st.cache_evict_skipped,
+            (unsigned long long)st.free_bytes);
+    }
+#else
+    (void)es;
+#endif
+}
+
 void evm_state_debug_dump(evm_state_t *es) {
     fprintf(stderr, "=== EVM STATE DUMP (all non-trivial accounts) ===\n");
     mem_art_foreach(&es->accounts, debug_dump_all_acct_cb, NULL);
@@ -1942,22 +2158,39 @@ void evm_state_dump_mpt(evm_state_t *es, const char *path) {
     fprintf(stderr, "MPT state dumped to %s\n", path);
 }
 
-// Post-pass: clear storage_dirty after storage roots have been computed.
-static bool clear_storage_dirty_cb(const uint8_t *key, size_t key_len,
-                                    const void *value, size_t value_len,
-                                    void *user_data) {
-    (void)key; (void)key_len; (void)value_len; (void)user_data;
-    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
-    ca->storage_dirty = false;
-    return true;
-}
-
 // Compute storage roots incrementally using shared storage mpt_store.
-// Collects mpt_dirty slots, groups by account, applies incremental updates.
+// Iterates the dirty_slots list (O(dirty)) instead of scanning all cached slots.
 static void compute_all_storage_roots(evm_state_t *es) {
-    // 1. Single pass: collect all mpt_dirty slots
+    // 1. Resolve dirty slot keys to mpt_storage_entry_t for sorting/grouping
     mpt_storage_vec_t sv = {0};
-    mem_art_foreach(&es->storage, mpt_collect_dirty_slot_cb, &sv);
+    for (size_t d = 0; d < es->dirty_slots.count; d++) {
+        const uint8_t *skey = es->dirty_slots.keys + d * SLOT_KEY_SIZE;
+        cached_slot_t *cs = (cached_slot_t *)mem_art_get_mut(
+            &es->storage, skey, SLOT_KEY_SIZE, NULL);
+        if (!cs || !cs->mpt_dirty) continue;  // gone or already cleared
+
+        if (sv.count >= sv.cap) {
+            size_t nc = sv.cap ? sv.cap * 2 : 256;
+            mpt_storage_entry_t *ne = realloc(sv.entries, nc * sizeof(*ne));
+            if (!ne) break;
+            sv.entries = ne; sv.cap = nc;
+        }
+        mpt_storage_entry_t *e = &sv.entries[sv.count++];
+        memcpy(e->addr, skey, 20);
+        memcpy(e->slot_hash, cs->slot_hash.bytes, 32);  // cached keccak256
+
+        if (uint256_is_zero(&cs->current)) {
+            e->value_len = 0;  // delete from trie
+        } else {
+            uint8_t vbe[32];
+            uint256_to_bytes(&cs->current, vbe);
+            e->value_len = (uint8_t)mpt_rlp_be(vbe, 32, e->value_rlp);
+        }
+
+        cs->mpt_dirty = false;
+        cs->block_dirty = false;
+    }
+    dirty_slot_clear(&es->dirty_slots);
 
     if (sv.count == 0) {
         free(sv.entries);
@@ -2000,73 +2233,18 @@ static void compute_all_storage_roots(evm_state_t *es) {
             goto clear;
         }
         mpt_store_root(es->storage_mpt, ca->storage_root.bytes);
-
     }
 
     free(sv.entries);
 
 clear:
-    // 4. Clear storage_dirty on all accounts
-    mem_art_foreach(&es->accounts, clear_storage_dirty_cb, NULL);
-}
-
-// Context for incremental MPT update callback
-typedef struct {
-    mpt_store_t  *mpt;
-    bool          prune_empty;
-    size_t        updated;
-    size_t        deleted;
-} mpt_incr_ctx_t;
-
-// Callback: for each mpt-dirty account, update account_mpt.
-// Also promotes block_dirty accounts to existed=true (handles miner reward,
-// uncle rewards, withdrawals — state changes that bypass commit_tx).
-static bool mpt_incr_update_cb(const uint8_t *key, size_t key_len,
-                                const void *value, size_t value_len,
-                                void *user_data) {
-    (void)key_len; (void)value_len;
-    mpt_incr_ctx_t *ctx = (mpt_incr_ctx_t *)user_data;
-    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
-
-    // Only process accounts that were modified since last MPT root computation
-    if (!ca->mpt_dirty)
-        return true;
-
-    // Promote block_dirty accounts to existed (equivalent of commit_tx promotion
-    // for direct state changes like miner reward/withdrawals that skip commit_tx)
-    if (ca->block_dirty && !ca->self_destructed) {
-        bool is_empty_check = (ca->nonce == 0 &&
-                               uint256_is_zero(&ca->balance) &&
-                               !ca->has_code);
-        if (!(!ca->existed && !ca->created && is_empty_check && ctx->prune_empty))
-            ca->existed = true;
+    // 4. Clear storage_dirty on dirty accounts only
+    for (size_t d = 0; d < es->dirty_accounts.count; d++) {
+        const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+            &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
+        if (ca) ca->storage_dirty = false;
     }
-
-    // Compute keccak256(address) — the trie key
-    hash_t addr_hash = hash_keccak256(ca->addr.bytes, 20);
-
-    // Use cached storage root directly from account struct
-    const uint8_t *sr = ca->storage_root.bytes;
-
-    const uint8_t *code_hash = ca->has_code
-        ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
-
-    // Check if account should be pruned (EIP-161)
-    bool is_empty = (ca->nonce == 0 &&
-                     uint256_is_zero(&ca->balance) &&
-                     !ca->has_code &&
-                     memcmp(sr, HASH_EMPTY_STORAGE.bytes, 32) == 0);
-
-    if (!ca->existed || (is_empty && ctx->prune_empty)) {
-        mpt_store_delete(ctx->mpt, addr_hash.bytes);
-        ctx->deleted++;
-    } else {
-        uint8_t rlp[120];
-        size_t rlp_len = mpt_rlp_account(ca->nonce, &ca->balance, sr, code_hash, rlp);
-        mpt_store_update(ctx->mpt, addr_hash.bytes, rlp, rlp_len);
-        ctx->updated++;
-    }
-    return true;
 }
 
 // Clear mpt_dirty and block_dirty flags after incremental MPT root computation.
@@ -2116,9 +2294,8 @@ static bool batch_collect_slot_cb(const uint8_t *key, size_t key_len,
         ctx->cap = nc;
     }
 
-    // Key: keccak256(slot_be) — cs->key+20 already has big-endian slot bytes
-    hash_t slot_hash = hash_keccak256(cs->key + 20, 32);
-    memcpy(ctx->entries[ctx->count].key, slot_hash.bytes, 32);
+    // Key: cached keccak256(slot_be)
+    memcpy(ctx->entries[ctx->count].key, cs->slot_hash.bytes, 32);
 
     // Value: RLP(trimmed big-endian)
     uint8_t val_be[32];
@@ -2179,9 +2356,8 @@ static bool batch_collect_account_cb(const uint8_t *key, size_t key_len,
         ctx->cap = nc;
     }
 
-    // Key: keccak256(address)
-    hash_t addr_hash = hash_keccak256(ca->addr.bytes, 20);
-    memcpy(ctx->entries[ctx->count].key, addr_hash.bytes, 32);
+    // Key: cached keccak256(address)
+    memcpy(ctx->entries[ctx->count].key, ca->addr_hash.bytes, 32);
 
     // Value: RLP([nonce, balance, storage_root, code_hash])
     uint8_t *rlp = malloc(120);
@@ -2240,11 +2416,44 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
             return root;
         }
 
-        mpt_incr_ctx_t ctx = {
-            .mpt = es->account_mpt,
-            .prune_empty = prune_empty,
-        };
-        mem_art_foreach(&es->accounts, mpt_incr_update_cb, &ctx);
+        // Iterate dirty account list directly — O(dirty) instead of O(total_cached)
+        for (size_t d = 0; d < es->dirty_accounts.count; d++) {
+            const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+                &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
+            if (!ca || !ca->mpt_dirty) continue;  // gone or cleared by revert
+
+            // Promote block_dirty accounts to existed
+            if (ca->block_dirty && !ca->self_destructed) {
+                bool is_empty_check = (ca->nonce == 0 &&
+                                       uint256_is_zero(&ca->balance) &&
+                                       !ca->has_code);
+                if (!(!ca->existed && !ca->created && is_empty_check && prune_empty))
+                    ca->existed = true;
+            }
+
+            const uint8_t *sr = ca->storage_root.bytes;
+            const uint8_t *code_hash = ca->has_code
+                ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
+
+            bool is_empty = (ca->nonce == 0 &&
+                             uint256_is_zero(&ca->balance) &&
+                             !ca->has_code &&
+                             memcmp(sr, HASH_EMPTY_STORAGE.bytes, 32) == 0);
+
+            if (!ca->existed || (is_empty && prune_empty)) {
+                mpt_store_delete(es->account_mpt, ca->addr_hash.bytes);
+            } else {
+                uint8_t rlp[120];
+                size_t rlp_len = mpt_rlp_account(ca->nonce, &ca->balance, sr, code_hash, rlp);
+                mpt_store_update(es->account_mpt, ca->addr_hash.bytes, rlp, rlp_len);
+            }
+
+            ca->mpt_dirty = false;
+            ca->block_dirty = false;
+            ca->block_code_dirty = false;
+        }
+        dirty_account_clear(&es->dirty_accounts);
 
         if (!mpt_store_commit_batch(es->account_mpt)) {
             fprintf(stderr, "FATAL: mpt_store_commit_batch failed for account trie\n");
@@ -2252,7 +2461,6 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
         }
 
         mpt_store_root(es->account_mpt, root.bytes);
-        mem_art_foreach(&es->accounts, clear_mpt_dirty_cb, NULL);
         return root;
     }
 
@@ -2279,6 +2487,8 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     free(ctx.rlp_bufs);
 
     mem_art_foreach(&es->accounts, clear_mpt_dirty_cb, NULL);
+    dirty_account_clear(&es->dirty_accounts);
+    dirty_slot_clear(&es->dirty_slots);
 #else
     fprintf(stderr, "FATAL: compute_mpt_root called without mpt_store (ENABLE_MEM_MPT not compiled)\n");
 #endif

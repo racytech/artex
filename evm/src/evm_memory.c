@@ -68,12 +68,12 @@ void evm_memory_reset(evm_memory_t *mem)
     if (!mem)
         return;
 
-    mem->size = 0;
-    // Zero out the memory for security
-    if (mem->data)
+    // Zero only the used portion (capacity may be much larger)
+    if (mem->data && mem->size > 0)
     {
-        memset(mem->data, 0, mem->capacity);
+        memset(mem->data, 0, mem->size);
     }
+    mem->size = 0;
 }
 
 void evm_memory_clear(evm_memory_t *mem)
@@ -90,7 +90,7 @@ bool evm_memory_read_byte(evm_memory_t *mem, uint64_t offset, uint8_t *value)
 {
     if (!mem || !value)
     {
-        LOG_EVM_ERROR("Invalid parameters");
+        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -108,7 +108,7 @@ bool evm_memory_write_byte(evm_memory_t *mem, uint64_t offset, uint8_t value)
 {
     if (!mem)
     {
-        LOG_EVM_ERROR("Invalid memory");
+        LOG_EVM_DEBUG("Invalid memory");
         return false;
     }
 
@@ -126,7 +126,7 @@ bool evm_memory_read_word(evm_memory_t *mem, uint64_t offset, uint256_t *value)
 {
     if (!mem || !value)
     {
-        LOG_EVM_ERROR("Invalid parameters");
+        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -145,7 +145,7 @@ bool evm_memory_write_word(evm_memory_t *mem, uint64_t offset, const uint256_t *
 {
     if (!mem || !value)
     {
-        LOG_EVM_ERROR("Invalid parameters");
+        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -164,7 +164,7 @@ bool evm_memory_read(evm_memory_t *mem, uint64_t offset, uint8_t *data, size_t s
 {
     if (!mem || !data)
     {
-        LOG_EVM_ERROR("Invalid parameters");
+        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -187,7 +187,7 @@ bool evm_memory_write(evm_memory_t *mem, uint64_t offset, const uint8_t *data, s
 {
     if (!mem || !data)
     {
-        LOG_EVM_ERROR("Invalid parameters");
+        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -210,11 +210,11 @@ bool evm_memory_write(evm_memory_t *mem, uint64_t offset, const uint8_t *data, s
 // Memory Expansion
 //==============================================================================
 
-bool evm_memory_expand(evm_memory_t *mem, uint64_t offset, size_t size)
+bool evm_memory_expand_slow(evm_memory_t *mem, uint64_t offset, size_t size)
 {
     if (!mem)
     {
-        LOG_EVM_ERROR("Invalid memory");
+        LOG_EVM_DEBUG("Invalid memory");
         return false;
     }
 
@@ -227,7 +227,7 @@ bool evm_memory_expand(evm_memory_t *mem, uint64_t offset, size_t size)
     uint64_t end = offset + size;
     if (end < offset)
     {
-        LOG_EVM_ERROR("Memory offset overflow");
+        LOG_EVM_DEBUG("Memory offset overflow");
         return false;
     }
 
@@ -247,7 +247,7 @@ bool evm_memory_ensure_size(evm_memory_t *mem, size_t min_size)
 {
     if (!mem)
     {
-        LOG_EVM_ERROR("Invalid memory");
+        LOG_EVM_DEBUG("Invalid memory");
         return false;
     }
 
@@ -316,43 +316,8 @@ bool evm_memory_is_empty(const evm_memory_t *mem)
 // Gas Cost Calculation
 //==============================================================================
 
-uint64_t evm_memory_expansion_cost(size_t current_size, size_t new_size)
-{
-    if (new_size <= current_size)
-    {
-        return 0; // No expansion needed
-    }
-
-    // Convert to words (round up)
-    size_t current_words = (current_size + EVM_MEMORY_WORD_SIZE - 1) / EVM_MEMORY_WORD_SIZE;
-    size_t new_words = (new_size + EVM_MEMORY_WORD_SIZE - 1) / EVM_MEMORY_WORD_SIZE;
-
-    // Calculate cost using Ethereum formula:
-    // memory_cost = (memory_size_word^2 / 512) + (3 * memory_size_word)
-    
-    uint64_t current_linear = 3 * current_words;
-    uint64_t current_quadratic = (current_words * current_words) / 512;
-    uint64_t current_cost = current_linear + current_quadratic;
-    
-    uint64_t new_linear = 3 * new_words;
-    uint64_t new_quadratic = (new_words * new_words) / 512;
-    uint64_t new_cost = new_linear + new_quadratic;
-
-    return new_cost - current_cost;
-}
-
-uint64_t evm_memory_access_cost(const evm_memory_t *mem, uint64_t offset, size_t size)
-{
-    if (!mem || size == 0)
-    {
-        return 0;
-    }
-
-    size_t current_size = mem->size;
-    size_t new_size = round_up_to_word(offset + size);
-
-    return evm_memory_expansion_cost(current_size, new_size);
-}
+// evm_memory_expansion_cost and evm_memory_access_cost are now
+// static inline in evm_memory.h for interpreter hot-path inlining.
 
 //==============================================================================
 // Utility Functions
@@ -362,7 +327,7 @@ bool evm_memory_copy(evm_memory_t *mem, uint64_t dest_offset, uint64_t src_offse
 {
     if (!mem)
     {
-        LOG_EVM_ERROR("Invalid memory");
+        LOG_EVM_DEBUG("Invalid memory");
         return false;
     }
 

@@ -253,6 +253,11 @@ bool test_runner_run_state_test(test_runner_t *runner,
                 .chain_id = uint256_from_uint64(runner->evm->chain_config->chain_id),
                 .excess_blob_gas = block_env.excess_blob_gas,
             };
+            /* Populate block_hash from previousHash for BLOCKHASH opcode */
+            if (test->env.has_previous_hash && evm_block.number > 0) {
+                uint64_t parent_idx = (evm_block.number - 1) % 256;
+                evm_block.block_hash[parent_idx] = test->env.previous_hash;
+            }
             evm_set_block_env(runner->evm, &evm_block);
             
             // Apply access list (EIP-2930) - mark addresses and storage keys as warm

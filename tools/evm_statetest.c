@@ -207,6 +207,13 @@ static int run_statetest_file(const char *filepath, const statetest_args_t *args
                 .chain_id  = uint256_from_uint64(fork_config->chain_id),
                 .excess_blob_gas = test->env.excess_blob_gas,
             };
+            /* Populate block_hash from previousHash for BLOCKHASH opcode.
+             * In state tests, previousHash is the parent block hash;
+             * currentNumber is typically 1, so BLOCKHASH(0) should return it. */
+            if (test->env.has_previous_hash && evm_block.number > 0) {
+                uint64_t parent_idx = (evm_block.number - 1) % 256;
+                evm_block.block_hash[parent_idx] = test->env.previous_hash;
+            }
             evm_set_block_env(evm, &evm_block);
 
             /* Determine tx type */

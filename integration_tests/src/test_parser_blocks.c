@@ -416,5 +416,10 @@ bool parse_environment(const cJSON *json, test_env_t *out) {
         parse_uint256(str, &out->excess_blob_gas);
     }
 
+    if (json_get_string(json, "previousHash", &str)) {
+        parse_hash(str, &out->previous_hash);
+        out->has_previous_hash = true;
+    }
+
     return true;
 }

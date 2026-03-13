@@ -217,6 +217,8 @@ typedef struct {
     uint256_t base_fee;         // EIP-1559 (optional)
     hash_t prev_randao;         // Post-merge PREVRANDAO (currentRandom)
     uint256_t excess_blob_gas;  // EIP-4844 (currentExcessBlobGas)
+    hash_t previous_hash;       // previousHash (parent block hash for BLOCKHASH)
+    bool has_previous_hash;
 } test_env_t;
 
 /**

@@ -21,6 +21,10 @@
 // Debug: set to true to trace CALL gas
 bool g_trace_calls __attribute__((weak)) = false;
 
+/* Stack buffer for small CALL input data — avoids malloc in the common case.
+ * 2 KB covers most contract calls. Max call depth 1024 × 2 KB = 2 MB stack. */
+#define CALLDATA_STACK_SIZE 2048
+
 //==============================================================================
 // Helper Functions
 //==============================================================================
@@ -93,13 +97,20 @@ static evm_status_t prepare_call(
     }
 
     //==========================================================================
-    // Balance Check
+    // Balance Check (deferred — used after gas deduction, matching geth)
     //==========================================================================
 
     bool balance_sufficient = true;
     if (has_value)
     {
         uint256_t caller_balance = evm_state_get_balance(evm->state, &evm->msg.recipient);
+        if (g_trace_calls) {
+            fprintf(stderr, "    balance_check: caller=%02x%02x..%02x%02x bal=%016lx_%016lx val=%016lx_%016lx\n",
+                    evm->msg.recipient.bytes[0], evm->msg.recipient.bytes[1],
+                    evm->msg.recipient.bytes[18], evm->msg.recipient.bytes[19],
+                    (unsigned long)(caller_balance.low >> 64), (unsigned long)caller_balance.low,
+                    (unsigned long)(value->low >> 64), (unsigned long)value->low);
+        }
         if (uint256_lt(&caller_balance, value))
             balance_sufficient = false;
     }
@@ -206,32 +217,12 @@ static evm_status_t prepare_call(
     }
 
     //==========================================================================
-    // Graceful Failure Checks
-    //==========================================================================
-
-    // Per the Yellow Paper: when a CALL fails gracefully (depth or balance),
-    // the child never executes but would have returned all gas including the
-    // stipend. So the caller gains the stipend: μ'_g = μ_g - c_EXTRA + G_STIPEND
-    *graceful_failure = false;
-    if (evm->msg.depth >= 1024)
-    {
-        evm->gas_left += stipend;
-        *gas_forwarded = 0;
-        *graceful_failure = true;
-        return EVM_SUCCESS;
-    }
-
-    if (!balance_sufficient)
-    {
-        evm->gas_left += stipend;
-        *gas_forwarded = 0;
-        *graceful_failure = true;
-        return EVM_SUCCESS;
-    }
-
-    //==========================================================================
     // Gas Forwarding
     //==========================================================================
+    // Compute gas to forward BEFORE graceful failure checks. In geth, the gas
+    // table deducts overhead + callGasTemp + stipend all at once. If this total
+    // exceeds available gas, the instruction OOGs before balance/depth checks.
+    // We check for that OOG condition first, then handle graceful failure.
 
     uint64_t gas_requested = uint256_to_uint64(gas_param);
     uint64_t gas_to_forward;
@@ -257,17 +248,47 @@ static evm_status_t prepare_call(
                 gas_requested, gas_to_forward, stipend, evm->gas_left);
     }
 
-    // Deduct the forwarded gas from caller
-    if (!evm_use_gas(evm, gas_to_forward))
+    // Pre-EIP-150: OOG if requested gas exceeds available gas.
+    // This check must happen BEFORE the graceful failure (balance/depth) checks
+    // to match geth, where the gas table deducts gas before the opcode executes.
+    // Post-EIP-150: gas_to_forward is capped at 63/64, so it always fits.
+    if (evm->fork < FORK_TANGERINE_WHISTLE && gas_to_forward > evm->gas_left)
     {
         if (g_trace_calls) {
-            fprintf(stderr, "    OOG: need %lu, have %lu\n", gas_to_forward, evm->gas_left);
+            fprintf(stderr, "    OOG: need %lu, have %lu\n",
+                    gas_to_forward, evm->gas_left);
         }
+        evm->gas_left = 0;
         *gas_forwarded = 0;
         return EVM_OUT_OF_GAS;
     }
 
-    // Callee receives forwarded gas + stipend (stipend is free bonus, not deducted from caller)
+    //==========================================================================
+    // Graceful Failure Checks
+    //==========================================================================
+
+    // Graceful failure: depth >= 1024 or insufficient balance.
+    // The child would have received gas_to_forward + stipend but never executes,
+    // so all of it (including stipend) is returned. Since we haven't deducted
+    // gas_to_forward yet, we only credit the stipend.
+    *graceful_failure = false;
+    if (evm->msg.depth >= 1024 || !balance_sufficient)
+    {
+        evm->gas_left += stipend;
+        *gas_forwarded = 0;
+        *graceful_failure = true;
+        return EVM_SUCCESS;
+    }
+
+    // Deduct the forwarded gas from caller (stipend is NOT deducted — it's a
+    // free bonus to the child that "leaks" back to the caller via gas refund)
+    if (!evm_use_gas(evm, gas_to_forward))
+    {
+        *gas_forwarded = 0;
+        return EVM_OUT_OF_GAS;
+    }
+
+    // Callee receives forwarded gas + stipend (stipend is free bonus)
     *gas_forwarded = gas_to_forward + stipend;
 
     return EVM_SUCCESS;
@@ -347,16 +368,18 @@ static evm_status_t op_call(evm_t *evm)
         return EVM_SUCCESS;
     }
 
-    // Extract call arguments from memory
+    // Extract call arguments from memory (stack buffer for small inputs)
+    uint8_t stack_buf[CALLDATA_STACK_SIZE];
     uint8_t *call_args = NULL;
     if (args_size_u64 > 0)
     {
-        call_args = malloc(args_size_u64);
+        call_args = (args_size_u64 <= CALLDATA_STACK_SIZE)
+                    ? stack_buf : malloc(args_size_u64);
         if (!call_args)
             return EVM_INTERNAL_ERROR;
         if (!evm_memory_read(evm->memory, args_offset_u64, call_args, args_size_u64))
         {
-            free(call_args);
+            if (call_args != stack_buf) free(call_args);
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -377,7 +400,7 @@ static evm_status_t op_call(evm_t *evm)
 
     evm_result_t subcall_result;
     bool exec_ok = evm_execute(evm, &subcall_msg, &subcall_result);
-    if (call_args) free(call_args);
+    if (call_args && call_args != stack_buf) free(call_args);
 
     if (!exec_ok)
         return EVM_INTERNAL_ERROR;
@@ -415,7 +438,7 @@ static evm_status_t op_call(evm_t *evm)
             evm->gas_refund += subcall_result.gas_refund;
     }
 
-    if (subcall_result.output_data) free(subcall_result.output_data);
+    /* output_data ownership transferred to evm->return_data by evm_execute */
 
     uint256_t result = call_succeeded ? uint256_from_uint64(1) : UINT256_ZERO;
     if (!evm_stack_push(evm->stack, &result))
@@ -501,21 +524,23 @@ static evm_status_t op_callcode(evm_t *evm)
         return EVM_SUCCESS;
     }
 
-    // Extract call arguments from memory
+    // Extract call arguments from memory (stack buffer for small inputs)
+    uint8_t stack_buf[CALLDATA_STACK_SIZE];
     uint8_t *call_args = NULL;
     if (args_size_u64 > 0)
     {
-        call_args = malloc(args_size_u64);
+        call_args = (args_size_u64 <= CALLDATA_STACK_SIZE)
+                    ? stack_buf : malloc(args_size_u64);
         if (!call_args)
         {
             LOG_EVM_ERROR("CALLCODE: Failed to allocate call arguments");
             return EVM_INTERNAL_ERROR;
         }
-        
+
         if (!evm_memory_read(evm->memory, args_offset_u64, call_args, args_size_u64))
         {
-            LOG_EVM_ERROR("CALLCODE: Failed to read call arguments from memory");
-            free(call_args);
+            LOG_EVM_DEBUG("CALLCODE: Failed to read call arguments from memory");
+            if (call_args != stack_buf) free(call_args);
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -537,11 +562,11 @@ static evm_status_t op_callcode(evm_t *evm)
     evm_result_t subcall_result;
     bool exec_ok = evm_execute(evm, &subcall_msg, &subcall_result);
     
-    if (call_args) free(call_args);
+    if (call_args && call_args != stack_buf) free(call_args);
 
     if (!exec_ok)
     {
-        LOG_EVM_ERROR("CALLCODE: Subcall execution failed internally");
+        LOG_EVM_DEBUG("CALLCODE: Subcall execution failed internally");
         return EVM_INTERNAL_ERROR;
     }
 
@@ -556,7 +581,7 @@ static evm_status_t op_callcode(evm_t *evm)
         if (!evm_memory_write(evm->memory, ret_offset_u64, 
                              subcall_result.output_data, copy_size))
         {
-            if (subcall_result.output_data) free(subcall_result.output_data);
+            /* output_data ownership transferred to evm->return_data by evm_execute */
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -583,7 +608,7 @@ static evm_status_t op_callcode(evm_t *evm)
             evm->gas_refund += subcall_result.gas_refund;
     }
 
-    if (subcall_result.output_data) free(subcall_result.output_data);
+    /* output_data ownership transferred to evm->return_data by evm_execute */
 
     uint256_t result = call_succeeded ? uint256_from_uint64(1) : UINT256_ZERO;
 
@@ -678,21 +703,23 @@ static evm_status_t op_delegatecall(evm_t *evm)
         return EVM_SUCCESS;
     }
 
-    // Extract call arguments from memory
+    // Extract call arguments from memory (stack buffer for small inputs)
+    uint8_t stack_buf[CALLDATA_STACK_SIZE];
     uint8_t *call_args = NULL;
     if (args_size_u64 > 0)
     {
-        call_args = malloc(args_size_u64);
+        call_args = (args_size_u64 <= CALLDATA_STACK_SIZE)
+                    ? stack_buf : malloc(args_size_u64);
         if (!call_args)
         {
             LOG_EVM_ERROR("DELEGATECALL: Failed to allocate call arguments");
             return EVM_INTERNAL_ERROR;
         }
-        
+
         if (!evm_memory_read(evm->memory, args_offset_u64, call_args, args_size_u64))
         {
-            LOG_EVM_ERROR("DELEGATECALL: Failed to read call arguments from memory");
-            free(call_args);
+            LOG_EVM_DEBUG("DELEGATECALL: Failed to read call arguments from memory");
+            if (call_args != stack_buf) free(call_args);
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -714,11 +741,11 @@ static evm_status_t op_delegatecall(evm_t *evm)
     evm_result_t subcall_result;
     bool exec_ok = evm_execute(evm, &subcall_msg, &subcall_result);
     
-    if (call_args) free(call_args);
+    if (call_args && call_args != stack_buf) free(call_args);
 
     if (!exec_ok)
     {
-        LOG_EVM_ERROR("DELEGATECALL: Subcall execution failed internally");
+        LOG_EVM_DEBUG("DELEGATECALL: Subcall execution failed internally");
         return EVM_INTERNAL_ERROR;
     }
 
@@ -733,7 +760,7 @@ static evm_status_t op_delegatecall(evm_t *evm)
         if (!evm_memory_write(evm->memory, ret_offset_u64, 
                              subcall_result.output_data, copy_size))
         {
-            if (subcall_result.output_data) free(subcall_result.output_data);
+            /* output_data ownership transferred to evm->return_data by evm_execute */
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -748,7 +775,7 @@ static evm_status_t op_delegatecall(evm_t *evm)
             evm->gas_refund += subcall_result.gas_refund;
     }
 
-    if (subcall_result.output_data) free(subcall_result.output_data);
+    /* output_data ownership transferred to evm->return_data by evm_execute */
 
     uint256_t result = call_succeeded ? uint256_from_uint64(1) : UINT256_ZERO;
 
@@ -842,21 +869,23 @@ static evm_status_t op_staticcall(evm_t *evm)
         return EVM_SUCCESS;
     }
 
-    // Extract call arguments from memory
+    // Extract call arguments from memory (stack buffer for small inputs)
+    uint8_t stack_buf[CALLDATA_STACK_SIZE];
     uint8_t *call_args = NULL;
     if (args_size_u64 > 0)
     {
-        call_args = malloc(args_size_u64);
+        call_args = (args_size_u64 <= CALLDATA_STACK_SIZE)
+                    ? stack_buf : malloc(args_size_u64);
         if (!call_args)
         {
             LOG_EVM_ERROR("STATICCALL: Failed to allocate call arguments");
             return EVM_INTERNAL_ERROR;
         }
-        
+
         if (!evm_memory_read(evm->memory, args_offset_u64, call_args, args_size_u64))
         {
-            LOG_EVM_ERROR("STATICCALL: Failed to read call arguments from memory");
-            free(call_args);
+            LOG_EVM_DEBUG("STATICCALL: Failed to read call arguments from memory");
+            if (call_args != stack_buf) free(call_args);
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -878,11 +907,11 @@ static evm_status_t op_staticcall(evm_t *evm)
     evm_result_t subcall_result;
     bool exec_ok = evm_execute(evm, &subcall_msg, &subcall_result);
     
-    if (call_args) free(call_args);
+    if (call_args && call_args != stack_buf) free(call_args);
 
     if (!exec_ok)
     {
-        LOG_EVM_ERROR("STATICCALL: Subcall execution failed internally");
+        LOG_EVM_DEBUG("STATICCALL: Subcall execution failed internally");
         return EVM_INTERNAL_ERROR;
     }
 
@@ -897,7 +926,7 @@ static evm_status_t op_staticcall(evm_t *evm)
         if (!evm_memory_write(evm->memory, ret_offset_u64, 
                              subcall_result.output_data, copy_size))
         {
-            if (subcall_result.output_data) free(subcall_result.output_data);
+            /* output_data ownership transferred to evm->return_data by evm_execute */
             return EVM_INVALID_MEMORY_ACCESS;
         }
     }
@@ -912,7 +941,7 @@ static evm_status_t op_staticcall(evm_t *evm)
             evm->gas_refund += subcall_result.gas_refund;
     }
 
-    if (subcall_result.output_data) free(subcall_result.output_data);
+    /* output_data ownership transferred to evm->return_data by evm_execute */
 
     uint256_t result = call_succeeded ? uint256_from_uint64(1) : UINT256_ZERO;
 

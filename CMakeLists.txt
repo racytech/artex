@@ -11,6 +11,7 @@ project(art_database C)
 option(ENABLE_MPT "Enable MPT (Merkle Patricia Trie) state root" ON)
 option(ENABLE_VERKLE "Enable Verkle state root" OFF)
 option(ENABLE_MEM_MPT "Enable in-memory batch MPT for test runner (not needed for chain_replay)" OFF)
+option(ENABLE_COMPACTION "Enable periodic storage MPT compaction during chain replay" OFF)
 option(ENABLE_EVM_TRACE "Enable EIP-3155 EVM execution tracing" OFF)
 
 if(NOT ENABLE_MPT AND NOT ENABLE_VERKLE)
@@ -518,6 +519,12 @@ add_test(NAME test_mpt_store_vectors
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+add_executable(test_mpt_store_refcount
+    database/tests/test_mpt_store_refcount.c
+)
+target_link_libraries(test_mpt_store_refcount mpt_store common)
+add_test(NAME test_mpt_store_refcount COMMAND test_mpt_store_refcount)
+
 # Benchmark: MPT Store at scale (realistic Ethereum workload)
 add_executable(bench_mpt_store
     tools/bench_mpt_store.c
@@ -703,6 +710,22 @@ endif()
 target_link_libraries(test_block_executor ${TEST_BLOCK_EXEC_LIBS})
 add_test(NAME test_block_executor COMMAND test_block_executor)
 
+add_executable(test_uint256_div common/tests/test_uint256_div.c)
+target_link_libraries(test_uint256_div common)
+add_test(NAME test_uint256_div COMMAND test_uint256_div)
+
+add_executable(test_uint256_ops common/tests/test_uint256_ops.c)
+target_link_libraries(test_uint256_ops common)
+add_test(NAME test_uint256_ops COMMAND test_uint256_ops)
+
+add_executable(test_keccak256 common/tests/test_keccak256.c)
+target_link_libraries(test_keccak256 common)
+add_test(NAME test_keccak256 COMMAND test_keccak256)
+
+add_executable(test_byte_conv common/tests/test_byte_conv.c)
+target_link_libraries(test_byte_conv common)
+add_test(NAME test_byte_conv COMMAND test_byte_conv)
+
 #==============================================================================
 # Libraries — Engine API (JWT — no cJSON dependency)
 #==============================================================================
@@ -852,6 +875,9 @@ if(CJSON_FOUND)
     if(ENABLE_MPT)
         list(APPEND SYNC_LIBS code_store)
     endif()
+    if(ENABLE_COMPACTION)
+        target_compile_definitions(sync PRIVATE ENABLE_COMPACTION=1)
+    endif()
     target_link_libraries(sync ${SYNC_LIBS})
 
     # Chain replay tool
@@ -922,6 +948,7 @@ message(STATUS "C Compiler:        ${CMAKE_C_COMPILER}")
 message(STATUS "C Flags:           ${CMAKE_C_FLAGS}")
 message(STATUS "MPT backend:       ${ENABLE_MPT}")
 message(STATUS "Verkle backend:    ${ENABLE_VERKLE}")
+message(STATUS "Compaction:        ${ENABLE_COMPACTION}")
 message(STATUS "")
 message(STATUS "Tuning:")
 message(STATUS "  Account cache:   ${MPT_ACCOUNT_CACHE_MB} MB")

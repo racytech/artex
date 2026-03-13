@@ -214,6 +214,9 @@ struct evm_t
     size_t     log_cap;
 
     // Access tracking (EIP-2929) is handled by evm_state internally
+
+    // Precomputed JUMPDEST bitmap (valid during evm_interpret, NULL otherwise)
+    const uint8_t *jumpdest_bitmap;
 };
 
 //==============================================================================
@@ -389,17 +392,17 @@ bool evm_resolve_delegation(evm_state_t *state, const address_t *addr, address_t
  * @param output_size Size of return data
  * @return Result structure
  */
-evm_result_t evm_result_success(uint64_t gas_left, const uint8_t *output_data, size_t output_size);
+evm_result_t evm_result_success(uint64_t gas_left, uint8_t *output_data, size_t output_size);
 
 /**
  * Create a revert result
  *
  * @param gas_left Remaining gas
- * @param output_data Revert data (will be copied)
+ * @param output_data Revert data (ownership transferred — caller must not free)
  * @param output_size Size of revert data
  * @return Result structure
  */
-evm_result_t evm_result_revert(uint64_t gas_left, const uint8_t *output_data, size_t output_size);
+evm_result_t evm_result_revert(uint64_t gas_left, uint8_t *output_data, size_t output_size);
 
 /**
  * Create an error result
