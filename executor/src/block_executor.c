@@ -1,4 +1,5 @@
 #include "block_executor.h"
+#include "tx_pipeline.h"
 #include "dao_fork.h"
 #include "tx_decoder.h"
 #include "fork.h"
@@ -11,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <pthread.h>
 
 extern bool g_trace_calls __attribute__((weak));
 
@@ -350,56 +352,50 @@ block_result_t block_execute(evm_t *evm,
                 (unsigned long)header->difficulty.low, (unsigned long)header->difficulty.high);
     }
 
-    /* Prefetch: decode first tx early so its sender/receiver are in cache
-     * before execution starts. Subsequent txs are prefetched via lookahead. */
-    transaction_t next_tx;
-    bool next_valid = false;
+    /* Launch prep thread to decode + ecrecover all txs ahead of execution */
+    tx_ring_t ring;
+    tx_ring_init(&ring);
+
+    tx_prep_ctx_t prep_ctx = {
+        .ring     = &ring,
+        .body     = body,
+        .tx_count = tx_count,
+        .chain_id = chain_id,
+        .cancel   = false,
+    };
+
+    pthread_t prep_tid = 0;
     if (tx_count > 0) {
-        const rlp_item_t *first_item = block_body_tx(body, 0);
-        if (first_item && tx_decode_rlp(&next_tx, first_item, chain_id)) {
-            next_valid = true;
-            evm_state_prefetch_account(evm->state, &next_tx.sender);
-            if (!next_tx.is_create)
-                evm_state_prefetch_account(evm->state, &next_tx.to);
-        }
+        pthread_create(&prep_tid, NULL, tx_prep_thread, &prep_ctx);
     }
 
     for (size_t i = 0; i < tx_count; i++) {
-        /* Use pre-decoded tx if available, otherwise decode now */
+        /* Pop next prepared tx from ring buffer (spins until available) */
+        prepared_tx_t ptx;
+        if (!tx_ring_pop(&ring, &ptx, &prep_ctx.cancel)) {
+            fprintf(stderr, "block_execute: ring pop cancelled at tx %zu\n", i);
+            result.success = false;
+            if (result.first_failure < 0) result.first_failure = (int)i;
+            break;
+        }
+
+        /* Handle sentinel — prep thread finished early (shouldn't happen
+         * unless tx_count mismatches, but be safe) */
+        if (ptx.done) {
+            fprintf(stderr, "block_execute: unexpected sentinel at tx %zu\n", i);
+            result.success = false;
+            if (result.first_failure < 0) result.first_failure = (int)i;
+            break;
+        }
+
         transaction_t tx;
-        bool need_decode = true;
-        if (next_valid) {
-            tx = next_tx;
-            next_valid = false;
-            need_decode = false;
+        if (!ptx.valid) {
+            fprintf(stderr, "block_execute: prep thread failed to decode tx %zu\n", i);
+            result.success = false;
+            if (result.first_failure < 0) result.first_failure = (int)i;
+            break;
         }
-
-        if (need_decode) {
-            const rlp_item_t *tx_item = block_body_tx(body, i);
-            if (!tx_item) {
-                fprintf(stderr, "block_execute: failed to get tx %zu\n", i);
-                result.success = false;
-                if (result.first_failure < 0) result.first_failure = (int)i;
-                break;
-            }
-            if (!tx_decode_rlp(&tx, tx_item, chain_id)) {
-                fprintf(stderr, "block_execute: failed to decode tx %zu\n", i);
-                result.success = false;
-                if (result.first_failure < 0) result.first_failure = (int)i;
-                break;
-            }
-        }
-
-        /* Lookahead: decode next tx and prefetch its accounts */
-        if (i + 1 < tx_count) {
-            const rlp_item_t *next_item = block_body_tx(body, i + 1);
-            if (next_item && tx_decode_rlp(&next_tx, next_item, chain_id)) {
-                next_valid = true;
-                evm_state_prefetch_account(evm->state, &next_tx.sender);
-                if (!next_tx.is_create)
-                    evm_state_prefetch_account(evm->state, &next_tx.to);
-            }
-        }
+        tx = ptx.tx;
 
         /* Trace transaction details when debugging */
         if (g_trace_calls) {
@@ -469,9 +465,24 @@ block_result_t block_execute(evm_t *evm,
     /* Compute receipt trie root */
     result.receipt_root = compute_receipt_root(result.receipts, tx_count);
 
-    /* Free leftover pre-decoded tx on early break */
-    if (next_valid)
-        tx_decoded_free(&next_tx);
+    /* Join prep thread and drain any remaining ring entries */
+    if (prep_tid) {
+        /* Signal cancel so prep thread stops if it's still working */
+        atomic_store_explicit(&prep_ctx.cancel, true, memory_order_relaxed);
+        pthread_join(prep_tid, NULL);
+
+        /* Drain remaining entries — after cancel the prep thread has exited
+         * and pushed a sentinel. Consume everything left in the ring. */
+        prepared_tx_t drain;
+        for (;;) {
+            size_t h = atomic_load_explicit(&ring.head, memory_order_acquire);
+            size_t t = atomic_load_explicit(&ring.tail, memory_order_relaxed);
+            if (h == t) break;  /* ring is empty */
+            tx_ring_pop(&ring, &drain, NULL);
+            if (drain.done) break;
+            if (drain.valid) tx_decoded_free(&drain.tx);
+        }
+    }
 
     /* Pay block reward (PoW only — zero after The Merge) */
     uint256_t base_reward = get_block_reward(evm->fork);

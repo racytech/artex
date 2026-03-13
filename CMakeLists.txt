@@ -249,6 +249,7 @@ target_compile_definitions(evm PRIVATE
 add_library(block_executor STATIC
     executor/src/block.c
     executor/src/tx_decoder.c
+    executor/src/tx_pipeline.c
     executor/src/block_executor.c
     executor/src/dao_fork.c
     executor/src/era1.c
@@ -256,7 +257,7 @@ add_library(block_executor STATIC
 target_include_directories(block_executor PUBLIC
     ${CMAKE_SOURCE_DIR}/executor/include
 )
-target_link_libraries(block_executor evm mem_mpt common secp256k1)
+target_link_libraries(block_executor evm mem_mpt common secp256k1 pthread)
 
 #==============================================================================
 # Libraries — Networking / Portal
