@@ -78,23 +78,7 @@ static uint256_t uint128_mul_to_uint256(uint128_t a, uint128_t b) {
 // Arithmetic operations
 // ============================================================================
 
-uint256_t uint256_mul(const uint256_t* a, const uint256_t* b) {
-    uint256_t result;
-
-    // (a_high*2^128 + a_low) × (b_high*2^128 + b_low) mod 2^256
-    // = a_low*b_low + (a_high*b_low + a_low*b_high)*2^128
-    // (a_high*b_high*2^256 overflows, ignored)
-
-    // Full 128×128→256 for low×low (needs both halves)
-    result = uint128_mul_to_uint256(a->low, b->low);
-
-    // Cross terms only contribute their low 128 bits to result.high
-    // (their high 128 bits would land at bit 256+, overflow)
-    // Use truncated 128-bit multiply — compiler emits a single mul instruction
-    result.high += a->high * b->low + a->low * b->high;
-
-    return result;
-}
+/* uint256_mul is now inline in uint256.h */
 
 /**
  * Internal combined divmod: *q = a / b, *r = a % b.
@@ -228,7 +212,7 @@ static void uint256_divmod_internal(const uint256_t *a, const uint256_t *b,
 }
 
 uint256_t uint256_div(const uint256_t* a, const uint256_t* b) {
-    if (!a || !b || uint256_is_zero(b)) return UINT256_ZERO;
+    if (uint256_is_zero(b))             return UINT256_ZERO;
     if (uint256_is_zero(a))             return UINT256_ZERO;
     if (uint256_is_one(b))              return *a;
     if (uint256_is_less(a, b))          return UINT256_ZERO;
@@ -240,7 +224,7 @@ uint256_t uint256_div(const uint256_t* a, const uint256_t* b) {
 }
 
 uint256_t uint256_mod(const uint256_t* a, const uint256_t* b) {
-    if (!a || !b || uint256_is_zero(b)) return UINT256_ZERO;
+    if (uint256_is_zero(b))             return UINT256_ZERO;
     if (uint256_is_zero(a))             return UINT256_ZERO;
     if (uint256_is_one(b))              return UINT256_ZERO;
     if (uint256_is_less(a, b))          return *a;
@@ -607,9 +591,35 @@ uint256_t uint256_exp(const uint256_t* base, const uint256_t* exponent) {
 }
 
 uint256_t uint256_addmod(const uint256_t* a, const uint256_t* b, const uint256_t* mod) {
-    if (!a || !b || !mod || uint256_is_zero(mod)) return UINT256_ZERO;
+    if (uint256_is_zero(mod)) return UINT256_ZERO;
 
-    // Reduce inputs
+    /* Fast path: when mod has high word set and both operands have high words
+     * <= mod's high word, we can use conditional subtraction instead of
+     * expensive full division. This covers the common case of large moduli. */
+    uint64_t mod_hi = (uint64_t)(mod->high >> 64);
+    if (mod_hi != 0 &&
+        (uint64_t)(a->high >> 64) <= mod_hi &&
+        (uint64_t)(b->high >> 64) <= mod_hi) {
+        /* Reduce a: if a >= mod, a -= mod */
+        uint256_t an = *a;
+        if (uint256_is_greater_equal(&an, mod))
+            an = uint256_sub(&an, mod);
+
+        /* Reduce b: if b >= mod, b -= mod */
+        uint256_t bn = *b;
+        if (uint256_is_greater_equal(&bn, mod))
+            bn = uint256_sub(&bn, mod);
+
+        uint256_t sum;
+        bool overflow = uint256_add_overflow(&an, &bn, &sum);
+
+        if (!overflow && uint256_is_less(&sum, mod))
+            return sum;
+
+        return uint256_sub(&sum, mod);
+    }
+
+    /* Slow path: full division */
     uint256_t a_mod = uint256_mod(a, mod);
     uint256_t b_mod = uint256_mod(b, mod);
 
@@ -619,10 +629,6 @@ uint256_t uint256_addmod(const uint256_t* a, const uint256_t* b, const uint256_t
     if (!overflow && uint256_is_less(&sum, mod))
         return sum;
 
-    // Either overflow (true sum = sum + 2^256) or sum >= mod.
-    // Since a_mod, b_mod < mod: true sum < 2*mod, so one subtraction suffices.
-    // When overflow: sum = true_sum mod 2^256, and sum - mod wraps correctly
-    // in unsigned 256-bit arithmetic (gives true_sum - mod).
     return uint256_sub(&sum, mod);
 }
 
@@ -752,7 +758,7 @@ static uint256_t uint512_mod256(const uint512_t *num, const uint256_t *d) {
 }
 
 uint256_t uint256_mulmod(const uint256_t* a, const uint256_t* b, const uint256_t* mod) {
-    if (!a || !b || !mod || uint256_is_zero(mod)) return UINT256_ZERO;
+    if (uint256_is_zero(mod)) return UINT256_ZERO;
     if (uint256_is_zero(a) || uint256_is_zero(b)) return UINT256_ZERO;
     if (uint256_is_one(a)) return uint256_mod(b, mod);
     if (uint256_is_one(b)) return uint256_mod(a, mod);
