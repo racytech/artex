@@ -59,13 +59,31 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         // Only Frontier active (already set above)
     } else if (strcmp(fork_name, "Homestead") == 0) {
         test_config.fork_blocks.homestead = 0;
+    } else if (strcmp(fork_name, "Tangerine Whistle") == 0 ||
+               strcmp(fork_name, "EIP150") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+    } else if (strcmp(fork_name, "Spurious Dragon") == 0 ||
+               strcmp(fork_name, "EIP158") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
     } else if (strcmp(fork_name, "Byzantium") == 0) {
         test_config.fork_blocks.homestead = 0;
         test_config.fork_blocks.tangerine_whistle = 0;
         test_config.fork_blocks.spurious_dragon = 0;
         test_config.fork_blocks.byzantium = 0;
+    } else if (strcmp(fork_name, "Constantinople") == 0) {
+        // Constantinople: EIP-1283 active (net gas metering for SSTORE)
+        // Do NOT enable Petersburg — it reverts EIP-1283
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
     } else if (strcmp(fork_name, "ConstantinopleFix") == 0 ||
-               strcmp(fork_name, "Constantinople") == 0) {
+               strcmp(fork_name, "Petersburg") == 0) {
+        // Petersburg (ConstantinopleFix): reverts EIP-1283
         test_config.fork_blocks.homestead = 0;
         test_config.fork_blocks.tangerine_whistle = 0;
         test_config.fork_blocks.spurious_dragon = 0;

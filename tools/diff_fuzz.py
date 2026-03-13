@@ -181,13 +181,18 @@ def generate_test_case(fork="Cancun"):
     alloc[coinbase] = {"balance": "0x0"}
 
     # Build env
+    PRE_LONDON_FORKS = ("Frontier", "Homestead", "Tangerine Whistle", "Spurious Dragon",
+                        "Byzantium", "Constantinople", "Istanbul", "Berlin")
     env = {
         "currentCoinbase": coinbase,
         "currentNumber": hex(random.randint(1, 1000000)),
         "currentTimestamp": hex(random.randint(1000, 2000000000)),
         "currentGasLimit": "0x1000000",
-        "currentBaseFee": hex(random.randint(1, 10**10)),
     }
+
+    # London+ has baseFee; pre-London does not
+    if fork not in PRE_LONDON_FORKS:
+        env["currentBaseFee"] = hex(random.randint(1, 10**10))
 
     # Pre-Paris forks: use currentDifficulty, NOT currentRandom
     # (geth overrides DIFFICULTY opcode with currentRandom when present)
@@ -227,7 +232,10 @@ def generate_test_case(fork="Cancun"):
             "s": "0x0",
         }
 
-        tx["gasPrice"] = hex(int(env["currentBaseFee"], 16))
+        if "currentBaseFee" in env:
+            tx["gasPrice"] = hex(int(env["currentBaseFee"], 16))
+        else:
+            tx["gasPrice"] = hex(random.randint(1, 10**10))
         if target:
             tx["to"] = target
         else:
