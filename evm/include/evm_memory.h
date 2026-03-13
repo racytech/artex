@@ -228,6 +228,10 @@ static inline uint64_t evm_memory_expansion_cost(size_t current_size, size_t new
     if (new_size <= current_size)
         return 0;
 
+    // Guard against word-rounding overflow
+    if (new_size > SIZE_MAX - (EVM_MEMORY_WORD_SIZE - 1))
+        return (uint64_t)1 << 62;
+
     size_t current_words = (current_size + EVM_MEMORY_WORD_SIZE - 1) / EVM_MEMORY_WORD_SIZE;
     size_t new_words = (new_size + EVM_MEMORY_WORD_SIZE - 1) / EVM_MEMORY_WORD_SIZE;
 
@@ -246,9 +250,14 @@ static inline uint64_t evm_memory_access_cost(const evm_memory_t *mem, uint64_t 
         return 0;
 
     if (offset > UINT64_MAX - size)
-        return UINT64_MAX;
+        return (uint64_t)1 << 62;
 
-    size_t new_size = ((offset + size) + EVM_MEMORY_WORD_SIZE - 1) & ~(size_t)(EVM_MEMORY_WORD_SIZE - 1);
+    size_t end = offset + size;
+    // Guard against word-rounding overflow: end + 31 must not wrap
+    if (end > UINT64_MAX - (EVM_MEMORY_WORD_SIZE - 1))
+        return (uint64_t)1 << 62;
+
+    size_t new_size = (end + EVM_MEMORY_WORD_SIZE - 1) & ~(size_t)(EVM_MEMORY_WORD_SIZE - 1);
 
     return evm_memory_expansion_cost(mem->size, new_size);
 }

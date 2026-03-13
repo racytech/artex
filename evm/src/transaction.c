@@ -531,8 +531,11 @@ bool transaction_execute(
             const authorization_t *auth = &tx->authorization_list[i];
 
             // 1. Chain ID check: must be 0 (wildcard) or match current chain
-            uint64_t auth_chain = uint256_to_uint64(&auth->chain_id);
-            if (auth_chain != 0 && auth_chain != chain_id) continue;
+            //    Must compare full uint256 — truncating to uint64 would make
+            //    large chain IDs with zero lower bits look like wildcards.
+            uint256_t expected_chain = uint256_from_uint64(chain_id);
+            if (!uint256_is_zero(&auth->chain_id) &&
+                !uint256_eq(&auth->chain_id, &expected_chain)) continue;
 
             // 2. Validate signature r,s ranges per EIP-7702 spec
             //    r must be in (0, SECP256K1N), s must be in (0, SECP256K1N/2]

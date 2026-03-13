@@ -1326,6 +1326,7 @@ op_revert:
 
 op_selfdestruct:
     status = op_selfdestruct(evm);
+    if (status != EVM_SUCCESS) goto error;
     EVM_TRACE_EXIT(evm, NULL);
     // SELFDESTRUCT produces no output — clear stale return data from subcalls
     if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }

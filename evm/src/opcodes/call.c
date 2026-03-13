@@ -224,7 +224,9 @@ static evm_status_t prepare_call(
     // exceeds available gas, the instruction OOGs before balance/depth checks.
     // We check for that OOG condition first, then handle graceful failure.
 
-    uint64_t gas_requested = uint256_to_uint64(gas_param);
+    // If gas_param overflows uint64, treat as "all available" (geth behavior)
+    bool gas_overflows = (gas_param->high != 0 || (uint64_t)(gas_param->low >> 64) != 0);
+    uint64_t gas_requested = gas_overflows ? UINT64_MAX : uint256_to_uint64(gas_param);
     uint64_t gas_to_forward;
 
     if (evm->fork >= FORK_TANGERINE_WHISTLE)
