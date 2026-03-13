@@ -37,14 +37,14 @@ static void keccak256_hash(const uint8_t *data, size_t len, uint8_t out[32])
 // Address Helpers
 //==============================================================================
 
-static uint8_t precompile_index(const address_t *addr)
+static uint16_t precompile_index(const address_t *addr)
 {
-    for (int i = 0; i < 19; i++)
+    for (int i = 0; i < 18; i++)
     {
         if (addr->bytes[i] != 0)
             return 0;
     }
-    return addr->bytes[19];
+    return ((uint16_t)addr->bytes[18] << 8) | addr->bytes[19];
 }
 
 //==============================================================================
@@ -53,7 +53,7 @@ static uint8_t precompile_index(const address_t *addr)
 
 bool is_precompile(const address_t *addr, evm_fork_t fork)
 {
-    uint8_t idx = precompile_index(addr);
+    uint16_t idx = precompile_index(addr);
     if (idx == 0)
         return false;
 
@@ -71,6 +71,9 @@ bool is_precompile(const address_t *addr, evm_fork_t fork)
 
     if (idx >= PRECOMPILE_BLS_G1ADD && idx <= PRECOMPILE_BLS_MAP_G2)
         return fork >= FORK_PRAGUE;
+
+    if (idx == PRECOMPILE_P256VERIFY)
+        return fork >= FORK_OSAKA;
 
     return false;
 }
@@ -481,6 +484,17 @@ static uint64_t modexp_mult_complexity_eip2565(uint64_t x)
     return (result > UINT64_MAX) ? UINT64_MAX : (uint64_t)result;
 }
 
+// EIP-7883 mult_complexity (Osaka+)
+// For x <= 32: returns 16
+// For x > 32: returns 2 * berlinMultComplexity(x)
+static uint64_t modexp_mult_complexity_osaka(uint64_t x)
+{
+    if (x <= 32)
+        return 16;
+    __uint128_t result = (__uint128_t)modexp_mult_complexity_eip2565(x) * 2;
+    return (result > UINT64_MAX) ? UINT64_MAX : (uint64_t)result;
+}
+
 static uint64_t modexp_gas(uint64_t base_len, uint64_t exp_len, uint64_t mod_len,
                             const uint8_t *exp_head, size_t exp_head_len,
                             evm_fork_t fork)
@@ -509,7 +523,30 @@ static uint64_t modexp_gas(uint64_t base_len, uint64_t exp_len, uint64_t mod_len
 
     uint64_t max_len = base_len > mod_len ? base_len : mod_len;
 
-    if (fork >= FORK_BERLIN)
+    if (fork >= FORK_OSAKA)
+    {
+        // EIP-7883: Osaka gas formula
+        // multiplier = 16, minGas = 500
+        uint64_t mc = modexp_mult_complexity_osaka(max_len);
+        // iterationCount uses multiplier=16 for large exponents
+        uint64_t iter;
+        if (exp_len <= 32)
+            iter = (head_bit_len > 0) ? head_bit_len - 1 : 0;
+        else {
+            if (exp_len - 32 > UINT64_MAX / 16)
+                iter = UINT64_MAX;
+            else {
+                iter = 16 * (exp_len - 32);
+                if (head_bit_len > 0)
+                    iter += head_bit_len - 1;
+            }
+        }
+        iter = iter > 1 ? iter : 1;
+        __uint128_t gas128 = (__uint128_t)mc * iter;
+        uint64_t gas = (gas128 > UINT64_MAX) ? UINT64_MAX : (uint64_t)gas128;
+        return gas > 500 ? gas : 500;
+    }
+    else if (fork >= FORK_BERLIN)
     {
         // EIP-2565
         uint64_t mc = modexp_mult_complexity_eip2565(max_len);
@@ -542,6 +579,14 @@ static evm_status_t precompile_modexp(const uint8_t *input, size_t input_size,
     // If base_len or mod_len overflow uint64, gas is astronomical → OOG
     if (base_len == UINT64_MAX || mod_len == UINT64_MAX)
         return EVM_OUT_OF_GAS;
+
+    // EIP-7823 (Osaka+): reject inputs where any length exceeds 1024 bytes
+    if (fork >= FORK_OSAKA &&
+        (base_len > 1024 || exp_len > 1024 || mod_len > 1024))
+    {
+        *gas = 0;
+        return EVM_REVERT;
+    }
 
     // exp_len overflow: gas depends on max(base_len, mod_len)
     // If max_len > 0, the gas will be huge → OOG
@@ -1456,6 +1501,155 @@ static evm_status_t precompile_stub(uint8_t idx, uint64_t *gas)
 }
 
 //==============================================================================
+// P256VERIFY Precompile (0x0100) — EIP-7212
+//==============================================================================
+
+// Gas: 6900 flat
+// Input: 160 bytes — hash(32) | r(32) | s(32) | x(32) | y(32)
+// Output: 32 bytes (uint256 = 1) on valid signature, empty on invalid
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
+#include <openssl/bn.h>
+#include <openssl/obj_mac.h>
+
+#define P256VERIFY_GAS 6900
+
+static evm_status_t precompile_p256verify(const uint8_t *input, size_t input_size,
+                                          uint64_t *gas,
+                                          uint8_t **output, size_t *output_size)
+{
+    if (*gas < P256VERIFY_GAS)
+        return EVM_OUT_OF_GAS;
+    *gas -= P256VERIFY_GAS;
+
+    // Input must be exactly 160 bytes
+    if (input_size != 160)
+    {
+        *output = NULL;
+        *output_size = 0;
+        return EVM_SUCCESS;
+    }
+
+    const uint8_t *hash = input;
+    const uint8_t *r_bytes = input + 32;
+    const uint8_t *s_bytes = input + 64;
+    const uint8_t *x_bytes = input + 96;
+    const uint8_t *y_bytes = input + 128;
+
+    int valid = 0;
+
+    BIGNUM *r = BN_bin2bn(r_bytes, 32, NULL);
+    BIGNUM *s = BN_bin2bn(s_bytes, 32, NULL);
+    BIGNUM *x = BN_bin2bn(x_bytes, 32, NULL);
+    BIGNUM *y = BN_bin2bn(y_bytes, 32, NULL);
+    if (!r || !s || !x || !y)
+        goto cleanup;
+
+    // Check r, s are in [1, order-1]
+    EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    if (!group)
+        goto cleanup;
+
+    BIGNUM *order = BN_new();
+    if (!order || !EC_GROUP_get_order(group, order, NULL))
+    {
+        BN_free(order);
+        EC_GROUP_free(group);
+        goto cleanup;
+    }
+
+    if (BN_is_zero(r) || BN_is_zero(s) ||
+        BN_cmp(r, order) >= 0 || BN_cmp(s, order) >= 0)
+    {
+        BN_free(order);
+        EC_GROUP_free(group);
+        goto cleanup;
+    }
+
+    // Construct the public key point
+    EC_POINT *pub_point = EC_POINT_new(group);
+    if (!pub_point ||
+        !EC_POINT_set_affine_coordinates_GFp(group, pub_point, x, y, NULL) ||
+        !EC_POINT_is_on_curve(group, pub_point, NULL))
+    {
+        EC_POINT_free(pub_point);
+        BN_free(order);
+        EC_GROUP_free(group);
+        goto cleanup;
+    }
+
+    // Build EC_KEY from the point
+    EC_KEY *ec_key = EC_KEY_new();
+    if (!ec_key ||
+        !EC_KEY_set_group(ec_key, group) ||
+        !EC_KEY_set_public_key(ec_key, pub_point))
+    {
+        EC_KEY_free(ec_key);
+        EC_POINT_free(pub_point);
+        BN_free(order);
+        EC_GROUP_free(group);
+        goto cleanup;
+    }
+
+    // Build ECDSA_SIG from (r, s)
+    ECDSA_SIG *sig = ECDSA_SIG_new();
+    if (!sig)
+    {
+        EC_KEY_free(ec_key);
+        EC_POINT_free(pub_point);
+        BN_free(order);
+        EC_GROUP_free(group);
+        goto cleanup;
+    }
+    // ECDSA_SIG_set0 takes ownership of r_bn, s_bn — duplicate them
+    BIGNUM *r_dup = BN_dup(r);
+    BIGNUM *s_dup = BN_dup(s);
+    if (!r_dup || !s_dup || !ECDSA_SIG_set0(sig, r_dup, s_dup))
+    {
+        if (r_dup) BN_free(r_dup);
+        if (s_dup) BN_free(s_dup);
+        ECDSA_SIG_free(sig);
+        EC_KEY_free(ec_key);
+        EC_POINT_free(pub_point);
+        BN_free(order);
+        EC_GROUP_free(group);
+        goto cleanup;
+    }
+
+    // Verify: ECDSA_do_verify returns 1 on valid, 0 on invalid, -1 on error
+    valid = (ECDSA_do_verify(hash, 32, sig, ec_key) == 1);
+
+    ECDSA_SIG_free(sig);
+    EC_KEY_free(ec_key);
+    EC_POINT_free(pub_point);
+    BN_free(order);
+    EC_GROUP_free(group);
+
+cleanup:
+    BN_free(r);
+    BN_free(s);
+    BN_free(x);
+    BN_free(y);
+
+    if (valid)
+    {
+        // Return 32-byte big-endian uint256 = 1
+        *output = calloc(32, 1);
+        if (!*output)
+            return EVM_INTERNAL_ERROR;
+        (*output)[31] = 1;
+        *output_size = 32;
+    }
+    else
+    {
+        *output = NULL;
+        *output_size = 0;
+    }
+
+    return EVM_SUCCESS;
+}
+
+//==============================================================================
 // precompile_execute
 //==============================================================================
 
@@ -1465,7 +1659,7 @@ evm_status_t precompile_execute(const address_t *addr,
                                 uint8_t **output, size_t *output_size,
                                 evm_fork_t fork)
 {
-    uint8_t idx = precompile_index(addr);
+    uint16_t idx = precompile_index(addr);
 
     *output = NULL;
     *output_size = 0;
@@ -1509,6 +1703,9 @@ evm_status_t precompile_execute(const address_t *addr,
         return precompile_bls_map_g1(input, input_size, gas, output, output_size);
     case PRECOMPILE_BLS_MAP_G2:
         return precompile_bls_map_g2(input, input_size, gas, output, output_size);
+
+    case PRECOMPILE_P256VERIFY:
+        return precompile_p256verify(input, input_size, gas, output, output_size);
 
     default:
         return EVM_INTERNAL_ERROR;
