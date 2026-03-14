@@ -1490,17 +1490,6 @@ static evm_status_t precompile_bls_map_g2(const uint8_t *input, size_t input_siz
 }
 
 //==============================================================================
-// Stub for unimplemented precompiles
-//==============================================================================
-
-static evm_status_t precompile_stub(uint8_t idx, uint64_t *gas)
-{
-    (void)idx;
-    *gas = 0;
-    return EVM_REVERT;
-}
-
-//==============================================================================
 // P256VERIFY Precompile (0x0100) — EIP-7212
 //==============================================================================
 

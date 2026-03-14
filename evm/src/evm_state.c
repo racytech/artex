@@ -1779,6 +1779,7 @@ static bool flush_all_storage_cb(const uint8_t *key, size_t key_len,
 }
 #endif /* ENABLE_VERKLE */
 
+#ifdef ENABLE_VERKLE
 static bool clear_block_dirty_account_cb(const uint8_t *key, size_t key_len,
                                           const void *value, size_t value_len,
                                           void *user_data) {
@@ -1799,6 +1800,7 @@ static bool clear_block_dirty_slot_cb(const uint8_t *key, size_t key_len,
     cs->block_dirty = false;
     return true;
 }
+#endif /* ENABLE_VERKLE */
 
 
 hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
@@ -2004,36 +2006,6 @@ static int cmp_storage_by_addr(const void *a, const void *b) {
 }
 
 #ifdef ENABLE_DEBUG
-// Debug: dump block_dirty accounts and storage
-static bool debug_dump_acct_cb(const uint8_t *key, size_t key_len,
-                                const void *value, size_t value_len,
-                                void *user_data) {
-    (void)key_len; (void)value_len; (void)user_data;
-    const cached_account_t *ca = (const cached_account_t *)value;
-    if (!ca->block_dirty && !ca->block_code_dirty) return true;
-    fprintf(stderr, "  DIRTY_ACCT %02x%02x..%02x%02x nonce=%lu has_code=%d existed=%d created=%d block_dirty=%d bal=",
-            key[0], key[1], key[18], key[19],
-            ca->nonce, ca->has_code, ca->existed, ca->created, ca->block_dirty);
-    uint8_t bal[32]; uint256_to_bytes(&ca->balance, bal);
-    for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", bal[i]);
-    fprintf(stderr, "\n");
-    return true;
-}
-static bool debug_dump_slot_cb(const uint8_t *key, size_t key_len,
-                                const void *value, size_t value_len,
-                                void *user_data) {
-    (void)key_len; (void)value_len; (void)user_data;
-    const cached_slot_t *cs = (const cached_slot_t *)value;
-    if (!cs->block_dirty) return true;
-    fprintf(stderr, "  DIRTY_SLOT addr=%02x%02x..%02x%02x slot=",
-            key[0], key[1], key[18], key[19]);
-    for (int i = 20; i < 52; i++) fprintf(stderr, "%02x", key[i]);
-    uint8_t vbe[32]; uint256_to_bytes(&cs->current, vbe);
-    fprintf(stderr, " val=");
-    for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", vbe[i]);
-    fprintf(stderr, "\n");
-    return true;
-}
 static bool debug_dump_all_acct_cb(const uint8_t *key, size_t key_len,
                                     const void *value, size_t value_len,
                                     void *user_data) {

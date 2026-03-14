@@ -205,22 +205,6 @@ extern "C"
     bool fork_has_staticcall(evm_fork_t fork);
 
     /**
-     * Check if RETURNDATASIZE/RETURNDATACOPY are available (Byzantium+)
-     *
-     * @param fork Current fork
-     * @return true if available
-     */
-    bool fork_has_returndata(evm_fork_t fork);
-
-    /**
-     * Check if REVERT is available (Byzantium+)
-     *
-     * @param fork Current fork
-     * @return true if available
-     */
-    bool fork_has_revert(evm_fork_t fork);
-
-    /**
      * Check if CREATE2 is available (Constantinople+)
      *
      * @param fork Current fork

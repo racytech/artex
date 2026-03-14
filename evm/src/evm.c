@@ -790,15 +790,3 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     return true;
 }
 
-evm_status_t evm_run(evm_t *evm)
-{
-    if (!evm)
-    {
-        return EVM_INTERNAL_ERROR;
-    }
-
-    // TODO: This will be replaced by evm_interpret() or integrated with it
-    LOG_EVM_DEBUG("evm_run stub - not yet implemented");
-    
-    return EVM_INTERNAL_ERROR;
-}

@@ -358,16 +358,6 @@ bool fork_has_staticcall(evm_fork_t fork)
     return fork >= FORK_BYZANTIUM;
 }
 
-bool fork_has_returndata(evm_fork_t fork)
-{
-    return fork >= FORK_BYZANTIUM;
-}
-
-bool fork_has_revert(evm_fork_t fork)
-{
-    return fork >= FORK_BYZANTIUM;
-}
-
 bool fork_has_create2(evm_fork_t fork)
 {
     return fork >= FORK_CONSTANTINOPLE;
