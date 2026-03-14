@@ -103,7 +103,11 @@ bool parse_block_header(const cJSON *json, test_block_header_t *out) {
     if (json_get_string(json, "parentBeaconBlockRoot", &str)) {
         parse_hash(str, &out->parent_beacon_block_root);
     }
-    
+
+    if (json_get_string(json, "requestsHash", &str)) {
+        parse_hash(str, &out->requests_hash);
+    }
+
     return true;
 }
 

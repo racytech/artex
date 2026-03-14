@@ -78,6 +78,7 @@ typedef struct {
     uint256_t blob_gas_used; // EIP-4844
     uint256_t excess_blob_gas;
     hash_t parent_beacon_block_root;
+    hash_t requests_hash;   // EIP-7685 (Prague+)
 } test_block_header_t;
 
 /**
@@ -339,6 +340,11 @@ typedef struct {
 
     /* newPayloadVersion: 1-4 */
     int      new_payload_version;
+
+    /* EIP-7685: execution requests (Prague+, V4) */
+    uint8_t **requests;
+    size_t   *request_lengths;
+    size_t    request_count;
 
     /* Expected validation error (NULL if block is valid) */
     char    *validation_error;

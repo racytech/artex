@@ -48,6 +48,12 @@ typedef struct {
 
     hash_t      receipt_root;    /* MPT root of RLP-encoded receipts */
     uint8_t     logs_bloom[256]; /* aggregate bloom = OR of all per-tx blooms */
+
+    /* EIP-7685: accumulated execution requests (Prague+)
+     * Each request: type_byte || request_data */
+    uint8_t   **requests;        /* array of request byte arrays */
+    size_t     *request_lengths; /* length of each request */
+    size_t      request_count;   /* number of requests */
 } block_result_t;
 
 /**

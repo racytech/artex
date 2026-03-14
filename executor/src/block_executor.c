@@ -213,8 +213,16 @@ static void header_to_evm_block_env(const block_header_t *hdr,
  * System contract call helper (Prague+)
  * ========================================================================= */
 
+/**
+ * Execute a system call and optionally capture return data.
+ * If out_data/out_len are non-NULL, the caller takes ownership of the output.
+ */
 static void system_call(evm_t *evm, const uint8_t addr_bytes[20],
-                        const uint8_t *calldata, size_t calldata_len) {
+                        const uint8_t *calldata, size_t calldata_len,
+                        uint8_t **out_data, size_t *out_len) {
+    if (out_data) *out_data = NULL;
+    if (out_len) *out_len = 0;
+
     address_t contract_addr, system_addr;
     memcpy(contract_addr.bytes, addr_bytes, 20);
     memset(system_addr.bytes, 0xff, 20);
@@ -248,6 +256,15 @@ static void system_call(evm_t *evm, const uint8_t addr_bytes[20],
         calldata, calldata_len, 30000000, 0);
     evm_result_t result;
     evm_execute(evm, &msg, &result);
+
+    /* Capture return data if requested */
+    if (out_data && result.output_data && result.output_size > 0) {
+        *out_data = result.output_data;
+        *out_len = result.output_size;
+        result.output_data = NULL;  /* transfer ownership */
+        result.output_size = 0;
+    }
+
     evm_result_free(&result);
 
     /* Commit system call state changes (reset access lists, commit originals).
@@ -334,7 +351,7 @@ block_result_t block_execute(evm_t *evm,
             0x9f, 0xB7, 0xB8, 0xbB, 0x85, 0x22, 0xd0, 0xBe, 0xac, 0x02
         };
         system_call(evm, BEACON_ROOT_ADDR,
-                    header->parent_beacon_root.bytes, 32);
+                    header->parent_beacon_root.bytes, 32, NULL, NULL);
     }
 
     /* EIP-2935: Store parent block hash in history contract (Prague+) */
@@ -344,7 +361,7 @@ block_result_t block_execute(evm_t *evm,
             0x7a, 0x02, 0x33, 0x5b, 0x17, 0x53, 0x20, 0x00, 0x29, 0x35
         };
         system_call(evm, HISTORY_ADDR,
-                    header->parent_hash.bytes, 32);
+                    header->parent_hash.bytes, 32, NULL, NULL);
     }
 
     uint64_t cumulative_gas = 0;
@@ -537,22 +554,124 @@ block_result_t block_execute(evm_t *evm,
                               &amount_wei);
     }
 
-    /* EIP-7002: Dequeue withdrawal requests (Prague+) */
+    /* EIP-7685: Accumulate execution requests (Prague+)
+     * Three request types collected in order:
+     *   0x00 = deposits (EIP-6110, extracted from receipt logs)
+     *   0x01 = withdrawal requests (EIP-7002, from system call return data)
+     *   0x02 = consolidation requests (EIP-7251, from system call return data)
+     */
     if (evm->fork >= FORK_PRAGUE) {
-        static const uint8_t WITHDRAWAL_REQ_ADDR[20] = {
-            0x00, 0x00, 0x09, 0x61, 0xef, 0x48, 0x0e, 0xb5, 0x5e, 0x80,
-            0xd1, 0x9a, 0xd8, 0x35, 0x79, 0xa6, 0x4c, 0x00, 0x70, 0x02
-        };
-        system_call(evm, WITHDRAWAL_REQ_ADDR, NULL, 0);
-    }
+        /* Temporary storage for up to 3 request types */
+        uint8_t *req_bufs[3] = {NULL, NULL, NULL};
+        size_t   req_lens[3] = {0, 0, 0};
 
-    /* EIP-7251: Dequeue consolidation requests (Prague+) */
-    if (evm->fork >= FORK_PRAGUE) {
-        static const uint8_t CONSOLIDATION_REQ_ADDR[20] = {
-            0x00, 0x00, 0xbb, 0xdd, 0xc7, 0xce, 0x48, 0x86, 0x42, 0xfb,
-            0x57, 0x9f, 0x8b, 0x00, 0xf3, 0xa5, 0x90, 0x00, 0x72, 0x51
+        /* --- EIP-6110: Extract deposit requests from transaction logs --- */
+        static const uint8_t DEPOSIT_ADDR[20] = {
+            0x00, 0x00, 0x00, 0x00, 0x21, 0x9a, 0xb5, 0x40, 0x35, 0x6c,
+            0xbb, 0x83, 0x9c, 0xbe, 0x05, 0x30, 0x3d, 0x77, 0x05, 0xfa
         };
-        system_call(evm, CONSOLIDATION_REQ_ADDR, NULL, 0);
+        {
+            /* Count deposit logs first */
+            size_t deposit_count = 0;
+            for (size_t r = 0; r < result.receipt_count; r++) {
+                for (size_t l = 0; l < result.receipts[r].log_count; l++) {
+                    evm_log_t *log = &result.receipts[r].logs[l];
+                    if (memcmp(log->address.bytes, DEPOSIT_ADDR, 20) == 0)
+                        deposit_count++;
+                }
+            }
+            if (deposit_count > 0) {
+                /* Each deposit: type(1) + pubkey(48) + creds(32) + amount(8) + sig(96) + index(8) = 193 bytes */
+                size_t deposit_data_len = deposit_count * 192;  /* without type prefix */
+                req_bufs[0] = malloc(1 + deposit_data_len);
+                if (req_bufs[0]) {
+                    req_bufs[0][0] = 0x00;  /* type byte */
+                    size_t off = 1;
+                    for (size_t r = 0; r < result.receipt_count; r++) {
+                        for (size_t l = 0; l < result.receipts[r].log_count; l++) {
+                            evm_log_t *log = &result.receipts[r].logs[l];
+                            if (memcmp(log->address.bytes, DEPOSIT_ADDR, 20) != 0)
+                                continue;
+                            /* ABI-decoded deposit log data (576 bytes):
+                             * 5 offsets (160B) + 5 length-prefixed fields.
+                             * Extract raw field bytes at known offsets. */
+                            /* Skip logs with insufficient data */
+                            if (log->data_len >= 576) {
+                                memcpy(req_bufs[0] + off,       log->data + 192, 48);  /* pubkey */
+                                memcpy(req_bufs[0] + off + 48,  log->data + 288, 32);  /* withdrawal_credentials */
+                                memcpy(req_bufs[0] + off + 80,  log->data + 352, 8);   /* amount */
+                                memcpy(req_bufs[0] + off + 88,  log->data + 416, 96);  /* signature */
+                                memcpy(req_bufs[0] + off + 184, log->data + 544, 8);   /* index */
+                                off += 192;
+                            }
+                        }
+                    }
+                    req_lens[0] = off;
+                }
+            }
+        }
+
+        /* --- EIP-7002: Dequeue withdrawal requests --- */
+        {
+            static const uint8_t WITHDRAWAL_REQ_ADDR[20] = {
+                0x00, 0x00, 0x09, 0x61, 0xef, 0x48, 0x0e, 0xb5, 0x5e, 0x80,
+                0xd1, 0x9a, 0xd8, 0x35, 0x79, 0xa6, 0x4c, 0x00, 0x70, 0x02
+            };
+            uint8_t *wd_data = NULL;
+            size_t wd_len = 0;
+            system_call(evm, WITHDRAWAL_REQ_ADDR, NULL, 0, &wd_data, &wd_len);
+            if (wd_data && wd_len > 0) {
+                req_bufs[1] = malloc(1 + wd_len);
+                if (req_bufs[1]) {
+                    req_bufs[1][0] = 0x01;  /* type byte */
+                    memcpy(req_bufs[1] + 1, wd_data, wd_len);
+                    req_lens[1] = 1 + wd_len;
+                }
+                free(wd_data);
+            }
+        }
+
+        /* --- EIP-7251: Dequeue consolidation requests --- */
+        {
+            static const uint8_t CONSOLIDATION_REQ_ADDR[20] = {
+                0x00, 0x00, 0xbb, 0xdd, 0xc7, 0xce, 0x48, 0x86, 0x42, 0xfb,
+                0x57, 0x9f, 0x8b, 0x00, 0xf3, 0xa5, 0x90, 0x00, 0x72, 0x51
+            };
+            uint8_t *cons_data = NULL;
+            size_t cons_len = 0;
+            system_call(evm, CONSOLIDATION_REQ_ADDR, NULL, 0, &cons_data, &cons_len);
+            if (cons_data && cons_len > 0) {
+                req_bufs[2] = malloc(1 + cons_len);
+                if (req_bufs[2]) {
+                    req_bufs[2][0] = 0x02;  /* type byte */
+                    memcpy(req_bufs[2] + 1, cons_data, cons_len);
+                    req_lens[2] = 1 + cons_len;
+                }
+                free(cons_data);
+            }
+        }
+
+        /* Collect non-empty requests into result */
+        size_t total_reqs = 0;
+        for (int i = 0; i < 3; i++)
+            if (req_lens[i] > 0) total_reqs++;
+
+        if (total_reqs > 0) {
+            result.requests = calloc(total_reqs, sizeof(uint8_t *));
+            result.request_lengths = calloc(total_reqs, sizeof(size_t));
+            result.request_count = total_reqs;
+            size_t idx = 0;
+            for (int i = 0; i < 3; i++) {
+                if (req_lens[i] > 0) {
+                    result.requests[idx] = req_bufs[i];
+                    result.request_lengths[idx] = req_lens[i];
+                    idx++;
+                }
+            }
+        } else {
+            /* Free any allocated but empty buffers */
+            for (int i = 0; i < 3; i++) free(req_bufs[i]);
+        }
     }
 
     /* Finalize state: flush dirty accounts/storage to state_db */
@@ -579,5 +698,13 @@ void block_result_free(block_result_t *result) {
         free(result->receipts);
         result->receipts = NULL;
         result->receipt_count = 0;
+
+        for (size_t i = 0; i < result->request_count; i++)
+            free(result->requests[i]);
+        free(result->requests);
+        free(result->request_lengths);
+        result->requests = NULL;
+        result->request_lengths = NULL;
+        result->request_count = 0;
     }
 }

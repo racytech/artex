@@ -136,7 +136,8 @@ static void payload_to_header(const execution_payload_t *p,
                                engine_version_t version,
                                const hash_t *tx_root,
                                const hash_t *withdrawals_root,
-                               const uint8_t *parent_beacon_root) {
+                               const uint8_t *parent_beacon_root,
+                               const hash_t *requests_hash) {
     memset(hdr, 0, sizeof(*hdr));
 
     memcpy(hdr->parent_hash.bytes, p->parent_hash, 32);
@@ -178,6 +179,12 @@ static void payload_to_header(const execution_payload_t *p,
     if (parent_beacon_root) {
         hdr->has_parent_beacon_root = true;
         memcpy(hdr->parent_beacon_root.bytes, parent_beacon_root, 32);
+    }
+
+    /* V4+: requests hash (EIP-7685) */
+    if (requests_hash) {
+        hdr->has_requests_hash = true;
+        hash_copy(&hdr->requests_hash, requests_hash);
     }
 }
 
@@ -467,11 +474,23 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
             free(wds);
         }
 
+        /* Step 2b: Compute requests hash (V4+, EIP-7685) */
+        hash_t req_hash = {0};
+        bool has_req_hash = false;
+        if (version >= ENGINE_V4) {
+            req_hash = block_compute_requests_hash(
+                (const uint8_t *const *)payload.requests,
+                payload.request_lengths,
+                payload.request_count);
+            has_req_hash = true;
+        }
+
         /* Step 3: Build header for hash verification */
         block_header_t header;
         payload_to_header(&payload, &header, version, &tx_root,
                           version >= ENGINE_V2 ? &wd_root : NULL,
-                          has_parent_beacon_root ? parent_beacon_root : NULL);
+                          has_parent_beacon_root ? parent_beacon_root : NULL,
+                          has_req_hash ? &req_hash : NULL);
 
         /* Step 4: Verify block hash */
         hash_t computed_hash = block_header_hash(&header);

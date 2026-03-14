@@ -2,6 +2,7 @@
 #include "mem_mpt.h"
 #include <string.h>
 #include <stdlib.h>
+#include <openssl/sha.h>
 
 /* =========================================================================
  * Helpers: extract typed values from RLP string items
@@ -146,6 +147,12 @@ bool block_header_decode_rlp(block_header_t *hdr,
     if (count > 19) {
         hdr->has_parent_beacon_root = true;
         rlp_get_hash(rlp_get_list_item(root, 19), &hdr->parent_beacon_root);
+    }
+
+    /* Field 20: requestsHash (Prague+, EIP-7685) */
+    if (count > 20) {
+        hdr->has_requests_hash = true;
+        rlp_get_hash(rlp_get_list_item(root, 20), &hdr->requests_hash);
     }
 
     rlp_item_free(root);
@@ -432,6 +439,10 @@ bytes_t block_header_encode_rlp(const block_header_t *hdr) {
     if (hdr->has_parent_beacon_root)
         rlp_list_append(list, rlp_string(hdr->parent_beacon_root.bytes, 32));
 
+    /* [20] requestsHash (Prague+, EIP-7685) */
+    if (hdr->has_requests_hash)
+        rlp_list_append(list, rlp_string(hdr->requests_hash.bytes, 32));
+
     bytes_t encoded = rlp_encode(list);
     rlp_item_free(list);
     return encoded;
@@ -555,4 +566,25 @@ cleanup:
     }
     free(entries);
     return root;
+}
+
+/* =========================================================================
+ * Requests hash computation (EIP-7685, Prague+)
+ * ========================================================================= */
+
+hash_t block_compute_requests_hash(const uint8_t *const *requests,
+                                    const size_t *lengths,
+                                    size_t count) {
+    hash_t result;
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+
+    for (size_t i = 0; i < count; i++) {
+        uint8_t req_hash[32];
+        SHA256(requests[i], lengths[i], req_hash);
+        SHA256_Update(&ctx, req_hash, 32);
+    }
+
+    SHA256_Final(result.bytes, &ctx);
+    return result;
 }

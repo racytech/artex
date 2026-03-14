@@ -21,6 +21,7 @@ extern "C" {
  *   London+:     16 (+ baseFeePerGas)
  *   Shanghai+:   17 (+ withdrawalsRoot)
  *   Cancun+:     20 (+ blobGasUsed, excessBlobGas, parentBeaconBlockRoot)
+ *   Prague+:     21 (+ requestsHash, EIP-7685)
  */
 typedef struct {
     hash_t    parent_hash;
@@ -55,6 +56,10 @@ typedef struct {
 
     bool      has_parent_beacon_root;
     hash_t    parent_beacon_root;
+
+    /* Prague+ (EIP-7685) */
+    bool      has_requests_hash;
+    hash_t    requests_hash;
 } block_header_t;
 
 /**
@@ -201,6 +206,19 @@ hash_t block_compute_tx_root(const block_body_t *body);
  */
 hash_t block_compute_withdrawals_root(const withdrawal_t *withdrawals,
                                        size_t count);
+
+/**
+ * Compute the EIP-7685 requests hash from execution requests.
+ * Hash = sha256(sha256(r0) || sha256(r1) || ... || sha256(rN))
+ *
+ * @param requests  Array of request byte arrays (type_byte || data)
+ * @param lengths   Length of each request
+ * @param count     Number of requests
+ * @return Requests hash (SHA-256)
+ */
+hash_t block_compute_requests_hash(const uint8_t *const *requests,
+                                    const size_t *lengths,
+                                    size_t count);
 
 #ifdef __cplusplus
 }

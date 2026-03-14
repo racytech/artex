@@ -521,6 +521,26 @@ static bool parse_engine_payload(const cJSON *entry, engine_test_payload_t *payl
         }
     }
 
+    /* params[3] = executionRequests (Prague+, V4) */
+    const cJSON *param3 = cJSON_GetArrayItem((cJSON *)params, 3);
+    if (param3 && cJSON_IsArray(param3)) {
+        int req_count = cJSON_GetArraySize(param3);
+        if (req_count > 0) {
+            payload->requests = calloc((size_t)req_count, sizeof(uint8_t *));
+            payload->request_lengths = calloc((size_t)req_count, sizeof(size_t));
+            payload->request_count = (size_t)req_count;
+            size_t idx = 0;
+            const cJSON *req_item;
+            cJSON_ArrayForEach(req_item, param3) {
+                if (cJSON_IsString(req_item)) {
+                    payload->requests[idx] = parse_hex_alloc(
+                        req_item->valuestring, &payload->request_lengths[idx]);
+                }
+                idx++;
+            }
+        }
+    }
+
     return true;
 }
 
