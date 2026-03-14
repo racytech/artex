@@ -454,6 +454,24 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
         return false;
     }
 
+    // Initialize persistent mpt_store if requested
+#ifdef ENABLE_MPT
+    if (config && config->mpt_store) {
+        if (!evm_state_init_mpt_stores(runner->state, "/tmp/test_runner_mpt",
+                                        4096, 65536)) {
+            fprintf(stderr, "ERROR: Failed to initialize mpt_store\n");
+            evm_state_destroy(runner->state);
+            runner->state = NULL;
+#ifdef ENABLE_VERKLE
+            verkle_state_destroy(runner->vs);
+            runner->vs = NULL;
+            cleanup_flat_dirs();
+#endif
+            return false;
+        }
+    }
+#endif
+
     // Initialize EVM
     runner->evm = evm_create(runner->state, NULL); // NULL = use default mainnet config
     if (!runner->evm) {
@@ -528,6 +546,12 @@ void test_runner_reset(test_runner_t *runner) {
             NULL   /* no code_store for tests */
         );
         if (runner->state) {
+#ifdef ENABLE_MPT
+            if (runner->config.mpt_store) {
+                evm_state_init_mpt_stores(runner->state, "/tmp/test_runner_mpt",
+                                           4096, 65536);
+            }
+#endif
             runner->evm = evm_create(runner->state, NULL);
         }
 #ifdef ENABLE_VERKLE

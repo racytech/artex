@@ -460,6 +460,33 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
     return es;
 }
 
+bool evm_state_init_mpt_stores(evm_state_t *es, const char *path,
+                                uint64_t acct_cap, uint64_t stor_cap) {
+#ifdef ENABLE_MPT
+    if (!es || !path) return false;
+    if (es->account_mpt || es->storage_mpt) return false;
+
+    es->account_mpt = mpt_store_create(path, acct_cap);
+    if (!es->account_mpt) return false;
+    mpt_store_set_cache_mb(es->account_mpt, 1);
+
+    char storage_path[512];
+    snprintf(storage_path, sizeof(storage_path), "%s_storage", path);
+    es->storage_mpt = mpt_store_create(storage_path, stor_cap);
+    if (!es->storage_mpt) {
+        mpt_store_destroy(es->account_mpt);
+        es->account_mpt = NULL;
+        return false;
+    }
+    mpt_store_set_cache_mb(es->storage_mpt, 1);
+    mpt_store_set_shared(es->storage_mpt, true);
+    return true;
+#else
+    (void)es; (void)path; (void)acct_cap; (void)stor_cap;
+    return false;
+#endif
+}
+
 // Callback: free heap-allocated code pointers before arena destroy
 static bool free_code_cb(const uint8_t *key, size_t key_len,
                           const void *value, size_t value_len,
