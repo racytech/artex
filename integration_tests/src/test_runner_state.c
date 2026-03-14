@@ -123,6 +123,14 @@ bool test_runner_run_state_test(test_runner_t *runner,
             // Commit pre-state as "original" for EIP-2200 storage tracking
             evm_state_commit(runner->state);
 
+            // Flush pre-state to persistent mpt_store (so unmodified accounts
+            // are in the trie before we clear dirty flags)
+#ifdef ENABLE_MPT
+            if (runner->config.mpt_store)
+                evm_state_compute_mpt_root(runner->state, false);
+#endif
+            evm_state_clear_prestate_dirty(runner->state);
+
             // Get transaction parameters for this test case
             uint256_t gas_limit = test->transaction.gas_limit_count > post_cond->gas_index ?
                 test->transaction.gas_limit[post_cond->gas_index] : uint256_from_uint64(0);

@@ -62,6 +62,15 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
 void evm_state_destroy(evm_state_t *es);
 
 /**
+ * Initialize persistent MPT stores on an existing evm_state (for testing).
+ * Creates fresh (truncated) stores at <path>.idx/.dat and <path>_storage.*.
+ * Uses small capacity hints suitable for test fixtures (not mainnet scale).
+ * Must be called BEFORE any state operations. Returns false on failure.
+ */
+bool evm_state_init_mpt_stores(evm_state_t *es, const char *path,
+                                uint64_t acct_cap, uint64_t stor_cap);
+
+/**
  * Mark state to discard pending writes on destroy.
  * Call after a failed block to prevent corrupting the on-disk MPT state.
  */
