@@ -18,8 +18,7 @@
 #include <string.h>
 #include <stdio.h>
 
-// Debug: set to true to trace CALL gas
-bool g_trace_calls __attribute__((weak)) = false;
+// g_trace_calls declared in interpreter.c (unity build)
 
 /* Stack buffer for small CALL input data — avoids malloc in the common case.
  * 2 KB covers most contract calls. Max call depth 1024 × 2 KB = 2 MB stack. */

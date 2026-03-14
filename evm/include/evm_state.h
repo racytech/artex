@@ -313,8 +313,10 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
  */
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty);
 #endif
-/** Print MPT cache stats (hit rate, pinned nodes, eviction skips) to stderr. */
+#ifdef ENABLE_DEBUG
 void evm_state_print_mpt_stats(evm_state_t *es);
 void evm_state_debug_dump(evm_state_t *es);
+void evm_state_dump_mpt(evm_state_t *es, const char *path);
+#endif
 
 #endif // EVM_STATE_H

@@ -11,7 +11,7 @@
 #include "logger.h"
 #include <stdlib.h>
 #include <stdio.h>
-extern bool g_trace_calls __attribute__((weak));
+// g_trace_calls declared in interpreter.c (unity build)
 
 //==============================================================================
 // Helper Functions

@@ -11,6 +11,7 @@ project(art_database C)
 option(ENABLE_MPT "Enable MPT (Merkle Patricia Trie) state root" ON)
 option(ENABLE_VERKLE "Enable Verkle state root" OFF)
 option(ENABLE_EVM_TRACE "Enable EIP-3155 EVM execution tracing" OFF)
+option(ENABLE_DEBUG "Enable debug instrumentation (g_trace_calls, state dump, --no-evict)" OFF)
 
 if(NOT ENABLE_MPT AND NOT ENABLE_VERKLE)
     message(FATAL_ERROR "At least one state backend must be enabled (ENABLE_MPT or ENABLE_VERKLE)")
@@ -231,6 +232,9 @@ if(ENABLE_VERKLE)
 endif()
 if(ENABLE_EVM_TRACE)
     target_compile_definitions(evm PUBLIC ENABLE_EVM_TRACE=1)
+endif()
+if(ENABLE_DEBUG)
+    target_compile_definitions(evm PUBLIC ENABLE_DEBUG=1)
 endif()
 target_compile_definitions(evm PRIVATE
     MPT_STORAGE_CACHE_MB=${MPT_STORAGE_CACHE_MB}

@@ -41,7 +41,9 @@ typedef struct {
     /* Behavior */
     uint32_t checkpoint_interval;   /* auto-save every N blocks (0 = never) */
     bool     validate_state_root;   /* compare computed root against header */
-    bool     no_evict;              /* debug: skip cache eviction at checkpoints */
+#ifdef ENABLE_DEBUG
+    bool     no_evict;              /* skip cache eviction at checkpoints */
+#endif
 } sync_config_t;
 
 typedef enum {
@@ -140,7 +142,8 @@ uint64_t sync_resumed_from(const sync_t *sync);
 /** Get current sync status (counters, last block). */
 sync_status_t sync_get_status(const sync_t *sync);
 
-/** Get the evm_state handle (for debug dump on mismatch). */
+#ifdef ENABLE_DEBUG
 struct evm_state *sync_get_state(const sync_t *sync);
+#endif
 
 #endif /* SYNC_H */

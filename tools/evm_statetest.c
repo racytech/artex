@@ -30,8 +30,9 @@
 /* From test_runner_core.c */
 extern chain_config_t *create_test_chain_config(const char *fork_name);
 
-/* Weak symbol for trace flag (referenced by some opcode files) */
+#ifdef ENABLE_DEBUG
 bool g_trace_calls __attribute__((weak)) = false;
+#endif
 
 /* =========================================================================
  * CLI argument parsing

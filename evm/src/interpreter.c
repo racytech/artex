@@ -28,6 +28,13 @@
 #include <string.h>
 #include <stdio.h>
 
+// Debug trace flag — shared across all opcode files (unity build).
+#ifdef ENABLE_DEBUG
+bool g_trace_calls __attribute__((weak)) = false;
+#else
+static const bool g_trace_calls = false;
+#endif
+
 // Include opcode implementations directly — single translation unit allows
 // the compiler to inline all opcode functions into the dispatch loop.
 #include "opcodes/arithmetic.c"

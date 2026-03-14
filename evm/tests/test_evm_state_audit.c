@@ -13,8 +13,9 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* Provide strong definition for the weak symbol used in evm_state.c */
+#ifdef ENABLE_DEBUG
 bool g_trace_calls = false;
+#endif
 
 static int tests_passed = 0;
 static int tests_failed = 0;

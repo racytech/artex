@@ -9,7 +9,11 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifdef ENABLE_DEBUG
 extern bool g_trace_calls __attribute__((weak));
+#else
+static const bool g_trace_calls = false;
+#endif
 
 // ============================================================================
 // Internal constants
@@ -1999,6 +2003,7 @@ static int cmp_storage_by_addr(const void *a, const void *b) {
                   ((const mpt_storage_entry_t *)b)->addr, 20);
 }
 
+#ifdef ENABLE_DEBUG
 // Debug: dump block_dirty accounts and storage
 static bool debug_dump_acct_cb(const uint8_t *key, size_t key_len,
                                 const void *value, size_t value_len,
@@ -2154,6 +2159,7 @@ void evm_state_dump_mpt(evm_state_t *es, const char *path) {
     fclose(f);
     fprintf(stderr, "MPT state dumped to %s\n", path);
 }
+#endif /* ENABLE_DEBUG */
 
 // Compute storage roots incrementally using shared storage mpt_store.
 // Iterates the dirty_slots list (O(dirty)) instead of scanning all cached slots.

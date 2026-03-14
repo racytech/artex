@@ -11,7 +11,11 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifdef ENABLE_DEBUG
 extern bool g_trace_calls __attribute__((weak));
+#else
+static const bool g_trace_calls = false;
+#endif
 
 //==============================================================================
 // Helper Functions

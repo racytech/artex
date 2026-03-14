@@ -22,7 +22,9 @@
 #include <sys/stat.h>
 #include "evm_tracer.h"
 
-bool g_trace_calls = false;  // Debug: trace CALL gas
+#ifdef ENABLE_DEBUG
+bool g_trace_calls = false;
+#endif
 
 #define ERA1_BLOCKS_PER_FILE 8192
 
@@ -221,7 +223,9 @@ int main(int argc, char **argv) {
     /* Parse flags */
     bool force_clean = false;
     bool follow_mode = false;
+#ifdef ENABLE_DEBUG
     bool no_evict = false;
+#endif
     uint64_t trace_block = UINT64_MAX;  /* UINT64_MAX = no tracing */
     int arg_offset = 0;
     while (arg_offset + 1 < argc && argv[1 + arg_offset][0] == '-') {
@@ -231,9 +235,11 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[1 + arg_offset], "--follow") == 0) {
             follow_mode = true;
             arg_offset++;
+#ifdef ENABLE_DEBUG
         } else if (strcmp(argv[1 + arg_offset], "--no-evict") == 0) {
             no_evict = true;
             arg_offset++;
+#endif
         } else if (strcmp(argv[1 + arg_offset], "--trace-block") == 0 && arg_offset + 2 < argc) {
             trace_block = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
@@ -295,7 +301,9 @@ int main(int argc, char **argv) {
         .checkpoint_path     = CKPT_PATH,
         .checkpoint_interval = CHECKPOINT_INTERVAL,
         .validate_state_root = true,
+#ifdef ENABLE_DEBUG
         .no_evict            = no_evict,
+#endif
     };
 #ifdef ENABLE_VERKLE
     cfg.verkle_value_dir  = VALUE_DIR;
@@ -471,7 +479,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Block %lu: STATE ROOT MISMATCH (at batch checkpoint)\n"
                         "  got:      %s\n  expected: %s\n",
                         bn, got_hex, exp_hex);
+#ifdef ENABLE_DEBUG
                 evm_state_debug_dump(sync_get_state(sync));
+#endif
             }
             fprintf(stderr, "\nFirst failure at block %lu — stopping.\n", bn);
             break;

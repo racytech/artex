@@ -14,7 +14,11 @@
 #include <stdio.h>
 #include <pthread.h>
 
+#ifdef ENABLE_DEBUG
 extern bool g_trace_calls __attribute__((weak));
+#else
+static const bool g_trace_calls = false;
+#endif
 
 /* =========================================================================
  * Bloom Filter (2048-bit / 256-byte Ethereum logs bloom)
