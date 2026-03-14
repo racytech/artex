@@ -8,6 +8,7 @@
  */
 
 #include "sync.h"
+#include "evm_state.h"
 #include "era1.h"
 #include "block.h"
 #include "hash.h"
@@ -220,6 +221,7 @@ int main(int argc, char **argv) {
     /* Parse flags */
     bool force_clean = false;
     bool follow_mode = false;
+    bool no_evict = false;
     uint64_t trace_block = UINT64_MAX;  /* UINT64_MAX = no tracing */
     int arg_offset = 0;
     while (arg_offset + 1 < argc && argv[1 + arg_offset][0] == '-') {
@@ -228,6 +230,9 @@ int main(int argc, char **argv) {
             arg_offset++;
         } else if (strcmp(argv[1 + arg_offset], "--follow") == 0) {
             follow_mode = true;
+            arg_offset++;
+        } else if (strcmp(argv[1 + arg_offset], "--no-evict") == 0) {
+            no_evict = true;
             arg_offset++;
         } else if (strcmp(argv[1 + arg_offset], "--trace-block") == 0 && arg_offset + 2 < argc) {
             trace_block = (uint64_t)atoll(argv[2 + arg_offset]);
@@ -290,6 +295,7 @@ int main(int argc, char **argv) {
         .checkpoint_path     = CKPT_PATH,
         .checkpoint_interval = CHECKPOINT_INTERVAL,
         .validate_state_root = true,
+        .no_evict            = no_evict,
     };
 #ifdef ENABLE_VERKLE
     cfg.verkle_value_dir  = VALUE_DIR;
@@ -465,6 +471,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Block %lu: STATE ROOT MISMATCH (at batch checkpoint)\n"
                         "  got:      %s\n  expected: %s\n",
                         bn, got_hex, exp_hex);
+                evm_state_debug_dump(sync_get_state(sync));
             }
             fprintf(stderr, "\nFirst failure at block %lu — stopping.\n", bn);
             break;

@@ -536,6 +536,7 @@ bool sync_execute_block(sync_t *sync,
         sync->pending_expected_root = header->state_root;
 #endif
 
+
     /* Determine outcome (gas only — root validated at checkpoint) */
     if (!gas_match) {
         result->ok    = false;
@@ -626,7 +627,8 @@ bool sync_checkpoint(sync_t *sync) {
     if (ok) sync->last_checkpoint_block = sync->last_block;
 
     /* Evict cache to bound memory — data is on disk, read-through reloads */
-    evm_state_evict_cache(sync->state);
+    if (!sync->config.no_evict)
+        evm_state_evict_cache(sync->state);
 
     /* Reset for next batch */
     sync->batch_root_computed = false;
@@ -650,4 +652,8 @@ sync_status_t sync_get_status(const sync_t *sync) {
     st.blocks_ok   = sync->blocks_ok;
     st.blocks_fail = sync->blocks_fail;
     return st;
+}
+
+evm_state_t *sync_get_state(const sync_t *sync) {
+    return sync ? sync->state : NULL;
 }
