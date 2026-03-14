@@ -2005,6 +2005,49 @@ static int cmp_storage_by_addr(const void *a, const void *b) {
                   ((const mpt_storage_entry_t *)b)->addr, 20);
 }
 
+// ============================================================================
+// Statistics
+// ============================================================================
+
+evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
+    evm_state_stats_t s = {0};
+    if (!es) return s;
+
+    s.cache_accounts   = mem_art_size(&es->accounts);
+    s.cache_slots      = mem_art_size(&es->storage);
+    s.cache_arena_bytes = es->accounts.arena_used + es->storage.arena_used;
+
+#ifdef ENABLE_MPT
+    if (es->account_mpt) {
+        mpt_store_stats_t ms = mpt_store_stats(es->account_mpt);
+        s.acct_mpt_nodes       = ms.node_count;
+        s.acct_mpt_data_bytes  = ms.data_file_size;
+        s.acct_mpt_cache_hits  = ms.cache_hits;
+        s.acct_mpt_cache_misses = ms.cache_misses;
+        s.acct_mpt_cache_count = ms.cache_count;
+        s.acct_mpt_cache_capacity = ms.cache_capacity;
+    }
+    if (es->storage_mpt) {
+        mpt_store_stats_t ms = mpt_store_stats(es->storage_mpt);
+        s.stor_mpt_nodes       = ms.node_count;
+        s.stor_mpt_data_bytes  = ms.data_file_size;
+        s.stor_mpt_cache_hits  = ms.cache_hits;
+        s.stor_mpt_cache_misses = ms.cache_misses;
+        s.stor_mpt_cache_count = ms.cache_count;
+        s.stor_mpt_cache_capacity = ms.cache_capacity;
+    }
+    if (es->code_store) {
+        code_store_cache_stats_t cs = code_store_cache_stats(es->code_store);
+        s.code_count       = code_store_count(es->code_store);
+        s.code_cache_hits  = cs.hits;
+        s.code_cache_misses = cs.misses;
+        s.code_cache_count = cs.count;
+        s.code_cache_capacity = cs.capacity;
+    }
+#endif
+    return s;
+}
+
 #ifdef ENABLE_DEBUG
 static bool debug_dump_all_acct_cb(const uint8_t *key, size_t key_len,
                                     const void *value, size_t value_len,

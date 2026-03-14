@@ -27,10 +27,26 @@ bool g_trace_calls = false;
 #endif
 
 #define ERA1_BLOCKS_PER_FILE 8192
+#define PARIS_BLOCK          15537394  /* last PoW block (The Merge) */
 
 #ifndef CHECKPOINT_INTERVAL
 #define CHECKPOINT_INTERVAL  256
 #endif
+
+static size_t get_rss_kb(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256];
+    size_t rss = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            rss = (size_t)atol(line + 6);
+            break;
+        }
+    }
+    fclose(f);
+    return rss;
+}
 
 /* Persistent store paths */
 static const char *VALUE_DIR  = "/home/racytech/workspace/art/data/chain_replay_values";
@@ -452,10 +468,40 @@ int main(int argc, char **argv) {
             double bps = CHECKPOINT_INTERVAL / (win_secs > 0 ? win_secs : 1);
             double tps = window_txs / (win_secs > 0 ? win_secs : 1);
             double mgps = (window_gas / 1e6) / (win_secs > 0 ? win_secs : 1);
-            sync_status_t st = sync_get_status(sync);
-            printf("Block %lu | %lu txs | %.0f tps | %.1f Mgas/s | %.0f blk/s | ok %lu fail %lu\n",
+            uint64_t remaining = (bn < PARIS_BLOCK) ? PARIS_BLOCK - bn : 0;
+            double eta_hrs = remaining / (bps > 0 ? bps : 1) / 3600.0;
+            printf("Block %lu | %lu txs | %.0f tps | %.1f Mgas/s | %.0f blk/s | %luK to Paris (%.1fh)\n",
                    bn, window_txs, tps, mgps, bps,
-                   st.blocks_ok, st.blocks_fail);
+                   remaining / 1000, eta_hrs);
+
+            /* Stats every 8 checkpoints (~2048 blocks) to avoid spam */
+            if (bn % (CHECKPOINT_INTERVAL * 8) == 0) {
+                evm_state_stats_t ss = sync_get_state_stats(sync);
+                size_t rss_mb = get_rss_kb() / 1024;
+                printf("  | cache: %zuK accts, %zuK slots (%zuMB arena)\n",
+                       ss.cache_accounts / 1000, ss.cache_slots / 1000,
+                       ss.cache_arena_bytes / (1024*1024));
+#ifdef ENABLE_MPT
+                uint64_t acct_total = ss.acct_mpt_cache_hits + ss.acct_mpt_cache_misses;
+                uint64_t stor_total = ss.stor_mpt_cache_hits + ss.stor_mpt_cache_misses;
+                printf("  | mpt: acct %luK nodes (hit %.1f%%, LRU %u/%uK), stor %luK nodes (hit %.1f%%, LRU %u/%uK)\n",
+                       ss.acct_mpt_nodes / 1000,
+                       acct_total ? 100.0 * ss.acct_mpt_cache_hits / acct_total : 0,
+                       ss.acct_mpt_cache_count / 1000, ss.acct_mpt_cache_capacity / 1000,
+                       ss.stor_mpt_nodes / 1000,
+                       stor_total ? 100.0 * ss.stor_mpt_cache_hits / stor_total : 0,
+                       ss.stor_mpt_cache_count / 1000, ss.stor_mpt_cache_capacity / 1000);
+                printf("  | code: %luK (hit %.1f%%, LRU %u/%uK) | disk: %.1fGB/%.1fGB | RSS %zuMB\n",
+                       ss.code_count / 1000,
+                       (ss.code_cache_hits + ss.code_cache_misses)
+                           ? 100.0 * ss.code_cache_hits / (ss.code_cache_hits + ss.code_cache_misses) : 0,
+                       ss.code_cache_count / 1000, ss.code_cache_capacity / 1000,
+                       ss.acct_mpt_data_bytes / 1e9, ss.stor_mpt_data_bytes / 1e9,
+                       rss_mb);
+#else
+                printf("  | RSS %zuMB\n", rss_mb);
+#endif
+            }
             window_txs = 0;
             window_gas = 0;
             clock_gettime(CLOCK_MONOTONIC, &t_window);

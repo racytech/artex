@@ -313,6 +313,44 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
  */
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty);
 #endif
+// ============================================================================
+// Cache / Store Statistics
+// ============================================================================
+
+typedef struct {
+    /* In-memory cache (mem_art) */
+    size_t   cache_accounts;      /* entries in account cache */
+    size_t   cache_slots;         /* entries in storage slot cache */
+    size_t   cache_arena_bytes;   /* total arena bytes (accounts + storage) */
+
+#ifdef ENABLE_MPT
+    /* Account MPT store */
+    uint64_t acct_mpt_nodes;
+    uint64_t acct_mpt_data_bytes;
+    uint64_t acct_mpt_cache_hits;
+    uint64_t acct_mpt_cache_misses;
+    uint32_t acct_mpt_cache_count;
+    uint32_t acct_mpt_cache_capacity;
+
+    /* Storage MPT store */
+    uint64_t stor_mpt_nodes;
+    uint64_t stor_mpt_data_bytes;
+    uint64_t stor_mpt_cache_hits;
+    uint64_t stor_mpt_cache_misses;
+    uint32_t stor_mpt_cache_count;
+    uint32_t stor_mpt_cache_capacity;
+
+    /* Code store */
+    uint64_t code_count;
+    uint64_t code_cache_hits;
+    uint64_t code_cache_misses;
+    uint32_t code_cache_count;
+    uint32_t code_cache_capacity;
+#endif
+} evm_state_stats_t;
+
+evm_state_stats_t evm_state_get_stats(const evm_state_t *es);
+
 #ifdef ENABLE_DEBUG
 void evm_state_print_mpt_stats(evm_state_t *es);
 void evm_state_debug_dump(evm_state_t *es);

@@ -6,6 +6,7 @@
 #include "hash.h"
 #include "block.h"
 #include "fork.h"
+#include "evm_state.h"
 
 /**
  * Sync Engine — reusable block execution + validation + checkpointing.
@@ -141,6 +142,9 @@ uint64_t sync_resumed_from(const sync_t *sync);
 
 /** Get current sync status (counters, last block). */
 sync_status_t sync_get_status(const sync_t *sync);
+
+/** Get cache/store statistics from the underlying evm_state. */
+evm_state_stats_t sync_get_state_stats(const sync_t *sync);
 
 #ifdef ENABLE_DEBUG
 struct evm_state *sync_get_state(const sync_t *sync);

@@ -89,6 +89,9 @@ struct sync {
      * not per-block. We remember the last block's expected root for validation. */
     hash_t   pending_expected_root;
     bool     batch_root_computed;
+
+    /* Stats snapshot taken before cache eviction (so callers see useful values) */
+    evm_state_stats_t last_stats;
 };
 
 // ============================================================================
@@ -626,6 +629,9 @@ bool sync_checkpoint(sync_t *sync) {
                                        sync->blocks_fail);
     if (ok) sync->last_checkpoint_block = sync->last_block;
 
+    /* Snapshot stats before eviction clears the cache */
+    sync->last_stats = evm_state_get_stats(sync->state);
+
     /* Evict cache to bound memory — data is on disk, read-through reloads */
 #ifdef ENABLE_DEBUG
     if (!sync->config.no_evict)
@@ -654,6 +660,11 @@ sync_status_t sync_get_status(const sync_t *sync) {
     st.blocks_ok   = sync->blocks_ok;
     st.blocks_fail = sync->blocks_fail;
     return st;
+}
+
+evm_state_stats_t sync_get_state_stats(const sync_t *sync) {
+    if (!sync) return (evm_state_stats_t){0};
+    return sync->last_stats;
 }
 
 #ifdef ENABLE_DEBUG
