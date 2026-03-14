@@ -58,6 +58,13 @@ mpt_store_t *mpt_store_open(const char *path);
 void mpt_store_destroy(mpt_store_t *ms);
 
 /**
+ * Reset store to empty state in-place without file recreation.
+ * Clears index, data, caches, and pending buffers. Root returns to EMPTY_ROOT.
+ * Much faster than destroy + create for repeated test use.
+ */
+void mpt_store_reset(mpt_store_t *ms);
+
+/**
  * Sync both index and data files to disk. Writes root hash to .dat header.
  */
 void mpt_store_sync(mpt_store_t *ms);

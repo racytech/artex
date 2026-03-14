@@ -65,6 +65,13 @@ disk_hash_t *disk_hash_open(const char *path);
  */
 void disk_hash_destroy(disk_hash_t *dh);
 
+/**
+ * Clear all entries in-place without file recreation.
+ * Zeros all buckets, resets entry/overflow counts, rewrites header.
+ * Much faster than destroy + create for repeated test use.
+ */
+void disk_hash_clear(disk_hash_t *dh);
+
 /* =========================================================================
  * Single Operations
  * ========================================================================= */

@@ -469,6 +469,12 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
 #endif
             return false;
         }
+        // Save mpt_store pointers for reuse across resets (avoids file recreation)
+        evm_state_detach_mpt_stores(runner->state,
+                                     &runner->account_mpt, &runner->storage_mpt);
+        // Re-attach (they're now owned by runner, detach prevents double-free)
+        evm_state_attach_mpt_stores(runner->state,
+                                     runner->account_mpt, runner->storage_mpt);
     }
 #endif
 
@@ -495,9 +501,19 @@ void test_runner_destroy(test_runner_t *runner) {
         evm_destroy(runner->evm);
     }
 
+    // Detach mpt stores before destroying state (runner owns them)
     if (runner->state) {
+        evm_state_detach_mpt_stores(runner->state, NULL, NULL);
         evm_state_destroy(runner->state);
     }
+
+#ifdef ENABLE_MPT
+    // Destroy runner-owned mpt stores
+    if (runner->account_mpt)
+        mpt_store_destroy((mpt_store_t *)runner->account_mpt);
+    if (runner->storage_mpt)
+        mpt_store_destroy((mpt_store_t *)runner->storage_mpt);
+#endif
 
 #ifdef ENABLE_VERKLE
     if (runner->vs) {
@@ -513,12 +529,13 @@ void test_runner_destroy(test_runner_t *runner) {
 void test_runner_reset(test_runner_t *runner) {
     if (!runner) return;
 
-    // Destroy old state
+    // Destroy old state (detach mpt stores first — runner owns them)
     if (runner->evm) {
         evm_destroy(runner->evm);
         runner->evm = NULL;
     }
     if (runner->state) {
+        evm_state_detach_mpt_stores(runner->state, NULL, NULL);
         evm_state_destroy(runner->state);
         runner->state = NULL;
     }
@@ -542,16 +559,16 @@ void test_runner_reset(test_runner_t *runner) {
 #else
             NULL,
 #endif
-            NULL,  /* no mpt_store for tests — use in-memory batch rebuild */
+            NULL,  /* no mpt_store — runner owns stores separately */
             NULL   /* no code_store for tests */
         );
         if (runner->state) {
-#ifdef ENABLE_MPT
-            if (runner->config.mpt_store) {
-                evm_state_init_mpt_stores(runner->state, "/tmp/test_runner_mpt",
-                                           4096, 65536);
+            // Re-attach runner-owned mpt stores (resets them in-place)
+            if (runner->account_mpt && runner->storage_mpt) {
+                evm_state_attach_mpt_stores(runner->state,
+                                             runner->account_mpt,
+                                             runner->storage_mpt);
             }
-#endif
             runner->evm = evm_create(runner->state, NULL);
         }
 #ifdef ENABLE_VERKLE

@@ -71,6 +71,28 @@ bool evm_state_init_mpt_stores(evm_state_t *es, const char *path,
                                 uint64_t acct_cap, uint64_t stor_cap);
 
 /**
+ * Reset persistent MPT stores to empty state in-place (for testing).
+ * Much faster than destroy + init cycle. No-op if stores not initialized.
+ */
+void evm_state_reset_mpt_stores(evm_state_t *es);
+
+/**
+ * Detach MPT stores from evm_state so evm_state_destroy won't free them.
+ * Returns pointers via out params. Caller takes ownership.
+ * Use evm_state_attach_mpt_stores() to re-attach to a fresh evm_state.
+ */
+void evm_state_detach_mpt_stores(evm_state_t *es,
+                                   void **out_account_mpt,
+                                   void **out_storage_mpt);
+
+/**
+ * Attach previously detached MPT stores to a fresh evm_state.
+ * Resets both stores to empty state before attaching.
+ */
+void evm_state_attach_mpt_stores(evm_state_t *es,
+                                   void *account_mpt, void *storage_mpt);
+
+/**
  * Mark state to discard pending writes on destroy.
  * Call after a failed block to prevent corrupting the on-disk MPT state.
  */

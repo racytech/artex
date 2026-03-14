@@ -487,6 +487,46 @@ bool evm_state_init_mpt_stores(evm_state_t *es, const char *path,
 #endif
 }
 
+void evm_state_reset_mpt_stores(evm_state_t *es) {
+#ifdef ENABLE_MPT
+    if (!es) return;
+    if (es->account_mpt) mpt_store_reset(es->account_mpt);
+    if (es->storage_mpt) mpt_store_reset(es->storage_mpt);
+#else
+    (void)es;
+#endif
+}
+
+void evm_state_detach_mpt_stores(evm_state_t *es,
+                                   void **out_account_mpt,
+                                   void **out_storage_mpt) {
+#ifdef ENABLE_MPT
+    if (!es) return;
+    if (out_account_mpt) *out_account_mpt = es->account_mpt;
+    if (out_storage_mpt) *out_storage_mpt = es->storage_mpt;
+    es->account_mpt = NULL;
+    es->storage_mpt = NULL;
+#else
+    (void)es;
+    if (out_account_mpt) *out_account_mpt = NULL;
+    if (out_storage_mpt) *out_storage_mpt = NULL;
+#endif
+}
+
+void evm_state_attach_mpt_stores(evm_state_t *es,
+                                   void *account_mpt, void *storage_mpt) {
+#ifdef ENABLE_MPT
+    if (!es) return;
+    es->account_mpt = (mpt_store_t *)account_mpt;
+    es->storage_mpt = (mpt_store_t *)storage_mpt;
+    if (es->account_mpt) mpt_store_reset(es->account_mpt);
+    if (es->storage_mpt) mpt_store_reset(es->storage_mpt);
+    if (es->storage_mpt) mpt_store_set_shared(es->storage_mpt, true);
+#else
+    (void)es; (void)account_mpt; (void)storage_mpt;
+#endif
+}
+
 // Callback: free heap-allocated code pointers before arena destroy
 static bool free_code_cb(const uint8_t *key, size_t key_len,
                           const void *value, size_t value_len,
