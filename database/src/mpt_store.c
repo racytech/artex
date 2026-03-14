@@ -1493,6 +1493,54 @@ void mpt_store_destroy(mpt_store_t *ms) {
     free(ms);
 }
 
+void mpt_store_reset(mpt_store_t *ms) {
+    if (!ms) return;
+
+    /* Free pending batch entries */
+    free(ms->dirty);
+    ms->dirty = NULL;
+    ms->dirty_count = ms->dirty_cap = 0;
+    ms->batch_active = false;
+    for (size_t i = 0; i < ms->val_page_count; i++)
+        free(ms->val_pages[i]);
+    free(ms->val_pages);
+    ms->val_pages = NULL;
+    ms->val_page_count = ms->val_page_cap = 0;
+    ms->val_page_used = 0;
+
+    /* Free deferred write buffer */
+    def_free_all(ms);
+    def_init(ms);
+
+    /* Free pending deletes */
+    free(ms->def_deletes);
+    ms->def_deletes = NULL;
+    ms->def_del_count = ms->def_del_cap = 0;
+
+    /* Clear LRU cache (keep allocation, just flush entries) */
+    if (ms->cache) {
+        uint32_t cap = ms->cache->capacity;
+        ncache_destroy(ms->cache);
+        ms->cache = ncache_create(cap);
+    }
+
+    /* Clear free lists */
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+        ms->free_lists[i].count = 0;
+    }
+    ms->free_slot_bytes = 0;
+
+    /* Clear disk index in-place */
+    disk_hash_clear(ms->index);
+
+    /* Truncate data file and rewrite header */
+    ftruncate(ms->data_fd, 0);
+    ms->data_size = 0;
+    ms->live_bytes = 0;
+    memcpy(ms->root_hash, EMPTY_ROOT, 32);
+    write_header(ms->data_fd, ms);
+}
+
 void mpt_store_sync(mpt_store_t *ms) {
     if (!ms) return;
     write_header(ms->data_fd, ms);

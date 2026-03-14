@@ -325,6 +325,19 @@ void disk_hash_destroy(disk_hash_t *dh) {
     free(dh);
 }
 
+void disk_hash_clear(disk_hash_t *dh) {
+    if (!dh) return;
+    /* Truncate to just the header, then re-extend to original bucket count.
+     * This zeros all bucket pages (sparse file) without file close/reopen. */
+    uint64_t file_size = PAGE_SIZE + dh->bucket_count * (uint64_t)PAGE_SIZE;
+    ftruncate(dh->fd, PAGE_SIZE);
+    ftruncate(dh->fd, (off_t)file_size);
+    dh->entry_count = 0;
+    dh->overflow_count = 0;
+    dh->dirty = false;
+    write_header(dh);
+}
+
 /* =========================================================================
  * Internal: scan a bucket chain for a key
  *

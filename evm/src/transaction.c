@@ -578,8 +578,8 @@ bool transaction_execute(
             uint32_t signer_code_len = 0;
             const uint8_t *signer_code = evm_state_get_code_ptr(state, signer, &signer_code_len);
             if (signer_code && signer_code_len > 0) {
-                // Allow if existing code is a delegation designator
-                if (signer_code_len != 23 ||
+                // Allow if existing code starts with delegation designator prefix
+                if (signer_code_len < 3 ||
                     signer_code[0] != 0xef || signer_code[1] != 0x01 || signer_code[2] != 0x00) {
                     continue;
                 }
