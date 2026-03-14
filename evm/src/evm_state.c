@@ -2501,12 +2501,20 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
             if (!ca || !ca->mpt_dirty) continue;  // gone or cleared by revert
 
             // Promote block_dirty accounts to existed
-            if (ca->block_dirty && !ca->self_destructed) {
-                bool is_empty_check = (ca->nonce == 0 &&
-                                       uint256_is_zero(&ca->balance) &&
-                                       !ca->has_code);
-                if (!(!ca->existed && !ca->created && is_empty_check && prune_empty))
-                    ca->existed = true;
+            // Must match promote_block_dirty_cb logic used by MEM_MPT path:
+            // - Process accounts with block_dirty OR block_code_dirty
+            // - Self-destructed accounts: set existed = false
+            // - Don't promote new empty accounts when pruning (EIP-161)
+            if (ca->block_dirty || ca->block_code_dirty) {
+                if (ca->self_destructed) {
+                    ca->existed = false;
+                } else {
+                    bool is_empty_check = (ca->nonce == 0 &&
+                                           uint256_is_zero(&ca->balance) &&
+                                           !ca->has_code);
+                    if (!(!ca->existed && !ca->created && is_empty_check && prune_empty))
+                        ca->existed = true;
+                }
             }
 
             const uint8_t *sr = ca->storage_root.bytes;
