@@ -442,7 +442,7 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
 #else
         NULL,
 #endif
-        NULL,  /* no mpt_store for tests — use in-memory batch rebuild */
+        NULL,  /* no mpt_store path — init stores separately below */
         NULL   /* no code_store for tests */
     );
     if (!runner->state) {
@@ -454,28 +454,26 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
         return false;
     }
 
-    // Initialize persistent mpt_store if requested
+    // Initialize persistent mpt_store for state root computation
 #ifdef ENABLE_MPT
-    if (config && config->mpt_store) {
-        if (!evm_state_init_mpt_stores(runner->state, "/dev/shm/test_runner_mpt",
-                                        4096, 65536)) {
-            fprintf(stderr, "ERROR: Failed to initialize mpt_store\n");
-            evm_state_destroy(runner->state);
-            runner->state = NULL;
+    if (!evm_state_init_mpt_stores(runner->state, "/dev/shm/test_runner_mpt",
+                                    4096, 65536)) {
+        fprintf(stderr, "ERROR: Failed to initialize mpt_store\n");
+        evm_state_destroy(runner->state);
+        runner->state = NULL;
 #ifdef ENABLE_VERKLE
-            verkle_state_destroy(runner->vs);
-            runner->vs = NULL;
-            cleanup_flat_dirs();
+        verkle_state_destroy(runner->vs);
+        runner->vs = NULL;
+        cleanup_flat_dirs();
 #endif
-            return false;
-        }
-        // Save mpt_store pointers for reuse across resets (avoids file recreation)
-        evm_state_detach_mpt_stores(runner->state,
-                                     &runner->account_mpt, &runner->storage_mpt);
-        // Re-attach (they're now owned by runner, detach prevents double-free)
-        evm_state_attach_mpt_stores(runner->state,
-                                     runner->account_mpt, runner->storage_mpt);
+        return false;
     }
+    // Save mpt_store pointers for reuse across resets (avoids file recreation)
+    evm_state_detach_mpt_stores(runner->state,
+                                 &runner->account_mpt, &runner->storage_mpt);
+    // Re-attach (they're now owned by runner, detach prevents double-free)
+    evm_state_attach_mpt_stores(runner->state,
+                                 runner->account_mpt, runner->storage_mpt);
 #endif
 
     // Initialize EVM

@@ -93,7 +93,6 @@ typedef struct {
     char **fork_filter;         // Only run specific forks (NULL = all)
     size_t fork_filter_count;
     uint64_t timeout_ms;        // Test timeout in milliseconds
-    bool mpt_store;             // Use persistent mpt_store instead of MEM_MPT
 } test_runner_config_t;
 
 /**

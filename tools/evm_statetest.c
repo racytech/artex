@@ -44,7 +44,6 @@ typedef struct {
     bool        trace;          /* --trace: full EIP-3155 tracing */
     bool        trace_summary;  /* --trace-summary: just stateRoot + pass/gas */
     bool        human;          /* --human: human-readable output */
-    bool        mpt_store;      /* --mpt-store: use persistent mpt_store instead of MEM_MPT */
 } statetest_args_t;
 
 static void print_usage(void) {
@@ -55,7 +54,6 @@ static void print_usage(void) {
         "  --statetest.fork <name>  Only run tests for the specified fork\n"
         "  --statetest.index <N>    Only run subtest at index N (-1 = all)\n"
         "  --human                  Human-readable output\n"
-        "  --mpt-store              Use persistent mpt_store path (not MEM_MPT)\n"
         "\n"
         "If no file is given, reads filenames from stdin (batch mode).\n"
     );
@@ -83,8 +81,6 @@ static bool parse_args(int argc, char **argv, statetest_args_t *args) {
             args->index_filter = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--human") == 0) {
             args->human = true;
-        } else if (strcmp(argv[i], "--mpt-store") == 0) {
-            args->mpt_store = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage();
             exit(0);
@@ -178,16 +174,14 @@ static int run_statetest_file(const char *filepath, const statetest_args_t *args
                 continue;
             }
 #ifdef ENABLE_MPT
-            if (args->mpt_store) {
-                if (!evm_state_init_mpt_stores(state, "/dev/shm/evm_statetest_mpt", 4096, 65536)) {
-                    evm_state_destroy(state);
-                    results[ri].name = test->name ? strdup(test->name) : NULL;
-                    results[ri].fork = fork_name ? strdup(fork_name) : NULL;
-                    results[ri].pass = false;
-                    results[ri].error = "failed to create mpt_store";
-                    ri++;
-                    continue;
-                }
+            if (!evm_state_init_mpt_stores(state, "/dev/shm/evm_statetest_mpt", 4096, 65536)) {
+                evm_state_destroy(state);
+                results[ri].name = test->name ? strdup(test->name) : NULL;
+                results[ri].fork = fork_name ? strdup(fork_name) : NULL;
+                results[ri].pass = false;
+                results[ri].error = "failed to create mpt_store";
+                ri++;
+                continue;
             }
 #endif
             evm_t *evm = evm_create(state, fork_config);
@@ -213,11 +207,10 @@ static int run_statetest_file(const char *filepath, const statetest_args_t *args
             test_runner_setup_state(state, test->pre_state, test->pre_state_count);
             evm_state_commit(state);
 #ifdef ENABLE_MPT
-            /* Flush pre-state to persistent mpt_store before clearing dirty flags.
+            /* Flush pre-state to mpt_store before clearing dirty flags.
              * Without this, pre-state accounts not modified during execution
              * would be missing from the incremental account trie. */
-            if (args->mpt_store)
-                evm_state_compute_mpt_root(state, false);
+            evm_state_compute_mpt_root(state, false);
 #endif
             evm_state_clear_prestate_dirty(state);
 

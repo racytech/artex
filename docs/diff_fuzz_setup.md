@@ -29,7 +29,7 @@ cd ~/workspace/art
 git checkout evm-diff-fuzz
 
 mkdir -p build && cd build
-cmake .. -DENABLE_MEM_MPT=ON -DENABLE_EVM_TRACE=ON
+cmake .. -DENABLE_EVM_TRACE=ON
 make -j$(nproc) evm_statetest
 ```
 

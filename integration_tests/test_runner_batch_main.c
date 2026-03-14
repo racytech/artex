@@ -19,7 +19,6 @@ static void print_usage(const char *program) {
     printf("  -s, --stop-on-fail     Stop on first failure\n");
     printf("  -f, --fork <name>      Only test specific fork (can specify multiple)\n");
     printf("  -t, --timeout <ms>     Test timeout in milliseconds (default: 30000)\n");
-    printf("      --mpt-store        Use persistent mpt_store for state root computation\n");
     printf("  -h, --help             Show this help message\n\n");
     printf("Examples:\n");
     printf("  %s integration_tests/fixtures/state_tests/frontier/\n", program);
@@ -33,8 +32,7 @@ int main(int argc, char **argv) {
         .stop_on_fail = false,
         .fork_filter = NULL,
         .fork_filter_count = 0,
-        .timeout_ms = 30000,
-        .mpt_store = false
+        .timeout_ms = 30000
     };
     
     char **fork_filters = NULL;
@@ -75,9 +73,6 @@ int main(int argc, char **argv) {
             i++;
             config.timeout_ms = strtoull(argv[i], NULL, 10);
             
-        } else if (strcmp(argv[i], "--mpt-store") == 0) {
-            config.mpt_store = true;
-
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "ERROR: Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -103,7 +98,6 @@ int main(int argc, char **argv) {
     printf("================================================================================\n");
     printf("Batch Integration Test Runner\n");
     printf("================================================================================\n");
-    if (config.mpt_store) printf("MPT store: enabled (persistent)\n");
     if (config.verbose) printf("Verbose: enabled\n");
     if (config.stop_on_fail) printf("Stop on fail: enabled\n");
     if (config.fork_filter_count > 0) {

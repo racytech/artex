@@ -4,14 +4,10 @@
 #ifdef ENABLE_MPT
 #include "mpt_store.h"
 #include "code_store.h"
-#ifdef ENABLE_MEM_MPT
-#include "mem_mpt.h"
-#endif
 #endif
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-// #include <time.h>  // uncomment for MPT root profiling
 
 extern bool g_trace_calls __attribute__((weak));
 
@@ -1800,34 +1796,6 @@ static bool clear_block_dirty_slot_cb(const uint8_t *key, size_t key_len,
     return true;
 }
 
-// Promote block_dirty non-empty accounts to existed=true.
-// With VERKLE, flush_all_accounts_cb handles this. Without VERKLE, this callback
-// does the minimal equivalent: update the existed flag so MPT root computation
-// can distinguish live accounts from never-existed ones.
-#ifndef ENABLE_VERKLE
-static bool promote_block_dirty_cb(const uint8_t *key, size_t key_len,
-                                    const void *value, size_t value_len,
-                                    void *user_data) {
-    (void)key; (void)key_len; (void)value_len;
-    bool prune_empty = *(bool *)user_data;
-    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
-
-    if (!ca->block_dirty && !ca->block_code_dirty) return true;
-
-    if (ca->self_destructed) {
-        ca->existed = false;
-        return true;
-    }
-
-    bool is_empty = (ca->nonce == 0 &&
-                     uint256_is_zero(&ca->balance) &&
-                     !ca->has_code);
-    if (!ca->existed && !ca->created && is_empty && prune_empty) return true;
-
-    ca->existed = true;
-    return true;
-}
-#endif
 
 hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     if (!es) return hash_zero();
@@ -1857,8 +1825,7 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     return root;
 #else
     // MPT path: promotion and block_dirty clearing are handled inside
-    // evm_state_compute_mpt_root (folded into mpt_incr_update_cb and
-    // clear_mpt_dirty_cb), so this is a no-op.
+    // evm_state_compute_mpt_root, so this is a no-op.
     (void)prune_empty;
     return hash_zero();
 #endif
@@ -2277,183 +2244,12 @@ clear:
     }
 }
 
-// Clear mpt_dirty and block_dirty flags after incremental MPT root computation.
-// block_dirty is always set alongside mpt_dirty, so clearing here covers both.
-static bool clear_mpt_dirty_cb(const uint8_t *key, size_t key_len,
-                                const void *value, size_t value_len,
-                                void *user_data) {
-    (void)key; (void)key_len; (void)value_len; (void)user_data;
-    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
-    ca->mpt_dirty = false;
-    ca->block_dirty = false;
-    ca->block_code_dirty = false;
-    return true;
-}
-
-#ifdef ENABLE_MEM_MPT
-// ============================================================================
-// In-memory batch MPT fallback (no mpt_store — test runner only)
-// ============================================================================
-
-// Context for collecting storage entries for batch MPT
-typedef struct {
-    address_t        addr;
-    mpt_batch_entry_t *entries;
-    size_t            count, cap;
-} batch_storage_ctx_t;
-
-// Callback: collect non-zero storage slots for one address into batch entries
-static bool batch_collect_slot_cb(const uint8_t *key, size_t key_len,
-                                   const void *value, size_t value_len,
-                                   void *user_data) {
-    (void)key_len; (void)value_len;
-    batch_storage_ctx_t *ctx = (batch_storage_ctx_t *)user_data;
-    const cached_slot_t *cs = (const cached_slot_t *)value;
-
-    // Only slots belonging to this address
-    if (memcmp(cs->key, ctx->addr.bytes, 20) != 0)
-        return true;
-
-    // Skip zero-valued slots (not in trie)
-    if (uint256_is_zero(&cs->current))
-        return true;
-
-    if (ctx->count >= ctx->cap) {
-        size_t nc = ctx->cap ? ctx->cap * 2 : 16;
-        ctx->entries = realloc(ctx->entries, nc * sizeof(mpt_batch_entry_t));
-        ctx->cap = nc;
-    }
-
-    // Key: cached keccak256(slot_be)
-    memcpy(ctx->entries[ctx->count].key, cs->slot_hash.bytes, 32);
-
-    // Value: RLP(trimmed big-endian)
-    uint8_t val_be[32];
-    uint256_to_bytes(&cs->current, val_be);
-    size_t vi = 0;
-    while (vi < 32 && val_be[vi] == 0) vi++;
-    size_t val_len = 32 - vi;
-    // RLP encode: allocate small buffer (max 33 bytes)
-    uint8_t *rlp_buf = malloc(33);
-    size_t rlp_len;
-    if (val_len == 1 && val_be[vi] < 0x80) {
-        rlp_buf[0] = val_be[vi];
-        rlp_len = 1;
-    } else {
-        rlp_buf[0] = 0x80 + (uint8_t)val_len;
-        memcpy(rlp_buf + 1, val_be + vi, val_len);
-        rlp_len = 1 + val_len;
-    }
-    ctx->entries[ctx->count].value = rlp_buf;
-    ctx->entries[ctx->count].value_len = rlp_len;
-    ctx->count++;
-    return true;
-}
-
-// Context for collecting account entries for batch MPT
-typedef struct {
-    evm_state_t       *es;
-    bool               prune_empty;
-    mpt_batch_entry_t *entries;
-    uint8_t          **rlp_bufs;  // to free later
-    size_t             count, cap;
-} batch_account_ctx_t;
-
-static bool batch_collect_account_cb(const uint8_t *key, size_t key_len,
-                                      const void *value, size_t value_len,
-                                      void *user_data) {
-    (void)key; (void)key_len; (void)value_len;
-    batch_account_ctx_t *ctx = (batch_account_ctx_t *)user_data;
-    const cached_account_t *ca = (const cached_account_t *)value;
-
-    if (!ca->existed) return true;
-
-    const uint8_t *sr = ca->storage_root.bytes;
-    const uint8_t *code_hash = ca->has_code
-        ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
-
-    bool is_empty = (ca->nonce == 0 &&
-                     uint256_is_zero(&ca->balance) &&
-                     !ca->has_code &&
-                     memcmp(sr, HASH_EMPTY_STORAGE.bytes, 32) == 0);
-
-    // EIP-161: only prune empty accounts that were touched during execution
-    // (mpt_dirty set). Pre-state empty accounts that were never touched must
-    // remain in the trie.
-    if (is_empty && ctx->prune_empty && ca->mpt_dirty) return true;
-
-    if (ctx->count >= ctx->cap) {
-        size_t nc = ctx->cap ? ctx->cap * 2 : 16;
-        ctx->entries = realloc(ctx->entries, nc * sizeof(mpt_batch_entry_t));
-        ctx->rlp_bufs = realloc(ctx->rlp_bufs, nc * sizeof(uint8_t *));
-        ctx->cap = nc;
-    }
-
-    // Key: cached keccak256(address)
-    memcpy(ctx->entries[ctx->count].key, ca->addr_hash.bytes, 32);
-
-    // Value: RLP([nonce, balance, storage_root, code_hash])
-    uint8_t *rlp = malloc(120);
-    size_t rlp_len = mpt_rlp_account(ca->nonce, &ca->balance, sr, code_hash, rlp);
-    ctx->entries[ctx->count].value = rlp;
-    ctx->entries[ctx->count].value_len = rlp_len;
-    ctx->rlp_bufs[ctx->count] = rlp;
-    ctx->count++;
-    return true;
-}
-
-// Compute storage root for a single account using in-memory batch MPT
-static hash_t batch_compute_storage_root(evm_state_t *es, const address_t *addr) {
-    batch_storage_ctx_t ctx = { .addr = *addr };
-    mem_art_foreach(&es->storage, batch_collect_slot_cb, &ctx);
-
-    hash_t root;
-    if (ctx.count == 0) {
-        root = HASH_EMPTY_STORAGE;
-    } else {
-        mpt_compute_root_batch(ctx.entries, ctx.count, &root);
-    }
-
-    // Free RLP buffers
-    for (size_t i = 0; i < ctx.count; i++)
-        free((void *)ctx.entries[i].value);
-    free(ctx.entries);
-    return root;
-}
-
-// Compute all storage roots using in-memory batch MPT (no mpt_store)
-static bool batch_compute_storage_root_cb(const uint8_t *key, size_t key_len,
-                                            const void *value, size_t value_len,
-                                            void *user_data) {
-    (void)key; (void)key_len; (void)value_len;
-    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
-    evm_state_t *es = (evm_state_t *)user_data;
-
-    if (!ca->existed) return true;
-
-    ca->storage_root = batch_compute_storage_root(es, &ca->addr);
-    return true;
-}
-#endif /* ENABLE_MEM_MPT */
-
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     hash_t root = hash_zero();
     if (!es) return root;
 
-    // ── Incremental path (with mpt_store on disk) ──
     if (es->account_mpt) {
-        // struct timespec t0, t1, t2, t3, t4;
-        // clock_gettime(CLOCK_MONOTONIC, &t0);
-
-        // // Snapshot cache stats before to measure hits/misses during this root
-        // mpt_store_stats_t acct_before = mpt_store_stats(es->account_mpt);
-        // mpt_store_stats_t stor_before = mpt_store_stats(es->storage_mpt);
-
-        // size_t dirty_accounts_count = es->dirty_accounts.count;
-        // size_t dirty_slots_count = es->dirty_slots.count;
-
         compute_all_storage_roots(es);
-        // clock_gettime(CLOCK_MONOTONIC, &t1);
 
         if (!mpt_store_begin_batch(es->account_mpt)) {
             fprintf(stderr, "FATAL: mpt_store_begin_batch failed for account trie\n");
@@ -2467,9 +2263,7 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
                 &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
             if (!ca || !ca->mpt_dirty) continue;  // gone or cleared by revert
 
-            // Promote block_dirty accounts to existed
-            // Must match promote_block_dirty_cb logic used by MEM_MPT path:
-            // - Process accounts with block_dirty OR block_code_dirty
+            // Promote block_dirty accounts to existed:
             // - Self-destructed accounts: set existed = false
             // - Don't promote new empty accounts when pruning (EIP-161)
             if (ca->block_dirty || ca->block_code_dirty) {
@@ -2506,77 +2300,17 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
             ca->block_code_dirty = false;
         }
         dirty_account_clear(&es->dirty_accounts);
-        // clock_gettime(CLOCK_MONOTONIC, &t2);
 
         if (!mpt_store_commit_batch(es->account_mpt)) {
             fprintf(stderr, "FATAL: mpt_store_commit_batch failed for account trie\n");
             return root;
         }
-        // clock_gettime(CLOCK_MONOTONIC, &t3);
 
         mpt_store_root(es->account_mpt, root.bytes);
-        // clock_gettime(CLOCK_MONOTONIC, &t4);
-
-        // // Snapshot cache stats after
-        // mpt_store_stats_t acct_after = mpt_store_stats(es->account_mpt);
-        // mpt_store_stats_t stor_after = mpt_store_stats(es->storage_mpt);
-
-        // double storage_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
-        //                     (t1.tv_nsec - t0.tv_nsec) / 1e6;
-        // double stage_ms   = (t2.tv_sec - t1.tv_sec) * 1000.0 +
-        //                     (t2.tv_nsec - t1.tv_nsec) / 1e6;
-        // double commit_ms  = (t3.tv_sec - t2.tv_sec) * 1000.0 +
-        //                     (t3.tv_nsec - t2.tv_nsec) / 1e6;
-        // double total_ms   = (t4.tv_sec - t0.tv_sec) * 1000.0 +
-        //                     (t4.tv_nsec - t0.tv_nsec) / 1e6;
-
-        // uint64_t s_hits   = stor_after.cache_hits - stor_before.cache_hits;
-        // uint64_t s_misses = stor_after.cache_misses - stor_before.cache_misses;
-        // uint64_t a_hits   = acct_after.cache_hits - acct_before.cache_hits;
-        // uint64_t a_misses = acct_after.cache_misses - acct_before.cache_misses;
-
-        // fprintf(stderr,
-        //     "  MPT root: %.1f ms (storage=%.1f stage=%.1f commit=%.1f) "
-        //     "dirty_acct=%zu dirty_slot=%zu "
-        //     "stor_cache=%llu/%llu (%.0f%%) acct_cache=%llu/%llu (%.0f%%)\n",
-        //     total_ms, storage_ms, stage_ms, commit_ms,
-        //     dirty_accounts_count, dirty_slots_count,
-        //     (unsigned long long)s_hits, (unsigned long long)(s_hits + s_misses),
-        //     (s_hits + s_misses) > 0 ? 100.0 * s_hits / (s_hits + s_misses) : 0,
-        //     (unsigned long long)a_hits, (unsigned long long)(a_hits + a_misses),
-        //     (a_hits + a_misses) > 0 ? 100.0 * a_hits / (a_hits + a_misses) : 0);
-
         return root;
     }
 
-#ifdef ENABLE_MEM_MPT
-    // ── In-memory batch path (no mpt_store — test runner only) ──
-    // Promote block_dirty accounts to existed (needed for batch MPT inclusion).
-    mem_art_foreach(&es->accounts, promote_block_dirty_cb, &prune_empty);
-    mem_art_foreach(&es->accounts, clear_block_dirty_account_cb, NULL);
-    mem_art_foreach(&es->storage, clear_block_dirty_slot_cb, NULL);
-
-    // Compute all storage roots via batch MPT
-    mem_art_foreach(&es->accounts, batch_compute_storage_root_cb, es);
-
-    // Collect all accounts into batch entries
-    batch_account_ctx_t ctx = { .es = es, .prune_empty = prune_empty };
-    mem_art_foreach(&es->accounts, batch_collect_account_cb, &ctx);
-
-    mpt_compute_root_batch(ctx.entries, ctx.count, &root);
-
-    // Cleanup
-    for (size_t i = 0; i < ctx.count; i++)
-        free(ctx.rlp_bufs[i]);
-    free(ctx.entries);
-    free(ctx.rlp_bufs);
-
-    mem_art_foreach(&es->accounts, clear_mpt_dirty_cb, NULL);
-    dirty_account_clear(&es->dirty_accounts);
-    dirty_slot_clear(&es->dirty_slots);
-#else
-    fprintf(stderr, "FATAL: compute_mpt_root called without mpt_store (ENABLE_MEM_MPT not compiled)\n");
-#endif
+    fprintf(stderr, "FATAL: compute_mpt_root called without mpt_store\n");
     return root;
 }
 #endif /* ENABLE_MPT */
