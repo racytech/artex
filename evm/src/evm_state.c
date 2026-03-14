@@ -1830,8 +1830,12 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
 
     return root;
 #else
-    // MPT path: promotion and block_dirty clearing are handled inside
-    // evm_state_compute_mpt_root, so this is a no-op.
+    // MPT path: delegate to compute_mpt_root which handles promotion,
+    // block_dirty clearing, and EIP-161 pruning.
+#ifdef ENABLE_MPT
+    if (es->account_mpt)
+        return evm_state_compute_mpt_root(es, prune_empty);
+#endif
     (void)prune_empty;
     return hash_zero();
 #endif
