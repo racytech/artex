@@ -457,7 +457,7 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
     // Initialize persistent mpt_store if requested
 #ifdef ENABLE_MPT
     if (config && config->mpt_store) {
-        if (!evm_state_init_mpt_stores(runner->state, "/tmp/test_runner_mpt",
+        if (!evm_state_init_mpt_stores(runner->state, "/dev/shm/test_runner_mpt",
                                         4096, 65536)) {
             fprintf(stderr, "ERROR: Failed to initialize mpt_store\n");
             evm_state_destroy(runner->state);

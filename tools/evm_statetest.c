@@ -179,7 +179,7 @@ static int run_statetest_file(const char *filepath, const statetest_args_t *args
             }
 #ifdef ENABLE_MPT
             if (args->mpt_store) {
-                if (!evm_state_init_mpt_stores(state, "/tmp/evm_statetest_mpt", 4096, 65536)) {
+                if (!evm_state_init_mpt_stores(state, "/dev/shm/evm_statetest_mpt", 4096, 65536)) {
                     evm_state_destroy(state);
                     results[ri].name = test->name ? strdup(test->name) : NULL;
                     results[ri].fork = fork_name ? strdup(fork_name) : NULL;
