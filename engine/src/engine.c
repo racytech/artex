@@ -112,6 +112,10 @@ engine_t *engine_create(const engine_config_t *config) {
         (struct evm_state *)config->evm_state);
     if (!eng->handler_ctx) goto fail;
 
+    /* If sync engine is provided, enable live mode execution */
+    if (config->sync)
+        engine_handler_ctx_set_sync(eng->handler_ctx, config->sync);
+
     /* RPC */
     eng->rpc = engine_rpc_create(eng->handler_ctx);
     if (!eng->rpc) goto fail;

@@ -19,6 +19,7 @@
 #include "uint256.h"
 #include "mem_mpt.h"
 #include "tx_decoder.h"
+#include "sync.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,10 @@ engine_handler_ctx_t *engine_handler_ctx_create(engine_store_t *store,
 
 void engine_handler_ctx_destroy(engine_handler_ctx_t *ctx) {
     free(ctx);
+}
+
+void engine_handler_ctx_set_sync(engine_handler_ctx_t *ctx, struct sync *sync) {
+    if (ctx) ctx->sync = sync;
 }
 
 /* =========================================================================
@@ -436,7 +441,7 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
             return NULL;
         }
         execution_payload_free(&payload);
-    } else if (ctx->evm) {
+    } else if (ctx->sync || ctx->evm) {
         /* ----------------------------------------------------------------
          * Full validation mode — verify hash, execute block, compare state
          * ---------------------------------------------------------------- */
@@ -487,87 +492,143 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
             return NULL;
         }
 
-        /* Step 6: Populate block hashes from store ring buffer */
-        hash_t block_hashes[256];
-        memset(block_hashes, 0, sizeof(block_hashes));
-        {
-            uint64_t lo = payload.block_number > 256
-                          ? payload.block_number - 256 : 0;
-            for (uint64_t bn = lo; bn < payload.block_number; bn++) {
-                uint8_t h[32];
-                if (engine_store_get_blockhash(ctx->store, bn, h))
-                    memcpy(block_hashes[bn % 256].bytes, h, 32);
+        if (ctx->sync) {
+            /* ----------------------------------------------------------
+             * Sync mode — delegate to sync_execute_block_live()
+             * Handles: execution, gas/root validation, checkpointing,
+             *          block hash ring buffer, MPT flush
+             * ---------------------------------------------------------- */
+            hash_t blk_hash;
+            memcpy(blk_hash.bytes, payload.block_hash, 32);
+
+            sync_block_result_t sync_result;
+            if (!sync_execute_block_live((sync_t *)ctx->sync, &header, &body,
+                                         &blk_hash, &sync_result)) {
+                status.status = PAYLOAD_INVALID;
+                status.has_latest_valid_hash = true;
+                memcpy(status.latest_valid_hash, payload.parent_hash, 32);
+                status.validation_error = "block execution failed";
+            } else if (!sync_result.ok) {
+                status.status = PAYLOAD_INVALID;
+                status.has_latest_valid_hash = true;
+                memcpy(status.latest_valid_hash, payload.parent_hash, 32);
+                if (sync_result.error == SYNC_GAS_MISMATCH)
+                    status.validation_error = "invalid gas used";
+                else if (sync_result.error == SYNC_ROOT_MISMATCH)
+                    status.validation_error = "invalid state root";
+                else
+                    status.validation_error = "validation failed";
+            } else {
+                status.status = PAYLOAD_VALID;
+                status.has_latest_valid_hash = true;
+                memcpy(status.latest_valid_hash, payload.block_hash, 32);
+
+                if (!engine_store_put(ctx->store, &payload, true)) {
+                    *err_code = -32603;
+                    *err_msg = "engine store full";
+                    block_body_free(&body);
+                    execution_payload_free(&payload);
+                    return NULL;
+                }
+                engine_store_record_blockhash(ctx->store,
+                                               payload.block_number,
+                                               payload.block_hash);
             }
-        }
 
-        /* Step 7: Execute block */
-        block_result_t result = block_execute(
-            (evm_t *)ctx->evm, &header, &body, block_hashes);
+            block_body_free(&body);
 
-        /* Step 8: Compute state root (MPT path returns zero from block_execute) */
+            if (status.status == PAYLOAD_INVALID) {
+                if (!engine_store_put(ctx->store, &payload, false))
+                    fprintf(stderr, "WARN: failed to store invalid payload (store full)\n");
+            }
+            execution_payload_free(&payload);
+        } else {
+            /* ----------------------------------------------------------
+             * Standalone mode — direct block_execute() (engine_server)
+             * ---------------------------------------------------------- */
+
+            /* Step 6: Populate block hashes from store ring buffer */
+            hash_t block_hashes[256];
+            memset(block_hashes, 0, sizeof(block_hashes));
+            {
+                uint64_t lo = payload.block_number > 256
+                              ? payload.block_number - 256 : 0;
+                for (uint64_t bn = lo; bn < payload.block_number; bn++) {
+                    uint8_t h[32];
+                    if (engine_store_get_blockhash(ctx->store, bn, h))
+                        memcpy(block_hashes[bn % 256].bytes, h, 32);
+                }
+            }
+
+            /* Step 7: Execute block */
+            block_result_t result = block_execute(
+                (evm_t *)ctx->evm, &header, &body, block_hashes);
+
+            /* Step 8: Compute state root (MPT path returns zero from block_execute) */
 #ifdef ENABLE_MPT
-        if (result.success && ctx->state) {
-            evm_t *e = (evm_t *)ctx->evm;
-            bool prune = (e->fork >= FORK_SPURIOUS_DRAGON);
-            result.state_root = evm_state_compute_mpt_root(
-                (evm_state_t *)ctx->state, prune);
-        }
+            if (result.success && ctx->state) {
+                evm_t *e = (evm_t *)ctx->evm;
+                bool prune = (e->fork >= FORK_SPURIOUS_DRAGON);
+                result.state_root = evm_state_compute_mpt_root(
+                    (evm_state_t *)ctx->state, prune);
+            }
 #endif
 
-        /* Step 9: Validate results */
-        if (!result.success) {
-            status.status = PAYLOAD_INVALID;
-            status.has_latest_valid_hash = true;
-            memcpy(status.latest_valid_hash, payload.parent_hash, 32);
-            status.validation_error = "block execution failed";
-        } else if (memcmp(result.state_root.bytes, payload.state_root, 32) != 0) {
-            status.status = PAYLOAD_INVALID;
-            status.has_latest_valid_hash = true;
-            memcpy(status.latest_valid_hash, payload.parent_hash, 32);
-            status.validation_error = "invalid state root";
-        } else if (result.gas_used != payload.gas_used) {
-            status.status = PAYLOAD_INVALID;
-            status.has_latest_valid_hash = true;
-            memcpy(status.latest_valid_hash, payload.parent_hash, 32);
-            status.validation_error = "invalid gas used";
-        } else if (memcmp(result.receipt_root.bytes, payload.receipts_root, 32) != 0) {
-            status.status = PAYLOAD_INVALID;
-            status.has_latest_valid_hash = true;
-            memcpy(status.latest_valid_hash, payload.parent_hash, 32);
-            status.validation_error = "invalid receipt root";
-        } else if (memcmp(result.logs_bloom, payload.logs_bloom, 256) != 0) {
-            status.status = PAYLOAD_INVALID;
-            status.has_latest_valid_hash = true;
-            memcpy(status.latest_valid_hash, payload.parent_hash, 32);
-            status.validation_error = "invalid logs bloom";
-        } else {
-            /* Block is valid */
-            status.status = PAYLOAD_VALID;
-            status.has_latest_valid_hash = true;
-            memcpy(status.latest_valid_hash, payload.block_hash, 32);
+            /* Step 9: Validate results */
+            if (!result.success) {
+                status.status = PAYLOAD_INVALID;
+                status.has_latest_valid_hash = true;
+                memcpy(status.latest_valid_hash, payload.parent_hash, 32);
+                status.validation_error = "block execution failed";
+            } else if (memcmp(result.state_root.bytes, payload.state_root, 32) != 0) {
+                status.status = PAYLOAD_INVALID;
+                status.has_latest_valid_hash = true;
+                memcpy(status.latest_valid_hash, payload.parent_hash, 32);
+                status.validation_error = "invalid state root";
+            } else if (result.gas_used != payload.gas_used) {
+                status.status = PAYLOAD_INVALID;
+                status.has_latest_valid_hash = true;
+                memcpy(status.latest_valid_hash, payload.parent_hash, 32);
+                status.validation_error = "invalid gas used";
+            } else if (memcmp(result.receipt_root.bytes, payload.receipts_root, 32) != 0) {
+                status.status = PAYLOAD_INVALID;
+                status.has_latest_valid_hash = true;
+                memcpy(status.latest_valid_hash, payload.parent_hash, 32);
+                status.validation_error = "invalid receipt root";
+            } else if (memcmp(result.logs_bloom, payload.logs_bloom, 256) != 0) {
+                status.status = PAYLOAD_INVALID;
+                status.has_latest_valid_hash = true;
+                memcpy(status.latest_valid_hash, payload.parent_hash, 32);
+                status.validation_error = "invalid logs bloom";
+            } else {
+                /* Block is valid */
+                status.status = PAYLOAD_VALID;
+                status.has_latest_valid_hash = true;
+                memcpy(status.latest_valid_hash, payload.block_hash, 32);
 
-            if (!engine_store_put(ctx->store, &payload, true)) {
-                *err_code = -32603;
-                *err_msg = "engine store full";
-                block_result_free(&result);
-                block_body_free(&body);
-                execution_payload_free(&payload);
-                return NULL;
+                if (!engine_store_put(ctx->store, &payload, true)) {
+                    *err_code = -32603;
+                    *err_msg = "engine store full";
+                    block_result_free(&result);
+                    block_body_free(&body);
+                    execution_payload_free(&payload);
+                    return NULL;
+                }
+                engine_store_record_blockhash(ctx->store,
+                                               payload.block_number,
+                                               payload.block_hash);
             }
-            engine_store_record_blockhash(ctx->store,
-                                           payload.block_number,
-                                           payload.block_hash);
-        }
 
-        block_result_free(&result);
-        block_body_free(&body);
+            block_result_free(&result);
+            block_body_free(&body);
 
-        /* If INVALID, store but mark as invalid (best-effort cache) */
-        if (status.status == PAYLOAD_INVALID) {
-            if (!engine_store_put(ctx->store, &payload, false))
-                fprintf(stderr, "WARN: failed to store invalid payload (store full)\n");
+            /* If INVALID, store but mark as invalid (best-effort cache) */
+            if (status.status == PAYLOAD_INVALID) {
+                if (!engine_store_put(ctx->store, &payload, false))
+                    fprintf(stderr, "WARN: failed to store invalid payload (store full)\n");
+            }
+            execution_payload_free(&payload);
         }
-        execution_payload_free(&payload);
     } else {
         /* Stub mode (no EVM) — store without execution */
         status.status = PAYLOAD_VALID;

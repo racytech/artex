@@ -852,6 +852,7 @@ if(CJSON_FOUND)
         ${CMAKE_SOURCE_DIR}/engine/include
         ${CJSON_INCLUDE_DIRS}
     )
+    target_include_directories(engine_handlers PRIVATE ${CMAKE_SOURCE_DIR}/sync/include)
     target_link_libraries(engine_handlers engine_rpc engine_types engine_store block_executor ${CJSON_LIBRARIES})
 
     # Engine (top-level orchestrator)
@@ -860,9 +861,11 @@ if(CJSON_FOUND)
     )
     target_include_directories(engine PUBLIC
         ${CMAKE_SOURCE_DIR}/engine/include
+        ${CMAKE_SOURCE_DIR}/sync/include
         ${CJSON_INCLUDE_DIRS}
     )
-    target_link_libraries(engine engine_http engine_jwt engine_rpc engine_handlers engine_store engine_types ${CJSON_LIBRARIES})
+    # Note: sync must come after engine_handlers for linker symbol resolution
+    target_link_libraries(engine engine_http engine_jwt engine_rpc engine_handlers sync engine_store engine_types ${CJSON_LIBRARIES})
 
     # Standalone Engine API server (for mock CL testing)
     add_executable(engine_server tools/engine_server.c)
@@ -896,7 +899,7 @@ if(CJSON_FOUND)
         ${CMAKE_SOURCE_DIR}/engine/include
         ${CJSON_INCLUDE_DIRS}
     )
-    target_link_libraries(test_engine_handlers engine_rpc engine_handlers engine_types engine_store block_executor ${CJSON_LIBRARIES})
+    target_link_libraries(test_engine_handlers engine_rpc engine_handlers sync engine_types engine_store block_executor ${CJSON_LIBRARIES})
     add_test(NAME test_engine_handlers COMMAND test_engine_handlers)
 
     # Sync engine (reusable block execution + validation + checkpointing)
@@ -916,6 +919,15 @@ if(CJSON_FOUND)
     add_executable(chain_replay tools/chain_replay.c)
     target_compile_definitions(chain_replay PRIVATE CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL})
     target_link_libraries(chain_replay sync)
+
+    # Artex Node — full execution client (era1 replay + CL sync)
+    add_executable(artex_node tools/artex_node.c)
+    target_include_directories(artex_node PRIVATE
+        ${CMAKE_SOURCE_DIR}/engine/include
+        ${CJSON_INCLUDE_DIRS}
+    )
+    target_compile_definitions(artex_node PRIVATE CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL})
+    target_link_libraries(artex_node sync engine ${CJSON_LIBRARIES})
 
     #==============================================================================
     # Integration Tests (Ethereum test vectors)

@@ -25,13 +25,17 @@ extern "C" {
  *   engine_destroy(eng);
  */
 
+struct sync;
+
 typedef struct {
     const char *host;           /* Listen address (default "127.0.0.1") */
     uint16_t    port;           /* Listen port (default 8551) */
     const char *jwt_secret_path;/* Path to hex-encoded JWT secret file */
-    /* EVM/state handles (optional, for block execution) */
+    /* EVM/state handles (optional, for standalone block execution) */
     void       *evm;
     void       *evm_state;
+    /* Sync engine (optional — if set, newPayload uses sync_execute_block_live) */
+    struct sync *sync;
 } engine_config_t;
 
 typedef struct engine engine_t;

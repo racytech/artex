@@ -71,8 +71,10 @@ typedef struct {
     uint64_t blocks_fail;
 } sync_status_t;
 
-/* Opaque handle */
+/* Opaque handles */
 typedef struct sync sync_t;
+struct evm;
+struct evm_state;
 
 // ============================================================================
 // Lifecycle
@@ -127,6 +129,49 @@ bool sync_execute_block(sync_t *sync,
                         sync_block_result_t *result);
 
 // ============================================================================
+// Live Mode (per-block validation for CL sync)
+// ============================================================================
+
+/**
+ * Execute a block with immediate per-block validation.
+ *
+ * Unlike sync_execute_block() (which defers root validation to checkpoint
+ * boundaries), this validates gas + state root immediately and flushes
+ * state synchronously. Designed for CL-driven sync where each newPayload
+ * needs a VALID/INVALID response.
+ *
+ * Returns false only on fatal error. Check result->ok for validation outcome.
+ */
+bool sync_execute_block_live(sync_t *sync,
+                              const block_header_t *header,
+                              const block_body_t *body,
+                              const hash_t *block_hash,
+                              sync_block_result_t *result);
+
+/**
+ * Switch between batch and live modes.
+ *
+ * Batch mode (live=false): root validated at checkpoint boundaries,
+ *   good for era1 replay (~2000+ blk/s).
+ *
+ * Live mode (live=true): root validated per block, synchronous flush,
+ *   required for CL sync (VALID/INVALID response per newPayload).
+ *
+ * Call sync_checkpoint() before switching to flush pending state.
+ */
+void sync_set_live_mode(sync_t *sync, bool live);
+
+/**
+ * Get the EVM instance owned by the sync engine.
+ */
+struct evm *sync_get_evm(const sync_t *sync);
+
+/**
+ * Get the EVM state instance owned by the sync engine (always available).
+ */
+struct evm_state *sync_get_state(const sync_t *sync);
+
+// ============================================================================
 // Checkpoint
 // ============================================================================
 
@@ -145,9 +190,5 @@ sync_status_t sync_get_status(const sync_t *sync);
 
 /** Get cache/store statistics from the underlying evm_state. */
 evm_state_stats_t sync_get_state_stats(const sync_t *sync);
-
-#ifdef ENABLE_DEBUG
-struct evm_state *sync_get_state(const sync_t *sync);
-#endif
 
 #endif /* SYNC_H */

@@ -26,17 +26,22 @@ extern "C" {
 /* Forward declarations for EVM/executor types */
 struct evm;
 struct evm_state;
+struct sync;
 
 typedef struct {
     engine_store_t *store;
-    struct evm     *evm;        /* for block execution */
+    struct evm     *evm;        /* for block execution (standalone mode) */
     struct evm_state *state;    /* EVM state handle */
+    struct sync    *sync;       /* if set, use sync_execute_block_live() */
 } engine_handler_ctx_t;
 
 /** Create handler context. Does NOT take ownership of store/evm/state. */
 engine_handler_ctx_t *engine_handler_ctx_create(engine_store_t *store,
                                                  struct evm *evm,
                                                  struct evm_state *state);
+
+/** Set sync engine on handler context (enables live mode execution). */
+void engine_handler_ctx_set_sync(engine_handler_ctx_t *ctx, struct sync *sync);
 
 /** Destroy handler context. */
 void engine_handler_ctx_destroy(engine_handler_ctx_t *ctx);
