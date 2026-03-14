@@ -33,6 +33,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <unistd.h>
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -256,12 +257,23 @@ static void test_body_decode(void) {
     PASS();
 }
 
+static void cleanup_mpt(const char *base) {
+    char path[256];
+    const char *suffixes[] = { ".dat", ".idx", "_storage.dat", "_storage.idx" };
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof(path), "%s%s", base, suffixes[i]);
+        unlink(path);
+    }
+}
+
 /* =========================================================================
  * Test 4: Executor smoke test (simple value transfer)
  * ========================================================================= */
 
 static void test_executor_smoke(void) {
     TEST("Block executor smoke test");
+
+    cleanup_mpt("/tmp/test_block_executor_mpt");
 
     /*
      * Set up:
@@ -383,6 +395,8 @@ static void test_executor_smoke(void) {
 static void test_dao_fork(void) {
     TEST("DAO fork drain");
 
+    cleanup_mpt("/tmp/test_block_executor_mpt");
+
     /* Create verkle state + evm state (no EVM needed, just state) */
 #ifdef ENABLE_VERKLE
     verkle_state_t *vs = verkle_state_create();
@@ -454,6 +468,8 @@ static void test_dao_fork(void) {
 
 static void test_dao_fork_block_check(void) {
     TEST("DAO fork block/chain gate");
+
+    cleanup_mpt("/tmp/test_block_executor_mpt");
 
     /* Create state with balance on a drain address */
 #ifdef ENABLE_VERKLE

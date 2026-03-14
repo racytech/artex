@@ -650,7 +650,7 @@ void code_store_flush(code_store_t *cs) {
  * ========================================================================= */
 
 uint64_t code_store_count(const code_store_t *cs) {
-    return cs ? disk_hash_count(cs->index) : 0;
+    return cs ? disk_hash_count(cs->index) + cs->def_count : 0;
 }
 
 /* =========================================================================
