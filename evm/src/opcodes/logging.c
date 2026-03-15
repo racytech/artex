@@ -10,7 +10,6 @@
 #include "evm_memory.h"
 #include "uint256.h"
 #include "gas.h"
-#include "logger.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -35,7 +34,6 @@ static evm_status_t op_log_common(evm_t *evm, uint8_t num_topics)
     // Check for static call violation (logs modify state)
     if (evm->msg.is_static)
     {
-        LOG_EVM_DEBUG("LOG%u: Cannot emit log in static call", num_topics);
         return EVM_STATIC_CALL_VIOLATION;
     }
 
@@ -116,9 +114,6 @@ static evm_status_t op_log_common(evm_t *evm, uint8_t num_topics)
         const uint8_t *mem_ptr = evm_memory_get_ptr(evm->memory, offset);
         memcpy(log->data, mem_ptr, (size_t)size);
     }
-
-    LOG_EVM_DEBUG("LOG%u: offset=%lu, size=%lu, %zu logs total",
-                  num_topics, offset, size, evm->log_count);
 
     return EVM_SUCCESS;
 }

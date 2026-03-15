@@ -14,7 +14,6 @@
 #include "gas.h"
 #include "precompile.h"
 #include "verkle_key.h"
-#include "logger.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -325,7 +324,6 @@ static evm_status_t op_selfdestruct(evm_t *evm)
     // Check for static call violation
     if (evm->msg.is_static)
     {
-        LOG_EVM_DEBUG("SELFDESTRUCT: Cannot selfdestruct in static call");
         return EVM_STATIC_CALL_VIOLATION;
     }
 
@@ -474,8 +472,6 @@ static evm_status_t op_selfdestruct(evm_t *evm)
         // Mark contract for deletion (pre-Cancun, or created in same tx)
         evm_state_self_destruct(evm->state, &evm->msg.recipient);
     }
-
-    LOG_EVM_DEBUG("SELFDESTRUCT: contract deleted, balance transferred");
 
     // Halt execution
     evm->stopped = true;

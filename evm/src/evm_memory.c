@@ -3,7 +3,7 @@
  */
 
 #include "evm_memory.h"
-#include "logger.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -30,7 +30,7 @@ evm_memory_t *evm_memory_create(void)
     evm_memory_t *mem = (evm_memory_t *)calloc(1, sizeof(evm_memory_t));
     if (!mem)
     {
-        LOG_EVM_ERROR("Failed to allocate memory structure");
+        fprintf(stderr, "FATAL: failed to allocate EVM memory struct (OOM)\n");
         return NULL;
     }
 
@@ -38,14 +38,14 @@ evm_memory_t *evm_memory_create(void)
     mem->data = (uint8_t *)calloc(mem->capacity, 1);
     if (!mem->data)
     {
-        LOG_EVM_ERROR("Failed to allocate memory data");
+        fprintf(stderr, "FATAL: failed to allocate EVM memory data (%zu bytes, OOM)\n",
+                mem->capacity);
         free(mem);
         return NULL;
     }
 
     mem->size = 0;
 
-    LOG_EVM_DEBUG("Created EVM memory with initial capacity %zu bytes", mem->capacity);
     return mem;
 }
 
@@ -60,7 +60,6 @@ void evm_memory_destroy(evm_memory_t *mem)
     }
 
     free(mem);
-    LOG_EVM_DEBUG("Destroyed EVM memory");
 }
 
 void evm_memory_reset(evm_memory_t *mem)
@@ -90,7 +89,6 @@ bool evm_memory_read_byte(evm_memory_t *mem, uint64_t offset, uint8_t *value)
 {
     if (!mem || !value)
     {
-        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -108,7 +106,6 @@ bool evm_memory_write_byte(evm_memory_t *mem, uint64_t offset, uint8_t value)
 {
     if (!mem)
     {
-        LOG_EVM_DEBUG("Invalid memory");
         return false;
     }
 
@@ -126,7 +123,6 @@ bool evm_memory_read_word(evm_memory_t *mem, uint64_t offset, uint256_t *value)
 {
     if (!mem || !value)
     {
-        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -145,7 +141,6 @@ bool evm_memory_write_word(evm_memory_t *mem, uint64_t offset, const uint256_t *
 {
     if (!mem || !value)
     {
-        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -164,7 +159,6 @@ bool evm_memory_read(evm_memory_t *mem, uint64_t offset, uint8_t *data, size_t s
 {
     if (!mem || !data)
     {
-        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -187,7 +181,6 @@ bool evm_memory_write(evm_memory_t *mem, uint64_t offset, const uint8_t *data, s
 {
     if (!mem || !data)
     {
-        LOG_EVM_DEBUG("Invalid parameters");
         return false;
     }
 
@@ -214,7 +207,6 @@ bool evm_memory_expand_slow(evm_memory_t *mem, uint64_t offset, size_t size)
 {
     if (!mem)
     {
-        LOG_EVM_DEBUG("Invalid memory");
         return false;
     }
 
@@ -227,7 +219,6 @@ bool evm_memory_expand_slow(evm_memory_t *mem, uint64_t offset, size_t size)
     uint64_t end = offset + size;
     if (end < offset)
     {
-        LOG_EVM_DEBUG("Memory offset overflow");
         return false;
     }
 
@@ -247,7 +238,6 @@ bool evm_memory_ensure_size(evm_memory_t *mem, size_t min_size)
 {
     if (!mem)
     {
-        LOG_EVM_DEBUG("Invalid memory");
         return false;
     }
 
@@ -272,7 +262,9 @@ bool evm_memory_ensure_size(evm_memory_t *mem, size_t min_size)
         uint8_t *new_data = (uint8_t *)realloc(mem->data, new_capacity);
         if (!new_data)
         {
-            LOG_EVM_ERROR("Failed to expand memory capacity to %zu bytes", new_capacity);
+            fprintf(stderr, "FATAL: failed to expand EVM memory to %zu bytes (OOM)\n"
+                    "  hint: contract may be allocating excessive memory\n",
+                    new_capacity);
             return false;
         }
 
@@ -282,7 +274,6 @@ bool evm_memory_ensure_size(evm_memory_t *mem, size_t min_size)
         mem->data = new_data;
         mem->capacity = new_capacity;
 
-        LOG_EVM_DEBUG("Expanded memory capacity to %zu bytes", new_capacity);
     }
 
     // Update size
@@ -327,7 +318,6 @@ bool evm_memory_copy(evm_memory_t *mem, uint64_t dest_offset, uint64_t src_offse
 {
     if (!mem)
     {
-        LOG_EVM_DEBUG("Invalid memory");
         return false;
     }
 

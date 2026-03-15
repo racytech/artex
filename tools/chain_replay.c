@@ -493,7 +493,9 @@ int main(int argc, char **argv) {
         /* Execute + validate via sync engine */
         sync_block_result_t result;
         if (!sync_execute_block(sync, &header, &body, &blk_hash, &result)) {
-            fprintf(stderr, "Block %lu: fatal execution error\n", bn);
+            fprintf(stderr, "Block %lu: fatal execution error\n"
+                    "  hint: this means sync_execute_block returned false (internal error, not validation)\n"
+                    "  hint: check for OOM, disk I/O errors, or corrupt era1 data\n", bn);
             block_body_free(&body);
             free(hdr_rlp);
             free(body_rlp);
@@ -706,32 +708,53 @@ int main(int argc, char **argv) {
                    bn, window_txs, tps, mgps, bps, win_secs,
                    remaining / 1000);
 
-            /* Stats every 8 checkpoints (~2048 blocks) to avoid spam */
-            if (bn % (CHECKPOINT_INTERVAL * 8) == 0) {
+            /* Cache/store stats every checkpoint */
+            {
                 evm_state_stats_t ss = sync_get_state_stats(sync);
                 size_t rss_mb = get_rss_kb() / 1024;
-                printf("  | cache: %zuK accts, %zuK slots (%zuMB arena)\n",
+                printf("  └ cache: %zuK accts, %zuK slots (%zuMB arena)\n",
                        ss.cache_accounts / 1000, ss.cache_slots / 1000,
                        ss.cache_arena_bytes / (1024*1024));
 #ifdef ENABLE_MPT
                 uint64_t acct_total = ss.acct_mpt_cache_hits + ss.acct_mpt_cache_misses;
                 uint64_t stor_total = ss.stor_mpt_cache_hits + ss.stor_mpt_cache_misses;
-                printf("  | mpt: acct %luK nodes (hit %.1f%%, LRU %u/%uK), stor %luK nodes (hit %.1f%%, LRU %u/%uK)\n",
+                printf("  └ mpt: acct %luK nodes (hit %.1f%%, LRU %u/%uK), stor %luK nodes (hit %.1f%%, LRU %u/%uK)\n",
                        ss.acct_mpt_nodes / 1000,
                        acct_total ? 100.0 * ss.acct_mpt_cache_hits / acct_total : 0,
                        ss.acct_mpt_cache_count / 1000, ss.acct_mpt_cache_capacity / 1000,
                        ss.stor_mpt_nodes / 1000,
                        stor_total ? 100.0 * ss.stor_mpt_cache_hits / stor_total : 0,
                        ss.stor_mpt_cache_count / 1000, ss.stor_mpt_cache_capacity / 1000);
-                printf("  | code: %luK (hit %.1f%%, LRU %u/%uK) | disk: %.1fGB/%.1fGB | RSS %zuMB\n",
+                printf("  └ code: %luK (hit %.1f%%, LRU %u/%uK) disk: %.1fGB/%.1fGB RSS %zuMB\n",
                        ss.code_count / 1000,
                        (ss.code_cache_hits + ss.code_cache_misses)
                            ? 100.0 * ss.code_cache_hits / (ss.code_cache_hits + ss.code_cache_misses) : 0,
                        ss.code_cache_count / 1000, ss.code_cache_capacity / 1000,
                        ss.acct_mpt_data_bytes / 1e9, ss.stor_mpt_data_bytes / 1e9,
                        rss_mb);
+
+                /* Root computation timing */
+                double root_total = ss.root_stor_ms + ss.root_acct_ms;
+                if (root_total > 0.1)
+                    printf("  └ root: stor=%.1f ms  acct=%.1f ms  total=%.1f ms (%zu dirty)\n",
+                           ss.root_stor_ms, ss.root_acct_ms, root_total,
+                           ss.root_dirty_count);
+
+                /* Background flush timing (from previous checkpoint, joined at this one) */
+                sync_checkpoint_stats_t cs = sync_get_checkpoint_stats(sync);
+                if (cs.valid) {
+                    printf("  └ flush: acct=%.1f ms  stor=%.1f ms  total=%.1f ms",
+                           cs.flush.acct_ms, cs.flush.stor_ms, cs.flush_total_ms);
+                    if (cs.flush_join_ms > 1.0)
+                        printf("  join=%.1f ms", cs.flush_join_ms);
+                    printf("\n");
+                }
+
+                /* Checkpoint total */
+                if (cs.root_total_ms > 0.1)
+                    printf("  └ checkpoint: total=%.1f ms\n", cs.root_total_ms);
 #else
-                printf("  | RSS %zuMB\n", rss_mb);
+                printf("  └ RSS %zuMB\n", rss_mb);
 #endif
             }
             window_txs = 0;
@@ -760,6 +783,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Block %lu: GAS MISMATCH  got %lu  expected %lu  diff %+ld\n",
                         bn, result.actual_gas, result.expected_gas,
                         (long)result.actual_gas - (long)result.expected_gas);
+                fprintf(stderr, "  hint: gas diff usually means opcode cost bug or missing gas rule\n"
+                        "  hint: run with --trace-block %lu to get EVM opcode trace\n"
+                        "  hint: compare trace against geth's evm_statetest output\n", bn);
             } else if (result.error == SYNC_ROOT_MISMATCH) {
                 char got_hex[67], exp_hex[67];
                 hash_to_hex(&result.actual_root, got_hex);
@@ -767,6 +793,12 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Block %lu: STATE ROOT MISMATCH (at batch checkpoint)\n"
                         "  got:      %s\n  expected: %s\n",
                         bn, got_hex, exp_hex);
+                fprintf(stderr, "  hint: root is validated every %u blocks — bug is in range [%lu..%lu]\n",
+                        CHECKPOINT_INTERVAL,
+                        bn > CHECKPOINT_INTERVAL ? bn - CHECKPOINT_INTERVAL + 1 : 1, bn);
+                fprintf(stderr, "  hint: if resumed from checkpoint, try deleting state files and replaying fresh\n"
+                        "  hint: run with --trace-block N to trace a specific block\n"
+                        "  hint: use evm_statetest for per-block differential fuzzing against geth\n");
 #ifdef ENABLE_DEBUG
                 evm_state_debug_dump(sync_get_state(sync));
 #endif

@@ -629,13 +629,21 @@ void code_store_flush(code_store_t *cs) {
 
         /* Write code bytes to .dat */
         if (e->code_len > 0 && e->code) {
-            pwrite(cs->data_fd, e->code, e->code_len,
-                   (off_t)(PAGE_SIZE + e->offset));
+            ssize_t written = pwrite(cs->data_fd, e->code, e->code_len,
+                                     (off_t)(PAGE_SIZE + e->offset));
+            if (written < 0 || (size_t)written != e->code_len) {
+                fprintf(stderr, "FATAL: code_store pwrite failed: %zd/%zu bytes\n"
+                        "  hint: disk full or I/O error\n",
+                        written, e->code_len);
+            }
         }
 
         /* Insert index entry */
         code_record_t rec = { .offset = e->offset, .length = e->code_len };
-        disk_hash_put(cs->index, e->hash, &rec);
+        if (!disk_hash_put(cs->index, e->hash, &rec)) {
+            fprintf(stderr, "FATAL: code_store disk_hash_put failed\n"
+                    "  hint: index may be corrupt or disk full\n");
+        }
     }
 
     /* Free deferred buffer */

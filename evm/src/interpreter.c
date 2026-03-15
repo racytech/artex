@@ -23,7 +23,7 @@
 #include "verkle_key.h"
 #include "evm_state.h"
 #include "evm_tracer.h"
-#include "logger.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -172,7 +172,7 @@ evm_result_t evm_interpret(evm_t *evm)
 {
     if (!evm || !evm->code || !evm->stack || !evm->memory)
     {
-        LOG_EVM_ERROR("Invalid EVM state");
+        fprintf(stderr, "FATAL: evm_interpret called with invalid EVM state (null code/stack/memory)\n");
         return evm_result_create(EVM_INTERNAL_ERROR, 0, 0, NULL, 0);
     }
 
@@ -1382,7 +1382,6 @@ error:
     if (status != EVM_OUT_OF_GAS) {
         EVM_TRACE_EXIT(evm, "execution error");
     }
-    LOG_EVM_DEBUG("Execution error at PC=%lu: status=%d", evm->pc, status);
     // All exceptional halts (non-REVERT) consume all remaining gas per EVM spec.
     // Only REVERT preserves remaining gas.
     if (status != EVM_REVERT)

@@ -8,7 +8,6 @@
 #include "evm_stack.h"
 #include "gas.h"
 #include "verkle_key.h"
-#include "logger.h"
 #include <stdlib.h>
 #include <stdio.h>
 // g_trace_calls declared in interpreter.c (unity build)
@@ -153,7 +152,6 @@ static evm_status_t op_sload(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 1))
     {
-        LOG_EVM_DEBUG("SLOAD: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -235,13 +233,11 @@ static evm_status_t op_sstore(evm_t *evm)
     // Check if we're in a static call (no state modifications allowed)
     if (evm->msg.is_static)
     {
-        LOG_EVM_DEBUG("SSTORE: State modification in static call");
         return EVM_STATIC_CALL_VIOLATION;
     }
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_EVM_DEBUG("SSTORE: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 

@@ -481,6 +481,8 @@ struct mpt_store {
     char            *idx_path;
     char            *dat_path;
     char            *free_path;   /* overflow free list file (.free) */
+
+    disk_hash_t     *flush_dh;   /* persistent second disk_hash for bg flush */
 };
 
 /* =========================================================================
@@ -1394,6 +1396,7 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
     ms->idx_path   = idx_path;
     ms->dat_path   = dat_path;
     ms->free_path  = make_path(path, ".free");
+    ms->flush_dh   = disk_hash_open_norecovery(idx_path);
     /* free_heads and free_slot_bytes zeroed by calloc */
     def_init(ms);
 
@@ -1460,6 +1463,7 @@ mpt_store_t *mpt_store_open(const char *path) {
     ms->idx_path   = idx_path;
     ms->dat_path   = dat_path;
     ms->free_path  = make_path(path, ".free");
+    ms->flush_dh   = disk_hash_open_norecovery(idx_path);
     def_init(ms);
 
     /* Load overflow free offsets from .free file */
@@ -1488,6 +1492,7 @@ void mpt_store_destroy(mpt_store_t *ms) {
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
         free_list_destroy(&ms->free_lists[i]);
     disk_hash_destroy(ms->index);
+    disk_hash_destroy(ms->flush_dh);
     close(ms->data_fd);
     free(ms->idx_path);
     free(ms->dat_path);
@@ -1668,7 +1673,7 @@ void mpt_store_flush(mpt_store_t *ms) {
  * Background flush — uses separate disk_hash to avoid rwlock contention
  * ========================================================================= */
 
-void mpt_store_flush_bg(mpt_store_t *ms) {
+void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats) {
     if (!ms) return;
 
     /* 1. Collect live entries and sort by offset for sequential I/O */
@@ -1697,13 +1702,12 @@ void mpt_store_flush_bg(mpt_store_t *ms) {
         }
     }
 
-    /* 2. Open a separate disk_hash instance on the same .idx file.
-     *    This gives us an independent rwlock — zero contention with executor.
-     *    Use norecovery — we don't need accurate entry_count, just put/delete. */
-    disk_hash_t *flush_dh = disk_hash_open_norecovery(ms->idx_path);
+    /* 2. Use persistent second disk_hash instance — independent rwlock,
+     *    zero contention with executor. Opened once at create/open time. */
+    disk_hash_t *flush_dh = ms->flush_dh;
     if (!flush_dh) {
-        fprintf(stderr, "mpt_store_flush_bg: failed to open flush disk_hash, "
-                "falling back to synchronous flush\n");
+        fprintf(stderr, "WARNING: mpt_store_flush_bg: no flush_dh, falling back to synchronous flush\n"
+                "  hint: disk_hash_open_norecovery failed at init — check .idx file integrity\n");
         free(sorted);
         mpt_store_flush_ex(ms, true);
         return;
@@ -1758,19 +1762,18 @@ void mpt_store_flush_bg(mpt_store_t *ms) {
     fdatasync(ms->data_fd);
     disk_hash_sync(flush_dh);
     clock_gettime(CLOCK_MONOTONIC, &_fs1);
-    disk_hash_destroy(flush_dh);
 
-    double _pw_ms = (_pw1.tv_sec - _pw0.tv_sec) * 1000.0 +
-                    (_pw1.tv_nsec - _pw0.tv_nsec) / 1e6;
-    double _dh_ms = (_pw2.tv_sec - _pw1.tv_sec) * 1000.0 +
-                    (_pw2.tv_nsec - _pw1.tv_nsec) / 1e6;
-    double _fs_ms = (_fs1.tv_sec - _fs0.tv_sec) * 1000.0 +
-                    (_fs1.tv_nsec - _fs0.tv_nsec) / 1e6;
-    if (live > 100)
-        fprintf(stderr, "  └ mpt_flush_bg: %zu writes (%zuKB), %zu deletes | "
-                "pwrite=%.1f ms  idx=%.1f ms  fsync=%.1f ms\n",
-                live, total_rlp_bytes / 1024, ms->def_del_count,
-                _pw_ms, _dh_ms, _fs_ms);
+    if (stats) {
+        stats->writes     = live;
+        stats->bytes      = total_rlp_bytes;
+        stats->deletes    = ms->def_del_count;
+        stats->pwrite_ms  = (_pw1.tv_sec - _pw0.tv_sec) * 1000.0 +
+                            (_pw1.tv_nsec - _pw0.tv_nsec) / 1e6;
+        stats->idx_ms     = (_pw2.tv_sec - _pw1.tv_sec) * 1000.0 +
+                            (_pw2.tv_nsec - _pw1.tv_nsec) / 1e6;
+        stats->fsync_ms   = (_fs1.tv_sec - _fs0.tv_sec) * 1000.0 +
+                            (_fs1.tv_nsec - _fs0.tv_nsec) / 1e6;
+    }
 }
 
 void mpt_store_flush_complete(mpt_store_t *ms) {

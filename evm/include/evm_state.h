@@ -104,11 +104,22 @@ void evm_state_discard_pending(evm_state_t *es);
 void evm_state_flush(evm_state_t *es);
 
 /**
+ * Flush timing stats from background flush (filled by evm_state_flush_bg).
+ */
+typedef struct {
+    mpt_flush_stats_t acct;     /* account MPT flush stats */
+    mpt_flush_stats_t stor;     /* storage MPT flush stats */
+    double            acct_ms;  /* total account flush time */
+    double            stor_ms;  /* total storage flush time */
+} evm_flush_bg_stats_t;
+
+/**
  * Background-safe flush. Uses separate disk_hash instances.
  * Call from background thread. Follow with evm_state_flush_complete()
  * from main thread after join.
+ * If stats is non-NULL, timing data is stored there instead of printed.
  */
-void evm_state_flush_bg(evm_state_t *es);
+void evm_state_flush_bg(evm_state_t *es, evm_flush_bg_stats_t *stats);
 
 /**
  * Finalize after background flush. Free deferred buffers and refresh metadata.
@@ -359,6 +370,11 @@ typedef struct {
     uint64_t code_cache_misses;
     uint32_t code_cache_count;
     uint32_t code_cache_capacity;
+
+    /* Root computation timing (filled by compute_mpt_root) */
+    double   root_stor_ms;
+    double   root_acct_ms;
+    size_t   root_dirty_count;
 #endif
 } evm_state_stats_t;
 

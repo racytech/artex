@@ -51,6 +51,23 @@ static void sync_wait_flush(sync_t *sync);
 #define BLOCK_HASH_WINDOW 256
 
 // ============================================================================
+// Background Flush context (forward declaration for struct sync)
+// ============================================================================
+
+typedef struct {
+    evm_state_t          *state;
+    const char           *checkpoint_path;
+    uint64_t              block_number;
+    hash_t                block_hashes[BLOCK_HASH_WINDOW];
+    uint64_t              total_gas;
+    uint64_t              blocks_ok;
+    uint64_t              blocks_fail;
+    /* Filled by bg thread for main thread to read after join */
+    evm_flush_bg_stats_t  flush_stats;
+    double                flush_total_ms;
+} flush_ctx_t;
+
+// ============================================================================
 // Checkpoint format (internal)
 // ============================================================================
 
@@ -108,6 +125,10 @@ struct sync {
     /* Background flush thread */
     pthread_t       flush_thread;
     bool            flush_thread_active;
+    flush_ctx_t    *flush_ctx;          /* kept alive until join for stats */
+
+    /* Checkpoint timing (filled during checkpoint cycle, read by caller) */
+    sync_checkpoint_stats_t ckpt_stats;
 };
 
 // ============================================================================
@@ -362,6 +383,10 @@ sync_t *sync_create(const sync_config_t *config) {
         s->cs = code_store_open(s->config.code_store_path);
         if (!s->cs)
             s->cs = code_store_create(s->config.code_store_path, 500000);
+        if (!s->cs)
+            fprintf(stderr, "WARNING: failed to open/create code store at '%s'\n"
+                    "  hint: check disk space and file permissions\n",
+                    s->config.code_store_path);
     }
 #endif
 
@@ -381,7 +406,10 @@ sync_t *sync_create(const sync_config_t *config) {
 #endif
     );
     if (!s->state) {
-        fprintf(stderr, "Failed to create EVM state\n");
+        fprintf(stderr, "FATAL: failed to create EVM state\n"
+                "  hint: check stderr above for MPT store errors\n"
+                "  hint: common cause: corrupt .idx/.dat files from killed process\n"
+                "  hint: delete state files and checkpoint, then replay fresh\n");
         goto fail;
     }
 
@@ -634,11 +662,10 @@ bool sync_execute_block(sync_t *sync,
         clock_gettime(CLOCK_MONOTONIC, &t_end);
         double root_ms = (t_root.tv_sec - t_start.tv_sec) * 1000.0 +
                          (t_root.tv_nsec - t_start.tv_nsec) / 1e6;
-        double ckpt_ms = (t_end.tv_sec - t_root.tv_sec) * 1000.0 +
-                         (t_end.tv_nsec - t_root.tv_nsec) / 1e6;
-        double total_ms = root_ms + ckpt_ms;
-        fprintf(stderr, "checkpoint block=%lu  root=%.1f ms  spawn=%.1f ms  total=%.1f ms\n",
-                bn, root_ms, ckpt_ms, total_ms);
+        double total_ms = root_ms +
+                          (t_end.tv_sec - t_root.tv_sec) * 1000.0 +
+                          (t_end.tv_nsec - t_root.tv_nsec) / 1e6;
+        sync->ckpt_stats.root_total_ms = total_ms;
     }
 
     block_result_free(&br);
@@ -742,23 +769,13 @@ struct evm *sync_get_evm(const sync_t *sync) {
 // Background Flush
 // ============================================================================
 
-typedef struct {
-    evm_state_t  *state;
-    const char   *checkpoint_path;
-    uint64_t      block_number;
-    hash_t        block_hashes[BLOCK_HASH_WINDOW];
-    uint64_t      total_gas;
-    uint64_t      blocks_ok;
-    uint64_t      blocks_fail;
-} flush_ctx_t;
-
 static void *flush_thread_fn(void *arg) {
     flush_ctx_t *ctx = (flush_ctx_t *)arg;
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     /* Flush MPT stores using separate disk_hash instances */
-    evm_state_flush_bg(ctx->state);
+    evm_state_flush_bg(ctx->state, &ctx->flush_stats);
 
     /* Save checkpoint marker */
     if (ctx->checkpoint_path) {
@@ -769,11 +786,10 @@ static void *flush_thread_fn(void *arg) {
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                (t1.tv_nsec - t0.tv_nsec) / 1e6;
-    fprintf(stderr, "  └ bg_flush=%.1f ms\n", ms);
+    ctx->flush_total_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                          (t1.tv_nsec - t0.tv_nsec) / 1e6;
 
-    free(ctx);
+    /* Don't free ctx — main thread reads stats after join */
     return NULL;
 }
 
@@ -790,8 +806,15 @@ static void sync_wait_flush(sync_t *sync) {
     /* Finalize: free deferred buffers + refresh disk_hash metadata */
     evm_state_flush_complete(sync->state);
 
-    if (wait_ms > 1.0)
-        fprintf(stderr, "  └ flush_join=%.1f ms\n", wait_ms);
+    /* Copy stats from ctx before freeing */
+    if (sync->flush_ctx) {
+        sync->ckpt_stats.flush          = sync->flush_ctx->flush_stats;
+        sync->ckpt_stats.flush_total_ms = sync->flush_ctx->flush_total_ms;
+        sync->ckpt_stats.flush_join_ms  = wait_ms;
+        sync->ckpt_stats.valid          = true;
+        free(sync->flush_ctx);
+        sync->flush_ctx = NULL;
+    }
 }
 
 // ============================================================================
@@ -847,9 +870,12 @@ bool sync_checkpoint(sync_t *sync) {
         ctx->total_gas       = sync->total_gas;
         ctx->blocks_ok       = sync->blocks_ok;
         ctx->blocks_fail     = sync->blocks_fail;
+        memset(&ctx->flush_stats, 0, sizeof(ctx->flush_stats));
+        ctx->flush_total_ms  = 0;
 
         if (pthread_create(&sync->flush_thread, NULL, flush_thread_fn, ctx) == 0) {
             sync->flush_thread_active = true;
+            sync->flush_ctx = ctx;
         } else {
             /* Thread creation failed — fall back to synchronous flush */
             fprintf(stderr, "WARNING: bg flush thread creation failed, "
@@ -908,6 +934,11 @@ sync_status_t sync_get_status(const sync_t *sync) {
 evm_state_stats_t sync_get_state_stats(const sync_t *sync) {
     if (!sync) return (evm_state_stats_t){0};
     return sync->last_stats;
+}
+
+sync_checkpoint_stats_t sync_get_checkpoint_stats(const sync_t *sync) {
+    if (!sync) return (sync_checkpoint_stats_t){0};
+    return sync->ckpt_stats;
 }
 
 evm_state_t *sync_get_state(const sync_t *sync) {

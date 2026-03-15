@@ -10,7 +10,7 @@
 #include "evm_stack.h"
 #include "evm_memory.h"
 #include "verkle_key.h"
-#include "logger.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -89,14 +89,14 @@ evm_t *evm_create(evm_state_t *state, const chain_config_t *chain_config)
 {
     if (!state)
     {
-        LOG_EVM_ERROR("Cannot create EVM without state");
+        fprintf(stderr, "FATAL: cannot create EVM without state\n");
         return NULL;
     }
 
     evm_t *evm = calloc(1, sizeof(evm_t));
     if (!evm)
     {
-        LOG_EVM_ERROR("Failed to allocate EVM");
+        fprintf(stderr, "FATAL: failed to allocate EVM struct (OOM)\n");
         return NULL;
     }
 
@@ -108,7 +108,7 @@ evm_t *evm_create(evm_state_t *state, const chain_config_t *chain_config)
     evm->stack = evm_stack_create();
     if (!evm->stack)
     {
-        LOG_EVM_ERROR("Failed to create EVM stack");
+        fprintf(stderr, "FATAL: failed to create EVM stack (OOM)\n");
         free(evm);
         return NULL;
     }
@@ -116,14 +116,11 @@ evm_t *evm_create(evm_state_t *state, const chain_config_t *chain_config)
     evm->memory = evm_memory_create();
     if (!evm->memory)
     {
-        LOG_EVM_ERROR("Failed to create EVM memory");
+        fprintf(stderr, "FATAL: failed to create EVM memory (OOM)\n");
         evm_stack_destroy(evm->stack);
         free(evm);
         return NULL;
     }
-
-    LOG_EVM_DEBUG("Created EVM instance (chain: %s, id: %lu)",
-              evm->chain_config->name, evm->chain_config->chain_id);
 
     return evm;
 }
@@ -214,9 +211,6 @@ void evm_set_block_env(evm_t *evm, const evm_block_env_t *block)
     if (evm->fork >= FORK_CANCUN) {
         evm->block.blob_base_fee = calc_blob_gas_price(&block->excess_blob_gas, evm->fork);
     }
-
-    LOG_EVM_DEBUG("Set block environment: number=%lu, fork=%s",
-              block->number, fork_get_name(evm->fork));
 }
 
 void evm_set_tx_context(evm_t *evm, const evm_tx_context_t *tx)
@@ -462,7 +456,6 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
 {
     if (!evm || !msg || !result)
     {
-        LOG_EVM_DEBUG("Invalid arguments to evm_execute");
         return false;
     }
 
@@ -470,7 +463,6 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     // Reference: process_message() uses "depth > STACK_DEPTH_LIMIT" where limit=1024
     if (msg->depth > 1024)
     {
-        LOG_EVM_DEBUG("Call depth limit exceeded (depth=%d, max=1024)", msg->depth);
         *result = evm_result_error(EVM_CALL_DEPTH_EXCEEDED, msg->gas);
         return true; // Not an internal error, just depth exceeded
     }
@@ -494,7 +486,8 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         
         if (!evm->stack || !evm->memory)
         {
-            LOG_EVM_ERROR("Failed to create stack/memory for subcall");
+            fprintf(stderr, "FATAL: failed to create stack/memory for subcall depth=%d (OOM)\n",
+                    msg->depth);
             if (evm->stack) evm_stack_destroy(evm->stack);
             if (evm->memory) evm_memory_destroy(evm->memory);
             evm_restore_context(evm, &saved_context);
@@ -632,7 +625,6 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         evm->msg.input_data = NULL;
         evm->msg.input_size = 0;
 
-        LOG_EVM_DEBUG("CREATE: Running init code (%zu bytes)", evm->code_size);
     }
     else if (is_precompile(&msg->code_addr, evm->fork))
     {
@@ -699,12 +691,10 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         {
             evm->code = contract_code;
             evm->code_size = code_len;
-            LOG_EVM_DEBUG("CALL: Executing code from state (%zu bytes)", evm->code_size);
         }
         else
         {
             // No code at address - simple value transfer
-            LOG_EVM_DEBUG("No code at address, simple value transfer");
 
             // Save subcall's remaining gas before restoring parent context
             uint64_t subcall_gas_remaining = evm->gas_left;
@@ -728,7 +718,6 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     // Check if there's any code to execute
     if (evm->code_size == 0)
     {
-        LOG_EVM_DEBUG("No code to execute");
         
         // Cleanup and restore context if subcall
         if (is_subcall)

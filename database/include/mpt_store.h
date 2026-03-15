@@ -83,12 +83,25 @@ void mpt_store_flush(mpt_store_t *ms);
 void mpt_store_flush_ex(mpt_store_t *ms, bool do_sync);
 
 /**
+ * Per-MPT flush timing stats (filled by mpt_store_flush_bg).
+ */
+typedef struct {
+    size_t writes;      /* nodes written */
+    size_t bytes;       /* total RLP bytes written */
+    size_t deletes;     /* nodes deleted */
+    double pwrite_ms;   /* data file pwrite time */
+    double idx_ms;      /* disk_hash put/delete time */
+    double fsync_ms;    /* fdatasync + sync time */
+} mpt_flush_stats_t;
+
+/**
  * Background-safe flush. Opens a separate disk_hash instance on the same
  * .idx file so the executor's disk_hash reads are never blocked.
  * Does NOT free the deferred buffer — call mpt_store_flush_complete()
  * from the main thread after the background thread joins.
+ * If stats is non-NULL, timing data is stored there instead of printed.
  */
-void mpt_store_flush_bg(mpt_store_t *ms);
+void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats);
 
 /**
  * Finalize after background flush: free deferred buffers and refresh

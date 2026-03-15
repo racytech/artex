@@ -200,4 +200,23 @@ sync_status_t sync_get_status(const sync_t *sync);
 /** Get cache/store statistics from the underlying evm_state. */
 evm_state_stats_t sync_get_state_stats(const sync_t *sync);
 
+/**
+ * Checkpoint timing stats (filled during checkpoint cycle).
+ * Retrieve with sync_get_checkpoint_stats() after sync_execute_block().
+ */
+typedef struct {
+    /* Root computation */
+    double root_total_ms;       /* total wall time for root + checkpoint */
+
+    /* Background flush (from previous checkpoint, joined at this one) */
+    evm_flush_bg_stats_t flush; /* per-MPT breakdown */
+    double flush_total_ms;      /* total bg flush wall time */
+    double flush_join_ms;       /* time spent waiting for bg thread */
+
+    bool   valid;               /* true if a checkpoint happened this cycle */
+} sync_checkpoint_stats_t;
+
+/** Get checkpoint timing stats from the last checkpoint cycle. */
+sync_checkpoint_stats_t sync_get_checkpoint_stats(const sync_t *sync);
+
 #endif /* SYNC_H */

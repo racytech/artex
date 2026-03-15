@@ -208,6 +208,10 @@ struct evm_state {
     code_store_t     *code_store;   // content-addressed bytecode store (not owned)
     dirty_account_vec_t dirty_accounts; // accounts with mpt_dirty=true
     dirty_slot_vec_t    dirty_slots;    // slots with mpt_dirty=true
+    /* Root computation timing (last compute_mpt_root call) */
+    double              last_root_stor_ms;
+    double              last_root_acct_ms;
+    size_t              last_root_dirty_count;
 #endif
 };
 
@@ -441,6 +445,10 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
         if (!es->account_mpt)
             es->account_mpt = mpt_store_create(mpt_path, (uint64_t)MPT_ACCOUNT_CAPACITY);
         if (!es->account_mpt) {
+            fprintf(stderr, "FATAL: failed to open/create account MPT at '%s'\n"
+                    "  hint: check path exists, disk space, file permissions\n"
+                    "  hint: delete '%s.idx' and '%s.dat' to start fresh\n",
+                    mpt_path, mpt_path, mpt_path);
             mem_art_destroy(&es->accounts);
             mem_art_destroy(&es->storage);
             mem_art_destroy(&es->warm_addrs);
@@ -462,6 +470,10 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
             mpt_store_set_shared(es->storage_mpt, true);
         }
         if (!es->storage_mpt) {
+            fprintf(stderr, "FATAL: failed to open/create storage MPT at '%s_storage'\n"
+                    "  hint: check disk space, file permissions\n"
+                    "  hint: delete '%s_storage.idx' and '%s_storage.dat' to start fresh\n",
+                    mpt_path, mpt_path, mpt_path);
             mpt_store_destroy(es->account_mpt);
             mem_art_destroy(&es->accounts);
             mem_art_destroy(&es->storage);
@@ -581,20 +593,24 @@ void evm_state_flush(evm_state_t *es) {
 #endif
 }
 
-void evm_state_flush_bg(evm_state_t *es) {
+void evm_state_flush_bg(evm_state_t *es, evm_flush_bg_stats_t *stats) {
     if (!es) return;
 #ifdef ENABLE_MPT
     struct timespec _t0, _t1, _t2;
+    mpt_flush_stats_t acct_st = {0}, stor_st = {0};
     clock_gettime(CLOCK_MONOTONIC, &_t0);
-    if (es->account_mpt) mpt_store_flush_bg(es->account_mpt);
+    if (es->account_mpt) mpt_store_flush_bg(es->account_mpt, &acct_st);
     clock_gettime(CLOCK_MONOTONIC, &_t1);
-    if (es->storage_mpt) mpt_store_flush_bg(es->storage_mpt);
+    if (es->storage_mpt) mpt_store_flush_bg(es->storage_mpt, &stor_st);
     clock_gettime(CLOCK_MONOTONIC, &_t2);
-    double acct_ms = (_t1.tv_sec - _t0.tv_sec) * 1000.0 +
-                     (_t1.tv_nsec - _t0.tv_nsec) / 1e6;
-    double stor_ms = (_t2.tv_sec - _t1.tv_sec) * 1000.0 +
-                     (_t2.tv_nsec - _t1.tv_nsec) / 1e6;
-    fprintf(stderr, "  └ flush_bg: acct=%.1f ms  stor=%.1f ms\n", acct_ms, stor_ms);
+    if (stats) {
+        stats->acct    = acct_st;
+        stats->stor    = stor_st;
+        stats->acct_ms = (_t1.tv_sec - _t0.tv_sec) * 1000.0 +
+                         (_t1.tv_nsec - _t0.tv_nsec) / 1e6;
+        stats->stor_ms = (_t2.tv_sec - _t1.tv_sec) * 1000.0 +
+                         (_t2.tv_nsec - _t1.tv_nsec) / 1e6;
+    }
 #endif
 }
 
@@ -2104,6 +2120,9 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
         s.code_cache_count = cs.count;
         s.code_cache_capacity = cs.capacity;
     }
+    s.root_stor_ms     = es->last_root_stor_ms;
+    s.root_acct_ms     = es->last_root_acct_ms;
+    s.root_dirty_count = es->last_root_dirty_count;
 #endif
     return s;
 }
@@ -2570,7 +2589,8 @@ static void compute_all_storage_roots(evm_state_t *es) {
         // Load this account's storage root into the shared store
         mpt_store_set_root(es->storage_mpt, ca->storage_root.bytes);
         if (!mpt_store_begin_batch(es->storage_mpt)) {
-            fprintf(stderr, "FATAL: mpt_store_begin_batch failed for storage trie\n");
+            fprintf(stderr, "FATAL: mpt_store_begin_batch failed for storage trie\n"
+                    "  hint: another batch may already be in progress (double begin)\n");
             free(sv.entries);
             goto clear;
         }
@@ -2585,7 +2605,9 @@ static void compute_all_storage_roots(evm_state_t *es) {
         }
 
         if (!mpt_store_commit_batch(es->storage_mpt)) {
-            fprintf(stderr, "FATAL: mpt_store_commit_batch failed for storage trie\n");
+            fprintf(stderr, "FATAL: mpt_store_commit_batch failed for storage trie\n"
+                    "  hint: likely OOM (deferred buffer alloc) or corrupt trie node on disk\n"
+                    "  hint: delete storage MPT files and replay to rebuild\n");
             free(sv.entries);
             goto clear;
         }
@@ -2622,7 +2644,8 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
         clock_gettime(CLOCK_MONOTONIC, &_rt1);
 
         if (!mpt_store_begin_batch(es->account_mpt)) {
-            fprintf(stderr, "FATAL: mpt_store_begin_batch failed for account trie\n");
+            fprintf(stderr, "FATAL: mpt_store_begin_batch failed for account trie\n"
+                    "  hint: another batch may already be in progress (double begin)\n");
             return root;
         }
 
@@ -2675,18 +2698,18 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
         dirty_account_clear(&es->dirty_accounts);
 
         if (!mpt_store_commit_batch(es->account_mpt)) {
-            fprintf(stderr, "FATAL: mpt_store_commit_batch failed for account trie\n");
+            fprintf(stderr, "FATAL: mpt_store_commit_batch failed for account trie\n"
+                    "  hint: likely OOM (deferred buffer alloc) or corrupt trie node on disk\n"
+                    "  hint: delete account MPT files and replay to rebuild\n");
             return root;
         }
         clock_gettime(CLOCK_MONOTONIC, &_rt2);
 
-        double _stor_ms = (_rt1.tv_sec - _rt0.tv_sec) * 1000.0 +
-                          (_rt1.tv_nsec - _rt0.tv_nsec) / 1e6;
-        double _acct_ms = (_rt2.tv_sec - _rt1.tv_sec) * 1000.0 +
-                          (_rt2.tv_nsec - _rt1.tv_nsec) / 1e6;
-        if (_stor_ms + _acct_ms > 100.0)
-            fprintf(stderr, "  └ mpt_root: storage=%.1f ms (%zu dirty accts), account=%.1f ms (%zu dirty), total=%.1f ms\n",
-                    _stor_ms, _acct_dirty_count, _acct_ms, _acct_dirty_count, _stor_ms + _acct_ms);
+        es->last_root_stor_ms = (_rt1.tv_sec - _rt0.tv_sec) * 1000.0 +
+                               (_rt1.tv_nsec - _rt0.tv_nsec) / 1e6;
+        es->last_root_acct_ms = (_rt2.tv_sec - _rt1.tv_sec) * 1000.0 +
+                                (_rt2.tv_nsec - _rt1.tv_nsec) / 1e6;
+        es->last_root_dirty_count = _acct_dirty_count;
 
         mpt_store_root(es->account_mpt, root.bytes);
         return root;

@@ -17,7 +17,6 @@
 #include "gas.h"
 #include "verkle_key.h"
 #include "precompile.h"
-#include "logger.h"
 #include <string.h>
 
 /* EIP-4762: System contracts get warm access cost (like precompiles)
@@ -386,9 +385,6 @@ static evm_status_t op_extcodesize(evm_t *evm)
         return EVM_STACK_OVERFLOW;
     }
 
-    LOG_EVM_DEBUG("EXTCODESIZE: address=0x...%02x%02x, size=%u",
-                  addr.bytes[18], addr.bytes[19], code_size);
-
     return EVM_SUCCESS;
 }
 
@@ -586,9 +582,6 @@ static evm_status_t op_extcodehash(evm_t *evm)
     {
         return EVM_STACK_OVERFLOW;
     }
-
-    LOG_EVM_DEBUG("EXTCODEHASH: address=0x...%02x%02x",
-                  addr.bytes[18], addr.bytes[19]);
 
     return EVM_SUCCESS;
 }

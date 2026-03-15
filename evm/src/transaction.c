@@ -6,7 +6,6 @@
 #include "evm.h"
 #include "opcodes/create.h"
 #include "verkle_key.h"
-#include "logger.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -208,8 +207,6 @@ bool transaction_validate(
     // Check nonce
     uint64_t current_nonce = evm_state_get_nonce(state, &tx->sender);
     if (tx->nonce != current_nonce) {
-        LOG_EVM_DEBUG("Transaction nonce mismatch: expected %lu, got %lu",
-                 current_nonce, tx->nonce);
         return false;
     }
 
@@ -224,7 +221,6 @@ bool transaction_validate(
     if (tx->gas_limit > 0) {
         uint256_t check = uint256_div(&gas_cost, &gas_limit_u256);
         if (!uint256_eq(&check, &effective_gas_price)) {
-            LOG_EVM_DEBUG("Gas cost overflow: gasPrice * gasLimit exceeds uint256");
             return false;
         }
     }
@@ -232,18 +228,15 @@ bool transaction_validate(
     uint256_t total_cost = uint256_add(&tx->value, &gas_cost);
     // Check for addition overflow (value + gas_cost > 2^256)
     if (uint256_lt(&total_cost, &gas_cost)) {
-        LOG_EVM_DEBUG("Total cost overflow: value + gas_cost exceeds uint256");
         return false;
     }
 
     if (uint256_lt(&sender_balance, &total_cost)) {
-        LOG_EVM_DEBUG("Insufficient balance for transaction");
         return false;
     }
 
     // Check gas limit
     if (tx->gas_limit > env->gas_limit) {
-        LOG_EVM_DEBUG("Transaction gas limit exceeds block gas limit");
         return false;
     }
 
@@ -295,19 +288,15 @@ bool transaction_execute(
 
     // Reject transaction types not supported by the current fork
     if (tx->type == TX_TYPE_EIP2930 && evm->fork < FORK_BERLIN) {
-        LOG_EVM_DEBUG("EIP-2930 type-1 tx not valid before Berlin");
         return false;
     }
     if (tx->type == TX_TYPE_EIP1559 && evm->fork < FORK_LONDON) {
-        LOG_EVM_DEBUG("EIP-1559 type-2 tx not valid before London");
         return false;
     }
     if (tx->type == TX_TYPE_EIP4844 && evm->fork < FORK_CANCUN) {
-        LOG_EVM_DEBUG("EIP-4844 type-3 tx not valid before Cancun");
         return false;
     }
     if (tx->type == TX_TYPE_EIP7702 && evm->fork < FORK_PRAGUE) {
-        LOG_EVM_DEBUG("EIP-7702 type-4 tx not valid before Prague");
         return false;
     }
 
@@ -315,12 +304,10 @@ bool transaction_execute(
     if (tx->type == TX_TYPE_EIP7702) {
         // Must have non-empty authorization list
         if (!tx->authorization_list || tx->authorization_list_count == 0) {
-            LOG_EVM_DEBUG("EIP-7702: empty authorization list");
             return false;
         }
         // Cannot be contract creation
         if (tx->is_create) {
-            LOG_EVM_DEBUG("EIP-7702: type-4 tx cannot be contract creation");
             return false;
         }
     }
@@ -329,46 +316,37 @@ bool transaction_execute(
     if (tx->type == TX_TYPE_EIP4844) {
         // Blob tx cannot be contract creation
         if (tx->is_create) {
-            LOG_EVM_DEBUG("EIP-4844: blob tx cannot be contract creation");
             return false;
         }
         // Must have at least one blob hash
         if (tx->blob_versioned_hashes_count == 0) {
-            LOG_EVM_DEBUG("EIP-4844: blob tx must have at least one blob hash");
             return false;
         }
         // Max blobs per block: 6 in Cancun, 9 in Prague (EIP-7742)
         uint64_t max_blobs = (evm->fork >= FORK_PRAGUE) ? 9 : 6;
         if (tx->blob_versioned_hashes_count > max_blobs) {
-            LOG_EVM_DEBUG("EIP-4844: too many blobs (%zu > %lu)", tx->blob_versioned_hashes_count, max_blobs);
             return false;
         }
         // Validate blob hash version: must start with VERSIONED_HASH_VERSION_KZG = 0x01
         for (size_t i = 0; i < tx->blob_versioned_hashes_count; i++) {
             if (tx->blob_versioned_hashes[i].bytes[0] != 0x01) {
-                LOG_EVM_DEBUG("EIP-4844: invalid blob hash version byte 0x%02x at index %zu",
-                              tx->blob_versioned_hashes[i].bytes[0], i);
                 return false;
             }
         }
         // max_fee_per_blob_gas must be >= blob_base_fee
         uint256_t blob_base_fee = calc_blob_gas_price(&env->excess_blob_gas, evm->fork);
         if (uint256_lt(&tx->max_fee_per_blob_gas, &blob_base_fee)) {
-            LOG_EVM_DEBUG("EIP-4844: max_fee_per_blob_gas below blob base fee");
             return false;
         }
     }
 
     // EIP-3860 (Shanghai+): Reject contract creation with initcode > MAX_INITCODE_SIZE
     if (tx->is_create && evm->fork >= FORK_SHANGHAI && tx->data_size > 49152) {
-        LOG_EVM_DEBUG("Initcode size %zu exceeds limit 49152", tx->data_size);
         return false;
     }
 
     // Transaction gas limit must not exceed block gas limit
     if (tx->gas_limit > env->gas_limit) {
-        LOG_EVM_DEBUG("Transaction gas limit %lu exceeds block gas limit %lu",
-                      tx->gas_limit, env->gas_limit);
         return false;
     }
 
@@ -376,12 +354,10 @@ bool transaction_execute(
     if (tx->type == TX_TYPE_EIP1559 || tx->type == TX_TYPE_EIP4844 || tx->type == TX_TYPE_EIP7702) {
         // max_priority_fee_per_gas must not exceed max_fee_per_gas
         if (uint256_gt(&tx->max_priority_fee_per_gas, &tx->max_fee_per_gas)) {
-            LOG_EVM_DEBUG("max_priority_fee_per_gas exceeds max_fee_per_gas");
             return false;
         }
         // max_fee_per_gas must be >= block base_fee
         if (uint256_lt(&tx->max_fee_per_gas, &env->base_fee)) {
-            LOG_EVM_DEBUG("max_fee_per_gas below block base_fee");
             return false;
         }
     }
@@ -390,7 +366,6 @@ bool transaction_execute(
     if (evm->fork >= FORK_LONDON &&
         (tx->type == TX_TYPE_LEGACY || tx->type == TX_TYPE_EIP2930)) {
         if (uint256_lt(&tx->gas_price, &env->base_fee)) {
-            LOG_EVM_DEBUG("gas_price below block base_fee");
             return false;
         }
     }
@@ -410,13 +385,11 @@ bool transaction_execute(
         if (tx->gas_limit > 0) {
             uint256_t check = uint256_div(&max_gas_cost, &gl);
             if (!uint256_eq(&check, &max_gas_price)) {
-                LOG_EVM_DEBUG("Gas cost overflow in balance check");
                 return false;
             }
         }
         uint256_t total_cost = uint256_add(&max_gas_cost, &tx->value);
         if (uint256_lt(&total_cost, &max_gas_cost)) {
-            LOG_EVM_DEBUG("Total cost overflow in balance check");
             return false;
         }
 
@@ -430,7 +403,6 @@ bool transaction_execute(
 
         uint256_t sender_balance = evm_state_get_balance(state, &tx->sender);
         if (uint256_lt(&sender_balance, &total_cost)) {
-            LOG_EVM_DEBUG("Insufficient sender balance for max gas cost + value");
             return false;
         }
     }
@@ -439,12 +411,11 @@ bool transaction_execute(
     {
         uint64_t sender_nonce = evm_state_get_nonce(state, &tx->sender);
         if (tx->nonce != sender_nonce) {
-            LOG_EVM_ERROR("Transaction nonce mismatch: expected %lu, got %lu",
+            fprintf(stderr, "FATAL: transaction nonce mismatch: expected %lu, got %lu\n  hint: state nonce diverged from expected — likely a state corruption or missed tx\n",
                      sender_nonce, tx->nonce);
             return false;
         }
         if (sender_nonce == UINT64_MAX) {
-            LOG_EVM_DEBUG("Sender nonce at maximum, cannot increment");
             return false;
         }
     }
@@ -463,7 +434,6 @@ bool transaction_execute(
                     is_delegation = true;
             }
             if (!is_delegation) {
-                LOG_EVM_DEBUG("EIP-3607: sender has code (not an EOA)");
                 return false;
             }
         }
@@ -504,7 +474,6 @@ bool transaction_execute(
 
     // Deduct upfront gas cost from sender
     if (!evm_state_sub_balance(state, &tx->sender, &gas_cost)) {
-        LOG_EVM_DEBUG("Failed to deduct gas cost from sender");
         evm_state_revert(state, snapshot);
         return false;
     }
@@ -517,7 +486,6 @@ bool transaction_execute(
         uint256_t blob_gas_u256 = uint256_from_uint64(total_blob_gas);
         blob_gas_cost = uint256_mul(&blob_base_fee, &blob_gas_u256);
         if (!evm_state_sub_balance(state, &tx->sender, &blob_gas_cost)) {
-            LOG_EVM_DEBUG("Failed to deduct blob gas cost from sender");
             evm_state_revert(state, snapshot);
             return false;
         }
@@ -678,8 +646,6 @@ bool transaction_execute(
             collision = evm_state_has_storage(state, &contract_address);
         }
         if (collision) {
-            LOG_EVM_DEBUG("Contract address collision: nonce=%lu, code_size=%u",
-                         existing_nonce, existing_code);
             // collision remains true
         } else {
             evm_state_create_account(state, &contract_address);
@@ -703,8 +669,6 @@ bool transaction_execute(
     // EIP-7623: must also have enough for floor data gas
     uint64_t min_gas_required = intrinsic_gas > floor_data_gas ? intrinsic_gas : floor_data_gas;
     if (tx->gas_limit < min_gas_required) {
-        LOG_EVM_DEBUG("Insufficient gas: limit=%lu, intrinsic=%lu, floor=%lu",
-                 tx->gas_limit, intrinsic_gas, floor_data_gas);
         evm_state_revert(state, snapshot);
         return false;
     }
@@ -727,7 +691,6 @@ bool transaction_execute(
         address_t recipient = tx->is_create ? contract_address : tx->to;
         if (!uint256_is_zero(&tx->value)) {
             if (!evm_state_sub_balance(state, &tx->sender, &tx->value)) {
-                LOG_EVM_DEBUG("Failed to deduct value from sender");
                 evm_state_revert(state, snapshot);
                 return false;
             }
@@ -788,7 +751,6 @@ bool transaction_execute(
     // Execute EVM
     evm_result_t evm_result;
     if (!evm_execute(evm, &msg, &evm_result)) {
-        LOG_EVM_DEBUG("EVM execution failed");
         evm_state_revert(state, snapshot);
         return false;
     }
@@ -873,7 +835,6 @@ bool transaction_execute(
                     if (evm_result.gas_left < deployment_gas) {
                         if (evm->fork >= FORK_HOMESTEAD) {
                             // Homestead+: OOG, consume all gas, revert
-                            LOG_EVM_DEBUG("Insufficient gas for code deployment");
                             evm_state_revert(state, exec_snapshot);
                             result->status = EVM_OUT_OF_GAS;
                             result->gas_used = tx->gas_limit;

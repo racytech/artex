@@ -11,7 +11,7 @@
 #include "evm_tracer.h"
 #include "gas.h"
 #include "verkle_key.h"
-#include "logger.h"
+#include <stdio.h>
 #include "uint256.h"
 #include "address.h"
 #include "hash.h"
@@ -111,7 +111,7 @@ static evm_status_t execute_create(evm_t *evm,
 
     if (evm->msg.depth >= 1024)
     {
-        LOG_EVM_DEBUG("CREATE: Call depth limit exceeded");
+
         if (init_code) free(init_code);
         uint256_t zero = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &zero))
@@ -128,7 +128,7 @@ static evm_status_t execute_create(evm_t *evm,
         uint256_t sender_balance = evm_state_get_balance(evm->state, &evm->msg.recipient);
         if (uint256_lt(&sender_balance, value))
         {
-            LOG_EVM_DEBUG("CREATE: Insufficient balance for value transfer");
+
             if (init_code) free(init_code);
             uint256_t zero = UINT256_ZERO;
             if (!evm_stack_push(evm->stack, &zero))
@@ -140,7 +140,7 @@ static evm_status_t execute_create(evm_t *evm,
     // EIP-2681: nonce overflow check — CREATE fails if nonce >= 2^64-1
     if (sender_nonce >= UINT64_MAX)
     {
-        LOG_EVM_DEBUG("CREATE: Sender nonce at maximum (EIP-2681)");
+
         if (init_code) free(init_code);
         uint256_t zero = UINT256_ZERO;
         if (!evm_stack_push(evm->stack, &zero))
@@ -219,7 +219,7 @@ static evm_status_t execute_create(evm_t *evm,
     }
     if (collision)
     {
-        LOG_EVM_DEBUG("CREATE: Address collision detected");
+
         // Consume all forwarded gas (collision consumes all gas)
         EVM_TRACE_RETURN(NULL, 0, gas_forwarded, "contract address collision");
         CREATE_FAIL_PUSH_ZERO();
@@ -534,13 +534,13 @@ static evm_status_t op_create(evm_t *evm)
         init_code = malloc(size_u64);
         if (!init_code)
         {
-            LOG_EVM_ERROR("CREATE: Failed to allocate init code");
+            fprintf(stderr, "FATAL: CREATE failed to allocate init code (OOM)\n");
             return EVM_INTERNAL_ERROR;
         }
 
         if (!evm_memory_read(evm->memory, offset_u64, init_code, size_u64))
         {
-            LOG_EVM_DEBUG("CREATE: Failed to read init code from memory");
+
             free(init_code);
             return EVM_INVALID_MEMORY_ACCESS;
         }
@@ -571,7 +571,7 @@ static evm_status_t op_create2(evm_t *evm)
     // Check for static call violation
     if (evm->msg.is_static)
     {
-        LOG_EVM_DEBUG("CREATE2: Cannot create contract in static call");
+
         return EVM_STATIC_CALL_VIOLATION;
     }
 
@@ -648,13 +648,13 @@ static evm_status_t op_create2(evm_t *evm)
         init_code = malloc(size_u64);
         if (!init_code)
         {
-            LOG_EVM_ERROR("CREATE2: Failed to allocate init code");
+            fprintf(stderr, "FATAL: CREATE2 failed to allocate init code (OOM)\n");
             return EVM_INTERNAL_ERROR;
         }
 
         if (!evm_memory_read(evm->memory, offset_u64, init_code, size_u64))
         {
-            LOG_EVM_DEBUG("CREATE2: Failed to read init code from memory");
+
             free(init_code);
             return EVM_INVALID_MEMORY_ACCESS;
         }

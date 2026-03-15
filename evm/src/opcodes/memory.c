@@ -7,7 +7,6 @@
 #include "evm_memory.h"
 #include "evm_stack.h"
 #include "gas.h"
-#include "logger.h"
 #include <string.h>
 
 // op_mload and op_mstore are inlined in the interpreter dispatch loop.
@@ -22,7 +21,6 @@ static evm_status_t op_mstore8(evm_t *evm)
 
     if (!evm_stack_require(evm->stack, 2))
     {
-        LOG_EVM_DEBUG("MSTORE8: Stack underflow");
         return EVM_STACK_UNDERFLOW;
     }
 
@@ -49,7 +47,6 @@ static evm_status_t op_mstore8(evm_t *evm)
     // Write 1 byte to memory
     if (!evm_memory_write_byte(evm->memory, mem_offset, byte_value))
     {
-        LOG_EVM_DEBUG("MSTORE8: Failed to write to memory at offset %lu", mem_offset);
         return EVM_INVALID_MEMORY_ACCESS;
     }
 
