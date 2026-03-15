@@ -516,12 +516,13 @@ bool sync_execute_block(sync_t *sync,
 
     uint64_t bn = header->number;
 
-    /* Store block hash in ring buffer */
-    sync->block_hashes[bn % BLOCK_HASH_WINDOW] = *block_hash;
-
-    /* Execute block */
+    /* Execute block (block_hashes contains hashes up to block bn-1) */
     block_result_t br = block_execute(sync->evm, header, body,
                                       sync->block_hashes);
+
+    /* Store current block's hash AFTER execution so it doesn't overwrite
+     * the hash 256 blocks ago (same ring buffer slot) during execution. */
+    sync->block_hashes[bn % BLOCK_HASH_WINDOW] = *block_hash;
 
     result->gas_used = br.gas_used;
     result->tx_count = br.tx_count;
@@ -609,12 +610,13 @@ bool sync_execute_block_live(sync_t *sync,
 
     uint64_t bn = header->number;
 
-    /* Store block hash in ring buffer */
-    sync->block_hashes[bn % BLOCK_HASH_WINDOW] = *block_hash;
-
-    /* Execute block */
+    /* Execute block (block_hashes contains hashes up to block bn-1) */
     block_result_t br = block_execute(sync->evm, header, body,
                                       sync->block_hashes);
+
+    /* Store current block's hash AFTER execution so it doesn't overwrite
+     * the hash 256 blocks ago (same ring buffer slot) during execution. */
+    sync->block_hashes[bn % BLOCK_HASH_WINDOW] = *block_hash;
 
     result->gas_used = br.gas_used;
     result->tx_count = br.tx_count;
