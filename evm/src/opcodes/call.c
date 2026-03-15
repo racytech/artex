@@ -579,7 +579,7 @@ static evm_status_t op_callcode(evm_t *evm)
         size_t copy_size = ret_size_u64 < subcall_result.output_size ? 
                           ret_size_u64 : subcall_result.output_size;
         
-        if (!evm_memory_write(evm->memory, ret_offset_u64, 
+        if (!evm_memory_write(evm->memory, ret_offset_u64,
                              subcall_result.output_data, copy_size))
         {
             /* output_data ownership transferred to evm->return_data by evm_execute */
@@ -758,7 +758,7 @@ static evm_status_t op_delegatecall(evm_t *evm)
         size_t copy_size = ret_size_u64 < subcall_result.output_size ? 
                           ret_size_u64 : subcall_result.output_size;
         
-        if (!evm_memory_write(evm->memory, ret_offset_u64, 
+        if (!evm_memory_write(evm->memory, ret_offset_u64,
                              subcall_result.output_data, copy_size))
         {
             /* output_data ownership transferred to evm->return_data by evm_execute */
@@ -924,7 +924,7 @@ static evm_status_t op_staticcall(evm_t *evm)
         size_t copy_size = ret_size_u64 < subcall_result.output_size ? 
                           ret_size_u64 : subcall_result.output_size;
         
-        if (!evm_memory_write(evm->memory, ret_offset_u64, 
+        if (!evm_memory_write(evm->memory, ret_offset_u64,
                              subcall_result.output_data, copy_size))
         {
             /* output_data ownership transferred to evm->return_data by evm_execute */

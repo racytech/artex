@@ -379,7 +379,7 @@ bool evm_resolve_delegation(evm_state_t *state, const address_t *addr, address_t
  * Create a success result
  *
  * @param gas_left Remaining gas
- * @param output_data Return data (will be copied)
+ * @param output_data Return data (ownership transferred — caller must not free)
  * @param output_size Size of return data
  * @return Result structure
  */

@@ -160,6 +160,7 @@ evm_result_t evm_result_create(evm_status_t status,
     result.output_size = output_size;
     /* Take ownership of output_data — caller must not free it */
     result.output_data = (output_data && output_size > 0) ? output_data : NULL;
+
     return result;
 }
 
@@ -1404,7 +1405,7 @@ done:
     // Free JUMPDEST bitmap
     free(jumpdest_bitmap);
     evm->jumpdest_bitmap = NULL;
-    // Create result — transfers ownership of return_data to result
+    // Create result with output data
     evm_result_t res = evm_result_create(status, evm->gas_left, evm->gas_refund, evm->return_data, evm->return_data_size);
     evm->return_data = NULL;  /* ownership transferred */
     evm->return_data_size = 0;

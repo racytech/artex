@@ -309,7 +309,6 @@ evm_result_t evm_result_success(uint64_t gas_left, uint8_t *output_data, size_t 
         .output_data = (output_data && output_size > 0) ? output_data : NULL,
         .output_size = output_size
     };
-
     return result;
 }
 
@@ -322,7 +321,6 @@ evm_result_t evm_result_revert(uint64_t gas_left, uint8_t *output_data, size_t o
         .output_data = (output_data && output_size > 0) ? output_data : NULL,
         .output_size = output_size
     };
-
     return result;
 }
 
@@ -786,7 +784,7 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         evm->return_data = result->output_data;
         evm->return_data_size = result->output_size;
     }
-    
+
     return true;
 }
 
