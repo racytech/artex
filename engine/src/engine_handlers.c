@@ -581,7 +581,11 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
 
             /* Step 7: Execute block */
             block_result_t result = block_execute(
-                (evm_t *)ctx->evm, &header, &body, block_hashes);
+                (evm_t *)ctx->evm, &header, &body, block_hashes
+#ifdef ENABLE_HISTORY
+                , NULL
+#endif
+                );
 
             /* Step 8: Compute state root (MPT path returns zero from block_execute) */
 #ifdef ENABLE_MPT

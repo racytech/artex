@@ -1,4 +1,7 @@
 #include "block_executor.h"
+#ifdef ENABLE_HISTORY
+#include "state_history.h"
+#endif
 #include "tx_pipeline.h"
 #include "dao_fork.h"
 #include "tx_decoder.h"
@@ -293,7 +296,11 @@ static uint256_t get_block_reward(evm_fork_t fork) {
 block_result_t block_execute(evm_t *evm,
                              const block_header_t *header,
                              const block_body_t *body,
-                             const hash_t *block_hashes) {
+                             const hash_t *block_hashes
+#ifdef ENABLE_HISTORY
+                             , state_history_t *history
+#endif
+                             ) {
     block_result_t result;
     memset(&result, 0, sizeof(result));
     result.first_failure = -1;
@@ -675,6 +682,12 @@ block_result_t block_execute(evm_t *evm,
 
     /* Finalize state: flush dirty accounts/storage to state_db */
     evm_state_finalize(evm->state);
+
+#ifdef ENABLE_HISTORY
+    /* Capture state diff before dirty flags are cleared by compute_state_root */
+    if (history)
+        state_history_capture(history, evm->state, header->number);
+#endif
 
     /* Compute state root — prune empty accounts post-Spurious Dragon (EIP-161).
      * For Verkle: flushes block-dirty state to backing store, clears dirty flags.

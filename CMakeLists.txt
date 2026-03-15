@@ -12,6 +12,7 @@ option(ENABLE_MPT "Enable MPT (Merkle Patricia Trie) state root" ON)
 option(ENABLE_VERKLE "Enable Verkle state root" OFF)
 option(ENABLE_EVM_TRACE "Enable EIP-3155 EVM execution tracing" OFF)
 option(ENABLE_DEBUG "Enable debug instrumentation (g_trace_calls, state dump, --no-evict)" OFF)
+option(ENABLE_HISTORY "Enable per-block state diff history tracking" OFF)
 
 if(NOT ENABLE_MPT AND NOT ENABLE_VERKLE)
     message(FATAL_ERROR "At least one state backend must be enabled (ENABLE_MPT or ENABLE_VERKLE)")
@@ -236,6 +237,9 @@ endif()
 if(ENABLE_DEBUG)
     target_compile_definitions(evm PUBLIC ENABLE_DEBUG=1)
 endif()
+if(ENABLE_HISTORY)
+    target_compile_definitions(evm PUBLIC ENABLE_HISTORY=1)
+endif()
 target_compile_definitions(evm PRIVATE
     MPT_STORAGE_CACHE_MB=${MPT_STORAGE_CACHE_MB}
     MPT_ACCOUNT_CAPACITY=${MPT_ACCOUNT_CAPACITY}
@@ -246,7 +250,7 @@ target_compile_definitions(evm PRIVATE
 # Libraries — Block Executor
 #==============================================================================
 
-add_library(block_executor STATIC
+set(BLOCK_EXECUTOR_SOURCES
     executor/src/block.c
     executor/src/tx_decoder.c
     executor/src/tx_pipeline.c
@@ -254,6 +258,10 @@ add_library(block_executor STATIC
     executor/src/dao_fork.c
     executor/src/era1.c
 )
+if(ENABLE_HISTORY)
+    list(APPEND BLOCK_EXECUTOR_SOURCES executor/src/state_history.c)
+endif()
+add_library(block_executor STATIC ${BLOCK_EXECUTOR_SOURCES})
 target_include_directories(block_executor PUBLIC
     ${CMAKE_SOURCE_DIR}/executor/include
 )
@@ -751,6 +759,15 @@ endif()
 target_link_libraries(test_block_executor ${TEST_BLOCK_EXEC_LIBS})
 add_test(NAME test_block_executor COMMAND test_block_executor)
 
+if(ENABLE_HISTORY)
+    add_executable(test_state_history executor/tests/test_state_history.c)
+    target_link_libraries(test_state_history block_executor evm common)
+    add_test(NAME test_state_history COMMAND test_state_history)
+
+    add_executable(history_dump tools/history_dump.c)
+    target_link_libraries(history_dump block_executor evm common)
+endif()
+
 add_executable(test_uint256_div common/tests/test_uint256_div.c)
 target_link_libraries(test_uint256_div common)
 add_test(NAME test_uint256_div COMMAND test_uint256_div)
@@ -998,6 +1015,7 @@ message(STATUS "C Compiler:        ${CMAKE_C_COMPILER}")
 message(STATUS "C Flags:           ${CMAKE_C_FLAGS}")
 message(STATUS "MPT backend:       ${ENABLE_MPT}")
 message(STATUS "Verkle backend:    ${ENABLE_VERKLE}")
+message(STATUS "State history:     ${ENABLE_HISTORY}")
 message(STATUS "")
 message(STATUS "Tuning:")
 message(STATUS "  Account cache:   ${MPT_ACCOUNT_CACHE_MB} MB")

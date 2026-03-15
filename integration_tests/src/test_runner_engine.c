@@ -359,7 +359,11 @@ bool test_runner_run_engine_test(test_runner_t *runner,
         uint32_t pre_block_snap = evm_state_snapshot(runner->state);
 
         /* Execute block */
-        block_result_t block_result = block_execute(runner->evm, &hdr, &body, block_hashes);
+        block_result_t block_result = block_execute(runner->evm, &hdr, &body, block_hashes
+#ifdef ENABLE_HISTORY
+            , NULL
+#endif
+            );
 
         if (runner->config.verbose) {
             printf("    gas_used=%lu (expected=%lu), tx_count=%zu, success=%d\n",

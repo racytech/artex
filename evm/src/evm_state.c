@@ -54,18 +54,27 @@ typedef struct cached_account {
     hash_t     code_hash;       // 32 bytes
     hash_t     storage_root;    // cached storage root (avoids recomputation for clean accounts)
     hash_t     addr_hash;       // cached keccak256(addr) — computed once on first load
+#ifdef ENABLE_HISTORY
+    /* Pre-block snapshots for state history diffs */
+    uint64_t   original_nonce;
+    uint256_t  original_balance;
+    hash_t     original_code_hash;
+#endif
 } cached_account_t;
 
 // --- Storage cache ---
 
 typedef struct cached_slot {
     uint8_t   key[SLOT_KEY_SIZE];   // addr[20] || slot_be[32] — kept for finalize
-    uint256_t original;             // value when first loaded
+    uint256_t original;             // value when first loaded (reset per-tx by commit_tx)
     uint256_t current;
     bool dirty;
     bool block_dirty;           // survives commit_tx, cleared at block end
     bool mpt_dirty;             // needs update in storage mpt_store (cleared after storage root compute)
     hash_t slot_hash;           // cached keccak256(slot_be) — computed once on first load
+#ifdef ENABLE_HISTORY
+    uint256_t block_original;   // value at start of block (for state diff tracking)
+#endif
 } cached_slot_t;
 
 // --- Journal ---
@@ -306,6 +315,12 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
     }
 #endif
 
+#ifdef ENABLE_HISTORY
+    ca_local.original_nonce = ca_local.nonce;
+    ca_local.original_balance = ca_local.balance;
+    ca_local.original_code_hash = ca_local.code_hash;
+#endif
+
     return (cached_account_t *)mem_art_upsert(
         &es->accounts, addr->bytes, ADDRESS_SIZE,
         &ca_local, sizeof(cached_account_t));
@@ -357,6 +372,10 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
             }
         }
     }
+#endif
+
+#ifdef ENABLE_HISTORY
+    cs_local.block_original = cs_local.original;
 #endif
 
     return (cached_slot_t *)mem_art_upsert(
@@ -1253,6 +1272,9 @@ static bool commit_slot_cb(const uint8_t *key, size_t key_len,
     cached_slot_t *cs = (cached_slot_t *)(uintptr_t)value;
     cs->original = cs->current;
     cs->dirty = false;
+#ifdef ENABLE_HISTORY
+    cs->block_original = cs->current;
+#endif
     return true;
 }
 
@@ -1272,6 +1294,11 @@ static bool commit_account_cb(const uint8_t *key, size_t key_len,
     ca->dirty = false;
     ca->code_dirty = false;
     ca->self_destructed = false;
+#ifdef ENABLE_HISTORY
+    ca->original_nonce = ca->nonce;
+    ca->original_balance = ca->balance;
+    ca->original_code_hash = ca->code_hash;
+#endif
     return true;
 }
 
@@ -2358,6 +2385,103 @@ size_t evm_state_collect_storage_keys(evm_state_t *es, const address_t *addr,
     mem_art_foreach(&es->storage, collect_slots_cb, &ctx);
     return ctx.count;
 }
+
+// ============================================================================
+// State history diff collection
+// ============================================================================
+
+#ifdef ENABLE_HISTORY
+#include "state_history.h"
+
+void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
+    if (!es || !out) return;
+
+    /* --- Account diffs from dirty_accounts vector --- */
+#ifdef ENABLE_MPT
+    uint32_t acct_cap = (uint32_t)es->dirty_accounts.count;
+#else
+    /* Verkle path: count block_dirty accounts via scan */
+    uint32_t acct_cap = 64;
+#endif
+    account_diff_t *accts = acct_cap > 0 ? calloc(acct_cap, sizeof(account_diff_t)) : NULL;
+    uint32_t acct_count = 0;
+
+#ifdef ENABLE_MPT
+    for (size_t d = 0; d < es->dirty_accounts.count; d++) {
+        const uint8_t *akey = es->dirty_accounts.keys + d * 20;
+        const cached_account_t *ca = (const cached_account_t *)mem_art_get(
+            &es->accounts, akey, 20, NULL);
+        if (!ca) continue;
+        if (!ca->block_dirty && !ca->block_code_dirty) continue;
+
+        /* Skip if nothing actually changed */
+        bool nonce_changed = (ca->nonce != ca->original_nonce);
+        bool balance_changed = !uint256_is_equal(&ca->balance, &ca->original_balance);
+        bool code_changed = (memcmp(ca->code_hash.bytes, ca->original_code_hash.bytes, 32) != 0);
+        bool is_created = ca->created;
+        bool is_destructed = ca->self_destructed;
+
+        if (!nonce_changed && !balance_changed && !code_changed &&
+            !is_created && !is_destructed)
+            continue;
+
+        if (acct_count >= acct_cap) {
+            acct_cap = acct_cap ? acct_cap * 2 : 64;
+            accts = realloc(accts, acct_cap * sizeof(account_diff_t));
+        }
+        account_diff_t *a = &accts[acct_count++];
+        a->addr = ca->addr;
+        a->old_nonce = ca->original_nonce;
+        a->new_nonce = ca->nonce;
+        a->old_balance = ca->original_balance;
+        a->new_balance = ca->balance;
+        a->old_code_hash = ca->original_code_hash;
+        a->new_code_hash = ca->code_hash;
+        a->flags = 0;
+        if (is_created) a->flags |= ACCT_DIFF_CREATED;
+        if (is_destructed) a->flags |= ACCT_DIFF_DESTRUCTED;
+    }
+#endif
+
+    /* --- Storage diffs from dirty_slots vector --- */
+#ifdef ENABLE_MPT
+    uint32_t slot_cap = (uint32_t)es->dirty_slots.count;
+#else
+    uint32_t slot_cap = 64;
+#endif
+    storage_diff_t *slots = slot_cap > 0 ? calloc(slot_cap, sizeof(storage_diff_t)) : NULL;
+    uint32_t slot_count = 0;
+
+#ifdef ENABLE_MPT
+    for (size_t d = 0; d < es->dirty_slots.count; d++) {
+        const uint8_t *skey = es->dirty_slots.keys + d * SLOT_KEY_SIZE;
+        const cached_slot_t *cs = (const cached_slot_t *)mem_art_get(
+            &es->storage, skey, SLOT_KEY_SIZE, NULL);
+        if (!cs) continue;
+        if (!cs->block_dirty) continue;
+
+        /* Skip if value didn't actually change from block start */
+        if (uint256_is_equal(&cs->block_original, &cs->current))
+            continue;
+
+        if (slot_count >= slot_cap) {
+            slot_cap = slot_cap ? slot_cap * 2 : 64;
+            slots = realloc(slots, slot_cap * sizeof(storage_diff_t));
+        }
+        storage_diff_t *s = &slots[slot_count++];
+        memcpy(s->addr.bytes, skey, 20);
+        s->slot = uint256_from_bytes(skey + 20, 32);
+        s->old_value = cs->block_original;
+        s->new_value = cs->current;
+    }
+#endif
+
+    out->accounts = accts;
+    out->account_count = acct_count;
+    out->storage = slots;
+    out->storage_count = slot_count;
+}
+#endif /* ENABLE_HISTORY */
 
 // Compute storage roots incrementally using shared storage mpt_store.
 // Iterates the dirty_slots list (O(dirty)) instead of scanning all cached slots.

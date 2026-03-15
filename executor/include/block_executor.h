@@ -8,6 +8,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef ENABLE_HISTORY
+typedef struct state_history state_history_t;
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -68,12 +72,17 @@ typedef struct {
  * @param body         Decoded block body (transaction list)
  * @param block_hashes Optional: 256 recent block hashes for BLOCKHASH opcode
  *                     (indexed by block_number % 256). NULL = all zeros.
+ * @param history      Optional: state history tracker (NULL = no capture)
  * @return Block execution result
  */
 block_result_t block_execute(evm_t *evm,
                              const block_header_t *header,
                              const block_body_t *body,
-                             const hash_t *block_hashes);
+                             const hash_t *block_hashes
+#ifdef ENABLE_HISTORY
+                             , state_history_t *history
+#endif
+                             );
 
 /**
  * Free block result resources.

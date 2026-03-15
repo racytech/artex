@@ -25,6 +25,9 @@
 #ifdef ENABLE_MPT
 #include "code_store.h"
 #endif
+#ifdef ENABLE_HISTORY
+#include "state_history.h"
+#endif
 #include "uint256.h"
 #include "address.h"
 #include "keccak256.h"
@@ -93,6 +96,10 @@ struct sync {
 
     /* Stats snapshot taken before cache eviction (so callers see useful values) */
     evm_state_stats_t last_stats;
+
+#ifdef ENABLE_HISTORY
+    state_history_t *history;
+#endif
 };
 
 // ============================================================================
@@ -286,6 +293,8 @@ sync_t *sync_create(const sync_config_t *config) {
         s->config.code_store_path = strdup(config->code_store_path);
     if (config->checkpoint_path)
         s->config.checkpoint_path = strdup(config->checkpoint_path);
+    if (config->history_dir)
+        s->config.history_dir = strdup(config->history_dir);
 
     /* Try to resume from checkpoint */
     checkpoint_t ckpt;
@@ -378,6 +387,15 @@ sync_t *sync_create(const sync_config_t *config) {
         goto fail;
     }
 
+#ifdef ENABLE_HISTORY
+    if (s->config.history_dir) {
+        s->history = state_history_create(s->config.history_dir);
+        if (!s->history)
+            fprintf(stderr, "Warning: failed to create state history at %s\n",
+                    s->config.history_dir);
+    }
+#endif
+
     (void)resumed;
     return s;
 
@@ -391,6 +409,7 @@ fail:
     free((char *)s->config.verkle_commit_dir);
     free((char *)s->config.mpt_path);
     free((char *)s->config.checkpoint_path);
+    free((char *)s->config.history_dir);
     free(s);
     return NULL;
 }
@@ -416,12 +435,16 @@ void sync_destroy(sync_t *sync) {
 #ifdef ENABLE_MPT
     if (sync->cs) code_store_destroy(sync->cs);
 #endif
+#ifdef ENABLE_HISTORY
+    if (sync->history) state_history_destroy(sync->history);
+#endif
 
     free((char *)sync->config.verkle_value_dir);
     free((char *)sync->config.verkle_commit_dir);
     free((char *)sync->config.mpt_path);
     free((char *)sync->config.code_store_path);
     free((char *)sync->config.checkpoint_path);
+    free((char *)sync->config.history_dir);
     free(sync);
 }
 
@@ -513,7 +536,11 @@ bool sync_execute_block(sync_t *sync,
 
     /* Execute block (block_hashes contains hashes up to block bn-1) */
     block_result_t br = block_execute(sync->evm, header, body,
-                                      sync->block_hashes);
+                                      sync->block_hashes
+#ifdef ENABLE_HISTORY
+                                      , sync->history
+#endif
+                                      );
 
     /* Store current block's hash AFTER execution so it doesn't overwrite
      * the hash 256 blocks ago (same ring buffer slot) during execution. */
@@ -615,7 +642,11 @@ bool sync_execute_block_live(sync_t *sync,
 
     /* Execute block (block_hashes contains hashes up to block bn-1) */
     block_result_t br = block_execute(sync->evm, header, body,
-                                      sync->block_hashes);
+                                      sync->block_hashes
+#ifdef ENABLE_HISTORY
+                                      , sync->history
+#endif
+                                      );
 
     /* Store current block's hash AFTER execution so it doesn't overwrite
      * the hash 256 blocks ago (same ring buffer slot) during execution. */

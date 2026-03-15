@@ -376,4 +376,14 @@ size_t evm_state_collect_addresses(evm_state_t *es, address_t *out, size_t max_c
 size_t evm_state_collect_storage_keys(evm_state_t *es, const address_t *addr,
                                        uint256_t *out, size_t max_count);
 
+#ifdef ENABLE_HISTORY
+/**
+ * Collect per-block state diffs from dirty accounts and storage slots.
+ * Must be called after finalize() but before compute_state_root_ex().
+ * Fills caller-provided block_diff_t. Caller owns allocated arrays.
+ */
+struct block_diff_t;
+void evm_state_collect_block_diff(evm_state_t *es, struct block_diff_t *out);
+#endif
+
 #endif // EVM_STATE_H

@@ -48,12 +48,24 @@ static size_t get_rss_kb(void) {
     return rss;
 }
 
-/* Persistent store paths */
-static const char *VALUE_DIR  = "/home/racytech/workspace/art/data/chain_replay_values";
-static const char *COMMIT_DIR = "/home/racytech/workspace/art/data/chain_replay_commits";
-static const char *CKPT_PATH  = "/home/racytech/workspace/art/data/chain_replay.ckpt";
-static const char *MPT_PATH   = "/home/racytech/workspace/art/data/chain_replay_mpt";
-static const char *CODE_PATH  = "/home/racytech/workspace/art/data/chain_replay_code";
+/* Default persistent store paths */
+#define DEFAULT_DATA_DIR "/home/racytech/workspace/art/data"
+
+static char value_dir[512];
+static char commit_dir[512];
+static char ckpt_path[512];
+static char mpt_path[512];
+static char code_path[512];
+static char history_path[512];
+
+static void set_data_paths(const char *data_dir) {
+    snprintf(value_dir, sizeof(value_dir), "%s/chain_replay_values", data_dir);
+    snprintf(commit_dir, sizeof(commit_dir), "%s/chain_replay_commits", data_dir);
+    snprintf(ckpt_path, sizeof(ckpt_path), "%s/chain_replay.ckpt", data_dir);
+    snprintf(mpt_path, sizeof(mpt_path), "%s/chain_replay_mpt", data_dir);
+    snprintf(code_path, sizeof(code_path), "%s/chain_replay_code", data_dir);
+    snprintf(history_path, sizeof(history_path), "%s/chain_replay_history", data_dir);
+}
 
 /* =========================================================================
  * Graceful shutdown via SIGINT
@@ -246,6 +258,10 @@ int main(int argc, char **argv) {
     uint64_t trace_block = UINT64_MAX;  /* UINT64_MAX = no tracing */
     uint64_t dump_prestate_block = UINT64_MAX;
     const char *dump_prestate_path = NULL;
+#ifdef ENABLE_HISTORY
+    bool no_history = false;
+#endif
+    const char *data_dir = DEFAULT_DATA_DIR;
     int arg_offset = 0;
     while (arg_offset + 1 < argc && argv[1 + arg_offset][0] == '-') {
         if (strcmp(argv[1 + arg_offset], "--clean") == 0) {
@@ -257,6 +273,14 @@ int main(int argc, char **argv) {
 #ifdef ENABLE_DEBUG
         } else if (strcmp(argv[1 + arg_offset], "--no-evict") == 0) {
             no_evict = true;
+            arg_offset++;
+#endif
+        } else if (strcmp(argv[1 + arg_offset], "--data-dir") == 0 && arg_offset + 2 < argc) {
+            data_dir = argv[2 + arg_offset];
+            arg_offset += 2;
+#ifdef ENABLE_HISTORY
+        } else if (strcmp(argv[1 + arg_offset], "--no-history") == 0) {
+            no_history = true;
             arg_offset++;
 #endif
         } else if (strcmp(argv[1 + arg_offset], "--trace-block") == 0 && arg_offset + 2 < argc) {
@@ -282,6 +306,8 @@ int main(int argc, char **argv) {
             "Options:\n"
             "  --clean               Delete existing checkpoint and state, start from genesis\n"
             "  --follow              Wait for new era1 files instead of stopping\n"
+            "  --data-dir DIR        Set data directory for all state files (default: data/)\n"
+            "  --no-history          Disable per-block state diff history\n"
             "  --trace-block N       Enable EIP-3155 EVM trace for block N (to stderr)\n"
             "  --dump-prestate N [P] Dump pre-state alloc.json for block N to path P\n"
             "                        (default: alloc_<N>.json). Two-pass: executes block\n"
@@ -289,9 +315,14 @@ int main(int argc, char **argv) {
             "                        and dumps their pre-execution values.\n"
             "\n"
             "Checkpoints every %d blocks to %s\n",
-            argv[0], CHECKPOINT_INTERVAL, CKPT_PATH);
+            argv[0], CHECKPOINT_INTERVAL, ckpt_path);
         return 1;
     }
+
+    set_data_paths(data_dir);
+
+    /* Ensure data directory exists */
+    mkdir(data_dir, 0755);
 
     const char *era1_dir     = argv[1 + arg_offset];
     const char *genesis_path = argv[2 + arg_offset];
@@ -314,13 +345,17 @@ int main(int argc, char **argv) {
     /* Clean up old state if requested */
     if (force_clean) {
         printf("--clean: removing existing state and checkpoint\n");
-        unlink(CKPT_PATH);
+        unlink(ckpt_path);
         char cmd[512];
         snprintf(cmd, sizeof(cmd),
                  "rm -rf %s %s %s.idx %s.dat %s_storage.idx %s_storage.dat %s.idx %s.dat 2>/dev/null",
-                 VALUE_DIR, COMMIT_DIR, MPT_PATH, MPT_PATH, MPT_PATH, MPT_PATH,
-                 CODE_PATH, CODE_PATH);
+                 value_dir, commit_dir, mpt_path, mpt_path, mpt_path, mpt_path,
+                 code_path, code_path);
         (void)system(cmd);
+#ifdef ENABLE_HISTORY
+        snprintf(cmd, sizeof(cmd), "rm -rf %s 2>/dev/null", history_path);
+        (void)system(cmd);
+#endif
     }
 
     /* Create sync engine */
@@ -329,7 +364,7 @@ int main(int argc, char **argv) {
         .verkle_value_dir    = NULL,
         .verkle_commit_dir   = NULL,
         .mpt_path            = NULL,
-        .checkpoint_path     = CKPT_PATH,
+        .checkpoint_path     = ckpt_path,
         .checkpoint_interval = CHECKPOINT_INTERVAL,
         .validate_state_root = true,
 #ifdef ENABLE_DEBUG
@@ -337,12 +372,16 @@ int main(int argc, char **argv) {
 #endif
     };
 #ifdef ENABLE_VERKLE
-    cfg.verkle_value_dir  = VALUE_DIR;
-    cfg.verkle_commit_dir = COMMIT_DIR;
+    cfg.verkle_value_dir  = value_dir;
+    cfg.verkle_commit_dir = commit_dir;
+#endif
+#ifdef ENABLE_HISTORY
+    if (!no_history)
+        cfg.history_dir = history_path;
 #endif
 #ifdef ENABLE_MPT
-    cfg.mpt_path = MPT_PATH;
-    cfg.code_store_path = CODE_PATH;
+    cfg.mpt_path = mpt_path;
+    cfg.code_store_path = code_path;
 #endif
 
     sync_t *sync = sync_create(&cfg);

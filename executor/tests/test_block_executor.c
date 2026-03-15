@@ -364,7 +364,11 @@ static void test_executor_smoke(void) {
     ASSERT(body.tx_count == 1, "body tx count");
 
     /* Execute! */
-    block_result_t result = block_execute(evm, &header, &body, NULL);
+    block_result_t result = block_execute(evm, &header, &body, NULL
+#ifdef ENABLE_HISTORY
+        , NULL
+#endif
+        );
 
     printf("\n    gas_used=%lu, tx_count=%zu, success=%d, first_failure=%d\n    ",
            result.gas_used, result.tx_count, result.success, result.first_failure);
@@ -511,7 +515,11 @@ static void test_dao_fork_block_check(void) {
     block_body_t body;
     ASSERT(block_body_decode_rlp(&body, body_enc.data, body_enc.len), "decode body");
 
-    block_result_t result = block_execute(evm, &header, &body, NULL);
+    block_result_t result = block_execute(evm, &header, &body, NULL
+#ifdef ENABLE_HISTORY
+        , NULL
+#endif
+        );
     (void)result;
 
     /* Drain address should still have its balance */

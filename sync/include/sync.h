@@ -39,6 +39,9 @@ typedef struct {
     /* Checkpoint file path (NULL = no checkpointing) */
     const char *checkpoint_path;
 
+    /* State history (per-block diff tracking, NULL = disabled) */
+    const char *history_dir;
+
     /* Behavior */
     uint32_t checkpoint_interval;   /* auto-save every N blocks (0 = never) */
     bool     validate_state_root;   /* compare computed root against header */
