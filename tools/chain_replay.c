@@ -60,6 +60,7 @@ static const char *CODE_PATH  = "/home/racytech/workspace/art/data/chain_replay_
  * ========================================================================= */
 
 static volatile sig_atomic_t g_shutdown = 0;
+static volatile sig_atomic_t g_shutdown_pending = 0;
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -243,6 +244,8 @@ int main(int argc, char **argv) {
     bool no_evict = false;
 #endif
     uint64_t trace_block = UINT64_MAX;  /* UINT64_MAX = no tracing */
+    uint64_t dump_prestate_block = UINT64_MAX;
+    const char *dump_prestate_path = NULL;
     int arg_offset = 0;
     while (arg_offset + 1 < argc && argv[1 + arg_offset][0] == '-') {
         if (strcmp(argv[1 + arg_offset], "--clean") == 0) {
@@ -259,6 +262,14 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[1 + arg_offset], "--trace-block") == 0 && arg_offset + 2 < argc) {
             trace_block = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
+        } else if (strcmp(argv[1 + arg_offset], "--dump-prestate") == 0 && arg_offset + 2 < argc) {
+            dump_prestate_block = (uint64_t)atoll(argv[2 + arg_offset]);
+            arg_offset += 2;
+            /* Optional output path */
+            if (arg_offset + 1 < argc && argv[1 + arg_offset][0] != '-') {
+                dump_prestate_path = argv[1 + arg_offset];
+                arg_offset++;
+            }
         } else {
             break;
         }
@@ -266,12 +277,16 @@ int main(int argc, char **argv) {
 
     if (argc - arg_offset < 3) {
         fprintf(stderr,
-            "Usage: %s [--clean] [--follow] [--trace-block N] <era1_dir> <genesis.json> [start_block] [end_block]\n"
+            "Usage: %s [options] <era1_dir> <genesis.json> [start_block] [end_block]\n"
             "\n"
             "Options:\n"
-            "  --clean           Delete existing checkpoint and state, start from genesis\n"
-            "  --follow          Wait for new era1 files instead of stopping (run alongside downloader)\n"
-            "  --trace-block N   Enable EIP-3155 EVM trace for block N (to stderr)\n"
+            "  --clean               Delete existing checkpoint and state, start from genesis\n"
+            "  --follow              Wait for new era1 files instead of stopping\n"
+            "  --trace-block N       Enable EIP-3155 EVM trace for block N (to stderr)\n"
+            "  --dump-prestate N [P] Dump pre-state alloc.json for block N to path P\n"
+            "                        (default: alloc_<N>.json). Two-pass: executes block\n"
+            "                        to discover accessed accounts, then reloads checkpoint\n"
+            "                        and dumps their pre-execution values.\n"
             "\n"
             "Checkpoints every %d blocks to %s\n",
             argv[0], CHECKPOINT_INTERVAL, CKPT_PATH);
@@ -390,11 +405,10 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t_window);
 
     for (uint64_t bn = start_block; bn <= end_block; bn++) {
-        /* Graceful shutdown */
-        if (g_shutdown) {
-            printf("\nSIGINT received — saving checkpoint\n");
-            sync_checkpoint(sync);
-            break;
+        /* Graceful shutdown: finish current batch, checkpoint at next boundary */
+        if (g_shutdown && !g_shutdown_pending) {
+            g_shutdown_pending = true;
+            printf("\nSIGINT received — finishing batch to next checkpoint...\n");
         }
 
         if (!archive_ensure(&archive, bn, follow_mode, era1_dir))
@@ -455,6 +469,186 @@ int main(int argc, char **argv) {
         }
 #endif
 
+        /* Dump prestate for this block (two-pass) */
+        if (bn == dump_prestate_block) {
+            evm_state_t *es = sync_get_state(sync);
+
+            /* Pass 1: Collect all accessed addresses and storage keys */
+            #define MAX_ADDRS  8192
+            #define MAX_SLOTS  65536
+            address_t *addrs = malloc(MAX_ADDRS * sizeof(address_t));
+            size_t n_addrs = evm_state_collect_addresses(es, addrs, MAX_ADDRS);
+            printf("Prestate: collected %zu addresses from cache\n", n_addrs);
+
+            /* Collect storage keys per address */
+            typedef struct { address_t addr; uint256_t *keys; size_t count; } addr_slots_t;
+            addr_slots_t *addr_slots = malloc(n_addrs * sizeof(addr_slots_t));
+            uint256_t *slot_buf = malloc(MAX_SLOTS * sizeof(uint256_t));
+            size_t total_slots = 0;
+            for (size_t i = 0; i < n_addrs; i++) {
+                addr_slots[i].addr = addrs[i];
+                size_t n = evm_state_collect_storage_keys(es, &addrs[i],
+                    slot_buf + total_slots,
+                    MAX_SLOTS - total_slots);
+                addr_slots[i].keys = slot_buf + total_slots;
+                addr_slots[i].count = n;
+                total_slots += n;
+            }
+            printf("Prestate: collected %zu storage keys\n", total_slots);
+
+            /* Pass 2: Destroy sync, recreate from checkpoint (clean pre-state) */
+            sync_destroy(sync);
+            sync = sync_create(&cfg);
+            if (!sync) {
+                fprintf(stderr, "Failed to recreate sync for prestate dump\n");
+                free(addrs); free(addr_slots); free(slot_buf);
+                archive_close(&archive);
+                return 1;
+            }
+            es = sync_get_state(sync);
+
+            /* Build output path */
+            char default_path[256];
+            if (!dump_prestate_path) {
+                snprintf(default_path, sizeof(default_path), "alloc_%lu.json", bn);
+                dump_prestate_path = default_path;
+            }
+
+            /* Query each address/slot from clean state and dump as alloc.json */
+            FILE *out = fopen(dump_prestate_path, "w");
+            if (!out) {
+                fprintf(stderr, "Failed to open %s for writing\n", dump_prestate_path);
+                free(addrs); free(addr_slots); free(slot_buf);
+                break;
+            }
+
+            fprintf(out, "{\n");
+            for (size_t i = 0; i < n_addrs; i++) {
+                address_t *a = &addrs[i];
+                /* Touch the account to load it into cache */
+                bool exists = evm_state_exists(es, a);
+                uint64_t nonce = evm_state_get_nonce(es, a);
+                uint256_t balance = evm_state_get_balance(es, a);
+
+                if (i > 0) fprintf(out, ",\n");
+                fprintf(out, "  \"0x");
+                for (int j = 0; j < 20; j++) fprintf(out, "%02x", a->bytes[j]);
+                fprintf(out, "\": {\n");
+
+                /* Balance */
+                uint8_t bal[32]; uint256_to_bytes(&balance, bal);
+                fprintf(out, "    \"balance\": \"0x");
+                int s = 0; while (s < 31 && bal[s] == 0) s++;
+                for (int j = s; j < 32; j++) fprintf(out, "%02x", bal[j]);
+                fprintf(out, "\",\n");
+
+                /* Nonce */
+                fprintf(out, "    \"nonce\": \"0x%lx\"", nonce);
+
+                /* Code */
+                uint32_t code_size = evm_state_get_code_size(es, a);
+                if (code_size > 0) {
+                    const uint8_t *code = evm_state_get_code_ptr(es, a, &code_size);
+                    if (code && code_size > 0) {
+                        fprintf(out, ",\n    \"code\": \"0x");
+                        for (uint32_t c = 0; c < code_size; c++)
+                            fprintf(out, "%02x", code[c]);
+                        fprintf(out, "\"");
+                    }
+                }
+
+                /* Storage */
+                if (addr_slots[i].count > 0) {
+                    fprintf(stderr, "  dumping %zu slots for 0x", addr_slots[i].count);
+                    for (int j = 0; j < 20; j++) fprintf(stderr, "%02x", a->bytes[j]);
+                    fprintf(stderr, "\n");
+                    fprintf(out, ",\n    \"storage\": {");
+                    bool first_slot = true;
+                    size_t zero_count = 0;
+                    for (size_t si = 0; si < addr_slots[i].count; si++) {
+                        uint256_t val = evm_state_get_storage(es, a, &addr_slots[i].keys[si]);
+                        if (uint256_is_zero(&val)) { zero_count++; continue; }
+                        if (!first_slot) fprintf(out, ",");
+                        first_slot = false;
+                        uint8_t kbe[32], vbe[32];
+                        uint256_to_bytes(&addr_slots[i].keys[si], kbe);
+                        uint256_to_bytes(&val, vbe);
+                        fprintf(out, "\n      \"0x");
+                        for (int j = 0; j < 32; j++) fprintf(out, "%02x", kbe[j]);
+                        fprintf(out, "\": \"0x");
+                        for (int j = 0; j < 32; j++) fprintf(out, "%02x", vbe[j]);
+                        fprintf(out, "\"");
+                    }
+                    fprintf(out, "\n    }");
+                    if (zero_count > 0)
+                        fprintf(stderr, "    %zu slots returned zero\n", zero_count);
+                }
+
+                fprintf(out, "\n  }");
+                (void)exists;
+            }
+            fprintf(out, "\n}\n");
+            fclose(out);
+
+            printf("Prestate dumped to %s (%zu accounts, %zu storage keys)\n",
+                   dump_prestate_path, n_addrs, total_slots);
+
+            /* Write env.json with blockHashes for BLOCKHASH opcode support */
+            {
+                /* Derive env path from alloc path (same directory) */
+                char env_path[512];
+                const char *last_slash = strrchr(dump_prestate_path, '/');
+                if (last_slash) {
+                    size_t dir_len = (size_t)(last_slash - dump_prestate_path);
+                    snprintf(env_path, sizeof(env_path), "%.*s/env.json",
+                             (int)dir_len, dump_prestate_path);
+                } else {
+                    snprintf(env_path, sizeof(env_path), "env.json");
+                }
+
+                FILE *ef = fopen(env_path, "w");
+                if (ef) {
+                    fprintf(ef, "{\n");
+                    fprintf(ef, "  \"currentCoinbase\": \"0x");
+                    for (int j = 0; j < 20; j++) fprintf(ef, "%02x", header.coinbase.bytes[j]);
+                    fprintf(ef, "\",\n");
+                    fprintf(ef, "  \"currentDifficulty\": \"0x%lx\",\n",
+                            uint256_to_uint64(&header.difficulty));
+                    fprintf(ef, "  \"currentGasLimit\": \"0x%lx\",\n", header.gas_limit);
+                    fprintf(ef, "  \"currentNumber\": \"0x%lx\",\n", header.number);
+                    fprintf(ef, "  \"currentTimestamp\": \"0x%lx\",\n", header.timestamp);
+                    fprintf(ef, "  \"parentHash\": \"0x");
+                    for (int j = 0; j < 32; j++) fprintf(ef, "%02x", header.parent_hash.bytes[j]);
+                    fprintf(ef, "\",\n");
+                    fprintf(ef, "  \"blockHashes\": {\n");
+                    bool first_bh = true;
+                    uint64_t start_bh = bn > 256 ? bn - 256 : 1;
+                    for (uint64_t bh_num = start_bh; bh_num < bn; bh_num++) {
+                        hash_t bh;
+                        if (sync_get_block_hash(sync, bh_num, &bh)) {
+                            if (!first_bh) fprintf(ef, ",\n");
+                            first_bh = false;
+                            fprintf(ef, "    \"%lu\": \"0x", bh_num);
+                            for (int j = 0; j < 32; j++) fprintf(ef, "%02x", bh.bytes[j]);
+                            fprintf(ef, "\"");
+                        }
+                    }
+                    fprintf(ef, "\n  }\n}\n");
+                    fclose(ef);
+                    printf("Environment dumped to %s (with %lu block hashes)\n",
+                           env_path, bn - start_bh);
+                }
+            }
+
+            free(addrs);
+            free(addr_slots);
+            free(slot_buf);
+            block_body_free(&body);
+            free(hdr_rlp);
+            free(body_rlp);
+            break;  /* done — exit main loop */
+        }
+
         window_txs += result.tx_count;
         window_gas += result.gas_used;
 
@@ -505,6 +699,16 @@ int main(int argc, char **argv) {
             window_txs = 0;
             window_gas = 0;
             clock_gettime(CLOCK_MONOTONIC, &t_window);
+        }
+
+        /* SIGINT: exit after validated checkpoint */
+        if (g_shutdown_pending && result.ok &&
+            bn % CHECKPOINT_INTERVAL == 0) {
+            printf("Checkpoint validated at block %lu — exiting.\n", bn);
+            block_body_free(&body);
+            free(hdr_rlp);
+            free(body_rlp);
+            break;
         }
 
         bool block_ok = result.ok;

@@ -357,4 +357,23 @@ void evm_state_debug_dump(evm_state_t *es);
 void evm_state_dump_mpt(evm_state_t *es, const char *path);
 #endif
 
+/**
+ * Dump all cached accounts and storage as a geth-compatible alloc.json.
+ * Writes to the given path. Only dumps accounts that existed.
+ */
+void evm_state_dump_alloc_json(evm_state_t *es, const char *path);
+
+/**
+ * Collect all cached account addresses into a flat array.
+ * Returns number of addresses written. Caller provides buffer.
+ */
+size_t evm_state_collect_addresses(evm_state_t *es, address_t *out, size_t max_count);
+
+/**
+ * Collect all cached storage slot keys for a given address.
+ * Writes uint256_t slot keys to out. Returns count.
+ */
+size_t evm_state_collect_storage_keys(evm_state_t *es, const address_t *addr,
+                                       uint256_t *out, size_t max_count);
+
 #endif // EVM_STATE_H

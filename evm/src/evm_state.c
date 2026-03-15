@@ -2183,6 +2183,182 @@ void evm_state_dump_mpt(evm_state_t *es, const char *path) {
 }
 #endif /* ENABLE_DEBUG */
 
+// ============================================================================
+// JSON alloc dump (geth t8n compatible)
+// ============================================================================
+
+typedef struct {
+    FILE *f;
+    mem_art_t *storage;
+    bool first_account;
+} alloc_json_ctx_t;
+
+// Collect storage slots for a specific address
+typedef struct {
+    FILE *f;
+    const uint8_t *addr;  // 20-byte address to match
+    bool first_slot;
+} alloc_storage_ctx_t;
+
+static bool alloc_storage_cb(const uint8_t *key, size_t key_len,
+                              const void *value, size_t value_len,
+                              void *user_data) {
+    (void)key_len; (void)value_len;
+    alloc_storage_ctx_t *ctx = (alloc_storage_ctx_t *)user_data;
+    const cached_slot_t *cs = (const cached_slot_t *)value;
+
+    // key[0..19] = address, key[20..51] = slot
+    if (memcmp(key, ctx->addr, 20) != 0) return true;
+    if (uint256_is_zero(&cs->current)) return true;
+
+    if (!ctx->first_slot) fprintf(ctx->f, ",\n");
+    ctx->first_slot = false;
+
+    // slot key (big-endian 32 bytes)
+    fprintf(ctx->f, "        \"0x");
+    for (int i = 20; i < 52; i++) fprintf(ctx->f, "%02x", key[i]);
+    fprintf(ctx->f, "\": \"0x");
+
+    uint8_t vbe[32];
+    uint256_to_bytes(&cs->current, vbe);
+    for (int i = 0; i < 32; i++) fprintf(ctx->f, "%02x", vbe[i]);
+    fprintf(ctx->f, "\"");
+
+    return true;
+}
+
+static bool alloc_account_cb(const uint8_t *key, size_t key_len,
+                               const void *value, size_t value_len,
+                               void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    alloc_json_ctx_t *ctx = (alloc_json_ctx_t *)user_data;
+    const cached_account_t *ca = (const cached_account_t *)value;
+
+    if (!ca->existed) return true;
+
+    if (!ctx->first_account) fprintf(ctx->f, ",\n");
+    ctx->first_account = false;
+
+    // Address
+    fprintf(ctx->f, "  \"0x");
+    for (int i = 0; i < 20; i++) fprintf(ctx->f, "%02x", ca->addr.bytes[i]);
+    fprintf(ctx->f, "\": {\n");
+
+    // Balance
+    uint8_t bal[32];
+    uint256_to_bytes(&ca->balance, bal);
+    fprintf(ctx->f, "    \"balance\": \"0x");
+    int s = 0; while (s < 31 && bal[s] == 0) s++;
+    for (int i = s; i < 32; i++) fprintf(ctx->f, "%02x", bal[i]);
+    fprintf(ctx->f, "\",\n");
+
+    // Nonce
+    fprintf(ctx->f, "    \"nonce\": \"0x%lx\"", ca->nonce);
+
+    // Code
+    if (ca->has_code && ca->code && ca->code_size > 0) {
+        fprintf(ctx->f, ",\n    \"code\": \"0x");
+        for (uint32_t i = 0; i < ca->code_size; i++)
+            fprintf(ctx->f, "%02x", ca->code[i]);
+        fprintf(ctx->f, "\"");
+    }
+
+    // Storage
+    alloc_storage_ctx_t sctx = {
+        .f = ctx->f,
+        .addr = ca->addr.bytes,
+        .first_slot = true,
+    };
+    // Pre-scan to check if any storage exists for this address
+    // (writes slots directly if found)
+    fprintf(ctx->f, ",\n    \"storage\": {");
+    mem_art_foreach(ctx->storage, alloc_storage_cb, &sctx);
+    if (!sctx.first_slot)
+        fprintf(ctx->f, "\n    ");
+    fprintf(ctx->f, "}\n  }");
+
+    return true;
+}
+
+void evm_state_dump_alloc_json(evm_state_t *es, const char *path) {
+    if (!es || !path) return;
+    FILE *f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "Failed to open %s\n", path); return; }
+    alloc_json_ctx_t ctx = {
+        .f = f,
+        .storage = &es->storage,
+        .first_account = true,
+    };
+    fprintf(f, "{\n");
+    mem_art_foreach(&es->accounts, alloc_account_cb, &ctx);
+    fprintf(f, "\n}\n");
+    fclose(f);
+}
+
+// ============================================================================
+// Address/slot collection for prestate dump
+// ============================================================================
+
+typedef struct {
+    address_t *out;
+    size_t count;
+    size_t max;
+} collect_addr_ctx_t;
+
+static bool collect_addr_cb(const uint8_t *key, size_t key_len,
+                              const void *value, size_t value_len,
+                              void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    collect_addr_ctx_t *ctx = (collect_addr_ctx_t *)user_data;
+    const cached_account_t *ca = (const cached_account_t *)value;
+    /* Only collect accounts that existed or were touched */
+    if (!ca->existed && !ca->dirty && !ca->block_dirty && !ca->created)
+        return true;
+    if (ctx->count >= ctx->max) return false;  /* buffer full */
+    memcpy(ctx->out[ctx->count].bytes, ca->addr.bytes, 20);
+    ctx->count++;
+    return true;
+}
+
+size_t evm_state_collect_addresses(evm_state_t *es, address_t *out, size_t max_count) {
+    if (!es || !out || max_count == 0) return 0;
+    collect_addr_ctx_t ctx = { .out = out, .count = 0, .max = max_count };
+    mem_art_foreach(&es->accounts, collect_addr_cb, &ctx);
+    return ctx.count;
+}
+
+typedef struct {
+    const uint8_t *addr;
+    uint256_t *out;
+    size_t count;
+    size_t max;
+} collect_slots_ctx_t;
+
+static bool collect_slots_cb(const uint8_t *key, size_t key_len,
+                               const void *value, size_t value_len,
+                               void *user_data) {
+    (void)key_len; (void)value_len;
+    collect_slots_ctx_t *ctx = (collect_slots_ctx_t *)user_data;
+    /* key[0..19] = address, key[20..51] = slot (big-endian) */
+    if (memcmp(key, ctx->addr, 20) != 0) return true;
+    const cached_slot_t *cs = (const cached_slot_t *)value;
+    /* Include slots that were accessed (even if zero now — they might have been non-zero before) */
+    if (ctx->count >= ctx->max) return false;
+    ctx->out[ctx->count] = uint256_from_bytes(key + 20, 32);
+    ctx->count++;
+    return true;
+}
+
+size_t evm_state_collect_storage_keys(evm_state_t *es, const address_t *addr,
+                                       uint256_t *out, size_t max_count) {
+    if (!es || !addr || !out || max_count == 0) return 0;
+    collect_slots_ctx_t ctx = {
+        .addr = addr->bytes, .out = out, .count = 0, .max = max_count
+    };
+    mem_art_foreach(&es->storage, collect_slots_cb, &ctx);
+    return ctx.count;
+}
+
 // Compute storage roots incrementally using shared storage mpt_store.
 // Iterates the dirty_slots list (O(dirty)) instead of scanning all cached slots.
 static void compute_all_storage_roots(evm_state_t *es) {
@@ -2246,11 +2422,12 @@ static void compute_all_storage_roots(evm_state_t *es) {
         }
 
         for (size_t j = start; j < i; j++) {
-            if (sv.entries[j].value_len == 0)
+            if (sv.entries[j].value_len == 0) {
                 mpt_store_delete(es->storage_mpt, sv.entries[j].slot_hash);
-            else
+            } else {
                 mpt_store_update(es->storage_mpt, sv.entries[j].slot_hash,
                                  sv.entries[j].value_rlp, sv.entries[j].value_len);
+            }
         }
 
         if (!mpt_store_commit_batch(es->storage_mpt)) {
