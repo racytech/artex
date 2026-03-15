@@ -318,6 +318,44 @@ disk_hash_t *disk_hash_open(const char *path) {
     return dh;
 }
 
+disk_hash_t *disk_hash_open_norecovery(const char *path) {
+    if (!path) return NULL;
+
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return NULL;
+
+    disk_hash_header_t hdr;
+    if (!read_header(fd, &hdr)) { close(fd); return NULL; }
+
+    if (hdr.magic != DISK_HASH_MAGIC || hdr.version != DISK_HASH_VERSION) {
+        close(fd);
+        return NULL;
+    }
+
+    uint32_t slot_size = 1 + hdr.key_size + hdr.record_size;
+    uint32_t expected_spb = (PAGE_SIZE - BUCKET_HEADER_SIZE) / slot_size;
+    if (hdr.slots_per_bucket != expected_spb) {
+        close(fd);
+        return NULL;
+    }
+
+    disk_hash_t *dh = calloc(1, sizeof(*dh));
+    if (!dh) { close(fd); return NULL; }
+
+    dh->fd               = fd;
+    dh->key_size         = hdr.key_size;
+    dh->record_size      = hdr.record_size;
+    dh->slot_size        = slot_size;
+    dh->slots_per_bucket = hdr.slots_per_bucket;
+    dh->bucket_count     = hdr.bucket_count;
+    dh->entry_count      = hdr.entry_count;
+    dh->overflow_count   = hdr.overflow_count;
+    dh->dirty            = false;  /* skip recovery — caller accepts stale metadata */
+    pthread_rwlock_init(&dh->rwlock, NULL);
+
+    return dh;
+}
+
 void disk_hash_destroy(disk_hash_t *dh) {
     if (!dh) return;
     pthread_rwlock_destroy(&dh->rwlock);
@@ -708,4 +746,14 @@ void disk_hash_sync(disk_hash_t *dh) {
     write_header(dh);
     fdatasync(dh->fd);
     pthread_rwlock_unlock(&dh->rwlock);
+}
+
+void disk_hash_refresh(disk_hash_t *dh) {
+    if (!dh) return;
+    disk_hash_header_t hdr;
+    if (read_header(dh->fd, &hdr)) {
+        dh->entry_count    = hdr.entry_count;
+        dh->overflow_count = hdr.overflow_count;
+        dh->dirty          = false;
+    }
 }

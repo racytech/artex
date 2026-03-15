@@ -104,6 +104,19 @@ void evm_state_discard_pending(evm_state_t *es);
 void evm_state_flush(evm_state_t *es);
 
 /**
+ * Background-safe flush. Uses separate disk_hash instances.
+ * Call from background thread. Follow with evm_state_flush_complete()
+ * from main thread after join.
+ */
+void evm_state_flush_bg(evm_state_t *es);
+
+/**
+ * Finalize after background flush. Free deferred buffers and refresh metadata.
+ * Call from main thread after background flush thread has joined.
+ */
+void evm_state_flush_complete(evm_state_t *es);
+
+/**
  * Enable/disable batch mode. In batch mode, per-block verkle flush
  * is skipped — block_dirty flags accumulate across blocks.
  * Call evm_state_flush_verkle() at checkpoint time to flush.

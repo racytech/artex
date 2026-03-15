@@ -82,6 +82,21 @@ void mpt_store_flush(mpt_store_t *ms);
  */
 void mpt_store_flush_ex(mpt_store_t *ms, bool do_sync);
 
+/**
+ * Background-safe flush. Opens a separate disk_hash instance on the same
+ * .idx file so the executor's disk_hash reads are never blocked.
+ * Does NOT free the deferred buffer — call mpt_store_flush_complete()
+ * from the main thread after the background thread joins.
+ */
+void mpt_store_flush_bg(mpt_store_t *ms);
+
+/**
+ * Finalize after background flush: free deferred buffers and refresh
+ * the executor's disk_hash metadata from disk. Must be called from the
+ * main thread after the background flush thread has joined.
+ */
+void mpt_store_flush_complete(mpt_store_t *ms);
+
 /* =========================================================================
  * Trie Root
  * ========================================================================= */

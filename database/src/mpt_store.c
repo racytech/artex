@@ -1665,6 +1665,123 @@ void mpt_store_flush(mpt_store_t *ms) {
 }
 
 /* =========================================================================
+ * Background flush — uses separate disk_hash to avoid rwlock contention
+ * ========================================================================= */
+
+void mpt_store_flush_bg(mpt_store_t *ms) {
+    if (!ms) return;
+
+    /* 1. Collect live entries and sort by offset for sequential I/O */
+    size_t live = 0;
+    size_t total_rlp_bytes = 0;
+    for (size_t i = 0; i < ms->def_count; i++) {
+        if (ms->def_entries[i].rlp) {
+            live++;
+            total_rlp_bytes += ms->def_entries[i].rlp_len;
+        }
+    }
+
+    /* Nothing to flush — skip expensive disk_hash_open */
+    if (live == 0 && ms->def_del_count == 0)
+        return;
+
+    deferred_entry_t **sorted = NULL;
+    if (live > 0) {
+        sorted = malloc(live * sizeof(*sorted));
+        if (sorted) {
+            size_t j = 0;
+            for (size_t i = 0; i < ms->def_count; i++)
+                if (ms->def_entries[i].rlp)
+                    sorted[j++] = &ms->def_entries[i];
+            qsort(sorted, live, sizeof(*sorted), def_offset_cmp);
+        }
+    }
+
+    /* 2. Open a separate disk_hash instance on the same .idx file.
+     *    This gives us an independent rwlock — zero contention with executor.
+     *    Use norecovery — we don't need accurate entry_count, just put/delete. */
+    disk_hash_t *flush_dh = disk_hash_open_norecovery(ms->idx_path);
+    if (!flush_dh) {
+        fprintf(stderr, "mpt_store_flush_bg: failed to open flush disk_hash, "
+                "falling back to synchronous flush\n");
+        free(sorted);
+        mpt_store_flush_ex(ms, true);
+        return;
+    }
+
+    /* 3. pwrite node data to .dat (sequential offsets) */
+    struct timespec _pw0, _pw1, _pw2;
+    clock_gettime(CLOCK_MONOTONIC, &_pw0);
+    size_t n = sorted ? live : ms->def_count;
+    for (size_t i = 0; i < n; i++) {
+        deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
+        if (!e->rlp) continue;
+        pwrite(ms->data_fd, e->rlp, e->rlp_len,
+               (off_t)(PAGE_SIZE + e->offset));
+    }
+
+    /* 4. disk_hash_put on flush_dh (not ms->index) */
+    clock_gettime(CLOCK_MONOTONIC, &_pw1);
+    for (size_t i = 0; i < n; i++) {
+        deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
+        if (!e->rlp) continue;
+        node_record_t rec = { .offset = e->offset,
+                              .length = e->rlp_len,
+                              .refcount = e->refcount };
+        disk_hash_put(flush_dh, e->hash, &rec);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &_pw2);
+    free(sorted);
+
+    /* 5. Apply pending deletes via flush_dh */
+    for (size_t i = 0; i < ms->def_del_count; i++) {
+        node_record_t rec;
+        if (disk_hash_get(flush_dh, ms->def_deletes[i].hash, &rec)) {
+            if (rec.refcount > 1) {
+                rec.refcount--;
+                disk_hash_put(flush_dh, ms->def_deletes[i].hash, &rec);
+            } else {
+                if (ms->live_bytes >= rec.length)
+                    ms->live_bytes -= rec.length;
+                int sc = size_class_for(rec.length);
+                free_list_push(&ms->free_lists[sc], rec.offset);
+                ms->free_slot_bytes += SIZE_CLASSES[sc];
+                disk_hash_delete(flush_dh, ms->def_deletes[i].hash);
+            }
+        }
+    }
+
+    /* 6. fdatasync + sync */
+    struct timespec _fs0, _fs1;
+    clock_gettime(CLOCK_MONOTONIC, &_fs0);
+    write_header(ms->data_fd, ms);
+    fdatasync(ms->data_fd);
+    disk_hash_sync(flush_dh);
+    clock_gettime(CLOCK_MONOTONIC, &_fs1);
+    disk_hash_destroy(flush_dh);
+
+    double _pw_ms = (_pw1.tv_sec - _pw0.tv_sec) * 1000.0 +
+                    (_pw1.tv_nsec - _pw0.tv_nsec) / 1e6;
+    double _dh_ms = (_pw2.tv_sec - _pw1.tv_sec) * 1000.0 +
+                    (_pw2.tv_nsec - _pw1.tv_nsec) / 1e6;
+    double _fs_ms = (_fs1.tv_sec - _fs0.tv_sec) * 1000.0 +
+                    (_fs1.tv_nsec - _fs0.tv_nsec) / 1e6;
+    if (live > 100)
+        fprintf(stderr, "  └ mpt_flush_bg: %zu writes (%zuKB), %zu deletes | "
+                "pwrite=%.1f ms  idx=%.1f ms  fsync=%.1f ms\n",
+                live, total_rlp_bytes / 1024, ms->def_del_count,
+                _pw_ms, _dh_ms, _fs_ms);
+}
+
+void mpt_store_flush_complete(mpt_store_t *ms) {
+    if (!ms) return;
+    /* Free deferred buffers — safe, called from main thread after bg join */
+    def_free_all(ms);
+    /* Refresh executor's disk_hash metadata from disk */
+    disk_hash_refresh(ms->index);
+}
+
+/* =========================================================================
  * Root hash
  * ========================================================================= */
 

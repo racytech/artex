@@ -39,6 +39,10 @@
 #include <sys/stat.h>
 #include <stddef.h>
 #include <time.h>
+#include <pthread.h>
+
+/* Forward declarations */
+static void sync_wait_flush(sync_t *sync);
 
 // ============================================================================
 // Constants
@@ -100,6 +104,10 @@ struct sync {
 #ifdef ENABLE_HISTORY
     state_history_t *history;
 #endif
+
+    /* Background flush thread */
+    pthread_t       flush_thread;
+    bool            flush_thread_active;
 };
 
 // ============================================================================
@@ -417,6 +425,9 @@ fail:
 void sync_destroy(sync_t *sync) {
     if (!sync) return;
 
+    /* Wait for any in-flight background flush to complete */
+    sync_wait_flush(sync);
+
     /* Do NOT save a final checkpoint for unsaved progress.
      * Only auto-checkpoints (with validated MPT roots) are trustworthy.
      * SIGINT or end-of-run should preserve the last validated checkpoint. */
@@ -596,7 +607,12 @@ bool sync_execute_block(sync_t *sync,
         sync->config.checkpoint_interval > 0 &&
         sync->blocks_fail == 0 &&
         bn % sync->config.checkpoint_interval == 0) {
-        struct timespec t_start, t_end, t_root, t_flush, t_ckpt;
+        struct timespec t_start, t_end, t_root;
+
+        /* Wait for previous background flush to complete before root computation.
+         * Normally instant since flush (6.8s) finishes during execution (15.3s). */
+        sync_wait_flush(sync);
+
         clock_gettime(CLOCK_MONOTONIC, &t_start);
 #ifdef ENABLE_MPT
         /* Validate MPT root at checkpoint boundary */
@@ -621,7 +637,7 @@ bool sync_execute_block(sync_t *sync,
         double ckpt_ms = (t_end.tv_sec - t_root.tv_sec) * 1000.0 +
                          (t_end.tv_nsec - t_root.tv_nsec) / 1e6;
         double total_ms = root_ms + ckpt_ms;
-        fprintf(stderr, "checkpoint block=%lu  root=%.1f ms  flush+save=%.1f ms  total=%.1f ms\n",
+        fprintf(stderr, "checkpoint block=%lu  root=%.1f ms  spawn=%.1f ms  total=%.1f ms\n",
                 bn, root_ms, ckpt_ms, total_ms);
     }
 
@@ -723,6 +739,62 @@ struct evm *sync_get_evm(const sync_t *sync) {
 }
 
 // ============================================================================
+// Background Flush
+// ============================================================================
+
+typedef struct {
+    evm_state_t  *state;
+    const char   *checkpoint_path;
+    uint64_t      block_number;
+    hash_t        block_hashes[BLOCK_HASH_WINDOW];
+    uint64_t      total_gas;
+    uint64_t      blocks_ok;
+    uint64_t      blocks_fail;
+} flush_ctx_t;
+
+static void *flush_thread_fn(void *arg) {
+    flush_ctx_t *ctx = (flush_ctx_t *)arg;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    /* Flush MPT stores using separate disk_hash instances */
+    evm_state_flush_bg(ctx->state);
+
+    /* Save checkpoint marker */
+    if (ctx->checkpoint_path) {
+        checkpoint_save_internal(ctx->checkpoint_path,
+                                 ctx->block_number, ctx->block_hashes,
+                                 ctx->total_gas, ctx->blocks_ok,
+                                 ctx->blocks_fail);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    fprintf(stderr, "  └ bg_flush=%.1f ms\n", ms);
+
+    free(ctx);
+    return NULL;
+}
+
+static void sync_wait_flush(sync_t *sync) {
+    if (!sync->flush_thread_active) return;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    pthread_join(sync->flush_thread, NULL);
+    sync->flush_thread_active = false;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double wait_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                     (t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    /* Finalize: free deferred buffers + refresh disk_hash metadata */
+    evm_state_flush_complete(sync->state);
+
+    if (wait_ms > 1.0)
+        fprintf(stderr, "  └ flush_join=%.1f ms\n", wait_ms);
+}
+
+// ============================================================================
 // Checkpoint
 // ============================================================================
 
@@ -740,46 +812,71 @@ bool sync_checkpoint(sync_t *sync) {
     }
 #endif
 
-    /* Flush accumulated dirty state to backing stores */
-    struct timespec tf0, tf1, tf2, tf3;
-    clock_gettime(CLOCK_MONOTONIC, &tf0);
+    /* Flush verkle synchronously (fast, executor needs consistent state) */
 #ifdef ENABLE_VERKLE
     evm_state_flush_verkle(sync->state);
     if (sync->vs) verkle_state_sync(sync->vs);
 #endif
-#ifdef ENABLE_MPT
-    evm_state_flush(sync->state);
-    if (sync->cs) code_store_flush(sync->cs);
-#endif
-    clock_gettime(CLOCK_MONOTONIC, &tf1);
-
-    /* Write checkpoint marker — the commit point */
-    bool ok = checkpoint_save_internal(sync->config.checkpoint_path,
-                                       sync->last_block, sync->block_hashes,
-                                       sync->total_gas, sync->blocks_ok,
-                                       sync->blocks_fail);
-    if (ok) sync->last_checkpoint_block = sync->last_block;
 
     /* Snapshot stats before eviction clears the cache */
     sync->last_stats = evm_state_get_stats(sync->state);
 
-    /* Evict cache to bound memory — data is on disk, read-through reloads */
-    clock_gettime(CLOCK_MONOTONIC, &tf2);
+    /* Evict cache — root computation captured all dirty data into MPT
+     * deferred buffer, verkle flush wrote dirty state to backing store.
+     * Safe to drop cached entries now; read-through will reload on demand. */
 #ifdef ENABLE_DEBUG
     if (!sync->config.no_evict)
 #endif
         evm_state_evict_cache(sync->state);
-    clock_gettime(CLOCK_MONOTONIC, &tf3);
-    double flush_ms = (tf1.tv_sec - tf0.tv_sec) * 1000.0 +
-                      (tf1.tv_nsec - tf0.tv_nsec) / 1e6;
-    double evict_ms = (tf3.tv_sec - tf2.tv_sec) * 1000.0 +
-                      (tf3.tv_nsec - tf2.tv_nsec) / 1e6;
-    fprintf(stderr, "  └ flush=%.1f ms  evict=%.1f ms\n", flush_ms, evict_ms);
+
+    /* Advance checkpoint block — root is validated, flush will persist it */
+    sync->last_checkpoint_block = sync->last_block;
+
+#ifdef ENABLE_MPT
+    /* Spawn background flush thread — MPT flush + code_store + checkpoint save.
+     * Executor continues immediately with next batch. */
+    flush_ctx_t *ctx = malloc(sizeof(*ctx));
+    /* Flush code store synchronously — it shares locks with executor */
+    if (sync->cs) code_store_flush(sync->cs);
+
+    if (ctx) {
+        ctx->state           = sync->state;
+        ctx->checkpoint_path = sync->config.checkpoint_path;
+        ctx->block_number    = sync->last_block;
+        memcpy(ctx->block_hashes, sync->block_hashes, sizeof(sync->block_hashes));
+        ctx->total_gas       = sync->total_gas;
+        ctx->blocks_ok       = sync->blocks_ok;
+        ctx->blocks_fail     = sync->blocks_fail;
+
+        if (pthread_create(&sync->flush_thread, NULL, flush_thread_fn, ctx) == 0) {
+            sync->flush_thread_active = true;
+        } else {
+            /* Thread creation failed — fall back to synchronous flush */
+            fprintf(stderr, "WARNING: bg flush thread creation failed, "
+                    "falling back to synchronous\n");
+            free(ctx);
+            evm_state_flush(sync->state);
+            if (sync->cs) code_store_flush(sync->cs);
+            checkpoint_save_internal(sync->config.checkpoint_path,
+                                     sync->last_block, sync->block_hashes,
+                                     sync->total_gas, sync->blocks_ok,
+                                     sync->blocks_fail);
+            evm_state_evict_cache(sync->state);
+        }
+    } else {
+        /* malloc failed — synchronous fallback */
+        evm_state_flush(sync->state);
+        if (sync->cs) code_store_flush(sync->cs);
+        evm_state_evict_cache(sync->state);
+    }
+#else
+    evm_state_evict_cache(sync->state);
+#endif
 
     /* Reset for next batch */
     sync->batch_root_computed = false;
 
-    return ok;
+    return true;
 }
 
 uint64_t sync_resumed_from(const sync_t *sync) {

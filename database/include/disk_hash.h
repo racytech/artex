@@ -60,6 +60,13 @@ disk_hash_t *disk_hash_create(const char *path, uint32_t key_size,
 disk_hash_t *disk_hash_open(const char *path);
 
 /**
+ * Open without recovery scan. Accepts potentially stale metadata
+ * (entry_count/overflow_count). Use for background flush where only
+ * put/delete/sync are needed and accurate counts don't matter.
+ */
+disk_hash_t *disk_hash_open_norecovery(const char *path);
+
+/**
  * Close file descriptor, free the struct.
  * Does NOT remove the file.
  */
@@ -147,5 +154,11 @@ uint64_t disk_hash_capacity(const disk_hash_t *dh);
  * Write header (entry_count, overflow_count) and fsync the file.
  */
 void disk_hash_sync(disk_hash_t *dh);
+
+/**
+ * Re-read header from disk to refresh in-memory metadata.
+ * Use after another disk_hash instance has written to the same file.
+ */
+void disk_hash_refresh(disk_hash_t *dh);
 
 #endif /* DISK_HASH_H */

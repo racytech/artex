@@ -581,6 +581,31 @@ void evm_state_flush(evm_state_t *es) {
 #endif
 }
 
+void evm_state_flush_bg(evm_state_t *es) {
+    if (!es) return;
+#ifdef ENABLE_MPT
+    struct timespec _t0, _t1, _t2;
+    clock_gettime(CLOCK_MONOTONIC, &_t0);
+    if (es->account_mpt) mpt_store_flush_bg(es->account_mpt);
+    clock_gettime(CLOCK_MONOTONIC, &_t1);
+    if (es->storage_mpt) mpt_store_flush_bg(es->storage_mpt);
+    clock_gettime(CLOCK_MONOTONIC, &_t2);
+    double acct_ms = (_t1.tv_sec - _t0.tv_sec) * 1000.0 +
+                     (_t1.tv_nsec - _t0.tv_nsec) / 1e6;
+    double stor_ms = (_t2.tv_sec - _t1.tv_sec) * 1000.0 +
+                     (_t2.tv_nsec - _t1.tv_nsec) / 1e6;
+    fprintf(stderr, "  └ flush_bg: acct=%.1f ms  stor=%.1f ms\n", acct_ms, stor_ms);
+#endif
+}
+
+void evm_state_flush_complete(evm_state_t *es) {
+    if (!es) return;
+#ifdef ENABLE_MPT
+    if (es->account_mpt) mpt_store_flush_complete(es->account_mpt);
+    if (es->storage_mpt) mpt_store_flush_complete(es->storage_mpt);
+#endif
+}
+
 
 void evm_state_set_batch_mode(evm_state_t *es, bool enabled) {
     if (es) es->batch_mode = enabled;
