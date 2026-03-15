@@ -89,7 +89,7 @@ typedef struct {
         struct { uint64_t val; bool dirty; bool block_dirty; } nonce;
         struct { uint256_t val; bool dirty; bool block_dirty; } balance;
         struct { hash_t old_hash; bool old_has_code; uint8_t *old_code; uint32_t old_code_size; } code;
-        struct { uint256_t slot; uint256_t old_value; } storage;
+        struct { uint256_t slot; uint256_t old_value; bool old_mpt_dirty; } storage;
         uint256_t slot;             // WARM_SLOT
         bool old_self_destructed;   // JOURNAL_SELF_DESTRUCT
         struct {                    // JOURNAL_ACCOUNT_CREATE: saved pre-create state
@@ -1015,7 +1015,8 @@ void evm_state_set_storage(evm_state_t *es, const address_t *addr,
         .addr = *addr,
         .data.storage = {
             .slot = *key,
-            .old_value = cs->current
+            .old_value = cs->current,
+            .old_mpt_dirty = cs->mpt_dirty
         }
     };
     journal_push(es, &je);
@@ -1457,6 +1458,7 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
             if (cs) {
                 cs->current = je->data.storage.old_value;
                 cs->dirty = !uint256_is_equal(&cs->current, &cs->original);
+                cs->mpt_dirty = je->data.storage.old_mpt_dirty;
             }
             break;
         }
