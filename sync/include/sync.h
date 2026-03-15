@@ -181,6 +181,12 @@ bool sync_checkpoint(sync_t *sync);
 /** Returns the block number from which we resumed (0 if fresh start). */
 uint64_t sync_resumed_from(const sync_t *sync);
 
+/**
+ * Get a block hash from the 256-entry ring buffer.
+ * Returns true if the block number is within the window, false otherwise.
+ */
+bool sync_get_block_hash(const sync_t *sync, uint64_t block_number, hash_t *out);
+
 // ============================================================================
 // Status
 // ============================================================================

@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <stddef.h>
+#include <time.h>
 
 // ============================================================================
 // Constants
@@ -397,20 +398,14 @@ fail:
 void sync_destroy(sync_t *sync) {
     if (!sync) return;
 
-    /* Final checkpoint if we have unsaved progress.
-     * Routes through sync_checkpoint() to ensure MPT root is computed
-     * before eviction (needed for SIGINT / graceful shutdown paths). */
-    if (sync->blocks_fail == 0 &&
-        sync->last_block > sync->last_checkpoint_block &&
-        sync->config.checkpoint_path) {
-        sync_checkpoint(sync);
-        printf("Checkpoint saved at block %lu\n", sync->last_block);
-    }
+    /* Do NOT save a final checkpoint for unsaved progress.
+     * Only auto-checkpoints (with validated MPT roots) are trustworthy.
+     * SIGINT or end-of-run should preserve the last validated checkpoint. */
 
-    /* If any block failed, discard pending MPT writes to avoid corrupting
-     * the on-disk state.  The checkpoint file was already saved at the last
-     * good block, so the disk state must match that checkpoint. */
-    if (sync->blocks_fail > 0 && sync->state)
+    /* Discard pending MPT writes to avoid corrupting the on-disk state.
+     * The checkpoint file reflects the last validated boundary — any
+     * blocks executed past that are unvalidated and must not be flushed. */
+    if (sync->state && sync->last_block > sync->last_checkpoint_block)
         evm_state_discard_pending(sync->state);
 
     if (sync->evm) evm_destroy(sync->evm);
@@ -536,8 +531,9 @@ bool sync_execute_block(sync_t *sync,
      * Save the expected root from each block header — at checkpoint time
      * we validate against the last block's root. */
 #ifdef ENABLE_MPT
-    if (sync->config.validate_state_root)
+    if (sync->config.validate_state_root) {
         sync->pending_expected_root = header->state_root;
+    }
 #endif
 
 
@@ -572,7 +568,9 @@ bool sync_execute_block(sync_t *sync,
     if (result->ok &&
         sync->config.checkpoint_interval > 0 &&
         sync->blocks_fail == 0 &&
-        bn - sync->last_checkpoint_block >= sync->config.checkpoint_interval) {
+        bn % sync->config.checkpoint_interval == 0) {
+        struct timespec t_start, t_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
 #ifdef ENABLE_MPT
         /* Validate MPT root at checkpoint boundary */
         hash_t actual_root, expected_root;
@@ -589,6 +587,11 @@ bool sync_execute_block(sync_t *sync,
         }
 #endif
         sync_checkpoint(sync);
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
+        double elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000.0 +
+                            (t_end.tv_nsec - t_start.tv_nsec) / 1e6;
+        fprintf(stderr, "checkpoint block=%lu  validate+save=%.1f ms\n",
+                bn, elapsed_ms);
     }
 
     block_result_free(&br);
@@ -736,6 +739,14 @@ bool sync_checkpoint(sync_t *sync) {
 
 uint64_t sync_resumed_from(const sync_t *sync) {
     return sync ? sync->resumed_block : 0;
+}
+
+bool sync_get_block_hash(const sync_t *sync, uint64_t block_number, hash_t *out) {
+    if (!sync || !out || block_number == 0) return false;
+    if (block_number > sync->last_block) return false;
+    if (sync->last_block - block_number >= BLOCK_HASH_WINDOW) return false;
+    *out = sync->block_hashes[block_number % BLOCK_HASH_WINDOW];
+    return true;
 }
 
 // ============================================================================
