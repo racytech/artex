@@ -1068,6 +1068,21 @@ bool mem_art_insert(mem_art_t *tree, const uint8_t *key, size_t key_len,
     return true;
 }
 
+bool mem_art_insert_check(mem_art_t *tree, const uint8_t *key, size_t key_len,
+                          const void *value, size_t value_len, bool *was_new) {
+    if (!tree || !key || key_len == 0) return false;
+
+    bool inserted = false;
+    mem_ref_t new_root = insert_recursive(tree, tree->root, key, key_len, 0,
+                                          value, value_len, &inserted, NULL);
+    if (new_root == MEM_REF_NULL && tree->root != MEM_REF_NULL) return false;
+
+    tree->root = new_root;
+    if (inserted) tree->size++;
+    if (was_new) *was_new = inserted;
+    return true;
+}
+
 const void *mem_art_get(const mem_art_t *tree, const uint8_t *key,
                         size_t key_len, size_t *value_len) {
     if (!tree || !key || key_len == 0) return NULL;

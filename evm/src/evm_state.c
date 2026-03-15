@@ -1593,10 +1593,10 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
 bool evm_state_warm_address(evm_state_t *es, const address_t *addr) {
     if (!es || !addr) return false;
 
-    if (mem_art_contains(&es->warm_addrs, addr->bytes, ADDRESS_SIZE))
-        return true;
-
-    mem_art_insert(&es->warm_addrs, addr->bytes, ADDRESS_SIZE, NULL, 0);
+    bool was_new = false;
+    mem_art_insert_check(&es->warm_addrs, addr->bytes, ADDRESS_SIZE,
+                         NULL, 0, &was_new);
+    if (!was_new) return true;  // already warm
 
     journal_entry_t je = {
         .type = JOURNAL_WARM_ADDR,
@@ -1614,10 +1614,10 @@ bool evm_state_warm_slot(evm_state_t *es, const address_t *addr,
     uint8_t skey[SLOT_KEY_SIZE];
     make_slot_key(addr, key, skey);
 
-    if (mem_art_contains(&es->warm_slots, skey, SLOT_KEY_SIZE))
-        return true;
-
-    mem_art_insert(&es->warm_slots, skey, SLOT_KEY_SIZE, NULL, 0);
+    bool was_new = false;
+    mem_art_insert_check(&es->warm_slots, skey, SLOT_KEY_SIZE,
+                         NULL, 0, &was_new);
+    if (!was_new) return true;  // already warm
 
     journal_entry_t je = {
         .type = JOURNAL_WARM_SLOT,

@@ -66,6 +66,12 @@ void mem_art_destroy(mem_art_t *tree);
 bool mem_art_insert(mem_art_t *tree, const uint8_t *key, size_t key_len,
                 const void *value, size_t value_len);
 
+/** Insert and report whether the key was new (single traversal).
+ *  Returns false on allocation failure. Sets *was_new = true if inserted,
+ *  false if key already existed (value updated in place). */
+bool mem_art_insert_check(mem_art_t *tree, const uint8_t *key, size_t key_len,
+                          const void *value, size_t value_len, bool *was_new);
+
 const void *mem_art_get(const mem_art_t *tree, const uint8_t *key, size_t key_len,
                     size_t *value_len);
 
