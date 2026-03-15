@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /* =========================================================================
  * Constants
@@ -37,7 +38,7 @@
 #define MAX_NODE_RLP       1024         /* generous upper bound for node RLP */
 #define DIRTY_INIT_CAP     256
 #define DEFERRED_INIT_CAP  256
-#define DEFERRED_BUCKETS   4096   /* hash table buckets for deferred node index */
+#define DEFERRED_BUCKETS   65536  /* hash table buckets for deferred node index */
 
 /* Size-class slot allocator: nodes are padded to the smallest class that fits.
  * Freed slots form intrusive linked lists (next-pointer stored in first 8B). */
@@ -932,7 +933,7 @@ static void def_init(mpt_store_t *ms) {
 static uint32_t def_bucket(const uint8_t hash[32]) {
     uint32_t h;
     memcpy(&h, hash, 4);
-    return h % DEFERRED_BUCKETS;
+    return h & (DEFERRED_BUCKETS - 1);
 }
 
 static bool def_contains(const mpt_store_t *ms, const uint8_t hash[32]) {
@@ -1172,16 +1173,17 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
          * the delete will correctly decrement at flush time.
          * Example: refcount=1, delete queued (-1), write increments (+1)
          *   → at flush: refcount goes 2→1. Net = 1. Correct. */
+        /* Check deferred buffer first (common during same checkpoint) */
+        deferred_entry_t *def = def_find_mut(ms, out_hash);
+        if (def) {
+            def->refcount++;
+            return true;
+        }
+        /* Then check disk */
         node_record_t existing;
         if (disk_hash_get(ms->index, out_hash, &existing)) {
             existing.refcount++;
             disk_hash_put(ms->index, out_hash, &existing);
-            return true;
-        }
-        /* Check deferred buffer */
-        deferred_entry_t *def = def_find_mut(ms, out_hash);
-        if (def) {
-            def->refcount++;
             return true;
         }
     } else {
@@ -1543,9 +1545,16 @@ void mpt_store_reset(mpt_store_t *ms) {
 
 void mpt_store_sync(mpt_store_t *ms) {
     if (!ms) return;
+    struct timespec _s0, _s1;
+    clock_gettime(CLOCK_MONOTONIC, &_s0);
     write_header(ms->data_fd, ms);
-    fsync(ms->data_fd);
+    fdatasync(ms->data_fd);
     disk_hash_sync(ms->index);
+    clock_gettime(CLOCK_MONOTONIC, &_s1);
+    double _s_ms = (_s1.tv_sec - _s0.tv_sec) * 1000.0 +
+                   (_s1.tv_nsec - _s0.tv_nsec) / 1e6;
+    if (_s_ms > 10.0)
+        fprintf(stderr, "  └ mpt_sync: %.1f ms\n", _s_ms);
 }
 
 static int def_offset_cmp(const void *a, const void *b) {
@@ -1554,13 +1563,18 @@ static int def_offset_cmp(const void *a, const void *b) {
     return (ea->offset > eb->offset) - (ea->offset < eb->offset);
 }
 
-void mpt_store_flush(mpt_store_t *ms) {
+void mpt_store_flush_ex(mpt_store_t *ms, bool do_sync) {
     if (!ms) return;
 
     /* 1. Collect live entries and sort by offset for sequential I/O */
     size_t live = 0;
-    for (size_t i = 0; i < ms->def_count; i++)
-        if (ms->def_entries[i].rlp) live++;
+    size_t total_rlp_bytes = 0;
+    for (size_t i = 0; i < ms->def_count; i++) {
+        if (ms->def_entries[i].rlp) {
+            live++;
+            total_rlp_bytes += ms->def_entries[i].rlp_len;
+        }
+    }
 
     deferred_entry_t **sorted = NULL;
     if (live > 0) {
@@ -1575,6 +1589,8 @@ void mpt_store_flush(mpt_store_t *ms) {
     }
 
     /* Write sorted entries — sequential offsets reduce disk seeks */
+    struct timespec _pw0, _pw1, _pw2;
+    clock_gettime(CLOCK_MONOTONIC, &_pw0);
     size_t n = sorted ? live : ms->def_count;
     for (size_t i = 0; i < n; i++) {
         deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
@@ -1582,12 +1598,18 @@ void mpt_store_flush(mpt_store_t *ms) {
 
         pwrite(ms->data_fd, e->rlp, e->rlp_len,
                (off_t)(PAGE_SIZE + e->offset));
+    }
+    clock_gettime(CLOCK_MONOTONIC, &_pw1);
+    for (size_t i = 0; i < n; i++) {
+        deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
+        if (!e->rlp) continue;
 
         node_record_t rec = { .offset = e->offset,
                               .length = e->rlp_len,
                               .refcount = e->refcount };
         disk_hash_put(ms->index, e->hash, &rec);
     }
+    clock_gettime(CLOCK_MONOTONIC, &_pw2);
     free(sorted);
 
     /* 2. Apply pending deletes (refcount-aware) */
@@ -1611,12 +1633,35 @@ void mpt_store_flush(mpt_store_t *ms) {
     }
 
     /* 3. Free deferred buffers */
+    size_t _del_count = ms->def_del_count;
     def_free_all(ms);
 
-    /* 4. Sync header + fsync both files */
-    write_header(ms->data_fd, ms);
-    fsync(ms->data_fd);
-    disk_hash_sync(ms->index);
+    double _pw_ms = (_pw1.tv_sec - _pw0.tv_sec) * 1000.0 +
+                    (_pw1.tv_nsec - _pw0.tv_nsec) / 1e6;
+    double _dh_ms = (_pw2.tv_sec - _pw1.tv_sec) * 1000.0 +
+                    (_pw2.tv_nsec - _pw1.tv_nsec) / 1e6;
+
+    if (do_sync) {
+        struct timespec _fs0, _fs1;
+        clock_gettime(CLOCK_MONOTONIC, &_fs0);
+        write_header(ms->data_fd, ms);
+        fdatasync(ms->data_fd);
+        disk_hash_sync(ms->index);
+        clock_gettime(CLOCK_MONOTONIC, &_fs1);
+        double _fs_ms = (_fs1.tv_sec - _fs0.tv_sec) * 1000.0 +
+                        (_fs1.tv_nsec - _fs0.tv_nsec) / 1e6;
+        if (live > 100)
+            fprintf(stderr, "  └ mpt_flush: %zu writes (%zuKB data), %zu deletes | pwrite=%.1f ms  idx=%.1f ms  fdatasync=%.1f ms\n",
+                    live, total_rlp_bytes / 1024, _del_count, _pw_ms, _dh_ms, _fs_ms);
+    } else {
+        if (live > 100)
+            fprintf(stderr, "  └ mpt_write: %zu writes (%zuKB data), %zu deletes | pwrite=%.1f ms  idx=%.1f ms\n",
+                    live, total_rlp_bytes / 1024, _del_count, _pw_ms, _dh_ms);
+    }
+}
+
+void mpt_store_flush(mpt_store_t *ms) {
+    mpt_store_flush_ex(ms, true);
 }
 
 /* =========================================================================
@@ -2300,8 +2345,19 @@ bool mpt_store_commit_batch(mpt_store_t *ms) {
         return true;
     }
 
-    /* Sort dirty entries by nibbles */
-    qsort(ms->dirty, ms->dirty_count, sizeof(dirty_entry_t), dirty_cmp);
+    /* Sort dirty entries by nibbles (skip for 0-1 entries) */
+    if (ms->dirty_count > 1) {
+        /* Check if already sorted before paying for qsort */
+        bool sorted = true;
+        for (size_t i = 1; i < ms->dirty_count; i++) {
+            if (dirty_cmp(&ms->dirty[i-1], &ms->dirty[i]) > 0) {
+                sorted = false;
+                break;
+            }
+        }
+        if (!sorted)
+            qsort(ms->dirty, ms->dirty_count, sizeof(dirty_entry_t), dirty_cmp);
+    }
 
     /* Deduplicate: keep the LAST entry for each key (last staged wins) */
     if (ms->dirty_count > 1) {

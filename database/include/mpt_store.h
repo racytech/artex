@@ -76,6 +76,12 @@ void mpt_store_sync(mpt_store_t *ms);
  */
 void mpt_store_flush(mpt_store_t *ms);
 
+/**
+ * Flush deferred writes. If do_sync is false, writes are buffered in the OS
+ * page cache but not fdatasync'd — call mpt_store_sync() separately.
+ */
+void mpt_store_flush_ex(mpt_store_t *ms, bool do_sync);
+
 /* =========================================================================
  * Trie Root
  * ========================================================================= */

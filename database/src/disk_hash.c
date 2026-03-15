@@ -706,6 +706,6 @@ void disk_hash_sync(disk_hash_t *dh) {
     pthread_rwlock_wrlock(&dh->rwlock);
     dh->dirty = false;
     write_header(dh);
-    fsync(dh->fd);
+    fdatasync(dh->fd);
     pthread_rwlock_unlock(&dh->rwlock);
 }
