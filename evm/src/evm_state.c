@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 #ifdef ENABLE_DEBUG
 extern bool g_trace_calls __attribute__((weak));
@@ -2486,6 +2487,9 @@ void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
 // Compute storage roots incrementally using shared storage mpt_store.
 // Iterates the dirty_slots list (O(dirty)) instead of scanning all cached slots.
 static void compute_all_storage_roots(evm_state_t *es) {
+    struct timespec _sr_t0, _sr_t1;
+    clock_gettime(CLOCK_MONOTONIC, &_sr_t0);
+
     // 1. Resolve dirty slot keys to mpt_storage_entry_t for sorting/grouping
     mpt_storage_vec_t sv = {0};
     for (size_t d = 0; d < es->dirty_slots.count; d++) {
@@ -2516,6 +2520,7 @@ static void compute_all_storage_roots(evm_state_t *es) {
         cs->mpt_dirty = false;
         cs->block_dirty = false;
     }
+    size_t _dirty_slot_count = es->dirty_slots.count;
     dirty_slot_clear(&es->dirty_slots);
 
     if (sv.count == 0) {
@@ -2564,6 +2569,13 @@ static void compute_all_storage_roots(evm_state_t *es) {
 
     free(sv.entries);
 
+    clock_gettime(CLOCK_MONOTONIC, &_sr_t1);
+    double _sr_ms = (_sr_t1.tv_sec - _sr_t0.tv_sec) * 1000.0 +
+                    (_sr_t1.tv_nsec - _sr_t0.tv_nsec) / 1e6;
+    if (_sr_ms > 100.0)
+        fprintf(stderr, "  └ storage_roots: %.1f ms, %zu dirty slots, %zu dirty accts\n",
+                _sr_ms, _dirty_slot_count, es->dirty_accounts.count);
+
 clear:
     // 4. Clear storage_dirty on dirty accounts only
     for (size_t d = 0; d < es->dirty_accounts.count; d++) {
@@ -2579,12 +2591,17 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     if (!es) return root;
 
     if (es->account_mpt) {
+        struct timespec _rt0, _rt1, _rt2;
+        clock_gettime(CLOCK_MONOTONIC, &_rt0);
         compute_all_storage_roots(es);
+        clock_gettime(CLOCK_MONOTONIC, &_rt1);
 
         if (!mpt_store_begin_batch(es->account_mpt)) {
             fprintf(stderr, "FATAL: mpt_store_begin_batch failed for account trie\n");
             return root;
         }
+
+        size_t _acct_dirty_count = es->dirty_accounts.count;
 
         // Iterate dirty account list directly — O(dirty) instead of O(total_cached)
         for (size_t d = 0; d < es->dirty_accounts.count; d++) {
@@ -2636,6 +2653,15 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
             fprintf(stderr, "FATAL: mpt_store_commit_batch failed for account trie\n");
             return root;
         }
+        clock_gettime(CLOCK_MONOTONIC, &_rt2);
+
+        double _stor_ms = (_rt1.tv_sec - _rt0.tv_sec) * 1000.0 +
+                          (_rt1.tv_nsec - _rt0.tv_nsec) / 1e6;
+        double _acct_ms = (_rt2.tv_sec - _rt1.tv_sec) * 1000.0 +
+                          (_rt2.tv_nsec - _rt1.tv_nsec) / 1e6;
+        if (_stor_ms + _acct_ms > 100.0)
+            fprintf(stderr, "  └ mpt_root: storage=%.1f ms (%zu dirty accts), account=%.1f ms (%zu dirty), total=%.1f ms\n",
+                    _stor_ms, _acct_dirty_count, _acct_ms, _acct_dirty_count, _stor_ms + _acct_ms);
 
         mpt_store_root(es->account_mpt, root.bytes);
         return root;

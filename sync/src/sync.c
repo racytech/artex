@@ -596,7 +596,7 @@ bool sync_execute_block(sync_t *sync,
         sync->config.checkpoint_interval > 0 &&
         sync->blocks_fail == 0 &&
         bn % sync->config.checkpoint_interval == 0) {
-        struct timespec t_start, t_end;
+        struct timespec t_start, t_end, t_root, t_flush, t_ckpt;
         clock_gettime(CLOCK_MONOTONIC, &t_start);
 #ifdef ENABLE_MPT
         /* Validate MPT root at checkpoint boundary */
@@ -613,12 +613,16 @@ bool sync_execute_block(sync_t *sync,
             return true;
         }
 #endif
+        clock_gettime(CLOCK_MONOTONIC, &t_root);
         sync_checkpoint(sync);
         clock_gettime(CLOCK_MONOTONIC, &t_end);
-        double elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000.0 +
-                            (t_end.tv_nsec - t_start.tv_nsec) / 1e6;
-        fprintf(stderr, "checkpoint block=%lu  validate+save=%.1f ms\n",
-                bn, elapsed_ms);
+        double root_ms = (t_root.tv_sec - t_start.tv_sec) * 1000.0 +
+                         (t_root.tv_nsec - t_start.tv_nsec) / 1e6;
+        double ckpt_ms = (t_end.tv_sec - t_root.tv_sec) * 1000.0 +
+                         (t_end.tv_nsec - t_root.tv_nsec) / 1e6;
+        double total_ms = root_ms + ckpt_ms;
+        fprintf(stderr, "checkpoint block=%lu  root=%.1f ms  flush+save=%.1f ms  total=%.1f ms\n",
+                bn, root_ms, ckpt_ms, total_ms);
     }
 
     block_result_free(&br);
@@ -737,6 +741,8 @@ bool sync_checkpoint(sync_t *sync) {
 #endif
 
     /* Flush accumulated dirty state to backing stores */
+    struct timespec tf0, tf1, tf2, tf3;
+    clock_gettime(CLOCK_MONOTONIC, &tf0);
 #ifdef ENABLE_VERKLE
     evm_state_flush_verkle(sync->state);
     if (sync->vs) verkle_state_sync(sync->vs);
@@ -745,6 +751,7 @@ bool sync_checkpoint(sync_t *sync) {
     evm_state_flush(sync->state);
     if (sync->cs) code_store_flush(sync->cs);
 #endif
+    clock_gettime(CLOCK_MONOTONIC, &tf1);
 
     /* Write checkpoint marker — the commit point */
     bool ok = checkpoint_save_internal(sync->config.checkpoint_path,
@@ -757,10 +764,17 @@ bool sync_checkpoint(sync_t *sync) {
     sync->last_stats = evm_state_get_stats(sync->state);
 
     /* Evict cache to bound memory — data is on disk, read-through reloads */
+    clock_gettime(CLOCK_MONOTONIC, &tf2);
 #ifdef ENABLE_DEBUG
     if (!sync->config.no_evict)
 #endif
         evm_state_evict_cache(sync->state);
+    clock_gettime(CLOCK_MONOTONIC, &tf3);
+    double flush_ms = (tf1.tv_sec - tf0.tv_sec) * 1000.0 +
+                      (tf1.tv_nsec - tf0.tv_nsec) / 1e6;
+    double evict_ms = (tf3.tv_sec - tf2.tv_sec) * 1000.0 +
+                      (tf3.tv_nsec - tf2.tv_nsec) / 1e6;
+    fprintf(stderr, "  └ flush=%.1f ms  evict=%.1f ms\n", flush_ms, evict_ms);
 
     /* Reset for next batch */
     sync->batch_root_computed = false;

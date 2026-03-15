@@ -702,10 +702,9 @@ int main(int argc, char **argv) {
             double tps = window_txs / (win_secs > 0 ? win_secs : 1);
             double mgps = (window_gas / 1e6) / (win_secs > 0 ? win_secs : 1);
             uint64_t remaining = (bn < PARIS_BLOCK) ? PARIS_BLOCK - bn : 0;
-            double eta_hrs = remaining / (bps > 0 ? bps : 1) / 3600.0;
-            printf("Block %lu | %lu txs | %.0f tps | %.1f Mgas/s | %.0f blk/s | %luK to Paris (%.1fh)\n",
-                   bn, window_txs, tps, mgps, bps,
-                   remaining / 1000, eta_hrs);
+            printf("Block %lu | %lu txs | %.0f tps | %.1f Mgas/s | %.0f blk/s | %.1fs/256blk | %luK to Paris\n",
+                   bn, window_txs, tps, mgps, bps, win_secs,
+                   remaining / 1000);
 
             /* Stats every 8 checkpoints (~2048 blocks) to avoid spam */
             if (bn % (CHECKPOINT_INTERVAL * 8) == 0) {
