@@ -1834,8 +1834,9 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
 #else
     // MPT path: delegate to compute_mpt_root which handles promotion,
     // block_dirty clearing, and EIP-161 pruning.
+    // In batch mode, defer to checkpoint — dirty flags must accumulate.
 #ifdef ENABLE_MPT
-    if (es->account_mpt)
+    if (es->account_mpt && !es->batch_mode)
         return evm_state_compute_mpt_root(es, prune_empty);
 #endif
     (void)prune_empty;
@@ -2191,7 +2192,8 @@ static void compute_all_storage_roots(evm_state_t *es) {
         const uint8_t *skey = es->dirty_slots.keys + d * SLOT_KEY_SIZE;
         cached_slot_t *cs = (cached_slot_t *)mem_art_get_mut(
             &es->storage, skey, SLOT_KEY_SIZE, NULL);
-        if (!cs || !cs->mpt_dirty) continue;  // gone or already cleared
+        if (!cs) continue;
+        if (!cs->mpt_dirty) continue;
 
         if (sv.count >= sv.cap) {
             size_t nc = sv.cap ? sv.cap * 2 : 256;
@@ -2288,7 +2290,8 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
             const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
             cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
                 &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
-            if (!ca || !ca->mpt_dirty) continue;  // gone or cleared by revert
+            if (!ca) continue;
+            if (!ca->mpt_dirty) continue;
 
             // Promote block_dirty accounts to existed:
             // - Self-destructed accounts: set existed = false

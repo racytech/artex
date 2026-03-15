@@ -509,7 +509,6 @@ block_result_t block_execute(evm_t *evm,
     uint256_t base_reward = get_block_reward(evm->fork);
     if (!uint256_is_zero(&base_reward)) {
         uint256_t miner_reward = base_reward;
-
         /* Uncle inclusion bonuses */
         size_t uncle_count = block_body_uncle_count(body);
         for (size_t u = 0; u < uncle_count; u++) {
