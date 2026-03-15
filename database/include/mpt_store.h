@@ -209,6 +209,13 @@ void mpt_store_set_cache(mpt_store_t *ms, uint32_t max_entries);
  */
 void mpt_store_set_cache_mb(mpt_store_t *ms, uint32_t megabytes);
 
+/**
+ * Verify trie hash integrity by walking all nodes and recomputing hashes.
+ * Returns true if the recomputed root matches the stored root.
+ * On mismatch, prints diagnostic info to stderr.
+ */
+bool mpt_store_verify_hashes(const mpt_store_t *ms);
+
 /* =========================================================================
  * Stats
  * ========================================================================= */

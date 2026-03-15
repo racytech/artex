@@ -2253,6 +2253,11 @@ static node_ref_t update_subtrie(mpt_store_t *ms, const node_ref_t *current,
 
     if (!load_from_ref(ms, current, buf, &buf_len, &node, (uint8_t)depth)) {
         /* Can't load — treat as empty */
+        if (current->type == REF_HASH) {
+            fprintf(stderr, "DBG update_subtrie: LOST NODE hash=");
+            for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%02x", current->hash[_i]);
+            fprintf(stderr, "... depth=%zu entries=%zu\n", depth, end - start);
+        }
         return build_fresh(ms, entries, start, end, depth);
     }
 
@@ -2511,6 +2516,108 @@ bool mpt_store_walk_leaves(const mpt_store_t *ms, mpt_leaf_cb_t cb,
     node_ref_t root = { .type = REF_HASH };
     memcpy(root.hash, ms->root_hash, 32);
     return walk_leaves_ref(ms, &root, cb, user_data);
+}
+
+/* Recursively verify hashes: load node by hash, re-hash its RLP, compare.
+ * Returns the recomputed hash (or zeros on error). */
+static bool verify_hash_ref(const mpt_store_t *ms, const node_ref_t *ref,
+                              uint8_t out_hash[32], int depth,
+                              int *total_checked, int *mismatches) {
+    if (ref->type == REF_EMPTY) {
+        memset(out_hash, 0, 32);
+        return true;
+    }
+
+    uint8_t buf[MAX_NODE_RLP];
+    size_t buf_len;
+    mpt_node_t node;
+
+    if (ref->type == REF_INLINE) {
+        /* Inline nodes: hash the raw data */
+        keccak(ref->raw.data, ref->raw.len, out_hash);
+        if (!decode_node(ref->raw.data, ref->raw.len, &node))
+            return false;
+    } else {
+        /* REF_HASH: load and verify */
+        buf_len = load_node_rlp(ms, ref->hash, buf, NCACHE_DEPTH_UNKNOWN);
+        if (buf_len == 0) {
+            fprintf(stderr, "VERIFY: missing node at depth %d hash=0x", depth);
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", ref->hash[i]);
+            fprintf(stderr, "...\n");
+            return false;
+        }
+        /* Recompute hash from loaded RLP */
+        uint8_t computed[32];
+        keccak(buf, buf_len, computed);
+        (*total_checked)++;
+
+        if (memcmp(computed, ref->hash, 32) != 0) {
+            (*mismatches)++;
+            fprintf(stderr, "VERIFY: HASH MISMATCH at depth %d!\n");
+            fprintf(stderr, "  expected: 0x");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", ref->hash[i]);
+            fprintf(stderr, "\n  computed: 0x");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", computed[i]);
+            fprintf(stderr, "\n  buf_len=%zu\n", buf_len);
+        }
+        memcpy(out_hash, computed, 32);
+
+        if (!decode_node(buf, buf_len, &node))
+            return false;
+    }
+
+    /* Recurse into children */
+    if (node.type == MPT_NODE_BRANCH) {
+        for (int i = 0; i < 16; i++) {
+            if (node.branch.children[i].type != REF_EMPTY) {
+                uint8_t child_hash[32];
+                if (!verify_hash_ref(ms, &node.branch.children[i],
+                                      child_hash, depth + 1,
+                                      total_checked, mismatches))
+                    return false;
+            }
+        }
+    } else if (node.type == MPT_NODE_EXTENSION) {
+        uint8_t child_hash[32];
+        if (!verify_hash_ref(ms, &node.extension.child, child_hash,
+                              depth + 1, total_checked, mismatches))
+            return false;
+    }
+    return true;
+}
+
+bool mpt_store_verify_hashes(const mpt_store_t *ms) {
+    if (!ms) return false;
+
+    static const uint8_t EMPTY[32] = {
+        0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
+        0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e,
+        0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0,
+        0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21
+    };
+
+    if (memcmp(ms->root_hash, EMPTY, 32) == 0) {
+        fprintf(stderr, "VERIFY: empty trie, nothing to check\n");
+        return true;
+    }
+
+    node_ref_t root = { .type = REF_HASH };
+    memcpy(root.hash, ms->root_hash, 32);
+
+    int total_checked = 0, mismatches = 0;
+    uint8_t root_hash[32];
+    bool ok = verify_hash_ref(ms, &root, root_hash, 0,
+                               &total_checked, &mismatches);
+
+    fprintf(stderr, "VERIFY: checked %d nodes, %d mismatches\n",
+            total_checked, mismatches);
+
+    if (!ok) {
+        fprintf(stderr, "VERIFY: walk failed\n");
+        return false;
+    }
+
+    return mismatches == 0;
 }
 
 bool mpt_store_compact(mpt_store_t *ms) {
