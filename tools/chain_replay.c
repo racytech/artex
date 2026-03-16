@@ -76,7 +76,12 @@ static volatile sig_atomic_t g_shutdown_pending = 0;
 
 static void sigint_handler(int sig) {
     (void)sig;
-    g_shutdown = 1;
+    if (g_shutdown) {
+        /* Second Ctrl+C — force immediate exit from loop */
+        g_shutdown = 2;
+    } else {
+        g_shutdown = 1;
+    }
 }
 
 /* =========================================================================
@@ -448,6 +453,12 @@ int main(int argc, char **argv) {
         if (g_shutdown && !g_shutdown_pending) {
             g_shutdown_pending = true;
             printf("\nSIGINT received — finishing batch to next checkpoint...\n");
+            printf("  (press Ctrl+C again to stop immediately)\n");
+        }
+        /* Second Ctrl+C — stop immediately, sync_destroy handles cleanup */
+        if (g_shutdown >= 2) {
+            printf("\nForced stop — cleaning up...\n");
+            break;
         }
 
         if (!archive_ensure(&archive, bn, follow_mode, era1_dir))
@@ -807,6 +818,12 @@ int main(int argc, char **argv) {
             break;
         }
     }
+
+    /* Block SIGINT during cleanup — flush must complete cleanly */
+    sigset_t block_set, old_set;
+    sigemptyset(&block_set);
+    sigaddset(&block_set, SIGINT);
+    sigprocmask(SIG_BLOCK, &block_set, &old_set);
 
     /* Summary */
     clock_gettime(CLOCK_MONOTONIC, &t_now);
