@@ -736,6 +736,28 @@ uint64_t disk_hash_capacity(const disk_hash_t *dh) {
 }
 
 /* =========================================================================
+ * Iteration
+ * ========================================================================= */
+
+void disk_hash_foreach_key(const disk_hash_t *dh, disk_hash_key_cb_t cb,
+                            void *user_data) {
+    if (!dh || !cb) return;
+
+    uint8_t page[PAGE_SIZE];
+    uint64_t total_pages = dh->bucket_count + dh->overflow_count;
+
+    for (uint64_t bid = 0; bid < total_pages; bid++) {
+        if (!read_bucket(dh->fd, bid, page))
+            continue;
+        for (uint32_t i = 0; i < dh->slots_per_bucket; i++) {
+            const uint8_t *s = slot_ptr_const(page, dh->slot_size, i);
+            if (s[0] == SLOT_OCCUPIED)
+                cb(s + 1, user_data);
+        }
+    }
+}
+
+/* =========================================================================
  * Durability
  * ========================================================================= */
 

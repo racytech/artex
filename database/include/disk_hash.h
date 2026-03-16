@@ -147,6 +147,19 @@ uint64_t disk_hash_count(const disk_hash_t *dh);
 uint64_t disk_hash_capacity(const disk_hash_t *dh);
 
 /* =========================================================================
+ * Iteration
+ * ========================================================================= */
+
+/**
+ * Iterate all live keys. Calls cb(key, user_data) for each occupied slot.
+ * Keys are visited in bucket order (not sorted). Reads every bucket page.
+ * Use for one-time bulk operations (e.g. bloom filter population).
+ */
+typedef void (*disk_hash_key_cb_t)(const uint8_t *key, void *user_data);
+void disk_hash_foreach_key(const disk_hash_t *dh, disk_hash_key_cb_t cb,
+                            void *user_data);
+
+/* =========================================================================
  * Durability
  * ========================================================================= */
 
