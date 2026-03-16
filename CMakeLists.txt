@@ -13,6 +13,7 @@ option(ENABLE_VERKLE "Enable Verkle state root" OFF)
 option(ENABLE_EVM_TRACE "Enable EIP-3155 EVM execution tracing" OFF)
 option(ENABLE_DEBUG "Enable debug instrumentation (g_trace_calls, state dump, --no-evict)" OFF)
 option(ENABLE_HISTORY "Enable per-block state diff history tracking" OFF)
+option(ENABLE_DISK_HASH_MMAP "Use mmap-based disk_hash instead of pread/pwrite" ON)
 
 if(NOT ENABLE_MPT AND NOT ENABLE_VERKLE)
     message(FATAL_ERROR "At least one state backend must be enabled (ENABLE_MPT or ENABLE_VERKLE)")
@@ -79,10 +80,12 @@ add_library(art_store STATIC
 )
 target_link_libraries(art_store compact_art)
 
-# Disk Hash (zero-RAM disk-backed hash table, pread/pwrite)
-add_library(disk_hash STATIC
-    database/src/disk_hash.c
-)
+# Disk Hash — backend selection
+if(ENABLE_DISK_HASH_MMAP)
+    add_library(disk_hash STATIC database/src/disk_hash_mmap.c)
+else()
+    add_library(disk_hash STATIC database/src/disk_hash.c)
+endif()
 target_link_libraries(disk_hash pthread)
 
 # Code Store (content-addressed, append-only, deduplicated)
@@ -565,7 +568,11 @@ add_library(common_pic STATIC
 set_target_properties(common_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(common_pic snappy)
 
-add_library(disk_hash_pic STATIC database/src/disk_hash.c)
+if(ENABLE_DISK_HASH_MMAP)
+    add_library(disk_hash_pic STATIC database/src/disk_hash_mmap.c)
+else()
+    add_library(disk_hash_pic STATIC database/src/disk_hash.c)
+endif()
 set_target_properties(disk_hash_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(disk_hash_pic pthread)
 
@@ -1029,7 +1036,11 @@ message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
 message(STATUS "  - compact_art (space-efficient index ART)")
 message(STATUS "  - art_store (ART-indexed persistent record store)")
-message(STATUS "  - disk_hash (zero-RAM disk-backed hash table)")
+if(ENABLE_DISK_HASH_MMAP)
+    message(STATUS "  - disk_hash (mmap-backed hash table)")
+else()
+    message(STATUS "  - disk_hash (pread/pwrite hash table)")
+endif()
 message(STATUS "  - code_store (content-addressed bytecode storage)")
 message(STATUS "  - verkle (verkle tree with Pedersen commitments)")
 message(STATUS "  - evm (Ethereum Virtual Machine)")
