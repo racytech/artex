@@ -485,6 +485,16 @@ target_link_libraries(mpt_fuzz
     -Wl,--no-whole-archive
     pthread snappy)
 
+# Test: Verkle flat (go-verkle cross-validation + revert + determinism)
+add_executable(test_verkle_flat
+    verkle/tests/test_verkle_flat.c
+)
+target_link_libraries(test_verkle_flat verkle_flat)
+add_test(NAME test_verkle_flat
+    COMMAND test_verkle_flat
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
 # Benchmark: Verkle flat scale (disk-backed block simulation)
 add_executable(bench_verkle_flat
     verkle/tests/bench_verkle_flat.c
