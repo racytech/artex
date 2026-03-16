@@ -15,6 +15,7 @@
  * (checkpoint_interval = 1 or a dedicated per-block validate API).
  */
 
+#include <signal.h>
 #include "sync.h"
 #include "evm.h"
 #include "evm_state.h"
@@ -876,6 +877,13 @@ bool sync_checkpoint(sync_t *sync) {
         /* Pre-grow mmap before bg thread — dat_remap is not safe concurrently */
         evm_state_flush_prepare(sync->state);
 
+        /* Block SIGINT so the flush thread inherits the mask — it must
+         * complete uninterrupted to avoid torn writes on mmap'd files. */
+        sigset_t sigint_set, old_set;
+        sigemptyset(&sigint_set);
+        sigaddset(&sigint_set, SIGINT);
+        pthread_sigmask(SIG_BLOCK, &sigint_set, &old_set);
+
         if (pthread_create(&sync->flush_thread, NULL, flush_thread_fn, ctx) == 0) {
             sync->flush_thread_active = true;
             sync->flush_ctx = ctx;
@@ -892,6 +900,9 @@ bool sync_checkpoint(sync_t *sync) {
                                      sync->blocks_fail);
             evm_state_evict_cache(sync->state);
         }
+
+        /* Restore SIGINT for main thread */
+        pthread_sigmask(SIG_SETMASK, &old_set, NULL);
     } else {
         /* malloc failed — synchronous fallback */
         evm_state_flush(sync->state);
