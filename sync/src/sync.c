@@ -44,6 +44,7 @@
 
 /* Forward declarations */
 static void sync_wait_flush(sync_t *sync);
+static void *flush_thread_fn(void *arg);
 
 // ============================================================================
 // Constants
@@ -56,6 +57,15 @@ static void sync_wait_flush(sync_t *sync);
 // ============================================================================
 
 typedef struct {
+    /* Persistent thread state */
+    pthread_t             thread;
+    pthread_mutex_t       mutex;
+    pthread_cond_t        work_ready;  /* main → flush: new work available */
+    pthread_cond_t        work_done;   /* flush → main: work completed */
+    bool                  has_work;    /* protected by mutex */
+    bool                  shutdown;    /* signal thread to exit */
+
+    /* Work payload (written by main before signaling, read by flush thread) */
     evm_state_t          *state;
     const char           *checkpoint_path;
     uint64_t              block_number;
@@ -63,7 +73,8 @@ typedef struct {
     uint64_t              total_gas;
     uint64_t              blocks_ok;
     uint64_t              blocks_fail;
-    /* Filled by bg thread for main thread to read after join */
+
+    /* Results (written by flush thread, read by main after work_done) */
     evm_flush_bg_stats_t  flush_stats;
     double                flush_total_ms;
 } flush_ctx_t;
@@ -123,10 +134,8 @@ struct sync {
     state_history_t *history;
 #endif
 
-    /* Background flush thread */
-    pthread_t       flush_thread;
-    bool            flush_thread_active;
-    flush_ctx_t    *flush_ctx;          /* kept alive until join for stats */
+    /* Persistent background flush thread */
+    flush_ctx_t    *flush_ctx;          /* NULL if flush thread not started */
 
     /* Checkpoint timing (filled during checkpoint cycle, read by caller) */
     sync_checkpoint_stats_t ckpt_stats;
@@ -433,6 +442,37 @@ sync_t *sync_create(const sync_config_t *config) {
     }
 #endif
 
+#ifdef ENABLE_MPT
+    /* Spawn persistent background flush thread.
+     * Block SIGINT before pthread_create so the child inherits the blocked
+     * mask — prevents torn writes from Ctrl+C during flush. */
+    {
+        flush_ctx_t *ctx = calloc(1, sizeof(flush_ctx_t));
+        if (ctx) {
+            pthread_mutex_init(&ctx->mutex, NULL);
+            pthread_cond_init(&ctx->work_ready, NULL);
+            pthread_cond_init(&ctx->work_done, NULL);
+
+            sigset_t block_set, old_set;
+            sigemptyset(&block_set);
+            sigaddset(&block_set, SIGINT);
+            pthread_sigmask(SIG_BLOCK, &block_set, &old_set);
+
+            if (pthread_create(&ctx->thread, NULL, flush_thread_fn, ctx) == 0) {
+                s->flush_ctx = ctx;
+            } else {
+                fprintf(stderr, "Warning: failed to create flush thread\n");
+                pthread_cond_destroy(&ctx->work_done);
+                pthread_cond_destroy(&ctx->work_ready);
+                pthread_mutex_destroy(&ctx->mutex);
+                free(ctx);
+            }
+
+            pthread_sigmask(SIG_SETMASK, &old_set, NULL);
+        }
+    }
+#endif
+
     (void)resumed;
     return s;
 
@@ -456,6 +496,21 @@ void sync_destroy(sync_t *sync) {
 
     /* Wait for any in-flight background flush to complete */
     sync_wait_flush(sync);
+
+    /* Shutdown persistent flush thread */
+    if (sync->flush_ctx) {
+        flush_ctx_t *ctx = sync->flush_ctx;
+        pthread_mutex_lock(&ctx->mutex);
+        ctx->shutdown = true;
+        pthread_cond_signal(&ctx->work_ready);
+        pthread_mutex_unlock(&ctx->mutex);
+        pthread_join(ctx->thread, NULL);
+        pthread_cond_destroy(&ctx->work_done);
+        pthread_cond_destroy(&ctx->work_ready);
+        pthread_mutex_destroy(&ctx->mutex);
+        free(ctx);
+        sync->flush_ctx = NULL;
+    }
 
     /* Do NOT save a final checkpoint for unsaved progress.
      * Only auto-checkpoints (with validated MPT roots) are trustworthy.
@@ -772,50 +827,67 @@ struct evm *sync_get_evm(const sync_t *sync) {
 
 static void *flush_thread_fn(void *arg) {
     flush_ctx_t *ctx = (flush_ctx_t *)arg;
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    /* Flush MPT stores using separate disk_hash instances */
-    evm_state_flush_bg(ctx->state, &ctx->flush_stats);
+    pthread_mutex_lock(&ctx->mutex);
+    while (true) {
+        /* Wait for work or shutdown signal */
+        while (!ctx->has_work && !ctx->shutdown)
+            pthread_cond_wait(&ctx->work_ready, &ctx->mutex);
 
-    /* Save checkpoint marker */
-    if (ctx->checkpoint_path) {
-        checkpoint_save_internal(ctx->checkpoint_path,
-                                 ctx->block_number, ctx->block_hashes,
-                                 ctx->total_gas, ctx->blocks_ok,
-                                 ctx->blocks_fail);
+        if (ctx->shutdown) {
+            pthread_mutex_unlock(&ctx->mutex);
+            return NULL;
+        }
+
+        /* Do the flush (mutex held briefly, but work is outside critical section) */
+        pthread_mutex_unlock(&ctx->mutex);
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        evm_state_flush_bg(ctx->state, &ctx->flush_stats);
+
+        if (ctx->checkpoint_path) {
+            checkpoint_save_internal(ctx->checkpoint_path,
+                                     ctx->block_number, ctx->block_hashes,
+                                     ctx->total_gas, ctx->blocks_ok,
+                                     ctx->blocks_fail);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        ctx->flush_total_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                              (t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+        /* Signal completion */
+        pthread_mutex_lock(&ctx->mutex);
+        ctx->has_work = false;
+        pthread_cond_signal(&ctx->work_done);
     }
-
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    ctx->flush_total_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                          (t1.tv_nsec - t0.tv_nsec) / 1e6;
-
-    /* Don't free ctx — main thread reads stats after join */
-    return NULL;
 }
 
 static void sync_wait_flush(sync_t *sync) {
-    if (!sync->flush_thread_active) return;
+    flush_ctx_t *ctx = sync->flush_ctx;
+    if (!ctx) return;
+
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    pthread_join(sync->flush_thread, NULL);
-    sync->flush_thread_active = false;
+
+    /* Wait for flush thread to finish current work */
+    pthread_mutex_lock(&ctx->mutex);
+    while (ctx->has_work)
+        pthread_cond_wait(&ctx->work_done, &ctx->mutex);
+    pthread_mutex_unlock(&ctx->mutex);
+
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double wait_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
                      (t1.tv_nsec - t0.tv_nsec) / 1e6;
 
-    /* Finalize: free deferred buffers + refresh disk_hash metadata */
     evm_state_flush_complete(sync->state);
 
-    /* Copy stats from ctx before freeing */
-    if (sync->flush_ctx) {
-        sync->ckpt_stats.flush          = sync->flush_ctx->flush_stats;
-        sync->ckpt_stats.flush_total_ms = sync->flush_ctx->flush_total_ms;
-        sync->ckpt_stats.flush_join_ms  = wait_ms;
-        sync->ckpt_stats.valid          = true;
-        free(sync->flush_ctx);
-        sync->flush_ctx = NULL;
-    }
+    sync->ckpt_stats.flush          = ctx->flush_stats;
+    sync->ckpt_stats.flush_total_ms = ctx->flush_total_ms;
+    sync->ckpt_stats.flush_join_ms  = wait_ms;
+    sync->ckpt_stats.valid          = true;
 }
 
 // ============================================================================
@@ -857,13 +929,13 @@ bool sync_checkpoint(sync_t *sync) {
     sync->last_checkpoint_block = sync->last_block;
 
 #ifdef ENABLE_MPT
-    /* Spawn background flush thread — MPT flush + code_store + checkpoint save.
-     * Executor continues immediately with next batch. */
-    flush_ctx_t *ctx = malloc(sizeof(*ctx));
     /* Flush code store synchronously — it shares locks with executor */
     if (sync->cs) code_store_flush(sync->cs);
 
+    /* Signal persistent flush thread with new work */
+    flush_ctx_t *ctx = sync->flush_ctx;
     if (ctx) {
+        pthread_mutex_lock(&ctx->mutex);
         ctx->state           = sync->state;
         ctx->checkpoint_path = sync->config.checkpoint_path;
         ctx->block_number    = sync->last_block;
@@ -873,41 +945,16 @@ bool sync_checkpoint(sync_t *sync) {
         ctx->blocks_fail     = sync->blocks_fail;
         memset(&ctx->flush_stats, 0, sizeof(ctx->flush_stats));
         ctx->flush_total_ms  = 0;
-
-        /* Pre-grow mmap before bg thread — dat_remap is not safe concurrently */
-        evm_state_flush_prepare(sync->state);
-
-        /* Block SIGINT so the flush thread inherits the mask — it must
-         * complete uninterrupted to avoid torn writes on mmap'd files. */
-        sigset_t sigint_set, old_set;
-        sigemptyset(&sigint_set);
-        sigaddset(&sigint_set, SIGINT);
-        pthread_sigmask(SIG_BLOCK, &sigint_set, &old_set);
-
-        if (pthread_create(&sync->flush_thread, NULL, flush_thread_fn, ctx) == 0) {
-            sync->flush_thread_active = true;
-            sync->flush_ctx = ctx;
-        } else {
-            /* Thread creation failed — fall back to synchronous flush */
-            fprintf(stderr, "WARNING: bg flush thread creation failed, "
-                    "falling back to synchronous\n");
-            free(ctx);
-            evm_state_flush(sync->state);
-            if (sync->cs) code_store_flush(sync->cs);
-            checkpoint_save_internal(sync->config.checkpoint_path,
-                                     sync->last_block, sync->block_hashes,
-                                     sync->total_gas, sync->blocks_ok,
-                                     sync->blocks_fail);
-            evm_state_evict_cache(sync->state);
-        }
-
-        /* Restore SIGINT for main thread */
-        pthread_sigmask(SIG_SETMASK, &old_set, NULL);
+        ctx->has_work        = true;
+        pthread_cond_signal(&ctx->work_ready);
+        pthread_mutex_unlock(&ctx->mutex);
     } else {
-        /* malloc failed — synchronous fallback */
+        /* Flush thread not started — synchronous fallback */
         evm_state_flush(sync->state);
-        if (sync->cs) code_store_flush(sync->cs);
-        evm_state_evict_cache(sync->state);
+        checkpoint_save_internal(sync->config.checkpoint_path,
+                                 sync->last_block, sync->block_hashes,
+                                 sync->total_gas, sync->blocks_ok,
+                                 sync->blocks_fail);
     }
 #else
     evm_state_evict_cache(sync->state);
