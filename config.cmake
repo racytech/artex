@@ -8,6 +8,9 @@ set(CMAKE_BUILD_TYPE Release)
 set(ENABLE_MPT    ON)
 set(ENABLE_VERKLE OFF)
 
+# Build verkle libraries for background state building (pre-fork)
+set(ENABLE_VERKLE_BUILD OFF)
+
 # MPT disk_hash capacity hints (pre-allocated hash table slots)
 set(MPT_ACCOUNT_CAPACITY  500000000)  # account trie (~500M for mainnet)
 set(MPT_STORAGE_CAPACITY  4000000000)  # storage trie (~4B for mainnet)

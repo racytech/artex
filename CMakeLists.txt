@@ -9,11 +9,16 @@ project(art_database C)
 
 # Backend options (overridable via config.cmake or -D flags)
 option(ENABLE_MPT "Enable MPT (Merkle Patricia Trie) state root" ON)
-option(ENABLE_VERKLE "Enable Verkle state root" OFF)
+option(ENABLE_VERKLE "Enable Verkle as active state backend (post-fork)" OFF)
+option(ENABLE_VERKLE_BUILD "Build verkle libraries for background state building (pre-fork)" OFF)
 option(ENABLE_EVM_TRACE "Enable EIP-3155 EVM execution tracing" OFF)
 option(ENABLE_DEBUG "Enable debug instrumentation (g_trace_calls, state dump, --no-evict)" OFF)
 option(ENABLE_HISTORY "Enable per-block state diff history tracking" OFF)
 
+# ENABLE_VERKLE implies ENABLE_VERKLE_BUILD
+if(ENABLE_VERKLE)
+    set(ENABLE_VERKLE_BUILD ON)
+endif()
 
 if(NOT ENABLE_MPT AND NOT ENABLE_VERKLE)
     message(FATAL_ERROR "At least one state backend must be enabled (ENABLE_MPT or ENABLE_VERKLE)")
@@ -127,23 +132,26 @@ add_library(verkle_key STATIC
 )
 target_link_libraries(verkle_key pedersen)
 
-# Verkle state (typed account/storage interface over flat updater)
-add_library(verkle_state STATIC
-    verkle/src/verkle_state.c
-)
-target_link_libraries(verkle_state verkle_key verkle_flat)
+# Verkle flat backend (only built when ENABLE_VERKLE_BUILD or ENABLE_VERKLE)
+if(ENABLE_VERKLE_BUILD)
+    # Verkle commitment store (disk_hash-backed commitment persistence)
+    add_library(verkle_commit_store STATIC
+        verkle/src/verkle_commit_store.c
+    )
+    target_link_libraries(verkle_commit_store banderwagon disk_hash)
 
-# Verkle commitment store (disk_hash-backed commitment persistence)
-add_library(verkle_commit_store STATIC
-    verkle/src/verkle_commit_store.c
-)
-target_link_libraries(verkle_commit_store banderwagon disk_hash)
+    # Verkle flat updater (disk-backed commitment updates, O(block) RAM)
+    add_library(verkle_flat STATIC
+        verkle/src/verkle_flat.c
+    )
+    target_link_libraries(verkle_flat verkle_commit_store disk_hash pedersen banderwagon)
 
-# Verkle flat updater (disk-backed commitment updates, O(block) RAM)
-add_library(verkle_flat STATIC
-    verkle/src/verkle_flat.c
-)
-target_link_libraries(verkle_flat verkle_commit_store disk_hash pedersen banderwagon)
+    # Verkle state (typed account/storage interface over flat updater)
+    add_library(verkle_state STATIC
+        verkle/src/verkle_state.c
+    )
+    target_link_libraries(verkle_state verkle_key verkle_flat)
+endif()
 
 # In-Memory Batch MPT (testing only — used by test runner for state root verification)
 add_library(mem_mpt STATIC
@@ -201,6 +209,9 @@ if(ENABLE_MPT)
 endif()
 if(ENABLE_VERKLE)
     target_compile_definitions(evm PUBLIC ENABLE_VERKLE=1)
+endif()
+if(ENABLE_VERKLE_BUILD)
+    target_compile_definitions(evm PUBLIC ENABLE_VERKLE_BUILD=1)
 endif()
 if(ENABLE_EVM_TRACE)
     target_compile_definitions(evm PUBLIC ENABLE_EVM_TRACE=1)
@@ -485,21 +496,23 @@ target_link_libraries(mpt_fuzz
     -Wl,--no-whole-archive
     pthread snappy)
 
-# Test: Verkle flat (go-verkle cross-validation + revert + determinism)
-add_executable(test_verkle_flat
-    verkle/tests/test_verkle_flat.c
-)
-target_link_libraries(test_verkle_flat verkle_flat)
-add_test(NAME test_verkle_flat
-    COMMAND test_verkle_flat
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-)
+if(ENABLE_VERKLE_BUILD)
+    # Test: Verkle flat (go-verkle cross-validation + revert + determinism)
+    add_executable(test_verkle_flat
+        verkle/tests/test_verkle_flat.c
+    )
+    target_link_libraries(test_verkle_flat verkle_flat)
+    add_test(NAME test_verkle_flat
+        COMMAND test_verkle_flat
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    )
 
-# Benchmark: Verkle flat scale (disk-backed block simulation)
-add_executable(bench_verkle_flat
-    verkle/tests/bench_verkle_flat.c
-)
-target_link_libraries(bench_verkle_flat verkle_state)
+    # Benchmark: Verkle flat scale (disk-backed block simulation)
+    add_executable(bench_verkle_flat
+        verkle/tests/bench_verkle_flat.c
+    )
+    target_link_libraries(bench_verkle_flat verkle_state)
+endif()
 
 #==============================================================================
 # Tests — Networking
@@ -894,6 +907,7 @@ message(STATUS "C Compiler:        ${CMAKE_C_COMPILER}")
 message(STATUS "C Flags:           ${CMAKE_C_FLAGS}")
 message(STATUS "MPT backend:       ${ENABLE_MPT}")
 message(STATUS "Verkle backend:    ${ENABLE_VERKLE}")
+message(STATUS "Verkle build:      ${ENABLE_VERKLE_BUILD}")
 message(STATUS "State history:     ${ENABLE_HISTORY}")
 message(STATUS "")
 message(STATUS "Tuning:")
