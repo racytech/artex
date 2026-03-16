@@ -426,6 +426,12 @@ add_executable(test_stress_art_store
 target_link_libraries(test_stress_art_store art_store)
 
 # Test: Disk Hash (zero-RAM disk-backed hash table)
+add_executable(test_bloom_filter
+    database/tests/test_bloom_filter.c
+)
+target_link_libraries(test_bloom_filter bloom_filter m)
+add_test(NAME test_bloom_filter COMMAND test_bloom_filter)
+
 add_executable(test_disk_hash
     database/tests/test_disk_hash.c
 )
