@@ -193,47 +193,6 @@ bool vcs_get_internal(const verkle_commit_store_t *cs,
 }
 
 /* =========================================================================
- * Tree Flush
- * ========================================================================= */
-
-static bool flush_node(verkle_commit_store_t *cs,
-                        const verkle_node_t *node,
-                        int depth,
-                        uint8_t *path)
-{
-    if (!node) return true;
-
-    if (node->type == VERKLE_LEAF) {
-        return vcs_put_leaf(cs, node->leaf.stem,
-                            &node->leaf.c1,
-                            &node->leaf.c2,
-                            &node->leaf.commitment);
-    }
-
-    /* Internal node */
-    if (!vcs_put_internal(cs, depth, path, &node->internal.commitment))
-        return false;
-
-    for (int i = 0; i < VERKLE_WIDTH; i++) {
-        if (node->internal.children[i]) {
-            path[depth] = (uint8_t)i;
-            if (!flush_node(cs, node->internal.children[i], depth + 1, path))
-                return false;
-        }
-    }
-    return true;
-}
-
-bool vcs_flush_tree(verkle_commit_store_t *cs, const verkle_tree_t *vt) {
-    if (!cs || !vt) return false;
-    if (!vt->root) return true;  /* empty tree — nothing to flush */
-
-    uint8_t path[VERKLE_STEM_LEN];
-    memset(path, 0, sizeof(path));
-    return flush_node(cs, vt->root, 0, path);
-}
-
-/* =========================================================================
  * Durability
  * ========================================================================= */
 

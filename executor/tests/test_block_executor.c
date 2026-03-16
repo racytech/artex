@@ -285,9 +285,9 @@ static void test_executor_smoke(void) {
      * Sender: 0x9d8A62f656a8d1615C1294fd71e9CFb3E4855A4F
      */
 
-    /* Create verkle state (in-memory tree) */
+    /* Create verkle state (flat backend) */
 #ifdef ENABLE_VERKLE
-    verkle_state_t *vs = verkle_state_create();
+    verkle_state_t *vs = verkle_state_create_flat("/tmp/test_blk_exec_vf", "/tmp/test_blk_exec_vc");
     ASSERT(vs != NULL, "create verkle_state");
 #else
     void *vs = NULL;
@@ -403,7 +403,7 @@ static void test_dao_fork(void) {
 
     /* Create verkle state + evm state (no EVM needed, just state) */
 #ifdef ENABLE_VERKLE
-    verkle_state_t *vs = verkle_state_create();
+    verkle_state_t *vs = verkle_state_create_flat("/tmp/test_blk_exec_vf", "/tmp/test_blk_exec_vc");
     ASSERT(vs != NULL, "create verkle_state");
 #else
     void *vs = NULL;
@@ -477,7 +477,7 @@ static void test_dao_fork_block_check(void) {
 
     /* Create state with balance on a drain address */
 #ifdef ENABLE_VERKLE
-    verkle_state_t *vs = verkle_state_create();
+    verkle_state_t *vs = verkle_state_create_flat("/tmp/test_blk_exec_vf", "/tmp/test_blk_exec_vc");
     ASSERT(vs != NULL, "create verkle_state");
 #else
     void *vs = NULL;

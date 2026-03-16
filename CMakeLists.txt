@@ -121,41 +121,23 @@ add_library(pedersen STATIC
 )
 target_link_libraries(pedersen banderwagon blst)
 
-# Verkle tree (in-memory width-256 trie with Pedersen commitments)
-add_library(verkle STATIC
-    verkle/src/verkle.c
-)
-target_link_libraries(verkle pedersen banderwagon)
-
 # Verkle key derivation (pedersen hash for address/storage → tree key mapping)
 add_library(verkle_key STATIC
     verkle/src/verkle_key.c
 )
 target_link_libraries(verkle_key pedersen)
 
-# Verkle state (typed account/storage interface over verkle tree)
+# Verkle state (typed account/storage interface over flat updater)
 add_library(verkle_state STATIC
     verkle/src/verkle_state.c
 )
-target_link_libraries(verkle_state verkle verkle_key verkle_flat)
+target_link_libraries(verkle_state verkle_key verkle_flat)
 
 # Verkle commitment store (disk_hash-backed commitment persistence)
 add_library(verkle_commit_store STATIC
     verkle/src/verkle_commit_store.c
 )
-target_link_libraries(verkle_commit_store verkle banderwagon disk_hash)
-
-# Verkle snapshot (binary tree serialization/deserialization)
-add_library(verkle_snapshot STATIC
-    verkle/src/verkle_snapshot.c
-)
-target_link_libraries(verkle_snapshot verkle banderwagon)
-
-# Verkle journal (block revert + crash recovery + background checkpoint)
-add_library(verkle_journal STATIC
-    verkle/src/verkle_journal.c
-)
-target_link_libraries(verkle_journal verkle verkle_snapshot banderwagon)
+target_link_libraries(verkle_commit_store banderwagon disk_hash)
 
 # Verkle flat updater (disk-backed commitment updates, O(block) RAM)
 add_library(verkle_flat STATIC
@@ -423,13 +405,6 @@ add_executable(test_pedersen
 target_link_libraries(test_pedersen pedersen)
 add_test(NAME test_pedersen COMMAND test_pedersen)
 
-# Test: Verkle tree (in-memory trie with Pedersen commitments)
-add_executable(test_verkle
-    verkle/tests/test_verkle.c
-)
-target_link_libraries(test_verkle verkle)
-add_test(NAME test_verkle COMMAND test_verkle)
-
 # Test: Verkle key derivation (pedersen hash → tree key mapping)
 add_executable(test_verkle_key
     verkle/tests/test_verkle_key.c
@@ -437,26 +412,6 @@ add_executable(test_verkle_key
 target_link_libraries(test_verkle_key verkle_key)
 add_test(NAME test_verkle_key COMMAND test_verkle_key)
 
-# Test: Verkle state (typed account/storage interface)
-add_executable(test_verkle_state
-    verkle/tests/test_verkle_state.c
-)
-target_link_libraries(test_verkle_state verkle_state)
-add_test(NAME test_verkle_state COMMAND test_verkle_state)
-
-# Test: Verkle commitment store (disk_hash-backed persistence)
-add_executable(test_verkle_commit_store
-    verkle/tests/test_verkle_commit_store.c
-)
-target_link_libraries(test_verkle_commit_store verkle_commit_store verkle)
-add_test(NAME test_verkle_commit_store COMMAND test_verkle_commit_store)
-
-# Test: Verkle snapshot (binary tree serialization/deserialization)
-add_executable(test_verkle_snapshot
-    verkle/tests/test_verkle_snapshot.c
-)
-target_link_libraries(test_verkle_snapshot verkle_snapshot verkle_state)
-add_test(NAME test_verkle_snapshot COMMAND test_verkle_snapshot)
 
 # Test: EVM state management audit
 add_executable(test_evm_state_audit
@@ -530,47 +485,11 @@ target_link_libraries(mpt_fuzz
     -Wl,--no-whole-archive
     pthread snappy)
 
-# Test: Verkle journal (block revert + crash recovery + checkpoint)
-add_executable(test_verkle_journal
-    verkle/tests/test_verkle_journal.c
-)
-target_link_libraries(test_verkle_journal verkle_journal verkle_state)
-add_test(NAME test_verkle_journal COMMAND test_verkle_journal)
-
-# Benchmark: Verkle state scale (block simulation)
-add_executable(bench_verkle_state
-    verkle/tests/bench_verkle_state.c
-)
-target_link_libraries(bench_verkle_state verkle_journal verkle_state verkle_snapshot)
-
-# Test: Verkle flat updater (disk-backed commitment updates)
-add_executable(test_verkle_flat
-    verkle/tests/test_verkle_flat.c
-)
-target_link_libraries(test_verkle_flat verkle_flat verkle)
-add_test(NAME test_verkle_flat COMMAND test_verkle_flat)
-
-# Stress Test: Verkle flat updater (cross-validated, fail-fast)
-add_executable(test_stress_verkle_flat
-    verkle/tests/test_stress_verkle_flat.c
-)
-target_link_libraries(test_stress_verkle_flat verkle_flat verkle verkle_commit_store)
-
 # Benchmark: Verkle flat scale (disk-backed block simulation)
 add_executable(bench_verkle_flat
     verkle/tests/bench_verkle_flat.c
 )
 target_link_libraries(bench_verkle_flat verkle_state)
-
-# Test: Verkle cross-validation (go-verkle reference vectors)
-add_executable(test_verkle_cross_validation
-    verkle/tests/test_verkle_cross_validation.c
-)
-target_link_libraries(test_verkle_cross_validation verkle_flat verkle)
-add_test(NAME test_verkle_cross_validation
-    COMMAND test_verkle_cross_validation
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-)
 
 #==============================================================================
 # Tests — Networking
@@ -977,7 +896,7 @@ message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
 message(STATUS "  - disk_hash (mmap-backed hash table)")
 message(STATUS "  - code_store (content-addressed bytecode storage)")
-message(STATUS "  - verkle (verkle tree with Pedersen commitments)")
+message(STATUS "  - verkle_flat (disk-backed verkle state with Pedersen commitments)")
 message(STATUS "  - evm (Ethereum Virtual Machine)")
 message(STATUS "  - block_executor (block decode + execution)")
 message(STATUS "  - sync (block execution + validation + checkpointing)")

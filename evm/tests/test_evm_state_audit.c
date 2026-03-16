@@ -51,7 +51,7 @@ typedef struct {
 static test_state_t make_state(void) {
     test_state_t ts;
 #ifdef ENABLE_VERKLE
-    ts.vs = verkle_state_create();
+    ts.vs = verkle_state_create_flat("/tmp/test_evm_audit_vf", "/tmp/test_evm_audit_vc");
     ts.es = evm_state_create(ts.vs,
 #else
     ts.es = evm_state_create(NULL,

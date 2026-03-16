@@ -1,8 +1,8 @@
 #ifndef VERKLE_COMMIT_STORE_H
 #define VERKLE_COMMIT_STORE_H
 
-#include "verkle.h"
 #include "disk_hash.h"
+#include "banderwagon.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -77,13 +77,6 @@ bool vcs_get_internal(const verkle_commit_store_t *cs,
                       int depth,
                       const uint8_t *path_prefix,
                       banderwagon_point_t *commitment);
-
-/* =========================================================================
- * Tree Flush
- * ========================================================================= */
-
-/** Walk the in-memory tree and persist all commitments. */
-bool vcs_flush_tree(verkle_commit_store_t *cs, const verkle_tree_t *vt);
 
 /* =========================================================================
  * Durability

@@ -11,8 +11,6 @@ static bool vs_set(verkle_state_t *vs,
                    const uint8_t key[32],
                    const uint8_t value[32])
 {
-    if (vs->type == VS_BACKEND_TREE)
-        return verkle_set(vs->tree, key, value);
     return verkle_flat_set(vs->flat, key, value);
 }
 
@@ -20,17 +18,12 @@ static bool vs_get(const verkle_state_t *vs,
                    const uint8_t key[32],
                    uint8_t value[32])
 {
-    if (vs->type == VS_BACKEND_TREE)
-        return verkle_get(vs->tree, key, value);
     return verkle_flat_get(vs->flat, key, value);
 }
 
 static void vs_root_hash(const verkle_state_t *vs, uint8_t out[32])
 {
-    if (vs->type == VS_BACKEND_TREE)
-        verkle_root_hash(vs->tree, out);
-    else
-        verkle_flat_root_hash(vs->flat, out);
+    verkle_flat_root_hash(vs->flat, out);
 }
 
 /* =========================================================================
@@ -69,21 +62,11 @@ static void set_basic_data(verkle_state_t *vs,
  * Lifecycle
  * ========================================================================= */
 
-verkle_state_t *verkle_state_create(void) {
-    verkle_state_t *vs = calloc(1, sizeof(verkle_state_t));
-    if (!vs) return NULL;
-    vs->type = VS_BACKEND_TREE;
-    vs->tree = verkle_create();
-    if (!vs->tree) { free(vs); return NULL; }
-    return vs;
-}
-
 verkle_state_t *verkle_state_create_flat(const char *value_dir,
                                           const char *commit_dir)
 {
     verkle_state_t *vs = calloc(1, sizeof(verkle_state_t));
     if (!vs) return NULL;
-    vs->type = VS_BACKEND_FLAT;
     vs->flat = verkle_flat_create(value_dir, commit_dir);
     if (!vs->flat) { free(vs); return NULL; }
     return vs;
@@ -94,7 +77,6 @@ verkle_state_t *verkle_state_open_flat(const char *value_dir,
 {
     verkle_state_t *vs = calloc(1, sizeof(verkle_state_t));
     if (!vs) return NULL;
-    vs->type = VS_BACKEND_FLAT;
     vs->flat = verkle_flat_open(value_dir, commit_dir);
     if (!vs->flat) { free(vs); return NULL; }
     return vs;
@@ -102,10 +84,7 @@ verkle_state_t *verkle_state_open_flat(const char *value_dir,
 
 void verkle_state_destroy(verkle_state_t *vs) {
     if (!vs) return;
-    if (vs->type == VS_BACKEND_TREE)
-        verkle_destroy(vs->tree);
-    else
-        verkle_flat_destroy(vs->flat);
+    verkle_flat_destroy(vs->flat);
     free(vs);
 }
 
@@ -113,12 +92,8 @@ void verkle_state_destroy(verkle_state_t *vs) {
  * Backend Accessors
  * ========================================================================= */
 
-verkle_tree_t *verkle_state_get_tree(verkle_state_t *vs) {
-    return (vs->type == VS_BACKEND_TREE) ? vs->tree : NULL;
-}
-
 verkle_flat_t *verkle_state_get_flat(verkle_state_t *vs) {
-    return (vs->type == VS_BACKEND_FLAT) ? vs->flat : NULL;
+    return vs->flat;
 }
 
 /* =========================================================================
@@ -126,26 +101,19 @@ verkle_flat_t *verkle_state_get_flat(verkle_state_t *vs) {
  * ========================================================================= */
 
 bool verkle_state_begin_block(verkle_state_t *vs, uint64_t block_number) {
-    if (vs->type == VS_BACKEND_FLAT)
-        return verkle_flat_begin_block(vs->flat, block_number);
-    return true;
+    return verkle_flat_begin_block(vs->flat, block_number);
 }
 
 bool verkle_state_commit_block(verkle_state_t *vs) {
-    if (vs->type == VS_BACKEND_FLAT)
-        return verkle_flat_commit_block(vs->flat);
-    return true;
+    return verkle_flat_commit_block(vs->flat);
 }
 
 bool verkle_state_revert_block(verkle_state_t *vs) {
-    if (vs->type == VS_BACKEND_FLAT)
-        return verkle_flat_revert_block(vs->flat);
-    return true;
+    return verkle_flat_revert_block(vs->flat);
 }
 
 void verkle_state_sync(verkle_state_t *vs) {
-    if (vs->type == VS_BACKEND_FLAT)
-        verkle_flat_sync(vs->flat);
+    verkle_flat_sync(vs->flat);
 }
 
 /* =========================================================================
