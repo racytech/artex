@@ -375,6 +375,10 @@ typedef struct {
     double   root_stor_ms;
     double   root_acct_ms;
     size_t   root_dirty_count;
+
+    /* Commit-batch profiling (from last root computation) */
+    mpt_commit_stats_t acct_commit;
+    mpt_commit_stats_t stor_commit;
 #endif
 } evm_state_stats_t;
 

@@ -254,6 +254,31 @@ bool mpt_store_verify_hashes(const mpt_store_t *ms);
  * Stats
  * ========================================================================= */
 
+/**
+ * Commit-batch profiling counters. Accumulate across multiple commit_batch
+ * calls (e.g. all storage root commits within one checkpoint).
+ * Call mpt_store_reset_commit_stats() before a profiling window,
+ * mpt_store_get_commit_stats() after.
+ */
+typedef struct {
+    double   keccak_ns;       /** Time spent in keccak hashing */
+    double   load_ns;         /** Time spent loading nodes (cache + disk) */
+    double   check_ns;        /** Time spent on existence checks in write_node */
+    double   delete_ns;       /** Time spent on delete_node / delete_ref */
+    double   encode_ns;       /** Time spent encoding RLP (residual) */
+    double   sort_ns;         /** Time spent sorting dirty entries */
+    uint32_t nodes_hashed;    /** Nodes that required keccak (>=32 byte RLP) */
+    uint32_t nodes_loaded;    /** Nodes loaded from cache or disk */
+    uint32_t load_cache_hits; /** Node loads served from cache */
+    uint32_t load_disk_reads; /** Node loads that hit disk (pread) */
+    uint32_t check_hits;      /** Existence checks that found the node */
+    uint32_t deletes;         /** Nodes deleted (delete_ref calls) */
+    uint32_t commits;         /** Number of commit_batch calls */
+} mpt_commit_stats_t;
+
+void mpt_store_reset_commit_stats(mpt_store_t *ms);
+mpt_commit_stats_t mpt_store_get_commit_stats(const mpt_store_t *ms);
+
 typedef struct {
     uint64_t node_count;      /** Live nodes in the index */
     uint64_t data_file_size;  /** Total .dat file size in bytes */

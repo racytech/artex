@@ -746,10 +746,33 @@ int main(int argc, char **argv) {
 
                 /* Root computation timing */
                 double root_total = ss.root_stor_ms + ss.root_acct_ms;
-                if (root_total > 0.1)
+                if (root_total > 0.1) {
                     printf("  └ root: stor=%.1f ms  acct=%.1f ms  total=%.1f ms (%zu dirty)\n",
                            ss.root_stor_ms, ss.root_acct_ms, root_total,
                            ss.root_dirty_count);
+                    /* Storage trie commit breakdown */
+                    mpt_commit_stats_t sc = ss.stor_commit;
+                    if (sc.commits > 0)
+                        printf("    └ stor: keccak=%.1f  load=%.1f  check=%.1f  del=%.1f  enc=%.1f  sort=%.1f ms"
+                               "  nodes=%u  loaded=%u (cache=%u disk=%u)  chk_hit=%u  del=%u  commits=%u\n",
+                               sc.keccak_ns / 1e6, sc.load_ns / 1e6,
+                               sc.check_ns / 1e6, sc.delete_ns / 1e6,
+                               sc.encode_ns / 1e6, sc.sort_ns / 1e6,
+                               sc.nodes_hashed, sc.nodes_loaded,
+                               sc.load_cache_hits, sc.load_disk_reads,
+                               sc.check_hits, sc.deletes, sc.commits);
+                    /* Account trie commit breakdown */
+                    mpt_commit_stats_t ac = ss.acct_commit;
+                    if (ac.commits > 0)
+                        printf("    └ acct: keccak=%.1f  load=%.1f  check=%.1f  del=%.1f  enc=%.1f  sort=%.1f ms"
+                               "  nodes=%u  loaded=%u (cache=%u disk=%u)  chk_hit=%u  del=%u\n",
+                               ac.keccak_ns / 1e6, ac.load_ns / 1e6,
+                               ac.check_ns / 1e6, ac.delete_ns / 1e6,
+                               ac.encode_ns / 1e6, ac.sort_ns / 1e6,
+                               ac.nodes_hashed, ac.nodes_loaded,
+                               ac.load_cache_hits, ac.load_disk_reads,
+                               ac.check_hits, ac.deletes);
+                }
 
                 /* Background flush timing (from previous checkpoint, joined at this one) */
                 sync_checkpoint_stats_t cs = sync_get_checkpoint_stats(sync);

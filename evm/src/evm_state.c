@@ -212,6 +212,8 @@ struct evm_state {
     double              last_root_stor_ms;
     double              last_root_acct_ms;
     size_t              last_root_dirty_count;
+    mpt_commit_stats_t  last_stor_commit;
+    mpt_commit_stats_t  last_acct_commit;
 #endif
 };
 
@@ -2123,6 +2125,8 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
     s.root_stor_ms     = es->last_root_stor_ms;
     s.root_acct_ms     = es->last_root_acct_ms;
     s.root_dirty_count = es->last_root_dirty_count;
+    s.stor_commit      = es->last_stor_commit;
+    s.acct_commit      = es->last_acct_commit;
 #endif
     return s;
 }
@@ -2638,6 +2642,10 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     if (!es) return root;
 
     if (es->account_mpt) {
+        /* Reset commit stats for this root computation window */
+        mpt_store_reset_commit_stats(es->storage_mpt);
+        mpt_store_reset_commit_stats(es->account_mpt);
+
         struct timespec _rt0, _rt1, _rt2;
         clock_gettime(CLOCK_MONOTONIC, &_rt0);
         compute_all_storage_roots(es);
@@ -2710,6 +2718,8 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
         es->last_root_acct_ms = (_rt2.tv_sec - _rt1.tv_sec) * 1000.0 +
                                 (_rt2.tv_nsec - _rt1.tv_nsec) / 1e6;
         es->last_root_dirty_count = _acct_dirty_count;
+        es->last_stor_commit = mpt_store_get_commit_stats(es->storage_mpt);
+        es->last_acct_commit = mpt_store_get_commit_stats(es->account_mpt);
 
         mpt_store_root(es->account_mpt, root.bytes);
         return root;
