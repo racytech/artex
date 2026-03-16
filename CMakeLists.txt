@@ -63,17 +63,6 @@ add_library(art_database STATIC
     database/src/mem_art.c
 )
 
-# Compact ART — Space-Efficient Index (fixed-size keys/values, arena-allocated)
-add_library(compact_art STATIC
-    database/src/compact_art.c
-)
-
-# ART Store (compact_art-indexed persistent record store)
-add_library(art_store STATIC
-    database/src/art_store.c
-)
-target_link_libraries(art_store compact_art)
-
 # Bloom Filter (probabilistic set membership)
 add_library(bloom_filter STATIC database/src/bloom_filter.c)
 target_link_libraries(bloom_filter m)
@@ -378,49 +367,6 @@ add_executable(bench_mem_art_index
 )
 target_link_libraries(bench_mem_art_index art_database)
 
-# Test: compact_art stress (correctness at scale)
-add_executable(test_stress_compact_art
-    database/tests/test_stress_compact_art.c
-)
-target_link_libraries(test_stress_compact_art compact_art)
-
-# Test: Compact ART Iterator Seek (lower-bound)
-add_executable(test_compact_art_seek
-    database/tests/test_compact_art_seek.c
-)
-target_link_libraries(test_compact_art_seek compact_art)
-add_test(NAME test_compact_art_seek COMMAND test_compact_art_seek)
-
-# Benchmark: compact_art vs mem_art (memory comparison)
-add_executable(bench_compact_art_index
-    database/tests/bench_compact_art_index.c
-)
-target_link_libraries(bench_compact_art_index compact_art art_database)
-
-# Benchmark: per-block merge latency at scale
-add_executable(bench_per_block_merge
-    database/tests/bench_per_block_merge.c
-)
-target_link_libraries(bench_per_block_merge compact_art art_database)
-
-# Benchmark: dual compact_art RSS (accounts 32B + storage 64B)
-add_executable(bench_dual_index
-    database/tests/bench_dual_index.c
-)
-target_link_libraries(bench_dual_index compact_art)
-
-# Benchmark: art_store scale (RAM + disk + throughput at mainnet scale)
-add_executable(bench_art_store_scale
-    database/tests/bench_art_store_scale.c
-)
-target_link_libraries(bench_art_store_scale art_store)
-
-# Stress Test: ART Store (correctness + persistence at scale)
-add_executable(test_stress_art_store
-    database/tests/test_stress_art_store.c
-)
-target_link_libraries(test_stress_art_store art_store)
-
 # Test: Disk Hash (zero-RAM disk-backed hash table)
 add_executable(test_bloom_filter
     database/tests/test_bloom_filter.c
@@ -498,7 +444,7 @@ add_executable(test_verkle_state
 target_link_libraries(test_verkle_state verkle_state)
 add_test(NAME test_verkle_state COMMAND test_verkle_state)
 
-# Test: Verkle commitment store (art_store-backed persistence)
+# Test: Verkle commitment store (disk_hash-backed persistence)
 add_executable(test_verkle_commit_store
     verkle/tests/test_verkle_commit_store.c
 )
@@ -1029,8 +975,6 @@ message(STATUS "  Checkpoint every:${CHECKPOINT_INTERVAL} blocks")
 message(STATUS "")
 message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
-message(STATUS "  - compact_art (space-efficient index ART)")
-message(STATUS "  - art_store (ART-indexed persistent record store)")
 message(STATUS "  - disk_hash (mmap-backed hash table)")
 message(STATUS "  - code_store (content-addressed bytecode storage)")
 message(STATUS "  - verkle (verkle tree with Pedersen commitments)")

@@ -10,7 +10,7 @@
  * Bump arena allocator: all nodes and leaves allocated from a single
  * contiguous buffer. No per-node malloc overhead. O(1) destroy.
  *
- * Node layout matches compact_art: 3-byte header, 4-byte child refs,
+ * Node layout: 3-byte header, 4-byte child refs,
  * 8-byte inline prefix, Node32 with 2×SSE lookup.
  *
  * Dead space (from node growth or value updates) is not reclaimed —
