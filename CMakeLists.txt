@@ -80,6 +80,10 @@ add_library(art_store STATIC
 )
 target_link_libraries(art_store compact_art)
 
+# Bloom Filter (probabilistic set membership)
+add_library(bloom_filter STATIC database/src/bloom_filter.c)
+target_link_libraries(bloom_filter m)
+
 # Disk Hash (mmap-backed hash table)
 add_library(disk_hash STATIC database/src/disk_hash_mmap.c)
 target_link_libraries(disk_hash pthread)
@@ -184,7 +188,7 @@ add_library(mpt_store STATIC
 )
 target_include_directories(mpt_store PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 target_compile_definitions(mpt_store PRIVATE MPT_DEFAULT_CACHE_MB=${MPT_ACCOUNT_CACHE_MB})
-target_link_libraries(mpt_store disk_hash common)
+target_link_libraries(mpt_store disk_hash bloom_filter common)
 
 #==============================================================================
 # Libraries — EVM
@@ -551,7 +555,7 @@ add_library(mpt_store_pic STATIC database/src/mpt_store.c)
 target_include_directories(mpt_store_pic PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 target_compile_definitions(mpt_store_pic PRIVATE MPT_DEFAULT_CACHE_MB=64)
 set_target_properties(mpt_store_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(mpt_store_pic disk_hash common)
+target_link_libraries(mpt_store_pic disk_hash bloom_filter common)
 
 add_library(mem_mpt_pic STATIC database/src/mem_mpt.c)
 set_target_properties(mem_mpt_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)

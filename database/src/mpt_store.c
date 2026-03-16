@@ -18,6 +18,7 @@
 
 #include "mpt_store.h"
 #include "disk_hash.h"
+#include "bloom_filter.h"
 #include "keccak256.h"
 
 #include <stdio.h>
@@ -189,11 +190,17 @@ struct mpt_store {
     char            *dat_path;
     char            *free_path;   /* overflow free list file (.free) */
 
-
+    /* Bloom filter for fast negative lookups in write_node */
+    bloom_filter_t  *bloom;
 
     /* Commit-batch profiling (accumulates across calls, reset manually) */
     mpt_commit_stats_t cstats;
 };
+
+/* Callback for disk_hash_foreach_key → bloom_filter_add */
+static void bloom_populate_cb(const uint8_t *key, void *user_data) {
+    bloom_filter_add((bloom_filter_t *)user_data, key, NODE_HASH_SIZE);
+}
 
 /* =========================================================================
  * Commit stats timing
@@ -714,9 +721,13 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
     ms->cstats.keccak_ns += (double)(cstat_now() - _t0);
     ms->cstats.nodes_hashed++;
 
-    /* Check if already exists in the mmap'd index */
+    /* Check if already exists — bloom filter rejects most misses without
+     * touching the mmap'd disk_hash pages (avoids page faults at scale). */
     uint64_t _chk0 = cstat_now();
-    if (ms->shared) {
+    if (ms->bloom && !bloom_filter_maybe_contains(ms->bloom, out_hash, 32)) {
+        /* Definitely not in index — skip disk_hash lookup */
+        ms->cstats.check_ns += (double)(cstat_now() - _chk0);
+    } else if (ms->shared) {
         /* Shared mode: increment refcount if node already exists */
         node_record_t existing;
         if (disk_hash_get(ms->index, out_hash, &existing)) {
@@ -763,6 +774,10 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
                           .length = (uint32_t)rlp_len,
                           .refcount = 1 };
     disk_hash_put(ms->index, out_hash, &rec);
+
+    /* Add to bloom filter so future checks avoid disk_hash lookup */
+    if (ms->bloom)
+        bloom_filter_add(ms->bloom, out_hash, 32);
 
     ms->live_bytes += rlp_len;
 
@@ -963,6 +978,9 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
 
     write_header_dat(ms);
 
+    /* Bloom filter — empty store, sized for initial growth */
+    ms->bloom = bloom_filter_create(capacity_hint > 0 ? capacity_hint : 100000, 0.01);
+
     return ms;
 }
 
@@ -1048,6 +1066,14 @@ mpt_store_t *mpt_store_open(const char *path) {
     if (ms->free_path)
         read_free_overflow(ms->free_path, ms);
 
+    /* Populate bloom filter from existing index entries */
+    {
+        uint64_t n = disk_hash_count(ms->index);
+        ms->bloom = bloom_filter_create(n > 100000 ? n * 2 : 100000, 0.01);
+        if (ms->bloom)
+            disk_hash_foreach_key(ms->index, bloom_populate_cb, ms->bloom);
+    }
+
     return ms;
 }
 
@@ -1062,6 +1088,7 @@ void mpt_store_destroy(mpt_store_t *ms) {
 
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
         free_list_destroy(&ms->free_lists[i]);
+    bloom_filter_destroy(ms->bloom);
     disk_hash_destroy(ms->index);
     if (ms->data_base && ms->data_base != MAP_FAILED)
         munmap(ms->data_base, ms->data_mapped);
@@ -1109,6 +1136,10 @@ void mpt_store_reset(mpt_store_t *ms) {
     ms->live_bytes = 0;
     memcpy(ms->root_hash, EMPTY_ROOT, 32);
     write_header_dat(ms);
+
+    /* Clear bloom filter */
+    if (ms->bloom)
+        bloom_filter_clear(ms->bloom);
 }
 
 void mpt_store_sync(mpt_store_t *ms) {
