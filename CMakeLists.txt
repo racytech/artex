@@ -665,6 +665,11 @@ if(ENABLE_HISTORY)
 
     add_executable(history_dump tools/history_dump.c)
     target_link_libraries(history_dump block_executor evm common)
+
+    if(ENABLE_VERKLE_BUILD)
+        add_executable(verkle_build tools/verkle_build.c)
+        target_link_libraries(verkle_build block_executor evm verkle_flat verkle_key pedersen common)
+    endif()
 endif()
 
 add_executable(test_uint256_div common/tests/test_uint256_div.c)
