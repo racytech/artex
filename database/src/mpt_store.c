@@ -47,73 +47,6 @@
 static const uint16_t SIZE_CLASSES[NUM_SIZE_CLASSES] = {64, 128, 256, 512, 1024};
 
 
-/* =========================================================================
- * Bloom filter — negative lookup filter for disk_hash existence checks.
- *
- * Eliminates ~97% of random mmap accesses during write_node by quickly
- * confirming "definitely not in store." Uses the keccak hash itself as
- * source of randomness (double hashing: hi = h1 + i*h2).
- *
- * Sized at ~10 bits per expected entry for ~1% FPR with k=7.
- * Never supports removal — deleted nodes become false positives
- * (harmless: falls back to disk_hash_get). Rebuilt on compaction.
- * ========================================================================= */
-
-typedef struct {
-    uint64_t *bits;
-    size_t    n_bits;    /* total bits */
-    uint32_t  k;         /* hash functions (always 7) */
-} bloom_t;
-
-static bloom_t *bloom_create(size_t expected_entries) {
-    if (expected_entries < 1024) expected_entries = 1024;
-    /* ~10 bits per entry → ~1% FPR with k=7 */
-    size_t n_bits = expected_entries * 10;
-    /* Round up to multiple of 64 */
-    n_bits = (n_bits + 63) & ~(size_t)63;
-
-    bloom_t *b = calloc(1, sizeof(bloom_t));
-    if (!b) return NULL;
-    b->n_bits = n_bits;
-    b->k = 7;
-    b->bits = calloc(n_bits / 64, sizeof(uint64_t));
-    if (!b->bits) { free(b); return NULL; }
-    return b;
-}
-
-static void bloom_destroy(bloom_t *b) {
-    if (!b) return;
-    free(b->bits);
-    free(b);
-}
-
-static inline void bloom_add(bloom_t *b, const uint8_t hash[32]) {
-    uint32_t h1, h2;
-    memcpy(&h1, hash, 4);
-    memcpy(&h2, hash + 4, 4);
-    for (uint32_t i = 0; i < b->k; i++) {
-        size_t idx = (h1 + (uint64_t)i * h2) % b->n_bits;
-        b->bits[idx / 64] |= (1ULL << (idx % 64));
-    }
-}
-
-/* disk_hash_foreach_key callback adapter for bloom population */
-static void bloom_add_cb(const uint8_t *key, void *user_data) {
-    bloom_add((bloom_t *)user_data, key);
-}
-
-/* Returns false = definitely not present. true = maybe present. */
-static inline bool bloom_maybe(const bloom_t *b, const uint8_t hash[32]) {
-    uint32_t h1, h2;
-    memcpy(&h1, hash, 4);
-    memcpy(&h2, hash + 4, 4);
-    for (uint32_t i = 0; i < b->k; i++) {
-        size_t idx = (h1 + (uint64_t)i * h2) % b->n_bits;
-        if (!(b->bits[idx / 64] & (1ULL << (idx % 64))))
-            return false;
-    }
-    return true;
-}
 /* Empty trie root = keccak256(RLP("")) = keccak256(0x80) */
 static const uint8_t EMPTY_ROOT[32] = {
     0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
@@ -257,7 +190,6 @@ struct mpt_store {
     char            *free_path;   /* overflow free list file (.free) */
 
 
-    bloom_t         *bloom;      /* negative filter: skip disk_hash on miss */
 
     /* Commit-batch profiling (accumulates across calls, reset manually) */
     mpt_commit_stats_t cstats;
@@ -765,10 +697,6 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
         return 0;
     memcpy(buf, ms->data_base + dat_off, rec.length);
 
-    /* Warm bloom filter with nodes loaded from disk */
-    if (ms->bloom)
-        bloom_add((bloom_t *)ms->bloom, hash);
-
     cs->load_ns += (double)(cstat_now() - _t0);
     cs->nodes_loaded++;
     cs->load_disk_reads++;
@@ -786,26 +714,21 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
     ms->cstats.keccak_ns += (double)(cstat_now() - _t0);
     ms->cstats.nodes_hashed++;
 
-    /* Check if already exists — bloom filter skips expensive disk_hash
-     * lookups for the ~97% of nodes that are definitely new. */
+    /* Check if already exists in the mmap'd index */
     uint64_t _chk0 = cstat_now();
-    bool bloom_hit = ms->bloom && bloom_maybe(ms->bloom, out_hash);
-
     if (ms->shared) {
         /* Shared mode: increment refcount if node already exists */
-        if (bloom_hit) {
-            node_record_t existing;
-            if (disk_hash_get(ms->index, out_hash, &existing)) {
-                existing.refcount++;
-                disk_hash_put(ms->index, out_hash, &existing);
-                ms->cstats.check_ns += (double)(cstat_now() - _chk0);
-                ms->cstats.check_hits++;
-                return true;
-            }
+        node_record_t existing;
+        if (disk_hash_get(ms->index, out_hash, &existing)) {
+            existing.refcount++;
+            disk_hash_put(ms->index, out_hash, &existing);
+            ms->cstats.check_ns += (double)(cstat_now() - _chk0);
+            ms->cstats.check_hits++;
+            return true;
         }
     } else {
         /* Non-shared: refcount always 1 — fast existence check */
-        if (bloom_hit && disk_hash_contains(ms->index, out_hash)) {
+        if (disk_hash_contains(ms->index, out_hash)) {
             ms->cstats.check_ns += (double)(cstat_now() - _chk0);
             ms->cstats.check_hits++;
             return true;
@@ -842,10 +765,6 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
     disk_hash_put(ms->index, out_hash, &rec);
 
     ms->live_bytes += rlp_len;
-
-    /* Add to bloom filter for future lookups */
-    if (ms->bloom)
-        bloom_add(ms->bloom, out_hash);
 
     return true;
 }
@@ -1044,9 +963,6 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
 
     write_header_dat(ms);
 
-    /* Bloom filter — starts empty, populated lazily as nodes are written */
-    ms->bloom = bloom_create(capacity_hint > 0 ? capacity_hint / 4 : 1024);
-
     return ms;
 }
 
@@ -1132,23 +1048,6 @@ mpt_store_t *mpt_store_open(const char *path) {
     if (ms->free_path)
         read_free_overflow(ms->free_path, ms);
 
-    /* Bloom filter — populated from all existing disk_hash keys on open.
-     * Without this, lazily-populated bloom has false negatives for
-     * nodes on disk but not yet seen this session. */
-    uint64_t n = disk_hash_count(index);
-    ms->bloom = bloom_create(n > 1024 ? n : 1024);
-    if (ms->bloom && n > 0) {
-        printf("bloom: populating %lu keys from %s ...", (unsigned long)n, path);
-        fflush(stdout);
-        struct timespec tb0, tb1;
-        clock_gettime(CLOCK_MONOTONIC, &tb0);
-        disk_hash_foreach_key(index, bloom_add_cb, ms->bloom);
-        clock_gettime(CLOCK_MONOTONIC, &tb1);
-        double bloom_ms = (tb1.tv_sec - tb0.tv_sec) * 1000.0 +
-                          (tb1.tv_nsec - tb0.tv_nsec) / 1e6;
-        printf(" done (%.1f ms)\n", bloom_ms);
-    }
-
     return ms;
 }
 
@@ -1161,7 +1060,6 @@ void mpt_store_destroy(mpt_store_t *ms) {
         free(ms->val_pages[i]);
     free(ms->val_pages);
 
-    bloom_destroy(ms->bloom);
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
         free_list_destroy(&ms->free_lists[i]);
     disk_hash_destroy(ms->index);
@@ -1188,12 +1086,6 @@ void mpt_store_reset(mpt_store_t *ms) {
     ms->val_pages = NULL;
     ms->val_page_count = ms->val_page_cap = 0;
     ms->val_page_used = 0;
-
-    /* Reset bloom filter */
-    if (ms->bloom) {
-        size_t nb = ms->bloom->n_bits;
-        memset(ms->bloom->bits, 0, nb / 8);
-    }
 
     /* Clear free lists */
     for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
