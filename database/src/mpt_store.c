@@ -292,7 +292,6 @@ struct mpt_store {
     char            *dat_path;
     char            *free_path;   /* overflow free list file (.free) */
 
-    disk_hash_t     *flush_dh;   /* persistent second disk_hash for bg flush */
 
     bloom_t         *bloom;      /* negative filter: skip disk_hash on miss */
 
@@ -1280,7 +1279,6 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
     ms->idx_path   = idx_path;
     ms->dat_path   = dat_path;
     ms->free_path  = make_path(path, ".free");
-    ms->flush_dh   = disk_hash_open_norecovery(idx_path);
     /* free_heads and free_slot_bytes zeroed by calloc */
     def_init(ms);
 
@@ -1389,7 +1387,6 @@ mpt_store_t *mpt_store_open(const char *path) {
     ms->idx_path   = idx_path;
     ms->dat_path   = dat_path;
     ms->free_path  = make_path(path, ".free");
-    ms->flush_dh   = disk_hash_open_norecovery(idx_path);
     def_init(ms);
 
     /* Load overflow free offsets from .free file */
@@ -1432,7 +1429,6 @@ void mpt_store_destroy(mpt_store_t *ms) {
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
         free_list_destroy(&ms->free_lists[i]);
     disk_hash_destroy(ms->index);
-    disk_hash_destroy(ms->flush_dh);
     if (ms->data_base && ms->data_base != MAP_FAILED)
         munmap(ms->data_base, ms->data_mapped);
     close(ms->data_fd);
@@ -1664,18 +1660,7 @@ void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats) {
         }
     }
 
-    /* 2. Use persistent second disk_hash instance — independent rwlock,
-     *    zero contention with executor. Opened once at create/open time. */
-    disk_hash_t *flush_dh = ms->flush_dh;
-    if (!flush_dh) {
-        fprintf(stderr, "WARNING: mpt_store_flush_bg: no flush_dh, falling back to synchronous flush\n"
-                "  hint: disk_hash_open_norecovery failed at init — check .idx file integrity\n");
-        free(sorted);
-        mpt_store_flush_ex(ms, true);
-        return;
-    }
-
-    /* 3. memcpy node data to mmap'd .dat (sequential offsets)
+    /* 2. memcpy node data to mmap'd .dat (sequential offsets)
      * Note: mpt_store_flush_prepare() must have been called from the main
      * thread before this runs — dat_remap is not safe from bg thread. */
     struct timespec _pw0, _pw1, _pw2;
@@ -1687,7 +1672,7 @@ void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats) {
         memcpy(ms->data_base + PAGE_SIZE + e->offset, e->rlp, e->rlp_len);
     }
 
-    /* 4. disk_hash_put on flush_dh (not ms->index) */
+    /* 3. disk_hash_put on ms->index (mmap — rwlock contention is negligible) */
     clock_gettime(CLOCK_MONOTONIC, &_pw1);
     for (size_t i = 0; i < n; i++) {
         deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
@@ -1695,35 +1680,35 @@ void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats) {
         node_record_t rec = { .offset = e->offset,
                               .length = e->rlp_len,
                               .refcount = e->refcount };
-        disk_hash_put(flush_dh, e->hash, &rec);
+        disk_hash_put(ms->index, e->hash, &rec);
     }
     clock_gettime(CLOCK_MONOTONIC, &_pw2);
     free(sorted);
 
-    /* 5. Apply pending deletes via flush_dh */
+    /* 4. Apply pending deletes */
     for (size_t i = 0; i < ms->def_del_count; i++) {
         node_record_t rec;
-        if (disk_hash_get(flush_dh, ms->def_deletes[i].hash, &rec)) {
+        if (disk_hash_get(ms->index, ms->def_deletes[i].hash, &rec)) {
             if (rec.refcount > 1) {
                 rec.refcount--;
-                disk_hash_put(flush_dh, ms->def_deletes[i].hash, &rec);
+                disk_hash_put(ms->index, ms->def_deletes[i].hash, &rec);
             } else {
                 if (ms->live_bytes >= rec.length)
                     ms->live_bytes -= rec.length;
                 int sc = size_class_for(rec.length);
                 free_list_push(&ms->free_lists[sc], rec.offset);
                 ms->free_slot_bytes += SIZE_CLASSES[sc];
-                disk_hash_delete(flush_dh, ms->def_deletes[i].hash);
+                disk_hash_delete(ms->index, ms->def_deletes[i].hash);
             }
         }
     }
 
-    /* 6. msync + sync */
+    /* 5. msync + sync */
     struct timespec _fs0, _fs1;
     clock_gettime(CLOCK_MONOTONIC, &_fs0);
     write_header_dat(ms);
     msync(ms->data_base, ms->data_mapped, MS_SYNC);
-    disk_hash_sync(flush_dh);
+    disk_hash_sync(ms->index);
     clock_gettime(CLOCK_MONOTONIC, &_fs1);
 
     if (stats) {
@@ -1743,8 +1728,6 @@ void mpt_store_flush_complete(mpt_store_t *ms) {
     if (!ms) return;
     /* Free deferred buffers — safe, called from main thread after bg join */
     def_free_all(ms);
-    /* Refresh executor's disk_hash metadata from disk */
-    disk_hash_refresh(ms->index);
 }
 
 /* =========================================================================

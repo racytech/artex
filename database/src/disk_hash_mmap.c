@@ -290,7 +290,7 @@ disk_hash_t *disk_hash_create(const char *path, uint32_t key_size,
     return dh;
 }
 
-static disk_hash_t *open_internal(const char *path, bool do_recovery) {
+disk_hash_t *disk_hash_open(const char *path) {
     if (!path) return NULL;
 
     int fd = open(path, O_RDWR);
@@ -346,10 +346,10 @@ static disk_hash_t *open_internal(const char *path, bool do_recovery) {
     dh->bucket_count     = hdr.bucket_count;
     dh->entry_count      = hdr.entry_count;
     dh->overflow_count   = hdr.overflow_count;
-    dh->dirty            = do_recovery ? (hdr.dirty != 0) : false;
+    dh->dirty            = (hdr.dirty != 0);
     pthread_rwlock_init(&dh->rwlock, NULL);
 
-    if (do_recovery && dh->dirty) {
+    if (dh->dirty) {
         if (!recover(dh)) {
             munmap(base, file_size);
             close(fd);
@@ -359,14 +359,6 @@ static disk_hash_t *open_internal(const char *path, bool do_recovery) {
     }
 
     return dh;
-}
-
-disk_hash_t *disk_hash_open(const char *path) {
-    return open_internal(path, true);
-}
-
-disk_hash_t *disk_hash_open_norecovery(const char *path) {
-    return open_internal(path, false);
 }
 
 void disk_hash_destroy(disk_hash_t *dh) {
@@ -757,18 +749,4 @@ void disk_hash_sync(disk_hash_t *dh) {
     pthread_rwlock_unlock(&dh->rwlock);
 }
 
-void disk_hash_refresh(disk_hash_t *dh) {
-    if (!dh) return;
-    /* Re-read header from the mmap region (another process may have
-     * written via a separate fd+mmap — MAP_SHARED guarantees coherence). */
-    const disk_hash_header_t *hdr = (const disk_hash_header_t *)dh->base;
-    dh->entry_count    = hdr->entry_count;
-    dh->overflow_count = hdr->overflow_count;
-    dh->dirty          = false;
 
-    /* Remap if overflow pages were added by another instance */
-    size_t needed = PAGE_SIZE +
-        (dh->bucket_count + dh->overflow_count) * (size_t)PAGE_SIZE;
-    if (needed > dh->mapped_size)
-        remap(dh, needed);
-}
