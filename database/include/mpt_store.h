@@ -69,15 +69,14 @@ void mpt_store_reset(mpt_store_t *ms);
 void mpt_store_sync(mpt_store_t *ms);
 
 /**
- * Flush deferred writes to disk. Writes all buffered nodes to .dat,
- * applies pending deletes, syncs both files.
+ * Sync mmap'd data to disk. Writes header, msyncs .dat, syncs .idx.
  * Call at checkpoint time for transactional durability.
  */
 void mpt_store_flush(mpt_store_t *ms);
 
 /**
- * Flush deferred writes. If do_sync is false, writes are buffered in the OS
- * page cache but not fdatasync'd — call mpt_store_sync() separately.
+ * Sync mmap'd data to disk. If do_sync is false, this is a no-op —
+ * call mpt_store_sync() separately when ready.
  */
 void mpt_store_flush_ex(mpt_store_t *ms, bool do_sync);
 
@@ -94,22 +93,15 @@ typedef struct {
 } mpt_flush_stats_t;
 
 /**
- * Background-safe flush. Opens a separate disk_hash instance on the same
- * .idx file so the executor's disk_hash reads are never blocked.
- * Does NOT free the deferred buffer — call mpt_store_flush_complete()
- * from the main thread after the background thread joins.
- * If stats is non-NULL, timing data is stored there instead of printed.
+ * Sync mmap'd data to disk with timing stats.
+ * If stats is non-NULL, timing data is stored there.
  */
-/** Pre-grow mmap before spawning bg flush thread (main thread only). */
+/** No-op — retained for API compatibility. */
 void mpt_store_flush_prepare(mpt_store_t *ms);
 
 void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats);
 
-/**
- * Finalize after background flush: free deferred buffers and refresh
- * the executor's disk_hash metadata from disk. Must be called from the
- * main thread after the background flush thread has joined.
- */
+/** No-op — retained for API compatibility. */
 void mpt_store_flush_complete(mpt_store_t *ms);
 
 /* =========================================================================

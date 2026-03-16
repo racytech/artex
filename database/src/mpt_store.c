@@ -40,8 +40,6 @@
 #define MAX_NIBBLES        64           /* 32-byte key = 64 nibbles */
 #define MAX_NODE_RLP       1024         /* generous upper bound for node RLP */
 #define DIRTY_INIT_CAP     256
-#define DEFERRED_INIT_CAP  256
-#define DEFERRED_BUCKETS   65536  /* hash table buckets for deferred node index */
 
 /* Size-class slot allocator: nodes are padded to the smallest class that fits.
  * Freed slots form intrusive linked lists (next-pointer stored in first 8B). */
@@ -225,20 +223,6 @@ typedef struct {
  * Main struct
  * ========================================================================= */
 
-/* Deferred write buffer entry — node not yet written to disk */
-typedef struct {
-    uint8_t  hash[32];
-    uint8_t *rlp;        /* malloc'd copy of node RLP */
-    uint32_t rlp_len;
-    uint64_t offset;     /* allocated slot (in-memory alloc_slot result) */
-    uint32_t refcount;   /* shared-mode reference count */
-    int      ht_next;    /* next index in hash chain, -1 = end */
-} deferred_entry_t;
-
-typedef struct {
-    uint8_t hash[32];
-    int     ht_next;    /* next index in hash chain, -1 = end */
-} del_entry_t;
 
 struct mpt_store {
     disk_hash_t     *index;
@@ -267,26 +251,6 @@ struct mpt_store {
 #define VAL_PAGE_SIZE 65536
 
     bool             shared;         /* multi-trie mode: skip node deletion */
-
-    /* Deferred write buffer: nodes allocated but not yet pwrite'd to disk.
-     * Flushed to disk on mpt_store_flush() at checkpoint time. */
-    deferred_entry_t *def_entries;
-    size_t            def_count;
-    size_t            def_cap;
-    int               def_ht[DEFERRED_BUCKETS]; /* hash table heads, -1 = empty */
-
-    /* Page-based arena for deferred RLP data — eliminates per-node malloc */
-    uint8_t        **def_rlp_pages;
-    size_t           def_rlp_page_count;
-    size_t           def_rlp_page_cap;
-    size_t           def_rlp_page_used;
-#define DEF_RLP_PAGE_SIZE 65536
-
-    /* Pending deletes: on-disk node hashes to delete at flush time */
-    del_entry_t      *def_deletes;
-    size_t            def_del_count;
-    size_t            def_del_cap;
-    int               def_del_ht[DEFERRED_BUCKETS]; /* hash table for O(1) cancel */
 
     char            *idx_path;
     char            *dat_path;
@@ -776,201 +740,6 @@ static bool decode_node(const uint8_t *rlp, size_t rlp_len, mpt_node_t *node) {
 }
 
 /* =========================================================================
- * Deferred write buffer helpers
- * ========================================================================= */
-
-static void def_init(mpt_store_t *ms) {
-    memset(ms->def_ht, 0xff, sizeof(ms->def_ht));  /* -1 = empty */
-    memset(ms->def_del_ht, 0xff, sizeof(ms->def_del_ht));
-    ms->def_count = 0;
-}
-
-static uint32_t def_bucket(const uint8_t hash[32]) {
-    uint32_t h;
-    memcpy(&h, hash, 4);
-    return h & (DEFERRED_BUCKETS - 1);
-}
-
-static bool def_contains(const mpt_store_t *ms, const uint8_t hash[32]) {
-    uint32_t b = def_bucket(hash);
-    int idx = ms->def_ht[b];
-    while (idx >= 0) {
-        if (memcmp(ms->def_entries[idx].hash, hash, 32) == 0 &&
-            ms->def_entries[idx].rlp != NULL)
-            return true;
-        idx = ms->def_entries[idx].ht_next;
-    }
-    return false;
-}
-
-/* Find deferred entry by hash. Returns NULL if not found or removed. */
-static const deferred_entry_t *def_find(const mpt_store_t *ms,
-                                         const uint8_t hash[32]) {
-    uint32_t b = def_bucket(hash);
-    int idx = ms->def_ht[b];
-    while (idx >= 0) {
-        if (memcmp(ms->def_entries[idx].hash, hash, 32) == 0 &&
-            ms->def_entries[idx].rlp != NULL)
-            return &ms->def_entries[idx];
-        idx = ms->def_entries[idx].ht_next;
-    }
-    return NULL;
-}
-
-/* Mutable version of def_find — for refcount updates. */
-static deferred_entry_t *def_find_mut(mpt_store_t *ms,
-                                       const uint8_t hash[32]) {
-    uint32_t b = def_bucket(hash);
-    int idx = ms->def_ht[b];
-    while (idx >= 0) {
-        if (memcmp(ms->def_entries[idx].hash, hash, 32) == 0 &&
-            ms->def_entries[idx].rlp != NULL)
-            return &ms->def_entries[idx];
-        idx = ms->def_entries[idx].ht_next;
-    }
-    return NULL;
-}
-
-static uint8_t *def_rlp_arena_alloc(mpt_store_t *ms, size_t len) {
-    if (ms->def_rlp_page_count == 0 ||
-        ms->def_rlp_page_used + len > DEF_RLP_PAGE_SIZE) {
-        if (ms->def_rlp_page_count >= ms->def_rlp_page_cap) {
-            size_t nc = ms->def_rlp_page_cap ? ms->def_rlp_page_cap * 2 : 8;
-            uint8_t **np = realloc(ms->def_rlp_pages, nc * sizeof(*np));
-            if (!np) return NULL;
-            ms->def_rlp_pages = np;
-            ms->def_rlp_page_cap = nc;
-        }
-        size_t psz = len > DEF_RLP_PAGE_SIZE ? len : DEF_RLP_PAGE_SIZE;
-        ms->def_rlp_pages[ms->def_rlp_page_count] = malloc(psz);
-        if (!ms->def_rlp_pages[ms->def_rlp_page_count]) return NULL;
-        ms->def_rlp_page_count++;
-        ms->def_rlp_page_used = 0;
-    }
-    uint8_t *ptr = ms->def_rlp_pages[ms->def_rlp_page_count - 1] +
-                   ms->def_rlp_page_used;
-    ms->def_rlp_page_used += len;
-    return ptr;
-}
-
-static bool def_append(mpt_store_t *ms, const uint8_t hash[32],
-                        const uint8_t *rlp, uint32_t rlp_len, uint64_t offset) {
-    if (ms->def_count >= ms->def_cap) {
-        size_t new_cap = ms->def_cap ? ms->def_cap * 2 : DEFERRED_INIT_CAP;
-        deferred_entry_t *p = realloc(ms->def_entries,
-                                       new_cap * sizeof(deferred_entry_t));
-        if (!p) return false;
-        ms->def_entries = p;
-        ms->def_cap = new_cap;
-    }
-    deferred_entry_t *e = &ms->def_entries[ms->def_count];
-    memcpy(e->hash, hash, 32);
-    e->rlp = def_rlp_arena_alloc(ms, rlp_len);
-    if (!e->rlp) return false;
-    memcpy(e->rlp, rlp, rlp_len);
-    e->rlp_len = rlp_len;
-    e->offset = offset;
-    e->refcount = 1;
-
-    uint32_t b = def_bucket(hash);
-    e->ht_next = ms->def_ht[b];
-    ms->def_ht[b] = (int)ms->def_count;
-    ms->def_count++;
-    return true;
-}
-
-/* Remove a deferred entry. Returns true if found and removed.
- * Returns the slot to the free list. */
-static bool def_remove(mpt_store_t *ms, const uint8_t hash[32]) {
-    uint32_t b = def_bucket(hash);
-    int idx = ms->def_ht[b];
-    int *prev = &ms->def_ht[b];
-    while (idx >= 0) {
-        deferred_entry_t *e = &ms->def_entries[idx];
-        if (memcmp(e->hash, hash, 32) == 0 && e->rlp != NULL) {
-            /* Unlink from hash chain */
-            *prev = e->ht_next;
-            /* Return slot to free list */
-            int sc = size_class_for(e->rlp_len);
-            free_list_push(&ms->free_lists[sc], e->offset);
-            ms->free_slot_bytes += SIZE_CLASSES[sc];
-            /* Mark as removed (RLP lives in arena, freed in bulk) */
-            e->rlp = NULL;
-            return true;
-        }
-        prev = &e->ht_next;
-        idx = e->ht_next;
-    }
-    return false;
-}
-
-/* Pending deletes for on-disk nodes — hash-indexed for O(1) cancel */
-static bool def_del_append(mpt_store_t *ms, const uint8_t hash[32]) {
-    if (ms->def_del_count >= ms->def_del_cap) {
-        size_t new_cap = ms->def_del_cap ? ms->def_del_cap * 2 : 64;
-        del_entry_t *p = realloc(ms->def_deletes, new_cap * sizeof(del_entry_t));
-        if (!p) return false;
-        ms->def_deletes = p;
-        ms->def_del_cap = new_cap;
-    }
-    size_t idx = ms->def_del_count++;
-    memcpy(ms->def_deletes[idx].hash, hash, 32);
-    uint32_t bkt = def_bucket(hash);
-    ms->def_deletes[idx].ht_next = ms->def_del_ht[bkt];
-    ms->def_del_ht[bkt] = (int)idx;
-    return true;
-}
-
-/* Cancel a pending delete (when dedup detects the node is still needed). */
-static void def_del_cancel(mpt_store_t *ms, const uint8_t hash[32]) {
-    uint32_t bkt = def_bucket(hash);
-    int *prev = &ms->def_del_ht[bkt];
-    int idx = *prev;
-    while (idx >= 0) {
-        del_entry_t *e = &ms->def_deletes[idx];
-        if (memcmp(e->hash, hash, 32) == 0) {
-            *prev = e->ht_next;
-            /* Swap with last entry to keep array packed */
-            size_t last = ms->def_del_count - 1;
-            if ((size_t)idx != last) {
-                del_entry_t *tail = &ms->def_deletes[last];
-                /* Fix chain pointing to 'last' before overwriting */
-                uint32_t tail_bkt = def_bucket(tail->hash);
-                int *tp = &ms->def_del_ht[tail_bkt];
-                while (*tp >= 0) {
-                    if (*tp == (int)last) { *tp = idx; break; }
-                    tp = &ms->def_deletes[*tp].ht_next;
-                }
-                memcpy(e->hash, tail->hash, 32);
-                e->ht_next = tail->ht_next;
-            }
-            ms->def_del_count--;
-            return;
-        }
-        prev = &e->ht_next;
-        idx = e->ht_next;
-    }
-}
-
-static void def_free_all(mpt_store_t *ms) {
-    free(ms->def_entries);
-    ms->def_entries = NULL;
-    ms->def_count = ms->def_cap = 0;
-    /* Free deferred RLP arena pages */
-    for (size_t i = 0; i < ms->def_rlp_page_count; i++)
-        free(ms->def_rlp_pages[i]);
-    free(ms->def_rlp_pages);
-    ms->def_rlp_pages = NULL;
-    ms->def_rlp_page_count = ms->def_rlp_page_cap = 0;
-    ms->def_rlp_page_used = 0;
-    /* Free pending deletes */
-    free(ms->def_deletes);
-    ms->def_deletes = NULL;
-    ms->def_del_count = ms->def_del_cap = 0;
-    def_init(ms);
-}
-
-/* =========================================================================
  * Node I/O
  * ========================================================================= */
 
@@ -982,17 +751,6 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
     (void)depth;
     uint64_t _t0 = cstat_now();
     mpt_commit_stats_t *cs = (mpt_commit_stats_t *)&ms->cstats;
-
-    /* Check deferred buffer first (nodes written this checkpoint) */
-    const deferred_entry_t *de = def_find(ms, hash);
-    if (de) {
-        if (de->rlp_len <= MAX_NODE_RLP)
-            memcpy(buf, de->rlp, de->rlp_len);
-        cs->load_ns += (double)(cstat_now() - _t0);
-        cs->nodes_loaded++;
-        cs->load_cache_hits++;
-        return de->rlp_len;
-    }
 
     /* Look up in disk_hash index → offset/length */
     node_record_t rec;
@@ -1017,8 +775,9 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
     return rec.length;
 }
 
-/* Write a node to the data file and insert its hash into the index.
+/* Write a node to the mmap'd data file and insert its hash into the index.
  * Uses size-class free lists to reuse deleted slots before appending.
+ * All writes go directly to mmap'd .dat and disk_hash index.
  * Returns true on success. */
 static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
                        uint8_t out_hash[32]) {
@@ -1033,19 +792,7 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
     bool bloom_hit = ms->bloom && bloom_maybe(ms->bloom, out_hash);
 
     if (ms->shared) {
-        /* Shared mode: increment refcount. Do NOT cancel pending deletes —
-         * the delete will correctly decrement at flush time.
-         * Example: refcount=1, delete queued (-1), write increments (+1)
-         *   → at flush: refcount goes 2→1. Net = 1. Correct. */
-        /* Check deferred buffer first (common during same checkpoint) */
-        deferred_entry_t *def = def_find_mut(ms, out_hash);
-        if (def) {
-            def->refcount++;
-            ms->cstats.check_ns += (double)(cstat_now() - _chk0);
-            ms->cstats.check_hits++;
-            return true;
-        }
-        /* Bloom says definitely not on disk → skip disk_hash_get */
+        /* Shared mode: increment refcount if node already exists */
         if (bloom_hit) {
             node_record_t existing;
             if (disk_hash_get(ms->index, out_hash, &existing)) {
@@ -1058,14 +805,7 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         }
     } else {
         /* Non-shared: refcount always 1 — fast existence check */
-        if (def_contains(ms, out_hash)) {
-            ms->cstats.check_ns += (double)(cstat_now() - _chk0);
-            ms->cstats.check_hits++;
-            return true;
-        }
-        /* Bloom says definitely not on disk → skip disk_hash_contains */
         if (bloom_hit && disk_hash_contains(ms->index, out_hash)) {
-            def_del_cancel(ms, out_hash);
             ms->cstats.check_ns += (double)(cstat_now() - _chk0);
             ms->cstats.check_hits++;
             return true;
@@ -1079,7 +819,7 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
     uint64_t write_offset;
 
     if (free_list_pop(&ms->free_lists[sc], &write_offset)) {
-        /* Reusing a freed slot — no disk I/O needed */
+        /* Reusing a freed slot */
         ms->free_slot_bytes -= slot_size;
     } else {
         /* Append at end of data area */
@@ -1087,9 +827,19 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         ms->data_size += slot_size;
     }
 
-    /* Buffer in deferred write buffer (no pwrite, no disk_hash_put) */
-    if (!def_append(ms, out_hash, rlp, (uint32_t)rlp_len, write_offset))
-        return false;
+    /* Grow mmap if needed, then write directly to mmap'd .dat */
+    size_t needed = PAGE_SIZE + write_offset + slot_size;
+    if (needed > ms->data_mapped) {
+        if (!dat_remap(ms, needed))
+            return false;
+    }
+    memcpy(ms->data_base + PAGE_SIZE + write_offset, rlp, rlp_len);
+
+    /* Insert into disk_hash index */
+    node_record_t rec = { .offset = write_offset,
+                          .length = (uint32_t)rlp_len,
+                          .refcount = 1 };
+    disk_hash_put(ms->index, out_hash, &rec);
 
     ms->live_bytes += rlp_len;
 
@@ -1097,38 +847,29 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
     if (ms->bloom)
         bloom_add(ms->bloom, out_hash);
 
-    /* Skip cache insert — new nodes live in the deferred buffer and
-     * load_node_rlp checks def_find before cache.  Inserting here when
-     * the cache is full causes 44K+ LRU evictions per checkpoint with
-     * terrible cache locality (random pointer chasing through 4M entries),
-     * adding seconds of overhead to commit_batch. */
-
     return true;
 }
 
-/* Delete a node: buffer the delete for flush time */
+/* Delete a node: decrement refcount or remove from index immediately */
 static void delete_node(mpt_store_t *ms, const uint8_t hash[32]) {
     uint64_t _d0 = cstat_now();
 
-    /* Check if this is a deferred entry (not on disk yet) */
-    deferred_entry_t *def = def_find_mut(ms, hash);
-    if (def) {
-        if (def->refcount > 1) {
+    node_record_t rec;
+    if (disk_hash_get(ms->index, hash, &rec)) {
+        if (rec.refcount > 1) {
             /* Other references remain — decrement only */
-            def->refcount--;
-            ms->cstats.delete_ns += (double)(cstat_now() - _d0);
-            ms->cstats.deletes++;
-            return;
+            rec.refcount--;
+            disk_hash_put(ms->index, hash, &rec);
+        } else {
+            /* Last reference — free the slot and remove from index */
+            if (ms->live_bytes >= rec.length)
+                ms->live_bytes -= rec.length;
+            int sc = size_class_for(rec.length);
+            free_list_push(&ms->free_lists[sc], rec.offset);
+            ms->free_slot_bytes += SIZE_CLASSES[sc];
+            disk_hash_delete(ms->index, hash);
         }
-        /* Last reference — remove entirely */
-        def_remove(ms, hash);
-        ms->cstats.delete_ns += (double)(cstat_now() - _d0);
-        ms->cstats.deletes++;
-        return;
     }
-
-    /* On-disk node: defer the actual delete until flush */
-    def_del_append(ms, hash);
 
     ms->cstats.delete_ns += (double)(cstat_now() - _d0);
     ms->cstats.deletes++;
@@ -1280,7 +1021,6 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
     ms->dat_path   = dat_path;
     ms->free_path  = make_path(path, ".free");
     /* free_heads and free_slot_bytes zeroed by calloc */
-    def_init(ms);
 
     /* mmap the .dat file */
     size_t init_sz = DAT_INITIAL_MAP_SIZE;
@@ -1387,7 +1127,6 @@ mpt_store_t *mpt_store_open(const char *path) {
     ms->idx_path   = idx_path;
     ms->dat_path   = dat_path;
     ms->free_path  = make_path(path, ".free");
-    def_init(ms);
 
     /* Load overflow free offsets from .free file */
     if (ms->free_path)
@@ -1422,9 +1161,6 @@ void mpt_store_destroy(mpt_store_t *ms) {
         free(ms->val_pages[i]);
     free(ms->val_pages);
 
-    /* Free deferred write buffer */
-    def_free_all(ms);
-
     bloom_destroy(ms->bloom);
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
         free_list_destroy(&ms->free_lists[i]);
@@ -1452,15 +1188,6 @@ void mpt_store_reset(mpt_store_t *ms) {
     ms->val_pages = NULL;
     ms->val_page_count = ms->val_page_cap = 0;
     ms->val_page_used = 0;
-
-    /* Free deferred write buffer */
-    def_free_all(ms);
-    def_init(ms);
-
-    /* Free pending deletes */
-    free(ms->def_deletes);
-    ms->def_deletes = NULL;
-    ms->def_del_count = ms->def_del_cap = 0;
 
     /* Reset bloom filter */
     if (ms->bloom) {
@@ -1506,110 +1233,12 @@ void mpt_store_sync(mpt_store_t *ms) {
         fprintf(stderr, "  └ mpt_sync: %.1f ms\n", _s_ms);
 }
 
-static int def_offset_cmp(const void *a, const void *b) {
-    const deferred_entry_t *ea = *(const deferred_entry_t *const *)a;
-    const deferred_entry_t *eb = *(const deferred_entry_t *const *)b;
-    return (ea->offset > eb->offset) - (ea->offset < eb->offset);
-}
-
 void mpt_store_flush_ex(mpt_store_t *ms, bool do_sync) {
     if (!ms) return;
-
-    /* 1. Collect live entries and sort by offset for sequential I/O */
-    size_t live = 0;
-    size_t total_rlp_bytes = 0;
-    for (size_t i = 0; i < ms->def_count; i++) {
-        if (ms->def_entries[i].rlp) {
-            live++;
-            total_rlp_bytes += ms->def_entries[i].rlp_len;
-        }
-    }
-
-    deferred_entry_t **sorted = NULL;
-    if (live > 0) {
-        sorted = malloc(live * sizeof(*sorted));
-        if (sorted) {
-            size_t j = 0;
-            for (size_t i = 0; i < ms->def_count; i++)
-                if (ms->def_entries[i].rlp)
-                    sorted[j++] = &ms->def_entries[i];
-            qsort(sorted, live, sizeof(*sorted), def_offset_cmp);
-        }
-    }
-
-    /* Ensure mmap covers all data — grow if needed */
-    size_t needed = PAGE_SIZE + ms->data_size;
-    if (needed > ms->data_mapped)
-        dat_remap(ms, needed);
-
-    /* Write sorted entries via mmap memcpy */
-    struct timespec _pw0, _pw1, _pw2;
-    clock_gettime(CLOCK_MONOTONIC, &_pw0);
-    size_t n = sorted ? live : ms->def_count;
-    for (size_t i = 0; i < n; i++) {
-        deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
-        if (!e->rlp) continue;
-
-        memcpy(ms->data_base + PAGE_SIZE + e->offset, e->rlp, e->rlp_len);
-    }
-    clock_gettime(CLOCK_MONOTONIC, &_pw1);
-    for (size_t i = 0; i < n; i++) {
-        deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
-        if (!e->rlp) continue;
-
-        node_record_t rec = { .offset = e->offset,
-                              .length = e->rlp_len,
-                              .refcount = e->refcount };
-        disk_hash_put(ms->index, e->hash, &rec);
-    }
-    clock_gettime(CLOCK_MONOTONIC, &_pw2);
-    free(sorted);
-
-    /* 2. Apply pending deletes (refcount-aware) */
-    for (size_t i = 0; i < ms->def_del_count; i++) {
-        node_record_t rec;
-        if (disk_hash_get(ms->index, ms->def_deletes[i].hash, &rec)) {
-            if (rec.refcount > 1) {
-                /* Other references remain — decrement, keep node */
-                rec.refcount--;
-                disk_hash_put(ms->index, ms->def_deletes[i].hash, &rec);
-            } else {
-                /* Last reference — free the slot */
-                if (ms->live_bytes >= rec.length)
-                    ms->live_bytes -= rec.length;
-                int sc = size_class_for(rec.length);
-                free_list_push(&ms->free_lists[sc], rec.offset);
-                ms->free_slot_bytes += SIZE_CLASSES[sc];
-                disk_hash_delete(ms->index, ms->def_deletes[i].hash);
-            }
-        }
-    }
-
-    /* 3. Free deferred buffers */
-    size_t _del_count = ms->def_del_count;
-    def_free_all(ms);
-
-    double _pw_ms = (_pw1.tv_sec - _pw0.tv_sec) * 1000.0 +
-                    (_pw1.tv_nsec - _pw0.tv_nsec) / 1e6;
-    double _dh_ms = (_pw2.tv_sec - _pw1.tv_sec) * 1000.0 +
-                    (_pw2.tv_nsec - _pw1.tv_nsec) / 1e6;
-
     if (do_sync) {
-        struct timespec _fs0, _fs1;
-        clock_gettime(CLOCK_MONOTONIC, &_fs0);
         write_header_dat(ms);
         msync(ms->data_base, ms->data_mapped, MS_SYNC);
         disk_hash_sync(ms->index);
-        clock_gettime(CLOCK_MONOTONIC, &_fs1);
-        double _fs_ms = (_fs1.tv_sec - _fs0.tv_sec) * 1000.0 +
-                        (_fs1.tv_nsec - _fs0.tv_nsec) / 1e6;
-        if (live > 100)
-            fprintf(stderr, "  └ mpt_flush: %zu writes (%zuKB data), %zu deletes | pwrite=%.1f ms  idx=%.1f ms  fdatasync=%.1f ms\n",
-                    live, total_rlp_bytes / 1024, _del_count, _pw_ms, _dh_ms, _fs_ms);
-    } else {
-        if (live > 100)
-            fprintf(stderr, "  └ mpt_write: %zu writes (%zuKB data), %zu deletes | pwrite=%.1f ms  idx=%.1f ms\n",
-                    live, total_rlp_bytes / 1024, _del_count, _pw_ms, _dh_ms);
     }
 }
 
@@ -1617,118 +1246,26 @@ void mpt_store_flush(mpt_store_t *ms) {
     mpt_store_flush_ex(ms, true);
 }
 
-/* Pre-grow mmap before spawning bg flush thread.
- * Must be called from the main thread — dat_remap uses MREMAP_MAYMOVE
- * which would race with concurrent load_node_rlp reads on data_base. */
-void mpt_store_flush_prepare(mpt_store_t *ms) {
-    if (!ms) return;
-    size_t needed = PAGE_SIZE + ms->data_size;
-    if (needed > ms->data_mapped)
-        dat_remap(ms, needed);
-}
-
-/* =========================================================================
- * Background flush — uses separate disk_hash to avoid rwlock contention
- * ========================================================================= */
+/* No-op — writes go directly to mmap, no pre-grow needed. */
+void mpt_store_flush_prepare(mpt_store_t *ms) { (void)ms; }
 
 void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats) {
     if (!ms) return;
-
-    /* 1. Collect live entries and sort by offset for sequential I/O */
-    size_t live = 0;
-    size_t total_rlp_bytes = 0;
-    for (size_t i = 0; i < ms->def_count; i++) {
-        if (ms->def_entries[i].rlp) {
-            live++;
-            total_rlp_bytes += ms->def_entries[i].rlp_len;
-        }
-    }
-
-    /* Nothing to flush — skip expensive disk_hash_open */
-    if (live == 0 && ms->def_del_count == 0)
-        return;
-
-    deferred_entry_t **sorted = NULL;
-    if (live > 0) {
-        sorted = malloc(live * sizeof(*sorted));
-        if (sorted) {
-            size_t j = 0;
-            for (size_t i = 0; i < ms->def_count; i++)
-                if (ms->def_entries[i].rlp)
-                    sorted[j++] = &ms->def_entries[i];
-            qsort(sorted, live, sizeof(*sorted), def_offset_cmp);
-        }
-    }
-
-    /* 2. memcpy node data to mmap'd .dat (sequential offsets)
-     * Note: mpt_store_flush_prepare() must have been called from the main
-     * thread before this runs — dat_remap is not safe from bg thread. */
-    struct timespec _pw0, _pw1, _pw2;
-    clock_gettime(CLOCK_MONOTONIC, &_pw0);
-    size_t n = sorted ? live : ms->def_count;
-    for (size_t i = 0; i < n; i++) {
-        deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
-        if (!e->rlp) continue;
-        memcpy(ms->data_base + PAGE_SIZE + e->offset, e->rlp, e->rlp_len);
-    }
-
-    /* 3. disk_hash_put on ms->index (mmap — rwlock contention is negligible) */
-    clock_gettime(CLOCK_MONOTONIC, &_pw1);
-    for (size_t i = 0; i < n; i++) {
-        deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
-        if (!e->rlp) continue;
-        node_record_t rec = { .offset = e->offset,
-                              .length = e->rlp_len,
-                              .refcount = e->refcount };
-        disk_hash_put(ms->index, e->hash, &rec);
-    }
-    clock_gettime(CLOCK_MONOTONIC, &_pw2);
-    free(sorted);
-
-    /* 4. Apply pending deletes */
-    for (size_t i = 0; i < ms->def_del_count; i++) {
-        node_record_t rec;
-        if (disk_hash_get(ms->index, ms->def_deletes[i].hash, &rec)) {
-            if (rec.refcount > 1) {
-                rec.refcount--;
-                disk_hash_put(ms->index, ms->def_deletes[i].hash, &rec);
-            } else {
-                if (ms->live_bytes >= rec.length)
-                    ms->live_bytes -= rec.length;
-                int sc = size_class_for(rec.length);
-                free_list_push(&ms->free_lists[sc], rec.offset);
-                ms->free_slot_bytes += SIZE_CLASSES[sc];
-                disk_hash_delete(ms->index, ms->def_deletes[i].hash);
-            }
-        }
-    }
-
-    /* 5. msync + sync */
     struct timespec _fs0, _fs1;
     clock_gettime(CLOCK_MONOTONIC, &_fs0);
     write_header_dat(ms);
     msync(ms->data_base, ms->data_mapped, MS_SYNC);
     disk_hash_sync(ms->index);
     clock_gettime(CLOCK_MONOTONIC, &_fs1);
-
     if (stats) {
-        stats->writes     = live;
-        stats->bytes      = total_rlp_bytes;
-        stats->deletes    = ms->def_del_count;
-        stats->pwrite_ms  = (_pw1.tv_sec - _pw0.tv_sec) * 1000.0 +
-                            (_pw1.tv_nsec - _pw0.tv_nsec) / 1e6;
-        stats->idx_ms     = (_pw2.tv_sec - _pw1.tv_sec) * 1000.0 +
-                            (_pw2.tv_nsec - _pw1.tv_nsec) / 1e6;
-        stats->fsync_ms   = (_fs1.tv_sec - _fs0.tv_sec) * 1000.0 +
-                            (_fs1.tv_nsec - _fs0.tv_nsec) / 1e6;
+        memset(stats, 0, sizeof(*stats));
+        stats->fsync_ms = (_fs1.tv_sec - _fs0.tv_sec) * 1000.0 +
+                          (_fs1.tv_nsec - _fs0.tv_nsec) / 1e6;
     }
 }
 
-void mpt_store_flush_complete(mpt_store_t *ms) {
-    if (!ms) return;
-    /* Free deferred buffers — safe, called from main thread after bg join */
-    def_free_all(ms);
-}
+/* No-op — no deferred buffers to free. */
+void mpt_store_flush_complete(mpt_store_t *ms) { (void)ms; }
 
 /* =========================================================================
  * Root hash
@@ -2826,7 +2363,7 @@ bool mpt_store_compact(mpt_store_t *ms) {
         return false;
     }
 
-    /* Copy root hash and flush deferred writes to disk */
+    /* Copy root hash and sync to disk */
     memcpy(new_ms->root_hash, ms->root_hash, 32);
     mpt_store_flush(new_ms);
 
@@ -2938,9 +2475,7 @@ bool mpt_store_compact_roots(mpt_store_t *ms,
         return false;
     }
 
-    /* Flush deferred writes to disk before swapping files.
-     * write_node() buffers all nodes in def_entries — mpt_store_sync()
-     * only writes the header, so nodes would be lost on file swap. */
+    /* Sync mmap'd data to disk before swapping files */
     mpt_store_flush(new_ms);
 
     /* Swap files */
