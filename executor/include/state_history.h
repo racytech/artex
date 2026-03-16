@@ -117,6 +117,12 @@ struct evm_state;
 void state_history_capture(state_history_t *sh, struct evm_state *es,
                             uint64_t block_number);
 
+/**
+ * Push a pre-built diff to the ring buffer. Non-blocking: drops if full.
+ * The ring takes ownership of diff->accounts and diff->storage on success.
+ */
+void state_history_push(state_history_t *sh, block_diff_t *diff);
+
 /* ── Query API (thread-safe, read-only against consumer) ──────────────── */
 
 /**

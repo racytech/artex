@@ -242,11 +242,18 @@ set(BLOCK_EXECUTOR_SOURCES
 if(ENABLE_HISTORY)
     list(APPEND BLOCK_EXECUTOR_SOURCES executor/src/state_history.c)
 endif()
+if(ENABLE_VERKLE_BUILD)
+    list(APPEND BLOCK_EXECUTOR_SOURCES executor/src/verkle_builder.c)
+endif()
 add_library(block_executor STATIC ${BLOCK_EXECUTOR_SOURCES})
 target_include_directories(block_executor PUBLIC
     ${CMAKE_SOURCE_DIR}/executor/include
 )
-target_link_libraries(block_executor evm mem_mpt common secp256k1 pthread)
+set(BLOCK_EXECUTOR_LIBS evm mem_mpt common secp256k1 pthread)
+if(ENABLE_VERKLE_BUILD)
+    list(APPEND BLOCK_EXECUTOR_LIBS verkle_flat verkle_key pedersen)
+endif()
+target_link_libraries(block_executor ${BLOCK_EXECUTOR_LIBS})
 
 #==============================================================================
 # Libraries — Networking / Portal

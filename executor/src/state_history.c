@@ -555,6 +555,16 @@ void state_history_capture(state_history_t *sh, evm_state_t *es,
     }
 }
 
+void state_history_push(state_history_t *sh, block_diff_t *diff) {
+    if (!sh || !diff) return;
+
+    if (!diff_ring_try_push(&sh->ring, diff)) {
+        fprintf(stderr, "state_history: ring full, dropped diff for block %lu\n",
+                diff->block_number);
+        block_diff_free(diff);
+    }
+}
+
 /* =========================================================================
  * Query API
  * ========================================================================= */

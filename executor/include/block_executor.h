@@ -11,6 +11,9 @@
 #ifdef ENABLE_HISTORY
 typedef struct state_history state_history_t;
 #endif
+#ifdef ENABLE_VERKLE_BUILD
+typedef struct verkle_builder verkle_builder_t;
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -81,6 +84,9 @@ block_result_t block_execute(evm_t *evm,
                              const hash_t *block_hashes
 #ifdef ENABLE_HISTORY
                              , state_history_t *history
+#endif
+#ifdef ENABLE_VERKLE_BUILD
+                             , verkle_builder_t *verkle_builder
 #endif
                              );
 

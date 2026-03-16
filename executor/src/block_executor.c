@@ -2,6 +2,9 @@
 #ifdef ENABLE_HISTORY
 #include "state_history.h"
 #endif
+#ifdef ENABLE_VERKLE_BUILD
+#include "verkle_builder.h"
+#endif
 #include "tx_pipeline.h"
 #include "dao_fork.h"
 #include "tx_decoder.h"
@@ -299,6 +302,9 @@ block_result_t block_execute(evm_t *evm,
                              const hash_t *block_hashes
 #ifdef ENABLE_HISTORY
                              , state_history_t *history
+#endif
+#ifdef ENABLE_VERKLE_BUILD
+                             , verkle_builder_t *verkle_builder
 #endif
                              ) {
     block_result_t result;
@@ -683,10 +689,60 @@ block_result_t block_execute(evm_t *evm,
     /* Finalize state: flush dirty accounts/storage to state_db */
     evm_state_finalize(evm->state);
 
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+    /* Capture state diff before dirty flags are cleared by compute_state_root.
+     * Collect once, push to both consumers independently. */
+    {
+        bool need_diff = false;
 #ifdef ENABLE_HISTORY
-    /* Capture state diff before dirty flags are cleared by compute_state_root */
-    if (history)
-        state_history_capture(history, evm->state, header->number);
+        if (history) need_diff = true;
+#endif
+#ifdef ENABLE_VERKLE_BUILD
+        if (verkle_builder) need_diff = true;
+#endif
+        if (need_diff) {
+            block_diff_t diff;
+            memset(&diff, 0, sizeof(diff));
+            diff.block_number = header->number;
+            evm_state_collect_block_diff(evm->state, &diff);
+
+#ifdef ENABLE_HISTORY
+            if (history) {
+                /* state_history_capture expects to push to its own ring.
+                 * We push a copy so each consumer owns its arrays. */
+                block_diff_t hist_diff = diff;
+                if (diff.account_count > 0) {
+                    hist_diff.accounts = malloc(diff.account_count * sizeof(account_diff_t));
+                    memcpy(hist_diff.accounts, diff.accounts,
+                           diff.account_count * sizeof(account_diff_t));
+                }
+                if (diff.storage_count > 0) {
+                    hist_diff.storage = malloc(diff.storage_count * sizeof(storage_diff_t));
+                    memcpy(hist_diff.storage, diff.storage,
+                           diff.storage_count * sizeof(storage_diff_t));
+                }
+                state_history_push(history, &hist_diff);
+            }
+#endif
+#ifdef ENABLE_VERKLE_BUILD
+            if (verkle_builder) {
+                block_diff_t vb_diff = diff;
+                if (diff.account_count > 0) {
+                    vb_diff.accounts = malloc(diff.account_count * sizeof(account_diff_t));
+                    memcpy(vb_diff.accounts, diff.accounts,
+                           diff.account_count * sizeof(account_diff_t));
+                }
+                if (diff.storage_count > 0) {
+                    vb_diff.storage = malloc(diff.storage_count * sizeof(storage_diff_t));
+                    memcpy(vb_diff.storage, diff.storage,
+                           diff.storage_count * sizeof(storage_diff_t));
+                }
+                verkle_builder_push(verkle_builder, &vb_diff);
+            }
+#endif
+            block_diff_free(&diff);
+        }
+    }
 #endif
 
     /* Compute state root — prune empty accounts post-Spurious Dragon (EIP-161).

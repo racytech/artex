@@ -368,6 +368,9 @@ static void test_executor_smoke(void) {
 #ifdef ENABLE_HISTORY
         , NULL
 #endif
+#ifdef ENABLE_VERKLE_BUILD
+        , NULL
+#endif
         );
 
     printf("\n    gas_used=%lu, tx_count=%zu, success=%d, first_failure=%d\n    ",
@@ -517,6 +520,9 @@ static void test_dao_fork_block_check(void) {
 
     block_result_t result = block_execute(evm, &header, &body, NULL
 #ifdef ENABLE_HISTORY
+        , NULL
+#endif
+#ifdef ENABLE_VERKLE_BUILD
         , NULL
 #endif
         );

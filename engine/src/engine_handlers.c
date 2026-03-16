@@ -585,6 +585,9 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
 #ifdef ENABLE_HISTORY
                 , NULL
 #endif
+#ifdef ENABLE_VERKLE_BUILD
+                , NULL
+#endif
                 );
 
             /* Step 8: Compute state root (MPT path returns zero from block_execute) */

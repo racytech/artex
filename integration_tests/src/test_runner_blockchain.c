@@ -211,6 +211,9 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
 #ifdef ENABLE_HISTORY
             , NULL
 #endif
+#ifdef ENABLE_VERKLE_BUILD
+            , NULL
+#endif
             );
 
         {

@@ -30,6 +30,9 @@
 #ifdef ENABLE_HISTORY
 #include "state_history.h"
 #endif
+#ifdef ENABLE_VERKLE_BUILD
+#include "verkle_builder.h"
+#endif
 #include "uint256.h"
 #include "address.h"
 #include "keccak256.h"
@@ -134,6 +137,9 @@ struct sync {
 
 #ifdef ENABLE_HISTORY
     state_history_t *history;
+#endif
+#ifdef ENABLE_VERKLE_BUILD
+    verkle_builder_t *verkle_builder;
 #endif
 
     /* Persistent background flush thread */
@@ -338,6 +344,10 @@ sync_t *sync_create(const sync_config_t *config) {
         s->config.checkpoint_path = strdup(config->checkpoint_path);
     if (config->history_dir)
         s->config.history_dir = strdup(config->history_dir);
+    if (config->verkle_builder_value_dir)
+        s->config.verkle_builder_value_dir = strdup(config->verkle_builder_value_dir);
+    if (config->verkle_builder_commit_dir)
+        s->config.verkle_builder_commit_dir = strdup(config->verkle_builder_commit_dir);
 
     /* Try to resume from checkpoint */
     checkpoint_t ckpt;
@@ -463,6 +473,19 @@ sync_t *sync_create(const sync_config_t *config) {
     }
 #endif
 
+#ifdef ENABLE_VERKLE_BUILD
+    if (s->config.verkle_builder_value_dir && s->config.verkle_builder_commit_dir) {
+        /* Try open first (resume), fall back to create */
+        s->verkle_builder = verkle_builder_open(s->config.verkle_builder_value_dir,
+                                                 s->config.verkle_builder_commit_dir);
+        if (!s->verkle_builder)
+            s->verkle_builder = verkle_builder_create(s->config.verkle_builder_value_dir,
+                                                       s->config.verkle_builder_commit_dir);
+        if (!s->verkle_builder)
+            fprintf(stderr, "Warning: failed to create verkle builder\n");
+    }
+#endif
+
 #ifdef ENABLE_MPT
     /* Spawn persistent background flush thread.
      * Block SIGINT before pthread_create so the child inherits the blocked
@@ -510,6 +533,8 @@ fail:
     free((char *)s->config.flat_state_path);
     free((char *)s->config.checkpoint_path);
     free((char *)s->config.history_dir);
+    free((char *)s->config.verkle_builder_value_dir);
+    free((char *)s->config.verkle_builder_commit_dir);
     free(s);
     return NULL;
 }
@@ -557,6 +582,9 @@ void sync_destroy(sync_t *sync) {
 #ifdef ENABLE_HISTORY
     if (sync->history) state_history_destroy(sync->history);
 #endif
+#ifdef ENABLE_VERKLE_BUILD
+    if (sync->verkle_builder) verkle_builder_destroy(sync->verkle_builder);
+#endif
 
     free((char *)sync->config.verkle_value_dir);
     free((char *)sync->config.verkle_commit_dir);
@@ -565,6 +593,8 @@ void sync_destroy(sync_t *sync) {
     free((char *)sync->config.flat_state_path);
     free((char *)sync->config.checkpoint_path);
     free((char *)sync->config.history_dir);
+    free((char *)sync->config.verkle_builder_value_dir);
+    free((char *)sync->config.verkle_builder_commit_dir);
     free(sync);
 }
 
@@ -659,6 +689,9 @@ bool sync_execute_block(sync_t *sync,
                                       sync->block_hashes
 #ifdef ENABLE_HISTORY
                                       , sync->history
+#endif
+#ifdef ENABLE_VERKLE_BUILD
+                                      , sync->verkle_builder
 #endif
                                       );
 
@@ -773,6 +806,9 @@ bool sync_execute_block_live(sync_t *sync,
                                       sync->block_hashes
 #ifdef ENABLE_HISTORY
                                       , sync->history
+#endif
+#ifdef ENABLE_VERKLE_BUILD
+                                      , sync->verkle_builder
 #endif
                                       );
 

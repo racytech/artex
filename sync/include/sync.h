@@ -43,6 +43,10 @@ typedef struct {
     /* State history (per-block diff tracking, NULL = disabled) */
     const char *history_dir;
 
+    /* Verkle builder (background verkle state construction, NULL = disabled) */
+    const char *verkle_builder_value_dir;
+    const char *verkle_builder_commit_dir;
+
     /* Behavior */
     uint32_t checkpoint_interval;   /* auto-save every N blocks (0 = never) */
     bool     validate_state_root;   /* compare computed root against header */
