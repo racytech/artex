@@ -3,12 +3,14 @@
  *
  * Two-file design:
  *   <path>.idx — disk_hash index: code_hash (32B) → {offset, length} (12B)
- *   <path>.dat — append-only flat file of raw code bytes
+ *   <path>.dat — mmap'd append-only flat file of raw code bytes
  *
  * Deduplication is free: same code → same hash → disk_hash_contains = true → skip.
- * Thread-safe: reads via pread (lock-free), writes serialized by mutex.
+ * Thread-safe: reads from mmap (lock-free), writes serialized by mutex.
  * Crash-safe: data written before index (orphaned bytes = harmless).
  */
+
+#define _GNU_SOURCE  /* mremap */
 
 #include "../include/code_store.h"
 #include "../include/disk_hash.h"
@@ -19,6 +21,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 /* =========================================================================
  * Constants
@@ -28,6 +32,7 @@
 #define CODE_STORE_VERSION  1
 #define PAGE_SIZE           4096
 #define CODE_HASH_SIZE      32
+#define DAT_INITIAL_MAP_SIZE (4 * 1024 * 1024)  /* 4 MB */
 
 /* =========================================================================
  * On-disk data file header (first 4096 bytes)
@@ -58,7 +63,7 @@ _Static_assert(sizeof(code_record_t) == 12, "code_record_t must be 12 bytes");
  * LRU Code Cache
  *
  * In-memory LRU cache for hot contract bytecode, keyed by code_hash.
- * Eliminates repeated pread() for frequently-called contracts.
+ * Eliminates disk_hash lookup for frequently-called contracts.
  *
  * Layout: flat pre-allocated entry array + hash table + doubly-linked
  * LRU list. All operations O(1). Variable-length code via malloc'd buffers.
@@ -276,31 +281,15 @@ static void ccache_put(code_cache_t *c, const uint8_t hash[32],
  * In-memory structure
  * ========================================================================= */
 
-/* =========================================================================
- * Deferred write buffer
- * ========================================================================= */
-
-typedef struct {
-    uint8_t   hash[32];
-    uint8_t  *code;       /* malloc'd copy (NULL for zero-length code) */
-    uint32_t  code_len;
-    uint64_t  offset;     /* allocated position in data file */
-} code_deferred_t;
-
-#define CODE_DEF_INIT_CAP 32
-
 struct code_store {
     disk_hash_t     *index;         /* code_hash → code_record_t */
-    int              data_fd;       /* append-only flat file */
+    int              data_fd;       /* backing fd for mmap */
+    uint8_t         *data_base;     /* mmap base for .dat file */
+    size_t           data_mapped;   /* current mmap size */
     uint64_t         data_size;     /* current write position (bytes after header) */
-    pthread_mutex_t  write_lock;    /* serialize appends */
+    pthread_mutex_t  write_lock;    /* serialize appends + mremap */
     char            *idx_path;      /* owned, for cleanup */
     char            *dat_path;      /* owned, for cleanup */
-
-    /* Deferred write buffer — flushed at checkpoint */
-    code_deferred_t *def_entries;
-    size_t           def_count;
-    size_t           def_cap;
 
     /* LRU code cache (NULL = disabled) */
     code_cache_t    *cache;
@@ -320,13 +309,12 @@ static char *make_path(const char *base, const char *ext) {
     return p;
 }
 
-static void write_data_header(int fd, uint64_t data_size) {
-    code_store_header_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.magic     = CODE_STORE_MAGIC;
-    hdr.version   = CODE_STORE_VERSION;
-    hdr.data_size = data_size;
-    (void)pwrite(fd, &hdr, PAGE_SIZE, 0);
+/* Write header to mmap'd .dat (first page) */
+static void write_data_header(code_store_t *cs) {
+    code_store_header_t *hdr = (code_store_header_t *)cs->data_base;
+    hdr->magic     = CODE_STORE_MAGIC;
+    hdr->version   = CODE_STORE_VERSION;
+    hdr->data_size = cs->data_size;
 }
 
 static bool read_data_header(int fd, code_store_header_t *hdr) {
@@ -335,59 +323,25 @@ static bool read_data_header(int fd, code_store_header_t *hdr) {
     return true;
 }
 
-/* =========================================================================
- * Deferred buffer helpers
- * ========================================================================= */
+/* Grow the mmap'd .dat file to at least `needed` bytes.
+ * Uses mremap(MREMAP_MAYMOVE) — fast, no munmap+mmap cycle. */
+static bool dat_remap(code_store_t *cs, size_t needed) {
+    /* Double until large enough */
+    size_t new_sz = cs->data_mapped;
+    while (new_sz < needed)
+        new_sz *= 2;
 
-static void def_init(code_store_t *cs) {
-    cs->def_entries = NULL;
-    cs->def_count   = 0;
-    cs->def_cap     = 0;
-}
+    if (ftruncate(cs->data_fd, (off_t)new_sz) != 0)
+        return false;
 
-static const code_deferred_t *def_find(const code_store_t *cs,
-                                        const uint8_t hash[32]) {
-    for (size_t i = 0; i < cs->def_count; i++) {
-        if (memcmp(cs->def_entries[i].hash, hash, 32) == 0)
-            return &cs->def_entries[i];
-    }
-    return NULL;
-}
+    void *p = mremap(cs->data_base, cs->data_mapped, new_sz, MREMAP_MAYMOVE);
+    if (p == MAP_FAILED)
+        return false;
 
-static bool def_append(code_store_t *cs, const uint8_t hash[32],
-                        const uint8_t *code, uint32_t code_len,
-                        uint64_t offset) {
-    if (cs->def_count >= cs->def_cap) {
-        size_t new_cap = cs->def_cap ? cs->def_cap * 2 : CODE_DEF_INIT_CAP;
-        code_deferred_t *tmp = realloc(cs->def_entries,
-                                        new_cap * sizeof(code_deferred_t));
-        if (!tmp) return false;
-        cs->def_entries = tmp;
-        cs->def_cap     = new_cap;
-    }
-    code_deferred_t *e = &cs->def_entries[cs->def_count++];
-    memcpy(e->hash, hash, 32);
-    e->code_len = code_len;
-    e->offset   = offset;
-    if (code_len > 0 && code) {
-        e->code = malloc(code_len);
-        if (!e->code) { cs->def_count--; return false; }
-        memcpy(e->code, code, code_len);
-    } else {
-        e->code = NULL;
-    }
+    cs->data_base   = p;
+    cs->data_mapped = new_sz;
     return true;
 }
-
-static void def_free_all(code_store_t *cs) {
-    for (size_t i = 0; i < cs->def_count; i++)
-        free(cs->def_entries[i].code);
-    free(cs->def_entries);
-    def_init(cs);
-}
-
-/* Forward declaration */
-void code_store_flush(code_store_t *cs);
 
 /* =========================================================================
  * Lifecycle
@@ -413,9 +367,6 @@ code_store_t *code_store_create(const char *path, uint64_t capacity_hint) {
         return NULL;
     }
 
-    /* Write header */
-    write_data_header(data_fd, 0);
-
     code_store_t *cs = calloc(1, sizeof(*cs));
     if (!cs) {
         close(data_fd);
@@ -424,14 +375,36 @@ code_store_t *code_store_create(const char *path, uint64_t capacity_hint) {
         return NULL;
     }
 
+    /* mmap the .dat file */
+    size_t init_sz = DAT_INITIAL_MAP_SIZE;
+    if (ftruncate(data_fd, (off_t)init_sz) != 0) {
+        close(data_fd);
+        disk_hash_destroy(index);
+        free(idx_path); free(dat_path);
+        free(cs);
+        return NULL;
+    }
+    cs->data_base = mmap(NULL, init_sz, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, data_fd, 0);
+    if (cs->data_base == MAP_FAILED) {
+        close(data_fd);
+        disk_hash_destroy(index);
+        free(idx_path); free(dat_path);
+        free(cs);
+        return NULL;
+    }
+    cs->data_mapped = init_sz;
+
     cs->index     = index;
     cs->data_fd   = data_fd;
     cs->data_size = 0;
     cs->idx_path  = idx_path;
     cs->dat_path  = dat_path;
     pthread_mutex_init(&cs->write_lock, NULL);
-    def_init(cs);
     cs->cache = ccache_create(CCACHE_DEFAULT_CAP);
+
+    /* Write header to mmap */
+    write_data_header(cs);
 
     return cs;
 }
@@ -474,13 +447,36 @@ code_store_t *code_store_open(const char *path) {
         return NULL;
     }
 
+    /* mmap the .dat file */
+    struct stat sb;
+    if (fstat(data_fd, &sb) != 0 || sb.st_size < (off_t)PAGE_SIZE) {
+        close(data_fd);
+        disk_hash_destroy(index);
+        free(cs); free(idx_path); free(dat_path);
+        return NULL;
+    }
+    size_t map_sz = (size_t)sb.st_size;
+    if (map_sz < DAT_INITIAL_MAP_SIZE)
+        map_sz = DAT_INITIAL_MAP_SIZE;
+    /* Ensure file is large enough for the mapping */
+    if ((size_t)sb.st_size < map_sz)
+        ftruncate(data_fd, (off_t)map_sz);
+    cs->data_base = mmap(NULL, map_sz, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, data_fd, 0);
+    if (cs->data_base == MAP_FAILED) {
+        close(data_fd);
+        disk_hash_destroy(index);
+        free(cs); free(idx_path); free(dat_path);
+        return NULL;
+    }
+    cs->data_mapped = map_sz;
+
     cs->index     = index;
     cs->data_fd   = data_fd;
     cs->data_size = hdr.data_size;
     cs->idx_path  = idx_path;
     cs->dat_path  = dat_path;
     pthread_mutex_init(&cs->write_lock, NULL);
-    def_init(cs);
     cs->cache = ccache_create(CCACHE_DEFAULT_CAP);
 
     return cs;
@@ -488,10 +484,11 @@ code_store_t *code_store_open(const char *path) {
 
 void code_store_destroy(code_store_t *cs) {
     if (!cs) return;
-    code_store_flush(cs);
     ccache_destroy(cs->cache);
     pthread_mutex_destroy(&cs->write_lock);
     disk_hash_destroy(cs->index);
+    if (cs->data_base && cs->data_base != MAP_FAILED)
+        munmap(cs->data_base, cs->data_mapped);
     close(cs->data_fd);
     free(cs->idx_path);
     free(cs->dat_path);
@@ -507,28 +504,44 @@ bool code_store_put(code_store_t *cs, const uint8_t code_hash[32],
     if (!cs || !code_hash) return false;
     if (code_len > 0 && !code) return false;
 
-    /* Fast path: already exists in deferred buffer or on disk (dedup) */
-    if (def_find(cs, code_hash))
-        return true;
+    /* Fast path: already exists on disk (dedup) */
     if (disk_hash_contains(cs->index, code_hash))
         return true;
 
-    /* Slow path: acquire write lock, double-check, defer */
+    /* Acquire write lock, double-check, then write immediately */
     pthread_mutex_lock(&cs->write_lock);
 
-    if (def_find(cs, code_hash) ||
-        disk_hash_contains(cs->index, code_hash)) {
+    if (disk_hash_contains(cs->index, code_hash)) {
         pthread_mutex_unlock(&cs->write_lock);
         return true;
     }
 
-    /* Allocate offset and buffer in deferred array (no disk I/O) */
+    /* Allocate offset in data region */
     uint64_t offset = cs->data_size;
-    if (!def_append(cs, code_hash, code, code_len, offset)) {
+    cs->data_size += code_len;
+
+    /* Grow mmap if needed */
+    size_t needed = PAGE_SIZE + offset + code_len;
+    if (needed > cs->data_mapped) {
+        if (!dat_remap(cs, needed)) {
+            cs->data_size -= code_len;  /* rollback */
+            pthread_mutex_unlock(&cs->write_lock);
+            return false;
+        }
+    }
+
+    /* Write code bytes directly to mmap'd .dat */
+    if (code_len > 0)
+        memcpy(cs->data_base + PAGE_SIZE + offset, code, code_len);
+
+    /* Insert into disk_hash index — makes it immediately findable */
+    code_record_t rec = { .offset = offset, .length = code_len };
+    if (!disk_hash_put(cs->index, code_hash, &rec)) {
+        fprintf(stderr, "FATAL: code_store disk_hash_put failed\n");
+        cs->data_size -= code_len;  /* rollback */
         pthread_mutex_unlock(&cs->write_lock);
         return false;
     }
-    cs->data_size += code_len;
 
     /* Pre-populate cache so first get() is a hit */
     if (cs->cache && code_len > 0)
@@ -542,24 +555,13 @@ uint32_t code_store_get(const code_store_t *cs, const uint8_t code_hash[32],
                         uint8_t *buf, uint32_t buf_len) {
     if (!cs || !code_hash) return 0;
 
-    /* Check deferred buffer first */
-    const code_deferred_t *def = def_find(cs, code_hash);
-    if (def) {
-        if (buf_len < def->code_len)
-            return def->code_len;
-        if (def->code_len > 0 && buf && def->code)
-            memcpy(buf, def->code, def->code_len);
-        return def->code_len;
-    }
-
     /* Check LRU cache */
     if (cs->cache) {
-        code_cache_t *cc = cs->cache;
-        uint32_t cached = ccache_get(cc, code_hash, buf, buf_len);
+        uint32_t cached = ccache_get(cs->cache, code_hash, buf, buf_len);
         if (cached > 0) return cached;
     }
 
-    /* Fall back to disk */
+    /* Look up in disk_hash index */
     code_record_t rec;
     if (!disk_hash_get(cs->index, code_hash, &rec))
         return 0;
@@ -568,12 +570,12 @@ uint32_t code_store_get(const code_store_t *cs, const uint8_t code_hash[32],
     if (buf_len < rec.length)
         return rec.length;
 
-    /* Read code from data file */
+    /* Read code from mmap'd data file */
     if (rec.length > 0 && buf) {
-        ssize_t n = pread(cs->data_fd, buf, rec.length,
-                          (off_t)(PAGE_SIZE + rec.offset));
-        if (n != (ssize_t)rec.length)
-            return 0;  /* I/O error */
+        size_t dat_off = PAGE_SIZE + rec.offset;
+        if (dat_off + rec.length > cs->data_mapped)
+            return 0;  /* out of bounds — corrupt record */
+        memcpy(buf, cs->data_base + dat_off, rec.length);
 
         /* Insert into cache for future lookups */
         if (cs->cache)
@@ -585,15 +587,11 @@ uint32_t code_store_get(const code_store_t *cs, const uint8_t code_hash[32],
 
 bool code_store_contains(const code_store_t *cs, const uint8_t code_hash[32]) {
     if (!cs || !code_hash) return false;
-    if (def_find(cs, code_hash)) return true;
     return disk_hash_contains(cs->index, code_hash);
 }
 
 uint32_t code_store_get_size(const code_store_t *cs, const uint8_t code_hash[32]) {
     if (!cs || !code_hash) return 0;
-
-    const code_deferred_t *def = def_find(cs, code_hash);
-    if (def) return def->code_len;
 
     /* Check LRU cache (avoids disk_hash index lookup) */
     if (cs->cache) {
@@ -613,43 +611,15 @@ uint32_t code_store_get_size(const code_store_t *cs, const uint8_t code_hash[32]
 
 void code_store_sync(code_store_t *cs) {
     if (!cs) return;
-    /* Write data header with current data_size */
-    write_data_header(cs->data_fd, cs->data_size);
-    fsync(cs->data_fd);
-    /* Sync disk_hash index */
+    write_data_header(cs);
+    msync(cs->data_base, cs->data_mapped, MS_SYNC);
     disk_hash_sync(cs->index);
 }
 
 void code_store_flush(code_store_t *cs) {
     if (!cs) return;
-
-    /* Write all deferred entries to disk */
-    for (size_t i = 0; i < cs->def_count; i++) {
-        code_deferred_t *e = &cs->def_entries[i];
-
-        /* Write code bytes to .dat */
-        if (e->code_len > 0 && e->code) {
-            ssize_t written = pwrite(cs->data_fd, e->code, e->code_len,
-                                     (off_t)(PAGE_SIZE + e->offset));
-            if (written < 0 || (size_t)written != e->code_len) {
-                fprintf(stderr, "FATAL: code_store pwrite failed: %zd/%zu bytes\n"
-                        "  hint: disk full or I/O error\n",
-                        written, e->code_len);
-            }
-        }
-
-        /* Insert index entry */
-        code_record_t rec = { .offset = e->offset, .length = e->code_len };
-        if (!disk_hash_put(cs->index, e->hash, &rec)) {
-            fprintf(stderr, "FATAL: code_store disk_hash_put failed\n"
-                    "  hint: index may be corrupt or disk full\n");
-        }
-    }
-
-    /* Free deferred buffer */
-    def_free_all(cs);
-
-    /* Sync to disk */
+    /* All writes are immediate (mmap + disk_hash_put in code_store_put).
+     * Flush just syncs the header and pages to disk. */
     code_store_sync(cs);
 }
 
@@ -658,7 +628,7 @@ void code_store_flush(code_store_t *cs) {
  * ========================================================================= */
 
 uint64_t code_store_count(const code_store_t *cs) {
-    return cs ? disk_hash_count(cs->index) + cs->def_count : 0;
+    return cs ? disk_hash_count(cs->index) : 0;
 }
 
 /* =========================================================================

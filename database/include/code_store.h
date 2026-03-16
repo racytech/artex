@@ -17,9 +17,9 @@
  *   - Content-addressed: same code → same hash → stored once (free dedup)
  *   - Write-once: code is immutable after deployment, never updated/deleted
  *   - Variable-length: codes range from 0 to ~24KB
- *   - Thread-safe: reads are lock-free (pread), writes serialized by mutex
+ *   - Thread-safe: reads from mmap (lock-free), writes serialized by mutex
  *
- * File layout (data file):
+ * File layout (data file, mmap'd MAP_SHARED):
  *   [Header: 4096 bytes]
  *     magic[4] "CDST" | version[4] 1 | data_size[8] | reserved[4080]
  *   [Code region: offset 4096+]
@@ -99,9 +99,9 @@ uint32_t code_store_get_size(const code_store_t *cs, const uint8_t code_hash[32]
 void code_store_sync(code_store_t *cs);
 
 /**
- * Flush deferred writes to disk and sync.
- * Writes all buffered code entries to .dat + .idx, then syncs.
- * Call at checkpoint time for transactional durability.
+ * Sync mmap'd data and index to disk.
+ * All writes are immediate (mmap), so this just ensures durability.
+ * Call at checkpoint time.
  */
 void code_store_flush(code_store_t *cs);
 
