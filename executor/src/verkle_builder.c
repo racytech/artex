@@ -66,63 +66,61 @@ static bool ring_pop(diff_ring_t *ring, block_diff_t *out,
 /* =========================================================================
  * Diff → Verkle conversion
  *
- * For each account diff: update basic_data (nonce + balance) and code_hash.
- * For each storage diff: update the storage slot value.
- *
- * We only write new_* values — the verkle tree doesn't need old values.
+ * For each address group: update basic_data (nonce + balance), code_hash,
+ * and storage slots. Only writes fields that actually changed (field_mask).
  * ========================================================================= */
 
-static void apply_account_diff(verkle_flat_t *vf, const account_diff_t *a) {
-    const uint8_t *addr = a->addr.bytes;
+static void apply_group(verkle_flat_t *vf, const addr_diff_t *g) {
+    const uint8_t *addr = g->addr.bytes;
 
-    /* Pack basic data: version(1) + reserved(4) + code_size(3) + nonce(8) + balance(16) = 32 */
-    uint8_t basic_data[32];
-    uint8_t basic_key[32];
-    verkle_account_basic_data_key(basic_key, addr);
+    /* Update basic_data if nonce or balance changed */
+    if (g->field_mask & (FIELD_NONCE | FIELD_BALANCE)) {
+        uint8_t basic_data[32];
+        uint8_t basic_key[32];
+        verkle_account_basic_data_key(basic_key, addr);
 
-    /* Read existing basic data (preserves version and code_size) */
-    if (!verkle_flat_get(vf, basic_key, basic_data))
-        memset(basic_data, 0, 32);
+        if (!verkle_flat_get(vf, basic_key, basic_data))
+            memset(basic_data, 0, 32);
 
-    /* Write nonce (8-byte BE at offset 8) */
-    uint64_t nonce = a->new_nonce;
-    for (int i = 7; i >= 0; i--) {
-        basic_data[VERKLE_BASIC_DATA_NONCE_OFFSET + i] = (uint8_t)(nonce & 0xFF);
-        nonce >>= 8;
+        if (g->field_mask & FIELD_NONCE) {
+            uint64_t nonce = g->nonce;
+            for (int i = 7; i >= 0; i--) {
+                basic_data[VERKLE_BASIC_DATA_NONCE_OFFSET + i] = (uint8_t)(nonce & 0xFF);
+                nonce >>= 8;
+            }
+        }
+
+        if (g->field_mask & FIELD_BALANCE) {
+            uint8_t bal_be[32];
+            uint256_to_bytes(&g->balance, bal_be);
+            for (int i = 0; i < VERKLE_BASIC_DATA_BALANCE_SIZE; i++)
+                basic_data[31 - i] = bal_be[i];
+        }
+
+        verkle_flat_set(vf, basic_key, basic_data);
     }
 
-    /* Write balance (16-byte BE at offset 16, from uint256 LE) */
-    uint8_t bal_be[32];
-    uint256_to_bytes(&a->new_balance, bal_be);
-    for (int i = 0; i < VERKLE_BASIC_DATA_BALANCE_SIZE; i++)
-        basic_data[31 - i] = bal_be[i];
+    /* Code hash — only if changed */
+    if (g->field_mask & FIELD_CODE_HASH) {
+        uint8_t code_hash_key[32];
+        verkle_account_code_hash_key(code_hash_key, addr);
+        verkle_flat_set(vf, code_hash_key, g->code_hash.bytes);
+    }
 
-    verkle_flat_set(vf, basic_key, basic_data);
-
-    /* Code hash (raw 32 bytes at suffix 1) */
-    uint8_t code_hash_key[32];
-    verkle_account_code_hash_key(code_hash_key, addr);
-    verkle_flat_set(vf, code_hash_key, a->new_code_hash.bytes);
-}
-
-static void apply_storage_diff(verkle_flat_t *vf, const storage_diff_t *s) {
-    uint8_t key[32];
-    uint8_t slot_le[32], val_le[32];
-
-    /* Convert slot and value to LE bytes for key derivation */
-    uint256_to_bytes(&s->slot, slot_le);
-    uint256_to_bytes(&s->new_value, val_le);
-
-    verkle_storage_key(key, s->addr.bytes, slot_le);
-    verkle_flat_set(vf, key, val_le);
+    /* Storage slots */
+    for (uint16_t j = 0; j < g->slot_count; j++) {
+        uint8_t key[32];
+        uint8_t slot_le[32], val_le[32];
+        uint256_to_bytes(&g->slots[j].slot, slot_le);
+        uint256_to_bytes(&g->slots[j].value, val_le);
+        verkle_storage_key(key, addr, slot_le);
+        verkle_flat_set(vf, key, val_le);
+    }
 }
 
 static void apply_diff(verkle_flat_t *vf, const block_diff_t *diff) {
-    for (uint32_t i = 0; i < diff->account_count; i++)
-        apply_account_diff(vf, &diff->accounts[i]);
-
-    for (uint32_t i = 0; i < diff->storage_count; i++)
-        apply_storage_diff(vf, &diff->storage[i]);
+    for (uint16_t i = 0; i < diff->group_count; i++)
+        apply_group(vf, &diff->groups[i]);
 }
 
 /* =========================================================================

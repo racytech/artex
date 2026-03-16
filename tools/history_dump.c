@@ -22,7 +22,6 @@ static void print_address(const address_t *addr) {
 static void print_uint256(const uint256_t *v) {
     uint8_t buf[32];
     uint256_to_bytes(v, buf);
-    /* Skip leading zeros */
     int start = 0;
     while (start < 31 && buf[start] == 0) start++;
     printf("0x");
@@ -36,50 +35,45 @@ static void print_hash(const hash_t *h) {
 }
 
 static void print_diff(const block_diff_t *diff) {
-    printf("Block %lu: %u accounts, %u storage slots\n",
-           diff->block_number, diff->account_count, diff->storage_count);
+    /* Count total slots across groups */
+    uint32_t total_slots = 0;
+    for (uint16_t i = 0; i < diff->group_count; i++)
+        total_slots += diff->groups[i].slot_count;
 
-    for (uint32_t i = 0; i < diff->account_count; i++) {
-        const account_diff_t *a = &diff->accounts[i];
-        printf("  Account ");
-        print_address(&a->addr);
+    printf("Block %lu: %u address groups, %u storage slots\n",
+           diff->block_number, diff->group_count, total_slots);
 
-        if (a->flags & ACCT_DIFF_CREATED) printf(" [CREATED]");
-        if (a->flags & ACCT_DIFF_DESTRUCTED) printf(" [DESTRUCTED]");
+    for (uint16_t i = 0; i < diff->group_count; i++) {
+        const addr_diff_t *g = &diff->groups[i];
+        printf("  ");
+        print_address(&g->addr);
+
+        if (g->flags & ACCT_DIFF_CREATED) printf(" [CREATED]");
+        if (g->flags & ACCT_DIFF_DESTRUCTED) printf(" [DESTRUCTED]");
         printf("\n");
 
-        if (a->old_nonce != a->new_nonce)
-            printf("    nonce:   %lu -> %lu\n", a->old_nonce, a->new_nonce);
+        if (g->field_mask & FIELD_NONCE)
+            printf("    nonce:   %lu\n", g->nonce);
 
-        if (!uint256_is_equal(&a->old_balance, &a->new_balance)) {
+        if (g->field_mask & FIELD_BALANCE) {
             printf("    balance: ");
-            print_uint256(&a->old_balance);
-            printf(" -> ");
-            print_uint256(&a->new_balance);
+            print_uint256(&g->balance);
             printf("\n");
         }
 
-        if (memcmp(a->old_code_hash.bytes, a->new_code_hash.bytes, 32) != 0) {
+        if (g->field_mask & FIELD_CODE_HASH) {
             printf("    code:    ");
-            print_hash(&a->old_code_hash);
-            printf("\n          -> ");
-            print_hash(&a->new_code_hash);
+            print_hash(&g->code_hash);
             printf("\n");
         }
-    }
 
-    for (uint32_t i = 0; i < diff->storage_count; i++) {
-        const storage_diff_t *s = &diff->storage[i];
-        printf("  Storage ");
-        print_address(&s->addr);
-        printf(" slot ");
-        print_uint256(&s->slot);
-        printf("\n");
-        printf("    ");
-        print_uint256(&s->old_value);
-        printf(" -> ");
-        print_uint256(&s->new_value);
-        printf("\n");
+        for (uint16_t j = 0; j < g->slot_count; j++) {
+            printf("    slot ");
+            print_uint256(&g->slots[j].slot);
+            printf(" = ");
+            print_uint256(&g->slots[j].value);
+            printf("\n");
+        }
     }
 }
 
@@ -106,38 +100,37 @@ int main(int argc, char **argv) {
     printf("History range: blocks %lu to %lu (%lu blocks)\n\n", first, last, last - first + 1);
 
     if (argc == 2) {
-        /* Summary mode: scan all blocks and print stats */
-        uint64_t total_accts = 0, total_slots = 0;
-        uint64_t blocks_with_accts = 0, blocks_with_slots = 0;
-        uint64_t max_accts = 0, max_slots = 0;
-        uint64_t max_accts_block = 0, max_slots_block = 0;
+        /* Summary mode */
+        uint64_t total_groups = 0, total_slots = 0;
+        uint64_t max_groups = 0, max_slots = 0;
+        uint64_t max_groups_block = 0, max_slots_block = 0;
 
         for (uint64_t bn = first; bn <= last; bn++) {
             block_diff_t diff;
             if (!state_history_get_diff(sh, bn, &diff)) continue;
 
-            total_accts += diff.account_count;
-            total_slots += diff.storage_count;
-            if (diff.account_count > 0) blocks_with_accts++;
-            if (diff.storage_count > 0) blocks_with_slots++;
-            if (diff.account_count > max_accts) {
-                max_accts = diff.account_count;
-                max_accts_block = bn;
+            uint32_t block_slots = 0;
+            for (uint16_t i = 0; i < diff.group_count; i++)
+                block_slots += diff.groups[i].slot_count;
+
+            total_groups += diff.group_count;
+            total_slots += block_slots;
+            if (diff.group_count > max_groups) {
+                max_groups = diff.group_count;
+                max_groups_block = bn;
             }
-            if (diff.storage_count > max_slots) {
-                max_slots = diff.storage_count;
+            if (block_slots > max_slots) {
+                max_slots = block_slots;
                 max_slots_block = bn;
             }
             block_diff_free(&diff);
         }
 
         printf("Stats:\n");
-        printf("  Total account diffs:  %lu\n", total_accts);
-        printf("  Total storage diffs:  %lu\n", total_slots);
-        printf("  Blocks with account changes: %lu / %lu\n", blocks_with_accts, last - first + 1);
-        printf("  Blocks with storage changes: %lu / %lu\n", blocks_with_slots, last - first + 1);
-        printf("  Max accounts in one block: %lu (block %lu)\n", max_accts, max_accts_block);
-        printf("  Max storage in one block:  %lu (block %lu)\n", max_slots, max_slots_block);
+        printf("  Total address groups: %lu\n", total_groups);
+        printf("  Total storage slots:  %lu\n", total_slots);
+        printf("  Max groups in one block: %lu (block %lu)\n", max_groups, max_groups_block);
+        printf("  Max slots in one block:  %lu (block %lu)\n", max_slots, max_slots_block);
     } else {
         /* Dump specific block(s) */
         uint64_t start = (uint64_t)atoll(argv[2]);

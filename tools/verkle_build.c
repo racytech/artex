@@ -49,54 +49,54 @@ static void sigint_handler(int sig) {
  * Diff → Verkle conversion (same logic as verkle_builder.c)
  * ========================================================================= */
 
-static void apply_account_diff(verkle_flat_t *vf, const account_diff_t *a) {
-    const uint8_t *addr = a->addr.bytes;
+static void apply_group(verkle_flat_t *vf, const addr_diff_t *g) {
+    const uint8_t *addr = g->addr.bytes;
 
-    /* basic_data: version(1) + reserved(4) + code_size(3) + nonce(8) + balance(16) = 32 */
-    uint8_t basic_data[32];
-    uint8_t basic_key[32];
-    verkle_account_basic_data_key(basic_key, addr);
+    if (g->field_mask & (FIELD_NONCE | FIELD_BALANCE)) {
+        uint8_t basic_data[32];
+        uint8_t basic_key[32];
+        verkle_account_basic_data_key(basic_key, addr);
 
-    if (!verkle_flat_get(vf, basic_key, basic_data))
-        memset(basic_data, 0, 32);
+        if (!verkle_flat_get(vf, basic_key, basic_data))
+            memset(basic_data, 0, 32);
 
-    /* Nonce (8-byte BE at offset 8) */
-    uint64_t nonce = a->new_nonce;
-    for (int i = 7; i >= 0; i--) {
-        basic_data[VERKLE_BASIC_DATA_NONCE_OFFSET + i] = (uint8_t)(nonce & 0xFF);
-        nonce >>= 8;
+        if (g->field_mask & FIELD_NONCE) {
+            uint64_t nonce = g->nonce;
+            for (int i = 7; i >= 0; i--) {
+                basic_data[VERKLE_BASIC_DATA_NONCE_OFFSET + i] = (uint8_t)(nonce & 0xFF);
+                nonce >>= 8;
+            }
+        }
+
+        if (g->field_mask & FIELD_BALANCE) {
+            uint8_t bal_be[32];
+            uint256_to_bytes(&g->balance, bal_be);
+            for (int i = 0; i < VERKLE_BASIC_DATA_BALANCE_SIZE; i++)
+                basic_data[31 - i] = bal_be[i];
+        }
+
+        verkle_flat_set(vf, basic_key, basic_data);
     }
 
-    /* Balance (16-byte BE at offset 16, from uint256 LE) */
-    uint8_t bal_be[32];
-    uint256_to_bytes(&a->new_balance, bal_be);
-    for (int i = 0; i < VERKLE_BASIC_DATA_BALANCE_SIZE; i++)
-        basic_data[31 - i] = bal_be[i];
+    if (g->field_mask & FIELD_CODE_HASH) {
+        uint8_t code_hash_key[32];
+        verkle_account_code_hash_key(code_hash_key, addr);
+        verkle_flat_set(vf, code_hash_key, g->code_hash.bytes);
+    }
 
-    verkle_flat_set(vf, basic_key, basic_data);
-
-    /* Code hash */
-    uint8_t code_hash_key[32];
-    verkle_account_code_hash_key(code_hash_key, addr);
-    verkle_flat_set(vf, code_hash_key, a->new_code_hash.bytes);
-}
-
-static void apply_storage_diff(verkle_flat_t *vf, const storage_diff_t *s) {
-    uint8_t key[32];
-    uint8_t slot_le[32], val_le[32];
-
-    uint256_to_bytes(&s->slot, slot_le);
-    uint256_to_bytes(&s->new_value, val_le);
-
-    verkle_storage_key(key, s->addr.bytes, slot_le);
-    verkle_flat_set(vf, key, val_le);
+    for (uint16_t j = 0; j < g->slot_count; j++) {
+        uint8_t key[32];
+        uint8_t slot_le[32], val_le[32];
+        uint256_to_bytes(&g->slots[j].slot, slot_le);
+        uint256_to_bytes(&g->slots[j].value, val_le);
+        verkle_storage_key(key, addr, slot_le);
+        verkle_flat_set(vf, key, val_le);
+    }
 }
 
 static void apply_diff(verkle_flat_t *vf, const block_diff_t *diff) {
-    for (uint32_t i = 0; i < diff->account_count; i++)
-        apply_account_diff(vf, &diff->accounts[i]);
-    for (uint32_t i = 0; i < diff->storage_count; i++)
-        apply_storage_diff(vf, &diff->storage[i]);
+    for (uint16_t i = 0; i < diff->group_count; i++)
+        apply_group(vf, &diff->groups[i]);
 }
 
 /* =========================================================================
@@ -194,8 +194,8 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
     uint64_t blocks_done = 0;
-    uint64_t total_accounts = 0;
-    uint64_t total_storage = 0;
+    uint64_t total_groups = 0;
+    uint64_t total_slots = 0;
     for (uint64_t bn = start_block; bn <= end_block && !g_stop; bn++) {
         block_diff_t diff;
         if (!state_history_get_diff(sh, bn, &diff)) {
@@ -207,8 +207,9 @@ int main(int argc, char **argv) {
         apply_diff(vf, &diff);
         verkle_flat_commit_block(vf);
 
-        total_accounts += diff.account_count;
-        total_storage  += diff.storage_count;
+        total_groups += diff.group_count;
+        for (uint16_t i = 0; i < diff.group_count; i++)
+            total_slots += diff.groups[i].slot_count;
         block_diff_free(&diff);
         blocks_done++;
 
@@ -227,9 +228,9 @@ int main(int argc, char **argv) {
             int eta_m = (int)((eta_s - eta_h * 3600) / 60);
 
             printf("\r  block %lu  |  %lu done  |  %.0f blk/s  |  "
-                   "accts=%lu  slots=%lu  |  ETA %dh%02dm   ",
+                   "groups=%lu  slots=%lu  |  ETA %dh%02dm   ",
                    bn, blocks_done, bps,
-                   total_accounts, total_storage, eta_h, eta_m);
+                   total_groups, total_slots, eta_h, eta_m);
             fflush(stdout);
         }
     }
@@ -252,8 +253,8 @@ int main(int argc, char **argv) {
                      (t_now.tv_nsec - t_start.tv_nsec) / 1e9;
     printf("\nDone: %lu blocks in %.1fs (%.0f blk/s)\n",
            blocks_done, total_s, blocks_done / total_s);
-    printf("  Account diffs applied: %lu\n", total_accounts);
-    printf("  Storage diffs applied: %lu\n", total_storage);
+    printf("  Address groups applied: %lu\n", total_groups);
+    printf("  Storage slots applied: %lu\n", total_slots);
 
     if (g_stop)
         printf("  (stopped early by signal — state is consistent up to last synced block)\n");

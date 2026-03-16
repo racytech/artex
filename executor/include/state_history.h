@@ -13,73 +13,81 @@ extern "C" {
 #endif
 
 /* =========================================================================
- * State History: per-block diff tracking
+ * State History: per-block diff tracking (v3 — grouped, new-values-only)
  *
- * Records account and storage changes for every block into an append-only
- * log. Used for debugging (diff comparison, bisection) and as a feed for
- * verkle tree construction.
+ * Records per-block state changes into an append-only log. Used for
+ * debugging (diff comparison, bisection) and as a feed for verkle
+ * tree construction.
  *
  * Architecture:
  *   block_executor (producer) → SPSC ring → consumer thread → disk
  *
  * The executor never blocks: if the ring is full, the diff is dropped.
  *
- * File format (v2):
+ * v3 format improvements over v2:
+ *   - New values only (old values reconstructed from block N-1 when needed)
+ *   - Grouped by address (account fields + storage slots in one entry)
+ *   - Field bitmask (skip unchanged account fields on disk)
+ *
+ * File format (v3):
  *   .idx — 16-byte header (magic + version + first_block) + 16-byte entries
  *   .dat — variable-length records, each with CRC32C trailer
- *   Record: header(16) + account_diffs(165 each) + storage_diffs(116 each) + crc32(4)
+ *   Record: header(16) + addr_groups(variable) + crc32(4)
+ *
+ * On-disk record layout:
+ *   header:  block_number(8) + record_len(4) + group_count(2) + reserved(2)
+ *   per group:
+ *     addr(20) + flags(1) + field_mask(1) + slot_count(2) = 24 bytes fixed
+ *     [nonce(8)]        if field_mask & FIELD_NONCE
+ *     [balance(32)]     if field_mask & FIELD_BALANCE
+ *     [code_hash(32)]   if field_mask & FIELD_CODE_HASH
+ *     [slot(32) + value(32)] × slot_count
  *
  * On reopen, the tail is validated by walking backwards and checking CRC.
- * Corrupt trailing records are truncated. fdatasync every 256 blocks, so
- * worst-case crash loss is ~256 blocks of diffs.
- *
- * Disk usage (measured from 200K early blocks, extrapolated):
- *   Early chain (0-4.3M):   ~350 bytes/block  →  ~1.5 GB
- *   Mid chain (4.3M-15.5M): ~40 KB/block      →  ~440 GB
- *   Post-merge (15.5M+):    ~160 KB/block      →  ~750 GB
- *   Full chain total:        ~1.2 TB uncompressed
- *
- * Future size reduction options (not yet implemented):
- *   1. Per-record compression (zstd/lz4): 2-4x reduction → 300-600 GB.
- *      Balances share leading bytes, code_hash often unchanged, lots of zeros.
- *   2. Compact encoding: bitmask for changed fields, skip unchanged code_hash
- *      (currently 64 bytes per account even when identical). Could halve
- *      account diff size.
- *   3. Pruning: keep only last N blocks (e.g. 100K ≈ 2 weeks post-merge
- *      → ~16 GB). Sufficient for debugging. Truncate old entries from head.
- *   4. Delta encoding: store balance diff instead of full old+new (32+32 bytes
- *      → typically 8-16 bytes).
+ * Corrupt trailing records are truncated.
  * ========================================================================= */
 
 /* ── Per-block diff types ─────────────────────────────────────────────── */
 
+/* Account flags */
 #define ACCT_DIFF_CREATED      (1 << 0)
 #define ACCT_DIFF_DESTRUCTED   (1 << 1)
 
-typedef struct {
-    address_t addr;
-    uint64_t  old_nonce,  new_nonce;
-    uint256_t old_balance, new_balance;
-    hash_t    old_code_hash, new_code_hash;
-    uint8_t   flags;       /* ACCT_DIFF_CREATED | ACCT_DIFF_DESTRUCTED */
-} account_diff_t;
+/* Field bitmask — which account fields changed */
+#define FIELD_NONCE     (1 << 0)
+#define FIELD_BALANCE   (1 << 1)
+#define FIELD_CODE_HASH (1 << 2)
 
+/** Single storage slot change (new value only). */
 typedef struct {
-    address_t addr;
     uint256_t slot;
-    uint256_t old_value, new_value;
-} storage_diff_t;
+    uint256_t value;        /* new value */
+} slot_diff_t;
 
+/** Per-address diff group: account fields + storage slots. */
+typedef struct {
+    address_t   addr;
+    uint8_t     flags;       /* ACCT_DIFF_CREATED | ACCT_DIFF_DESTRUCTED */
+    uint8_t     field_mask;  /* FIELD_NONCE | FIELD_BALANCE | FIELD_CODE_HASH */
+    uint64_t    nonce;       /* new nonce (valid if field_mask & FIELD_NONCE) */
+    uint256_t   balance;     /* new balance (valid if field_mask & FIELD_BALANCE) */
+    hash_t      code_hash;   /* new code_hash (valid if field_mask & FIELD_CODE_HASH) */
+    slot_diff_t *slots;      /* heap-allocated array */
+    uint16_t    slot_count;
+} addr_diff_t;
+
+/** Per-block diff: array of address groups. */
 typedef struct block_diff_t {
-    uint64_t        block_number;
-    account_diff_t *accounts;        /* heap-allocated array */
-    uint32_t        account_count;
-    storage_diff_t *storage;         /* heap-allocated array */
-    uint32_t        storage_count;
+    uint64_t     block_number;
+    addr_diff_t *groups;        /* heap-allocated array */
+    uint16_t     group_count;
 } block_diff_t;
 
 /** Free a block_diff_t's heap allocations (not the struct itself). */
 void block_diff_free(block_diff_t *diff);
+
+/** Deep-copy a block_diff_t (allocates new groups + slots arrays). */
+void block_diff_clone(const block_diff_t *src, block_diff_t *dst);
 
 /* ── SPSC ring buffer for diffs ───────────────────────────────────────── */
 
@@ -119,7 +127,7 @@ void state_history_capture(state_history_t *sh, struct evm_state *es,
 
 /**
  * Push a pre-built diff to the ring buffer. Non-blocking: drops if full.
- * The ring takes ownership of diff->accounts and diff->storage on success.
+ * The ring takes ownership of diff->groups (and nested slots) on success.
  */
 void state_history_push(state_history_t *sh, block_diff_t *diff);
 

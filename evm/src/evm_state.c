@@ -2468,16 +2468,12 @@ size_t evm_state_collect_storage_keys(evm_state_t *es, const address_t *addr,
 void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
     if (!es || !out) return;
 
-    /* --- Account diffs from dirty_accounts vector --- */
-#ifdef ENABLE_MPT
-    uint32_t acct_cap = (uint32_t)es->dirty_accounts.count;
-#else
-    /* Verkle path: count block_dirty accounts via scan */
-    uint32_t acct_cap = 64;
-#endif
-    account_diff_t *accts = acct_cap > 0 ? calloc(acct_cap, sizeof(account_diff_t)) : NULL;
-    uint32_t acct_count = 0;
+    uint16_t group_cap = 64;
+    uint16_t group_count = 0;
+    addr_diff_t *groups = calloc(group_cap, sizeof(addr_diff_t));
+    if (!groups) return;
 
+    /* --- Phase 1: account diffs → create groups --- */
 #ifdef ENABLE_MPT
     for (size_t d = 0; d < es->dirty_accounts.count; d++) {
         const uint8_t *akey = es->dirty_accounts.keys + d * 20;
@@ -2486,7 +2482,6 @@ void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
         if (!ca) continue;
         if (!ca->block_dirty && !ca->block_code_dirty) continue;
 
-        /* Skip if nothing actually changed */
         bool nonce_changed = (ca->nonce != ca->original_nonce);
         bool balance_changed = !uint256_is_equal(&ca->balance, &ca->original_balance);
         bool code_changed = (memcmp(ca->code_hash.bytes, ca->original_code_hash.bytes, 32) != 0);
@@ -2497,33 +2492,33 @@ void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
             !is_created && !is_destructed)
             continue;
 
-        if (acct_count >= acct_cap) {
-            acct_cap = acct_cap ? acct_cap * 2 : 64;
-            accts = realloc(accts, acct_cap * sizeof(account_diff_t));
+        if (group_count >= group_cap) {
+            group_cap = group_cap * 2;
+            groups = realloc(groups, group_cap * sizeof(addr_diff_t));
         }
-        account_diff_t *a = &accts[acct_count++];
-        a->addr = ca->addr;
-        a->old_nonce = ca->original_nonce;
-        a->new_nonce = ca->nonce;
-        a->old_balance = ca->original_balance;
-        a->new_balance = ca->balance;
-        a->old_code_hash = ca->original_code_hash;
-        a->new_code_hash = ca->code_hash;
-        a->flags = 0;
-        if (is_created) a->flags |= ACCT_DIFF_CREATED;
-        if (is_destructed) a->flags |= ACCT_DIFF_DESTRUCTED;
+        addr_diff_t *g = &groups[group_count++];
+        memset(g, 0, sizeof(*g));
+        g->addr = ca->addr;
+        g->flags = 0;
+        if (is_created) g->flags |= ACCT_DIFF_CREATED;
+        if (is_destructed) g->flags |= ACCT_DIFF_DESTRUCTED;
+        g->field_mask = 0;
+        if (nonce_changed) {
+            g->field_mask |= FIELD_NONCE;
+            g->nonce = ca->nonce;
+        }
+        if (balance_changed) {
+            g->field_mask |= FIELD_BALANCE;
+            g->balance = ca->balance;
+        }
+        if (code_changed) {
+            g->field_mask |= FIELD_CODE_HASH;
+            g->code_hash = ca->code_hash;
+        }
     }
 #endif
 
-    /* --- Storage diffs from dirty_slots vector --- */
-#ifdef ENABLE_MPT
-    uint32_t slot_cap = (uint32_t)es->dirty_slots.count;
-#else
-    uint32_t slot_cap = 64;
-#endif
-    storage_diff_t *slots = slot_cap > 0 ? calloc(slot_cap, sizeof(storage_diff_t)) : NULL;
-    uint32_t slot_count = 0;
-
+    /* --- Phase 2: storage diffs → assign to groups --- */
 #ifdef ENABLE_MPT
     for (size_t d = 0; d < es->dirty_slots.count; d++) {
         const uint8_t *skey = es->dirty_slots.keys + d * SLOT_KEY_SIZE;
@@ -2531,27 +2526,39 @@ void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
             &es->storage, skey, SLOT_KEY_SIZE, NULL);
         if (!cs) continue;
         if (!cs->block_dirty) continue;
-
-        /* Skip if value didn't actually change from block start */
         if (uint256_is_equal(&cs->block_original, &cs->current))
             continue;
 
-        if (slot_count >= slot_cap) {
-            slot_cap = slot_cap ? slot_cap * 2 : 64;
-            slots = realloc(slots, slot_cap * sizeof(storage_diff_t));
+        /* Find existing group for this address */
+        addr_diff_t *g = NULL;
+        for (uint16_t i = 0; i < group_count; i++) {
+            if (memcmp(groups[i].addr.bytes, skey, 20) == 0) {
+                g = &groups[i];
+                break;
+            }
         }
-        storage_diff_t *s = &slots[slot_count++];
-        memcpy(s->addr.bytes, skey, 20);
+
+        /* Create new group if address not found (storage-only change) */
+        if (!g) {
+            if (group_count >= group_cap) {
+                group_cap = group_cap * 2;
+                groups = realloc(groups, group_cap * sizeof(addr_diff_t));
+            }
+            g = &groups[group_count++];
+            memset(g, 0, sizeof(*g));
+            memcpy(g->addr.bytes, skey, 20);
+        }
+
+        /* Append slot to group */
+        g->slots = realloc(g->slots, (g->slot_count + 1) * sizeof(slot_diff_t));
+        slot_diff_t *s = &g->slots[g->slot_count++];
         s->slot = uint256_from_bytes(skey + 20, 32);
-        s->old_value = cs->block_original;
-        s->new_value = cs->current;
+        s->value = cs->current;
     }
 #endif
 
-    out->accounts = accts;
-    out->account_count = acct_count;
-    out->storage = slots;
-    out->storage_count = slot_count;
+    out->groups = groups;
+    out->group_count = group_count;
 }
 #endif /* ENABLE_HISTORY || ENABLE_VERKLE_BUILD */
 

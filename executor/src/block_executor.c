@@ -708,35 +708,15 @@ block_result_t block_execute(evm_t *evm,
 
 #ifdef ENABLE_HISTORY
             if (history) {
-                /* state_history_capture expects to push to its own ring.
-                 * We push a copy so each consumer owns its arrays. */
-                block_diff_t hist_diff = diff;
-                if (diff.account_count > 0) {
-                    hist_diff.accounts = malloc(diff.account_count * sizeof(account_diff_t));
-                    memcpy(hist_diff.accounts, diff.accounts,
-                           diff.account_count * sizeof(account_diff_t));
-                }
-                if (diff.storage_count > 0) {
-                    hist_diff.storage = malloc(diff.storage_count * sizeof(storage_diff_t));
-                    memcpy(hist_diff.storage, diff.storage,
-                           diff.storage_count * sizeof(storage_diff_t));
-                }
+                block_diff_t hist_diff;
+                block_diff_clone(&diff, &hist_diff);
                 state_history_push(history, &hist_diff);
             }
 #endif
 #ifdef ENABLE_VERKLE_BUILD
             if (verkle_builder) {
-                block_diff_t vb_diff = diff;
-                if (diff.account_count > 0) {
-                    vb_diff.accounts = malloc(diff.account_count * sizeof(account_diff_t));
-                    memcpy(vb_diff.accounts, diff.accounts,
-                           diff.account_count * sizeof(account_diff_t));
-                }
-                if (diff.storage_count > 0) {
-                    vb_diff.storage = malloc(diff.storage_count * sizeof(storage_diff_t));
-                    memcpy(vb_diff.storage, diff.storage,
-                           diff.storage_count * sizeof(storage_diff_t));
-                }
+                block_diff_t vb_diff;
+                block_diff_clone(&diff, &vb_diff);
                 verkle_builder_push(verkle_builder, &vb_diff);
             }
 #endif

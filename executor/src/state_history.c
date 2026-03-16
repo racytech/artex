@@ -18,7 +18,6 @@
 #include <nmmintrin.h>
 static uint32_t crc32c(const uint8_t *data, size_t len) {
     uint32_t crc = 0xFFFFFFFF;
-    /* Process 8 bytes at a time */
     while (len >= 8) {
         crc = (uint32_t)_mm_crc32_u64(crc, *(const uint64_t *)data);
         data += 8;
@@ -30,7 +29,6 @@ static uint32_t crc32c(const uint8_t *data, size_t len) {
     return crc ^ 0xFFFFFFFF;
 }
 #else
-/* Software fallback (slice-by-1) */
 static uint32_t crc32c(const uint8_t *data, size_t len) {
     static const uint32_t poly = 0x82F63B78;
     uint32_t crc = 0xFFFFFFFF;
@@ -44,52 +42,40 @@ static uint32_t crc32c(const uint8_t *data, size_t len) {
 #endif
 
 /* =========================================================================
- * File format constants
+ * File format constants (v3)
  * ========================================================================= */
 
 #define HIST_MAGIC   0x54534948  /* "HIST" in little-endian */
-#define HIST_VERSION 2
+#define HIST_VERSION 3
 
 /* Index header: magic(4) + version(4) + first_block(8) = 16 bytes */
 #define IDX_HEADER_SIZE 16
 /* Index entry: block_number(8) + dat_offset(8) = 16 bytes */
 #define IDX_ENTRY_SIZE  16
 
-/* Data record header: block_number(8) + record_len(4) + acct_count(2) + slot_count(2) = 16 bytes */
+/* Data record header: block_number(8) + record_len(4) + group_count(2) + reserved(2) = 16 bytes */
 #define DAT_RECORD_HEADER 16
 
-/* account_diff on disk: addr(20) + old_nonce(8) + new_nonce(8) + old_bal(32) + new_bal(32)
- *                       + old_code_hash(32) + new_code_hash(32) + flags(1) = 165 bytes */
-#define ACCT_DIFF_DISK_SIZE 165
-
-/* storage_diff on disk: addr(20) + slot(32) + old_val(32) + new_val(32) = 116 bytes */
-#define SLOT_DIFF_DISK_SIZE 116
-
-/* Each .dat record ends with a CRC32C (4 bytes) covering header + payload.
- * Total record size = DAT_RECORD_HEADER + accts*165 + slots*116 + 4 */
+/* Per-group fixed header: addr(20) + flags(1) + field_mask(1) + slot_count(2) = 24 bytes */
+#define GROUP_HEADER_SIZE 24
 
 /* =========================================================================
  * Internal state
  * ========================================================================= */
 
 struct state_history {
-    /* Files */
     int         dat_fd;
     int         idx_fd;
     char       *dir_path;
 
-    /* Index state */
     uint64_t    first_block;
-    uint64_t    block_count;     /* blocks written so far */
+    uint64_t    block_count;
 
-    /* SPSC ring */
     diff_ring_t ring;
 
-    /* Consumer thread */
     pthread_t   consumer_tid;
     atomic_bool stop;
 
-    /* Write position in dat file */
     uint64_t    dat_offset;
 };
 
@@ -99,16 +85,35 @@ struct state_history {
 
 void block_diff_free(block_diff_t *diff) {
     if (!diff) return;
-    free(diff->accounts);
-    free(diff->storage);
-    diff->accounts = NULL;
-    diff->storage = NULL;
-    diff->account_count = 0;
-    diff->storage_count = 0;
+    for (uint16_t i = 0; i < diff->group_count; i++)
+        free(diff->groups[i].slots);
+    free(diff->groups);
+    diff->groups = NULL;
+    diff->group_count = 0;
+}
+
+void block_diff_clone(const block_diff_t *src, block_diff_t *dst) {
+    dst->block_number = src->block_number;
+    dst->group_count = src->group_count;
+    if (src->group_count == 0) {
+        dst->groups = NULL;
+        return;
+    }
+    dst->groups = malloc(src->group_count * sizeof(addr_diff_t));
+    for (uint16_t i = 0; i < src->group_count; i++) {
+        dst->groups[i] = src->groups[i];
+        if (src->groups[i].slot_count > 0) {
+            size_t sz = src->groups[i].slot_count * sizeof(slot_diff_t);
+            dst->groups[i].slots = malloc(sz);
+            memcpy(dst->groups[i].slots, src->groups[i].slots, sz);
+        } else {
+            dst->groups[i].slots = NULL;
+        }
+    }
 }
 
 /* =========================================================================
- * SPSC ring buffer (same pattern as tx_pipeline.c)
+ * SPSC ring buffer
  * ========================================================================= */
 
 static void diff_ring_init(diff_ring_t *ring) {
@@ -117,33 +122,26 @@ static void diff_ring_init(diff_ring_t *ring) {
     atomic_store_explicit(&ring->tail, 0, memory_order_relaxed);
 }
 
-/* Non-blocking push. Returns false if ring is full (diff will be dropped). */
 static bool diff_ring_try_push(diff_ring_t *ring, const block_diff_t *diff) {
     size_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
     size_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
-
     if (h - t >= DIFF_RING_CAP)
-        return false;  /* ring full */
-
+        return false;
     ring->slots[h & (DIFF_RING_CAP - 1)] = *diff;
     atomic_store_explicit(&ring->head, h + 1, memory_order_release);
     return true;
 }
 
-/* Blocking pop with stop flag. Returns false only if stopped while empty. */
 static bool diff_ring_pop(diff_ring_t *ring, block_diff_t *out,
                            const atomic_bool *stop) {
     size_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
-
     for (;;) {
         size_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
-        if (h > t)
-            break;
+        if (h > t) break;
         if (stop && atomic_load_explicit(stop, memory_order_relaxed))
             return false;
         sched_yield();
     }
-
     *out = ring->slots[t & (DIFF_RING_CAP - 1)];
     atomic_store_explicit(&ring->tail, t + 1, memory_order_release);
     return true;
@@ -187,48 +185,65 @@ static uint64_t read_u64(const uint8_t *buf) {
 }
 
 /* =========================================================================
- * Record serialization
+ * Record serialization (v3 — grouped, new-values-only, field bitmask)
  * ========================================================================= */
 
-static size_t serialize_diff(const block_diff_t *diff, uint8_t **out) {
-    size_t acct_size = (size_t)diff->account_count * ACCT_DIFF_DISK_SIZE;
-    size_t slot_size = (size_t)diff->storage_count * SLOT_DIFF_DISK_SIZE;
-    size_t record_len = acct_size + slot_size;
-    size_t total = DAT_RECORD_HEADER + record_len + 4; /* +4 for CRC32 */
+/** Compute serialized size of a group (excluding addr/flags/mask/slot_count header). */
+static size_t group_payload_size(const addr_diff_t *g) {
+    size_t sz = 0;
+    if (g->field_mask & FIELD_NONCE)     sz += 8;
+    if (g->field_mask & FIELD_BALANCE)   sz += 32;
+    if (g->field_mask & FIELD_CODE_HASH) sz += 32;
+    sz += (size_t)g->slot_count * 64;  /* slot(32) + value(32) */
+    return sz;
+}
 
+static size_t serialize_diff(const block_diff_t *diff, uint8_t **out) {
+    /* Compute total record_len (everything after the 16-byte header, before CRC) */
+    size_t record_len = 0;
+    for (uint16_t i = 0; i < diff->group_count; i++)
+        record_len += GROUP_HEADER_SIZE + group_payload_size(&diff->groups[i]);
+
+    size_t total = DAT_RECORD_HEADER + record_len + 4; /* +4 CRC32 */
     uint8_t *buf = malloc(total);
     if (!buf) return 0;
 
-    /* Record header (record_len excludes CRC32 — stays compatible with reader) */
+    /* Record header */
     write_u64(buf, diff->block_number);
     write_u32(buf + 8, (uint32_t)record_len);
-    write_u16(buf + 12, (uint16_t)diff->account_count);
-    write_u16(buf + 14, (uint16_t)diff->storage_count);
+    write_u16(buf + 12, diff->group_count);
+    write_u16(buf + 14, 0); /* reserved */
 
-    /* Account diffs */
+    /* Groups */
     uint8_t *p = buf + DAT_RECORD_HEADER;
-    for (uint32_t i = 0; i < diff->account_count; i++) {
-        const account_diff_t *a = &diff->accounts[i];
-        memcpy(p, a->addr.bytes, 20); p += 20;
-        write_u64(p, a->old_nonce); p += 8;
-        write_u64(p, a->new_nonce); p += 8;
-        uint256_to_bytes(&a->old_balance, p); p += 32;
-        uint256_to_bytes(&a->new_balance, p); p += 32;
-        memcpy(p, a->old_code_hash.bytes, 32); p += 32;
-        memcpy(p, a->new_code_hash.bytes, 32); p += 32;
-        *p++ = a->flags;
+    for (uint16_t i = 0; i < diff->group_count; i++) {
+        const addr_diff_t *g = &diff->groups[i];
+
+        /* Group header */
+        memcpy(p, g->addr.bytes, 20); p += 20;
+        *p++ = g->flags;
+        *p++ = g->field_mask;
+        write_u16(p, g->slot_count); p += 2;
+
+        /* Conditional account fields */
+        if (g->field_mask & FIELD_NONCE) {
+            write_u64(p, g->nonce); p += 8;
+        }
+        if (g->field_mask & FIELD_BALANCE) {
+            uint256_to_bytes(&g->balance, p); p += 32;
+        }
+        if (g->field_mask & FIELD_CODE_HASH) {
+            memcpy(p, g->code_hash.bytes, 32); p += 32;
+        }
+
+        /* Storage slots */
+        for (uint16_t j = 0; j < g->slot_count; j++) {
+            uint256_to_bytes(&g->slots[j].slot, p); p += 32;
+            uint256_to_bytes(&g->slots[j].value, p); p += 32;
+        }
     }
 
-    /* Storage diffs */
-    for (uint32_t i = 0; i < diff->storage_count; i++) {
-        const storage_diff_t *s = &diff->storage[i];
-        memcpy(p, s->addr.bytes, 20); p += 20;
-        uint256_to_bytes(&s->slot, p); p += 32;
-        uint256_to_bytes(&s->old_value, p); p += 32;
-        uint256_to_bytes(&s->new_value, p); p += 32;
-    }
-
-    /* CRC32C over header + payload (not the CRC itself) */
+    /* CRC32C */
     uint32_t crc = crc32c(buf, DAT_RECORD_HEADER + record_len);
     write_u32(p, crc);
 
@@ -241,50 +256,56 @@ static bool deserialize_diff(const uint8_t *buf, size_t buf_len,
     if (buf_len < DAT_RECORD_HEADER) return false;
 
     out->block_number = read_u64(buf);
-    uint32_t record_len = read_u32(buf + 8);
-    out->account_count = read_u16(buf + 12);
-    out->storage_count = read_u16(buf + 14);
+    /* record_len at buf+8, used by caller for sizing */
+    out->group_count = read_u16(buf + 12);
 
-    size_t expected = DAT_RECORD_HEADER +
-                      (size_t)out->account_count * ACCT_DIFF_DISK_SIZE +
-                      (size_t)out->storage_count * SLOT_DIFF_DISK_SIZE;
-    if (buf_len < expected) return false;
-    (void)record_len;
-
-    /* Account diffs */
-    out->accounts = NULL;
-    if (out->account_count > 0) {
-        out->accounts = calloc(out->account_count, sizeof(account_diff_t));
-        if (!out->accounts) return false;
+    out->groups = NULL;
+    if (out->group_count > 0) {
+        out->groups = calloc(out->group_count, sizeof(addr_diff_t));
+        if (!out->groups) return false;
     }
+
     const uint8_t *p = buf + DAT_RECORD_HEADER;
-    for (uint32_t i = 0; i < out->account_count; i++) {
-        account_diff_t *a = &out->accounts[i];
-        memcpy(a->addr.bytes, p, 20); p += 20;
-        a->old_nonce = read_u64(p); p += 8;
-        a->new_nonce = read_u64(p); p += 8;
-        a->old_balance = uint256_from_bytes(p, 32); p += 32;
-        a->new_balance = uint256_from_bytes(p, 32); p += 32;
-        memcpy(a->old_code_hash.bytes, p, 32); p += 32;
-        memcpy(a->new_code_hash.bytes, p, 32); p += 32;
-        a->flags = *p++;
-    }
+    const uint8_t *end = buf + buf_len;
 
-    /* Storage diffs */
-    out->storage = NULL;
-    if (out->storage_count > 0) {
-        out->storage = calloc(out->storage_count, sizeof(storage_diff_t));
-        if (!out->storage) { free(out->accounts); return false; }
-    }
-    for (uint32_t i = 0; i < out->storage_count; i++) {
-        storage_diff_t *s = &out->storage[i];
-        memcpy(s->addr.bytes, p, 20); p += 20;
-        s->slot = uint256_from_bytes(p, 32); p += 32;
-        s->old_value = uint256_from_bytes(p, 32); p += 32;
-        s->new_value = uint256_from_bytes(p, 32); p += 32;
-    }
+    for (uint16_t i = 0; i < out->group_count; i++) {
+        addr_diff_t *g = &out->groups[i];
 
+        if (p + GROUP_HEADER_SIZE > end) goto fail;
+        memcpy(g->addr.bytes, p, 20); p += 20;
+        g->flags = *p++;
+        g->field_mask = *p++;
+        g->slot_count = read_u16(p); p += 2;
+
+        if (g->field_mask & FIELD_NONCE) {
+            if (p + 8 > end) goto fail;
+            g->nonce = read_u64(p); p += 8;
+        }
+        if (g->field_mask & FIELD_BALANCE) {
+            if (p + 32 > end) goto fail;
+            g->balance = uint256_from_bytes(p, 32); p += 32;
+        }
+        if (g->field_mask & FIELD_CODE_HASH) {
+            if (p + 32 > end) goto fail;
+            memcpy(g->code_hash.bytes, p, 32); p += 32;
+        }
+
+        g->slots = NULL;
+        if (g->slot_count > 0) {
+            if (p + (size_t)g->slot_count * 64 > end) goto fail;
+            g->slots = calloc(g->slot_count, sizeof(slot_diff_t));
+            if (!g->slots) goto fail;
+            for (uint16_t j = 0; j < g->slot_count; j++) {
+                g->slots[j].slot = uint256_from_bytes(p, 32); p += 32;
+                g->slots[j].value = uint256_from_bytes(p, 32); p += 32;
+            }
+        }
+    }
     return true;
+
+fail:
+    block_diff_free(out);
+    return false;
 }
 
 /* =========================================================================
@@ -298,9 +319,8 @@ static void *consumer_thread(void *arg) {
     while (!atomic_load_explicit(&sh->stop, memory_order_relaxed)) {
         block_diff_t diff;
         if (!diff_ring_pop(&sh->ring, &diff, &sh->stop))
-            break;  /* stopped */
+            break;
 
-        /* Serialize */
         uint8_t *buf;
         size_t buf_len = serialize_diff(&diff, &buf);
         if (buf_len == 0) {
@@ -308,7 +328,6 @@ static void *consumer_thread(void *arg) {
             continue;
         }
 
-        /* Write data record */
         uint64_t offset = sh->dat_offset;
         ssize_t nw = pwrite(sh->dat_fd, buf, buf_len, (off_t)offset);
         free(buf);
@@ -320,7 +339,6 @@ static void *consumer_thread(void *arg) {
         }
         sh->dat_offset += buf_len;
 
-        /* Write index entry */
         uint8_t idx_entry[IDX_ENTRY_SIZE];
         write_u64(idx_entry, diff.block_number);
         write_u64(idx_entry + 8, offset);
@@ -333,7 +351,6 @@ static void *consumer_thread(void *arg) {
 
         block_diff_free(&diff);
 
-        /* Periodic sync to disk */
         blocks_since_sync++;
         if (blocks_since_sync >= 256) {
             fdatasync(sh->dat_fd);
@@ -384,7 +401,6 @@ static void *consumer_thread(void *arg) {
 state_history_t *state_history_create(const char *dir_path) {
     if (!dir_path) return NULL;
 
-    /* Ensure directory exists */
     mkdir(dir_path, 0755);
 
     state_history_t *sh = calloc(1, sizeof(state_history_t));
@@ -394,13 +410,11 @@ state_history_t *state_history_create(const char *dir_path) {
     sh->dat_fd = -1;
     sh->idx_fd = -1;
 
-    /* Open data file */
     char path[512];
     snprintf(path, sizeof(path), "%s/state_history.dat", dir_path);
     sh->dat_fd = open(path, O_RDWR | O_CREAT, 0644);
     if (sh->dat_fd < 0) goto fail;
 
-    /* Open index file */
     snprintf(path, sizeof(path), "%s/state_history.idx", dir_path);
     sh->idx_fd = open(path, O_RDWR | O_CREAT, 0644);
     if (sh->idx_fd < 0) goto fail;
@@ -409,10 +423,15 @@ state_history_t *state_history_create(const char *dir_path) {
     uint8_t hdr[IDX_HEADER_SIZE];
     ssize_t nr = pread(sh->idx_fd, hdr, IDX_HEADER_SIZE, 0);
     if (nr == IDX_HEADER_SIZE && read_u32(hdr) == HIST_MAGIC) {
-        /* Existing index — resume */
+        uint32_t version = read_u32(hdr + 4);
+        if (version != HIST_VERSION) {
+            fprintf(stderr, "state_history: incompatible version %u (expected %u), "
+                    "delete history files to regenerate\n", version, HIST_VERSION);
+            goto fail;
+        }
+
         sh->first_block = read_u64(hdr + 8);
 
-        /* Count existing entries from file size */
         off_t idx_size = lseek(sh->idx_fd, 0, SEEK_END);
         if (idx_size > IDX_HEADER_SIZE)
             sh->block_count = (uint64_t)(idx_size - IDX_HEADER_SIZE) / IDX_ENTRY_SIZE;
@@ -430,14 +449,12 @@ state_history_t *state_history_create(const char *dir_path) {
             uint64_t bn = read_u64(ie);
             uint64_t doff = read_u64(ie + 8);
 
-            /* Read record header */
             uint8_t rh[DAT_RECORD_HEADER];
             if (pread(sh->dat_fd, rh, DAT_RECORD_HEADER, (off_t)doff) != DAT_RECORD_HEADER) {
                 sh->block_count--;
                 continue;
             }
 
-            /* Block number in record must match index */
             if (read_u64(rh) != bn) {
                 sh->block_count--;
                 continue;
@@ -465,7 +482,6 @@ state_history_t *state_history_create(const char *dir_path) {
                 continue;
             }
 
-            /* Last record is valid — truncate files to this point */
             sh->dat_offset = doff + total;
             ftruncate(sh->dat_fd, (off_t)sh->dat_offset);
             ftruncate(sh->idx_fd,
@@ -474,7 +490,6 @@ state_history_t *state_history_create(const char *dir_path) {
         }
 
         if (sh->block_count == 0) {
-            /* All records corrupt or empty — start fresh */
             ftruncate(sh->dat_fd, 0);
             sh->dat_offset = 0;
             memset(hdr, 0, IDX_HEADER_SIZE);
@@ -485,11 +500,10 @@ state_history_t *state_history_create(const char *dir_path) {
             ftruncate(sh->idx_fd, IDX_HEADER_SIZE);
         }
     } else {
-        /* New index — write header */
         memset(hdr, 0, IDX_HEADER_SIZE);
         write_u32(hdr, HIST_MAGIC);
         write_u32(hdr + 4, HIST_VERSION);
-        write_u64(hdr + 8, 0);  /* first_block set on first write */
+        write_u64(hdr + 8, 0);
         pwrite(sh->idx_fd, hdr, IDX_HEADER_SIZE, 0);
         sh->dat_offset = 0;
     }
@@ -497,7 +511,6 @@ state_history_t *state_history_create(const char *dir_path) {
     diff_ring_init(&sh->ring);
     atomic_store_explicit(&sh->stop, false, memory_order_relaxed);
 
-    /* Start consumer thread */
     if (pthread_create(&sh->consumer_tid, NULL, consumer_thread, sh) != 0)
         goto fail;
 
@@ -514,11 +527,9 @@ fail:
 void state_history_destroy(state_history_t *sh) {
     if (!sh) return;
 
-    /* Signal stop and wait for consumer */
     atomic_store_explicit(&sh->stop, true, memory_order_release);
     pthread_join(sh->consumer_tid, NULL);
 
-    /* Update index header with final first_block */
     if (sh->block_count > 0) {
         uint8_t hdr[IDX_HEADER_SIZE];
         write_u32(hdr, HIST_MAGIC);
@@ -535,7 +546,7 @@ void state_history_destroy(state_history_t *sh) {
 }
 
 /* =========================================================================
- * Producer: capture diff from evm_state
+ * Producer
  * ========================================================================= */
 
 void state_history_capture(state_history_t *sh, evm_state_t *es,
@@ -579,7 +590,6 @@ bool state_history_get_diff(const state_history_t *sh,
     uint64_t idx = block_number - sh->first_block;
     if (idx >= sh->block_count) return false;
 
-    /* Read index entry */
     uint8_t idx_entry[IDX_ENTRY_SIZE];
     off_t idx_pos = (off_t)(IDX_HEADER_SIZE + idx * IDX_ENTRY_SIZE);
     if (pread(sh->idx_fd, idx_entry, IDX_ENTRY_SIZE, idx_pos) != IDX_ENTRY_SIZE)
@@ -589,16 +599,15 @@ bool state_history_get_diff(const state_history_t *sh,
     uint64_t dat_offset = read_u64(idx_entry + 8);
 
     if (stored_bn != block_number)
-        return false;  /* sanity check */
+        return false;
 
-    /* Read record header to get size */
     uint8_t rec_hdr[DAT_RECORD_HEADER];
     if (pread(sh->dat_fd, rec_hdr, DAT_RECORD_HEADER, (off_t)dat_offset) != DAT_RECORD_HEADER)
         return false;
 
     uint32_t record_len = read_u32(rec_hdr + 8);
     size_t payload = DAT_RECORD_HEADER + record_len;
-    size_t total = payload + 4; /* +4 for CRC32C */
+    size_t total = payload + 4;
 
     uint8_t *buf = malloc(total);
     if (!buf) return false;
@@ -608,7 +617,6 @@ bool state_history_get_diff(const state_history_t *sh,
         return false;
     }
 
-    /* Verify CRC32C */
     uint32_t stored_crc = read_u32(buf + payload);
     uint32_t actual_crc = crc32c(buf, payload);
     if (stored_crc != actual_crc) {
