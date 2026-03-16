@@ -20,12 +20,6 @@ if(NOT ENABLE_MPT AND NOT ENABLE_VERKLE)
 endif()
 
 # Tunable parameters (overridable via config.cmake or -D flags)
-if(NOT DEFINED MPT_ACCOUNT_CACHE_MB)
-    set(MPT_ACCOUNT_CACHE_MB 2048)
-endif()
-if(NOT DEFINED MPT_STORAGE_CACHE_MB)
-    set(MPT_STORAGE_CACHE_MB 2048)
-endif()
 if(NOT DEFINED MPT_ACCOUNT_CAPACITY)
     set(MPT_ACCOUNT_CAPACITY 500000000)
 endif()
@@ -187,7 +181,6 @@ add_library(mpt_store STATIC
     database/src/mpt_store.c
 )
 target_include_directories(mpt_store PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-target_compile_definitions(mpt_store PRIVATE MPT_DEFAULT_CACHE_MB=${MPT_ACCOUNT_CACHE_MB})
 target_link_libraries(mpt_store disk_hash bloom_filter common)
 
 #==============================================================================
@@ -244,7 +237,6 @@ if(ENABLE_HISTORY)
     target_compile_definitions(evm PUBLIC ENABLE_HISTORY=1)
 endif()
 target_compile_definitions(evm PRIVATE
-    MPT_STORAGE_CACHE_MB=${MPT_STORAGE_CACHE_MB}
     MPT_ACCOUNT_CAPACITY=${MPT_ACCOUNT_CAPACITY}
     MPT_STORAGE_CAPACITY=${MPT_STORAGE_CAPACITY}
 )
@@ -559,7 +551,6 @@ target_link_libraries(bench_mpt_store mpt_store common)
 # Build PIC versions of dependencies for the shared library
 add_library(mpt_store_pic STATIC database/src/mpt_store.c)
 target_include_directories(mpt_store_pic PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-target_compile_definitions(mpt_store_pic PRIVATE MPT_DEFAULT_CACHE_MB=64)
 set_target_properties(mpt_store_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(mpt_store_pic disk_hash bloom_filter common)
 
@@ -1027,8 +1018,6 @@ message(STATUS "Verkle backend:    ${ENABLE_VERKLE}")
 message(STATUS "State history:     ${ENABLE_HISTORY}")
 message(STATUS "")
 message(STATUS "Tuning:")
-message(STATUS "  Account cache:   ${MPT_ACCOUNT_CACHE_MB} MB")
-message(STATUS "  Storage cache:   ${MPT_STORAGE_CACHE_MB} MB")
 message(STATUS "  Account capacity:${MPT_ACCOUNT_CAPACITY}")
 message(STATUS "  Storage capacity:${MPT_STORAGE_CAPACITY}")
 message(STATUS "  Code cache:      ${CODE_CACHE_ENTRIES} entries")
