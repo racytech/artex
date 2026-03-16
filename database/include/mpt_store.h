@@ -101,6 +101,9 @@ typedef struct {
  * from the main thread after the background thread joins.
  * If stats is non-NULL, timing data is stored there instead of printed.
  */
+/** Pre-grow mmap before spawning bg flush thread (main thread only). */
+void mpt_store_flush_prepare(mpt_store_t *ms);
+
 void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats);
 
 /**
