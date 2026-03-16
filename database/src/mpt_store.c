@@ -721,28 +721,22 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
     ms->cstats.keccak_ns += (double)(cstat_now() - _t0);
     ms->cstats.nodes_hashed++;
 
-    /* Check if already exists — bloom filter rejects most misses without
-     * touching the mmap'd disk_hash pages (avoids page faults at scale). */
+    /* Check if already exists — only needed for shared mode (refcounting).
+     * Non-shared mode: every commit deletes old nodes and writes new ones
+     * with different hashes, so duplicates effectively never occur. */
     uint64_t _chk0 = cstat_now();
-    if (ms->bloom && !bloom_filter_maybe_contains(ms->bloom, out_hash, 32)) {
-        /* Definitely not in index — skip disk_hash lookup */
-        ms->cstats.check_ns += (double)(cstat_now() - _chk0);
-    } else if (ms->shared) {
+    if (ms->shared) {
         /* Shared mode: increment refcount if node already exists */
-        node_record_t existing;
-        if (disk_hash_get(ms->index, out_hash, &existing)) {
-            existing.refcount++;
-            disk_hash_put(ms->index, out_hash, &existing);
-            ms->cstats.check_ns += (double)(cstat_now() - _chk0);
-            ms->cstats.check_hits++;
-            return true;
-        }
-    } else {
-        /* Non-shared: refcount always 1 — fast existence check */
-        if (disk_hash_contains(ms->index, out_hash)) {
-            ms->cstats.check_ns += (double)(cstat_now() - _chk0);
-            ms->cstats.check_hits++;
-            return true;
+        bool skip = ms->bloom && !bloom_filter_maybe_contains(ms->bloom, out_hash, 32);
+        if (!skip) {
+            node_record_t existing;
+            if (disk_hash_get(ms->index, out_hash, &existing)) {
+                existing.refcount++;
+                disk_hash_put(ms->index, out_hash, &existing);
+                ms->cstats.check_ns += (double)(cstat_now() - _chk0);
+                ms->cstats.check_hits++;
+                return true;
+            }
         }
     }
     ms->cstats.check_ns += (double)(cstat_now() - _chk0);

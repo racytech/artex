@@ -842,6 +842,10 @@ if(CJSON_FOUND)
     endif()
     target_link_libraries(sync ${SYNC_LIBS})
 
+    # MPT root stress test
+    add_executable(stress_mpt_root tools/stress_mpt_root.c)
+    target_link_libraries(stress_mpt_root evm common)
+
     # Chain replay tool
     add_executable(chain_replay tools/chain_replay.c)
     target_compile_definitions(chain_replay PRIVATE CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL})
