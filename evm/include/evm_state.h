@@ -119,6 +119,9 @@ typedef struct {
  * from main thread after join.
  * If stats is non-NULL, timing data is stored there instead of printed.
  */
+/** Pre-grow mmap mappings before spawning bg flush thread (main thread). */
+void evm_state_flush_prepare(evm_state_t *es);
+
 void evm_state_flush_bg(evm_state_t *es, evm_flush_bg_stats_t *stats);
 
 /**

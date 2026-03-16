@@ -595,6 +595,14 @@ void evm_state_flush(evm_state_t *es) {
 #endif
 }
 
+void evm_state_flush_prepare(evm_state_t *es) {
+    if (!es) return;
+#ifdef ENABLE_MPT
+    if (es->account_mpt) mpt_store_flush_prepare(es->account_mpt);
+    if (es->storage_mpt) mpt_store_flush_prepare(es->storage_mpt);
+#endif
+}
+
 void evm_state_flush_bg(evm_state_t *es, evm_flush_bg_stats_t *stats) {
     if (!es) return;
 #ifdef ENABLE_MPT

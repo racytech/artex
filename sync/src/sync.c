@@ -873,6 +873,9 @@ bool sync_checkpoint(sync_t *sync) {
         memset(&ctx->flush_stats, 0, sizeof(ctx->flush_stats));
         ctx->flush_total_ms  = 0;
 
+        /* Pre-grow mmap before bg thread — dat_remap is not safe concurrently */
+        evm_state_flush_prepare(sync->state);
+
         if (pthread_create(&sync->flush_thread, NULL, flush_thread_fn, ctx) == 0) {
             sync->flush_thread_active = true;
             sync->flush_ctx = ctx;
