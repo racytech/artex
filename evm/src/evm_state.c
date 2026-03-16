@@ -56,7 +56,7 @@ typedef struct cached_account {
     hash_t     code_hash;       // 32 bytes
     hash_t     storage_root;    // cached storage root (avoids recomputation for clean accounts)
     hash_t     addr_hash;       // cached keccak256(addr) — computed once on first load
-#ifdef ENABLE_HISTORY
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
     /* Pre-block snapshots for state history diffs */
     uint64_t   original_nonce;
     uint256_t  original_balance;
@@ -74,7 +74,7 @@ typedef struct cached_slot {
     bool block_dirty;           // survives commit_tx, cleared at block end
     bool mpt_dirty;             // needs update in storage mpt_store (cleared after storage root compute)
     hash_t slot_hash;           // cached keccak256(slot_be) — computed once on first load
-#ifdef ENABLE_HISTORY
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
     uint256_t block_original;   // value at start of block (for state diff tracking)
 #endif
 } cached_slot_t;
@@ -339,7 +339,7 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
 account_loaded:
 #endif
 
-#ifdef ENABLE_HISTORY
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
     ca_local.original_nonce = ca_local.nonce;
     ca_local.original_balance = ca_local.balance;
     ca_local.original_code_hash = ca_local.code_hash;
@@ -408,7 +408,7 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
 slot_loaded:
 #endif
 
-#ifdef ENABLE_HISTORY
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
     cs_local.block_original = cs_local.original;
 #endif
 
@@ -1353,7 +1353,7 @@ static bool commit_slot_cb(const uint8_t *key, size_t key_len,
     cached_slot_t *cs = (cached_slot_t *)(uintptr_t)value;
     cs->original = cs->current;
     cs->dirty = false;
-#ifdef ENABLE_HISTORY
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
     cs->block_original = cs->current;
 #endif
     return true;
@@ -1375,7 +1375,7 @@ static bool commit_account_cb(const uint8_t *key, size_t key_len,
     ca->dirty = false;
     ca->code_dirty = false;
     ca->self_destructed = false;
-#ifdef ENABLE_HISTORY
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
     ca->original_nonce = ca->nonce;
     ca->original_balance = ca->balance;
     ca->original_code_hash = ca->code_hash;
@@ -2462,7 +2462,7 @@ size_t evm_state_collect_storage_keys(evm_state_t *es, const address_t *addr,
 // State history diff collection
 // ============================================================================
 
-#ifdef ENABLE_HISTORY
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
 #include "state_history.h"
 
 void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
@@ -2553,7 +2553,7 @@ void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
     out->storage = slots;
     out->storage_count = slot_count;
 }
-#endif /* ENABLE_HISTORY */
+#endif /* ENABLE_HISTORY || ENABLE_VERKLE_BUILD */
 
 // Compute storage roots incrementally using shared storage mpt_store.
 // Iterates the dirty_slots list (O(dirty)) instead of scanning all cached slots.

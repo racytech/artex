@@ -412,7 +412,7 @@ size_t evm_state_collect_addresses(evm_state_t *es, address_t *out, size_t max_c
 size_t evm_state_collect_storage_keys(evm_state_t *es, const address_t *addr,
                                        uint256_t *out, size_t max_count);
 
-#ifdef ENABLE_HISTORY
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
 /**
  * Collect per-block state diffs from dirty accounts and storage slots.
  * Must be called after finalize() but before compute_state_root_ex().
