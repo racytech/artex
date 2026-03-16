@@ -468,7 +468,6 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
         if (!es->storage_mpt)
             es->storage_mpt = mpt_store_create(storage_path, (uint64_t)MPT_STORAGE_CAPACITY);
         if (es->storage_mpt) {
-            mpt_store_set_cache_mb(es->storage_mpt, MPT_STORAGE_CACHE_MB);
             mpt_store_set_shared(es->storage_mpt, true);
         }
         if (!es->storage_mpt) {
@@ -502,8 +501,6 @@ bool evm_state_init_mpt_stores(evm_state_t *es, const char *path,
 
     es->account_mpt = mpt_store_create(path, acct_cap);
     if (!es->account_mpt) return false;
-    mpt_store_set_cache_mb(es->account_mpt, 1);
-
     char storage_path[512];
     snprintf(storage_path, sizeof(storage_path), "%s_storage", path);
     es->storage_mpt = mpt_store_create(storage_path, stor_cap);
@@ -512,7 +509,6 @@ bool evm_state_init_mpt_stores(evm_state_t *es, const char *path,
         es->account_mpt = NULL;
         return false;
     }
-    mpt_store_set_cache_mb(es->storage_mpt, 1);
     mpt_store_set_shared(es->storage_mpt, true);
     return true;
 #else
@@ -2108,19 +2104,11 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
         mpt_store_stats_t ms = mpt_store_stats(es->account_mpt);
         s.acct_mpt_nodes       = ms.node_count;
         s.acct_mpt_data_bytes  = ms.data_file_size;
-        s.acct_mpt_cache_hits  = ms.cache_hits;
-        s.acct_mpt_cache_misses = ms.cache_misses;
-        s.acct_mpt_cache_count = ms.cache_count;
-        s.acct_mpt_cache_capacity = ms.cache_capacity;
     }
     if (es->storage_mpt) {
         mpt_store_stats_t ms = mpt_store_stats(es->storage_mpt);
         s.stor_mpt_nodes       = ms.node_count;
         s.stor_mpt_data_bytes  = ms.data_file_size;
-        s.stor_mpt_cache_hits  = ms.cache_hits;
-        s.stor_mpt_cache_misses = ms.cache_misses;
-        s.stor_mpt_cache_count = ms.cache_count;
-        s.stor_mpt_cache_capacity = ms.cache_capacity;
     }
     if (es->code_store) {
         code_store_cache_stats_t cs = code_store_cache_stats(es->code_store);
@@ -2187,16 +2175,10 @@ void evm_state_print_mpt_stats(evm_state_t *es) {
     for (int i = 0; i < 2; i++) {
         if (!stores[i]) continue;
         mpt_store_stats_t st = mpt_store_stats(stores[i]);
-        uint64_t total = st.cache_hits + st.cache_misses;
-        double hit_rate = total > 0 ? 100.0 * st.cache_hits / total : 0;
         fprintf(stderr,
-            "  %s MPT: %llu nodes, cache %u/%u (%.1f%% hit), "
-            "pinned=%u, evict_skipped=%llu, free=%llu B\n",
+            "  %s MPT: %llu nodes, free=%llu B\n",
             names[i],
             (unsigned long long)st.node_count,
-            st.cache_count, st.cache_capacity, hit_rate,
-            st.cache_pinned,
-            (unsigned long long)st.cache_evict_skipped,
             (unsigned long long)st.free_bytes);
     }
 #else

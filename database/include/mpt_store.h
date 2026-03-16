@@ -28,7 +28,6 @@
  * Node reads: root_hash → disk_hash_get → {offset,len} → pread from .dat
  * Two I/O ops per node, both page-cache friendly.
  *
- * Default: 2 GB in-memory LRU cache for hot trie nodes.
  */
 
 typedef struct mpt_store mpt_store_t;
@@ -226,24 +225,13 @@ bool mpt_store_walk_leaves(const mpt_store_t *ms, mpt_leaf_cb_t cb,
                             void *user_data);
 
 /* =========================================================================
- * Node Cache
+ * Node Cache (legacy no-ops, retained for API compatibility)
  * ========================================================================= */
 
-/**
- * Enable an in-memory LRU cache for hot trie nodes.
- * max_entries: number of cache slots (0 = disable cache).
- * Each entry uses ~1070 bytes, so 32K entries ≈ 34 MB.
- * Can be called at any time; replaces any existing cache.
- *
- * Note: create/open auto-enable a 2 GB cache by default.
- * Call with 0 to disable.
- */
+/** No-op. LRU cache has been removed; mmap'd .dat replaces it. */
 void mpt_store_set_cache(mpt_store_t *ms, uint32_t max_entries);
 
-/**
- * Set cache size in megabytes. Convenience wrapper over set_cache().
- * 0 = disable cache.
- */
+/** No-op. LRU cache has been removed; mmap'd .dat replaces it. */
 void mpt_store_set_cache_mb(mpt_store_t *ms, uint32_t megabytes);
 
 /**
@@ -288,12 +276,6 @@ typedef struct {
     uint64_t live_data_bytes; /** Approximate bytes of live node data */
     uint64_t free_bytes;      /** Bytes on free lists (available for reuse) */
     uint64_t garbage_bytes;   /** Unreclaimable waste (padding in slots) */
-    uint64_t cache_hits;      /** Cache hit count (0 if no cache) */
-    uint64_t cache_misses;    /** Cache miss count (0 if no cache) */
-    uint32_t cache_count;     /** Current entries in cache */
-    uint32_t cache_capacity;  /** Max cache entries */
-    uint64_t cache_evict_skipped; /** Times eviction skipped a pinned node */
-    uint32_t cache_pinned;    /** Pinned entries (depth <= PIN_DEPTH) */
 } mpt_store_stats_t;
 
 /**

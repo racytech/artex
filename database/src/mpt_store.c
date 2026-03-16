@@ -48,13 +48,6 @@
 #define NUM_SIZE_CLASSES    5
 static const uint16_t SIZE_CLASSES[NUM_SIZE_CLASSES] = {64, 128, 256, 512, 1024};
 
-/* Default LRU cache: 2 GB */
-#define MPT_DEFAULT_CACHE_MB 2048
-
-/* Depth pinning: nodes at trie depth <= this threshold are never evicted.
- * depth 0 = root (1 node), depth 1 = 16, depth 2 = 256, depth 3 = 4096,
- * depth 4 = 65536. Total pinned ~70K nodes × ~1KB = ~70MB — negligible. */
-#define NCACHE_PIN_DEPTH 4
 
 /* =========================================================================
  * Bloom filter — negative lookup filter for disk_hash existence checks.
@@ -123,8 +116,6 @@ static inline bool bloom_maybe(const bloom_t *b, const uint8_t hash[32]) {
     }
     return true;
 }
-#define NCACHE_DEPTH_UNKNOWN 0xFF  /* for nodes inserted without depth info */
-
 /* Empty trie root = keccak256(RLP("")) = keccak256(0x80) */
 static const uint8_t EMPTY_ROOT[32] = {
     0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
@@ -218,260 +209,6 @@ typedef struct {
 } mpt_node_t;
 
 /* =========================================================================
- * In-memory LRU node cache
- *
- * Caches raw RLP bytes keyed by node hash. Eliminates disk I/O for hot
- * trie nodes (top levels, recently written nodes). All operations O(1).
- *
- * Layout: flat pre-allocated entry array + index-based doubly-linked LRU
- * list + separate hash table (open chaining with index links).
- * ========================================================================= */
-
-#define NCACHE_SENTINEL 0xFFFFFFFFU
-
-typedef struct {
-    uint8_t  hash[32];
-    uint8_t  rlp[MAX_NODE_RLP];
-    uint16_t rlp_len;
-    uint8_t  depth;         /* trie depth (for pin eviction policy) */
-    uint32_t ht_next;       /* next in hash bucket chain */
-    uint32_t lru_prev;      /* doubly-linked LRU list */
-    uint32_t lru_next;
-} ncache_entry_t;
-
-typedef struct {
-    ncache_entry_t *entries;
-    uint32_t       *buckets;        /* hash table → entry index */
-    uint32_t        capacity;
-    uint32_t        bucket_mask;    /* bucket_count - 1 (power of 2) */
-    uint32_t        count;
-    uint32_t        lru_head;       /* most recently used */
-    uint32_t        lru_tail;       /* least recently used */
-    uint32_t        free_head;      /* free list (uses lru_next for chain) */
-    uint64_t        hits;
-    uint64_t        misses;
-    uint64_t        evict_skipped;  /* times eviction skipped a pinned node */
-    uint32_t        pinned_count;   /* entries with depth <= PIN_DEPTH */
-} node_cache_t;
-
-static inline uint32_t ncache_bucket(const node_cache_t *c,
-                                      const uint8_t hash[32]) {
-    uint64_t h;
-    memcpy(&h, hash, 8);
-    return (uint32_t)(h & c->bucket_mask);
-}
-
-static node_cache_t *ncache_create(uint32_t capacity) {
-    if (capacity == 0) return NULL;
-
-    node_cache_t *c = calloc(1, sizeof(*c));
-    if (!c) return NULL;
-
-    /* Round bucket count up to next power of 2 (at least 2× capacity) */
-    uint32_t bc = 1;
-    while (bc < capacity * 2) bc <<= 1;
-
-    c->entries = calloc(capacity, sizeof(ncache_entry_t));
-    c->buckets = malloc(bc * sizeof(uint32_t));
-    if (!c->entries || !c->buckets) {
-        free(c->entries); free(c->buckets); free(c);
-        return NULL;
-    }
-
-    c->capacity    = capacity;
-    c->bucket_mask = bc - 1;
-    c->count       = 0;
-    c->lru_head    = NCACHE_SENTINEL;
-    c->lru_tail    = NCACHE_SENTINEL;
-    c->hits        = 0;
-    c->misses      = 0;
-
-    /* Initialize buckets to empty */
-    for (uint32_t i = 0; i < bc; i++)
-        c->buckets[i] = NCACHE_SENTINEL;
-
-    /* Build free list (chain through lru_next) */
-    for (uint32_t i = 0; i < capacity; i++)
-        c->entries[i].lru_next = (i + 1 < capacity) ? i + 1 : NCACHE_SENTINEL;
-    c->free_head = 0;
-
-    return c;
-}
-
-static void ncache_destroy(node_cache_t *c) {
-    if (!c) return;
-    free(c->entries);
-    free(c->buckets);
-    free(c);
-}
-
-/* Remove entry from LRU list (does NOT touch hash table or free list) */
-static void ncache_lru_remove(node_cache_t *c, uint32_t idx) {
-    ncache_entry_t *e = &c->entries[idx];
-    if (e->lru_prev != NCACHE_SENTINEL)
-        c->entries[e->lru_prev].lru_next = e->lru_next;
-    else
-        c->lru_head = e->lru_next;
-    if (e->lru_next != NCACHE_SENTINEL)
-        c->entries[e->lru_next].lru_prev = e->lru_prev;
-    else
-        c->lru_tail = e->lru_prev;
-}
-
-/* Push entry to front of LRU list (most recently used) */
-static void ncache_lru_push_front(node_cache_t *c, uint32_t idx) {
-    ncache_entry_t *e = &c->entries[idx];
-    e->lru_prev = NCACHE_SENTINEL;
-    e->lru_next = c->lru_head;
-    if (c->lru_head != NCACHE_SENTINEL)
-        c->entries[c->lru_head].lru_prev = idx;
-    c->lru_head = idx;
-    if (c->lru_tail == NCACHE_SENTINEL)
-        c->lru_tail = idx;
-}
-
-/* Remove entry from its hash bucket chain */
-static void ncache_ht_remove(node_cache_t *c, uint32_t idx) {
-    uint32_t b = ncache_bucket(c, c->entries[idx].hash);
-    uint32_t *prev = &c->buckets[b];
-    while (*prev != NCACHE_SENTINEL) {
-        if (*prev == idx) {
-            *prev = c->entries[idx].ht_next;
-            return;
-        }
-        prev = &c->entries[*prev].ht_next;
-    }
-}
-
-/* Look up a node by hash. On hit, copies RLP to buf and moves to LRU front. */
-/* Lightweight existence check — no data copy, no LRU promotion. */
-static bool ncache_contains(const node_cache_t *c, const uint8_t hash[32]) {
-    uint32_t b = ncache_bucket(c, hash);
-    uint32_t idx = c->buckets[b];
-    while (idx != NCACHE_SENTINEL) {
-        if (memcmp(c->entries[idx].hash, hash, 32) == 0)
-            return true;
-        idx = c->entries[idx].ht_next;
-    }
-    return false;
-}
-
-/* ncache_get/ncache_put unused — mmap'd .dat replaces LRU for reads,
- * and write_node no longer inserts into cache (deferred buffer suffices). */
-static bool __attribute__((unused)) ncache_get(node_cache_t *c, const uint8_t hash[32],
-                        uint8_t *buf, uint16_t *out_len) {
-    uint32_t b = ncache_bucket(c, hash);
-    uint32_t idx = c->buckets[b];
-    while (idx != NCACHE_SENTINEL) {
-        ncache_entry_t *e = &c->entries[idx];
-        if (memcmp(e->hash, hash, 32) == 0) {
-            /* Hit — copy data and move to LRU front */
-            memcpy(buf, e->rlp, e->rlp_len);
-            *out_len = e->rlp_len;
-            ncache_lru_remove(c, idx);
-            ncache_lru_push_front(c, idx);
-            c->hits++;
-            return true;
-        }
-        idx = e->ht_next;
-    }
-    c->misses++;
-    return false;
-}
-
-/* Insert or update a node in the cache. Evicts LRU tail if full.
- * depth = trie depth of this node (used for pin policy). */
-static void __attribute__((unused)) ncache_put(node_cache_t *c, const uint8_t hash[32],
-                        const uint8_t *rlp, uint16_t rlp_len, uint8_t depth) {
-    if (rlp_len > MAX_NODE_RLP) return;
-
-    /* Check if already present — update in place */
-    uint32_t b = ncache_bucket(c, hash);
-    uint32_t idx = c->buckets[b];
-    while (idx != NCACHE_SENTINEL) {
-        ncache_entry_t *e = &c->entries[idx];
-        if (memcmp(e->hash, hash, 32) == 0) {
-            memcpy(e->rlp, rlp, rlp_len);
-            e->rlp_len = rlp_len;
-            /* Update depth if we now have better info */
-            if (depth < e->depth) e->depth = depth;
-            ncache_lru_remove(c, idx);
-            ncache_lru_push_front(c, idx);
-            return;
-        }
-        idx = e->ht_next;
-    }
-
-    /* Allocate a slot */
-    uint32_t slot;
-    if (c->free_head != NCACHE_SENTINEL) {
-        slot = c->free_head;
-        c->free_head = c->entries[slot].lru_next;
-    } else {
-        /* Evict LRU tail — skip pinned entries (depth <= PIN_DEPTH) */
-        slot = c->lru_tail;
-        while (slot != NCACHE_SENTINEL &&
-               c->entries[slot].depth <= NCACHE_PIN_DEPTH) {
-            c->evict_skipped++;
-            slot = c->entries[slot].lru_prev;
-        }
-        if (slot == NCACHE_SENTINEL) {
-            /* All entries are pinned — fall back to true LRU tail.
-             * This can only happen if cache is undersized for the trie. */
-            slot = c->lru_tail;
-        }
-        /* Track pinned count change for evicted entry */
-        if (c->entries[slot].depth <= NCACHE_PIN_DEPTH && c->pinned_count > 0)
-            c->pinned_count--;
-        ncache_lru_remove(c, slot);
-        ncache_ht_remove(c, slot);
-        c->count--;
-    }
-
-    /* Fill entry */
-    ncache_entry_t *e = &c->entries[slot];
-    memcpy(e->hash, hash, 32);
-    memcpy(e->rlp, rlp, rlp_len);
-    e->rlp_len = rlp_len;
-    e->depth = depth;
-    if (depth <= NCACHE_PIN_DEPTH) c->pinned_count++;
-
-    /* Insert into hash bucket */
-    b = ncache_bucket(c, hash);
-    e->ht_next = c->buckets[b];
-    c->buckets[b] = slot;
-
-    /* Push to LRU front */
-    ncache_lru_push_front(c, slot);
-    c->count++;
-}
-
-/* Remove a node from the cache (if present). */
-static void ncache_delete(node_cache_t *c, const uint8_t hash[32]) {
-    uint32_t b = ncache_bucket(c, hash);
-    uint32_t idx = c->buckets[b];
-    uint32_t *prev = &c->buckets[b];
-    while (idx != NCACHE_SENTINEL) {
-        ncache_entry_t *e = &c->entries[idx];
-        if (memcmp(e->hash, hash, 32) == 0) {
-            /* Remove from hash chain */
-            *prev = e->ht_next;
-            /* Remove from LRU */
-            ncache_lru_remove(c, idx);
-            if (e->depth <= NCACHE_PIN_DEPTH && c->pinned_count > 0)
-                c->pinned_count--;
-            /* Return to free list */
-            e->lru_next = c->free_head;
-            c->free_head = idx;
-            c->count--;
-            return;
-        }
-        prev = &e->ht_next;
-        idx = e->ht_next;
-    }
-}
-
-/* =========================================================================
  * In-memory free list (one per size class)
  *
  * Simple dynamic array of free slot offsets. Zero disk I/O during normal
@@ -528,8 +265,6 @@ struct mpt_store {
     size_t           val_page_cap;
     size_t           val_page_used;   /* bytes used in current page */
 #define VAL_PAGE_SIZE 65536
-
-    node_cache_t    *cache;          /* NULL = no caching */
 
     bool             shared;         /* multi-trie mode: skip node deletion */
 
@@ -632,9 +367,6 @@ static void free_list_destroy(free_list_t *fl) {
     fl->offsets = NULL;
     fl->count = fl->capacity = 0;
 }
-
-/* Forward declaration (used by mpt_store_create/open) */
-void mpt_store_set_cache_mb(mpt_store_t *ms, uint32_t megabytes);
 
 /* Return index of smallest size class that fits `len` bytes */
 static int size_class_for(uint32_t len) {
@@ -1327,12 +1059,6 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         }
     } else {
         /* Non-shared: refcount always 1 — fast existence check */
-        if (ms->cache && ncache_contains(ms->cache, out_hash)) {
-            def_del_cancel(ms, out_hash);
-            ms->cstats.check_ns += (double)(cstat_now() - _chk0);
-            ms->cstats.check_hits++;
-            return true;
-        }
         if (def_contains(ms, out_hash)) {
             ms->cstats.check_ns += (double)(cstat_now() - _chk0);
             ms->cstats.check_hits++;
@@ -1397,8 +1123,6 @@ static void delete_node(mpt_store_t *ms, const uint8_t hash[32]) {
         }
         /* Last reference — remove entirely */
         def_remove(ms, hash);
-        if (ms->cache)
-            ncache_delete(ms->cache, hash);
         ms->cstats.delete_ns += (double)(cstat_now() - _d0);
         ms->cstats.deletes++;
         return;
@@ -1407,9 +1131,6 @@ static void delete_node(mpt_store_t *ms, const uint8_t hash[32]) {
     /* On-disk node: defer the actual delete until flush */
     def_del_append(ms, hash);
 
-    /* Evict from cache */
-    if (ms->cache)
-        ncache_delete(ms->cache, hash);
     ms->cstats.delete_ns += (double)(cstat_now() - _d0);
     ms->cstats.deletes++;
 }
@@ -1588,9 +1309,6 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
     /* Bloom filter — starts empty, populated lazily as nodes are written */
     ms->bloom = bloom_create(capacity_hint > 0 ? capacity_hint / 4 : 1024);
 
-    /* Enable default LRU cache */
-    mpt_store_set_cache_mb(ms, MPT_DEFAULT_CACHE_MB);
-
     return ms;
 }
 
@@ -1695,9 +1413,6 @@ mpt_store_t *mpt_store_open(const char *path) {
         printf(" done (%.1f ms)\n", bloom_ms);
     }
 
-    /* Enable default LRU cache */
-    mpt_store_set_cache_mb(ms, MPT_DEFAULT_CACHE_MB);
-
     return ms;
 }
 
@@ -1713,7 +1428,6 @@ void mpt_store_destroy(mpt_store_t *ms) {
     /* Free deferred write buffer */
     def_free_all(ms);
 
-    ncache_destroy(ms->cache);
     bloom_destroy(ms->bloom);
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
         free_list_destroy(&ms->free_lists[i]);
@@ -1751,13 +1465,6 @@ void mpt_store_reset(mpt_store_t *ms) {
     free(ms->def_deletes);
     ms->def_deletes = NULL;
     ms->def_del_count = ms->def_del_cap = 0;
-
-    /* Clear LRU cache (keep allocation, just flush entries) */
-    if (ms->cache) {
-        uint32_t cap = ms->cache->capacity;
-        ncache_destroy(ms->cache);
-        ms->cache = ncache_create(cap);
-    }
 
     /* Reset bloom filter */
     if (ms->bloom) {
@@ -2313,7 +2020,7 @@ static node_ref_t collapse_branch(mpt_store_t *ms, node_ref_t children[16]) {
     mpt_node_t child_node;
 
     if (!load_from_ref(ms, &child_ref, buf, &buf_len, &child_node,
-                        NCACHE_DEPTH_UNKNOWN)) {
+                        0)) {
         /* Can't load child — just make an extension with 1-nibble path */
         return make_extension(ms, &prefix_nibble, 1, &child_ref);
     }
@@ -2912,7 +2619,7 @@ static bool compact_walk(const mpt_store_t *old_ms, mpt_store_t *new_ms,
 
     /* Load node from old store */
     uint8_t buf[MAX_NODE_RLP];
-    size_t buf_len = load_node_rlp(old_ms, ref->hash, buf, NCACHE_DEPTH_UNKNOWN);
+    size_t buf_len = load_node_rlp(old_ms, ref->hash, buf, 0);
     if (buf_len == 0) return false;
 
     /* Write to new store */
@@ -2953,7 +2660,7 @@ static bool walk_leaves_ref(const mpt_store_t *ms, const node_ref_t *ref,
             return false;
     } else {
         /* REF_HASH */
-        buf_len = load_node_rlp(ms, ref->hash, buf, NCACHE_DEPTH_UNKNOWN);
+        buf_len = load_node_rlp(ms, ref->hash, buf, 0);
         if (buf_len == 0) return false;
         if (!decode_node(buf, buf_len, &node))
             return false;
@@ -3004,7 +2711,7 @@ static bool verify_hash_ref(const mpt_store_t *ms, const node_ref_t *ref,
             return false;
     } else {
         /* REF_HASH: load and verify */
-        buf_len = load_node_rlp(ms, ref->hash, buf, NCACHE_DEPTH_UNKNOWN);
+        buf_len = load_node_rlp(ms, ref->hash, buf, 0);
         if (buf_len == 0) {
             fprintf(stderr, "VERIFY: missing node at depth %d hash=0x", depth);
             for (int i = 0; i < 8; i++) fprintf(stderr, "%02x", ref->hash[i]);
@@ -3180,13 +2887,6 @@ bool mpt_store_compact(mpt_store_t *ms) {
         free_list_clear(&ms->free_lists[i]);
     ms->free_slot_bytes = 0;
 
-    /* Invalidate cache — all offsets changed after compaction */
-    if (ms->cache) {
-        uint32_t cap = ms->cache->capacity;
-        ncache_destroy(ms->cache);
-        ms->cache = ncache_create(cap);
-    }
-
     /* Remove overflow file — compacted store has no free slots */
     if (ms->free_path) unlink(ms->free_path);
 
@@ -3201,7 +2901,6 @@ bool mpt_store_compact(mpt_store_t *ms) {
     new_ms->dat_path = NULL;
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
         free_list_destroy(&new_ms->free_lists[i]);
-    ncache_destroy(new_ms->cache);
     free(new_ms->dirty);
     free(new_ms);
 
@@ -3297,12 +2996,6 @@ bool mpt_store_compact_roots(mpt_store_t *ms,
         free_list_clear(&ms->free_lists[i]);
     ms->free_slot_bytes = 0;
 
-    if (ms->cache) {
-        uint32_t cap = ms->cache->capacity;
-        ncache_destroy(ms->cache);
-        ms->cache = ncache_create(cap);
-    }
-
     /* Remove overflow file — compacted store has no free slots */
     if (ms->free_path) unlink(ms->free_path);
 
@@ -3317,7 +3010,6 @@ bool mpt_store_compact_roots(mpt_store_t *ms,
     new_ms->dat_path = NULL;
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
         free_list_destroy(&new_ms->free_lists[i]);
-    ncache_destroy(new_ms->cache);
     free(new_ms->dirty);
     free(new_ms);
 
@@ -3333,21 +3025,11 @@ bool mpt_store_compact_roots(mpt_store_t *ms,
  * ========================================================================= */
 
 void mpt_store_set_cache(mpt_store_t *ms, uint32_t max_entries) {
-    if (!ms) return;
-    ncache_destroy(ms->cache);
-    ms->cache = ncache_create(max_entries); /* NULL if max_entries == 0 */
+    (void)ms; (void)max_entries;
 }
 
 void mpt_store_set_cache_mb(mpt_store_t *ms, uint32_t megabytes) {
-    if (!ms) return;
-    if (megabytes == 0) {
-        mpt_store_set_cache(ms, 0);
-        return;
-    }
-    uint32_t entries = (uint32_t)(
-        (uint64_t)megabytes * 1024 * 1024 / sizeof(ncache_entry_t));
-    if (entries == 0) entries = 1;
-    mpt_store_set_cache(ms, entries);
+    (void)ms; (void)megabytes;
 }
 
 mpt_store_stats_t mpt_store_stats(const mpt_store_t *ms) {
@@ -3364,15 +3046,6 @@ mpt_store_stats_t mpt_store_stats(const mpt_store_t *ms) {
     st.free_bytes = ms->free_slot_bytes;
     st.garbage_bytes = ms->data_size > ms->live_bytes + ms->free_slot_bytes
                      ? ms->data_size - ms->live_bytes - ms->free_slot_bytes : 0;
-
-    if (ms->cache) {
-        st.cache_hits          = ms->cache->hits;
-        st.cache_misses        = ms->cache->misses;
-        st.cache_count         = ms->cache->count;
-        st.cache_capacity      = ms->cache->capacity;
-        st.cache_evict_skipped = ms->cache->evict_skipped;
-        st.cache_pinned        = ms->cache->pinned_count;
-    }
 
     return st;
 }

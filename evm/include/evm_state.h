@@ -354,18 +354,10 @@ typedef struct {
     /* Account MPT store */
     uint64_t acct_mpt_nodes;
     uint64_t acct_mpt_data_bytes;
-    uint64_t acct_mpt_cache_hits;
-    uint64_t acct_mpt_cache_misses;
-    uint32_t acct_mpt_cache_count;
-    uint32_t acct_mpt_cache_capacity;
 
     /* Storage MPT store */
     uint64_t stor_mpt_nodes;
     uint64_t stor_mpt_data_bytes;
-    uint64_t stor_mpt_cache_hits;
-    uint64_t stor_mpt_cache_misses;
-    uint32_t stor_mpt_cache_count;
-    uint32_t stor_mpt_cache_capacity;
 
     /* Code store */
     uint64_t code_count;

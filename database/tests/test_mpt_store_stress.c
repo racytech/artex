@@ -123,7 +123,7 @@ static void test_insert_evict_readback(void) {
     CHECK(bad == 0, "insert readback: %d/500 keys corrupted", bad);
 
     mpt_store_stats_t st = mpt_store_stats(ms);
-    CHECK(st.cache_misses > 0, "expected cache misses with 64-entry cache");
+    /* cache stats removed — LRU replaced by mmap */
 
     mpt_store_destroy(ms);
     if (bad == 0) printf("OK\n");
@@ -354,8 +354,7 @@ static void test_flush_every_batch(void) {
     CHECK(bad == 0, "flush-every-batch: %d verifications failed", bad);
 
     mpt_store_stats_t st = mpt_store_stats(ms);
-    CHECK(st.cache_misses > 100,
-          "expected many cache misses, got %lu", st.cache_misses);
+    /* cache stats removed — LRU replaced by mmap */
 
     mpt_store_destroy(ms);
     if (bad == 0) printf("OK (600 keys, cache=32)\n");
@@ -588,8 +587,7 @@ static void test_large_batch_tiny_cache(void) {
     CHECK(bad == 0, "large batch: %d/2000 keys corrupted", bad);
 
     mpt_store_stats_t st = mpt_store_stats(ms);
-    printf("(hits=%lu misses=%lu evict_skip=%lu) ",
-           st.cache_hits, st.cache_misses, st.cache_evict_skipped);
+    printf("(nodes=%lu) ", (unsigned long)st.node_count);
 
     /* Delete half, verify other half survives */
     mpt_store_begin_batch(ms);

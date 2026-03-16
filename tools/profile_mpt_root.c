@@ -170,8 +170,6 @@ int main(int argc, char **argv) {
     }
 
     mpt_store_set_shared(stor_mpt, true);
-    mpt_store_set_cache_mb(acct_mpt, 512);
-    mpt_store_set_cache_mb(stor_mpt, 512);
 
     rng_t rng = { .state = 42 };
 
@@ -235,11 +233,11 @@ int main(int argc, char **argv) {
      * Phase 1: Profile dirty update rounds
      * ===================================================================== */
 
-    fprintf(stderr, "%6s  %8s  %8s  %8s  %8s  %6s  %6s  %7s  %7s\n",
+    fprintf(stderr, "%6s  %8s  %8s  %8s  %8s  %7s  %7s\n",
             "round", "total_ms", "stor_ms", "stage_ms", "commt_ms",
-            "s_hit%", "a_hit%", "d_accts", "d_slots");
+            "d_accts", "d_slots");
     fprintf(stderr, "------  --------  --------  --------  --------  "
-                    "------  ------  -------  -------\n");
+                    "-------  -------\n");
 
     for (int r = 0; r < rounds; r++) {
         /* Pick dirty accounts (Zipf-like: bias toward recent) */
@@ -252,9 +250,6 @@ int main(int argc, char **argv) {
         }
 
         struct timespec t0, t1, t2, t3;
-        mpt_store_stats_t s_before = mpt_store_stats(stor_mpt);
-        mpt_store_stats_t a_before = mpt_store_stats(acct_mpt);
-
         /* --- Storage trie updates --- */
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -301,23 +296,13 @@ int main(int argc, char **argv) {
 
         clock_gettime(CLOCK_MONOTONIC, &t3);
 
-        mpt_store_stats_t s_after = mpt_store_stats(stor_mpt);
-        mpt_store_stats_t a_after = mpt_store_stats(acct_mpt);
-
-        uint64_t s_h = s_after.cache_hits - s_before.cache_hits;
-        uint64_t s_m = s_after.cache_misses - s_before.cache_misses;
-        uint64_t a_h = a_after.cache_hits - a_before.cache_hits;
-        uint64_t a_m = a_after.cache_misses - a_before.cache_misses;
-
         double stor_ms  = ms_diff(&t0, &t1);
         double stage_ms = ms_diff(&t1, &t2);
         double commt_ms = ms_diff(&t2, &t3);
         double total_ms = ms_diff(&t0, &t3);
 
-        fprintf(stderr, "%6d  %7.1f   %7.1f   %7.1f   %7.1f   %5.1f   %5.1f   %6d  %7d\n",
+        fprintf(stderr, "%6d  %7.1f   %7.1f   %7.1f   %7.1f   %6d  %7d\n",
                 r, total_ms, stor_ms, stage_ms, commt_ms,
-                (s_h + s_m) > 0 ? 100.0 * s_h / (s_h + s_m) : 0,
-                (a_h + a_m) > 0 ? 100.0 * a_h / (a_h + a_m) : 0,
                 dirty_per_round, total_dirty_slots);
 
         free(dirty_idx);
@@ -327,10 +312,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\nFinal stats:\n");
     mpt_store_stats_t acct_st = mpt_store_stats(acct_mpt);
     mpt_store_stats_t stor_st = mpt_store_stats(stor_mpt);
-    fprintf(stderr, "  account trie: %llu nodes, cache %u/%u\n",
-            (unsigned long long)acct_st.node_count, acct_st.cache_count, acct_st.cache_capacity);
-    fprintf(stderr, "  storage trie: %llu nodes, cache %u/%u\n",
-            (unsigned long long)stor_st.node_count, stor_st.cache_count, stor_st.cache_capacity);
+    fprintf(stderr, "  account trie: %llu nodes\n",
+            (unsigned long long)acct_st.node_count);
+    fprintf(stderr, "  storage trie: %llu nodes\n",
+            (unsigned long long)stor_st.node_count);
 
     /* Cleanup */
     mpt_store_destroy(acct_mpt);
