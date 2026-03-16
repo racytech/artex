@@ -35,6 +35,7 @@ typedef struct {
     const char *verkle_commit_dir;
     const char *mpt_path;
     const char *code_store_path;   /* contract bytecode store (NULL = no code persistence) */
+    const char *flat_state_path;   /* O(1) flat account/storage store (NULL = disabled) */
 
     /* Checkpoint file path (NULL = no checkpointing) */
     const char *checkpoint_path;
