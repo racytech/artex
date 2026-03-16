@@ -140,7 +140,7 @@ static bool slot_get(const verkle_flat_t *vf, int depth,
     if (!vf->slot_store) return false;
     uint8_t key[32], val[32];
     make_slot_key(key, depth, path, slot);
-    if (!art_store_get(vf->slot_store, key, val))
+    if (!disk_hash_get(vf->slot_store, key, val))
         return false;
     memcpy(out_stem, val, 31);
     return true;
@@ -155,7 +155,7 @@ static void slot_put(verkle_flat_t *vf, int depth,
     make_slot_key(key, depth, path, slot);
     memset(val, 0, 32);
     memcpy(val, stem, 31);
-    art_store_put(vf->slot_store, key, val);
+    disk_hash_put(vf->slot_store, key, val);
 }
 
 static void slot_delete(verkle_flat_t *vf, int depth,
@@ -164,7 +164,7 @@ static void slot_delete(verkle_flat_t *vf, int depth,
     if (!vf->slot_store) return;
     uint8_t key[32];
     make_slot_key(key, depth, path, slot);
-    art_store_delete(vf->slot_store, key);
+    disk_hash_delete(vf->slot_store, key);
 }
 
 /* =========================================================================
@@ -181,23 +181,23 @@ static verkle_flat_t *alloc_handle(void) {
 static bool create_slot_store(verkle_flat_t *vf, const char *commit_dir)
 {
     char slot_path[512];
-    snprintf(slot_path, sizeof(slot_path), "%s/slots.dat", commit_dir);
-    vf->slot_store = art_store_create(slot_path, VF_SLOT_KEY_SIZE,
-                                       VF_SLOT_RECORD_SIZE);
+    snprintf(slot_path, sizeof(slot_path), "%s/slots.idx", commit_dir);
+    vf->slot_store = disk_hash_create(slot_path, VF_SLOT_KEY_SIZE,
+                                       VF_SLOT_RECORD_SIZE, VF_INITIAL_CAPACITY);
     return vf->slot_store != NULL;
 }
 
 static bool open_slot_store(verkle_flat_t *vf, const char *commit_dir)
 {
     char slot_path[512];
-    snprintf(slot_path, sizeof(slot_path), "%s/slots.dat", commit_dir);
+    snprintf(slot_path, sizeof(slot_path), "%s/slots.idx", commit_dir);
     /* If file doesn't exist yet, create it (migration from old format) */
     struct stat st;
     if (stat(slot_path, &st) != 0) {
-        vf->slot_store = art_store_create(slot_path, VF_SLOT_KEY_SIZE,
-                                           VF_SLOT_RECORD_SIZE);
+        vf->slot_store = disk_hash_create(slot_path, VF_SLOT_KEY_SIZE,
+                                           VF_SLOT_RECORD_SIZE, VF_INITIAL_CAPACITY);
     } else {
-        vf->slot_store = art_store_open(slot_path);
+        vf->slot_store = disk_hash_open(slot_path);
     }
     return vf->slot_store != NULL;
 }
@@ -266,7 +266,7 @@ void verkle_flat_destroy(verkle_flat_t *vf) {
     if (!vf) return;
     if (vf->value_store)  disk_hash_destroy(vf->value_store);
     if (vf->commit_store) vcs_destroy(vf->commit_store);
-    if (vf->slot_store)   art_store_destroy(vf->slot_store);
+    if (vf->slot_store)   disk_hash_destroy(vf->slot_store);
     free(vf->changes);
     free(vf->undos);
     free(vf->commit_undos);
@@ -973,7 +973,7 @@ bool verkle_flat_revert_block(verkle_flat_t *vf) {
     /* Restore commitments + slots in reverse */
     for (uint32_t i = vf->cu_count; i > blk->commit_undo_start; i--) {
         vf_commit_undo_t *cu = &vf->commit_undos[i - 1];
-        art_store_t *store;
+        disk_hash_t *store;
         switch (cu->store_id) {
             case VF_STORE_LEAF:     store = vf->commit_store->leaf_store; break;
             case VF_STORE_INTERNAL: store = vf->commit_store->internal_store; break;
@@ -981,9 +981,9 @@ bool verkle_flat_revert_block(verkle_flat_t *vf) {
             default: continue;
         }
         if (cu->data_len == 0) {
-            art_store_delete(store, cu->cs_key);
+            disk_hash_delete(store, cu->cs_key);
         } else {
-            art_store_put(store, cu->cs_key, cu->old_data);
+            disk_hash_put(store, cu->cs_key, cu->old_data);
         }
     }
 
@@ -1076,5 +1076,5 @@ void verkle_flat_sync(verkle_flat_t *vf) {
     if (!vf) return;
     disk_hash_sync(vf->value_store);
     vcs_sync(vf->commit_store);
-    if (vf->slot_store) art_store_sync(vf->slot_store);
+    if (vf->slot_store) disk_hash_sync(vf->slot_store);
 }

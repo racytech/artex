@@ -150,11 +150,11 @@ add_library(verkle_state STATIC
 )
 target_link_libraries(verkle_state verkle verkle_key verkle_flat)
 
-# Verkle commitment store (art_store-backed commitment persistence)
+# Verkle commitment store (disk_hash-backed commitment persistence)
 add_library(verkle_commit_store STATIC
     verkle/src/verkle_commit_store.c
 )
-target_link_libraries(verkle_commit_store verkle banderwagon art_store)
+target_link_libraries(verkle_commit_store verkle banderwagon disk_hash)
 
 # Verkle snapshot (binary tree serialization/deserialization)
 add_library(verkle_snapshot STATIC
@@ -172,7 +172,7 @@ target_link_libraries(verkle_journal verkle verkle_snapshot banderwagon)
 add_library(verkle_flat STATIC
     verkle/src/verkle_flat.c
 )
-target_link_libraries(verkle_flat verkle_commit_store art_store disk_hash pedersen banderwagon)
+target_link_libraries(verkle_flat verkle_commit_store disk_hash pedersen banderwagon)
 
 # In-Memory Batch MPT (testing only — used by test runner for state root verification)
 add_library(mem_mpt STATIC
