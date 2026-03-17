@@ -996,6 +996,9 @@ bool sync_checkpoint(sync_t *sync) {
     /* Sync flat state to disk */
     if (sync->flat_state) flat_state_sync(sync->flat_state);
 
+    /* Pre-grow mmap regions so bg flush can write without mremap */
+    evm_state_flush_prepare(sync->state);
+
     /* Signal persistent flush thread with new work */
     flush_ctx_t *ctx = sync->flush_ctx;
     if (ctx) {

@@ -390,7 +390,7 @@ int main(int argc, char **argv) {
 #ifdef ENABLE_MPT
     cfg.mpt_path = mpt_path;
     cfg.code_store_path = code_path;
-    cfg.flat_state_path = flat_state_path;
+    cfg.flat_state_path = NULL;  /* flat_state disabled — stale files cause corruption */
 #endif
 
     sync_t *sync = sync_create(&cfg);
