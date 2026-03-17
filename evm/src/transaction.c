@@ -735,19 +735,6 @@ bool transaction_execute(
     address_t recipient = tx->is_create ? contract_address : tx->to;
     address_t code_addr = tx->is_create ? contract_address : tx->to;
 
-    // Fast path for simple ETH transfers: no create, no calldata, no code at recipient.
-    // Skips evm_execute entirely (no stack/memory alloc, no warm address marking,
-    // no interpreter dispatch). The value transfer already happened above.
-    if (!tx->is_create && tx->data_size == 0 && evm->fork < FORK_VERKLE) {
-        uint32_t recipient_code_len = evm_state_get_code_size(state, &tx->to);
-        if (recipient_code_len == 0) {
-            result->status = EVM_SUCCESS;
-            result->gas_used = intrinsic_gas;
-            result->gas_refund = 0;
-            goto post_execution;
-        }
-    }
-
     evm_message_t msg = {
         .kind = tx->is_create ? EVM_CREATE : EVM_CALL,
         .caller = tx->sender,

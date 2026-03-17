@@ -723,6 +723,11 @@ bool sync_execute_block(sync_t *sync,
     if (!gas_match) {
         result->ok    = false;
         result->error = SYNC_GAS_MISMATCH;
+        /* Transfer receipt ownership to caller for debugging */
+        result->receipts = br.receipts;
+        result->receipt_count = br.receipt_count;
+        br.receipts = NULL;
+        br.receipt_count = 0;
         sync->blocks_fail++;
     } else {
         result->ok    = true;

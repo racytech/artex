@@ -497,7 +497,7 @@ def main():
         if 'currentRandom' in header:
             env['currentRandom'] = header['mixHash']
 
-        with open(os.path.join(args.t8n_dir, 'env.json'), 'w') as f:
+        with open(os.path.join(args.t8n_dir, 'header_env.json'), 'w') as f:
             json.dump(env, f, indent=2)
 
         # txs.json — note: these have v/r/s but NOT secretKey

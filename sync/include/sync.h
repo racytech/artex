@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include "hash.h"
 #include "block.h"
+#include "block_executor.h"
 #include "fork.h"
 #include "evm_state.h"
 
@@ -72,6 +73,10 @@ typedef struct {
     hash_t       actual_root;   /* from computation */
     uint32_t     transfer_count;/* simple ETH transfers */
     uint32_t     call_count;    /* contract calls / creates */
+
+    /* Per-tx receipts (only populated on gas mismatch, caller must free) */
+    tx_receipt_t *receipts;
+    size_t        receipt_count;
 } sync_block_result_t;
 
 typedef struct {

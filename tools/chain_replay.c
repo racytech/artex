@@ -18,6 +18,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include "evm_tracer.h"
@@ -822,9 +823,158 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Block %lu: GAS MISMATCH  got %lu  expected %lu  diff %+ld\n",
                         bn, result.actual_gas, result.expected_gas,
                         (long)result.actual_gas - (long)result.expected_gas);
-                fprintf(stderr, "  hint: gas diff usually means opcode cost bug or missing gas rule\n"
-                        "  hint: run with --trace-block %lu to get EVM opcode trace\n"
-                        "  hint: compare trace against geth's evm_statetest output\n", bn);
+                fprintf(stderr, "  hint: gas diff usually means opcode cost bug or missing gas rule\n");
+
+                /* Log our per-tx gas for comparison against era1 expected */
+                if (result.receipts && result.receipt_count > 0) {
+                    fprintf(stderr, "  per-tx gas (%zu txs, divergent only):\n", result.receipt_count);
+                    for (size_t ti = 0; ti < result.receipt_count; ti++) {
+                        fprintf(stderr, "    tx %3zu: gas=%7lu  cum=%lu  status=%u\n",
+                                ti, result.receipts[ti].gas_used,
+                                result.receipts[ti].cumulative_gas,
+                                result.receipts[ti].status_code);
+                    }
+                    /* Free receipts */
+                    for (size_t ti = 0; ti < result.receipt_count; ti++) {
+                        if (result.receipts[ti].logs)
+                            free(result.receipts[ti].logs);
+                    }
+                    free(result.receipts);
+                    result.receipts = NULL;
+                }
+
+                /* Auto-dump prestate for the failing block */
+                {
+                    char auto_dir[512];
+                    snprintf(auto_dir, sizeof(auto_dir), "known_issues/block_%lu", bn);
+                    mkdir("known_issues", 0755);
+                    mkdir(auto_dir, 0755);
+                    fprintf(stderr, "  auto-dumping prestate to %s/ ...\n", auto_dir);
+
+                    evm_state_t *es = sync_get_state(sync);
+
+                    /* Collect addresses and storage keys from dirty cache */
+                    address_t *d_addrs = malloc(MAX_ADDRS * sizeof(address_t));
+                    size_t d_n_addrs = evm_state_collect_addresses(es, d_addrs, MAX_ADDRS);
+
+                    typedef struct { address_t addr; uint256_t *keys; size_t count; } dslot_t;
+                    dslot_t *d_aslots = malloc(d_n_addrs * sizeof(dslot_t));
+                    uint256_t *d_sbuf = malloc(MAX_SLOTS * sizeof(uint256_t));
+                    size_t d_total_slots = 0;
+                    for (size_t di = 0; di < d_n_addrs; di++) {
+                        d_aslots[di].addr = d_addrs[di];
+                        size_t n = evm_state_collect_storage_keys(es, &d_addrs[di],
+                            d_sbuf + d_total_slots, MAX_SLOTS - d_total_slots);
+                        d_aslots[di].keys = d_sbuf + d_total_slots;
+                        d_aslots[di].count = n;
+                        d_total_slots += n;
+                    }
+
+                    /* Recreate sync from checkpoint for clean pre-state */
+                    sync_destroy(sync);
+                    sync = sync_create(&cfg);
+                    if (!sync) {
+                        fprintf(stderr, "  failed to recreate sync for prestate dump\n");
+                        free(d_addrs); free(d_aslots); free(d_sbuf);
+                        archive_close(&archive);
+                        return 1;
+                    }
+                    es = sync_get_state(sync);
+
+                    /* Write alloc.json */
+                    char alloc_p[512];
+                    snprintf(alloc_p, sizeof(alloc_p), "%s/alloc.json", auto_dir);
+                    FILE *af = fopen(alloc_p, "w");
+                    if (af) {
+                        fprintf(af, "{\n");
+                        for (size_t di = 0; di < d_n_addrs; di++) {
+                            address_t *a = &d_addrs[di];
+                            evm_state_exists(es, a);
+                            uint64_t nn = evm_state_get_nonce(es, a);
+                            uint256_t bal = evm_state_get_balance(es, a);
+                            if (di > 0) fprintf(af, ",\n");
+                            fprintf(af, "  \"0x");
+                            for (int j = 0; j < 20; j++) fprintf(af, "%02x", a->bytes[j]);
+                            fprintf(af, "\": {\n");
+                            uint8_t bb[32]; uint256_to_bytes(&bal, bb);
+                            fprintf(af, "    \"balance\": \"0x");
+                            int s = 0; while (s < 31 && bb[s] == 0) s++;
+                            for (int j = s; j < 32; j++) fprintf(af, "%02x", bb[j]);
+                            fprintf(af, "\",\n");
+                            fprintf(af, "    \"nonce\": \"0x%lx\"", nn);
+                            uint32_t csz = evm_state_get_code_size(es, a);
+                            if (csz > 0) {
+                                const uint8_t *code = evm_state_get_code_ptr(es, a, &csz);
+                                if (code && csz > 0) {
+                                    fprintf(af, ",\n    \"code\": \"0x");
+                                    for (uint32_t c = 0; c < csz; c++) fprintf(af, "%02x", code[c]);
+                                    fprintf(af, "\"");
+                                }
+                            }
+                            if (d_aslots[di].count > 0) {
+                                fprintf(af, ",\n    \"storage\": {");
+                                bool fs = true;
+                                for (size_t si = 0; si < d_aslots[di].count; si++) {
+                                    uint256_t val = evm_state_get_storage(es, a, &d_aslots[di].keys[si]);
+                                    if (uint256_is_zero(&val)) continue;
+                                    if (!fs) fprintf(af, ",");
+                                    fs = false;
+                                    uint8_t kb[32], vb[32];
+                                    uint256_to_bytes(&d_aslots[di].keys[si], kb);
+                                    uint256_to_bytes(&val, vb);
+                                    fprintf(af, "\n      \"0x");
+                                    for (int j = 0; j < 32; j++) fprintf(af, "%02x", kb[j]);
+                                    fprintf(af, "\": \"0x");
+                                    for (int j = 0; j < 32; j++) fprintf(af, "%02x", vb[j]);
+                                    fprintf(af, "\"");
+                                }
+                                fprintf(af, "\n    }");
+                            }
+                            fprintf(af, "\n  }");
+                        }
+                        fprintf(af, "\n}\n");
+                        fclose(af);
+                        fprintf(stderr, "  dumped %zu accounts, %zu slots to %s\n",
+                                d_n_addrs, d_total_slots, alloc_p);
+                    }
+
+                    /* Write env.json */
+                    char env_p[512];
+                    snprintf(env_p, sizeof(env_p), "%s/env.json", auto_dir);
+                    FILE *ef = fopen(env_p, "w");
+                    if (ef) {
+                        fprintf(ef, "{\n");
+                        fprintf(ef, "  \"currentCoinbase\": \"0x");
+                        for (int j = 0; j < 20; j++) fprintf(ef, "%02x", header.coinbase.bytes[j]);
+                        fprintf(ef, "\",\n");
+                        fprintf(ef, "  \"currentDifficulty\": \"0x%lx\",\n",
+                                uint256_to_uint64(&header.difficulty));
+                        fprintf(ef, "  \"currentGasLimit\": \"0x%lx\",\n", header.gas_limit);
+                        fprintf(ef, "  \"currentNumber\": \"0x%lx\",\n", header.number);
+                        fprintf(ef, "  \"currentTimestamp\": \"0x%lx\",\n", header.timestamp);
+                        fprintf(ef, "  \"parentHash\": \"0x");
+                        for (int j = 0; j < 32; j++) fprintf(ef, "%02x", header.parent_hash.bytes[j]);
+                        fprintf(ef, "\",\n");
+                        fprintf(ef, "  \"blockHashes\": {\n");
+                        bool fbh = true;
+                        uint64_t sbh = bn > 256 ? bn - 256 : 1;
+                        for (uint64_t bhn = sbh; bhn < bn; bhn++) {
+                            hash_t bh;
+                            if (sync_get_block_hash(sync, bhn, &bh)) {
+                                if (!fbh) fprintf(ef, ",\n");
+                                fbh = false;
+                                fprintf(ef, "    \"%lu\": \"0x", bhn);
+                                for (int j = 0; j < 32; j++) fprintf(ef, "%02x", bh.bytes[j]);
+                                fprintf(ef, "\"");
+                            }
+                        }
+                        fprintf(ef, "\n  }\n}\n");
+                        fclose(ef);
+                    }
+
+                    free(d_addrs); free(d_aslots); free(d_sbuf);
+                    /* sync was recreated — don't use old state after this */
+                }
             } else if (result.error == SYNC_ROOT_MISMATCH) {
                 char got_hex[67], exp_hex[67];
                 hash_to_hex(&result.actual_root, got_hex);

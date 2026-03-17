@@ -155,6 +155,9 @@ reference/
 # Fuzz reports
 fuzz_report/
 
+# Debug dumps
+known_issues/
+
 # Old checklist
 todo-checklist-old.md
 
