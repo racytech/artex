@@ -846,10 +846,22 @@ if(CJSON_FOUND)
     add_executable(stress_mpt_root tools/stress_mpt_root.c)
     target_link_libraries(stress_mpt_root evm common)
 
+    # TUI (ncurses terminal UI, optional)
+    find_package(Curses QUIET)
+    if(CURSES_FOUND)
+        add_library(tui STATIC tui/src/tui.c)
+        target_include_directories(tui PUBLIC ${CMAKE_SOURCE_DIR}/tui/include)
+        target_link_libraries(tui common ${CURSES_LIBRARIES} pthread)
+    endif()
+
     # Chain replay tool
     add_executable(chain_replay tools/chain_replay.c)
     target_compile_definitions(chain_replay PRIVATE CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL})
     target_link_libraries(chain_replay sync)
+    if(CURSES_FOUND)
+        target_link_libraries(chain_replay tui)
+        target_compile_definitions(chain_replay PRIVATE ENABLE_TUI=1)
+    endif()
 
     # Artex Node — full execution client (era1 replay + CL sync)
     add_executable(artex_node tools/artex_node.c)

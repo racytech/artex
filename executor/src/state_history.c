@@ -1,5 +1,6 @@
 #include "state_history.h"
 #include "evm_state.h"
+#include "logger.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -315,6 +316,10 @@ fail:
 static void *consumer_thread(void *arg) {
     state_history_t *sh = (state_history_t *)arg;
     uint64_t blocks_since_sync = 0;
+    uint64_t interval_accounts = 0;
+    uint64_t interval_slots = 0;
+    uint64_t interval_bytes = 0;
+    uint64_t interval_created = 0;
 
     while (!atomic_load_explicit(&sh->stop, memory_order_relaxed)) {
         block_diff_t diff;
@@ -332,8 +337,8 @@ static void *consumer_thread(void *arg) {
         ssize_t nw = pwrite(sh->dat_fd, buf, buf_len, (off_t)offset);
         free(buf);
         if (nw < 0 || (size_t)nw != buf_len) {
-            fprintf(stderr, "state_history: write failed for block %lu\n",
-                    diff.block_number);
+            LOG_HIST_ERROR( "history: write failed for block %lu",
+                   diff.block_number);
             block_diff_free(&diff);
             continue;
         }
@@ -349,13 +354,33 @@ static void *consumer_thread(void *arg) {
             sh->first_block = diff.block_number;
         sh->block_count++;
 
+        /* Accumulate stats for periodic log */
+        interval_accounts += diff.group_count;
+        for (uint16_t i = 0; i < diff.group_count; i++) {
+            interval_slots += diff.groups[i].slot_count;
+            if (diff.groups[i].flags & ACCT_DIFF_CREATED)
+                interval_created++;
+        }
+        interval_bytes += buf_len;
+
         block_diff_free(&diff);
 
         blocks_since_sync++;
         if (blocks_since_sync >= 256) {
             fdatasync(sh->dat_fd);
             fdatasync(sh->idx_fd);
+
+            LOG_HIST_INFO(
+                   "history: blk %lu (+256)  %lu accts  %lu slots  %lu created  %.1f KB",
+                   diff.block_number,
+                   interval_accounts, interval_slots, interval_created,
+                   (double)interval_bytes / 1024.0);
+
             blocks_since_sync = 0;
+            interval_accounts = 0;
+            interval_slots = 0;
+            interval_bytes = 0;
+            interval_created = 0;
         }
     }
 
@@ -425,8 +450,8 @@ state_history_t *state_history_create(const char *dir_path) {
     if (nr == IDX_HEADER_SIZE && read_u32(hdr) == HIST_MAGIC) {
         uint32_t version = read_u32(hdr + 4);
         if (version != HIST_VERSION) {
-            fprintf(stderr, "state_history: incompatible version %u (expected %u), "
-                    "delete history files to regenerate\n", version, HIST_VERSION);
+            LOG_HIST_ERROR( "history: incompatible version %u (expected %u), "
+               "delete files to regenerate", version, HIST_VERSION);
             goto fail;
         }
 
@@ -514,9 +539,16 @@ state_history_t *state_history_create(const char *dir_path) {
     if (pthread_create(&sh->consumer_tid, NULL, consumer_thread, sh) != 0)
         goto fail;
 
+    if (sh->block_count > 0)
+        LOG_HIST_INFO( "history: resumed at %s - %lu blocks (first: %lu)",
+               dir_path, sh->block_count, sh->first_block);
+    else
+        LOG_HIST_INFO( "history: created at %s", dir_path);
+
     return sh;
 
 fail:
+    LOG_HIST_ERROR( "history: failed to create at %s", dir_path);
     if (sh->dat_fd >= 0) close(sh->dat_fd);
     if (sh->idx_fd >= 0) close(sh->idx_fd);
     free(sh->dir_path);
@@ -560,8 +592,8 @@ void state_history_capture(state_history_t *sh, evm_state_t *es,
     evm_state_collect_block_diff(es, &diff);
 
     if (!diff_ring_try_push(&sh->ring, &diff)) {
-        fprintf(stderr, "state_history: ring full, dropped diff for block %lu\n",
-                block_number);
+        LOG_HIST_WARN( "history: ring full, dropped block %lu",
+               block_number);
         block_diff_free(&diff);
     }
 }
@@ -570,8 +602,8 @@ void state_history_push(state_history_t *sh, block_diff_t *diff) {
     if (!sh || !diff) return;
 
     if (!diff_ring_try_push(&sh->ring, diff)) {
-        fprintf(stderr, "state_history: ring full, dropped diff for block %lu\n",
-                diff->block_number);
+        LOG_HIST_WARN( "history: ring full, dropped block %lu",
+               diff->block_number);
         block_diff_free(diff);
     }
 }

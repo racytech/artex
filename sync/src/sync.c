@@ -467,9 +467,7 @@ sync_t *sync_create(const sync_config_t *config) {
 #ifdef ENABLE_HISTORY
     if (s->config.history_dir) {
         s->history = state_history_create(s->config.history_dir);
-        if (!s->history)
-            fprintf(stderr, "Warning: failed to create state history at %s\n",
-                    s->config.history_dir);
+        /* state_history_create logs its own errors via callback */
     }
 #endif
 

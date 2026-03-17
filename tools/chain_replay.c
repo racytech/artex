@@ -22,10 +22,16 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include "evm_tracer.h"
+#ifdef ENABLE_TUI
+#include "tui.h"
+#endif
+#include "logger.h"
 
 #ifdef ENABLE_DEBUG
 bool g_trace_calls = false;
 #endif
+
+#define LOG_ERR LOG_ERROR
 
 #define ERA1_BLOCKS_PER_FILE 8192
 #define PARIS_BLOCK          15537394  /* last PoW block (The Merge) */
@@ -269,10 +275,14 @@ int main(int argc, char **argv) {
 #ifdef ENABLE_HISTORY
     bool no_history = false;
 #endif
+    bool use_tui = true;
     const char *data_dir = DEFAULT_DATA_DIR;
     int arg_offset = 0;
     while (arg_offset + 1 < argc && argv[1 + arg_offset][0] == '-') {
-        if (strcmp(argv[1 + arg_offset], "--clean") == 0) {
+        if (strcmp(argv[1 + arg_offset], "--no-tui") == 0) {
+            use_tui = false;
+            arg_offset++;
+        } else if (strcmp(argv[1 + arg_offset], "--clean") == 0) {
             force_clean = true;
             arg_offset++;
         } else if (strcmp(argv[1 + arg_offset], "--follow") == 0) {
@@ -312,6 +322,7 @@ int main(int argc, char **argv) {
             "Usage: %s [options] <era1_dir> <genesis.json> [start_block] [end_block]\n"
             "\n"
             "Options:\n"
+            "  --no-tui              Disable ncurses terminal UI\n"
             "  --clean               Delete existing checkpoint and state, start from genesis\n"
             "  --follow              Wait for new era1 files instead of stopping\n"
             "  --data-dir DIR        Set data directory for all state files (default: data/)\n"
@@ -339,16 +350,42 @@ int main(int argc, char **argv) {
     uint64_t end_block  = (argc - arg_offset > 4)
                           ? (uint64_t)atoll(argv[4 + arg_offset]) : UINT64_MAX;
 
-    /* Install signal handler */
+    /* Install signal handler — no SA_RESTART so blocking reads can be interrupted */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigint_handler;
-    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);  /* intentionally no SA_RESTART for SIGINT */
+
+    /* Initialize TUI before heavy work so user sees progress */
+#ifdef ENABLE_TUI
+    if (use_tui) {
+        if (!tui_init()) {
+            use_tui = false;
+        } else {
+            freopen("/dev/null", "w", stdout);
+            freopen("/tmp/chain_replay_tui.log", "w", stderr);
+            LOG_INFO("Starting chain_replay...");
+            LOG_INFO("Era1 dir: %s", era1_dir);
+            LOG_INFO("Genesis:  %s", genesis_path);
+            LOG_INFO("Data dir: %s", data_dir);
+            LOG_WARN("Press Ctrl+C for graceful shutdown");
+        }
+    }
+#else
+    (void)use_tui;
+    use_tui = false;
+#endif
 
     /* Open era1 archive */
     era1_archive_t archive;
-    if (!archive_open(&archive, era1_dir)) return 1;
-    printf("Era1 archive: %zu files in %s\n", archive.count, era1_dir);
+    if (!archive_open(&archive, era1_dir)) {
+        LOG_ERR("Failed to open era1 directory: %s", era1_dir);
+#ifdef ENABLE_TUI
+        if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
+#endif
+        return 1;
+    }
+    LOG_INFO("Era1 archive: %zu files in %s", archive.count, era1_dir);
 
     /* Clean up old state if requested */
     if (force_clean) {
@@ -394,12 +431,20 @@ int main(int argc, char **argv) {
     cfg.flat_state_path = NULL;  /* flat_state disabled — stale files cause corruption */
 #endif
 
+    LOG_INFO("Loading state (bloom filter scan)...");
+#ifdef ENABLE_TUI
+    if (use_tui) { tui_tick(); }
+#endif
     sync_t *sync = sync_create(&cfg);
     if (!sync) {
-        fprintf(stderr, "Failed to create sync engine\n");
+        LOG_ERR("Failed to create sync engine");
+#ifdef ENABLE_TUI
+        if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
+#endif
         archive_close(&archive);
         return 1;
     }
+    LOG_INFO("State loaded successfully");
 
     uint64_t resumed = sync_resumed_from(sync);
     uint64_t start_block;
@@ -407,10 +452,11 @@ int main(int argc, char **argv) {
     if (resumed > 0) {
         start_block = resumed + 1;
         if (user_start > start_block) {
-            fprintf(stderr,
-                "Warning: requested start_block %lu > checkpoint %lu + 1\n"
-                "Cannot skip ahead — use --clean to restart from genesis\n",
-                user_start, resumed);
+            LOG_ERR("Requested start_block %lu > checkpoint %lu + 1", user_start, resumed);
+            LOG_ERR("Cannot skip ahead - use --clean to restart from genesis");
+#ifdef ENABLE_TUI
+            if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
+#endif
             sync_destroy(sync);
             archive_close(&archive);
             return 1;
@@ -430,7 +476,10 @@ int main(int argc, char **argv) {
         }
 
         if (!sync_load_genesis(sync, genesis_path, &gen_hash)) {
-            fprintf(stderr, "Failed to load genesis state\n");
+            LOG_ERR("Failed to load genesis state");
+#ifdef ENABLE_TUI
+            if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
+#endif
             sync_destroy(sync);
             archive_close(&archive);
             return 1;
@@ -443,10 +492,14 @@ int main(int argc, char **argv) {
     struct timespec t_start, t_now;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-    printf("Replaying blocks %lu to %lu...\n\n", start_block,
-           end_block == UINT64_MAX
-               ? (uint64_t)(archive.count * ERA1_BLOCKS_PER_FILE - 1)
-               : end_block);
+    uint64_t display_end = end_block == UINT64_MAX
+        ? (uint64_t)(archive.count * ERA1_BLOCKS_PER_FILE - 1)
+        : end_block;
+
+    if (!use_tui)
+        printf("Replaying blocks %lu to %lu...\n\n", start_block, display_end);
+    else
+        LOG_INFO("Replaying blocks %lu to %lu...", start_block, display_end);
 
     uint64_t window_txs = 0;
     uint64_t window_gas = 0;
@@ -454,17 +507,29 @@ int main(int argc, char **argv) {
     uint64_t window_calls = 0;
     struct timespec t_window;
     clock_gettime(CLOCK_MONOTONIC, &t_window);
+    struct timespec t_last_tui_update = {0, 0}; /* force immediate first update */
+
+    /* TUI rolling window — independent of checkpoint window for smooth stats */
+    uint64_t tui_window_blocks = 0;
+    uint64_t tui_window_txs = 0;
+    uint64_t tui_window_gas = 0;
+    uint64_t tui_window_transfers = 0;
+    uint64_t tui_window_calls = 0;
+    struct timespec t_tui_window;
+    clock_gettime(CLOCK_MONOTONIC, &t_tui_window);
+    #define TUI_WINDOW_SECS 2.0  /* reset rolling window every 2s */
+
 
     for (uint64_t bn = start_block; bn <= end_block; bn++) {
         /* Graceful shutdown: finish current batch, checkpoint at next boundary */
         if (g_shutdown && !g_shutdown_pending) {
             g_shutdown_pending = true;
-            printf("\nSIGINT received — finishing batch to next checkpoint...\n");
-            printf("  (press Ctrl+C again to stop immediately)\n");
+            LOG_WARN("SIGINT received - finishing batch to next checkpoint...");
+            LOG_WARN("(press Ctrl+C again to stop immediately)");
         }
         /* Second Ctrl+C — stop immediately, sync_destroy handles cleanup */
         if (g_shutdown >= 2) {
-            printf("\nForced stop — cleaning up...\n");
+            LOG_WARN("Forced stop - cleaning up...");
             break;
         }
 
@@ -713,6 +778,84 @@ int main(int argc, char **argv) {
         window_calls += result.call_count;
         window_gas += result.gas_used;
 
+#ifdef ENABLE_TUI
+        if (use_tui) {
+            tui_window_blocks++;
+            tui_window_txs += result.tx_count;
+            tui_window_gas += result.gas_used;
+            tui_window_transfers += result.transfer_count;
+            tui_window_calls += result.call_count;
+
+            if (!tui_tick()) {
+                g_shutdown = 1;
+                g_shutdown_pending = true;
+            }
+            /* Update stats panel every ~0.5s for live feel */
+            struct timespec t_tui_now;
+            clock_gettime(CLOCK_MONOTONIC, &t_tui_now);
+            double tui_dt = (t_tui_now.tv_sec - t_last_tui_update.tv_sec) +
+                            (t_tui_now.tv_nsec - t_last_tui_update.tv_nsec) / 1e9;
+            if (tui_dt >= 0.5) {
+                double elapsed = (t_tui_now.tv_sec - t_start.tv_sec) +
+                                 (t_tui_now.tv_nsec - t_start.tv_nsec) / 1e9;
+                double tui_win = (t_tui_now.tv_sec - t_tui_window.tv_sec) +
+                                 (t_tui_now.tv_nsec - t_tui_window.tv_nsec) / 1e9;
+                double bps = tui_window_blocks / (tui_win > 0 ? tui_win : 1);
+                double ltps = tui_window_txs / (tui_win > 0 ? tui_win : 1);
+                double lmgps = (tui_window_gas / 1e6) / (tui_win > 0 ? tui_win : 1);
+                evm_state_stats_t lss = sync_get_state_stats(sync);
+                sync_checkpoint_stats_t lcs = sync_get_checkpoint_stats(sync);
+                sync_status_t lst = sync_get_status(sync);
+                tui_stats_t ts = {
+                    .block_number     = bn,
+                    .target_block     = display_end < PARIS_BLOCK ? display_end : PARIS_BLOCK,
+                    .blocks_per_sec   = bps,
+                    .tps              = ltps,
+                    .mgas_per_sec     = lmgps,
+                    .window_secs      = tui_win,
+                    .window_txs       = tui_window_txs,
+                    .window_transfers = tui_window_transfers,
+                    .window_calls     = tui_window_calls,
+                    .checkpoint_interval = CHECKPOINT_INTERVAL,
+                    .cache_accounts   = lss.cache_accounts,
+                    .cache_slots      = lss.cache_slots,
+                    .cache_arena_mb   = lss.cache_arena_bytes / (1024*1024),
+                    .rss_mb           = get_rss_kb() / 1024,
+                    .total_blocks_ok  = lst.blocks_ok,
+                    .total_blocks_fail = lst.blocks_fail,
+                    .elapsed_secs     = elapsed,
+#ifdef ENABLE_MPT
+                    .root_stor_ms     = lss.root_stor_ms,
+                    .root_acct_ms     = lss.root_acct_ms,
+                    .root_dirty_count = lss.root_dirty_count,
+                    .acct_mpt_nodes   = lss.acct_mpt_nodes,
+                    .stor_mpt_nodes   = lss.stor_mpt_nodes,
+                    .acct_mpt_gb      = lss.acct_mpt_data_bytes / 1e9,
+                    .stor_mpt_gb      = lss.stor_mpt_data_bytes / 1e9,
+                    .code_count       = lss.code_count,
+                    .code_cache_hit_pct = (lss.code_cache_hits + lss.code_cache_misses)
+                        ? 100.0 * lss.code_cache_hits / (lss.code_cache_hits + lss.code_cache_misses) : 0,
+                    .flush_total_ms   = lcs.valid ? lcs.flush_total_ms : 0,
+                    .flush_join_ms    = lcs.valid ? lcs.flush_join_ms : 0,
+                    .checkpoint_total_ms = lcs.root_total_ms,
+#endif
+                };
+                tui_update_stats(&ts);
+                t_last_tui_update = t_tui_now;
+
+                /* Reset rolling window if enough time has passed */
+                if (tui_win >= TUI_WINDOW_SECS) {
+                    tui_window_blocks = 0;
+                    tui_window_txs = 0;
+                    tui_window_gas = 0;
+                    tui_window_transfers = 0;
+                    tui_window_calls = 0;
+                    t_tui_window = t_tui_now;
+                }
+            }
+        }
+#endif
+
         /* Progress every CHECKPOINT_INTERVAL blocks, on failure, or last block */
         if (bn % CHECKPOINT_INTERVAL == 0 || !result.ok || bn == end_block) {
             clock_gettime(CLOCK_MONOTONIC, &t_now);
@@ -723,16 +866,59 @@ int main(int argc, char **argv) {
             double bps = CHECKPOINT_INTERVAL / (win_secs > 0 ? win_secs : 1);
             double tps = window_txs / (win_secs > 0 ? win_secs : 1);
             double mgps = (window_gas / 1e6) / (win_secs > 0 ? win_secs : 1);
-            uint64_t remaining = (bn < PARIS_BLOCK) ? PARIS_BLOCK - bn : 0;
-            printf("Block %lu | %lu txs (%luT %luC) | %.0f tps | %.1f Mgas/s | %.0f blk/s | %.1fs/256blk | %luK to Paris\n",
-                   bn, window_txs, window_transfers, window_calls,
-                   tps, mgps, bps, win_secs,
-                   remaining / 1000);
+            evm_state_stats_t ss = sync_get_state_stats(sync);
+            sync_checkpoint_stats_t cs = sync_get_checkpoint_stats(sync);
+            size_t rss_mb = get_rss_kb() / 1024;
+            sync_status_t st = sync_get_status(sync);
 
-            /* Cache/store stats every checkpoint */
+#ifdef ENABLE_TUI
+            if (use_tui) {
+                tui_stats_t ts = {
+                    .block_number     = bn,
+                    .target_block     = display_end < PARIS_BLOCK ? display_end : PARIS_BLOCK,
+                    .blocks_per_sec   = bps,
+                    .tps              = tps,
+                    .mgas_per_sec     = mgps,
+                    .window_secs      = win_secs,
+                    .window_txs       = window_txs,
+                    .window_transfers = window_transfers,
+                    .window_calls     = window_calls,
+                    .checkpoint_interval = CHECKPOINT_INTERVAL,
+                    .cache_accounts   = ss.cache_accounts,
+                    .cache_slots      = ss.cache_slots,
+                    .cache_arena_mb   = ss.cache_arena_bytes / (1024*1024),
+                    .rss_mb           = rss_mb,
+                    .total_blocks_ok  = st.blocks_ok,
+                    .total_blocks_fail = st.blocks_fail,
+                    .elapsed_secs     = elapsed,
+#ifdef ENABLE_MPT
+                    .root_stor_ms     = ss.root_stor_ms,
+                    .root_acct_ms     = ss.root_acct_ms,
+                    .root_dirty_count = ss.root_dirty_count,
+                    .acct_mpt_nodes   = ss.acct_mpt_nodes,
+                    .stor_mpt_nodes   = ss.stor_mpt_nodes,
+                    .acct_mpt_gb      = ss.acct_mpt_data_bytes / 1e9,
+                    .stor_mpt_gb      = ss.stor_mpt_data_bytes / 1e9,
+                    .code_count       = ss.code_count,
+                    .code_cache_hit_pct = (ss.code_cache_hits + ss.code_cache_misses)
+                        ? 100.0 * ss.code_cache_hits / (ss.code_cache_hits + ss.code_cache_misses) : 0,
+                    .flush_total_ms   = cs.valid ? cs.flush_total_ms : 0,
+                    .flush_join_ms    = cs.valid ? cs.flush_join_ms : 0,
+                    .checkpoint_total_ms = cs.root_total_ms,
+#endif
+                };
+                tui_update_stats(&ts);
+                if (bn % CHECKPOINT_INTERVAL == 0)
+                    LOG_INFO("Checkpoint validated at block %lu", bn);
+            } else
+#endif
             {
-                evm_state_stats_t ss = sync_get_state_stats(sync);
-                size_t rss_mb = get_rss_kb() / 1024;
+                uint64_t remaining = (bn < PARIS_BLOCK) ? PARIS_BLOCK - bn : 0;
+                printf("Block %lu | %lu txs (%luT %luC) | %.0f tps | %.1f Mgas/s | %.0f blk/s | %.1fs/256blk | %luK to Paris\n",
+                       bn, window_txs, window_transfers, window_calls,
+                       tps, mgps, bps, win_secs,
+                       remaining / 1000);
+
                 printf("  └ cache: %zuK accts, %zuK slots (%zuMB arena)\n",
                        ss.cache_accounts / 1000, ss.cache_slots / 1000,
                        ss.cache_arena_bytes / (1024*1024));
@@ -748,13 +934,11 @@ int main(int argc, char **argv) {
                        ss.acct_mpt_data_bytes / 1e9, ss.stor_mpt_data_bytes / 1e9,
                        rss_mb);
 
-                /* Root computation timing */
                 double root_total = ss.root_stor_ms + ss.root_acct_ms;
                 if (root_total > 0.1) {
                     printf("  └ root: stor=%.1f ms  acct=%.1f ms  total=%.1f ms (%zu dirty)\n",
                            ss.root_stor_ms, ss.root_acct_ms, root_total,
                            ss.root_dirty_count);
-                    /* Storage trie commit breakdown */
                     mpt_commit_stats_t sc = ss.stor_commit;
                     if (sc.commits > 0)
                         printf("    └ stor: keccak=%.1f  load=%.1f  check=%.1f  del=%.1f  enc=%.1f  sort=%.1f ms"
@@ -765,7 +949,6 @@ int main(int argc, char **argv) {
                                sc.nodes_hashed, sc.nodes_loaded,
                                sc.load_cache_hits, sc.load_disk_reads,
                                sc.check_hits, sc.deletes, sc.commits);
-                    /* Account trie commit breakdown */
                     mpt_commit_stats_t ac = ss.acct_commit;
                     if (ac.commits > 0)
                         printf("    └ acct: keccak=%.1f  load=%.1f  check=%.1f  del=%.1f  enc=%.1f  sort=%.1f ms"
@@ -778,8 +961,6 @@ int main(int argc, char **argv) {
                                ac.check_hits, ac.deletes);
                 }
 
-                /* Background flush timing (from previous checkpoint, joined at this one) */
-                sync_checkpoint_stats_t cs = sync_get_checkpoint_stats(sync);
                 if (cs.valid) {
                     printf("  └ flush: acct=%.1f ms  stor=%.1f ms  total=%.1f ms",
                            cs.flush.acct_ms, cs.flush.stor_ms, cs.flush_total_ms);
@@ -788,7 +969,6 @@ int main(int argc, char **argv) {
                     printf("\n");
                 }
 
-                /* Checkpoint total */
                 if (cs.root_total_ms > 0.1)
                     printf("  └ checkpoint: total=%.1f ms\n", cs.root_total_ms);
 #else
@@ -805,7 +985,7 @@ int main(int argc, char **argv) {
         /* SIGINT: exit after validated checkpoint */
         if (g_shutdown_pending && result.ok &&
             bn % CHECKPOINT_INTERVAL == 0) {
-            printf("Checkpoint validated at block %lu — exiting.\n", bn);
+            LOG_INFO("Checkpoint validated at block %lu - exiting.", bn);
             block_body_free(&body);
             free(hdr_rlp);
             free(body_rlp);
@@ -1003,20 +1183,44 @@ int main(int argc, char **argv) {
     sigaddset(&block_set, SIGINT);
     sigprocmask(SIG_BLOCK, &block_set, &old_set);
 
-    /* Summary */
     clock_gettime(CLOCK_MONOTONIC, &t_now);
     double elapsed = (t_now.tv_sec - t_start.tv_sec) +
                      (t_now.tv_nsec - t_start.tv_nsec) / 1e9;
 
     sync_status_t st = sync_get_status(sync);
 
-    printf("\n===== Summary =====\n");
-    printf("Blocks OK:     %lu\n", st.blocks_ok);
-    printf("Blocks failed: %lu\n", st.blocks_fail);
-    printf("Total gas:     %lu\n", st.total_gas);
-    printf("Elapsed:       %.1f s\n", elapsed);
-    printf("Speed:         %.0f blk/s\n",
-           (st.blocks_ok + st.blocks_fail) / (elapsed > 0 ? elapsed : 1));
+#ifdef ENABLE_TUI
+    if (use_tui) {
+        /* Show summary in log panel, then wait for 'q' */
+        LOG_INFO("===== Summary =====");
+        LOG_INFO("Blocks OK:     %lu", st.blocks_ok);
+        LOG_INFO("Blocks failed: %lu", st.blocks_fail);
+        LOG_INFO("Total gas:     %lu", st.total_gas);
+        LOG_INFO("Elapsed:       %.1f s", elapsed);
+        LOG_INFO("Speed:         %.0f blk/s",
+                 (st.blocks_ok + st.blocks_fail) / (elapsed > 0 ? elapsed : 1));
+
+        tui_set_finished();
+
+        /* Block until user presses 'q' */
+        while (tui_tick()) {
+            usleep(50000);  /* 50ms — responsive without burning CPU */
+        }
+
+        tui_shutdown();
+        freopen("/dev/tty", "w", stdout);
+        freopen("/dev/tty", "w", stderr);
+    } else
+#endif
+    {
+        printf("\n===== Summary =====\n");
+        printf("Blocks OK:     %lu\n", st.blocks_ok);
+        printf("Blocks failed: %lu\n", st.blocks_fail);
+        printf("Total gas:     %lu\n", st.total_gas);
+        printf("Elapsed:       %.1f s\n", elapsed);
+        printf("Speed:         %.0f blk/s\n",
+               (st.blocks_ok + st.blocks_fail) / (elapsed > 0 ? elapsed : 1));
+    }
 
     sync_destroy(sync);  /* saves final checkpoint */
     archive_close(&archive);
