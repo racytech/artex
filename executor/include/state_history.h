@@ -148,6 +148,12 @@ bool state_history_get_diff(const state_history_t *sh,
 bool state_history_range(const state_history_t *sh,
                           uint64_t *first, uint64_t *last);
 
+/** Get disk usage in bytes (dat file size). */
+uint64_t state_history_disk_bytes(const state_history_t *sh);
+
+/** Get number of blocks recorded. */
+uint64_t state_history_block_count(const state_history_t *sh);
+
 #ifdef __cplusplus
 }
 #endif

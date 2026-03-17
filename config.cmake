@@ -22,5 +22,5 @@ set(MPT_STORAGE_CAPACITY  4000000000)  # storage trie (~4B for mainnet)
 set(CHECKPOINT_INTERVAL 256)
 
 # Debug instrumentation (trace, prestate dump, etc.)
-set(ENABLE_DEBUG ON)
-set(ENABLE_EVM_TRACE ON)
+set(ENABLE_DEBUG OFF)
+set(ENABLE_EVM_TRACE OFF)

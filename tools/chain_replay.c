@@ -364,6 +364,40 @@ int main(int argc, char **argv) {
         } else {
             freopen("/dev/null", "w", stdout);
             freopen("/tmp/chain_replay_tui.log", "w", stderr);
+
+            /* Build info bar */
+            char build[256];
+            snprintf(build, sizeof(build), "ARTEX  "
+                "MPT:%s  VERKLE:%s  HISTORY:%s  DEBUG:%s  EVM_TRACE:%s  CKPT:%d",
+#ifdef ENABLE_MPT
+                "ON",
+#else
+                "off",
+#endif
+#ifdef ENABLE_VERKLE
+                "ON",
+#else
+                "off",
+#endif
+#ifdef ENABLE_HISTORY
+                "ON",
+#else
+                "off",
+#endif
+#ifdef ENABLE_DEBUG
+                "ON",
+#else
+                "off",
+#endif
+#ifdef ENABLE_EVM_TRACE
+                "ON",
+#else
+                "off",
+#endif
+                CHECKPOINT_INTERVAL
+            );
+            tui_set_build_info(build);
+
             LOG_INFO("Starting chain_replay...");
             LOG_INFO("Era1 dir: %s", era1_dir);
             LOG_INFO("Genesis:  %s", genesis_path);
@@ -805,6 +839,7 @@ int main(int argc, char **argv) {
                 double lmgps = (tui_window_gas / 1e6) / (tui_win > 0 ? tui_win : 1);
                 evm_state_stats_t lss = sync_get_state_stats(sync);
                 sync_checkpoint_stats_t lcs = sync_get_checkpoint_stats(sync);
+                sync_history_stats_t lhs = sync_get_history_stats(sync);
                 sync_status_t lst = sync_get_status(sync);
                 tui_stats_t ts = {
                     .block_number     = bn,
@@ -839,6 +874,8 @@ int main(int argc, char **argv) {
                     .flush_join_ms    = lcs.valid ? lcs.flush_join_ms : 0,
                     .checkpoint_total_ms = lcs.root_total_ms,
 #endif
+                    .history_blocks   = lhs.blocks,
+                    .history_mb       = lhs.disk_mb,
                 };
                 tui_update_stats(&ts);
                 t_last_tui_update = t_tui_now;
@@ -868,6 +905,7 @@ int main(int argc, char **argv) {
             double mgps = (window_gas / 1e6) / (win_secs > 0 ? win_secs : 1);
             evm_state_stats_t ss = sync_get_state_stats(sync);
             sync_checkpoint_stats_t cs = sync_get_checkpoint_stats(sync);
+            sync_history_stats_t hs = sync_get_history_stats(sync);
             size_t rss_mb = get_rss_kb() / 1024;
             sync_status_t st = sync_get_status(sync);
 
@@ -906,6 +944,8 @@ int main(int argc, char **argv) {
                     .flush_join_ms    = cs.valid ? cs.flush_join_ms : 0,
                     .checkpoint_total_ms = cs.root_total_ms,
 #endif
+                    .history_blocks   = hs.blocks,
+                    .history_mb       = hs.disk_mb,
                 };
                 tui_update_stats(&ts);
                 if (bn % CHECKPOINT_INTERVAL == 0)

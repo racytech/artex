@@ -1076,6 +1076,17 @@ sync_checkpoint_stats_t sync_get_checkpoint_stats(const sync_t *sync) {
     return sync->ckpt_stats;
 }
 
+sync_history_stats_t sync_get_history_stats(const sync_t *sync) {
+    sync_history_stats_t st = {0};
+#ifdef ENABLE_HISTORY
+    if (sync && sync->history) {
+        st.blocks  = state_history_block_count(sync->history);
+        st.disk_mb = (double)state_history_disk_bytes(sync->history) / (1024.0 * 1024.0);
+    }
+#endif
+    return st;
+}
+
 evm_state_t *sync_get_state(const sync_t *sync) {
     return sync ? sync->state : NULL;
 }

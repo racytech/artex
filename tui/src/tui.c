@@ -15,9 +15,17 @@
  * ============================================================================ */
 
 #define STATS_HISTORY   5   /* number of rolling stat rows */
-#define STATS_HEIGHT    (4 + STATS_HISTORY + 4) /* pad + progress + hline + header + N rows + hline + status + hline */
+#define STATS_HEIGHT    (4 + STATS_HISTORY + 5) /* build bar + hline + progress + hline + header + N rows + hline + status + hline */
+#define TAB_BAR_HEIGHT  1
 #define LOG_RING_SIZE   4096
 #define LOG_MSG_LEN     512
+
+/* Tabs */
+typedef enum {
+    TAB_LOG = 0,
+    TAB_DETAIL,
+    TAB_COUNT,
+} tui_tab_t;
 
 /* Color pairs */
 #define CP_NORMAL    0
@@ -29,6 +37,7 @@
 #define CP_BORDER    6
 #define CP_STATUS_OK   7   /* black on green */
 #define CP_STATUS_FAIL 8   /* black on red */
+#define CP_BUILD_BAR   9   /* black on blue */
 
 /* ============================================================================
  * Log Ring Buffer
@@ -84,11 +93,17 @@ static struct {
     bool initialized;
     bool finished;          /* process done — 'q' enabled */
     bool logs_dirty;        /* true when logs need redraw */
+    bool detail_dirty;      /* true when detail tab needs redraw */
+
+    tui_tab_t active_tab;
+    WINDOW *tab_win;        /* tab bar window (1 row) */
 
     int stats_h;            /* actual stats height (clamped to LINES) */
 
     struct termios saved_termios;   /* terminal state before ncurses */
     bool termios_saved;
+
+    char build_info[256];          /* build feature string for top bar */
 } g;
 
 /* ============================================================================
@@ -104,7 +119,20 @@ static void draw_stats(void) {
 
     int row = 0;
 
-    /* Row 0: Top padding */
+    /* Row 0: Build info bar (black on blue background) */
+    if (g.build_info[0]) {
+        wattron(g.stats_win, A_BOLD | COLOR_PAIR(CP_BUILD_BAR));
+        mvwhline(g.stats_win, row, 0, ' ', w);
+        mvwprintw(g.stats_win, row, 1, " %s", g.build_info);
+        wattroff(g.stats_win, A_BOLD | COLOR_PAIR(CP_BUILD_BAR));
+    }
+    row++;
+
+    /* Separator after build bar */
+    if (row >= h) goto done;
+    wattron(g.stats_win, A_DIM);
+    mvwhline(g.stats_win, row, 0, ACS_HLINE, w);
+    wattroff(g.stats_win, A_DIM);
     row++;
 
     /* Row 1: Block progress bar */
@@ -112,15 +140,14 @@ static void draw_stats(void) {
     {
         double pct = s->target_block > 0
             ? 100.0 * s->block_number / s->target_block : 0;
-        int bar_start = 36;
+        int bar_start = 28;
         int bar_max = w - bar_start - 10;
         if (bar_max < 10) bar_max = 10;
         int filled = (int)(pct / 100.0 * bar_max);
         if (filled > bar_max) filled = bar_max;
 
-        mvwprintw(g.stats_win, row, 1, " block:");
         wattron(g.stats_win, A_BOLD | COLOR_PAIR(CP_HIGHLIGHT));
-        wprintw(g.stats_win, " %10lu", s->block_number);
+        mvwprintw(g.stats_win, row, 1, "%9lu", s->block_number);
         wattroff(g.stats_win, A_BOLD | COLOR_PAIR(CP_HIGHLIGHT));
         wprintw(g.stats_win, " / %-10lu", s->target_block);
 
@@ -211,10 +238,16 @@ static void draw_stats(void) {
         /* Fill entire row with background color */
         mvwhline(g.stats_win, row, 0, ' ', w);
 
-        mvwprintw(g.stats_win, row, 1,
+        int cx = 1;
+        mvwprintw(g.stats_win, row, cx,
                   " %3dh %02dm %02ds   DISK: %5.1f/%5.1fGB   RSS: %5zuMB   BLK/S: %6.0f   %10lu OK   %10lu FAIL",
                   hr, mn, sec, s->acct_mpt_gb, s->stor_mpt_gb, s->rss_mb,
                   s->blocks_per_sec, s->total_blocks_ok, s->total_blocks_fail);
+        if (s->history_blocks > 0) {
+            int cur_x = getcurx(g.stats_win);
+            if (cur_x + 16 < w)
+                wprintw(g.stats_win, "   HIST: %5.1fMB", s->history_mb);
+        }
 
         wattroff(g.stats_win, A_BOLD | COLOR_PAIR(cp));
     }
@@ -288,6 +321,145 @@ static void draw_logs(void) {
     wrefresh(g.log_win);
 }
 
+static void draw_tab_bar(void) {
+    if (!g.tab_win) return;
+    int w = getmaxx(g.tab_win);
+
+    werase(g.tab_win);
+
+    static const char *tab_names[] = { "LOG", "STATS" };
+    int cx = 1;
+
+    for (int i = 0; i < TAB_COUNT; i++) {
+        bool active = (i == (int)g.active_tab);
+        if (active)
+            wattron(g.tab_win, A_BOLD | A_REVERSE);
+        else
+            wattron(g.tab_win, A_DIM);
+
+        mvwprintw(g.tab_win, 0, cx, " %d:%s ", i + 1, tab_names[i]);
+
+        if (active)
+            wattroff(g.tab_win, A_BOLD | A_REVERSE);
+        else
+            wattroff(g.tab_win, A_DIM);
+
+        cx += (int)strlen(tab_names[i]) + 5;
+    }
+
+    /* Fill rest with dim line */
+    wattron(g.tab_win, A_DIM);
+    for (int x = cx; x < w; x++)
+        mvwaddch(g.tab_win, 0, x, ACS_HLINE);
+    wattroff(g.tab_win, A_DIM);
+
+    wrefresh(g.tab_win);
+}
+
+static void draw_detail(void) {
+    if (!g.log_win) return;
+
+    werase(g.log_win);
+    int h = getmaxy(g.log_win);
+    int w = getmaxx(g.log_win);
+    if (h <= 0 || w <= 0) return;
+
+    const tui_stats_t *s = &g.stats;
+    int row = 0;
+    int col1 = 2;   /* label column */
+    int col2 = 24;  /* value column */
+    int col3 = 42;  /* second label */
+    int col4 = 64;  /* second value */
+
+    /* Section: MPT Roots */
+    wattron(g.log_win, A_BOLD);
+    mvwprintw(g.log_win, row, col1, "MPT Roots");
+    wattroff(g.log_win, A_BOLD);
+    row++;
+
+    if (row < h) { mvwprintw(g.log_win, row, col1, "acct root:");
+                    mvwprintw(g.log_win, row, col2, "%8.1f ms", s->root_acct_ms);
+                    mvwprintw(g.log_win, row, col3, "stor root:");
+                    mvwprintw(g.log_win, row, col4, "%8.1f ms", s->root_stor_ms); row++; }
+    if (row < h) { mvwprintw(g.log_win, row, col1, "dirty count:");
+                    mvwprintw(g.log_win, row, col2, "%8zu", s->root_dirty_count); row++; }
+
+    /* Section: Flush */
+    row++;
+    if (row < h) { wattron(g.log_win, A_BOLD);
+                    mvwprintw(g.log_win, row, col1, "Flush / Checkpoint");
+                    wattroff(g.log_win, A_BOLD); row++; }
+
+    if (row < h) { mvwprintw(g.log_win, row, col1, "flush total:");
+                    mvwprintw(g.log_win, row, col2, "%8.1f ms", s->flush_total_ms);
+                    mvwprintw(g.log_win, row, col3, "flush join:");
+                    mvwprintw(g.log_win, row, col4, "%8.1f ms", s->flush_join_ms); row++; }
+    if (row < h) { mvwprintw(g.log_win, row, col1, "checkpoint:");
+                    mvwprintw(g.log_win, row, col2, "%8.1f ms", s->checkpoint_total_ms); row++; }
+
+    /* Section: Cache */
+    row++;
+    if (row < h) { wattron(g.log_win, A_BOLD);
+                    mvwprintw(g.log_win, row, col1, "Cache");
+                    wattroff(g.log_win, A_BOLD); row++; }
+
+    if (row < h) { mvwprintw(g.log_win, row, col1, "accounts:");
+                    mvwprintw(g.log_win, row, col2, "%8zu", s->cache_accounts);
+                    mvwprintw(g.log_win, row, col3, "slots:");
+                    mvwprintw(g.log_win, row, col4, "%8zu", s->cache_slots); row++; }
+    if (row < h) { mvwprintw(g.log_win, row, col1, "arena:");
+                    mvwprintw(g.log_win, row, col2, "%6zu MB", s->cache_arena_mb); row++; }
+
+    /* Section: MPT Store */
+    row++;
+    if (row < h) { wattron(g.log_win, A_BOLD);
+                    mvwprintw(g.log_win, row, col1, "MPT Store");
+                    wattroff(g.log_win, A_BOLD); row++; }
+
+    if (row < h) { mvwprintw(g.log_win, row, col1, "acct nodes:");
+                    mvwprintw(g.log_win, row, col2, "%8lu", s->acct_mpt_nodes);
+                    mvwprintw(g.log_win, row, col3, "stor nodes:");
+                    mvwprintw(g.log_win, row, col4, "%8lu", s->stor_mpt_nodes); row++; }
+    if (row < h) { mvwprintw(g.log_win, row, col1, "acct disk:");
+                    mvwprintw(g.log_win, row, col2, "%7.2f GB", s->acct_mpt_gb);
+                    mvwprintw(g.log_win, row, col3, "stor disk:");
+                    mvwprintw(g.log_win, row, col4, "%7.2f GB", s->stor_mpt_gb); row++; }
+
+    /* Section: Code Store */
+    row++;
+    if (row < h) { wattron(g.log_win, A_BOLD);
+                    mvwprintw(g.log_win, row, col1, "Code Store");
+                    wattroff(g.log_win, A_BOLD); row++; }
+
+    if (row < h) { mvwprintw(g.log_win, row, col1, "contracts:");
+                    mvwprintw(g.log_win, row, col2, "%8lu", s->code_count);
+                    mvwprintw(g.log_win, row, col3, "cache hit:");
+                    mvwprintw(g.log_win, row, col4, "%7.1f %%", s->code_cache_hit_pct); row++; }
+
+    /* Section: History */
+    if (s->history_blocks > 0) {
+        row++;
+        if (row < h) { wattron(g.log_win, A_BOLD);
+                        mvwprintw(g.log_win, row, col1, "History");
+                        wattroff(g.log_win, A_BOLD); row++; }
+
+        if (row < h) { mvwprintw(g.log_win, row, col1, "blocks:");
+                        mvwprintw(g.log_win, row, col2, "%8lu", s->history_blocks);
+                        mvwprintw(g.log_win, row, col3, "disk:");
+                        mvwprintw(g.log_win, row, col4, "%7.1f MB", s->history_mb); row++; }
+    }
+
+    wrefresh(g.log_win);
+}
+
+static void draw_content(void) {
+    switch (g.active_tab) {
+        case TAB_LOG:    draw_logs();   break;
+        case TAB_DETAIL: draw_detail(); break;
+        default: break;
+    }
+}
+
 static void create_windows(void) {
     /* Stats window: full STATS_HEIGHT or all available rows (min 2 for border) */
     g.stats_h = LINES < STATS_HEIGHT ? LINES : STATS_HEIGHT;
@@ -295,10 +467,19 @@ static void create_windows(void) {
 
     g.stats_win = newwin(g.stats_h, COLS, 0, 0);
 
-    /* Log window: only if there's space below stats */
-    int log_h = LINES - g.stats_h;
-    if (log_h > 0) {
-        g.log_win = newwin(log_h, COLS, g.stats_h, 0);
+    /* Tab bar: 1 row below stats */
+    int tab_y = g.stats_h;
+    if (tab_y < LINES) {
+        g.tab_win = newwin(TAB_BAR_HEIGHT, COLS, tab_y, 0);
+    } else {
+        g.tab_win = NULL;
+    }
+
+    /* Content window: below tab bar */
+    int content_y = g.stats_h + TAB_BAR_HEIGHT;
+    int content_h = LINES - content_y;
+    if (content_h > 0) {
+        g.log_win = newwin(content_h, COLS, content_y, 0);
     } else {
         g.log_win = NULL;
     }
@@ -313,6 +494,7 @@ static void handle_resize(void) {
 
     /* Destroy old windows */
     if (g.stats_win) { delwin(g.stats_win); g.stats_win = NULL; }
+    if (g.tab_win)   { delwin(g.tab_win);   g.tab_win = NULL; }
     if (g.log_win)   { delwin(g.log_win);   g.log_win = NULL; }
 
     /* End curses mode, resize, restart */
@@ -333,7 +515,8 @@ static void handle_resize(void) {
     /* Recreate windows and redraw */
     create_windows();
     draw_stats();
-    draw_logs();
+    draw_tab_bar();
+    draw_content();
 }
 
 /* ============================================================================
@@ -396,6 +579,7 @@ bool tui_init(void) {
         init_pair(CP_BORDER,      COLOR_CYAN,   -1);
         init_pair(CP_STATUS_OK,   COLOR_BLACK, COLOR_GREEN);
         init_pair(CP_STATUS_FAIL, COLOR_BLACK, COLOR_RED);
+        init_pair(CP_BUILD_BAR,   COLOR_BLACK, COLOR_BLUE);
     }
 
     /* Install SIGWINCH handler for reliable resize detection.
@@ -413,7 +597,8 @@ bool tui_init(void) {
     log_set_sink(tui_log_sink);
 
     draw_stats();
-    draw_logs();
+    draw_tab_bar();
+    draw_content();
 
     return true;
 }
@@ -423,6 +608,7 @@ void tui_shutdown(void) {
     log_set_sink(NULL);  /* restore default stderr logging */
     g.initialized = false;
     if (g.stats_win) delwin(g.stats_win);
+    if (g.tab_win) delwin(g.tab_win);
     if (g.log_win) delwin(g.log_win);
     endwin();
 
@@ -465,6 +651,7 @@ void tui_update_stats(const tui_stats_t *stats) {
     }
 
     draw_stats();
+    g.detail_dirty = true;
 }
 
 void tui_log(tui_log_level_t level, const char *fmt, ...) {
@@ -485,6 +672,11 @@ void tui_log(tui_log_level_t level, const char *fmt, ...) {
     g.logs_dirty = true;
 
     pthread_mutex_unlock(&g.ring_mutex);
+}
+
+void tui_set_build_info(const char *info) {
+    if (!info) return;
+    snprintf(g.build_info, sizeof(g.build_info), "%s", info);
 }
 
 void tui_set_finished(void) {
@@ -538,16 +730,39 @@ bool tui_tick(void) {
                 scrolled = true;
                 break;
             }
+            case '1':
+                if (g.active_tab != TAB_LOG) {
+                    g.active_tab = TAB_LOG;
+                    draw_tab_bar();
+                    g.logs_dirty = true;
+                }
+                break;
+            case '2':
+                if (g.active_tab != TAB_DETAIL) {
+                    g.active_tab = TAB_DETAIL;
+                    draw_tab_bar();
+                    g.detail_dirty = true;
+                }
+                break;
+            case '\t':  /* Tab key cycles */
+                g.active_tab = (g.active_tab + 1) % TAB_COUNT;
+                draw_tab_bar();
+                if (g.active_tab == TAB_LOG) g.logs_dirty = true;
+                else g.detail_dirty = true;
+                break;
             case KEY_RESIZE:
                 /* Handled via SIGWINCH + g_needs_resize flag */
                 break;
         }
     }
 
-    /* Only redraw logs when content changed or user scrolled */
-    if (g.logs_dirty || scrolled) {
+    /* Redraw content when dirty or scrolled */
+    if (g.active_tab == TAB_LOG && (g.logs_dirty || scrolled)) {
         g.logs_dirty = false;
         draw_logs();
+    } else if (g.active_tab == TAB_DETAIL && g.detail_dirty) {
+        g.detail_dirty = false;
+        draw_detail();
     }
     return true;
 }

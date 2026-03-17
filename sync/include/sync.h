@@ -231,4 +231,13 @@ typedef struct {
 /** Get checkpoint timing stats from the last checkpoint cycle. */
 sync_checkpoint_stats_t sync_get_checkpoint_stats(const sync_t *sync);
 
+/** History stats (only valid when ENABLE_HISTORY is on). */
+typedef struct {
+    uint64_t blocks;
+    double   disk_mb;
+} sync_history_stats_t;
+
+/** Get state history disk usage stats. Returns zeros if history is disabled. */
+sync_history_stats_t sync_get_history_stats(const sync_t *sync);
+
 #endif /* SYNC_H */

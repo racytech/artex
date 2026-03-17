@@ -668,3 +668,11 @@ bool state_history_range(const state_history_t *sh,
     if (last) *last = sh->first_block + sh->block_count - 1;
     return true;
 }
+
+uint64_t state_history_disk_bytes(const state_history_t *sh) {
+    return sh ? sh->dat_offset : 0;
+}
+
+uint64_t state_history_block_count(const state_history_t *sh) {
+    return sh ? sh->block_count : 0;
+}

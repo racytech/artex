@@ -51,6 +51,10 @@ typedef struct {
     uint64_t code_count;
     double   code_cache_hit_pct;
 
+    /* History */
+    uint64_t history_blocks;
+    double   history_mb;
+
     /* Memory */
     size_t   rss_mb;
 
@@ -76,6 +80,9 @@ typedef enum {
 
 /** Initialize ncurses TUI. Returns false if not a terminal. */
 bool tui_init(void);
+
+/** Set build info string shown in the top bar (call after tui_init). */
+void tui_set_build_info(const char *info);
 
 /** Shut down TUI, restore terminal. */
 void tui_shutdown(void);
