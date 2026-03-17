@@ -701,6 +701,8 @@ bool sync_execute_block(sync_t *sync,
 
     result->gas_used = br.gas_used;
     result->tx_count = br.tx_count;
+    result->transfer_count = br.transfer_count;
+    result->call_count = br.call_count;
 
     /* Validate gas */
     bool gas_match = (br.gas_used == header->gas_used);
@@ -818,6 +820,8 @@ bool sync_execute_block_live(sync_t *sync,
 
     result->gas_used = br.gas_used;
     result->tx_count = br.tx_count;
+    result->transfer_count = br.transfer_count;
+    result->call_count = br.call_count;
     result->expected_gas = header->gas_used;
     result->actual_gas   = br.gas_used;
 

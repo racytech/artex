@@ -449,6 +449,8 @@ int main(int argc, char **argv) {
 
     uint64_t window_txs = 0;
     uint64_t window_gas = 0;
+    uint64_t window_transfers = 0;
+    uint64_t window_calls = 0;
     struct timespec t_window;
     clock_gettime(CLOCK_MONOTONIC, &t_window);
 
@@ -706,6 +708,8 @@ int main(int argc, char **argv) {
         }
 
         window_txs += result.tx_count;
+        window_transfers += result.transfer_count;
+        window_calls += result.call_count;
         window_gas += result.gas_used;
 
         /* Progress every CHECKPOINT_INTERVAL blocks, on failure, or last block */
@@ -719,8 +723,9 @@ int main(int argc, char **argv) {
             double tps = window_txs / (win_secs > 0 ? win_secs : 1);
             double mgps = (window_gas / 1e6) / (win_secs > 0 ? win_secs : 1);
             uint64_t remaining = (bn < PARIS_BLOCK) ? PARIS_BLOCK - bn : 0;
-            printf("Block %lu | %lu txs | %.0f tps | %.1f Mgas/s | %.0f blk/s | %.1fs/256blk | %luK to Paris\n",
-                   bn, window_txs, tps, mgps, bps, win_secs,
+            printf("Block %lu | %lu txs (%luT %luC) | %.0f tps | %.1f Mgas/s | %.0f blk/s | %.1fs/256blk | %luK to Paris\n",
+                   bn, window_txs, window_transfers, window_calls,
+                   tps, mgps, bps, win_secs,
                    remaining / 1000);
 
             /* Cache/store stats every checkpoint */
@@ -791,6 +796,8 @@ int main(int argc, char **argv) {
             }
             window_txs = 0;
             window_gas = 0;
+            window_transfers = 0;
+            window_calls = 0;
             clock_gettime(CLOCK_MONOTONIC, &t_window);
         }
 

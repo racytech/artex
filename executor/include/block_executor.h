@@ -61,6 +61,9 @@ typedef struct {
     uint8_t   **requests;        /* array of request byte arrays */
     size_t     *request_lengths; /* length of each request */
     size_t      request_count;   /* number of requests */
+
+    uint32_t    transfer_count;  /* simple ETH transfers (no code, no calldata) */
+    uint32_t    call_count;      /* contract calls / creates */
 } block_result_t;
 
 /**

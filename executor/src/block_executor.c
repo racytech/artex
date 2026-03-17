@@ -443,6 +443,12 @@ block_result_t block_execute(evm_t *evm,
                     tx.is_create, tx.nonce, tx.gas_limit, tx.data_size);
         }
 
+        /* Classify: simple transfer vs contract interaction */
+        if (!tx.is_create && tx.data_size == 0)
+            result.transfer_count++;
+        else
+            result.call_count++;
+
         /* Execute transaction */
         transaction_result_t tx_result;
         bool ok = transaction_execute(evm, &tx, &tx_env, &tx_result);

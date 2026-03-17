@@ -70,6 +70,8 @@ typedef struct {
     uint64_t     actual_gas;    /* from execution */
     hash_t       expected_root; /* from header */
     hash_t       actual_root;   /* from computation */
+    uint32_t     transfer_count;/* simple ETH transfers */
+    uint32_t     call_count;    /* contract calls / creates */
 } sync_block_result_t;
 
 typedef struct {
