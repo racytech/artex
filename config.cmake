@@ -9,7 +9,7 @@ set(ENABLE_MPT    ON)
 set(ENABLE_VERKLE OFF)
 
 # Per-block state diff history (required for verkle_build tool)
-set(ENABLE_HISTORY ON)
+set(ENABLE_HISTORY OFF)
 
 # Build verkle libraries for background state building (pre-fork)
 set(ENABLE_VERKLE_BUILD OFF)
