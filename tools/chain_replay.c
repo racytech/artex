@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <pthread.h>
 #include "evm_tracer.h"
 #ifdef ENABLE_TUI
 #include "tui.h"
@@ -254,6 +255,164 @@ static bool archive_ensure(era1_archive_t *ar, uint64_t block_number,
     }
 
     return true;
+}
+
+/* =========================================================================
+ * Block prefetch — decode next block while executor runs current one
+ * ========================================================================= */
+
+typedef struct {
+    /* Decoded block data (owned by prefetch, swapped to consumer) */
+    uint8_t        *hdr_rlp;
+    size_t          hdr_len;
+    uint8_t        *body_rlp;
+    size_t          body_len;
+    block_header_t  header;
+    block_body_t    body;
+    hash_t          blk_hash;
+    uint64_t        block_number;
+    bool            valid;       /* decode succeeded */
+} prefetched_block_t;
+
+typedef struct {
+    pthread_t       thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond_ready;    /* prefetch → main: block is ready */
+    pthread_cond_t  cond_consumed; /* main → prefetch: buffer consumed */
+
+    era1_archive_t  archive;       /* own archive instance */
+    const char     *era1_dir;
+    bool            follow_mode;
+
+    prefetched_block_t buf;        /* single-slot buffer */
+    bool            has_data;      /* buffer contains a ready block */
+    uint64_t        next_block;    /* next block to prefetch */
+    uint64_t        end_block;
+    bool            stop;          /* signal thread to exit */
+    bool            error;         /* prefetch hit a fatal error */
+} block_prefetch_t;
+
+static void *prefetch_thread_fn(void *arg) {
+    block_prefetch_t *pf = (block_prefetch_t *)arg;
+
+    while (1) {
+        pthread_mutex_lock(&pf->mutex);
+
+        /* Wait until buffer is consumed or stop requested */
+        while (pf->has_data && !pf->stop)
+            pthread_cond_wait(&pf->cond_consumed, &pf->mutex);
+
+        if (pf->stop || pf->next_block > pf->end_block) {
+            pthread_mutex_unlock(&pf->mutex);
+            break;
+        }
+
+        uint64_t bn = pf->next_block++;
+        pthread_mutex_unlock(&pf->mutex);
+
+        /* Read + decode outside the lock */
+        prefetched_block_t blk;
+        memset(&blk, 0, sizeof(blk));
+        blk.block_number = bn;
+        blk.valid = false;
+
+        if (!archive_ensure(&pf->archive, bn, pf->follow_mode, pf->era1_dir)) {
+            pthread_mutex_lock(&pf->mutex);
+            pf->error = true;
+            pf->has_data = false;
+            pthread_cond_signal(&pf->cond_ready);
+            pthread_mutex_unlock(&pf->mutex);
+            break;
+        }
+
+        if (!era1_read_block(&pf->archive.current, bn,
+                             &blk.hdr_rlp, &blk.hdr_len,
+                             &blk.body_rlp, &blk.body_len)) {
+            pthread_mutex_lock(&pf->mutex);
+            pf->error = true;
+            pf->has_data = false;
+            pthread_cond_signal(&pf->cond_ready);
+            pthread_mutex_unlock(&pf->mutex);
+            break;
+        }
+
+        blk.blk_hash = hash_keccak256(blk.hdr_rlp, blk.hdr_len);
+
+        if (!block_header_decode_rlp(&blk.header, blk.hdr_rlp, blk.hdr_len) ||
+            !block_body_decode_rlp(&blk.body, blk.body_rlp, blk.body_len)) {
+            free(blk.hdr_rlp);
+            free(blk.body_rlp);
+            pthread_mutex_lock(&pf->mutex);
+            pf->error = true;
+            pf->has_data = false;
+            pthread_cond_signal(&pf->cond_ready);
+            pthread_mutex_unlock(&pf->mutex);
+            break;
+        }
+
+        blk.valid = true;
+
+        /* Hand off to consumer */
+        pthread_mutex_lock(&pf->mutex);
+        pf->buf = blk;
+        pf->has_data = true;
+        pthread_cond_signal(&pf->cond_ready);
+        pthread_mutex_unlock(&pf->mutex);
+    }
+
+    return NULL;
+}
+
+static bool prefetch_start(block_prefetch_t *pf, const char *era1_dir,
+                           uint64_t start_block, uint64_t end_block,
+                           bool follow) {
+    memset(pf, 0, sizeof(*pf));
+    pthread_mutex_init(&pf->mutex, NULL);
+    pthread_cond_init(&pf->cond_ready, NULL);
+    pthread_cond_init(&pf->cond_consumed, NULL);
+
+    pf->era1_dir = era1_dir;
+    pf->follow_mode = follow;
+    pf->next_block = start_block;
+    pf->end_block = end_block;
+
+    if (!archive_open(&pf->archive, era1_dir))
+        return false;
+
+    pthread_create(&pf->thread, NULL, prefetch_thread_fn, pf);
+    return true;
+}
+
+/** Get next prefetched block. Caller takes ownership of rlp buffers + body. */
+static bool prefetch_get(block_prefetch_t *pf, prefetched_block_t *out) {
+    pthread_mutex_lock(&pf->mutex);
+
+    while (!pf->has_data && !pf->error && !pf->stop)
+        pthread_cond_wait(&pf->cond_ready, &pf->mutex);
+
+    if (pf->error || !pf->has_data) {
+        pthread_mutex_unlock(&pf->mutex);
+        return false;
+    }
+
+    *out = pf->buf;
+    pf->has_data = false;
+    pthread_cond_signal(&pf->cond_consumed);
+    pthread_mutex_unlock(&pf->mutex);
+    return true;
+}
+
+static void prefetch_stop(block_prefetch_t *pf) {
+    pthread_mutex_lock(&pf->mutex);
+    pf->stop = true;
+    pthread_cond_signal(&pf->cond_consumed);
+    pthread_mutex_unlock(&pf->mutex);
+
+    pthread_join(pf->thread, NULL);
+    archive_close(&pf->archive);
+    pthread_mutex_destroy(&pf->mutex);
+    pthread_cond_destroy(&pf->cond_ready);
+    pthread_cond_destroy(&pf->cond_consumed);
 }
 
 /* =========================================================================
@@ -533,6 +692,18 @@ int main(int argc, char **argv) {
     #define TUI_WINDOW_SECS 2.0  /* reset rolling window every 2s */
 
 
+    /* Start block prefetch thread */
+    block_prefetch_t prefetch;
+    if (!prefetch_start(&prefetch, era1_dir, start_block, end_block, follow_mode)) {
+        LOG_ERR("Failed to start block prefetch");
+        sync_destroy(sync);
+        archive_close(&archive);
+#ifdef ENABLE_TUI
+        if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
+#endif
+        return 1;
+    }
+
     for (uint64_t bn = start_block; bn <= end_block; bn++) {
         /* Graceful shutdown: finish current batch, checkpoint at next boundary */
         if (g_shutdown && !g_shutdown_pending) {
@@ -546,37 +717,18 @@ int main(int argc, char **argv) {
             break;
         }
 
-        if (!archive_ensure(&archive, bn, follow_mode, era1_dir))
-            break;
-
-        /* Read block from era1 */
-        uint8_t *hdr_rlp, *body_rlp;
-        size_t hdr_len, body_len;
-        if (!era1_read_block(&archive.current, bn,
-                             &hdr_rlp, &hdr_len, &body_rlp, &body_len)) {
-            LOG_ERROR("Block %lu: failed to read from era1", bn);
+        /* Get next block from prefetch thread */
+        prefetched_block_t blk;
+        if (!prefetch_get(&prefetch, &blk)) {
+            LOG_ERROR("Block %lu: prefetch failed", bn);
             break;
         }
 
-        /* Compute block hash */
-        hash_t blk_hash = hash_keccak256(hdr_rlp, hdr_len);
-
-        /* Decode header and body */
-        block_header_t header;
-        if (!block_header_decode_rlp(&header, hdr_rlp, hdr_len)) {
-            LOG_ERROR("Block %lu: failed to decode header", bn);
-            free(hdr_rlp);
-            free(body_rlp);
-            break;
-        }
-
-        block_body_t body;
-        if (!block_body_decode_rlp(&body, body_rlp, body_len)) {
-            LOG_ERROR("Block %lu: failed to decode body", bn);
-            free(hdr_rlp);
-            free(body_rlp);
-            break;
-        }
+        uint8_t *hdr_rlp = blk.hdr_rlp;
+        uint8_t *body_rlp = blk.body_rlp;
+        block_header_t header = blk.header;
+        block_body_t body = blk.body;
+        hash_t blk_hash = blk.blk_hash;
 
         /* Enable EVM tracing for the target block */
 #ifdef ENABLE_EVM_TRACE
@@ -1227,6 +1379,7 @@ int main(int argc, char **argv) {
                (st.blocks_ok + st.blocks_fail) / (elapsed > 0 ? elapsed : 1));
     }
 
+    prefetch_stop(&prefetch);
     sync_destroy(sync);  /* saves final checkpoint */
     archive_close(&archive);
 
