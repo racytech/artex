@@ -1391,6 +1391,8 @@ static bool commit_account_cb(const uint8_t *key, size_t key_len,
     ca->original_balance = ca->balance;
     ca->original_code_hash = ca->code_hash;
     ca->block_accessed = false;
+    ca->block_created = false;
+    ca->block_self_destructed = false;
 #endif
     return true;
 }
@@ -2527,6 +2529,7 @@ void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
         if (is_created) g->flags |= ACCT_DIFF_CREATED;
         if (is_destructed) g->flags |= ACCT_DIFF_DESTRUCTED;
         if (is_touched) g->flags |= ACCT_DIFF_TOUCHED;
+        if (ca->block_dirty) g->flags |= ACCT_DIFF_FINAL_DIRTY;
         g->field_mask = 0;
         if (nonce_changed) {
             g->field_mask |= FIELD_NONCE;
@@ -2592,11 +2595,6 @@ void evm_state_apply_diff_bulk(evm_state_t *es, const block_diff_t *diff) {
     for (uint16_t i = 0; i < diff->group_count; i++) {
         const addr_diff_t *g = &diff->groups[i];
 
-        /* Don't skip any entry — even CREATED+empty entries need processing
-         * since they represent accounts that must exist in the trie pre-EIP-161.
-         * Spurious repeats (block_created persists across blocks) are harmless:
-         * apply_diff_bulk just re-sets existed=true + block_dirty=true. */
-
         /* ensure_account creates or loads the cached entry */
         cached_account_t *ca = ensure_account(es, &g->addr);
         if (!ca) continue;
@@ -2607,6 +2605,23 @@ void evm_state_apply_diff_bulk(evm_state_t *es, const block_diff_t *diff) {
             memset(ca->code_hash.bytes, 0, 32);
             ca->has_code = false;
             ca->storage_root = HASH_EMPTY_STORAGE;
+
+            /* Clear mpt_dirty on all previously-dirty cached slots for this
+             * account. In chain_replay, commit_tx_slot_cb zeros self-destructed
+             * account slots and clears mpt_dirty. Without this, stale slot
+             * values from earlier blocks survive destruction in batch mode and
+             * pollute the storage trie at checkpoint time. */
+            for (size_t d = 0; d < es->dirty_slots.count; d++) {
+                const uint8_t *skey = es->dirty_slots.keys + d * SLOT_KEY_SIZE;
+                if (memcmp(skey, g->addr.bytes, ADDRESS_SIZE) == 0) {
+                    cached_slot_t *cs = (cached_slot_t *)mem_art_get_mut(
+                        &es->storage, skey, SLOT_KEY_SIZE, NULL);
+                    if (cs) {
+                        cs->current = UINT256_ZERO;
+                        cs->mpt_dirty = false;
+                    }
+                }
+            }
         }
 
         if (g->field_mask & FIELD_NONCE)
@@ -2622,11 +2637,34 @@ void evm_state_apply_diff_bulk(evm_state_t *es, const block_diff_t *diff) {
             ca->code_dirty = true;
         }
 
-        /* Mark account as existing and mpt-dirty.
-         * Set block_dirty so compute_mpt_root's promotion logic runs
-         * (same as chain_replay where set_nonce/set_balance set block_dirty). */
-        ca->existed = true;
-        ca->block_dirty = true;
+        /* Determine existed/block_dirty based on final account state.
+         * For DESTRUCTED accounts: mirror commit_tx behavior — if the final
+         * state is empty, set existed=false and skip block_dirty so
+         * compute_mpt_root deletes (or skips) instead of writing an empty
+         * account to the trie. If destructed but re-created with new values
+         * (field_mask non-zero → non-empty), treat as a normal account.
+         *
+         * FINAL_DIRTY flag: when both CREATED and DESTRUCTED are set, the
+         * order matters. If the account was re-created AFTER being destructed
+         * (in a later tx within the same block), block_dirty is true in
+         * chain_replay at diff collection time. The FINAL_DIRTY flag captures
+         * this, so we preserve block_dirty=true and let compute_mpt_root's
+         * promotion logic handle it (pre-EIP-161: empty accounts get PUT). */
+        bool is_empty = (ca->nonce == 0 &&
+                         uint256_is_zero(&ca->balance) &&
+                         !ca->has_code);
+        if ((g->flags & ACCT_DIFF_DESTRUCTED) && is_empty &&
+            !(g->flags & ACCT_DIFF_FINAL_DIRTY)) {
+            ca->existed = false;
+            ca->block_dirty = false;
+            /* Must explicitly clear block_dirty — in batch mode it may
+             * carry over from a prior block where this account was modified.
+             * If left true, compute_mpt_root's promotion block would
+             * re-set existed=true, writing an empty account to the trie. */
+        } else {
+            ca->existed = true;
+            ca->block_dirty = true;
+        }
         mark_account_mpt_dirty(es, ca);
 
         /* Storage slots */
@@ -2776,7 +2814,6 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
         }
 
         size_t _acct_dirty_count = es->dirty_accounts.count;
-
         // Iterate dirty account list directly — O(dirty) instead of O(total_cached)
         for (size_t d = 0; d < es->dirty_accounts.count; d++) {
             const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
@@ -2817,16 +2854,16 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
                 uint8_t rlp[120];
                 size_t rlp_len = mpt_rlp_account(ca->nonce, &ca->balance, sr, code_hash, rlp);
                 mpt_store_update(es->account_mpt, ca->addr_hash.bytes, rlp, rlp_len);
+            }
 
-                // Populate flat state with final account data
-                if (es->flat_state) {
-                    flat_account_record_t frec;
-                    frec.nonce = ca->nonce;
-                    uint256_to_bytes(&ca->balance, frec.balance);
-                    memcpy(frec.code_hash, code_hash, 32);
-                    memcpy(frec.storage_root, sr, 32);
-                    flat_state_put_account(es->flat_state, ca->addr.bytes, &frec);
-                }
+            // Populate flat state with final account data (writes only)
+            if (es->flat_state && ca->existed && !(is_empty && prune_empty)) {
+                flat_account_record_t frec;
+                frec.nonce = ca->nonce;
+                uint256_to_bytes(&ca->balance, frec.balance);
+                memcpy(frec.code_hash, code_hash, 32);
+                memcpy(frec.storage_root, sr, 32);
+                flat_state_put_account(es->flat_state, ca->addr.bytes, &frec);
             }
 
             ca->mpt_dirty = false;

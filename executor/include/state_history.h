@@ -53,6 +53,7 @@ extern "C" {
 #define ACCT_DIFF_CREATED      (1 << 0)
 #define ACCT_DIFF_DESTRUCTED   (1 << 1)
 #define ACCT_DIFF_TOUCHED      (1 << 2)  /* touched this block but no value change */
+#define ACCT_DIFF_FINAL_DIRTY  (1 << 3)  /* block_dirty was true at diff collection */
 
 /* Field bitmask — which account fields changed */
 #define FIELD_NONCE     (1 << 0)
