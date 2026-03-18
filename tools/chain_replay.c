@@ -37,6 +37,35 @@ bool g_trace_calls = false;
 #define ERA1_BLOCKS_PER_FILE 8192
 #define PARIS_BLOCK          15537394  /* last PoW block (The Merge) */
 
+/* Reconstruct metadata — same format as state_reconstruct.c */
+#define META_MAGIC   0x54504D52  /* "RMPT" */
+#define META_VERSION 1
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t last_block;
+    uint8_t  state_root[32];
+    uint8_t  prune_empty;
+    uint8_t  reserved[7];
+} reconstruct_meta_t;  /* 56 bytes */
+
+static bool meta_write(const char *path, uint64_t block,
+                       const uint8_t root[32], bool prune_empty) {
+    reconstruct_meta_t meta = {0};
+    meta.magic = META_MAGIC;
+    meta.version = META_VERSION;
+    meta.last_block = block;
+    memcpy(meta.state_root, root, 32);
+    meta.prune_empty = prune_empty ? 1 : 0;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(&meta, sizeof(meta), 1, f) == 1;
+    fclose(f);
+    return ok;
+}
+
 #ifndef CHECKPOINT_INTERVAL
 #define CHECKPOINT_INTERVAL  256
 #endif
@@ -423,6 +452,7 @@ int main(int argc, char **argv) {
     /* Parse flags */
     bool force_clean = false;
     bool follow_mode = false;
+    bool resume_mode = false;
 #ifdef ENABLE_DEBUG
     bool no_evict = false;
 #endif
@@ -458,6 +488,9 @@ int main(int argc, char **argv) {
             no_history = true;
             arg_offset++;
 #endif
+        } else if (strcmp(argv[1 + arg_offset], "--resume") == 0) {
+            resume_mode = true;
+            arg_offset++;
         } else if (strcmp(argv[1 + arg_offset], "--trace-block") == 0 && arg_offset + 2 < argc) {
             trace_block = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
@@ -483,6 +516,7 @@ int main(int argc, char **argv) {
             "  --clean               Delete existing state files, start from genesis\n"
             "  --follow              Wait for new era1 files instead of stopping\n"
             "  --data-dir DIR        Set data directory for all state files (default: data/)\n"
+            "  --resume              Resume from existing MPT state (reads .meta)\n"
             "  --no-history          Disable per-block state diff history\n"
             "  --trace-block N       Enable EIP-3155 EVM trace for block N (to stderr)\n"
             "  --dump-prestate N [P] Dump pre-state alloc.json for block N to path P\n"
@@ -635,30 +669,77 @@ int main(int argc, char **argv) {
     }
     LOG_INFO("State loaded successfully");
 
-    /* Read genesis block hash from era1 */
-    hash_t gen_hash = {0};
-    if (archive_ensure(&archive, 0, false, era1_dir)) {
-        uint8_t *hdr_rlp, *body_rlp;
-        size_t hdr_len, body_len;
-        if (era1_read_block(&archive.current, 0,
-                            &hdr_rlp, &hdr_len, &body_rlp, &body_len)) {
-            gen_hash = hash_keccak256(hdr_rlp, hdr_len);
-            free(hdr_rlp);
-            free(body_rlp);
+    uint64_t start_block = (user_start > 0) ? user_start : 1;
+
+    if (resume_mode) {
+        /* Read .meta to find last good block */
+        char meta_path[512];
+        snprintf(meta_path, sizeof(meta_path), "%s.meta", mpt_path);
+        reconstruct_meta_t meta;
+        FILE *mf = fopen(meta_path, "rb");
+        if (!mf || fread(&meta, sizeof(meta), 1, mf) != 1 ||
+            meta.magic != META_MAGIC) {
+            if (mf) fclose(mf);
+            LOG_ERR("No valid .meta file at %s — cannot resume", meta_path);
+#ifdef ENABLE_TUI
+            if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
+#endif
+            sync_destroy(sync);
+            archive_close(&archive);
+            return 1;
+        }
+        fclose(mf);
+
+        LOG_INFO("Resuming from block %lu", meta.last_block);
+        start_block = meta.last_block + 1;
+
+        /* Truncate history to last good block (removes stale/buggy diffs) */
+        sync_truncate_history(sync, meta.last_block);
+
+        /* Populate block hash ring from era1 (last 256 blocks) */
+        uint64_t hash_start = meta.last_block >= 256 ? meta.last_block - 255 : 0;
+        size_t hash_count = (size_t)(meta.last_block - hash_start + 1);
+        hash_t *hashes = calloc(hash_count, sizeof(hash_t));
+        if (hashes) {
+            for (uint64_t i = 0; i < hash_count; i++) {
+                uint64_t hbn = hash_start + i;
+                if (archive_ensure(&archive, hbn, false, era1_dir)) {
+                    uint8_t *h_rlp = NULL; size_t h_len = 0;
+                    uint8_t *b_rlp = NULL; size_t b_len = 0;
+                    if (era1_read_block(&archive.current, hbn,
+                                         &h_rlp, &h_len, &b_rlp, &b_len)) {
+                        hashes[i] = hash_keccak256(h_rlp, h_len);
+                        free(h_rlp); free(b_rlp);
+                    }
+                }
+            }
+            sync_resume(sync, meta.last_block, hashes, hash_count);
+            free(hashes);
+        }
+    } else {
+        /* Read genesis block hash from era1 */
+        hash_t gen_hash = {0};
+        if (archive_ensure(&archive, 0, false, era1_dir)) {
+            uint8_t *hdr_rlp, *body_rlp;
+            size_t hdr_len, body_len;
+            if (era1_read_block(&archive.current, 0,
+                                &hdr_rlp, &hdr_len, &body_rlp, &body_len)) {
+                gen_hash = hash_keccak256(hdr_rlp, hdr_len);
+                free(hdr_rlp);
+                free(body_rlp);
+            }
+        }
+
+        if (!sync_load_genesis(sync, genesis_path, &gen_hash)) {
+            LOG_ERR("Failed to load genesis state");
+#ifdef ENABLE_TUI
+            if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
+#endif
+            sync_destroy(sync);
+            archive_close(&archive);
+            return 1;
         }
     }
-
-    if (!sync_load_genesis(sync, genesis_path, &gen_hash)) {
-        LOG_ERR("Failed to load genesis state");
-#ifdef ENABLE_TUI
-        if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
-#endif
-        sync_destroy(sync);
-        archive_close(&archive);
-        return 1;
-    }
-
-    uint64_t start_block = (user_start > 0) ? user_start : 1;
 
     /* Progress tracking */
     struct timespec t_start, t_now;
@@ -1194,6 +1275,33 @@ int main(int argc, char **argv) {
 #ifdef ENABLE_DEBUG
                 evm_state_debug_dump(sync_get_state(sync));
 #endif
+            }
+
+            /* Write .meta so state_reconstruct can rebuild to last good checkpoint */
+            {
+                uint64_t safe_block = ((bn - 1) / CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL;
+                bool pe = (safe_block >= 2675000);
+                /* Read the expected root for the safe block from era1 */
+                uint8_t safe_root[32] = {0};
+                if (archive_ensure(&archive, safe_block, false, era1_dir)) {
+                    uint8_t *sr_hdr = NULL; size_t sr_hlen = 0;
+                    uint8_t *sr_body = NULL; size_t sr_blen = 0;
+                    if (era1_read_block(&archive.current, safe_block,
+                                         &sr_hdr, &sr_hlen, &sr_body, &sr_blen)) {
+                        block_header_t sr_header;
+                        if (block_header_decode_rlp(&sr_header, sr_hdr, sr_hlen))
+                            memcpy(safe_root, sr_header.state_root.bytes, 32);
+                        free(sr_hdr); free(sr_body);
+                    }
+                }
+                char meta_path[512];
+                snprintf(meta_path, sizeof(meta_path), "%s.meta", mpt_path);
+                if (meta_write(meta_path, safe_block, safe_root, pe)) {
+                    LOG_WARN("wrote %s — last good checkpoint: block %lu", meta_path, safe_block);
+                    LOG_WARN("to debug: state_reconstruct --resume to block %lu, "
+                             "then replay blocks %lu..%lu with per-block validation",
+                             safe_block, safe_block + 1, bn);
+                }
             }
 
             /* Auto-dump prestate for the failing block */

@@ -371,6 +371,31 @@ bool sync_load_genesis(sync_t *sync, const char *genesis_json_path,
 }
 
 // ============================================================================
+// Resume from existing state
+// ============================================================================
+
+bool sync_resume(sync_t *sync, uint64_t last_block,
+                 const hash_t *block_hashes, size_t count) {
+    if (!sync) return false;
+    if (sync->genesis_loaded) {
+        fprintf(stderr, "sync_resume: genesis already loaded or resumed\n");
+        return false;
+    }
+
+    /* Populate block hash ring */
+    if (block_hashes && count > 0) {
+        for (size_t i = 0; i < count; i++) {
+            uint64_t bn = last_block - count + 1 + i;
+            sync->block_hashes[bn % BLOCK_HASH_WINDOW] = block_hashes[i];
+        }
+    }
+
+    sync->last_block = last_block;
+    sync->genesis_loaded = true;
+    return true;
+}
+
+// ============================================================================
 // Batch MPT root validation (internal)
 // ============================================================================
 
@@ -669,6 +694,15 @@ sync_history_stats_t sync_get_history_stats(const sync_t *sync) {
     }
 #endif
     return st;
+}
+
+void sync_truncate_history(sync_t *sync, uint64_t last_block) {
+#ifdef ENABLE_HISTORY
+    if (sync && sync->history)
+        state_history_truncate(sync->history, last_block);
+#else
+    (void)sync; (void)last_block;
+#endif
 }
 
 evm_state_t *sync_get_state(const sync_t *sync) {

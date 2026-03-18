@@ -371,7 +371,7 @@ int main(int argc, char *argv[]) {
     char *last_slash = strrchr(data_dir, '/');
     if (last_slash) *last_slash = '\0';
 
-    snprintf(mpt_path, sizeof(mpt_path), "%s/reconstruct_mpt", data_dir);
+    snprintf(mpt_path, sizeof(mpt_path), "%s/chain_replay_mpt", data_dir);
     snprintf(code_path, sizeof(code_path), "%s/chain_replay_code", data_dir);
 
     printf("MPT output: %s\n", mpt_path);

@@ -115,6 +115,24 @@ bool sync_load_genesis(sync_t *sync, const char *genesis_json_path,
                        const hash_t *genesis_hash);
 
 // ============================================================================
+// Resume from existing state
+// ============================================================================
+
+/**
+ * Resume from an existing MPT state at `last_block`.
+ * Skips genesis loading — assumes the MPT files already contain valid state.
+ * Populates the block hash ring from the provided array.
+ *
+ * block_hashes: array of up to 256 hashes for blocks leading up to last_block.
+ *               Entry [i] = hash of block (last_block - count + 1 + i).
+ * count: number of hashes in the array (at most 256).
+ *
+ * Must be called instead of sync_load_genesis.
+ */
+bool sync_resume(sync_t *sync, uint64_t last_block,
+                 const hash_t *block_hashes, size_t count);
+
+// ============================================================================
 // Block Execution
 // ============================================================================
 
@@ -183,5 +201,8 @@ typedef struct {
 
 /** Get state history disk usage stats. Returns zeros if history is disabled. */
 sync_history_stats_t sync_get_history_stats(const sync_t *sync);
+
+/** Truncate state history to keep only blocks up to last_block. */
+void sync_truncate_history(sync_t *sync, uint64_t last_block);
 
 #endif /* SYNC_H */
