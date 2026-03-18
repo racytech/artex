@@ -32,8 +32,7 @@ typedef struct {
     size_t   root_dirty_count;
 
     /* Flush timing */
-    double   flush_total_ms;
-    double   flush_join_ms;
+    double   flush_ms;
     double   checkpoint_total_ms;
 
     /* Cache stats */

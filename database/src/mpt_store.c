@@ -1426,56 +1426,23 @@ void mpt_store_sync(mpt_store_t *ms) {
         fprintf(stderr, "  └ mpt_sync: %.1f ms\n", _s_ms);
 }
 
-void mpt_store_flush_ex(mpt_store_t *ms, bool do_sync) {
-    if (!ms) return;
-    if (do_sync) {
-        write_header_dat(ms);
-        msync(ms->data_base, ms->data_mapped, MS_SYNC);
-        disk_hash_sync(ms->index);
-    }
-}
-
 void mpt_store_flush(mpt_store_t *ms) {
-    mpt_store_flush_ex(ms, true);
-}
-
-/* Pre-grow mmap to fit all deferred writes (must be called from main thread
- * before flush_bg runs — mremap is not safe from bg thread). */
-void mpt_store_flush_prepare(mpt_store_t *ms) {
     if (!ms) return;
+
+    /* 1. Grow mmap to fit deferred writes */
     size_t needed = PAGE_SIZE + ms->data_size;
     if (needed > ms->data_mapped)
         dat_remap(ms, needed);
-}
 
-/* Flush deferred writes to mmap'd .dat + disk_hash, then sync to disk.
- * Can run on a background thread (after flush_prepare from main thread). */
-void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats) {
-    if (!ms) return;
-
-    /* 1. Collect live entries and sort by offset for sequential I/O */
+    /* 2. Collect live entries and sort by offset for sequential I/O */
     size_t live = 0;
-    size_t total_rlp_bytes = 0;
     for (size_t i = 0; i < ms->def_count; i++) {
-        if (ms->def_entries[i].rlp) {
+        if (ms->def_entries[i].rlp)
             live++;
-            total_rlp_bytes += ms->def_entries[i].rlp_len;
-        }
     }
 
     if (live == 0 && ms->def_del_count == 0) {
-        /* Nothing to flush — just sync */
-        struct timespec _fs0, _fs1;
-        clock_gettime(CLOCK_MONOTONIC, &_fs0);
-        write_header_dat(ms);
-        msync(ms->data_base, ms->data_mapped, MS_SYNC);
-        disk_hash_sync(ms->index);
-        clock_gettime(CLOCK_MONOTONIC, &_fs1);
-        if (stats) {
-            memset(stats, 0, sizeof(*stats));
-            stats->fsync_ms = (_fs1.tv_sec - _fs0.tv_sec) * 1000.0 +
-                              (_fs1.tv_nsec - _fs0.tv_nsec) / 1e6;
-        }
+        def_free_all(ms);
         return;
     }
 
@@ -1491,9 +1458,7 @@ void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats) {
         }
     }
 
-    /* 2. memcpy node data to mmap'd .dat (sequential offsets) */
-    struct timespec _pw0, _pw1, _pw2;
-    clock_gettime(CLOCK_MONOTONIC, &_pw0);
+    /* 3. memcpy node data to mmap (page cache — no disk I/O) */
     size_t n = sorted ? live : ms->def_count;
     for (size_t i = 0; i < n; i++) {
         deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
@@ -1501,8 +1466,7 @@ void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats) {
         memcpy(ms->data_base + PAGE_SIZE + e->offset, e->rlp, e->rlp_len);
     }
 
-    /* 3. disk_hash_put for each deferred entry */
-    clock_gettime(CLOCK_MONOTONIC, &_pw1);
+    /* 4. disk_hash_put for each deferred entry */
     for (size_t i = 0; i < n; i++) {
         deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
         if (!e->rlp) continue;
@@ -1510,14 +1474,12 @@ void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats) {
                               .length = e->rlp_len,
                               .refcount = e->refcount };
         disk_hash_put(ms->index, e->hash, &rec);
-        /* Populate bloom filter */
         if (ms->bloom)
             bloom_filter_add(ms->bloom, e->hash, 32);
     }
-    clock_gettime(CLOCK_MONOTONIC, &_pw2);
     free(sorted);
 
-    /* 4. Apply pending deletes */
+    /* 5. Apply pending deletes */
     for (size_t i = 0; i < ms->def_del_count; i++) {
         node_record_t rec;
         if (disk_hash_get(ms->index, ms->def_deletes[i].hash, &rec)) {
@@ -1535,31 +1497,11 @@ void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats) {
         }
     }
 
-    /* 5. msync + sync */
-    struct timespec _fs0, _fs1;
-    clock_gettime(CLOCK_MONOTONIC, &_fs0);
-    write_header_dat(ms);
-    msync(ms->data_base, ms->data_mapped, MS_SYNC);
-    disk_hash_sync(ms->index);
-    clock_gettime(CLOCK_MONOTONIC, &_fs1);
-
-    if (stats) {
-        stats->writes     = live;
-        stats->bytes      = total_rlp_bytes;
-        stats->deletes    = ms->def_del_count;
-        stats->pwrite_ms  = (_pw1.tv_sec - _pw0.tv_sec) * 1000.0 +
-                            (_pw1.tv_nsec - _pw0.tv_nsec) / 1e6;
-        stats->idx_ms     = (_pw2.tv_sec - _pw1.tv_sec) * 1000.0 +
-                            (_pw2.tv_nsec - _pw1.tv_nsec) / 1e6;
-        stats->fsync_ms   = (_fs1.tv_sec - _fs0.tv_sec) * 1000.0 +
-                            (_fs1.tv_nsec - _fs0.tv_nsec) / 1e6;
-    }
-}
-
-/* Free deferred buffers — called from main thread after bg flush join. */
-void mpt_store_flush_complete(mpt_store_t *ms) {
-    if (!ms) return;
+    /* 6. Free deferred buffers */
     def_free_all(ms);
+
+    /* No msync, no write_header_dat, no disk_hash_sync —
+     * OS page cache handles writeback asynchronously. */
 }
 
 /* =========================================================================

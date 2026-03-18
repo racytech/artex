@@ -390,10 +390,8 @@ static void draw_detail(void) {
                     mvwprintw(g.log_win, row, col1, "Flush / Checkpoint");
                     wattroff(g.log_win, A_BOLD); row++; }
 
-    if (row < h) { mvwprintw(g.log_win, row, col1, "flush total:");
-                    mvwprintw(g.log_win, row, col2, "%8.1f ms", s->flush_total_ms);
-                    mvwprintw(g.log_win, row, col3, "flush join:");
-                    mvwprintw(g.log_win, row, col4, "%8.1f ms", s->flush_join_ms); row++; }
+    if (row < h) { mvwprintw(g.log_win, row, col1, "flush:");
+                    mvwprintw(g.log_win, row, col2, "%8.1f ms", s->flush_ms); row++; }
     if (row < h) { mvwprintw(g.log_win, row, col1, "checkpoint:");
                     mvwprintw(g.log_win, row, col2, "%8.1f ms", s->checkpoint_total_ms); row++; }
 

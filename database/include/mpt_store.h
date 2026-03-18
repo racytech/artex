@@ -69,40 +69,11 @@ void mpt_store_reset(mpt_store_t *ms);
 void mpt_store_sync(mpt_store_t *ms);
 
 /**
- * Sync mmap'd data to disk. Writes header, msyncs .dat, syncs .idx.
- * Call at checkpoint time for transactional durability.
+ * Flush deferred writes to mmap (page cache) + disk_hash, then free
+ * deferred buffers. No msync — OS handles writeback asynchronously.
+ * Call at checkpoint time before evict_cache.
  */
 void mpt_store_flush(mpt_store_t *ms);
-
-/**
- * Sync mmap'd data to disk. If do_sync is false, this is a no-op —
- * call mpt_store_sync() separately when ready.
- */
-void mpt_store_flush_ex(mpt_store_t *ms, bool do_sync);
-
-/**
- * Per-MPT flush timing stats (filled by mpt_store_flush_bg).
- */
-typedef struct {
-    size_t writes;      /* nodes written */
-    size_t bytes;       /* total RLP bytes written */
-    size_t deletes;     /* nodes deleted */
-    double pwrite_ms;   /* data file pwrite time */
-    double idx_ms;      /* disk_hash put/delete time */
-    double fsync_ms;    /* fdatasync + sync time */
-} mpt_flush_stats_t;
-
-/**
- * Sync mmap'd data to disk with timing stats.
- * If stats is non-NULL, timing data is stored there.
- */
-/** No-op — retained for API compatibility. */
-void mpt_store_flush_prepare(mpt_store_t *ms);
-
-void mpt_store_flush_bg(mpt_store_t *ms, mpt_flush_stats_t *stats);
-
-/** No-op — retained for API compatibility. */
-void mpt_store_flush_complete(mpt_store_t *ms);
 
 /* =========================================================================
  * Trie Root

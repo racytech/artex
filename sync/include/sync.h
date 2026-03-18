@@ -220,10 +220,8 @@ typedef struct {
     /* Root computation */
     double root_total_ms;       /* total wall time for root + checkpoint */
 
-    /* Background flush (from previous checkpoint, joined at this one) */
-    evm_flush_bg_stats_t flush; /* per-MPT breakdown */
-    double flush_total_ms;      /* total bg flush wall time */
-    double flush_join_ms;       /* time spent waiting for bg thread */
+    /* Flush (synchronous — deferred writes to page cache) */
+    double flush_ms;            /* flush wall time */
 
     bool   valid;               /* true if a checkpoint happened this cycle */
 } sync_checkpoint_stats_t;
