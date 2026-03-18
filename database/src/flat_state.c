@@ -7,6 +7,11 @@
  *
  * All operations delegate directly to disk_hash. The mmap-backed disk_hash
  * provides OS page cache management — no explicit LRU needed.
+ *
+ * Performance: not suitable as the primary hot-path state cache.
+ * Random mmap access + per-op locking + msync(MS_SYNC) in flat_state_sync
+ * make it slower than in-memory mem_art. Best used as a cold-path fallback
+ * after cache eviction, not a replacement for the in-memory state cache.
  */
 
 #include "flat_state.h"

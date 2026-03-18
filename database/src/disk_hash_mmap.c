@@ -11,6 +11,16 @@
  *   - Zero-copy reads: get/contains return pointers into mapped region
  *   - No syscall overhead per bucket access
  *   - Overflow growth via mremap (Linux) — no munmap/mmap cycle
+ *
+ * Performance notes:
+ *   - disk_hash_sync() calls msync(MS_SYNC) on the full mapping, blocking
+ *     until all dirty pages are physically written. Avoid on hot paths.
+ *   - MAP_SHARED + hash-based bucket lookup = random page access across
+ *     a large mapping, causing TLB misses and kernel dirty page writeback
+ *     pressure (dirty_ratio throttling).
+ *   - pthread_rwlock on every get/put adds overhead vs pure in-memory
+ *     structures. Use mem_art for hot-path state cache; disk_hash is
+ *     best suited as a cold-path fallback after cache eviction.
  */
 
 #include "../include/disk_hash.h"
