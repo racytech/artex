@@ -101,11 +101,13 @@ void block_diff_clone(const block_diff_t *src, block_diff_t *dst) {
         return;
     }
     dst->groups = malloc(src->group_count * sizeof(addr_diff_t));
+    if (!dst->groups) { dst->group_count = 0; return; }
     for (uint16_t i = 0; i < src->group_count; i++) {
         dst->groups[i] = src->groups[i];
         if (src->groups[i].slot_count > 0) {
             size_t sz = src->groups[i].slot_count * sizeof(slot_diff_t);
             dst->groups[i].slots = malloc(sz);
+            if (!dst->groups[i].slots) { dst->groups[i].slot_count = 0; continue; }
             memcpy(dst->groups[i].slots, src->groups[i].slots, sz);
         } else {
             dst->groups[i].slots = NULL;
@@ -397,9 +399,15 @@ static void *consumer_thread(void *arg) {
         size_t buf_len = serialize_diff(&diff, &buf);
         if (buf_len > 0) {
             uint64_t offset = sh->dat_offset;
-            pwrite(sh->dat_fd, buf, buf_len, (off_t)offset);
-            sh->dat_offset += buf_len;
+            ssize_t nw = pwrite(sh->dat_fd, buf, buf_len, (off_t)offset);
             free(buf);
+            if (nw < 0 || (size_t)nw != buf_len) {
+                LOG_HIST_ERROR("history: drain write failed for block %lu",
+                       diff.block_number);
+                block_diff_free(&diff);
+                continue;
+            }
+            sh->dat_offset += buf_len;
 
             uint8_t idx_entry[IDX_ENTRY_SIZE];
             write_u64(idx_entry, diff.block_number);
@@ -458,8 +466,8 @@ state_history_t *state_history_create(const char *dir_path) {
         sh->first_block = read_u64(hdr + 8);
 
         off_t idx_size = lseek(sh->idx_fd, 0, SEEK_END);
-        if (idx_size > IDX_HEADER_SIZE)
-            sh->block_count = (uint64_t)(idx_size - IDX_HEADER_SIZE) / IDX_ENTRY_SIZE;
+        if (idx_size > (off_t)IDX_HEADER_SIZE)
+            sh->block_count = (uint64_t)(idx_size - (off_t)IDX_HEADER_SIZE) / IDX_ENTRY_SIZE;
 
         /* Validate tail: walk backwards, verify last record's CRC */
         while (sh->block_count > 0) {
@@ -675,4 +683,144 @@ uint64_t state_history_disk_bytes(const state_history_t *sh) {
 
 uint64_t state_history_block_count(const state_history_t *sh) {
     return sh ? sh->block_count : 0;
+}
+
+/* =========================================================================
+ * Truncation
+ * ========================================================================= */
+
+void state_history_truncate(state_history_t *sh, uint64_t last_block) {
+    if (!sh || sh->block_count == 0) return;
+
+    /* Nothing to truncate if last_block is at or past our last recorded */
+    uint64_t our_last = sh->first_block + sh->block_count - 1;
+    if (last_block >= our_last) return;
+
+    if (last_block < sh->first_block) {
+        /* Truncate everything */
+        ftruncate(sh->dat_fd, 0);
+        sh->dat_offset = 0;
+        sh->block_count = 0;
+        sh->first_block = 0;
+
+        uint8_t hdr[IDX_HEADER_SIZE];
+        write_u32(hdr, HIST_MAGIC);
+        write_u32(hdr + 4, HIST_VERSION);
+        write_u64(hdr + 8, 0);
+        pwrite(sh->idx_fd, hdr, IDX_HEADER_SIZE, 0);
+        ftruncate(sh->idx_fd, IDX_HEADER_SIZE);
+
+        LOG_HIST_INFO("history: truncated all blocks (requested last=%lu < first=%lu)",
+               last_block, sh->first_block);
+        return;
+    }
+
+    /* Keep blocks [first_block .. last_block] */
+    uint64_t keep = last_block - sh->first_block + 1;
+
+    /* Read the last kept entry to find the dat truncation point */
+    uint8_t ie[IDX_ENTRY_SIZE];
+    off_t ie_pos = (off_t)(IDX_HEADER_SIZE + (keep - 1) * IDX_ENTRY_SIZE);
+    if (pread(sh->idx_fd, ie, IDX_ENTRY_SIZE, ie_pos) != IDX_ENTRY_SIZE) {
+        LOG_HIST_ERROR("history: truncate failed to read last kept index entry");
+        return;
+    }
+
+    uint64_t dat_off = read_u64(ie + 8);
+
+    /* Read record header to get its total size */
+    uint8_t rh[DAT_RECORD_HEADER];
+    if (pread(sh->dat_fd, rh, DAT_RECORD_HEADER, (off_t)dat_off) != DAT_RECORD_HEADER) {
+        LOG_HIST_ERROR("history: truncate failed to read record header");
+        return;
+    }
+    uint32_t rlen = read_u32(rh + 8);
+    uint64_t new_dat_end = dat_off + DAT_RECORD_HEADER + rlen + 4; /* +4 CRC */
+
+    ftruncate(sh->dat_fd, (off_t)new_dat_end);
+    ftruncate(sh->idx_fd, (off_t)(IDX_HEADER_SIZE + keep * IDX_ENTRY_SIZE));
+
+    uint64_t removed = sh->block_count - keep;
+    sh->block_count = keep;
+    sh->dat_offset = new_dat_end;
+
+    fdatasync(sh->dat_fd);
+    fdatasync(sh->idx_fd);
+
+    LOG_HIST_INFO("history: truncated %lu blocks, kept %lu (first=%lu last=%lu)",
+           removed, keep, sh->first_block, last_block);
+}
+
+/* =========================================================================
+ * Forward reconstruction: apply_diff + replay
+ * ========================================================================= */
+
+void state_history_apply_diff(evm_state_t *es, const block_diff_t *diff) {
+    if (!es || !diff) return;
+
+    for (uint16_t i = 0; i < diff->group_count; i++) {
+        const addr_diff_t *g = &diff->groups[i];
+
+        /* Don't skip any entry — even CREATED+empty entries need processing
+         * since they represent accounts that must exist in the trie pre-EIP-161. */
+
+        if (g->flags & ACCT_DIFF_DESTRUCTED) {
+            /* Zero the account: set nonce/balance to 0, code_hash to empty */
+            evm_state_set_nonce(es, &g->addr, 0);
+            uint256_t zero = UINT256_ZERO_INIT;
+            evm_state_set_balance(es, &g->addr, &zero);
+            /* Storage slots from the diff will set the final values below */
+        }
+
+        if (g->field_mask & FIELD_NONCE)
+            evm_state_set_nonce(es, &g->addr, g->nonce);
+
+        if (g->field_mask & FIELD_BALANCE)
+            evm_state_set_balance(es, &g->addr, &g->balance);
+
+        if (g->field_mask & FIELD_CODE_HASH) {
+            /* Code hash is set via code — but during reconstruction from
+             * history alone, we don't have the actual bytecode. We store
+             * the code_hash directly. The code_store must be intact for
+             * actual EVM execution after reconstruction. */
+            evm_state_set_code_hash(es, &g->addr, &g->code_hash);
+        }
+
+        for (uint16_t j = 0; j < g->slot_count; j++) {
+            evm_state_set_storage(es, &g->addr,
+                                   &g->slots[j].slot, &g->slots[j].value);
+        }
+    }
+
+    /* Note: caller decides when to commit/finalize.
+     * For bulk reconstruction, skip per-block commit for performance. */
+}
+
+uint64_t state_history_replay(state_history_t *sh,
+                               evm_state_t *es,
+                               uint64_t first_block,
+                               uint64_t last_block) {
+    if (!sh || !es) return 0;
+    if (first_block > last_block) return 0;
+
+    uint64_t count = 0;
+    for (uint64_t bn = first_block; bn <= last_block; bn++) {
+        block_diff_t diff;
+        if (!state_history_get_diff(sh, bn, &diff)) {
+            LOG_HIST_ERROR("history: replay failed to read block %lu", bn);
+            return count;
+        }
+
+        state_history_apply_diff(es, &diff);
+        block_diff_free(&diff);
+        count++;
+
+        if (count % 10000 == 0)
+            LOG_HIST_INFO("history: replay progress %lu/%lu blocks",
+                   count, last_block - first_block + 1);
+    }
+
+    LOG_HIST_INFO("history: replay complete — %lu blocks applied (%lu..%lu)",
+           count, first_block, last_block);
+    return count;
 }

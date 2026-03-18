@@ -61,6 +61,10 @@ typedef struct cached_account {
     uint64_t   original_nonce;
     uint256_t  original_balance;
     hash_t     original_code_hash;
+    /* Block-level flags that survive commit_tx for diff capture */
+    bool       block_self_destructed;
+    bool       block_created;
+    bool       block_accessed;      // per-block touch flag, cleared by commit()
 #endif
 } cached_account_t;
 
@@ -117,6 +121,9 @@ typedef struct {
             bool       old_created;
             bool       old_existed;
             bool       old_self_destructed;
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+            bool       old_block_created;
+#endif
             hash_t     old_storage_root;
             bool       old_storage_dirty;
         } create;
@@ -618,43 +625,6 @@ void evm_state_flush(evm_state_t *es) {
 #endif
 }
 
-void evm_state_flush_prepare(evm_state_t *es) {
-    if (!es) return;
-#ifdef ENABLE_MPT
-    if (es->account_mpt) mpt_store_flush_prepare(es->account_mpt);
-    if (es->storage_mpt) mpt_store_flush_prepare(es->storage_mpt);
-#endif
-}
-
-void evm_state_flush_bg(evm_state_t *es, evm_flush_bg_stats_t *stats) {
-    if (!es) return;
-#ifdef ENABLE_MPT
-    struct timespec _t0, _t1, _t2;
-    mpt_flush_stats_t acct_st = {0}, stor_st = {0};
-    clock_gettime(CLOCK_MONOTONIC, &_t0);
-    if (es->account_mpt) mpt_store_flush_bg(es->account_mpt, &acct_st);
-    clock_gettime(CLOCK_MONOTONIC, &_t1);
-    if (es->storage_mpt) mpt_store_flush_bg(es->storage_mpt, &stor_st);
-    clock_gettime(CLOCK_MONOTONIC, &_t2);
-    if (stats) {
-        stats->acct    = acct_st;
-        stats->stor    = stor_st;
-        stats->acct_ms = (_t1.tv_sec - _t0.tv_sec) * 1000.0 +
-                         (_t1.tv_nsec - _t0.tv_nsec) / 1e6;
-        stats->stor_ms = (_t2.tv_sec - _t1.tv_sec) * 1000.0 +
-                         (_t2.tv_nsec - _t1.tv_nsec) / 1e6;
-    }
-#endif
-}
-
-void evm_state_flush_complete(evm_state_t *es) {
-    if (!es) return;
-#ifdef ENABLE_MPT
-    if (es->account_mpt) mpt_store_flush_complete(es->account_mpt);
-    if (es->storage_mpt) mpt_store_flush_complete(es->storage_mpt);
-#endif
-}
-
 
 void evm_state_set_batch_mode(evm_state_t *es, bool enabled) {
     if (es) es->batch_mode = enabled;
@@ -796,6 +766,9 @@ void evm_state_set_nonce(evm_state_t *es, const address_t *addr, uint64_t nonce)
     ca->nonce = nonce;
     ca->dirty = true;
     ca->block_dirty = true;
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+    ca->block_accessed = true;
+#endif
     mark_account_mpt_dirty(es, ca);
 }
 
@@ -832,6 +805,9 @@ void evm_state_set_balance(evm_state_t *es, const address_t *addr,
     ca->balance = *balance;
     ca->dirty = true;
     ca->block_dirty = true;
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+    ca->block_accessed = true;
+#endif
     mark_account_mpt_dirty(es, ca);
 }
 
@@ -863,6 +839,24 @@ hash_t evm_state_get_code_hash(evm_state_t *es, const address_t *addr) {
     if (!ca) return hash_zero();
     if (!ca->has_code) return HASH_EMPTY_CODE;
     return ca->code_hash;
+}
+
+void evm_state_set_code_hash(evm_state_t *es, const address_t *addr,
+                              const hash_t *code_hash) {
+    if (!es || !addr || !code_hash) return;
+    cached_account_t *ca = ensure_account(es, addr);
+    if (!ca) return;
+    ca->code_hash = *code_hash;
+    ca->has_code = (memcmp(code_hash->bytes, HASH_EMPTY_CODE.bytes, 32) != 0 &&
+                    memcmp(code_hash->bytes, ((hash_t){0}).bytes, 32) != 0);
+    ca->dirty = true;
+    ca->code_dirty = true;
+    ca->block_dirty = true;
+    ca->block_code_dirty = true;
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+    ca->block_accessed = true;
+#endif
+    mark_account_mpt_dirty(es, ca);
 }
 
 uint32_t evm_state_get_code_size(evm_state_t *es, const address_t *addr) {
@@ -1062,6 +1056,9 @@ void evm_state_set_code(evm_state_t *es, const address_t *addr,
     ca->code_dirty = true;
     ca->block_dirty = true;
     ca->block_code_dirty = true;
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+    ca->block_accessed = true;
+#endif
     mark_account_mpt_dirty(es, ca);
 }
 
@@ -1241,6 +1238,9 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
             .old_created        = ca->created,
             .old_existed        = ca->existed,
             .old_self_destructed = ca->self_destructed,
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+            .old_block_created  = ca->block_created,
+#endif
             .old_storage_root   = ca->storage_root,
             .old_storage_dirty  = ca->storage_dirty,
         },
@@ -1262,6 +1262,10 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
     ca->created = true;
     ca->dirty = true;
     ca->block_dirty = true;
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+    ca->block_created = true;
+    ca->block_accessed = true;
+#endif
     mark_account_mpt_dirty(es, ca);
     ca->code_dirty = false;
     ca->self_destructed = false;
@@ -1282,6 +1286,10 @@ static bool clear_prestate_account_cb(const uint8_t *key, size_t key_len,
     cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
     ca->block_dirty = false;
     ca->block_code_dirty = false;
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+    ca->block_self_destructed = false;
+    ca->block_created = false;
+#endif
     ca->mpt_dirty = false;
     return true;
 }
@@ -1323,6 +1331,9 @@ void evm_state_self_destruct(evm_state_t *es, const address_t *addr) {
     ca->self_destructed = true;
     ca->dirty = true;
     ca->block_dirty = true;
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+    ca->block_accessed = true;
+#endif
     mark_account_mpt_dirty(es, ca);
 }
 
@@ -1379,6 +1390,7 @@ static bool commit_account_cb(const uint8_t *key, size_t key_len,
     ca->original_nonce = ca->nonce;
     ca->original_balance = ca->balance;
     ca->original_code_hash = ca->code_hash;
+    ca->block_accessed = false;
 #endif
     return true;
 }
@@ -1426,9 +1438,12 @@ static bool commit_tx_account_cb(const uint8_t *key, size_t key_len,
         ca->created = false;
         ca->dirty = false;
         ca->code_dirty = false;
-        ca->block_dirty = false;       // account is dead — nothing to flush
-        ca->block_code_dirty = false;
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+        ca->block_self_destructed = true;
+#endif
+        ca->block_dirty = false;
         ca->self_destructed = false;
+        ca->block_code_dirty = false;
         ca->storage_root = HASH_EMPTY_STORAGE;
         return true;
     }
@@ -1461,7 +1476,7 @@ static bool commit_tx_slot_cb(const uint8_t *key, size_t key_len,
             cs->current = UINT256_ZERO;
             cs->original = UINT256_ZERO;
             cs->dirty = false;
-            cs->block_dirty = false;    // account is dead — zeroed slots don't need flush
+            cs->block_dirty = false;
             cs->mpt_dirty = false;
             return true;
         }
@@ -1588,6 +1603,9 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
                 ca->created         = je->data.create.old_created;
                 ca->existed         = je->data.create.old_existed;
                 ca->self_destructed = je->data.create.old_self_destructed;
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+                ca->block_created   = je->data.create.old_block_created;
+#endif
                 ca->storage_root    = je->data.create.old_storage_root;
                 ca->storage_dirty   = je->data.create.old_storage_dirty;
             }
@@ -2480,16 +2498,22 @@ void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
         const cached_account_t *ca = (const cached_account_t *)mem_art_get(
             &es->accounts, akey, 20, NULL);
         if (!ca) continue;
-        if (!ca->block_dirty && !ca->block_code_dirty) continue;
+        if (!ca->block_dirty && !ca->block_code_dirty &&
+            !ca->block_self_destructed && !ca->block_created)
+            continue;
 
         bool nonce_changed = (ca->nonce != ca->original_nonce);
         bool balance_changed = !uint256_is_equal(&ca->balance, &ca->original_balance);
         bool code_changed = (memcmp(ca->code_hash.bytes, ca->original_code_hash.bytes, 32) != 0);
-        bool is_created = ca->created;
-        bool is_destructed = ca->self_destructed;
-
+        bool is_created = ca->created || ca->block_created;
+        bool is_destructed = ca->self_destructed || ca->block_self_destructed;
+        /* block_accessed distinguishes "touched THIS block" from "dirty from
+         * a previous block within the checkpoint window". Include touched-but-
+         * unchanged accounts so reconstruction can set block_dirty for them. */
+        bool is_touched = ca->block_accessed && !nonce_changed && !balance_changed &&
+                          !code_changed && !is_created && !is_destructed;
         if (!nonce_changed && !balance_changed && !code_changed &&
-            !is_created && !is_destructed)
+            !is_created && !is_destructed && !is_touched)
             continue;
 
         if (group_count >= group_cap) {
@@ -2502,6 +2526,7 @@ void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
         g->flags = 0;
         if (is_created) g->flags |= ACCT_DIFF_CREATED;
         if (is_destructed) g->flags |= ACCT_DIFF_DESTRUCTED;
+        if (is_touched) g->flags |= ACCT_DIFF_TOUCHED;
         g->field_mask = 0;
         if (nonce_changed) {
             g->field_mask |= FIELD_NONCE;
@@ -2560,6 +2585,62 @@ void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
     out->groups = groups;
     out->group_count = group_count;
 }
+#ifdef ENABLE_HISTORY
+void evm_state_apply_diff_bulk(evm_state_t *es, const block_diff_t *diff) {
+    if (!es || !diff) return;
+
+    for (uint16_t i = 0; i < diff->group_count; i++) {
+        const addr_diff_t *g = &diff->groups[i];
+
+        /* Don't skip any entry — even CREATED+empty entries need processing
+         * since they represent accounts that must exist in the trie pre-EIP-161.
+         * Spurious repeats (block_created persists across blocks) are harmless:
+         * apply_diff_bulk just re-sets existed=true + block_dirty=true. */
+
+        /* ensure_account creates or loads the cached entry */
+        cached_account_t *ca = ensure_account(es, &g->addr);
+        if (!ca) continue;
+
+        if (g->flags & ACCT_DIFF_DESTRUCTED) {
+            ca->nonce = 0;
+            ca->balance = UINT256_ZERO_INIT;
+            memset(ca->code_hash.bytes, 0, 32);
+            ca->has_code = false;
+            ca->storage_root = HASH_EMPTY_STORAGE;
+        }
+
+        if (g->field_mask & FIELD_NONCE)
+            ca->nonce = g->nonce;
+
+        if (g->field_mask & FIELD_BALANCE)
+            ca->balance = g->balance;
+
+        if (g->field_mask & FIELD_CODE_HASH) {
+            ca->code_hash = g->code_hash;
+            ca->has_code = (memcmp(g->code_hash.bytes, HASH_EMPTY_CODE.bytes, 32) != 0 &&
+                            memcmp(g->code_hash.bytes, ((hash_t){0}).bytes, 32) != 0);
+            ca->code_dirty = true;
+        }
+
+        /* Mark account as existing and mpt-dirty.
+         * Set block_dirty so compute_mpt_root's promotion logic runs
+         * (same as chain_replay where set_nonce/set_balance set block_dirty). */
+        ca->existed = true;
+        ca->block_dirty = true;
+        mark_account_mpt_dirty(es, ca);
+
+        /* Storage slots */
+        for (uint16_t j = 0; j < g->slot_count; j++) {
+            cached_slot_t *cs = ensure_slot(es, &g->addr, &g->slots[j].slot);
+            if (!cs) continue;
+            cs->current = g->slots[j].value;
+            mark_slot_mpt_dirty(es, cs);
+            ca->storage_dirty = true;
+        }
+    }
+}
+#endif
+
 #endif /* ENABLE_HISTORY || ENABLE_VERKLE_BUILD */
 
 // Compute storage roots incrementally using shared storage mpt_store.

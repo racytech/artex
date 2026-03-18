@@ -60,7 +60,6 @@ static size_t get_rss_kb(void) {
 
 static char value_dir[512];
 static char commit_dir[512];
-static char ckpt_path[512];
 static char mpt_path[512];
 static char code_path[512];
 static char history_path[512];
@@ -69,7 +68,6 @@ static char flat_state_path[512];
 static void set_data_paths(const char *data_dir) {
     snprintf(value_dir, sizeof(value_dir), "%s/chain_replay_values", data_dir);
     snprintf(commit_dir, sizeof(commit_dir), "%s/chain_replay_commits", data_dir);
-    snprintf(ckpt_path, sizeof(ckpt_path), "%s/chain_replay.ckpt", data_dir);
     snprintf(mpt_path, sizeof(mpt_path), "%s/chain_replay_mpt", data_dir);
     snprintf(code_path, sizeof(code_path), "%s/chain_replay_code", data_dir);
     snprintf(history_path, sizeof(history_path), "%s/chain_replay_history", data_dir);
@@ -323,7 +321,7 @@ int main(int argc, char **argv) {
             "\n"
             "Options:\n"
             "  --no-tui              Disable ncurses terminal UI\n"
-            "  --clean               Delete existing checkpoint and state, start from genesis\n"
+            "  --clean               Delete existing state files, start from genesis\n"
             "  --follow              Wait for new era1 files instead of stopping\n"
             "  --data-dir DIR        Set data directory for all state files (default: data/)\n"
             "  --no-history          Disable per-block state diff history\n"
@@ -333,8 +331,8 @@ int main(int argc, char **argv) {
             "                        to discover accessed accounts, then reloads checkpoint\n"
             "                        and dumps their pre-execution values.\n"
             "\n"
-            "Checkpoints every %d blocks to %s\n",
-            argv[0], CHECKPOINT_INTERVAL, ckpt_path);
+            "Validates state root every %d blocks\n",
+            argv[0], CHECKPOINT_INTERVAL);
         return 1;
     }
 
@@ -423,8 +421,7 @@ int main(int argc, char **argv) {
 
     /* Clean up old state if requested */
     if (force_clean) {
-        printf("--clean: removing existing state and checkpoint\n");
-        unlink(ckpt_path);
+        printf("--clean: removing existing state files\n");
         char cmd[512];
         snprintf(cmd, sizeof(cmd),
                  "rm -rf %s %s %s.idx %s.dat %s_storage.idx %s_storage.dat %s.idx %s.dat"
@@ -444,7 +441,6 @@ int main(int argc, char **argv) {
         .verkle_value_dir    = NULL,
         .verkle_commit_dir   = NULL,
         .mpt_path            = NULL,
-        .checkpoint_path     = ckpt_path,
         .checkpoint_interval = CHECKPOINT_INTERVAL,
         .validate_state_root = true,
 #ifdef ENABLE_DEBUG
@@ -480,47 +476,30 @@ int main(int argc, char **argv) {
     }
     LOG_INFO("State loaded successfully");
 
-    uint64_t resumed = sync_resumed_from(sync);
-    uint64_t start_block;
-
-    if (resumed > 0) {
-        start_block = resumed + 1;
-        if (user_start > start_block) {
-            LOG_ERR("Requested start_block %lu > checkpoint %lu + 1", user_start, resumed);
-            LOG_ERR("Cannot skip ahead - use --clean to restart from genesis");
-#ifdef ENABLE_TUI
-            if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
-#endif
-            sync_destroy(sync);
-            archive_close(&archive);
-            return 1;
+    /* Read genesis block hash from era1 */
+    hash_t gen_hash = {0};
+    if (archive_ensure(&archive, 0, false, era1_dir)) {
+        uint8_t *hdr_rlp, *body_rlp;
+        size_t hdr_len, body_len;
+        if (era1_read_block(&archive.current, 0,
+                            &hdr_rlp, &hdr_len, &body_rlp, &body_len)) {
+            gen_hash = hash_keccak256(hdr_rlp, hdr_len);
+            free(hdr_rlp);
+            free(body_rlp);
         }
-    } else {
-        /* Read genesis block hash from era1 */
-        hash_t gen_hash = {0};
-        if (archive_ensure(&archive, 0, false, era1_dir)) {
-            uint8_t *hdr_rlp, *body_rlp;
-            size_t hdr_len, body_len;
-            if (era1_read_block(&archive.current, 0,
-                                &hdr_rlp, &hdr_len, &body_rlp, &body_len)) {
-                gen_hash = hash_keccak256(hdr_rlp, hdr_len);
-                free(hdr_rlp);
-                free(body_rlp);
-            }
-        }
-
-        if (!sync_load_genesis(sync, genesis_path, &gen_hash)) {
-            LOG_ERR("Failed to load genesis state");
-#ifdef ENABLE_TUI
-            if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
-#endif
-            sync_destroy(sync);
-            archive_close(&archive);
-            return 1;
-        }
-
-        start_block = (user_start > 0) ? user_start : 1;
     }
+
+    if (!sync_load_genesis(sync, genesis_path, &gen_hash)) {
+        LOG_ERR("Failed to load genesis state");
+#ifdef ENABLE_TUI
+        if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
+#endif
+        sync_destroy(sync);
+        archive_close(&archive);
+        return 1;
+    }
+
+    uint64_t start_block = (user_start > 0) ? user_start : 1;
 
     /* Progress tracking */
     struct timespec t_start, t_now;
@@ -575,7 +554,7 @@ int main(int argc, char **argv) {
         size_t hdr_len, body_len;
         if (!era1_read_block(&archive.current, bn,
                              &hdr_rlp, &hdr_len, &body_rlp, &body_len)) {
-            fprintf(stderr, "Block %lu: failed to read from era1\n", bn);
+            LOG_ERROR("Block %lu: failed to read from era1", bn);
             break;
         }
 
@@ -585,7 +564,7 @@ int main(int argc, char **argv) {
         /* Decode header and body */
         block_header_t header;
         if (!block_header_decode_rlp(&header, hdr_rlp, hdr_len)) {
-            fprintf(stderr, "Block %lu: failed to decode header\n", bn);
+            LOG_ERROR("Block %lu: failed to decode header", bn);
             free(hdr_rlp);
             free(body_rlp);
             break;
@@ -593,7 +572,7 @@ int main(int argc, char **argv) {
 
         block_body_t body;
         if (!block_body_decode_rlp(&body, body_rlp, body_len)) {
-            fprintf(stderr, "Block %lu: failed to decode body\n", bn);
+            LOG_ERROR("Block %lu: failed to decode body", bn);
             free(hdr_rlp);
             free(body_rlp);
             break;
@@ -610,9 +589,9 @@ int main(int argc, char **argv) {
         /* Execute + validate via sync engine */
         sync_block_result_t result;
         if (!sync_execute_block(sync, &header, &body, &blk_hash, &result)) {
-            fprintf(stderr, "Block %lu: fatal execution error\n"
-                    "  hint: this means sync_execute_block returned false (internal error, not validation)\n"
-                    "  hint: check for OOM, disk I/O errors, or corrupt era1 data\n", bn);
+            LOG_ERROR("Block %lu: fatal execution error", bn);
+            LOG_WARN("hint: sync_execute_block returned false (internal error, not validation)");
+            LOG_WARN("hint: check for OOM, disk I/O errors, or corrupt era1 data");
             block_body_free(&body);
             free(hdr_rlp);
             free(body_rlp);
@@ -838,7 +817,6 @@ int main(int argc, char **argv) {
                 double ltps = tui_window_txs / (tui_win > 0 ? tui_win : 1);
                 double lmgps = (tui_window_gas / 1e6) / (tui_win > 0 ? tui_win : 1);
                 evm_state_stats_t lss = sync_get_state_stats(sync);
-                sync_checkpoint_stats_t lcs = sync_get_checkpoint_stats(sync);
                 sync_history_stats_t lhs = sync_get_history_stats(sync);
                 sync_status_t lst = sync_get_status(sync);
                 tui_stats_t ts = {
@@ -870,9 +848,8 @@ int main(int argc, char **argv) {
                     .code_count       = lss.code_count,
                     .code_cache_hit_pct = (lss.code_cache_hits + lss.code_cache_misses)
                         ? 100.0 * lss.code_cache_hits / (lss.code_cache_hits + lss.code_cache_misses) : 0,
-                    .flush_total_ms   = lcs.valid ? lcs.flush_total_ms : 0,
-                    .flush_join_ms    = lcs.valid ? lcs.flush_join_ms : 0,
-                    .checkpoint_total_ms = lcs.root_total_ms,
+                    .flush_ms         = 0,
+                    .checkpoint_total_ms = 0,
 #endif
                     .history_blocks   = lhs.blocks,
                     .history_mb       = lhs.disk_mb,
@@ -904,7 +881,6 @@ int main(int argc, char **argv) {
             double tps = window_txs / (win_secs > 0 ? win_secs : 1);
             double mgps = (window_gas / 1e6) / (win_secs > 0 ? win_secs : 1);
             evm_state_stats_t ss = sync_get_state_stats(sync);
-            sync_checkpoint_stats_t cs = sync_get_checkpoint_stats(sync);
             sync_history_stats_t hs = sync_get_history_stats(sync);
             size_t rss_mb = get_rss_kb() / 1024;
             sync_status_t st = sync_get_status(sync);
@@ -940,9 +916,8 @@ int main(int argc, char **argv) {
                     .code_count       = ss.code_count,
                     .code_cache_hit_pct = (ss.code_cache_hits + ss.code_cache_misses)
                         ? 100.0 * ss.code_cache_hits / (ss.code_cache_hits + ss.code_cache_misses) : 0,
-                    .flush_total_ms   = cs.valid ? cs.flush_total_ms : 0,
-                    .flush_join_ms    = cs.valid ? cs.flush_join_ms : 0,
-                    .checkpoint_total_ms = cs.root_total_ms,
+                    .flush_ms         = 0,
+                    .checkpoint_total_ms = 0,
 #endif
                     .history_blocks   = hs.blocks,
                     .history_mb       = hs.disk_mb,
@@ -1001,16 +976,6 @@ int main(int argc, char **argv) {
                                ac.check_hits, ac.deletes);
                 }
 
-                if (cs.valid) {
-                    printf("  └ flush: acct=%.1f ms  stor=%.1f ms  total=%.1f ms",
-                           cs.flush.acct_ms, cs.flush.stor_ms, cs.flush_total_ms);
-                    if (cs.flush_join_ms > 1.0)
-                        printf("  join=%.1f ms", cs.flush_join_ms);
-                    printf("\n");
-                }
-
-                if (cs.root_total_ms > 0.1)
-                    printf("  └ checkpoint: total=%.1f ms\n", cs.root_total_ms);
 #else
                 printf("  └ RSS %zuMB\n", rss_mb);
 #endif
@@ -1040,16 +1005,16 @@ int main(int argc, char **argv) {
 
         if (!block_ok) {
             if (result.error == SYNC_GAS_MISMATCH) {
-                fprintf(stderr, "Block %lu: GAS MISMATCH  got %lu  expected %lu  diff %+ld\n",
+                LOG_ERROR("Block %lu: GAS MISMATCH  got %lu  expected %lu  diff %+ld",
                         bn, result.actual_gas, result.expected_gas,
                         (long)result.actual_gas - (long)result.expected_gas);
-                fprintf(stderr, "  hint: gas diff usually means opcode cost bug or missing gas rule\n");
+                LOG_WARN("hint: gas diff usually means opcode cost bug or missing gas rule");
 
                 /* Log our per-tx gas for comparison against era1 expected */
                 if (result.receipts && result.receipt_count > 0) {
-                    fprintf(stderr, "  per-tx gas (%zu txs, divergent only):\n", result.receipt_count);
+                    LOG_INFO("per-tx gas (%zu txs):", result.receipt_count);
                     for (size_t ti = 0; ti < result.receipt_count; ti++) {
-                        fprintf(stderr, "    tx %3zu: gas=%7lu  cum=%lu  status=%u\n",
+                        LOG_INFO("  tx %3zu: gas=%7lu  cum=%lu  status=%u",
                                 ti, result.receipts[ti].gas_used,
                                 result.receipts[ti].cumulative_gas,
                                 result.receipts[ti].status_code);
@@ -1062,157 +1027,157 @@ int main(int argc, char **argv) {
                     free(result.receipts);
                     result.receipts = NULL;
                 }
-
-                /* Auto-dump prestate for the failing block */
-                {
-                    char auto_dir[512];
-                    snprintf(auto_dir, sizeof(auto_dir), "known_issues/block_%lu", bn);
-                    mkdir("known_issues", 0755);
-                    mkdir(auto_dir, 0755);
-                    fprintf(stderr, "  auto-dumping prestate to %s/ ...\n", auto_dir);
-
-                    evm_state_t *es = sync_get_state(sync);
-
-                    /* Collect addresses and storage keys from dirty cache */
-                    address_t *d_addrs = malloc(MAX_ADDRS * sizeof(address_t));
-                    size_t d_n_addrs = evm_state_collect_addresses(es, d_addrs, MAX_ADDRS);
-
-                    typedef struct { address_t addr; uint256_t *keys; size_t count; } dslot_t;
-                    dslot_t *d_aslots = malloc(d_n_addrs * sizeof(dslot_t));
-                    uint256_t *d_sbuf = malloc(MAX_SLOTS * sizeof(uint256_t));
-                    size_t d_total_slots = 0;
-                    for (size_t di = 0; di < d_n_addrs; di++) {
-                        d_aslots[di].addr = d_addrs[di];
-                        size_t n = evm_state_collect_storage_keys(es, &d_addrs[di],
-                            d_sbuf + d_total_slots, MAX_SLOTS - d_total_slots);
-                        d_aslots[di].keys = d_sbuf + d_total_slots;
-                        d_aslots[di].count = n;
-                        d_total_slots += n;
-                    }
-
-                    /* Recreate sync from checkpoint for clean pre-state */
-                    sync_destroy(sync);
-                    sync = sync_create(&cfg);
-                    if (!sync) {
-                        fprintf(stderr, "  failed to recreate sync for prestate dump\n");
-                        free(d_addrs); free(d_aslots); free(d_sbuf);
-                        archive_close(&archive);
-                        return 1;
-                    }
-                    es = sync_get_state(sync);
-
-                    /* Write alloc.json */
-                    char alloc_p[512];
-                    snprintf(alloc_p, sizeof(alloc_p), "%s/alloc.json", auto_dir);
-                    FILE *af = fopen(alloc_p, "w");
-                    if (af) {
-                        fprintf(af, "{\n");
-                        for (size_t di = 0; di < d_n_addrs; di++) {
-                            address_t *a = &d_addrs[di];
-                            evm_state_exists(es, a);
-                            uint64_t nn = evm_state_get_nonce(es, a);
-                            uint256_t bal = evm_state_get_balance(es, a);
-                            if (di > 0) fprintf(af, ",\n");
-                            fprintf(af, "  \"0x");
-                            for (int j = 0; j < 20; j++) fprintf(af, "%02x", a->bytes[j]);
-                            fprintf(af, "\": {\n");
-                            uint8_t bb[32]; uint256_to_bytes(&bal, bb);
-                            fprintf(af, "    \"balance\": \"0x");
-                            int s = 0; while (s < 31 && bb[s] == 0) s++;
-                            for (int j = s; j < 32; j++) fprintf(af, "%02x", bb[j]);
-                            fprintf(af, "\",\n");
-                            fprintf(af, "    \"nonce\": \"0x%lx\"", nn);
-                            uint32_t csz = evm_state_get_code_size(es, a);
-                            if (csz > 0) {
-                                const uint8_t *code = evm_state_get_code_ptr(es, a, &csz);
-                                if (code && csz > 0) {
-                                    fprintf(af, ",\n    \"code\": \"0x");
-                                    for (uint32_t c = 0; c < csz; c++) fprintf(af, "%02x", code[c]);
-                                    fprintf(af, "\"");
-                                }
-                            }
-                            if (d_aslots[di].count > 0) {
-                                fprintf(af, ",\n    \"storage\": {");
-                                bool fs = true;
-                                for (size_t si = 0; si < d_aslots[di].count; si++) {
-                                    uint256_t val = evm_state_get_storage(es, a, &d_aslots[di].keys[si]);
-                                    if (uint256_is_zero(&val)) continue;
-                                    if (!fs) fprintf(af, ",");
-                                    fs = false;
-                                    uint8_t kb[32], vb[32];
-                                    uint256_to_bytes(&d_aslots[di].keys[si], kb);
-                                    uint256_to_bytes(&val, vb);
-                                    fprintf(af, "\n      \"0x");
-                                    for (int j = 0; j < 32; j++) fprintf(af, "%02x", kb[j]);
-                                    fprintf(af, "\": \"0x");
-                                    for (int j = 0; j < 32; j++) fprintf(af, "%02x", vb[j]);
-                                    fprintf(af, "\"");
-                                }
-                                fprintf(af, "\n    }");
-                            }
-                            fprintf(af, "\n  }");
-                        }
-                        fprintf(af, "\n}\n");
-                        fclose(af);
-                        fprintf(stderr, "  dumped %zu accounts, %zu slots to %s\n",
-                                d_n_addrs, d_total_slots, alloc_p);
-                    }
-
-                    /* Write env.json */
-                    char env_p[512];
-                    snprintf(env_p, sizeof(env_p), "%s/env.json", auto_dir);
-                    FILE *ef = fopen(env_p, "w");
-                    if (ef) {
-                        fprintf(ef, "{\n");
-                        fprintf(ef, "  \"currentCoinbase\": \"0x");
-                        for (int j = 0; j < 20; j++) fprintf(ef, "%02x", header.coinbase.bytes[j]);
-                        fprintf(ef, "\",\n");
-                        fprintf(ef, "  \"currentDifficulty\": \"0x%lx\",\n",
-                                uint256_to_uint64(&header.difficulty));
-                        fprintf(ef, "  \"currentGasLimit\": \"0x%lx\",\n", header.gas_limit);
-                        fprintf(ef, "  \"currentNumber\": \"0x%lx\",\n", header.number);
-                        fprintf(ef, "  \"currentTimestamp\": \"0x%lx\",\n", header.timestamp);
-                        fprintf(ef, "  \"parentHash\": \"0x");
-                        for (int j = 0; j < 32; j++) fprintf(ef, "%02x", header.parent_hash.bytes[j]);
-                        fprintf(ef, "\",\n");
-                        fprintf(ef, "  \"blockHashes\": {\n");
-                        bool fbh = true;
-                        uint64_t sbh = bn > 256 ? bn - 256 : 1;
-                        for (uint64_t bhn = sbh; bhn < bn; bhn++) {
-                            hash_t bh;
-                            if (sync_get_block_hash(sync, bhn, &bh)) {
-                                if (!fbh) fprintf(ef, ",\n");
-                                fbh = false;
-                                fprintf(ef, "    \"%lu\": \"0x", bhn);
-                                for (int j = 0; j < 32; j++) fprintf(ef, "%02x", bh.bytes[j]);
-                                fprintf(ef, "\"");
-                            }
-                        }
-                        fprintf(ef, "\n  }\n}\n");
-                        fclose(ef);
-                    }
-
-                    free(d_addrs); free(d_aslots); free(d_sbuf);
-                    /* sync was recreated — don't use old state after this */
-                }
             } else if (result.error == SYNC_ROOT_MISMATCH) {
                 char got_hex[67], exp_hex[67];
                 hash_to_hex(&result.actual_root, got_hex);
                 hash_to_hex(&result.expected_root, exp_hex);
-                fprintf(stderr, "Block %lu: STATE ROOT MISMATCH (at batch checkpoint)\n"
-                        "  got:      %s\n  expected: %s\n",
-                        bn, got_hex, exp_hex);
-                fprintf(stderr, "  hint: root is validated every %u blocks — bug is in range [%lu..%lu]\n",
+                LOG_ERROR("Block %lu: STATE ROOT MISMATCH (at batch checkpoint)", bn);
+                LOG_ERROR("got:      %s", got_hex);
+                LOG_ERROR("expected: %s", exp_hex);
+                LOG_WARN("hint: root is validated every %u blocks - bug is in range [%lu..%lu]",
                         CHECKPOINT_INTERVAL,
                         bn > CHECKPOINT_INTERVAL ? bn - CHECKPOINT_INTERVAL + 1 : 1, bn);
-                fprintf(stderr, "  hint: if resumed from checkpoint, try deleting state files and replaying fresh\n"
-                        "  hint: run with --trace-block N to trace a specific block\n"
-                        "  hint: use evm_statetest for per-block differential fuzzing against geth\n");
+                LOG_WARN("hint: if resumed from checkpoint, try --clean to replay fresh");
+                LOG_WARN("hint: use evm_statetest for per-block differential fuzzing against geth");
 #ifdef ENABLE_DEBUG
                 evm_state_debug_dump(sync_get_state(sync));
 #endif
             }
-            fprintf(stderr, "\nFirst failure at block %lu — stopping.\n", bn);
+
+            /* Auto-dump prestate for the failing block */
+            {
+                char auto_dir[512];
+                snprintf(auto_dir, sizeof(auto_dir), "known_issues/block_%lu", bn);
+                mkdir("known_issues", 0755);
+                mkdir(auto_dir, 0755);
+                LOG_INFO("auto-dumping prestate to %s/ ...", auto_dir);
+
+                evm_state_t *es = sync_get_state(sync);
+
+                /* Collect addresses and storage keys from dirty cache */
+                address_t *d_addrs = malloc(MAX_ADDRS * sizeof(address_t));
+                size_t d_n_addrs = evm_state_collect_addresses(es, d_addrs, MAX_ADDRS);
+
+                typedef struct { address_t addr; uint256_t *keys; size_t count; } dslot_t;
+                dslot_t *d_aslots = malloc(d_n_addrs * sizeof(dslot_t));
+                uint256_t *d_sbuf = malloc(MAX_SLOTS * sizeof(uint256_t));
+                size_t d_total_slots = 0;
+                for (size_t di = 0; di < d_n_addrs; di++) {
+                    d_aslots[di].addr = d_addrs[di];
+                    size_t n = evm_state_collect_storage_keys(es, &d_addrs[di],
+                        d_sbuf + d_total_slots, MAX_SLOTS - d_total_slots);
+                    d_aslots[di].keys = d_sbuf + d_total_slots;
+                    d_aslots[di].count = n;
+                    d_total_slots += n;
+                }
+
+                /* Recreate sync from checkpoint for clean pre-state */
+                sync_destroy(sync);
+                sync = sync_create(&cfg);
+                if (!sync) {
+                    LOG_ERROR("failed to recreate sync for prestate dump");
+                    free(d_addrs); free(d_aslots); free(d_sbuf);
+                    archive_close(&archive);
+                    return 1;
+                }
+                es = sync_get_state(sync);
+
+                /* Write alloc.json */
+                char alloc_p[512];
+                snprintf(alloc_p, sizeof(alloc_p), "%s/alloc.json", auto_dir);
+                FILE *af = fopen(alloc_p, "w");
+                if (af) {
+                    fprintf(af, "{\n");
+                    for (size_t di = 0; di < d_n_addrs; di++) {
+                        address_t *a = &d_addrs[di];
+                        evm_state_exists(es, a);
+                        uint64_t nn = evm_state_get_nonce(es, a);
+                        uint256_t bal = evm_state_get_balance(es, a);
+                        if (di > 0) fprintf(af, ",\n");
+                        fprintf(af, "  \"0x");
+                        for (int j = 0; j < 20; j++) fprintf(af, "%02x", a->bytes[j]);
+                        fprintf(af, "\": {\n");
+                        uint8_t bb[32]; uint256_to_bytes(&bal, bb);
+                        fprintf(af, "    \"balance\": \"0x");
+                        int s = 0; while (s < 31 && bb[s] == 0) s++;
+                        for (int j = s; j < 32; j++) fprintf(af, "%02x", bb[j]);
+                        fprintf(af, "\",\n");
+                        fprintf(af, "    \"nonce\": \"0x%lx\"", nn);
+                        uint32_t csz = evm_state_get_code_size(es, a);
+                        if (csz > 0) {
+                            const uint8_t *code = evm_state_get_code_ptr(es, a, &csz);
+                            if (code && csz > 0) {
+                                fprintf(af, ",\n    \"code\": \"0x");
+                                for (uint32_t c = 0; c < csz; c++) fprintf(af, "%02x", code[c]);
+                                fprintf(af, "\"");
+                            }
+                        }
+                        if (d_aslots[di].count > 0) {
+                            fprintf(af, ",\n    \"storage\": {");
+                            bool fs = true;
+                            for (size_t si = 0; si < d_aslots[di].count; si++) {
+                                uint256_t val = evm_state_get_storage(es, a, &d_aslots[di].keys[si]);
+                                if (uint256_is_zero(&val)) continue;
+                                if (!fs) fprintf(af, ",");
+                                fs = false;
+                                uint8_t kb[32], vb[32];
+                                uint256_to_bytes(&d_aslots[di].keys[si], kb);
+                                uint256_to_bytes(&val, vb);
+                                fprintf(af, "\n      \"0x");
+                                for (int j = 0; j < 32; j++) fprintf(af, "%02x", kb[j]);
+                                fprintf(af, "\": \"0x");
+                                for (int j = 0; j < 32; j++) fprintf(af, "%02x", vb[j]);
+                                fprintf(af, "\"");
+                            }
+                            fprintf(af, "\n    }");
+                        }
+                        fprintf(af, "\n  }");
+                    }
+                    fprintf(af, "\n}\n");
+                    fclose(af);
+                    LOG_INFO("dumped %zu accounts, %zu slots to %s",
+                            d_n_addrs, d_total_slots, alloc_p);
+                }
+
+                /* Write env.json */
+                char env_p[512];
+                snprintf(env_p, sizeof(env_p), "%s/env.json", auto_dir);
+                FILE *ef = fopen(env_p, "w");
+                if (ef) {
+                    fprintf(ef, "{\n");
+                    fprintf(ef, "  \"currentCoinbase\": \"0x");
+                    for (int j = 0; j < 20; j++) fprintf(ef, "%02x", header.coinbase.bytes[j]);
+                    fprintf(ef, "\",\n");
+                    fprintf(ef, "  \"currentDifficulty\": \"0x%lx\",\n",
+                            uint256_to_uint64(&header.difficulty));
+                    fprintf(ef, "  \"currentGasLimit\": \"0x%lx\",\n", header.gas_limit);
+                    fprintf(ef, "  \"currentNumber\": \"0x%lx\",\n", header.number);
+                    fprintf(ef, "  \"currentTimestamp\": \"0x%lx\",\n", header.timestamp);
+                    fprintf(ef, "  \"parentHash\": \"0x");
+                    for (int j = 0; j < 32; j++) fprintf(ef, "%02x", header.parent_hash.bytes[j]);
+                    fprintf(ef, "\",\n");
+                    fprintf(ef, "  \"blockHashes\": {\n");
+                    bool fbh = true;
+                    uint64_t sbh = bn > 256 ? bn - 256 : 1;
+                    for (uint64_t bhn = sbh; bhn < bn; bhn++) {
+                        hash_t bh;
+                        if (sync_get_block_hash(sync, bhn, &bh)) {
+                            if (!fbh) fprintf(ef, ",\n");
+                            fbh = false;
+                            fprintf(ef, "    \"%lu\": \"0x", bhn);
+                            for (int j = 0; j < 32; j++) fprintf(ef, "%02x", bh.bytes[j]);
+                            fprintf(ef, "\"");
+                        }
+                    }
+                    fprintf(ef, "\n  }\n}\n");
+                    fclose(ef);
+                }
+
+                free(d_addrs); free(d_aslots); free(d_sbuf);
+                /* sync was recreated — don't use old state after this */
+            }
+
+            LOG_ERROR("First failure at block %lu - stopping.", bn);
             break;
         }
     }

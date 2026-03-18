@@ -10,18 +10,17 @@
 #include "evm_state.h"
 
 /**
- * Sync Engine — reusable block execution + validation + checkpointing.
+ * Sync Engine — block execution + validation.
  *
  * Owns the full state lifecycle (evm_state, evm, verkle_state).
  * Callers provide decoded block headers and bodies from any source
  * (era1 files, Engine API, p2p, etc).
  *
  * Usage:
- *   1. sync_create(config)              — create engine, resume from checkpoint
- *   2. sync_load_genesis(path, hash)    — load genesis (skip if resumed)
+ *   1. sync_create(config)              — create engine
+ *   2. sync_load_genesis(path, hash)    — load genesis state
  *   3. sync_execute_block(...)          — execute + validate per block
- *   4. sync_checkpoint()                — force save (e.g. on SIGINT)
- *   5. sync_destroy()                   — final checkpoint + cleanup
+ *   4. sync_destroy()                   — cleanup
  */
 
 // ============================================================================
@@ -38,9 +37,6 @@ typedef struct {
     const char *code_store_path;   /* contract bytecode store (NULL = no code persistence) */
     const char *flat_state_path;   /* O(1) flat account/storage store (NULL = disabled) */
 
-    /* Checkpoint file path (NULL = no checkpointing) */
-    const char *checkpoint_path;
-
     /* State history (per-block diff tracking, NULL = disabled) */
     const char *history_dir;
 
@@ -49,10 +45,10 @@ typedef struct {
     const char *verkle_builder_commit_dir;
 
     /* Behavior */
-    uint32_t checkpoint_interval;   /* auto-save every N blocks (0 = never) */
+    uint32_t checkpoint_interval;   /* validate root + flush every N blocks (0 = never) */
     bool     validate_state_root;   /* compare computed root against header */
 #ifdef ENABLE_DEBUG
-    bool     no_evict;              /* skip cache eviction at checkpoints */
+    bool     no_evict;              /* skip cache eviction at interval boundaries */
 #endif
 } sync_config_t;
 
@@ -95,17 +91,10 @@ struct evm_state;
 // Lifecycle
 // ============================================================================
 
-/**
- * Create a sync engine.
- * If checkpoint_path is set and a valid checkpoint exists, state is restored
- * automatically. Returns NULL on failure.
- */
+/** Create a sync engine. Returns NULL on failure. */
 sync_t *sync_create(const sync_config_t *config);
 
-/**
- * Destroy sync engine. Saves a final checkpoint if blocks were processed
- * since the last checkpoint and blocks_fail == 0.
- */
+/** Destroy sync engine. */
 void sync_destroy(sync_t *sync);
 
 // ============================================================================
@@ -119,8 +108,8 @@ void sync_destroy(sync_t *sync);
  * genesis_hash: stored in block_hashes[0] for BLOCKHASH opcode.
  *               Pass NULL if unknown.
  *
- * Must be called before execute_block if not resuming from checkpoint.
- * Returns false on parse error or if genesis was already loaded/resumed.
+ * Must be called before execute_block.
+ * Returns false on parse error or if genesis was already loaded.
  */
 bool sync_load_genesis(sync_t *sync, const char *genesis_json_path,
                        const hash_t *genesis_hash);
@@ -150,12 +139,10 @@ bool sync_execute_block(sync_t *sync,
 /**
  * Execute a block with immediate per-block validation.
  *
- * Unlike sync_execute_block() (which defers root validation to checkpoint
+ * Unlike sync_execute_block() (which defers root validation to interval
  * boundaries), this validates gas + state root immediately and flushes
  * state synchronously. Designed for CL-driven sync where each newPayload
  * needs a VALID/INVALID response.
- *
- * Returns false only on fatal error. Check result->ok for validation outcome.
  */
 bool sync_execute_block_live(sync_t *sync,
                               const block_header_t *header,
@@ -163,71 +150,30 @@ bool sync_execute_block_live(sync_t *sync,
                               const hash_t *block_hash,
                               sync_block_result_t *result);
 
-/**
- * Switch between batch and live modes.
- *
- * Batch mode (live=false): root validated at checkpoint boundaries,
- *   good for era1 replay (~2000+ blk/s).
- *
- * Live mode (live=true): root validated per block, synchronous flush,
- *   required for CL sync (VALID/INVALID response per newPayload).
- *
- * Call sync_checkpoint() before switching to flush pending state.
- */
+/** Switch between batch and live modes. */
 void sync_set_live_mode(sync_t *sync, bool live);
 
-/**
- * Get the EVM instance owned by the sync engine.
- */
+/** Get the EVM instance owned by the sync engine. */
 struct evm *sync_get_evm(const sync_t *sync);
 
-/**
- * Get the EVM state instance owned by the sync engine (always available).
- */
+/** Get the EVM state instance owned by the sync engine. */
 struct evm_state *sync_get_state(const sync_t *sync);
 
 // ============================================================================
-// Checkpoint
+// Query
 // ============================================================================
-
-/** Force a checkpoint save now. Returns false if save fails. */
-bool sync_checkpoint(sync_t *sync);
-
-/** Returns the block number from which we resumed (0 if fresh start). */
-uint64_t sync_resumed_from(const sync_t *sync);
 
 /**
  * Get a block hash from the 256-entry ring buffer.
- * Returns true if the block number is within the window, false otherwise.
+ * Returns true if the block number is within the window.
  */
 bool sync_get_block_hash(const sync_t *sync, uint64_t block_number, hash_t *out);
-
-// ============================================================================
-// Status
-// ============================================================================
 
 /** Get current sync status (counters, last block). */
 sync_status_t sync_get_status(const sync_t *sync);
 
 /** Get cache/store statistics from the underlying evm_state. */
 evm_state_stats_t sync_get_state_stats(const sync_t *sync);
-
-/**
- * Checkpoint timing stats (filled during checkpoint cycle).
- * Retrieve with sync_get_checkpoint_stats() after sync_execute_block().
- */
-typedef struct {
-    /* Root computation */
-    double root_total_ms;       /* total wall time for root + checkpoint */
-
-    /* Flush (synchronous — deferred writes to page cache) */
-    double flush_ms;            /* flush wall time */
-
-    bool   valid;               /* true if a checkpoint happened this cycle */
-} sync_checkpoint_stats_t;
-
-/** Get checkpoint timing stats from the last checkpoint cycle. */
-sync_checkpoint_stats_t sync_get_checkpoint_stats(const sync_t *sync);
 
 /** History stats (only valid when ENABLE_HISTORY is on). */
 typedef struct {

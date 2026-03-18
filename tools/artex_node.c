@@ -307,8 +307,7 @@ static bool era1_replay(sync_t *sync, era1_archive_t *archive,
 
     for (uint64_t bn = start_block; bn <= end_block; bn++) {
         if (g_shutdown) {
-            printf("\nShutdown requested — saving checkpoint\n");
-            sync_checkpoint(sync);
+            printf("\nShutdown requested\n");
             return false;
         }
 
@@ -420,12 +419,9 @@ int main(int argc, char **argv) {
 
     char *mpt_path  = path_join(args.data_dir, "mpt");
     char *code_path = path_join(args.data_dir, "code");
-    char *ckpt_path = path_join(args.data_dir, "checkpoint");
-
     /* Clean up old state if requested */
     if (args.clean) {
-        printf("--clean: removing existing state and checkpoint\n");
-        unlink(ckpt_path);
+        printf("--clean: removing existing state files\n");
         char cmd[1024];
         snprintf(cmd, sizeof(cmd),
                  "rm -rf %s.idx %s.dat %s_storage.idx %s_storage.dat %s.idx %s.dat 2>/dev/null",
@@ -437,7 +433,7 @@ int main(int argc, char **argv) {
     /* Open era1 archive */
     era1_archive_t archive;
     if (!archive_open(&archive, args.era1_dir)) {
-        free(mpt_path); free(code_path); free(ckpt_path);
+        free(mpt_path); free(code_path);
         return 1;
     }
     printf("Era1 archive: %zu files in %s\n", archive.count, args.era1_dir);
@@ -448,7 +444,6 @@ int main(int argc, char **argv) {
         .verkle_value_dir    = NULL,
         .verkle_commit_dir   = NULL,
         .mpt_path            = NULL,
-        .checkpoint_path     = ckpt_path,
         .checkpoint_interval = args.checkpoint_interval,
         .validate_state_root = true,
     };
@@ -461,39 +456,31 @@ int main(int argc, char **argv) {
     if (!sync) {
         fprintf(stderr, "Failed to create sync engine\n");
         archive_close(&archive);
-        free(mpt_path); free(code_path); free(ckpt_path);
+        free(mpt_path); free(code_path);
         return 1;
     }
 
-    uint64_t resumed = sync_resumed_from(sync);
-    uint64_t start_block;
-
-    if (resumed > 0) {
-        start_block = resumed + 1;
-        printf("Resumed from checkpoint at block %lu\n", resumed);
-    } else {
-        /* Load genesis */
-        hash_t gen_hash = {0};
-        if (archive_ensure(&archive, 0)) {
-            uint8_t *hdr_rlp, *body_rlp;
-            size_t hdr_len, body_len;
-            if (era1_read_block(&archive.current, 0,
-                                &hdr_rlp, &hdr_len, &body_rlp, &body_len)) {
-                gen_hash = hash_keccak256(hdr_rlp, hdr_len);
-                free(hdr_rlp);
-                free(body_rlp);
-            }
+    /* Load genesis */
+    hash_t gen_hash = {0};
+    if (archive_ensure(&archive, 0)) {
+        uint8_t *hdr_rlp, *body_rlp;
+        size_t hdr_len, body_len;
+        if (era1_read_block(&archive.current, 0,
+                            &hdr_rlp, &hdr_len, &body_rlp, &body_len)) {
+            gen_hash = hash_keccak256(hdr_rlp, hdr_len);
+            free(hdr_rlp);
+            free(body_rlp);
         }
-
-        if (!sync_load_genesis(sync, args.genesis_path, &gen_hash)) {
-            fprintf(stderr, "Failed to load genesis state\n");
-            sync_destroy(sync);
-            archive_close(&archive);
-            free(mpt_path); free(code_path); free(ckpt_path);
-            return 1;
-        }
-        start_block = 1;
     }
+
+    if (!sync_load_genesis(sync, args.genesis_path, &gen_hash)) {
+        fprintf(stderr, "Failed to load genesis state\n");
+        sync_destroy(sync);
+        archive_close(&archive);
+        free(mpt_path); free(code_path);
+        return 1;
+    }
+    uint64_t start_block = 1;
 
     /* =====================================================================
      * Phase 1: Era1 Replay (batch mode)
@@ -520,7 +507,7 @@ int main(int argc, char **argv) {
         printf("Total gas:     %lu\n", st.total_gas);
 
         sync_destroy(sync);
-        free(mpt_path); free(code_path); free(ckpt_path);
+        free(mpt_path); free(code_path);
         return (replay_ok && st.blocks_fail == 0) ? 0 : 1;
     }
 
@@ -529,8 +516,7 @@ int main(int argc, char **argv) {
      * ===================================================================== */
 
     printf("\n===== Transition to CL sync =====\n");
-    printf("Saving checkpoint and switching to live mode...\n");
-    sync_checkpoint(sync);
+    printf("Switching to live mode...\n");
     sync_set_live_mode(sync, true);
 
     /* =====================================================================
@@ -552,7 +538,7 @@ int main(int argc, char **argv) {
     if (!eng) {
         fprintf(stderr, "Failed to create engine\n");
         sync_destroy(sync);
-        free(mpt_path); free(code_path); free(ckpt_path);
+        free(mpt_path); free(code_path);
         return 1;
     }
 
@@ -579,7 +565,6 @@ int main(int argc, char **argv) {
     sync_destroy(sync);  /* saves final checkpoint */
     free(mpt_path);
     free(code_path);
-    free(ckpt_path);
 
     return 0;
 }

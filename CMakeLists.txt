@@ -666,6 +666,10 @@ if(ENABLE_HISTORY)
     add_executable(history_dump tools/history_dump.c)
     target_link_libraries(history_dump block_executor evm common)
 
+    add_executable(state_reconstruct tools/state_reconstruct.c)
+    target_include_directories(state_reconstruct PRIVATE ${CJSON_INCLUDE_DIRS})
+    target_link_libraries(state_reconstruct block_executor evm common ${CJSON_LIBRARIES})
+
     if(ENABLE_VERKLE_BUILD)
         add_executable(verkle_build tools/verkle_build.c)
         target_link_libraries(verkle_build block_executor evm verkle_flat verkle_key pedersen common)

@@ -112,33 +112,6 @@ void evm_state_set_flat_state(evm_state_t *es, void *fs);
 #endif
 
 /**
- * Flush timing stats from background flush (filled by evm_state_flush_bg).
- */
-typedef struct {
-    mpt_flush_stats_t acct;     /* account MPT flush stats */
-    mpt_flush_stats_t stor;     /* storage MPT flush stats */
-    double            acct_ms;  /* total account flush time */
-    double            stor_ms;  /* total storage flush time */
-} evm_flush_bg_stats_t;
-
-/**
- * Background-safe flush. Uses separate disk_hash instances.
- * Call from background thread. Follow with evm_state_flush_complete()
- * from main thread after join.
- * If stats is non-NULL, timing data is stored there instead of printed.
- */
-/** Pre-grow mmap mappings before spawning bg flush thread (main thread). */
-void evm_state_flush_prepare(evm_state_t *es);
-
-void evm_state_flush_bg(evm_state_t *es, evm_flush_bg_stats_t *stats);
-
-/**
- * Finalize after background flush. Free deferred buffers and refresh metadata.
- * Call from main thread after background flush thread has joined.
- */
-void evm_state_flush_complete(evm_state_t *es);
-
-/**
  * Enable/disable batch mode. In batch mode, per-block verkle flush
  * is skipped — block_dirty flags accumulate across blocks.
  * Call evm_state_flush_verkle() at checkpoint time to flush.
@@ -198,6 +171,9 @@ bool      evm_state_sub_balance(evm_state_t *es, const address_t *addr,
 // ============================================================================
 
 hash_t   evm_state_get_code_hash(evm_state_t *es, const address_t *addr);
+/** Set code_hash directly (for state reconstruction from history diffs). */
+void     evm_state_set_code_hash(evm_state_t *es, const address_t *addr,
+                                  const hash_t *code_hash);
 uint32_t evm_state_get_code_size(evm_state_t *es, const address_t *addr);
 bool     evm_state_get_code(evm_state_t *es, const address_t *addr,
                             uint8_t *out, uint32_t *out_len);
@@ -420,6 +396,13 @@ size_t evm_state_collect_storage_keys(evm_state_t *es, const address_t *addr,
  */
 struct block_diff_t;
 void evm_state_collect_block_diff(evm_state_t *es, struct block_diff_t *out);
+
+/**
+ * Apply a block diff directly to cached state, bypassing journaling.
+ * For fast bulk reconstruction from history. No commit/finalize needed.
+ * Only marks mpt_dirty — caller computes root at the end.
+ */
+void evm_state_apply_diff_bulk(evm_state_t *es, const struct block_diff_t *out);
 #endif
 
 #endif // EVM_STATE_H

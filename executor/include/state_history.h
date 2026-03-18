@@ -52,6 +52,7 @@ extern "C" {
 /* Account flags */
 #define ACCT_DIFF_CREATED      (1 << 0)
 #define ACCT_DIFF_DESTRUCTED   (1 << 1)
+#define ACCT_DIFF_TOUCHED      (1 << 2)  /* touched this block but no value change */
 
 /* Field bitmask — which account fields changed */
 #define FIELD_NONCE     (1 << 0)
@@ -153,6 +154,36 @@ uint64_t state_history_disk_bytes(const state_history_t *sh);
 
 /** Get number of blocks recorded. */
 uint64_t state_history_block_count(const state_history_t *sh);
+
+/* ── Truncation (for checkpoint resume) ──────────────────────────────── */
+
+/**
+ * Truncate history to keep only blocks up to `last_block`.
+ * Used on checkpoint resume to discard entries beyond the checkpoint.
+ * Not thread-safe with consumer — call before pushing new diffs.
+ */
+void state_history_truncate(state_history_t *sh, uint64_t last_block);
+
+/* ── Forward reconstruction API ──────────────────────────────────────── */
+
+/**
+ * Apply a single block diff to an evm_state (forward reconstruction).
+ * Sets nonce/balance/code_hash and storage slots from the diff's new values.
+ * Handles ACCT_DIFF_CREATED (create account) and ACCT_DIFF_DESTRUCTED
+ * (zero nonce/balance/code_hash, clear cached storage).
+ */
+struct evm_state;
+void state_history_apply_diff(struct evm_state *es, const block_diff_t *diff);
+
+/**
+ * Replay diffs from first_block..last_block onto evm_state.
+ * Reads each diff from the history files and applies it via apply_diff.
+ * Returns the number of blocks successfully applied (0 on failure).
+ */
+uint64_t state_history_replay(state_history_t *sh,
+                               struct evm_state *es,
+                               uint64_t first_block,
+                               uint64_t last_block);
 
 #ifdef __cplusplus
 }
