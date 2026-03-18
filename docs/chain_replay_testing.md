@@ -94,8 +94,19 @@ Truncation: `state_history_truncate(sh, last_block)` — already implemented.
 | `--trace-block N` | EIP-3155 trace for block N |
 | `--dump-prestate N [P]` | Dump pre-state for block N |
 
-## TODO (to make this workflow work)
+## state_reconstruct
 
-1. **state_reconstruct → chain_replay_mpt**: change output prefix from `reconstruct_mpt` to `chain_replay_mpt` (or add `--mpt-prefix`)
-2. **chain_replay --resume truncates history**: call `state_history_truncate(sh, meta.last_block)` before executing
-3. **Test the full cycle**: run → mismatch → reconstruct → resume → verify history continuity
+Rebuilds MPT from history diffs (no EVM re-execution).
+
+```bash
+# Fresh build from genesis
+./state_reconstruct --data-dir <dir>/chain_replay_history <target_block>
+
+# Resume from existing snapshot
+./state_reconstruct --resume --data-dir <dir>/chain_replay_history <target_block>
+```
+
+Flags: `--no-validate`, `--validate-interval N`, `--evict-interval N`
+
+Writes to `chain_replay_mpt` (same path chain_replay uses).
+Reads code store from `chain_replay_code` (read-only).
