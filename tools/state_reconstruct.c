@@ -159,6 +159,65 @@ static bool load_genesis(evm_state_t *state, const char *path) {
 }
 
 /* =========================================================================
+ * Metadata file — records what block the MPT snapshot corresponds to
+ * ========================================================================= */
+
+#define META_MAGIC 0x54504D52  /* "RMPT" */
+#define META_VERSION 1
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t last_block;
+    uint8_t  state_root[32];
+    uint8_t  prune_empty;
+    uint8_t  reserved[7];
+} reconstruct_meta_t;  /* 56 bytes */
+
+static bool meta_write(const char *mpt_path, uint64_t block,
+                       const hash_t *root, bool prune_empty) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s.meta", mpt_path);
+
+    reconstruct_meta_t meta = {0};
+    meta.magic = META_MAGIC;
+    meta.version = META_VERSION;
+    meta.last_block = block;
+    memcpy(meta.state_root, root->bytes, 32);
+    meta.prune_empty = prune_empty ? 1 : 0;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror("meta_write"); return false; }
+    if (fwrite(&meta, sizeof(meta), 1, f) != 1) {
+        fclose(f); return false;
+    }
+    fclose(f);
+    return true;
+}
+
+static bool meta_read(const char *mpt_path, reconstruct_meta_t *out) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s.meta", mpt_path);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    if (fread(out, sizeof(*out), 1, f) != 1) {
+        fclose(f); return false;
+    }
+    fclose(f);
+
+    if (out->magic != META_MAGIC) {
+        fprintf(stderr, "Invalid meta magic: 0x%08x\n", out->magic);
+        return false;
+    }
+    if (out->version != META_VERSION) {
+        fprintf(stderr, "Unsupported meta version: %u\n", out->version);
+        return false;
+    }
+    return true;
+}
+
+/* =========================================================================
  * Print hash
  * ========================================================================= */
 
@@ -170,10 +229,21 @@ static void print_hash(const hash_t *h) {
  * Main
  * ========================================================================= */
 
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s <history_dir> <genesis.json> <era1_dir> [target_block] [options]\n"
+        "\n"
+        "Options:\n"
+        "  --resume                 Resume from existing MPT snapshot (reads .meta)\n"
+        "  --no-validate            Skip intermediate checkpoint validation\n"
+        "  --validate-interval N    Validate every N blocks (default: 256)\n"
+        "  --evict-interval N       Evict cache every N blocks (default: 256)\n",
+        prog);
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s <history_dir> <genesis.json> <era1_dir> [target_block]\n",
-                argv[0]);
+        usage(argv[0]);
         return 1;
     }
 
@@ -182,10 +252,29 @@ int main(int argc, char *argv[]) {
     const char *era1_dir     = argv[3];
     uint64_t    target_block = 0;
     bool        has_target   = false;
+    bool        resume_mode  = false;
+    bool        no_validate  = false;
+    uint64_t    validate_interval = 256;
+    uint64_t    evict_interval    = 256;
 
-    if (argc >= 5) {
-        target_block = strtoull(argv[4], NULL, 10);
-        has_target = true;
+    /* Parse positional + optional flags */
+    for (int i = 4; i < argc; i++) {
+        if (strcmp(argv[i], "--resume") == 0) {
+            resume_mode = true;
+        } else if (strcmp(argv[i], "--no-validate") == 0) {
+            no_validate = true;
+        } else if (strcmp(argv[i], "--validate-interval") == 0 && i + 1 < argc) {
+            validate_interval = strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--evict-interval") == 0 && i + 1 < argc) {
+            evict_interval = strtoull(argv[++i], NULL, 10);
+        } else if (argv[i][0] != '-') {
+            target_block = strtoull(argv[i], NULL, 10);
+            has_target = true;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            usage(argv[0]);
+            return 1;
+        }
     }
 
     /* ── Open history (read-only, no consumer thread needed) ──────────── */
@@ -261,6 +350,11 @@ int main(int argc, char *argv[]) {
 
     printf("Target block: %lu\n", target_block);
     printf("Expected root: 0x"); print_hash(&expected_root); printf("\n");
+    if (no_validate)
+        printf("Validation: DISABLED (evict every %lu blocks)\n", evict_interval);
+    else
+        printf("Validation: every %lu blocks (evict every %lu blocks)\n",
+               validate_interval, evict_interval);
 
     /* ── Build output paths ──────────────────────────────────────────── */
     char mpt_path[512];
@@ -283,7 +377,7 @@ int main(int argc, char *argv[]) {
     printf("MPT output: %s\n", mpt_path);
     printf("Code store: %s (existing)\n", code_path);
 
-    /* ── Create fresh evm_state ──────────────────────────────────────── */
+    /* ── Create evm_state (fresh or resume) ──────────────────────────── */
 #ifdef ENABLE_MPT
     code_store_t *cs = code_store_open(code_path);
     if (!cs) {
@@ -295,6 +389,39 @@ int main(int argc, char *argv[]) {
     void *cs = NULL;
 #endif
 
+    uint64_t start_block = hist_first;  /* first block to replay */
+
+    if (resume_mode) {
+        /* ── Resume from existing snapshot ──────────────────────────── */
+        reconstruct_meta_t meta;
+        if (!meta_read(mpt_path, &meta)) {
+            fprintf(stderr, "No valid .meta file at %s — cannot resume\n", mpt_path);
+#ifdef ENABLE_MPT
+            code_store_destroy(cs);
+#endif
+            state_history_destroy(sh);
+            return 1;
+        }
+
+        printf("\nResuming from snapshot at block %lu\n", meta.last_block);
+        printf("Snapshot root: 0x");
+        hash_t snap_root;
+        memcpy(snap_root.bytes, meta.state_root, 32);
+        print_hash(&snap_root);
+        printf("\n");
+
+        start_block = meta.last_block + 1;
+
+        if (start_block > target_block) {
+            printf("Snapshot already at or past target block — nothing to do\n");
+#ifdef ENABLE_MPT
+            code_store_destroy(cs);
+#endif
+            state_history_destroy(sh);
+            return 0;
+        }
+    }
+
     evm_state_t *es = evm_state_create(NULL, mpt_path, cs);
     if (!es) {
         fprintf(stderr, "Failed to create evm_state\n");
@@ -305,37 +432,39 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* ── Load genesis ────────────────────────────────────────────────── */
-    printf("\nLoading genesis...\n");
-    evm_state_begin_block(es, 0);
+    if (!resume_mode) {
+        /* ── Load genesis ──────────────────────────────────────────── */
+        printf("\nLoading genesis...\n");
+        evm_state_begin_block(es, 0);
 
-    if (!load_genesis(es, genesis_path)) {
-        fprintf(stderr, "Failed to load genesis\n");
-        evm_state_destroy(es);
+        if (!load_genesis(es, genesis_path)) {
+            fprintf(stderr, "Failed to load genesis\n");
+            evm_state_destroy(es);
 #ifdef ENABLE_MPT
-        code_store_destroy(cs);
+            code_store_destroy(cs);
 #endif
-        state_history_destroy(sh);
-        return 1;
-    }
+            state_history_destroy(sh);
+            return 1;
+        }
 
-    evm_state_commit(es);
-    evm_state_finalize(es);
+        evm_state_commit(es);
+        evm_state_finalize(es);
 
 #ifdef ENABLE_MPT
-    {
-        hash_t genesis_root = evm_state_compute_mpt_root(es, false);
-        printf("Genesis root: 0x"); print_hash(&genesis_root); printf("\n");
-    }
+        {
+            hash_t genesis_root = evm_state_compute_mpt_root(es, false);
+            printf("Genesis root: 0x"); print_hash(&genesis_root); printf("\n");
+        }
 #endif
+    }
 
     /* ── Replay diffs ────────────────────────────────────────────────── */
     /* Follow chain_replay's exact lifecycle:
      *   batch_mode ON → per block: begin_block → apply_diff (set_*) → commit → finalize
      *   every 256 blocks: compute_mpt_root → flush → evict_cache
      */
-    printf("\nReplaying %lu blocks from history...\n",
-           target_block - hist_first + 1);
+    printf("\nReplaying blocks %lu .. %lu (%lu blocks)...\n",
+           start_block, target_block, target_block - start_block + 1);
 
     evm_state_set_batch_mode(es, true);
 
@@ -343,7 +472,7 @@ int main(int argc, char *argv[]) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     uint64_t applied = 0;
-    for (uint64_t bn = hist_first; bn <= target_block; bn++) {
+    for (uint64_t bn = start_block; bn <= target_block; bn++) {
         block_diff_t diff;
         if (!state_history_get_diff(sh, bn, &diff)) {
             fprintf(stderr, "\nFailed to read diff for block %lu\n", bn);
@@ -359,14 +488,13 @@ int main(int argc, char *argv[]) {
         block_diff_free(&diff);
         applied++;
 
-        /* Checkpoint every 256 blocks — same as chain_replay. */
-        if (bn % 256 == 0) {
+        /* Validate checkpoint against era1 */
+        if (!no_validate && bn % validate_interval == 0) {
             bool pe = (bn >= 2675000);
             hash_t ckpt_root = evm_state_compute_mpt_root(es, pe);
             evm_state_flush(es);
             evm_state_evict_cache(es);
 
-            /* Validate checkpoint root against era1 */
             if (archive_ensure(&archive, bn)) {
                 uint8_t *h_rlp = NULL; size_t h_len = 0;
                 uint8_t *b_rlp = NULL; size_t b_len = 0;
@@ -380,16 +508,18 @@ int main(int argc, char *argv[]) {
                             printf("\n    expected: 0x"); print_hash(&bh.state_root);
                             printf("\n");
                             goto replay_done;
-                        } else if (bn % 10240 == 0) {
+                        } else if (bn % (validate_interval * 40) == 0) {
                             printf("\n  checkpoint %lu OK\n", bn);
                         }
                     }
                     free(h_rlp); free(b_rlp);
                 }
             }
+        } else if (bn % evict_interval == 0) {
+            /* No validation — just evict cache for memory management */
+            evm_state_flush(es);
+            evm_state_evict_cache(es);
         }
-
-
 
         if (applied % 10000 == 0) {
             clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -440,12 +570,16 @@ replay_done:
     printf("MPT not enabled — cannot compute root\n");
 #endif
 
-    /* ── Flush to disk ───────────────────────────────────────────────── */
+    /* ── Flush to disk + write metadata ─────────────────────────────── */
 #ifdef ENABLE_MPT
     if (memcmp(actual_root.bytes, expected_root.bytes, 32) == 0) {
         printf("\nFlushing reconstructed state to disk...\n");
         evm_state_flush(es);
-        printf("State saved to %s\n", mpt_path);
+        if (meta_write(mpt_path, target_block, &actual_root, prune_empty)) {
+            printf("State saved to %s (block %lu)\n", mpt_path, target_block);
+        } else {
+            fprintf(stderr, "Warning: state flushed but meta write failed\n");
+        }
     }
 #endif
 

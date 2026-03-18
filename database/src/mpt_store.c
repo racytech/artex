@@ -1500,8 +1500,9 @@ void mpt_store_flush(mpt_store_t *ms) {
     /* 6. Free deferred buffers */
     def_free_all(ms);
 
-    /* No msync, no write_header_dat, no disk_hash_sync —
-     * OS page cache handles writeback asynchronously. */
+    /* Write header (root hash, free lists, data_size) to mmap'd page.
+     * No msync/disk_hash_sync — OS page cache handles writeback. */
+    write_header_dat(ms);
 }
 
 /* =========================================================================
