@@ -86,7 +86,7 @@ static size_t get_rss_kb(void) {
 }
 
 /* Default persistent store paths */
-#define DEFAULT_DATA_DIR "/home/racytech/workspace/art/data"
+#define DEFAULT_DATA_DIR_NAME ".artex"
 
 static char value_dir[512];
 static char commit_dir[512];
@@ -463,7 +463,12 @@ int main(int argc, char **argv) {
     bool no_history = false;
 #endif
     bool use_tui = true;
-    const char *data_dir = DEFAULT_DATA_DIR;
+    /* Default data dir: ~/.artex */
+    char default_data_dir[512];
+    const char *home = getenv("HOME");
+    snprintf(default_data_dir, sizeof(default_data_dir), "%s/%s",
+             home ? home : ".", DEFAULT_DATA_DIR_NAME);
+    const char *data_dir = default_data_dir;
     int arg_offset = 0;
     while (arg_offset + 1 < argc && argv[1 + arg_offset][0] == '-') {
         if (strcmp(argv[1 + arg_offset], "--no-tui") == 0) {
@@ -515,7 +520,7 @@ int main(int argc, char **argv) {
             "  --no-tui              Disable ncurses terminal UI\n"
             "  --clean               Delete existing state files, start from genesis\n"
             "  --follow              Wait for new era1 files instead of stopping\n"
-            "  --data-dir DIR        Set data directory for all state files (default: data/)\n"
+            "  --data-dir DIR        Set data directory for all state files (default: ~/.artex)\n"
             "  --resume              Resume from existing MPT state (reads .meta)\n"
             "  --no-history          Disable per-block state diff history\n"
             "  --trace-block N       Enable EIP-3155 EVM trace for block N (to stderr)\n"
@@ -1437,6 +1442,10 @@ int main(int argc, char **argv) {
                 /* sync was recreated — don't use old state after this */
             }
 
+            /* Discard dirty state so destroy doesn't flush failing block to MPT.
+             * MPT on disk stays at last good checkpoint C. */
+            evm_state_discard_pending(sync_get_state(sync));
+
             LOG_ERROR("First failure at block %lu - stopping.", bn);
             break;
         }
@@ -1485,6 +1494,26 @@ int main(int argc, char **argv) {
         printf("Elapsed:       %.1f s\n", elapsed);
         printf("Speed:         %.0f blk/s\n",
                (st.blocks_ok + st.blocks_fail) / (elapsed > 0 ? elapsed : 1));
+    }
+
+    /* Write .meta for resume on success (mismatch handler already wrote its own) */
+    if (st.blocks_fail == 0 && st.last_block > 0) {
+        bool pe = (st.last_block >= 2675000);
+        uint8_t root[32] = {0};
+        if (archive_ensure(&archive, st.last_block, false, era1_dir)) {
+            uint8_t *h_rlp = NULL; size_t h_len = 0;
+            uint8_t *b_rlp = NULL; size_t b_len = 0;
+            if (era1_read_block(&archive.current, st.last_block,
+                                 &h_rlp, &h_len, &b_rlp, &b_len)) {
+                block_header_t hdr;
+                if (block_header_decode_rlp(&hdr, h_rlp, h_len))
+                    memcpy(root, hdr.state_root.bytes, 32);
+                free(h_rlp); free(b_rlp);
+            }
+        }
+        char mp[512];
+        snprintf(mp, sizeof(mp), "%s.meta", mpt_path);
+        meta_write(mp, st.last_block, root, pe);
     }
 
     prefetch_stop(&prefetch);

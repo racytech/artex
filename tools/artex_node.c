@@ -211,7 +211,7 @@ static void print_usage(const char *prog) {
         "  --genesis <path>        Genesis JSON file (required)\n"
         "  --era1 <dir>            Era1 archive directory (required)\n"
         "  --jwt-secret <path>     JWT secret hex file (required for CL sync)\n"
-        "  --data-dir <path>       Data directory (default: data/artex)\n"
+        "  --data-dir <path>       Data directory (default: ~/.artex)\n"
         "  --port <n>              Engine API port (default: 8551)\n"
         "  --host <addr>           Engine API listen address (default: 127.0.0.1)\n"
         "  --clean                 Delete existing state and start fresh\n"
@@ -220,9 +220,14 @@ static void print_usage(const char *prog) {
         prog, CHECKPOINT_INTERVAL);
 }
 
+static char default_data_dir[512];
+
 static bool parse_args(int argc, char **argv, artex_args_t *args) {
     memset(args, 0, sizeof(*args));
-    args->data_dir = "data/artex";
+    const char *home = getenv("HOME");
+    snprintf(default_data_dir, sizeof(default_data_dir), "%s/.artex",
+             home ? home : ".");
+    args->data_dir = default_data_dir;
     args->host = "127.0.0.1";
     args->port = 8551;
     args->checkpoint_interval = CHECKPOINT_INTERVAL;
