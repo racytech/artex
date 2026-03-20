@@ -139,6 +139,56 @@ use `disk_hash_batch_get` (already implemented in disk_hash_mmap.c).
 
 Files: `database/src/mpt_store.c`, `database/src/disk_hash_mmap.c`
 
+## AVX-512 / SIMD Optimizations
+
+Target: AMD Ryzen 9 9950X (Zen5) — full AVX-512 including IFMA.
+
+### 12. Keccak-256 AVX-512 [HIGH — 2-4x hashing speedup]
+
+Current keccak is portable C. Keccak-f[1600] state is 200 bytes — fits
+in 4 zmm registers. XKCP provides ready-to-use AVX-512 implementation
+with 4-way lane-interleaved permutation.
+
+Fires on every: SLOAD key derivation (`keccak(addr)`, `keccak(slot)`),
+MPT node hash, SHA3 opcode, CREATE2 address, account RLP hashing during
+`compute_mpt_root`.
+
+Can also use AVX2 fallback for older hardware. Runtime CPUID detection
+to select the best path.
+
+Files: `common/src/keccak256.c`, `common/include/keccak256.h`
+
+### 13. Pedersen/Banderwagon with AVX-512 IFMA [HIGH — Verkle only]
+
+`VPMADD52LUQ`/`VPMADD52HUQ` instructions do 52-bit integer multiply-
+accumulate — exactly what field multiplication needs. The Banderwagon
+prime field (253-bit) maps to 5x52-bit limbs.
+
+Benefits:
+- Field mul: single IFMA chain replaces 10+ scalar MUL+ADD
+- Multi-scalar multiplication (MSM) for Verkle commits: 2-4x speedup
+- IPA proof computation: dominated by field ops
+
+Not needed until Verkle goes live, but the 9950X has `avx512ifma` ready.
+
+Files: `verkle/src/banderwagon.c`, `verkle/src/pedersen.c`
+
+### 14. ART node scanning with AVX-512 [LOW — minor]
+
+`mem_art` Node16 already uses SSE2 (16-byte key compare). AVX-512 could
+scan Node48/Node256 (48-256 byte key arrays) in 1-4 loads instead of
+loops. Minor win since ART lookups are already fast.
+
+Files: `common/src/mem_art.c`
+
+### Notes on uint256
+
+Current `uint256_t` = two `__uint128_t`. The compiler already generates
+optimal `add`+`adc` for addition and schoolbook multiplication with
+4 partial 64x64→128 products. AVX-512 wouldn't help here — scalar
+carry-chain arithmetic is inherently sequential. Not worth vectorizing
+unless profiling shows uint256 as a bottleneck.
+
 ## Quick Reference: Implementation Order
 
 For maximum impact with minimum risk during active chain replay:
