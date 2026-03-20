@@ -368,6 +368,27 @@ static evm_status_t op_call(evm_t *evm)
         return EVM_SUCCESS;
     }
 
+    // EIP-158: skip call to non-existing account with zero value.
+    // Gas has already been charged by prepare_call. The account would be
+    // created then immediately pruned by EIP-161, so skip the work.
+    if (evm->fork >= FORK_SPURIOUS_DRAGON &&
+        uint256_is_zero(&value) &&
+        !is_precompile(&target_addr, evm->fork) &&
+        !evm_state_exists(evm->state, &target_addr))
+    {
+        // Clear return data
+        if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+        evm->return_data_size = 0;
+
+        // Return forwarded gas (minus stipend which is 0 for zero-value)
+        evm->gas_left += gas_forwarded;
+
+        uint256_t result = uint256_from_uint64(1);  // success
+        if (!evm_stack_push(evm->stack, &result))
+            return EVM_STACK_OVERFLOW;
+        return EVM_SUCCESS;
+    }
+
     // Extract call arguments from memory (stack buffer for small inputs)
     uint8_t stack_buf[CALLDATA_STACK_SIZE];
     uint8_t *call_args = NULL;
