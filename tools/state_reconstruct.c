@@ -235,8 +235,6 @@ static void usage(const char *prog) {
         "\n"
         "Options:\n"
         "  --resume                 Resume from existing MPT snapshot (reads .meta)\n"
-        "  --no-validate            Skip intermediate checkpoint validation\n"
-        "  --validate-interval N    Validate every N blocks (default: 256)\n"
         "  --evict-interval N       Evict cache every N blocks (default: 256)\n",
         prog);
 }
@@ -253,18 +251,12 @@ int main(int argc, char *argv[]) {
     uint64_t    target_block = 0;
     bool        has_target   = false;
     bool        resume_mode  = false;
-    bool        no_validate  = false;
-    uint64_t    validate_interval = 256;
     uint64_t    evict_interval    = 256;
 
     /* Parse positional + optional flags */
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "--resume") == 0) {
             resume_mode = true;
-        } else if (strcmp(argv[i], "--no-validate") == 0) {
-            no_validate = true;
-        } else if (strcmp(argv[i], "--validate-interval") == 0 && i + 1 < argc) {
-            validate_interval = strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--evict-interval") == 0 && i + 1 < argc) {
             evict_interval = strtoull(argv[++i], NULL, 10);
         } else if (argv[i][0] != '-') {
@@ -350,11 +342,8 @@ int main(int argc, char *argv[]) {
 
     printf("Target block: %lu\n", target_block);
     printf("Expected root: 0x"); print_hash(&expected_root); printf("\n");
-    if (no_validate)
-        printf("Validation: DISABLED (evict every %lu blocks)\n", evict_interval);
-    else
-        printf("Validation: every %lu blocks (evict every %lu blocks)\n",
-               validate_interval, evict_interval);
+    printf("Evict interval: %lu blocks (validation at final block only)\n",
+           evict_interval);
 
     /* ── Build output paths ──────────────────────────────────────────── */
     char mpt_path[512];
@@ -488,37 +477,15 @@ int main(int argc, char *argv[]) {
         block_diff_free(&diff);
         applied++;
 
-        /* Validate checkpoint against era1 */
-        if (!no_validate && bn % validate_interval == 0) {
+        /* Build trie incrementally + flush + evict at interval boundaries */
+        if (bn % evict_interval == 0) {
             bool pe = (bn >= 2675000);
-            hash_t ckpt_root = evm_state_compute_mpt_root(es, pe);
+            evm_state_compute_mpt_root(es, pe);
             evm_state_flush(es);
             evm_state_evict_cache(es);
 
-            if (archive_ensure(&archive, bn)) {
-                uint8_t *h_rlp = NULL; size_t h_len = 0;
-                uint8_t *b_rlp = NULL; size_t b_len = 0;
-                if (era1_read_block(&archive.current, bn,
-                                     &h_rlp, &h_len, &b_rlp, &b_len)) {
-                    block_header_t bh;
-                    if (block_header_decode_rlp(&bh, h_rlp, h_len)) {
-                        if (memcmp(ckpt_root.bytes, bh.state_root.bytes, 32) != 0) {
-                            printf("\n  CHECKPOINT MISMATCH at block %lu!\n", bn);
-                            printf("    actual:   0x"); print_hash(&ckpt_root);
-                            printf("\n    expected: 0x"); print_hash(&bh.state_root);
-                            printf("\n");
-                            goto replay_done;
-                        } else if (bn % (validate_interval * 40) == 0) {
-                            printf("\n  checkpoint %lu OK\n", bn);
-                        }
-                    }
-                    free(h_rlp); free(b_rlp);
-                }
-            }
-        } else if (bn % evict_interval == 0) {
-            /* No validation — just evict cache for memory management */
-            evm_state_flush(es);
-            evm_state_evict_cache(es);
+            if (bn % (evict_interval * 40) == 0)
+                printf("\n  checkpoint %lu done\n", bn);
         }
 
         if (applied % 10000 == 0) {
