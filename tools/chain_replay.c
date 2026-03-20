@@ -822,6 +822,14 @@ int main(int argc, char **argv) {
         block_body_t body = blk.body;
         hash_t blk_hash = blk.blk_hash;
 
+        /* Flush pre-execution state for dump-prestate (before target block runs) */
+        if (bn == dump_prestate_block) {
+            evm_state_t *pre_es = sync_get_state(sync);
+            bool pe = (header.number >= 2675000);
+            evm_state_compute_mpt_root(pre_es, pe);
+            evm_state_flush(pre_es);
+        }
+
         /* Enable EVM tracing for the target block */
 #ifdef ENABLE_EVM_TRACE
         if (bn == trace_block) {
@@ -877,7 +885,7 @@ int main(int argc, char **argv) {
             }
             printf("Prestate: collected %zu storage keys\n", total_slots);
 
-            /* Pass 2: Destroy sync, recreate from checkpoint (clean pre-state) */
+            /* Pass 2: Destroy sync, recreate from flushed pre-execution state */
             sync_destroy(sync);
             sync = sync_create(&cfg);
             if (!sync) {

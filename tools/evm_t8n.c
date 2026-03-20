@@ -517,6 +517,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: failed to create EVM state\n");
         return 1;
     }
+    /* Fresh MPT stores in RAM for state root computation */
+    evm_state_init_mpt_stores(state, "/dev/shm/evm_t8n_mpt",
+                               account_count * 4, account_count * 16);
 
     evm_t *evm = evm_create(state, chain_config);
     if (!evm) {

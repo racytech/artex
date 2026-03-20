@@ -2843,8 +2843,7 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
 
             bool is_empty = (ca->nonce == 0 &&
                              uint256_is_zero(&ca->balance) &&
-                             !ca->has_code &&
-                             memcmp(sr, HASH_EMPTY_STORAGE.bytes, 32) == 0);
+                             !ca->has_code);
 
             if (!ca->existed || (is_empty && prune_empty)) {
                 mpt_store_delete(es->account_mpt, ca->addr_hash.bytes);
