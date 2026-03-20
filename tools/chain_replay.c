@@ -463,6 +463,7 @@ int main(int argc, char **argv) {
     bool no_history = false;
 #endif
     bool use_tui = true;
+    uint32_t validate_every = CHECKPOINT_INTERVAL;
     /* Default data dir: ~/.artex */
     char default_data_dir[512];
     const char *home = getenv("HOME");
@@ -496,6 +497,10 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[1 + arg_offset], "--resume") == 0) {
             resume_mode = true;
             arg_offset++;
+        } else if (strcmp(argv[1 + arg_offset], "--validate-every") == 0 && arg_offset + 2 < argc) {
+            validate_every = (uint32_t)atoi(argv[2 + arg_offset]);
+            if (validate_every == 0) validate_every = 1;
+            arg_offset += 2;
         } else if (strcmp(argv[1 + arg_offset], "--trace-block") == 0 && arg_offset + 2 < argc) {
             trace_block = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
@@ -528,9 +533,10 @@ int main(int argc, char **argv) {
             "                        (default: alloc_<N>.json). Two-pass: executes block\n"
             "                        to discover accessed accounts, then reloads checkpoint\n"
             "                        and dumps their pre-execution values.\n"
+            "  --validate-every N    Validate state root every N blocks (default: %d)\n"
             "\n"
             "Validates state root every %d blocks\n",
-            argv[0], CHECKPOINT_INTERVAL);
+            argv[0], CHECKPOINT_INTERVAL, CHECKPOINT_INTERVAL);
         return 1;
     }
 
@@ -639,7 +645,7 @@ int main(int argc, char **argv) {
         .verkle_value_dir    = NULL,
         .verkle_commit_dir   = NULL,
         .mpt_path            = NULL,
-        .checkpoint_interval = CHECKPOINT_INTERVAL,
+        .checkpoint_interval = validate_every,
         .validate_state_root = true,
 #ifdef ENABLE_DEBUG
         .no_evict            = no_evict,
@@ -880,6 +886,30 @@ int main(int argc, char **argv) {
                 archive_close(&archive);
                 return 1;
             }
+
+            /* Re-populate block hash ring (lost on sync_destroy) */
+            {
+                uint64_t bh_start = bn > 256 ? bn - 256 : 0;
+                size_t bh_count = (size_t)(bn - bh_start);
+                hash_t *bh_hashes = calloc(bh_count, sizeof(hash_t));
+                if (bh_hashes) {
+                    for (uint64_t i = 0; i < bh_count; i++) {
+                        uint64_t bh_bn = bh_start + i;
+                        if (archive_ensure(&archive, bh_bn, false, era1_dir)) {
+                            uint8_t *h_rlp = NULL; size_t h_len = 0;
+                            uint8_t *b_rlp = NULL; size_t b_len = 0;
+                            if (era1_read_block(&archive.current, bh_bn,
+                                                 &h_rlp, &h_len, &b_rlp, &b_len)) {
+                                bh_hashes[i] = hash_keccak256(h_rlp, h_len);
+                                free(h_rlp); free(b_rlp);
+                            }
+                        }
+                    }
+                    sync_resume(sync, bn - 1, bh_hashes, bh_count);
+                    free(bh_hashes);
+                }
+            }
+
             es = sync_get_state(sync);
 
             /* Build output path */
@@ -1067,7 +1097,7 @@ int main(int argc, char **argv) {
                     .window_txs       = tui_window_txs,
                     .window_transfers = tui_window_transfers,
                     .window_calls     = tui_window_calls,
-                    .checkpoint_interval = CHECKPOINT_INTERVAL,
+                    .checkpoint_interval = validate_every,
                     .cache_accounts   = lss.cache_accounts,
                     .cache_slots      = lss.cache_slots,
                     .cache_arena_mb   = lss.cache_arena_bytes / (1024*1024),
@@ -1135,7 +1165,7 @@ int main(int argc, char **argv) {
                     .window_txs       = window_txs,
                     .window_transfers = window_transfers,
                     .window_calls     = window_calls,
-                    .checkpoint_interval = CHECKPOINT_INTERVAL,
+                    .checkpoint_interval = validate_every,
                     .cache_accounts   = ss.cache_accounts,
                     .cache_slots      = ss.cache_slots,
                     .cache_arena_mb   = ss.cache_arena_bytes / (1024*1024),

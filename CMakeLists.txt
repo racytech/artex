@@ -470,6 +470,14 @@ add_executable(bench_mpt_store
 )
 target_link_libraries(bench_mpt_store mpt_store common)
 
+# Tool: rebuild .idx from .dat
+add_executable(rebuild_idx tools/rebuild_idx.c)
+target_link_libraries(rebuild_idx disk_hash common)
+
+# Tool: verify MPT store hashes from root
+add_executable(verify_mpt tools/verify_mpt.c)
+target_link_libraries(verify_mpt mpt_store common)
+
 # Shared library for Python differential fuzzing (mpt_store + mem_mpt)
 # Build PIC versions of dependencies for the shared library
 add_library(mpt_store_pic STATIC database/src/mpt_store.c)
