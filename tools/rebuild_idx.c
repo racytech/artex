@@ -258,11 +258,15 @@ static bool is_under_artex(const char *path) {
 int main(int argc, char **argv) {
     bool verify  = false;
     bool dry_run = false;
+    uint64_t capacity_override = 0;
     const char *base_path = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--verify") == 0) verify = true;
         else if (strcmp(argv[i], "--dry-run") == 0) dry_run = true;
+        else if (strcmp(argv[i], "--capacity") == 0 && i + 1 < argc) {
+            capacity_override = strtoull(argv[++i], NULL, 10);
+        }
         else if (!base_path) base_path = argv[i];
         else {
             fprintf(stderr, "Unknown argument: %s\n", argv[i]);
@@ -271,7 +275,8 @@ int main(int argc, char **argv) {
     }
 
     if (!base_path) {
-        fprintf(stderr, "Usage: rebuild_idx <base_path> [--verify] [--dry-run]\n");
+        fprintf(stderr, "Usage: rebuild_idx <base_path> [--verify] [--dry-run] [--capacity N]\n");
+        fprintf(stderr, "  --capacity N  Set hash table capacity (default: node_count, i.e. tight fit)\n");
         return 1;
     }
 
@@ -447,11 +452,13 @@ int main(int argc, char **argv) {
     }
 
     /* Create fresh disk_hash */
-    printf("\nBuilding %s (%" PRIu64 " entries)...\n", out_idx, node_count);
+    uint64_t capacity = capacity_override > 0 ? capacity_override : node_count;
+    printf("\nBuilding %s (%" PRIu64 " entries, capacity %" PRIu64 ")...\n",
+           out_idx, node_count, capacity);
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     disk_hash_t *dh = disk_hash_create(out_idx, NODE_HASH_SIZE,
-                                         sizeof(node_record_t), node_count);
+                                         sizeof(node_record_t), capacity);
     if (!dh) {
         fprintf(stderr, "ERROR: disk_hash_create failed for %s\n", out_idx);
         free(nodes);
