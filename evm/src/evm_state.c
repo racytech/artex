@@ -1110,6 +1110,25 @@ uint256_t evm_state_get_storage(evm_state_t *es, const address_t *addr,
     return cs->current;
 }
 
+uint256_t evm_state_sload(evm_state_t *es, const address_t *addr,
+                          const uint256_t *key, bool *was_warm) {
+    if (!es || !addr || !key) {
+        if (was_warm) *was_warm = false;
+        return UINT256_ZERO_INIT;
+    }
+    // Single make_slot_key + ensure_slot lookup, then check warm_slots
+    // with the same skey — avoids double make_slot_key + double ART traversal
+    cached_slot_t *cs = ensure_slot(es, addr, key);
+    if (!cs) {
+        if (was_warm) *was_warm = false;
+        return UINT256_ZERO_INIT;
+    }
+    // Check warm using the skey already stored in cs->key
+    if (was_warm)
+        *was_warm = mem_art_contains(&es->warm_slots, cs->key, SLOT_KEY_SIZE);
+    return cs->current;
+}
+
 uint256_t evm_state_get_committed_storage(evm_state_t *es, const address_t *addr,
                                           const uint256_t *key) {
     if (!es || !addr || !key) return UINT256_ZERO_INIT;
@@ -1134,6 +1153,30 @@ void evm_state_get_storage_pair(evm_state_t *es, const address_t *addr,
     }
     if (current) *current = cs->current;
     if (original) *original = cs->original;
+}
+
+void evm_state_sstore_lookup(evm_state_t *es, const address_t *addr,
+                              const uint256_t *key,
+                              uint256_t *current, uint256_t *original,
+                              bool *was_warm) {
+    if (!es || !addr || !key) {
+        if (current) *current = UINT256_ZERO_INIT;
+        if (original) *original = UINT256_ZERO_INIT;
+        if (was_warm) *was_warm = false;
+        return;
+    }
+    cached_slot_t *cs = ensure_slot(es, addr, key);
+    if (!cs) {
+        if (current) *current = UINT256_ZERO_INIT;
+        if (original) *original = UINT256_ZERO_INIT;
+        if (was_warm) *was_warm = false;
+        return;
+    }
+    if (current) *current = cs->current;
+    if (original) *original = cs->original;
+    // Check warm using skey already stored in cs->key
+    if (was_warm)
+        *was_warm = mem_art_contains(&es->warm_slots, cs->key, SLOT_KEY_SIZE);
 }
 
 void evm_state_set_storage(evm_state_t *es, const address_t *addr,

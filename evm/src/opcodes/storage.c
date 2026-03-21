@@ -31,6 +31,7 @@ static uint64_t calculate_sstore_gas(
     const uint256_t *current_value,
     const uint256_t *original_value,
     const uint256_t *new_value,
+    bool is_warm,
     int64_t *gas_refund)
 {
     if (gas_refund) *gas_refund = 0;
@@ -66,10 +67,9 @@ static uint64_t calculate_sstore_gas(
         // cost stays 0 — witness gas handled in op_sstore
     } else if (evm->fork >= FORK_BERLIN) {
         // Berlin+ (EIP-2929): cold/warm access
-        bool is_warm = evm_is_storage_warm(evm, &evm->msg.recipient, key);
+        // Warm status passed in from caller (already checked via sstore_lookup)
         if (!is_warm) {
             cost += GAS_SLOAD_COLD;  // 2100
-            evm_mark_storage_warm(evm, &evm->msg.recipient, key);
         }
     }
 
@@ -172,14 +172,31 @@ static evm_status_t op_sload(evm_t *evm)
     }
     else if (evm->fork >= FORK_BERLIN)
     {
-        bool is_warm = evm_is_storage_warm(evm, &evm->msg.recipient, &key);
-        gas_cost = is_warm ? GAS_SLOAD_WARM : GAS_SLOAD_COLD;
+        // Combined lookup: ensure_slot + warm check in one pass
+        // (avoids double make_slot_key + double ART traversal)
+        bool was_warm;
+        uint256_t value = evm_state_sload(evm->state, &evm->msg.recipient, &key, &was_warm);
+        gas_cost = was_warm ? GAS_SLOAD_WARM : GAS_SLOAD_COLD;
 
-        // Mark as warm for future accesses
-        if (!is_warm)
-        {
+        if (!was_warm)
             evm_mark_storage_warm(evm, &evm->msg.recipient, &key);
+
+        if (!evm_use_gas(evm, gas_cost))
+            return EVM_OUT_OF_GAS;
+
+        if (g_trace_calls) {
+            char addr_hex[41];
+            for (int i = 0; i < 20; i++) sprintf(addr_hex + i*2, "%02x", evm->msg.recipient.bytes[i]);
+            fprintf(stderr, "  SLOAD depth=%d addr=%s slot=%016lx_%016lx val=%016lx_%016lx\n",
+                    evm->msg.depth, addr_hex,
+                    (unsigned long)(key.low >> 64), (unsigned long)key.low,
+                    (unsigned long)(value.low >> 64), (unsigned long)value.low);
         }
+
+        if (!evm_stack_push(evm->stack, &value))
+            return EVM_STACK_OVERFLOW;
+
+        return EVM_SUCCESS;
     }
     else if (evm->fork >= FORK_ISTANBUL)
     {
@@ -196,7 +213,7 @@ static evm_status_t op_sload(evm_t *evm)
         // Pre-EIP-150 (Frontier/Homestead): SLOAD costs 50
         gas_cost = GAS_SLOAD_FRONTIER;
     }
-    
+
     if (!evm_use_gas(evm, gas_cost))
     {
         return EVM_OUT_OF_GAS;
@@ -252,10 +269,11 @@ static evm_status_t op_sstore(evm_t *evm)
     evm_stack_pop(evm->stack, &key);
     evm_stack_pop(evm->stack, &value);
 
-    // Get current and original (committed) values in a single lookup
+    // Get current, original, and warm status in a single ensure_slot lookup
     uint256_t current_value, original_value;
-    evm_state_get_storage_pair(evm->state, &evm->msg.recipient, &key,
-                               &current_value, &original_value);
+    bool was_warm = false;
+    evm_state_sstore_lookup(evm->state, &evm->msg.recipient, &key,
+                             &current_value, &original_value, &was_warm);
 
     if (evm->fork >= FORK_VERKLE) {
         // EIP-4762 (Verkle): witness gas is the COMPLETE SSTORE cost.
@@ -271,7 +289,7 @@ static evm_status_t op_sstore(evm_t *evm)
     } else {
         // Calculate fork-specific SSTORE gas cost and refund (EIP-2200)
         int64_t gas_refund = 0;
-        uint64_t gas_cost = calculate_sstore_gas(evm, &key, &current_value, &original_value, &value, &gas_refund);
+        uint64_t gas_cost = calculate_sstore_gas(evm, &key, &current_value, &original_value, &value, was_warm, &gas_refund);
 
         if (g_trace_calls) {
             char addr_hex[41];
@@ -287,6 +305,10 @@ static evm_status_t op_sstore(evm_t *evm)
         if (!evm_use_gas(evm, gas_cost)) {
             return EVM_OUT_OF_GAS;
         }
+
+        // Mark warm for subsequent accesses (if cold, the cost was already charged)
+        if (!was_warm && evm->fork >= FORK_BERLIN)
+            evm_mark_storage_warm(evm, &evm->msg.recipient, &key);
 
         // Apply gas refund (can be negative for dirty writes)
         evm->gas_refund += gas_refund;
