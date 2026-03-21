@@ -79,6 +79,29 @@ chain_replay (one-time)          state_reconstruct (repeatable)
 └─────────────────────┘          └─────────────────────────┘
 ```
 
+## Fast Sync via State Snapshots
+
+For nodes that don't need history diffs, artex supports distributing
+pre-built state snapshots. Only the `.dat` files (trie node data) need
+to be transferred — the `.idx` files (hash table indexes) can be rebuilt
+locally using `rebuild_idx` in seconds.
+
+```
+Producer (periodic):
+  state_reconstruct → .dat files at block N
+  Distribute .dat + .meta over network (~8 GB for 4.5M blocks)
+
+Consumer:
+  Download .dat + .meta
+  rebuild_idx --capacity 500000000    (~30 seconds)
+  chain_replay --resume               (continues from block N)
+```
+
+The `.dat` files contain only the raw trie node data (append-only, no
+hash table overhead). The `.idx` files are 10-50x larger (sparse hash
+tables) but are fully derivable from `.dat`. This makes snapshots compact
+for distribution while keeping local reads fast via the rebuilt index.
+
 ## Building
 
 ```bash
