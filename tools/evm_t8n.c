@@ -224,6 +224,7 @@ typedef struct {
 
 static bool parse_t8n_txs(const cJSON *json, t8n_tx_t **out_txs,
                            size_t *out_count, uint64_t chain_id) {
+    (void)chain_id;
     if (!cJSON_IsArray(json)) {
         *out_txs = NULL;
         *out_count = 0;

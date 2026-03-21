@@ -13,7 +13,7 @@
 #ifdef ENABLE_DEBUG
 extern bool g_trace_calls __attribute__((weak));
 #else
-static const bool g_trace_calls = false;
+static const bool g_trace_calls __attribute__((unused)) = false;
 #endif
 
 // ============================================================================
@@ -2522,7 +2522,7 @@ static bool collect_slots_cb(const uint8_t *key, size_t key_len,
     collect_slots_ctx_t *ctx = (collect_slots_ctx_t *)user_data;
     /* key[0..19] = address, key[20..51] = slot (big-endian) */
     if (memcmp(key, ctx->addr, 20) != 0) return true;
-    const cached_slot_t *cs = (const cached_slot_t *)value;
+    (void)value;
     /* Include slots that were accessed (even if zero now — they might have been non-zero before) */
     if (ctx->count >= ctx->max) return false;
     ctx->out[ctx->count] = uint256_from_bytes(key + 20, 32);

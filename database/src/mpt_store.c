@@ -2242,7 +2242,6 @@ bool mpt_store_commit_batch(mpt_store_t *ms) {
 
     /* Flag slow commits for diagnosis */
     if (_enc_residual > 500e6) { /* > 500ms */
-        uint32_t _nodes_delta = ms->cstats.nodes_hashed;  /* cumulative, but useful */
         fprintf(stderr, "SLOW commit_batch: total=%.1f ms  enc=%.1f ms  "
                 "dirty=%zu  keccak=%.1f  load=%.1f  check=%.1f  del=%.1f ms\n",
                 _enc_total / 1e6, _enc_residual / 1e6,

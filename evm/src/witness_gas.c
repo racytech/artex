@@ -27,6 +27,7 @@ uint64_t witness_gas_access_event(witness_gas_t *wg,
                                    bool is_write,
                                    bool value_was_empty)
 {
+    (void)value_was_empty;
     uint64_t gas = 0;
 
     /* Stem = key[0:31]. Check/add to accessed_subtrees. */

@@ -90,6 +90,7 @@ static inline uint256_t addr_to_u256(const address_t *addr) {
     };
 }
 
+#ifdef ENABLE_VERKLE
 // Verkle witness gas for PUSH data bytes (cold path, only called in Verkle mode)
 static bool push_verkle_data_gas(evm_t *evm, uint8_t num_bytes,
                                   const address_t *code_addr_p) {
@@ -107,6 +108,7 @@ static bool push_verkle_data_gas(evm_t *evm, uint8_t num_bytes,
     }
     return true;
 }
+#endif
 
 //==============================================================================
 // Dispatch Table - Maps opcodes to label addresses

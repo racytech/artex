@@ -230,8 +230,6 @@ static void draw_stats(void) {
         int hr = (int)(s->elapsed_secs / 3600);
         int mn = (int)((s->elapsed_secs - hr * 3600) / 60);
         int sec = (int)(s->elapsed_secs) % 60;
-        double disk_gb = s->acct_mpt_gb + s->stor_mpt_gb;
-
         int cp = s->total_blocks_fail > 0 ? CP_STATUS_FAIL : CP_STATUS_OK;
         wattron(g.stats_win, A_BOLD | COLOR_PAIR(cp));
 

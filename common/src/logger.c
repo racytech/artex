@@ -59,6 +59,7 @@ static const char *COLOR_RESET = "\x1b[0m";
  * Helper Functions
  * ============================================================================ */
 
+__attribute__((unused))
 static const char *extract_filename(const char *path) {
     const char *slash = strrchr(path, '/');
     return slash ? slash + 1 : path;
@@ -101,6 +102,7 @@ void log_write(
     const char *fmt,
     ...
 ) {
+    (void)file; (void)line;
     if (level < g_logger.min_level)
         return;
 

@@ -34,6 +34,7 @@ static uint64_t calculate_sstore_gas(
     bool is_warm,
     int64_t *gas_refund)
 {
+    (void)key;
     if (gas_refund) *gas_refund = 0;
 
     bool current_is_zero = uint256_is_zero(current_value);

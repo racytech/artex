@@ -183,6 +183,7 @@ static evm_status_t precompile_sha256(const uint8_t *input, size_t input_size,
                                       uint8_t **output, size_t *output_size,
                                       evm_fork_t fork)
 {
+    (void)fork;
     uint64_t words = (input_size + 31) / 32;
     uint64_t cost = 60 + 12 * words;
 
@@ -211,6 +212,7 @@ static evm_status_t precompile_ripemd160(const uint8_t *input, size_t input_size
                                          uint8_t **output, size_t *output_size,
                                          evm_fork_t fork)
 {
+    (void)fork;
     uint64_t words = (input_size + 31) / 32;
     uint64_t cost = 600 + 120 * words;
 
@@ -240,6 +242,7 @@ static evm_status_t precompile_identity(const uint8_t *input, size_t input_size,
                                         uint8_t **output, size_t *output_size,
                                         evm_fork_t fork)
 {
+    (void)fork;
     uint64_t words = (input_size + 31) / 32;
     uint64_t cost = 15 + 3 * words;
 

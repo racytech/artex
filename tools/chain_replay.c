@@ -454,7 +454,9 @@ int main(int argc, char **argv) {
 #ifdef ENABLE_DEBUG
     bool no_evict = false;
 #endif
+#ifdef ENABLE_EVM_TRACE
     uint64_t trace_block = UINT64_MAX;  /* UINT64_MAX = no tracing */
+#endif
     uint64_t dump_prestate_block = UINT64_MAX;
     const char *dump_prestate_path = NULL;
 #ifdef ENABLE_HISTORY
@@ -499,9 +501,11 @@ int main(int argc, char **argv) {
             validate_every = (uint32_t)atoi(argv[2 + arg_offset]);
             if (validate_every == 0) validate_every = 1;
             arg_offset += 2;
+#ifdef ENABLE_EVM_TRACE
         } else if (strcmp(argv[1 + arg_offset], "--trace-block") == 0 && arg_offset + 2 < argc) {
             trace_block = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
+#endif
         } else if (strcmp(argv[1 + arg_offset], "--dump-prestate") == 0 && arg_offset + 2 < argc) {
             dump_prestate_block = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
