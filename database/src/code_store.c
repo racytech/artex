@@ -618,9 +618,8 @@ void code_store_sync(code_store_t *cs) {
 
 void code_store_flush(code_store_t *cs) {
     if (!cs) return;
-    /* All writes are immediate (mmap + disk_hash_put in code_store_put).
-     * Flush just syncs the header and pages to disk. */
-    code_store_sync(cs);
+    /* Write header to mmap. No msync — OS page cache handles writeback. */
+    write_data_header(cs);
 }
 
 /* =========================================================================

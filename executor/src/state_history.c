@@ -369,8 +369,7 @@ static void *consumer_thread(void *arg) {
 
         blocks_since_sync++;
         if (blocks_since_sync >= 256) {
-            fdatasync(sh->dat_fd);
-            fdatasync(sh->idx_fd);
+            /* No fdatasync — OS page cache handles writeback */
 
             LOG_HIST_INFO(
                    "history: blk %lu (+256)  %lu accts  %lu slots  %lu created  %.1f KB",
@@ -422,8 +421,6 @@ static void *consumer_thread(void *arg) {
         block_diff_free(&diff);
     }
 
-    fdatasync(sh->dat_fd);
-    fdatasync(sh->idx_fd);
     return NULL;
 }
 
@@ -576,7 +573,6 @@ void state_history_destroy(state_history_t *sh) {
         write_u32(hdr + 4, HIST_VERSION);
         write_u64(hdr + 8, sh->first_block);
         pwrite(sh->idx_fd, hdr, IDX_HEADER_SIZE, 0);
-        fdatasync(sh->idx_fd);
     }
 
     close(sh->dat_fd);
@@ -743,9 +739,6 @@ void state_history_truncate(state_history_t *sh, uint64_t last_block) {
     uint64_t removed = sh->block_count - keep;
     sh->block_count = keep;
     sh->dat_offset = new_dat_end;
-
-    fdatasync(sh->dat_fd);
-    fdatasync(sh->idx_fd);
 
     LOG_HIST_INFO("history: truncated %lu blocks, kept %lu (first=%lu last=%lu)",
            removed, keep, sh->first_block, last_block);

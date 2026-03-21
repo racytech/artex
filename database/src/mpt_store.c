@@ -348,7 +348,6 @@ static void write_free_overflow(const char *path, const mpt_store_t *ms,
                         overflow_counts[i] * sizeof(uint64_t));
         }
     }
-    fsync(fd);
     close(fd);
 }
 
