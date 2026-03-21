@@ -44,8 +44,11 @@ validation. Supports `--resume` from checkpoint, per-block state root
 validation (`--validate-every`), and pre-state dumping for debugging.
 
 **History** — Per-block state diffs written to append-only files via
-background thread. Enables state reconstruction from any checkpoint
-without full re-execution.
+background thread. A compact changelog of the entire Ethereum state:
+every account and storage mutation, block by block. Enables state
+reconstruction at any block without re-execution, historical balance/nonce
+queries, tracking when accounts were created or destroyed, and building
+any state backend (MPT, Verkle) from the same diffs.
 
 **Verkle** — Verkle trie backend with Banderwagon curve, Pedersen
 commitments, and IPA proofs. Incremental updates (O(1) per value change).
