@@ -18,7 +18,7 @@
  *   - MAP_SHARED + hash-based bucket lookup = random page access across
  *     a large mapping, causing TLB misses and kernel dirty page writeback
  *     pressure (dirty_ratio throttling).
- *   - pthread_rwlock on every get/put adds overhead vs pure in-memory
+ *   - Single-threaded design — no locking overhead
  *     structures. Use mem_art for hot-path state cache; disk_hash is
  *     best suited as a cold-path fallback after cache eviction.
  */
@@ -31,7 +31,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
@@ -97,7 +96,6 @@ struct disk_hash {
     uint64_t  entry_count;
     uint64_t  overflow_count;
     bool      dirty;
-    pthread_rwlock_t rwlock;
 };
 
 /* =========================================================================
@@ -294,7 +292,6 @@ disk_hash_t *disk_hash_create(const char *path, uint32_t key_size,
     dh->entry_count      = 0;
     dh->overflow_count   = 0;
     dh->dirty            = false;
-    pthread_rwlock_init(&dh->rwlock, NULL);
 
     write_header(dh);
     return dh;
@@ -357,7 +354,6 @@ disk_hash_t *disk_hash_open(const char *path) {
     dh->entry_count      = hdr.entry_count;
     dh->overflow_count   = hdr.overflow_count;
     dh->dirty            = (hdr.dirty != 0);
-    pthread_rwlock_init(&dh->rwlock, NULL);
 
     if (dh->dirty) {
         if (!recover(dh)) {
@@ -373,7 +369,6 @@ disk_hash_t *disk_hash_open(const char *path) {
 
 void disk_hash_destroy(disk_hash_t *dh) {
     if (!dh) return;
-    pthread_rwlock_destroy(&dh->rwlock);
     if (dh->base) munmap(dh->base, dh->mapped_size);
     close(dh->fd);
     free(dh);
@@ -551,38 +546,30 @@ static bool delete_unlocked(disk_hash_t *dh, const uint8_t *key) {
     return true;
 }
 
-/* --- Public API (locked) --- */
+/* --- Public API --- */
 
 bool disk_hash_get(const disk_hash_t *dh, const uint8_t *key, void *out) {
     if (!dh || !key) return false;
-    pthread_rwlock_rdlock((pthread_rwlock_t *)&dh->rwlock);
     bool ok = get_unlocked(dh, key, out);
-    pthread_rwlock_unlock((pthread_rwlock_t *)&dh->rwlock);
     return ok;
 }
 
 bool disk_hash_put(disk_hash_t *dh, const uint8_t *key, const void *record) {
     if (!dh || !key || !record) return false;
-    pthread_rwlock_wrlock(&dh->rwlock);
     bool ok = put_unlocked(dh, key, record);
-    pthread_rwlock_unlock(&dh->rwlock);
     return ok;
 }
 
 bool disk_hash_delete(disk_hash_t *dh, const uint8_t *key) {
     if (!dh || !key) return false;
-    pthread_rwlock_wrlock(&dh->rwlock);
     bool ok = delete_unlocked(dh, key);
-    pthread_rwlock_unlock(&dh->rwlock);
     return ok;
 }
 
 bool disk_hash_contains(const disk_hash_t *dh, const uint8_t *key) {
     if (!dh || !key) return false;
-    pthread_rwlock_rdlock((pthread_rwlock_t *)&dh->rwlock);
     uint64_t bid = hash_key(key) % dh->bucket_count;
     scan_result_t r = scan_chain_key(dh, bid, key);
-    pthread_rwlock_unlock((pthread_rwlock_t *)&dh->rwlock);
     return r.found;
 }
 
@@ -610,10 +597,8 @@ uint32_t disk_hash_batch_get(const disk_hash_t *dh,
 
     if (found) memset(found, 0, count * sizeof(bool));
 
-    pthread_rwlock_rdlock((pthread_rwlock_t *)&dh->rwlock);
-
     batch_entry_t *entries = malloc(count * sizeof(batch_entry_t));
-    if (!entries) { pthread_rwlock_unlock((pthread_rwlock_t *)&dh->rwlock); return 0; }
+    if (!entries) return 0;
 
     for (uint32_t i = 0; i < count; i++) {
         entries[i].idx       = i;
@@ -668,7 +653,6 @@ uint32_t disk_hash_batch_get(const disk_hash_t *dh,
     }
 
     free(entries);
-    pthread_rwlock_unlock((pthread_rwlock_t *)&dh->rwlock);
     return found_count;
 }
 
@@ -677,10 +661,8 @@ bool disk_hash_batch_put(disk_hash_t *dh,
                           uint32_t count) {
     if (!dh || !keys || !records || count == 0) return false;
 
-    pthread_rwlock_wrlock(&dh->rwlock);
-
     batch_entry_t *entries = malloc(count * sizeof(batch_entry_t));
-    if (!entries) { pthread_rwlock_unlock(&dh->rwlock); return false; }
+    if (!entries) return false;
 
     for (uint32_t i = 0; i < count; i++) {
         entries[i].idx       = i;
@@ -710,7 +692,6 @@ bool disk_hash_batch_put(disk_hash_t *dh,
     }
 
     free(entries);
-    pthread_rwlock_unlock(&dh->rwlock);
     return ok;
 }
 
@@ -752,11 +733,9 @@ void disk_hash_foreach_key(const disk_hash_t *dh, disk_hash_key_cb_t cb,
 
 void disk_hash_sync(disk_hash_t *dh) {
     if (!dh) return;
-    pthread_rwlock_wrlock(&dh->rwlock);
     dh->dirty = false;
     write_header(dh);
     msync(dh->base, dh->mapped_size, MS_SYNC);
-    pthread_rwlock_unlock(&dh->rwlock);
 }
 
 
