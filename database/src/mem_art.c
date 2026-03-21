@@ -29,7 +29,7 @@
 #define MEM_NODE48_MAX  48
 #define MEM_NODE256_MAX 256
 
-#define MEM_MAX_PREFIX  8
+#define MEM_MAX_PREFIX  20
 #define MEM_NODE48_EMPTY 255
 
 // ============================================================================
