@@ -198,6 +198,8 @@ struct evm_state {
 #endif
     mem_art_t         accounts;     // key: addr[20], value: cached_account_t
     mem_art_t         storage;      // key: skey[52], value: cached_slot_t
+    mem_art_t         prev_accounts; // previous generation (read-only fallback)
+    mem_art_t         prev_storage;  // previous generation (read-only fallback)
     journal_entry_t  *journal;
     uint32_t          journal_len;
     uint32_t          journal_cap;
@@ -286,6 +288,37 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
         &es->accounts, addr->bytes, ADDRESS_SIZE, NULL);
     if (ca) return ca;
 
+    // Check previous generation before going to disk
+    const cached_account_t *prev = (const cached_account_t *)mem_art_get(
+        &es->prev_accounts, addr->bytes, ADDRESS_SIZE, NULL);
+    if (prev) {
+        // Promote to current generation (copy all fields)
+        cached_account_t ca_copy = *prev;
+        // Deep-copy code pointer (prev's arena will be destroyed)
+        if (prev->code && prev->code_size > 0) {
+            ca_copy.code = malloc(prev->code_size);
+            if (ca_copy.code)
+                memcpy(ca_copy.code, prev->code, prev->code_size);
+        }
+        // Clear dirty flags — this is a fresh entry in the new window
+        ca_copy.mpt_dirty = false;
+        ca_copy.block_dirty = false;
+        ca_copy.block_code_dirty = false;
+        ca_copy.storage_dirty = false;
+        ca_copy.dirty = false;
+        ca_copy.code_dirty = false;
+        ca_copy.self_destructed = false;
+        ca_copy.created = false;
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+        ca_copy.original_nonce = ca_copy.nonce;
+        ca_copy.original_balance = ca_copy.balance;
+        ca_copy.original_code_hash = ca_copy.code_hash;
+#endif
+        return (cached_account_t *)mem_art_upsert(
+            &es->accounts, addr->bytes, ADDRESS_SIZE,
+            &ca_copy, sizeof(cached_account_t));
+    }
+
     // Build on stack, insert into arena
     cached_account_t ca_local;
     memset(&ca_local, 0, sizeof(ca_local));
@@ -349,6 +382,26 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
     cached_slot_t *cs = (cached_slot_t *)mem_art_get_mut(
         &es->storage, skey, SLOT_KEY_SIZE, NULL);
     if (cs) return cs;
+
+    // Check previous generation before going to disk
+    const cached_slot_t *prev_cs = (const cached_slot_t *)mem_art_get(
+        &es->prev_storage, skey, SLOT_KEY_SIZE, NULL);
+    if (prev_cs) {
+        // Promote to current generation
+        cached_slot_t cs_copy = *prev_cs;
+        cs_copy.mpt_dirty = false;
+        cs_copy.block_dirty = false;
+        cs_copy.dirty = false;
+        // original stays as-is (the committed value from prior window)
+        cs_copy.current = prev_cs->current;
+        cs_copy.original = prev_cs->current;  // current becomes new original
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+        cs_copy.block_original = cs_copy.original;
+#endif
+        return (cached_slot_t *)mem_art_upsert(
+            &es->storage, skey, SLOT_KEY_SIZE,
+            &cs_copy, sizeof(cached_slot_t));
+    }
 
     // Build on stack, insert into arena
     cached_slot_t cs_local;
@@ -430,11 +483,15 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
 
     if (!mem_art_init(&es->accounts) ||
         !mem_art_init(&es->storage) ||
+        !mem_art_init(&es->prev_accounts) ||
+        !mem_art_init(&es->prev_storage) ||
         !mem_art_init(&es->warm_addrs) ||
         !mem_art_init(&es->warm_slots) ||
         !mem_art_init(&es->transient)) {
         mem_art_destroy(&es->accounts);
         mem_art_destroy(&es->storage);
+        mem_art_destroy(&es->prev_accounts);
+        mem_art_destroy(&es->prev_storage);
         mem_art_destroy(&es->warm_addrs);
         mem_art_destroy(&es->warm_slots);
         mem_art_destroy(&es->transient);
@@ -576,15 +633,23 @@ static bool free_code_cb(const uint8_t *key, size_t key_len,
 
 void evm_state_evict_cache(evm_state_t *es) {
     if (!es) return;
-    /* Free heap-allocated code pointers before destroying arena */
-    mem_art_foreach(&es->accounts, free_code_cb, NULL);
-    /* Destroy and reinit account + storage trees */
-    mem_art_destroy(&es->accounts);
-    mem_art_destroy(&es->storage);
+
+    /* Free heap-allocated code pointers in previous generation */
+    mem_art_foreach(&es->prev_accounts, free_code_cb, NULL);
+    /* Destroy previous generation */
+    mem_art_destroy(&es->prev_accounts);
+    mem_art_destroy(&es->prev_storage);
+
+    /* Current becomes previous (read-only fallback for next window) */
+    es->prev_accounts = es->accounts;
+    es->prev_storage = es->storage;
+
+    /* Fresh current generation */
     mem_art_init(&es->accounts);
     mem_art_init(&es->storage);
+
 #ifdef ENABLE_MPT
-    /* Pointers into the old trees are now invalid */
+    /* Dirty lists were cleared by compute_mpt_root before eviction */
     dirty_account_clear(&es->dirty_accounts);
     dirty_slot_clear(&es->dirty_slots);
 #endif
@@ -645,12 +710,15 @@ void evm_state_destroy(evm_state_t *es) {
     dirty_slot_free(&es->dirty_slots);
 #endif
 
-    // Free code pointers owned by cached accounts
+    // Free code pointers owned by cached accounts (both generations)
     mem_art_foreach(&es->accounts, free_code_cb, NULL);
+    mem_art_foreach(&es->prev_accounts, free_code_cb, NULL);
 
-    // Destroy all trees
+    // Destroy all trees (both generations)
     mem_art_destroy(&es->accounts);
     mem_art_destroy(&es->storage);
+    mem_art_destroy(&es->prev_accounts);
+    mem_art_destroy(&es->prev_storage);
     mem_art_destroy(&es->warm_addrs);
     mem_art_destroy(&es->warm_slots);
     mem_art_destroy(&es->transient);
