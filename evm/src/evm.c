@@ -474,16 +474,67 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
     // Determine if this is a subcall (depth > 0)
     bool is_subcall = (msg->depth > 0);
     evm_context_t saved_context = {0};
-    
+
     if (is_subcall)
     {
+        // Fast path: CALL/STATICCALL/DELEGATECALL/CALLCODE to EOA (no code).
+        // Skip stack/memory allocation — just do value transfer and return.
+        if (msg->kind != EVM_CREATE && msg->kind != EVM_CREATE2 &&
+            !is_precompile(&msg->code_addr, evm->fork))
+        {
+            uint32_t code_len = 0;
+            const uint8_t *contract_code = evm_state_get_code_ptr(
+                evm->state, &msg->code_addr, &code_len);
+
+            // EIP-7702 delegation check
+            if (contract_code && code_len == 23 &&
+                contract_code[0] == 0xef && contract_code[1] == 0x01 &&
+                contract_code[2] == 0x00)
+            {
+                address_t delegate_addr;
+                memcpy(delegate_addr.bytes, &contract_code[3], 20);
+                contract_code = evm_state_get_code_ptr(
+                    evm->state, &delegate_addr, &code_len);
+            }
+
+            if (!contract_code || code_len == 0)
+            {
+                // No code — save context, do value transfer, return success
+                saved_context = evm_save_context(evm);
+                evm->msg = *msg;
+                evm->gas_left = msg->gas;
+
+                uint32_t snap = evm_state_snapshot(evm->state);
+                (void)snap;
+
+                // Touch + value transfer (same as below)
+                if (msg->kind == EVM_CALL || msg->kind == EVM_STATICCALL) {
+                    uint256_t zero = UINT256_ZERO;
+                    evm_state_add_balance(evm->state, &msg->recipient, &zero);
+                }
+                if ((msg->kind == EVM_CALL || msg->kind == EVM_CALLCODE) &&
+                    !uint256_is_zero(&msg->value)) {
+                    evm_state_sub_balance(evm->state, &msg->caller, &msg->value);
+                    evm_state_add_balance(evm->state, &msg->recipient, &msg->value);
+                }
+
+                uint64_t gas_remaining = evm->gas_left;
+                evm_restore_context(evm, &saved_context);
+                if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
+                evm->return_data_size = 0;
+
+                *result = evm_result_success(gas_remaining, NULL, 0);
+                return true;
+            }
+        }
+
         // Save parent's execution context
         saved_context = evm_save_context(evm);
-        
+
         // Create new stack and memory for this subcall
         evm->stack = evm_stack_create();
         evm->memory = evm_memory_create();
-        
+
         if (!evm->stack || !evm->memory)
         {
             fprintf(stderr, "FATAL: failed to create stack/memory for subcall depth=%d (OOM)\n",
@@ -494,7 +545,7 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
             *result = evm_result_error(EVM_INTERNAL_ERROR, 0);
             return false;
         }
-        
+
         // Clear return data for this subcall
         evm->return_data = NULL;
         evm->return_data_size = 0;
@@ -694,18 +745,14 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         }
         else
         {
-            // No code at address - simple value transfer
-
-            // Save subcall's remaining gas before restoring parent context
+            // No code at address — skip EVM setup entirely.
+            // Stack/memory were already allocated for subcalls, clean them up.
             uint64_t subcall_gas_remaining = evm->gas_left;
-
-            // Cleanup and restore context if subcall
             if (is_subcall)
             {
                 evm_stack_destroy(evm->stack);
                 evm_memory_destroy(evm->memory);
                 evm_restore_context(evm, &saved_context);
-                // Codeless call produces no output — clear stale return data
                 if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
                 evm->return_data_size = 0;
             }
