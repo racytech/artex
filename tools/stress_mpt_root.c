@@ -2,7 +2,7 @@
  * stress_mpt_root — Reproduce slow MPT root computation.
  *
  * Simulates the chain_replay checkpoint cycle:
- *   1. Create evm_state with MPT + flat_state
+ *   1. Create evm_state with MPT
  *   2. Populate N accounts (simulating accumulated cache)
  *   3. Compute MPT root (stages + commit_batch)
  *   4. Optionally evict cache and repeat
@@ -17,7 +17,6 @@
  *   --blocks <n>      Blocks per checkpoint interval (default: 256)
  *   --txs-per-block <n>  Txs per block (default: 8)
  *   --no-evict        Skip cache eviction between checkpoints
- *   --no-flat-state   Disable flat_state (isolate flat_state cost)
  *   --checkpoints <n> Number of checkpoints to run (default: 3)
  */
 
@@ -25,9 +24,6 @@
 #include "uint256.h"
 #include "hash.h"
 
-#ifdef ENABLE_MPT
-#include "flat_state.h"
-#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,7 +81,6 @@ int main(int argc, char **argv) {
     uint32_t blocks_per_ckpt = 256;
     uint32_t txs_per_block = 8;
     bool do_evict = true;
-    bool use_flat_state = true;
     bool dirty_all = false;
     int num_checkpoints = 3;
     const char *base_path = "/tmp/stress_mpt_root";
@@ -100,15 +95,13 @@ int main(int argc, char **argv) {
             txs_per_block = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--no-evict") == 0)
             do_evict = false;
-        else if (strcmp(argv[i], "--no-flat-state") == 0)
-            use_flat_state = false;
         else if (strcmp(argv[i], "--dirty-all") == 0)
             dirty_all = true;
         else if (strcmp(argv[i], "--checkpoints") == 0 && i + 1 < argc)
             num_checkpoints = atoi(argv[++i]);
         else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [--accounts N] [--blocks N] [--txs-per-block N] "
-                   "[--no-evict] [--no-flat-state] [--dirty-all] [--checkpoints N]\n", argv[0]);
+                   "[--no-evict] [--dirty-all] [--checkpoints N]\n", argv[0]);
             return 0;
         }
     }
@@ -118,7 +111,6 @@ int main(int argc, char **argv) {
     printf("  blocks/ckpt:    %u\n", blocks_per_ckpt);
     printf("  txs/block:      %u\n", txs_per_block);
     printf("  evict:          %s\n", do_evict ? "yes" : "no");
-    printf("  flat_state:     %s\n", use_flat_state ? "yes" : "no");
     printf("  dirty_all:      %s\n", dirty_all ? "yes" : "no");
     printf("  checkpoints:    %d\n", num_checkpoints);
     printf("\n");
@@ -135,18 +127,6 @@ int main(int argc, char **argv) {
     if (!es) {
         fprintf(stderr, "Failed to create evm_state\n");
         return 1;
-    }
-
-    /* Optionally attach flat_state */
-    flat_state_t *fs = NULL;
-    if (use_flat_state) {
-        fs = flat_state_create(base_path, 2000000, 20000000);
-        if (!fs) {
-            fprintf(stderr, "Failed to create flat_state\n");
-            evm_state_destroy(es);
-            return 1;
-        }
-        evm_state_set_flat_state(es, fs);
     }
 
     /* =====================================================================
@@ -315,7 +295,6 @@ int main(int argc, char **argv) {
 
     /* Cleanup */
     evm_state_destroy(es);
-    if (fs) flat_state_destroy(fs);
     cleanup_files(base_path);
 
     return 0;

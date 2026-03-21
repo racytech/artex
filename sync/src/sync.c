@@ -21,7 +21,6 @@
 #endif
 #ifdef ENABLE_MPT
 #include "code_store.h"
-#include "flat_state.h"
 #endif
 #ifdef ENABLE_HISTORY
 #include "state_history.h"
@@ -63,7 +62,6 @@ struct sync {
 #endif
 #ifdef ENABLE_MPT
     code_store_t  *cs;
-    flat_state_t  *flat_state;
 #endif
     evm_state_t *state;
     evm_t       *evm;
@@ -177,8 +175,6 @@ sync_t *sync_create(const sync_config_t *config) {
         s->config.mpt_path = strdup(config->mpt_path);
     if (config->code_store_path)
         s->config.code_store_path = strdup(config->code_store_path);
-    if (config->flat_state_path)
-        s->config.flat_state_path = strdup(config->flat_state_path);
     if (config->history_dir)
         s->config.history_dir = strdup(config->history_dir);
     if (config->verkle_builder_value_dir)
@@ -212,16 +208,6 @@ sync_t *sync_create(const sync_config_t *config) {
                     s->config.code_store_path);
     }
 
-    /* Open or create flat state (O(1) account/storage lookups) */
-    if (s->config.flat_state_path) {
-        s->flat_state = flat_state_open(s->config.flat_state_path);
-        if (!s->flat_state)
-            s->flat_state = flat_state_create(s->config.flat_state_path,
-                                               2000000, 20000000);
-        if (!s->flat_state)
-            fprintf(stderr, "WARNING: failed to open/create flat state at '%s'\n",
-                    s->config.flat_state_path);
-    }
 #endif
 
     /* Create evm_state */
@@ -250,11 +236,6 @@ sync_t *sync_create(const sync_config_t *config) {
     /* Batch mode: defer per-block verkle/MPT flush to checkpoint boundaries */
     evm_state_set_batch_mode(s->state, true);
 
-#ifdef ENABLE_MPT
-    /* Set flat state for O(1) lookups (bypasses MPT trie traversal) */
-    if (s->flat_state)
-        evm_state_set_flat_state(s->state, s->flat_state);
-#endif
 
     /* Create EVM */
     s->evm = evm_create(s->state, config->chain_config);
@@ -297,7 +278,6 @@ fail:
     free((char *)s->config.verkle_commit_dir);
     free((char *)s->config.mpt_path);
     free((char *)s->config.code_store_path);
-    free((char *)s->config.flat_state_path);
     free((char *)s->config.history_dir);
     free((char *)s->config.verkle_builder_value_dir);
     free((char *)s->config.verkle_builder_commit_dir);
@@ -315,7 +295,6 @@ void sync_destroy(sync_t *sync) {
 #endif
 #ifdef ENABLE_MPT
     if (sync->cs) code_store_destroy(sync->cs);
-    if (sync->flat_state) flat_state_destroy(sync->flat_state);
 #endif
 #ifdef ENABLE_HISTORY
     if (sync->history) state_history_destroy(sync->history);
@@ -328,7 +307,6 @@ void sync_destroy(sync_t *sync) {
     free((char *)sync->config.verkle_commit_dir);
     free((char *)sync->config.mpt_path);
     free((char *)sync->config.code_store_path);
-    free((char *)sync->config.flat_state_path);
     free((char *)sync->config.history_dir);
     free((char *)sync->config.verkle_builder_value_dir);
     free((char *)sync->config.verkle_builder_commit_dir);
@@ -651,7 +629,6 @@ static void sync_flush_and_evict(sync_t *sync) {
 
 #ifdef ENABLE_MPT
     if (sync->cs) code_store_flush(sync->cs);
-    if (sync->flat_state) flat_state_sync(sync->flat_state);
     evm_state_flush(sync->state);
 #endif
 

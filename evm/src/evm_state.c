@@ -4,7 +4,6 @@
 #ifdef ENABLE_MPT
 #include "mpt_store.h"
 #include "code_store.h"
-#include "flat_state.h"
 #endif
 #include <stdlib.h>
 #include <string.h>
@@ -214,7 +213,6 @@ struct evm_state {
     mpt_store_t      *account_mpt;  // persistent incremental account trie
     mpt_store_t      *storage_mpt;  // shared store for all per-account storage tries
     code_store_t     *code_store;   // content-addressed bytecode store (not owned)
-    flat_state_t     *flat_state;   // O(1) flat account/storage store (not owned, optional)
     dirty_account_vec_t dirty_accounts; // accounts with mpt_dirty=true
     dirty_slot_vec_t    dirty_slots;    // slots with mpt_dirty=true
     /* Root computation timing (last compute_mpt_root call) */
@@ -320,21 +318,7 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
     ca_local.addr_hash = hash_keccak256(addr->bytes, 20);
 
 #ifdef ENABLE_MPT
-    // Fast path: O(1) flat state lookup (single disk_hash read, mmap'd)
-    if (es->flat_state) {
-        flat_account_record_t frec;
-        if (flat_state_get_account(es->flat_state, addr->bytes, &frec)) {
-            ca_local.nonce = frec.nonce;
-            ca_local.balance = uint256_from_bytes(frec.balance, 32);
-            memcpy(ca_local.code_hash.bytes, frec.code_hash, 32);
-            memcpy(ca_local.storage_root.bytes, frec.storage_root, 32);
-            ca_local.has_code = !is_zero_hash(frec.code_hash) &&
-                                memcmp(frec.code_hash, HASH_EMPTY_CODE.bytes, 32) != 0;
-            ca_local.existed = true;
-            goto account_loaded;
-        }
-    }
-    // Slow path: MPT trie traversal (5-10 node reads)
+    // MPT trie traversal (5-10 node reads)
     if (es->account_mpt) {
         uint8_t rlp_buf[256];
         uint32_t rlp_len = mpt_store_get(es->account_mpt, ca_local.addr_hash.bytes,
@@ -343,7 +327,6 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
             mpt_rlp_decode_account(rlp_buf, rlp_len, &ca_local);
         }
     }
-account_loaded:
 #endif
 
 #if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
@@ -389,16 +372,7 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
     // Compute and cache keccak256(slot_be) — reused at MPT write time
     cs_local.slot_hash = hash_keccak256(skey + 20, 32);
 
-    // Fast path: O(1) flat state lookup (single disk_hash read, mmap'd)
-    if (es->flat_state) {
-        uint8_t val_be[32];
-        if (flat_state_get_storage(es->flat_state, skey, val_be)) {
-            cs_local.original = uint256_from_bytes(val_be, 32);
-            cs_local.current = cs_local.original;
-            goto slot_loaded;
-        }
-    }
-    // Slow path: MPT trie traversal (5-10 node reads)
+    // MPT trie traversal (5-10 node reads)
     if (es->storage_mpt) {
         cached_account_t *ca = ensure_account(es, addr);
         if (ca && memcmp(ca->storage_root.bytes, HASH_EMPTY_STORAGE.bytes, 32) != 0) {
@@ -412,7 +386,6 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
             }
         }
     }
-slot_loaded:
 #endif
 
 #if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
@@ -630,11 +603,6 @@ void evm_state_set_batch_mode(evm_state_t *es, bool enabled) {
     if (es) es->batch_mode = enabled;
 }
 
-#ifdef ENABLE_MPT
-void evm_state_set_flat_state(evm_state_t *es, void *fs) {
-    if (es) es->flat_state = (flat_state_t *)fs;
-}
-#endif
 
 void evm_state_flush_verkle(evm_state_t *es) {
 #ifdef ENABLE_VERKLE
@@ -2714,13 +2682,6 @@ static void compute_all_storage_roots(evm_state_t *es) {
             e->value_len = (uint8_t)mpt_rlp_be(vbe, 32, e->value_rlp);
         }
 
-        // Populate flat state with current value
-        if (es->flat_state) {
-            uint8_t val_be[32];
-            uint256_to_bytes(&cs->current, val_be);
-            flat_state_put_storage(es->flat_state, skey, val_be);
-        }
-
         cs->mpt_dirty = false;
         cs->block_dirty = false;
     }
@@ -2847,22 +2808,10 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
 
             if (!ca->existed || (is_empty && prune_empty)) {
                 mpt_store_delete(es->account_mpt, ca->addr_hash.bytes);
-                if (es->flat_state)
-                    flat_state_delete_account(es->flat_state, ca->addr.bytes);
             } else {
                 uint8_t rlp[120];
                 size_t rlp_len = mpt_rlp_account(ca->nonce, &ca->balance, sr, code_hash, rlp);
                 mpt_store_update(es->account_mpt, ca->addr_hash.bytes, rlp, rlp_len);
-            }
-
-            // Populate flat state with final account data (writes only)
-            if (es->flat_state && ca->existed && !(is_empty && prune_empty)) {
-                flat_account_record_t frec;
-                frec.nonce = ca->nonce;
-                uint256_to_bytes(&ca->balance, frec.balance);
-                memcpy(frec.code_hash, code_hash, 32);
-                memcpy(frec.storage_root, sr, 32);
-                flat_state_put_account(es->flat_state, ca->addr.bytes, &frec);
             }
 
             ca->mpt_dirty = false;

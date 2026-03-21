@@ -93,7 +93,6 @@ static char commit_dir[512];
 static char mpt_path[512];
 static char code_path[512];
 static char history_path[512];
-static char flat_state_path[512];
 
 static void set_data_paths(const char *data_dir) {
     snprintf(value_dir, sizeof(value_dir), "%s/chain_replay_values", data_dir);
@@ -101,7 +100,6 @@ static void set_data_paths(const char *data_dir) {
     snprintf(mpt_path, sizeof(mpt_path), "%s/chain_replay_mpt", data_dir);
     snprintf(code_path, sizeof(code_path), "%s/chain_replay_code", data_dir);
     snprintf(history_path, sizeof(history_path), "%s/chain_replay_history", data_dir);
-    snprintf(flat_state_path, sizeof(flat_state_path), "%s/chain_replay_flat", data_dir);
 }
 
 /* =========================================================================
@@ -629,9 +627,9 @@ int main(int argc, char **argv) {
         char cmd[512];
         snprintf(cmd, sizeof(cmd),
                  "rm -rf %s %s %s.idx %s.dat %s_storage.idx %s_storage.dat %s.idx %s.dat"
-                 " %s_flat_acct.idx %s_flat_stor.idx 2>/dev/null",
+                 " 2>/dev/null",
                  value_dir, commit_dir, mpt_path, mpt_path, mpt_path, mpt_path,
-                 code_path, code_path, flat_state_path, flat_state_path);
+                 code_path, code_path);
         (void)system(cmd);
 #ifdef ENABLE_HISTORY
         snprintf(cmd, sizeof(cmd), "rm -rf %s 2>/dev/null", history_path);
@@ -662,7 +660,6 @@ int main(int argc, char **argv) {
 #ifdef ENABLE_MPT
     cfg.mpt_path = mpt_path;
     cfg.code_store_path = code_path;
-    cfg.flat_state_path = NULL;  /* flat_state disabled — stale files cause corruption */
 #endif
 
     LOG_INFO("Loading state (bloom filter scan)...");

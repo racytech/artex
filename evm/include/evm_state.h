@@ -103,14 +103,6 @@ void evm_state_discard_pending(evm_state_t *es);
  */
 void evm_state_flush(evm_state_t *es);
 
-#ifdef ENABLE_MPT
-/**
- * Set the flat state store for O(1) account/storage lookups.
- * Not owned — caller manages lifecycle. Pass NULL to disable.
- */
-void evm_state_set_flat_state(evm_state_t *es, void *fs);
-#endif
-
 /**
  * Enable/disable batch mode. In batch mode, per-block verkle flush
  * is skipped — block_dirty flags accumulate across blocks.
