@@ -424,8 +424,11 @@ static void write_header_dat(mpt_store_t *ms) {
     }
 
     /* Write overflow to .free file */
-    if (ms->free_path)
-        write_free_overflow(ms->free_path, ms, hdr->free_counts);
+    if (ms->free_path) {
+        uint32_t counts[NUM_SIZE_CLASSES];
+        memcpy(counts, hdr->free_counts, sizeof(counts));
+        write_free_overflow(ms->free_path, ms, counts);
+    }
 }
 
 static bool read_header_dat(int fd, mpt_store_header_t *hdr) {
@@ -2473,7 +2476,7 @@ static bool verify_hash_ref(const mpt_store_t *ms, const node_ref_t *ref,
 
         if (memcmp(computed, ref->hash, 32) != 0) {
             (*mismatches)++;
-            fprintf(stderr, "VERIFY: HASH MISMATCH at depth %d!\n");
+            fprintf(stderr, "VERIFY: HASH MISMATCH at depth %d!\n", depth);
             fprintf(stderr, "  expected: 0x");
             for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", ref->hash[i]);
             fprintf(stderr, "\n  computed: 0x");

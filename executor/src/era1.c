@@ -189,8 +189,8 @@ bool era1_read_block(const era1_t *era, uint64_t block_number,
         return false;
 
     /* Advance past header entry */
-    uint32_t entry_len;
-    uint16_t entry_type;
+    uint32_t entry_len = 0;
+    uint16_t entry_type = 0;
     read_entry_header(era->data, era->file_size, offset, &entry_type, &entry_len);
     offset += ENTRY_HEADER_SIZE + entry_len;
 
