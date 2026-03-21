@@ -1263,6 +1263,15 @@ int main(int argc, char **argv) {
             clock_gettime(CLOCK_MONOTONIC, &t_window);
         }
 
+        /* Write .meta at every successful checkpoint */
+        if (result.ok && validate_every > 0 &&
+            bn % validate_every == 0) {
+            bool pe = (bn >= 2675000);
+            char mp[512];
+            snprintf(mp, sizeof(mp), "%s.meta", mpt_path);
+            meta_write(mp, bn, header.state_root.bytes, pe);
+        }
+
         /* SIGINT: exit after validated checkpoint */
         if (g_shutdown_pending && result.ok &&
             bn % CHECKPOINT_INTERVAL == 0) {
