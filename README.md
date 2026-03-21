@@ -1,122 +1,203 @@
-# ART - Ethereum Execution Engine
+# artex — Ethereum Execution Client
 
-A C implementation of the Ethereum execution layer with RocksDB-backed state management.
+A from-scratch Ethereum execution layer implementation in C. Designed for
+maximum throughput on modern hardware with minimal dependencies.
 
-## Project Structure
+## What is artex?
+
+artex is an Ethereum execution client that processes blocks, executes
+transactions via the EVM, and maintains the world state. It validates
+the entire Ethereum chain from genesis through pre-merge (era1 files)
+and post-merge (via Engine API from a Consensus Layer client).
+
+## Architecture
 
 ```
-art/
-├── common/          # Shared utilities (logging, uint256, etc.)
-├── database/        # RocksDB wrapper
-├── state/           # State management (StateDB, Journal, MPT)
-├── evm/             # EVM execution engine
-├── third_party/     # External dependencies (RocksDB)
-├── build/           # Build output
-└── docs/            # Documentation
+artex/
+├── evm/             # EVM interpreter (computed goto dispatch, all opcodes)
+├── executor/        # Block executor, era1 reader, state history
+├── database/        # disk_hash (mmap), mpt_store, code_store, mem_art (ART)
+├── sync/            # Sync engine (checkpoint, validation, resume)
+├── common/          # uint256, keccak256, RLP, hash, address, logger
+├── verkle/          # Verkle trie backend (Pedersen/IPA, banderwagon)
+├── engine/          # Engine API (JSON-RPC for CL integration)
+├── net/             # P2P networking (Portal Network, discv5)
+├── tui/             # Terminal UI for chain_replay progress
+├── integration_tests/ # State test + blockchain test runner
+├── tools/           # chain_replay, state_reconstruct, evm_t8n, etc.
+└── third_party/     # blst, secp256k1, cJSON
 ```
 
-## Dependencies
+## Key Components
 
-- CMake 3.15+
-- C11 compiler (GCC/Clang)
-- C++17 compiler (for RocksDB)
-- Snappy, Zstd, LZ4 (optional, for compression)
+**EVM** — Full Ethereum Virtual Machine with computed goto dispatch,
+all opcodes through Prague, precompiles (ecrecover, SHA-256, RIPEMD-160,
+modexp, BN256, BLAKE2, point evaluation, BLS12-381), and EIP-2929
+warm/cold access tracking.
 
-### Install system dependencies:
+**State** — Two-tier cache (in-memory ART with two-generation eviction)
+backed by persistent MPT store (mmap'd disk_hash + slot-allocated .dat).
+Incremental Merkle Patricia Trie with per-account storage roots.
 
-**Ubuntu/Debian:**
-```bash
-sudo apt-get install cmake build-essential libsnappy-dev libzstd-dev liblz4-dev
+**Sync** — Era1-based pre-merge chain replay with 256-block checkpoint
+validation. Supports `--resume` from checkpoint, per-block state root
+validation (`--validate-every`), and pre-state dumping for debugging.
+
+**History** — Per-block state diffs written to append-only files via
+background thread. Enables state reconstruction from any checkpoint
+without full re-execution.
+
+**Verkle** — Verkle trie backend with Banderwagon curve, Pedersen
+commitments, and IPA proofs. Incremental updates (O(1) per value change).
+Ready for Ethereum's Verkle transition.
+
+## State History: Execute Once, Reconstruct Anywhere
+
+artex records per-block state diffs during chain execution — every
+account and storage change is written to append-only history files via
+a background thread. This is a one-time cost: full chain replay from
+genesis (~2-3 months) produces a complete history of all state changes.
+
+Once the history exists, `state_reconstruct` can rebuild the full world
+state at any block — without EVM execution, without transaction decoding,
+without sender recovery. Just apply diffs sequentially. Hours instead of
+months.
+
+The same history diffs can reconstruct **any state backend**:
+- MPT (current Ethereum state commitment)
+- Verkle trie (future Ethereum state commitment)
+- Both simultaneously from the same diffs
+
 ```
-
-**Fedora/RHEL:**
-```bash
-sudo dnf install cmake gcc gcc-c++ snappy-devel libzstd-devel lz4-devel
-```
-
-**macOS:**
-```bash
-brew install cmake snappy zstd lz4
+chain_replay (one-time)          state_reconstruct (repeatable)
+┌─────────────────────┐          ┌─────────────────────────┐
+│ EVM execution       │          │ Read diff               │
+│ Gas validation      │ ──────►  │ set_nonce / set_balance  │
+│ Sender recovery     │  diffs   │ set_storage             │
+│ State root checks   │          │ compute_root            │
+│ ~2-3 months         │          │ ~hours                  │
+└─────────────────────┘          └─────────────────────────┘
 ```
 
 ## Building
 
 ```bash
-# Clone repository
-git clone <your-repo-url>
-cd art
-
-# RocksDB is already vendored in third_party/
-
-# Create build directory
 mkdir build && cd build
-
-# Configure
-cmake ..
-
-# Build (use -j for parallel build)
-cmake --build . -j$(nproc)
-
-# Run tests (optional)
-ctest
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
 ```
 
-## Build Options
+Configuration is in `config.cmake`:
+
+```cmake
+set(ENABLE_MPT    ON)    # Merkle Patricia Trie backend
+set(ENABLE_VERKLE OFF)   # Verkle trie backend
+set(ENABLE_HISTORY ON)   # Per-block state diff history
+```
+
+### Dependencies
+
+- CMake 3.15+
+- C11 compiler (GCC/Clang)
+- libsnappy, libcjson, libssl
 
 ```bash
-# Debug build
-cmake -DCMAKE_BUILD_TYPE=Debug ..
-
-# Release build (default)
-cmake -DCMAKE_BUILD_TYPE=Release ..
-
-# Disable tests
-cmake -DBUILD_TESTS=OFF ..
+# Ubuntu/Debian
+sudo apt-get install cmake build-essential libsnappy-dev libcjson-dev libssl-dev
 ```
 
-## Quick Start
+## Tools
 
-```c
-#include "database.h"
+### chain_replay — Full chain execution from era1 files
 
-// Open database
-database_options_t opts = database_default_options();
-opts.path = "/tmp/testdb";
+```bash
+# Fresh run from genesis
+./build/chain_replay data/era1 data/mainnet_genesis.json
 
-db_error_t err;
-database_t* db = database_open(&opts, &err);
+# Resume from checkpoint
+./build/chain_replay --resume data/era1 data/mainnet_genesis.json
 
-// Write data
-uint8_t key[20] = {0x12, 0x34, ...};
-uint8_t value[32] = {...};
-database_put(db, COLUMN_ACCOUNTS, key, 20, value, 32);
+# Per-block root validation (debugging)
+./build/chain_replay --resume --validate-every 1 data/era1 data/mainnet_genesis.json
 
-// Read data
-uint8_t* data;
-size_t len;
-database_get(db, COLUMN_ACCOUNTS, key, 20, &data, &len);
-free(data);
-
-// Close
-database_close(db);
+# Custom data directory
+./build/chain_replay --data-dir /path/to/state data/era1 data/mainnet_genesis.json
 ```
 
-## Components
+### state_reconstruct — Rebuild state from history diffs
 
-### Database Layer
-- RocksDB wrapper with column families
-- Atomic batch operations
-- Snapshot support
+```bash
+./build/state_reconstruct <history_dir> <genesis.json> <era1_dir> [target_block]
+```
 
-### State Layer
-- Account and storage management
-- Merkle Patricia Trie
-- Journal for dirty state tracking
+Reads per-block diffs from state history files, applies them to a fresh
+MPT, and validates against era1 block headers. No EVM execution needed.
 
-### EVM Layer
-- Opcode execution
-- Gas metering
-- Contract calls
+### evm_t8n — Transition tool for testing
+
+```bash
+./build/evm_t8n --input.alloc alloc.json --input.txs txs.json \
+    --input.env env.json --state.fork Cancun --output.result result.json
+```
+
+Compatible with geth's `evm t8n` format for differential testing.
+
+### rebuild_idx — Rebuild disk_hash index from data file
+
+```bash
+# Tight fit (verification/backup)
+./build/rebuild_idx /path/to/mpt_store
+
+# With capacity for continued use
+./build/rebuild_idx /path/to/mpt_store --capacity 500000000
+```
+
+### verify_mpt — Verify MPT integrity
+
+```bash
+./build/verify_mpt /path/to/mpt_store
+```
+
+Walks all trie nodes from root and recomputes keccak256 hashes.
+
+## Testing
+
+```bash
+# Internal test suites (91K+ tests)
+./build/test_runner_batch integration_tests/fixtures/state_tests
+./build/test_runner_batch integration_tests/fixtures/blockchain_tests
+
+# Ethereum reference tests
+./build/test_runner_batch ~/ethereum-tests/GeneralStateTests
+./build/test_runner_batch ~/ethereum-tests/BlockchainTests
+```
+
+## State Files
+
+Default data directory: `~/.artex/`
+
+| File | Purpose |
+|------|---------|
+| `chain_replay_mpt.dat` | Account trie node data |
+| `chain_replay_mpt.idx` | Account trie hash index |
+| `chain_replay_mpt_storage.dat` | Storage trie node data |
+| `chain_replay_mpt_storage.idx` | Storage trie hash index |
+| `chain_replay_mpt.meta` | Checkpoint marker (block + root) |
+| `chain_replay_mpt.free` | Free slot lists |
+| `chain_replay_code.dat` | Contract bytecode store |
+| `chain_replay_code.idx` | Code hash index |
+| `chain_replay_history/` | Per-block state diffs |
+
+## Design Principles
+
+- **Single-threaded execution** — EVM is inherently serial. No locks in
+  the hot path. Background thread only for history I/O.
+- **mmap everything** — OS page cache manages all disk I/O. No explicit
+  buffer pool, no fsync in the hot path.
+- **Arena allocation** — ART state cache uses bump allocator. O(1) destroy
+  on checkpoint eviction. No per-entry malloc.
+- **Minimal dependencies** — C with no runtime overhead. No garbage
+  collector, no JIT, no virtual dispatch.
 
 ## License
 
