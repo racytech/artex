@@ -18,9 +18,11 @@
  *   - MAP_SHARED + hash-based bucket lookup = random page access across
  *     a large mapping, causing TLB misses and kernel dirty page writeback
  *     pressure (dirty_ratio throttling).
- *   - Single-threaded design — no locking overhead
- *     structures. Use mem_art for hot-path state cache; disk_hash is
- *     best suited as a cold-path fallback after cache eviction.
+ *   - Single-threaded design — no locking overhead. If multi-threaded
+ *     access is needed in the future, add pthread_rwlock behind a
+ *     build-time flag (#ifdef DISK_HASH_THREADSAFE).
+ *   - Use mem_art for hot-path state cache; disk_hash is best suited
+ *     as a cold-path fallback after cache eviction.
  */
 
 #include "../include/disk_hash.h"
