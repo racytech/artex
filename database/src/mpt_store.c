@@ -1413,16 +1413,8 @@ void mpt_store_reset(mpt_store_t *ms) {
 
 void mpt_store_sync(mpt_store_t *ms) {
     if (!ms) return;
-    struct timespec _s0, _s1;
-    clock_gettime(CLOCK_MONOTONIC, &_s0);
     write_header_dat(ms);
-    msync(ms->data_base, ms->data_mapped, MS_SYNC);
-    disk_hash_sync(ms->index);
-    clock_gettime(CLOCK_MONOTONIC, &_s1);
-    double _s_ms = (_s1.tv_sec - _s0.tv_sec) * 1000.0 +
-                   (_s1.tv_nsec - _s0.tv_nsec) / 1e6;
-    if (_s_ms > 10.0)
-        fprintf(stderr, "  └ mpt_sync: %.1f ms\n", _s_ms);
+    /* No msync — OS page cache handles writeback */
 }
 
 void mpt_store_flush(mpt_store_t *ms) {

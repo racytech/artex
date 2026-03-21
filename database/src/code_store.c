@@ -612,8 +612,7 @@ uint32_t code_store_get_size(const code_store_t *cs, const uint8_t code_hash[32]
 void code_store_sync(code_store_t *cs) {
     if (!cs) return;
     write_data_header(cs);
-    msync(cs->data_base, cs->data_mapped, MS_SYNC);
-    disk_hash_sync(cs->index);
+    /* No msync — OS page cache handles writeback */
 }
 
 void code_store_flush(code_store_t *cs) {

@@ -737,7 +737,7 @@ void disk_hash_sync(disk_hash_t *dh) {
     if (!dh) return;
     dh->dirty = false;
     write_header(dh);
-    msync(dh->base, dh->mapped_size, MS_SYNC);
+    /* No msync — OS page cache handles writeback */
 }
 
 
