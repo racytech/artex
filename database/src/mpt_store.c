@@ -2781,9 +2781,6 @@ void mpt_store_set_cache(mpt_store_t *ms, uint32_t max_entries) {
     (void)ms; (void)max_entries;
 }
 
-void mpt_store_set_cache_mb(mpt_store_t *ms, uint32_t megabytes) {
-    (void)ms; (void)megabytes;
-}
 
 mpt_store_stats_t mpt_store_stats(const mpt_store_t *ms) {
     mpt_store_stats_t st = {0};

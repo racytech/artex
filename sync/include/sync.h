@@ -170,9 +170,6 @@ bool sync_execute_block_live(sync_t *sync,
 /** Switch between batch and live modes. */
 void sync_set_live_mode(sync_t *sync, bool live);
 
-/** Get the EVM instance owned by the sync engine. */
-struct evm *sync_get_evm(const sync_t *sync);
-
 /** Get the EVM state instance owned by the sync engine. */
 struct evm_state *sync_get_state(const sync_t *sync);
 

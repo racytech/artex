@@ -11,7 +11,6 @@
  *      (engine_newPayload needs VALID/INVALID response).
  */
 
-#include <signal.h>
 #include "sync.h"
 #include "evm.h"
 #include "evm_state.h"
@@ -39,7 +38,6 @@
 #include <sys/stat.h>
 #include <stddef.h>
 #include <time.h>
-#include <pthread.h>
 
 // ============================================================================
 // Constants
@@ -92,13 +90,6 @@ struct sync {
 // ============================================================================
 // Helpers
 // ============================================================================
-
-#ifdef ENABLE_VERKLE
-static bool dir_exists(const char *path) {
-    struct stat st;
-    return path && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-}
-#endif
 
 // ============================================================================
 // Genesis loading (internal)
@@ -590,9 +581,6 @@ void sync_set_live_mode(sync_t *sync, bool live) {
     evm_state_set_batch_mode(sync->state, !live);
 }
 
-struct evm *sync_get_evm(const sync_t *sync) {
-    return sync ? sync->evm : NULL;
-}
 
 // ============================================================================
 // Flush + Evict (periodic, after root validation)

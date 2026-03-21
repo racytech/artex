@@ -194,9 +194,6 @@ bool mpt_store_walk_leaves(const mpt_store_t *ms, mpt_leaf_cb_t cb,
 /** No-op. LRU cache has been removed; mmap'd .dat replaces it. */
 void mpt_store_set_cache(mpt_store_t *ms, uint32_t max_entries);
 
-/** No-op. LRU cache has been removed; mmap'd .dat replaces it. */
-void mpt_store_set_cache_mb(mpt_store_t *ms, uint32_t megabytes);
-
 /**
  * Verify trie hash integrity by walking all nodes and recomputing hashes.
  * Returns true if the recomputed root matches the stored root.
