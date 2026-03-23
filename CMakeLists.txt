@@ -250,7 +250,7 @@ target_include_directories(block_executor PUBLIC
 )
 set(BLOCK_EXECUTOR_LIBS evm mem_mpt common secp256k1 pthread)
 if(ENABLE_VERKLE_BUILD)
-    list(APPEND BLOCK_EXECUTOR_LIBS verkle_flat verkle_key pedersen)
+    list(APPEND BLOCK_EXECUTOR_LIBS verkle_state verkle_flat verkle_key pedersen)
 endif()
 target_link_libraries(block_executor ${BLOCK_EXECUTOR_LIBS})
 

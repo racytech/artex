@@ -247,10 +247,12 @@ sync_t *sync_create(const sync_config_t *config) {
     if (s->config.verkle_builder_value_dir && s->config.verkle_builder_commit_dir) {
         /* Try open first (resume), fall back to create */
         s->verkle_builder = verkle_builder_open(s->config.verkle_builder_value_dir,
-                                                 s->config.verkle_builder_commit_dir);
+                                                 s->config.verkle_builder_commit_dir,
+                                                 s->cs);
         if (!s->verkle_builder)
             s->verkle_builder = verkle_builder_create(s->config.verkle_builder_value_dir,
-                                                       s->config.verkle_builder_commit_dir);
+                                                       s->config.verkle_builder_commit_dir,
+                                                       s->cs);
         if (!s->verkle_builder)
             fprintf(stderr, "Warning: failed to create verkle builder\n");
     }
