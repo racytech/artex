@@ -76,6 +76,9 @@ target_link_libraries(bloom_filter m)
 add_library(disk_hash STATIC database/src/disk_hash_mmap.c)
 target_link_libraries(disk_hash pthread)
 
+# Disk Table (mmap-backed hash table optimized for pre-hashed keys)
+add_library(disk_table STATIC database/src/disk_table.c)
+
 # Code Store (content-addressed, append-only, deduplicated)
 add_library(code_store STATIC
     database/src/code_store.c
@@ -134,13 +137,13 @@ if(ENABLE_VERKLE_BUILD)
     add_library(verkle_commit_store STATIC
         verkle/src/verkle_commit_store.c
     )
-    target_link_libraries(verkle_commit_store banderwagon disk_hash)
+    target_link_libraries(verkle_commit_store banderwagon disk_table)
 
     # Verkle flat updater (disk-backed commitment updates, O(block) RAM)
     add_library(verkle_flat STATIC
         verkle/src/verkle_flat.c
     )
-    target_link_libraries(verkle_flat verkle_commit_store disk_hash pedersen banderwagon)
+    target_link_libraries(verkle_flat verkle_commit_store disk_table pedersen banderwagon)
 
     # Verkle state (typed account/storage interface over flat updater)
     add_library(verkle_state STATIC
@@ -677,6 +680,14 @@ if(ENABLE_HISTORY)
     if(ENABLE_VERKLE_BUILD)
         add_executable(verkle_build tools/verkle_build.c)
         target_link_libraries(verkle_build block_executor evm verkle_flat verkle_key pedersen common)
+
+        add_executable(verkle_reconstruct tools/verkle_reconstruct.c)
+        target_include_directories(verkle_reconstruct PRIVATE ${CJSON_INCLUDE_DIRS})
+        target_link_libraries(verkle_reconstruct
+            verkle_state verkle_flat verkle_key pedersen
+            code_store disk_hash
+            block_executor evm common
+            ${CJSON_LIBRARIES})
     endif()
 endif()
 

@@ -2,7 +2,7 @@
 #define VERKLE_FLAT_H
 
 #include "verkle_commit_store.h"
-#include "disk_hash.h"
+#include "disk_table.h"
 #include "banderwagon.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -65,9 +65,9 @@ typedef struct {
 /** Main handle. */
 typedef struct {
     /* Stores (owned) */
-    disk_hash_t             *value_store;
+    disk_table_t            *value_store;
     verkle_commit_store_t   *commit_store;
-    disk_hash_t             *slot_store;    /* (depth,path,slot) → occupant stem */
+    disk_table_t            *slot_store;    /* (depth,path,slot) → occupant stem */
 
     /* Current block changes */
     vf_change_t  *changes;

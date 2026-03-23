@@ -1,7 +1,7 @@
 #ifndef VERKLE_COMMIT_STORE_H
 #define VERKLE_COMMIT_STORE_H
 
-#include "disk_hash.h"
+#include "disk_table.h"
 #include "banderwagon.h"
 #include <stdint.h>
 #include <stdbool.h>
@@ -27,8 +27,8 @@ extern "C" {
  */
 
 typedef struct {
-    disk_hash_t *leaf_store;      /* key=32, record=96 (C1+C2+commitment) */
-    disk_hash_t *internal_store;  /* key=32, record=32 (commitment) */
+    disk_table_t *leaf_store;      /* key=32, record=96 (C1+C2+commitment) */
+    disk_table_t *internal_store;  /* key=32, record=32 (commitment) */
 } verkle_commit_store_t;
 
 /* =========================================================================

@@ -64,7 +64,7 @@ verkle_commit_store_t *vcs_create(const char *dir) {
     make_leaf_path(leaf_path, sizeof(leaf_path), dir);
     make_internal_path(internal_path, sizeof(internal_path), dir);
 
-    cs->leaf_store = disk_hash_create(leaf_path, VCS_KEY_SIZE,
+    cs->leaf_store = disk_table_create(leaf_path, VCS_KEY_SIZE,
                                        VCS_LEAF_RECORD_SIZE,
                                        VCS_LEAF_CAPACITY);
     if (!cs->leaf_store) {
@@ -72,11 +72,11 @@ verkle_commit_store_t *vcs_create(const char *dir) {
         return NULL;
     }
 
-    cs->internal_store = disk_hash_create(internal_path, VCS_KEY_SIZE,
+    cs->internal_store = disk_table_create(internal_path, VCS_KEY_SIZE,
                                            VCS_INTERNAL_RECORD_SIZE,
                                            VCS_INTERNAL_CAPACITY);
     if (!cs->internal_store) {
-        disk_hash_destroy(cs->leaf_store);
+        disk_table_destroy(cs->leaf_store);
         free(cs);
         return NULL;
     }
@@ -92,15 +92,15 @@ verkle_commit_store_t *vcs_open(const char *dir) {
     make_leaf_path(leaf_path, sizeof(leaf_path), dir);
     make_internal_path(internal_path, sizeof(internal_path), dir);
 
-    cs->leaf_store = disk_hash_open(leaf_path);
+    cs->leaf_store = disk_table_open(leaf_path);
     if (!cs->leaf_store) {
         free(cs);
         return NULL;
     }
 
-    cs->internal_store = disk_hash_open(internal_path);
+    cs->internal_store = disk_table_open(internal_path);
     if (!cs->internal_store) {
-        disk_hash_destroy(cs->leaf_store);
+        disk_table_destroy(cs->leaf_store);
         free(cs);
         return NULL;
     }
@@ -110,8 +110,8 @@ verkle_commit_store_t *vcs_open(const char *dir) {
 
 void vcs_destroy(verkle_commit_store_t *cs) {
     if (!cs) return;
-    if (cs->leaf_store) disk_hash_destroy(cs->leaf_store);
-    if (cs->internal_store) disk_hash_destroy(cs->internal_store);
+    if (cs->leaf_store) disk_table_destroy(cs->leaf_store);
+    if (cs->internal_store) disk_table_destroy(cs->internal_store);
     free(cs);
 }
 
@@ -133,7 +133,7 @@ bool vcs_put_leaf(verkle_commit_store_t *cs,
     banderwagon_serialize(buf + 32, c2);
     banderwagon_serialize(buf + 64, commitment);
 
-    return disk_hash_put(cs->leaf_store, key, buf);
+    return disk_table_put(cs->leaf_store, key, buf);
 }
 
 bool vcs_get_leaf(const verkle_commit_store_t *cs,
@@ -146,7 +146,7 @@ bool vcs_get_leaf(const verkle_commit_store_t *cs,
     make_leaf_key(key, stem);
 
     uint8_t buf[VCS_LEAF_RECORD_SIZE];
-    if (!disk_hash_get(cs->leaf_store, key, buf))
+    if (!disk_table_get(cs->leaf_store, key, buf))
         return false;
 
     if (!banderwagon_deserialize(c1, buf))
@@ -174,7 +174,7 @@ bool vcs_put_internal(verkle_commit_store_t *cs,
     uint8_t buf[VCS_INTERNAL_RECORD_SIZE];
     banderwagon_serialize(buf, commitment);
 
-    return disk_hash_put(cs->internal_store, key, buf);
+    return disk_table_put(cs->internal_store, key, buf);
 }
 
 bool vcs_get_internal(const verkle_commit_store_t *cs,
@@ -186,7 +186,7 @@ bool vcs_get_internal(const verkle_commit_store_t *cs,
     make_internal_key(key, depth, path_prefix);
 
     uint8_t buf[VCS_INTERNAL_RECORD_SIZE];
-    if (!disk_hash_get(cs->internal_store, key, buf))
+    if (!disk_table_get(cs->internal_store, key, buf))
         return false;
 
     return banderwagon_deserialize(commitment, buf);
@@ -198,6 +198,6 @@ bool vcs_get_internal(const verkle_commit_store_t *cs,
 
 void vcs_sync(verkle_commit_store_t *cs) {
     if (!cs) return;
-    if (cs->leaf_store) disk_hash_sync(cs->leaf_store);
-    if (cs->internal_store) disk_hash_sync(cs->internal_store);
+    if (cs->leaf_store) disk_table_sync(cs->leaf_store);
+    if (cs->internal_store) disk_table_sync(cs->internal_store);
 }
