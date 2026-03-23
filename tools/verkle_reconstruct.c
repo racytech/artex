@@ -24,6 +24,7 @@
 #include "hash.h"
 #include "address.h"
 #include "uint256.h"
+#include "bytes.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -212,7 +213,8 @@ static bool meta_read(const char *dir, verkle_meta_t *out) {
  * Genesis loading — apply initial allocations to verkle state
  * ========================================================================= */
 
-static bool load_genesis(verkle_state_t *vs, const char *path) {
+static bool load_genesis(verkle_state_t *vs, slot_tracker_t *tracker,
+                         const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) { perror("load_genesis"); return false; }
 
@@ -264,9 +266,18 @@ static bool load_genesis(verkle_state_t *vs, const char *path) {
 
         /* Code */
         cJSON *code_item = cJSON_GetObjectItem(entry, "code");
-        if (code_item && cJSON_IsString(code_item)) {
-            /* TODO: parse hex code, call verkle_state_set_code()
-             * and verkle_state_set_code_hash() */
+        if (code_item && cJSON_IsString(code_item) &&
+            strlen(code_item->valuestring) > 2) {
+            bytes_t code_bytes;
+            if (bytes_from_hex(code_item->valuestring, &code_bytes) &&
+                code_bytes.len > 0) {
+                verkle_state_set_code(vs, addr.bytes,
+                                      code_bytes.data, code_bytes.len);
+                hash_t code_hash = hash_keccak256(code_bytes.data,
+                                                   code_bytes.len);
+                verkle_state_set_code_hash(vs, addr.bytes, code_hash.bytes);
+                bytes_free(&code_bytes);
+            }
         }
 
         /* Storage */
@@ -282,6 +293,7 @@ static bool load_genesis(verkle_state_t *vs, const char *path) {
                 uint256_to_bytes_le(&slot, slot_bytes);
                 uint256_to_bytes_le(&value, val_bytes);
                 verkle_state_set_storage(vs, addr.bytes, slot_bytes, val_bytes);
+                slot_tracker_add(tracker, addr.bytes, slot_bytes);
             }
         }
 
@@ -519,13 +531,48 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* ── Init slot tracker (for SELFDESTRUCT support) ─────────────────── */
+    slot_tracker_t tracker;
+    if (!slot_tracker_init(&tracker)) {
+        fprintf(stderr, "Failed to init slot tracker\n");
+        verkle_state_destroy(vs);
+        if (cs) code_store_destroy(cs);
+        state_history_destroy(sh);
+        return 1;
+    }
+
+    /* ── Resume: rebuild slot tracker from prior diffs ────────────────── */
+    if (resume_mode) {
+        printf("\nRebuilding slot tracker from blocks %lu .. %lu...\n",
+               hist_first, start_block - 1);
+        double t_rebuild = now_sec();
+        for (uint64_t bn = hist_first; bn < start_block; bn++) {
+            block_diff_t diff;
+            if (!state_history_get_diff(sh, bn, &diff)) continue;
+
+            for (uint16_t g = 0; g < diff.group_count; g++) {
+                const addr_diff_t *grp = &diff.groups[g];
+                if (grp->flags & ACCT_DIFF_DESTRUCTED)
+                    slot_tracker_clear(&tracker, grp->addr.bytes);
+                for (uint16_t s = 0; s < grp->slot_count; s++) {
+                    uint8_t slot_bytes[32];
+                    uint256_to_bytes_le(&grp->slots[s].slot, slot_bytes);
+                    slot_tracker_add(&tracker, grp->addr.bytes, slot_bytes);
+                }
+            }
+            block_diff_free(&diff);
+        }
+        printf("  Slot tracker rebuilt in %.1fs\n", now_sec() - t_rebuild);
+    }
+
     /* ── Load genesis (only on fresh start) ────────────────────────────── */
     if (!resume_mode) {
         printf("\nLoading genesis...\n");
         verkle_state_begin_block(vs, 0);
 
-        if (!load_genesis(vs, genesis_path)) {
+        if (!load_genesis(vs, &tracker, genesis_path)) {
             fprintf(stderr, "Failed to load genesis\n");
+            slot_tracker_destroy(&tracker);
             verkle_state_destroy(vs);
             if (cs) code_store_destroy(cs);
             state_history_destroy(sh);
@@ -538,16 +585,6 @@ int main(int argc, char *argv[]) {
         verkle_state_root_hash(vs, genesis_root);
         printf("Genesis Verkle root: 0x"); print_hash(genesis_root);
         printf("\n");
-    }
-
-    /* ── Init slot tracker (for SELFDESTRUCT support) ─────────────────── */
-    slot_tracker_t tracker;
-    if (!slot_tracker_init(&tracker)) {
-        fprintf(stderr, "Failed to init slot tracker\n");
-        verkle_state_destroy(vs);
-        if (cs) code_store_destroy(cs);
-        state_history_destroy(sh);
-        return 1;
     }
 
     /* ── Replay diffs ──────────────────────────────────────────────────── */
