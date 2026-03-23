@@ -30,8 +30,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <cjson/cJSON.h>
+
+/* =========================================================================
+ * Graceful shutdown
+ * ========================================================================= */
+
+static volatile sig_atomic_t g_stop = 0;
+
+static void sigint_handler(int sig) {
+    (void)sig;
+    g_stop = 1;
+}
 
 /* =========================================================================
  * Slot Tracker — per-account storage slot index for SELFDESTRUCT
@@ -588,13 +600,16 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── Replay diffs ──────────────────────────────────────────────────── */
+    signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
+
     printf("\nReplaying blocks %lu .. %lu (%lu blocks)...\n",
            start_block, target_block, target_block - start_block + 1);
 
     double t0 = now_sec();
     uint64_t applied = 0;
 
-    for (uint64_t bn = start_block; bn <= target_block; bn++) {
+    for (uint64_t bn = start_block; bn <= target_block && !g_stop; bn++) {
         block_diff_t diff;
         if (!state_history_get_diff(sh, bn, &diff)) {
             fprintf(stderr, "\nFailed to read diff for block %lu\n", bn);
@@ -631,8 +646,24 @@ int main(int argc, char *argv[]) {
     }
 
     double elapsed = now_sec() - t0;
-    printf("\n\nReplay complete: %lu blocks in %.1f seconds (%.0f blk/s)\n",
-           applied, elapsed, applied > 0 ? applied / elapsed : 0);
+    uint64_t last_applied = start_block + applied - 1;
+
+    if (g_stop) {
+        printf("\n\nStopped by signal at block %lu (%lu blocks in %.1fs)\n",
+               last_applied, applied, elapsed);
+    } else {
+        printf("\n\nReplay complete: %lu blocks in %.1f seconds (%.0f blk/s)\n",
+               applied, elapsed, applied > 0 ? applied / elapsed : 0);
+    }
+
+    if (applied == 0) {
+        printf("No blocks applied — nothing to save.\n");
+        slot_tracker_destroy(&tracker);
+        verkle_state_destroy(vs);
+        if (cs) code_store_destroy(cs);
+        state_history_destroy(sh);
+        return g_stop ? 0 : 1;
+    }
 
     /* ── Compute Verkle root ───────────────────────────────────────────── */
     printf("\nComputing Verkle root...\n");
@@ -658,8 +689,8 @@ int main(int argc, char *argv[]) {
     printf("\nFlushing Verkle state to disk...\n");
     verkle_state_sync(vs);
 
-    if (meta_write(val_dir, target_block, actual_root)) {
-        printf("State saved (block %lu)\n", target_block);
+    if (meta_write(val_dir, last_applied, actual_root)) {
+        printf("State saved (block %lu)\n", last_applied);
     } else {
         fprintf(stderr, "Warning: state flushed but meta write failed\n");
     }
