@@ -416,6 +416,45 @@ bool verkle_state_exists(verkle_state_t *vs, const uint8_t addr[20])
 }
 
 /* =========================================================================
+ * Account Clearing (SELFDESTRUCT support)
+ * ========================================================================= */
+
+void verkle_state_clear_account(verkle_state_t *vs,
+                                const uint8_t addr[20],
+                                const uint8_t *storage_slots,
+                                uint32_t slot_count)
+{
+    static const uint8_t zero32[32] = {0};
+
+    /* 1. Read code_size before zeroing basic data (it's packed inside) */
+    uint64_t code_size = verkle_state_get_code_size(vs, addr);
+
+    /* 2. Zero basic data (version, code_size, nonce, balance) */
+    set_basic_data(vs, addr, zero32);
+
+    /* 3. Zero code hash */
+    verkle_state_set_code_hash(vs, addr, zero32);
+
+    /* 4. Zero code chunks */
+    if (code_size > 0) {
+        uint32_t num_chunks = (uint32_t)((code_size + 30) / 31);
+        for (uint32_t i = 0; i < num_chunks; i++) {
+            uint8_t key[32];
+            verkle_code_chunk_key(key, addr, i);
+            vs_set(vs, key, zero32);
+        }
+    }
+
+    /* 4. Zero all storage slots (caller provides the list) */
+    for (uint32_t i = 0; i < slot_count; i++) {
+        const uint8_t *slot = storage_slots + (uint64_t)i * 32;
+        uint8_t key[32];
+        verkle_storage_key(key, addr, slot);
+        vs_set(vs, key, zero32);
+    }
+}
+
+/* =========================================================================
  * Root
  * ========================================================================= */
 

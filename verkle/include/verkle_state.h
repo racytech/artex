@@ -151,6 +151,26 @@ void verkle_state_set_storage(verkle_state_t *vs,
 bool verkle_state_exists(verkle_state_t *vs, const uint8_t addr[20]);
 
 /* =========================================================================
+ * Account Clearing (SELFDESTRUCT support)
+ * ========================================================================= */
+
+/**
+ * Clear all state for an account: basic data, code hash, code chunks,
+ * and storage slots. Zeroes every tree key associated with this address.
+ *
+ * storage_slots:  array of 32-byte LE slot keys (uint256) belonging to
+ *                 this account. Caller is responsible for tracking these.
+ * slot_count:     number of entries in storage_slots.
+ *
+ * The caller must track which slots each account has written (e.g.,
+ * during sequential diff replay) and pass them here on destruction.
+ */
+void verkle_state_clear_account(verkle_state_t *vs,
+                                const uint8_t addr[20],
+                                const uint8_t *storage_slots,
+                                uint32_t slot_count);
+
+/* =========================================================================
  * Root
  * ========================================================================= */
 
