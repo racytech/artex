@@ -526,6 +526,13 @@ if(ENABLE_VERKLE_BUILD)
         verkle/tests/bench_verkle_flat.c
     )
     target_link_libraries(bench_verkle_flat verkle_state)
+
+    # Test: Verkle reconstruct (diff application + SELFDESTRUCT clearing)
+    add_executable(test_verkle_reconstruct
+        verkle/tests/test_verkle_reconstruct.c
+    )
+    target_link_libraries(test_verkle_reconstruct verkle_state art_database common)
+    add_test(NAME test_verkle_reconstruct COMMAND test_verkle_reconstruct)
 endif()
 
 #==============================================================================
