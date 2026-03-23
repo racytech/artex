@@ -695,6 +695,9 @@ if(ENABLE_HISTORY)
             code_store disk_hash
             block_executor evm common
             ${CJSON_LIBRARIES})
+
+        add_executable(verify_verkle tools/verify_verkle.c)
+        target_link_libraries(verify_verkle verkle_state verkle_flat verkle_key pedersen common)
     endif()
 endif()
 
