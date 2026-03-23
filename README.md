@@ -16,7 +16,7 @@ and post-merge (via Engine API from a Consensus Layer client).
 artex/
 ├── evm/             # EVM interpreter (computed goto dispatch, all opcodes)
 ├── executor/        # Block executor, era1 reader, state history
-├── database/        # disk_hash (mmap), mpt_store, code_store, mem_art (ART)
+├── database/        # disk_hash, disk_table (mmap), mpt_store, code_store, mem_art (ART)
 ├── sync/            # Sync engine (checkpoint, validation, resume)
 ├── common/          # uint256, keccak256, RLP, hash, address, logger
 ├── verkle/          # Verkle trie backend (Pedersen/IPA, banderwagon)
@@ -24,7 +24,7 @@ artex/
 ├── net/             # P2P networking (Portal Network, discv5)
 ├── tui/             # Terminal UI for chain_replay progress
 ├── integration_tests/ # State test + blockchain test runner
-├── tools/           # chain_replay, state_reconstruct, evm_t8n, etc.
+├── tools/           # chain_replay, state_reconstruct, verkle_reconstruct, evm_t8n
 └── third_party/     # blst, secp256k1, cJSON
 ```
 
@@ -52,7 +52,10 @@ any state backend (MPT, Verkle) from the same diffs.
 
 **Verkle** — Verkle trie backend with Banderwagon curve, Pedersen
 commitments, and IPA proofs. Incremental updates (O(1) per value change).
-Ready for Ethereum's Verkle transition.
+Backed by disk_table — an mmap'd hash table optimized for pre-hashed keys
+(no hash function, power-of-2 bitmask, fingerprint pre-filter).
+`verkle_reconstruct` rebuilds the full Verkle state from history diffs
+without EVM execution.
 
 ## State History: Execute Once, Reconstruct Anywhere
 
@@ -67,16 +70,16 @@ without sender recovery. Just apply diffs sequentially. Hours instead of
 months.
 
 The same history diffs can reconstruct **any state backend**:
-- MPT (current Ethereum state commitment)
-- Verkle trie (future Ethereum state commitment)
+- MPT via `state_reconstruct` (validates against era1 state roots)
+- Verkle via `verkle_reconstruct` (Pedersen commitments, code chunking)
 - Both simultaneously from the same diffs
 
 ```
-chain_replay (one-time)          state_reconstruct (repeatable)
+chain_replay (one-time)          state_reconstruct / verkle_reconstruct
 ┌─────────────────────┐          ┌─────────────────────────┐
 │ EVM execution       │          │ Read diff               │
 │ Gas validation      │ ──────►  │ set_nonce / set_balance  │
-│ Sender recovery     │  diffs   │ set_storage             │
+│ Sender recovery     │  diffs   │ set_storage / set_code   │
 │ State root checks   │          │ compute_root            │
 │ ~2-3 months         │          │ ~hours                  │
 └─────────────────────┘          └─────────────────────────┘
@@ -117,7 +120,8 @@ Configuration is in `config.cmake`:
 
 ```cmake
 set(ENABLE_MPT    ON)    # Merkle Patricia Trie backend
-set(ENABLE_VERKLE OFF)   # Verkle trie backend
+set(ENABLE_VERKLE OFF)   # Verkle as active state backend (post-fork)
+set(ENABLE_VERKLE_BUILD OFF) # Build verkle libraries (verkle_reconstruct, benchmarks)
 set(ENABLE_HISTORY ON)   # Per-block state diff history
 ```
 
@@ -150,7 +154,7 @@ sudo apt-get install cmake build-essential libsnappy-dev libcjson-dev libssl-dev
 ./build/chain_replay --data-dir /path/to/state data/era1 data/mainnet_genesis.json
 ```
 
-### state_reconstruct — Rebuild state from history diffs
+### state_reconstruct — Rebuild MPT state from history diffs
 
 ```bash
 ./build/state_reconstruct <history_dir> <genesis.json> <era1_dir> [target_block]
@@ -158,6 +162,17 @@ sudo apt-get install cmake build-essential libsnappy-dev libcjson-dev libssl-dev
 
 Reads per-block diffs from state history files, applies them to a fresh
 MPT, and validates against era1 block headers. No EVM execution needed.
+
+### verkle_reconstruct — Rebuild Verkle state from history diffs
+
+```bash
+./build/verkle_reconstruct <history_dir> <genesis.json> [target_block]
+./build/verkle_reconstruct <history_dir> <genesis.json> 10000000 --resume
+```
+
+Same diffs, Verkle backend. Derives Pedersen tree keys, chunks code into
+31-byte EIP-6800 segments, tracks per-account storage slots for
+SELFDESTRUCT clearing. Supports `--resume` with slot tracker rebuild.
 
 ### evm_t8n — Transition tool for testing
 
@@ -189,7 +204,7 @@ Walks all trie nodes from root and recomputes keccak256 hashes.
 ## Testing
 
 ```bash
-# Internal test suites (91K+ tests)
+# Internal test suites (94K+ tests)
 ./build/test_runner_batch integration_tests/fixtures/state_tests
 ./build/test_runner_batch integration_tests/fixtures/blockchain_tests
 
