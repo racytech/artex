@@ -57,10 +57,17 @@ static bool slot_tracker_init(slot_tracker_t *st) {
     return mem_art_init(&st->tree);
 }
 
+static bool slot_tracker_free_cb(const uint8_t *key, size_t key_len,
+                                 const void *value, size_t value_len,
+                                 void *user_data) {
+    (void)key; (void)key_len; (void)value_len; (void)user_data;
+    const slot_set_t *ss = (const slot_set_t *)value;
+    free(ss->keys);
+    return true;  /* continue iteration */
+}
+
 static void slot_tracker_destroy(slot_tracker_t *st) {
-    /* mem_art doesn't give us iteration, so we rely on OS cleanup.
-     * For a proper cleanup we'd need to iterate all entries and free
-     * each slot_set_t. In practice this runs once at exit. */
+    mem_art_foreach(&st->tree, slot_tracker_free_cb, NULL);
     mem_art_destroy(&st->tree);
 }
 
