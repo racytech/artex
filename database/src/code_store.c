@@ -5,7 +5,7 @@
  *   <path>.idx — disk_hash index: code_hash (32B) → {offset, length} (12B)
  *   <path>.dat — mmap'd append-only flat file of raw code bytes
  *
- * Deduplication is free: same code → same hash → disk_hash_contains = true → skip.
+ * Deduplication is free: same code → same hash → disk_table_contains = true → skip.
  * Thread-safe: reads from mmap (lock-free), writes serialized by mutex.
  * Crash-safe: data written before index (orphaned bytes = harmless).
  */
@@ -13,7 +13,7 @@
 #define _GNU_SOURCE  /* mremap */
 
 #include "../include/code_store.h"
-#include "../include/disk_hash.h"
+#include "../include/disk_table.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -282,7 +282,7 @@ static void ccache_put(code_cache_t *c, const uint8_t hash[32],
  * ========================================================================= */
 
 struct code_store {
-    disk_hash_t     *index;         /* code_hash → code_record_t */
+    disk_table_t     *index;         /* code_hash → code_record_t */
     int              data_fd;       /* backing fd for mmap */
     uint8_t         *data_base;     /* mmap base for .dat file */
     size_t           data_mapped;   /* current mmap size */
@@ -355,14 +355,14 @@ code_store_t *code_store_create(const char *path, uint64_t capacity_hint) {
     if (!idx_path || !dat_path) { free(idx_path); free(dat_path); return NULL; }
 
     /* Create disk_hash index: 32B key → 12B record */
-    disk_hash_t *index = disk_hash_create(idx_path, CODE_HASH_SIZE,
+    disk_table_t *index = disk_table_create(idx_path, CODE_HASH_SIZE,
                                            sizeof(code_record_t), capacity_hint);
     if (!index) { free(idx_path); free(dat_path); return NULL; }
 
     /* Create data file */
     int data_fd = open(dat_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (data_fd < 0) {
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(idx_path); free(dat_path);
         return NULL;
     }
@@ -370,7 +370,7 @@ code_store_t *code_store_create(const char *path, uint64_t capacity_hint) {
     code_store_t *cs = calloc(1, sizeof(*cs));
     if (!cs) {
         close(data_fd);
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(idx_path); free(dat_path);
         return NULL;
     }
@@ -379,7 +379,7 @@ code_store_t *code_store_create(const char *path, uint64_t capacity_hint) {
     size_t init_sz = DAT_INITIAL_MAP_SIZE;
     if (ftruncate(data_fd, (off_t)init_sz) != 0) {
         close(data_fd);
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(idx_path); free(dat_path);
         free(cs);
         return NULL;
@@ -388,7 +388,7 @@ code_store_t *code_store_create(const char *path, uint64_t capacity_hint) {
                          MAP_SHARED, data_fd, 0);
     if (cs->data_base == MAP_FAILED) {
         close(data_fd);
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(idx_path); free(dat_path);
         free(cs);
         return NULL;
@@ -417,13 +417,13 @@ code_store_t *code_store_open(const char *path) {
     if (!idx_path || !dat_path) { free(idx_path); free(dat_path); return NULL; }
 
     /* Open disk_hash index */
-    disk_hash_t *index = disk_hash_open(idx_path);
+    disk_table_t *index = disk_table_open(idx_path);
     if (!index) { free(idx_path); free(dat_path); return NULL; }
 
     /* Open data file */
     int data_fd = open(dat_path, O_RDWR);
     if (data_fd < 0) {
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(idx_path); free(dat_path);
         return NULL;
     }
@@ -434,7 +434,7 @@ code_store_t *code_store_open(const char *path) {
         hdr.magic != CODE_STORE_MAGIC ||
         hdr.version != CODE_STORE_VERSION) {
         close(data_fd);
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(idx_path); free(dat_path);
         return NULL;
     }
@@ -442,7 +442,7 @@ code_store_t *code_store_open(const char *path) {
     code_store_t *cs = calloc(1, sizeof(*cs));
     if (!cs) {
         close(data_fd);
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(idx_path); free(dat_path);
         return NULL;
     }
@@ -451,7 +451,7 @@ code_store_t *code_store_open(const char *path) {
     struct stat sb;
     if (fstat(data_fd, &sb) != 0 || sb.st_size < (off_t)PAGE_SIZE) {
         close(data_fd);
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(cs); free(idx_path); free(dat_path);
         return NULL;
     }
@@ -465,7 +465,7 @@ code_store_t *code_store_open(const char *path) {
                          MAP_SHARED, data_fd, 0);
     if (cs->data_base == MAP_FAILED) {
         close(data_fd);
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(cs); free(idx_path); free(dat_path);
         return NULL;
     }
@@ -486,7 +486,7 @@ void code_store_destroy(code_store_t *cs) {
     if (!cs) return;
     ccache_destroy(cs->cache);
     pthread_mutex_destroy(&cs->write_lock);
-    disk_hash_destroy(cs->index);
+    disk_table_destroy(cs->index);
     if (cs->data_base && cs->data_base != MAP_FAILED)
         munmap(cs->data_base, cs->data_mapped);
     close(cs->data_fd);
@@ -505,13 +505,13 @@ bool code_store_put(code_store_t *cs, const uint8_t code_hash[32],
     if (code_len > 0 && !code) return false;
 
     /* Fast path: already exists on disk (dedup) */
-    if (disk_hash_contains(cs->index, code_hash))
+    if (disk_table_contains(cs->index, code_hash))
         return true;
 
     /* Acquire write lock, double-check, then write immediately */
     pthread_mutex_lock(&cs->write_lock);
 
-    if (disk_hash_contains(cs->index, code_hash)) {
+    if (disk_table_contains(cs->index, code_hash)) {
         pthread_mutex_unlock(&cs->write_lock);
         return true;
     }
@@ -536,8 +536,8 @@ bool code_store_put(code_store_t *cs, const uint8_t code_hash[32],
 
     /* Insert into disk_hash index — makes it immediately findable */
     code_record_t rec = { .offset = offset, .length = code_len };
-    if (!disk_hash_put(cs->index, code_hash, &rec)) {
-        fprintf(stderr, "FATAL: code_store disk_hash_put failed\n");
+    if (!disk_table_put(cs->index, code_hash, &rec)) {
+        fprintf(stderr, "FATAL: code_store disk_table_put failed\n");
         cs->data_size -= code_len;  /* rollback */
         pthread_mutex_unlock(&cs->write_lock);
         return false;
@@ -563,7 +563,7 @@ uint32_t code_store_get(const code_store_t *cs, const uint8_t code_hash[32],
 
     /* Look up in disk_hash index */
     code_record_t rec;
-    if (!disk_hash_get(cs->index, code_hash, &rec))
+    if (!disk_table_get(cs->index, code_hash, &rec))
         return 0;
 
     /* If buffer too small, return required size */
@@ -587,7 +587,7 @@ uint32_t code_store_get(const code_store_t *cs, const uint8_t code_hash[32],
 
 bool code_store_contains(const code_store_t *cs, const uint8_t code_hash[32]) {
     if (!cs || !code_hash) return false;
-    return disk_hash_contains(cs->index, code_hash);
+    return disk_table_contains(cs->index, code_hash);
 }
 
 uint32_t code_store_get_size(const code_store_t *cs, const uint8_t code_hash[32]) {
@@ -600,7 +600,7 @@ uint32_t code_store_get_size(const code_store_t *cs, const uint8_t code_hash[32]
     }
 
     code_record_t rec;
-    if (!disk_hash_get(cs->index, code_hash, &rec))
+    if (!disk_table_get(cs->index, code_hash, &rec))
         return 0;
     return rec.length;
 }
@@ -626,7 +626,7 @@ void code_store_flush(code_store_t *cs) {
  * ========================================================================= */
 
 uint64_t code_store_count(const code_store_t *cs) {
-    return cs ? disk_hash_count(cs->index) : 0;
+    return cs ? disk_table_count(cs->index) : 0;
 }
 
 /* =========================================================================

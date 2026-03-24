@@ -17,7 +17,8 @@
 #define _GNU_SOURCE  /* mremap */
 
 #include "mpt_store.h"
-#include "disk_hash.h"
+#include "disk_table.h"
+#include "node_cache.h"
 #include "bloom_filter.h"
 #include "keccak256.h"
 
@@ -179,7 +180,7 @@ typedef struct {
 } del_entry_t;
 
 struct mpt_store {
-    disk_hash_t     *index;
+    disk_table_t     *index;
     int              data_fd;
     uint8_t         *data_base;      /* mmap base for .dat file */
     size_t           data_mapped;    /* current mmap size */
@@ -233,11 +234,15 @@ struct mpt_store {
     /* Bloom filter for fast negative lookups in write_node */
     bloom_filter_t  *bloom;
 
+    /* LRU node cache — keeps hot trie nodes in memory */
+    node_cache_t     ncache;
+    bool             ncache_enabled;
+
     /* Commit-batch profiling (accumulates across calls, reset manually) */
     mpt_commit_stats_t cstats;
 };
 
-/* Callback for disk_hash_foreach_key → bloom_filter_add */
+/* Callback for disk_table_foreach_key → bloom_filter_add */
 static void bloom_populate_cb(const uint8_t *key, void *user_data) {
     bloom_filter_add((bloom_filter_t *)user_data, key, NODE_HASH_SIZE);
 }
@@ -946,18 +951,35 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
         return de->rlp_len;
     }
 
-    /* Look up in disk_hash index → offset/length */
+    /* Check LRU node cache */
+    if (ms->ncache_enabled) {
+        uint32_t cached_len = node_cache_get(
+            (node_cache_t *)&ms->ncache, hash, buf, MAX_NODE_RLP);
+        if (cached_len > 0) {
+            cs->load_ns += (double)(cstat_now() - _t0);
+            cs->nodes_loaded++;
+            cs->load_cache_hits++;
+            return cached_len;
+        }
+    }
+
+    /* Look up in disk_table index → offset/length */
     node_record_t rec;
-    if (!disk_hash_get(ms->index, hash, &rec))
+    if (!disk_table_get(ms->index, hash, &rec))
         return 0;
     if (rec.length == 0 || rec.length > MAX_NODE_RLP)
         return 0;
 
-    /* Read from mmap'd .dat — OS page cache handles caching */
+    /* Read from mmap'd .dat */
     size_t dat_off = PAGE_SIZE + rec.offset;
     if (dat_off + rec.length > ms->data_mapped)
         return 0;
     memcpy(buf, ms->data_base + dat_off, rec.length);
+
+    /* Insert into LRU cache */
+    if (ms->ncache_enabled)
+        node_cache_put((node_cache_t *)&ms->ncache, hash, buf,
+                        (uint16_t)rec.length);
 
     cs->load_ns += (double)(cstat_now() - _t0);
     cs->nodes_loaded++;
@@ -989,9 +1011,9 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         bool skip = ms->bloom && !bloom_filter_maybe_contains(ms->bloom, out_hash, 32);
         if (!skip) {
             node_record_t existing;
-            if (disk_hash_get(ms->index, out_hash, &existing)) {
+            if (disk_table_get(ms->index, out_hash, &existing)) {
                 existing.refcount++;
-                disk_hash_put(ms->index, out_hash, &existing);
+                disk_table_put(ms->index, out_hash, &existing);
                 ms->cstats.check_ns += (double)(cstat_now() - _chk0);
                 ms->cstats.check_hits++;
                 return true;
@@ -1028,7 +1050,7 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         ms->data_size += slot_size;
     }
 
-    /* Buffer in deferred write buffer — no mmap write, no disk_hash_put */
+    /* Buffer in deferred write buffer — no mmap write, no disk_table_put */
     if (!def_append(ms, out_hash, rlp, (uint32_t)rlp_len, write_offset))
         return false;
 
@@ -1189,13 +1211,13 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
     char *dat_path = make_path(path, ".dat");
     if (!idx_path || !dat_path) { free(idx_path); free(dat_path); return NULL; }
 
-    disk_hash_t *index = disk_hash_create(idx_path, NODE_HASH_SIZE,
+    disk_table_t *index = disk_table_create(idx_path, NODE_HASH_SIZE,
                                            sizeof(node_record_t), capacity_hint);
     if (!index) { free(idx_path); free(dat_path); return NULL; }
 
     int data_fd = open(dat_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (data_fd < 0) {
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(idx_path); free(dat_path);
         return NULL;
     }
@@ -1203,7 +1225,7 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
     mpt_store_t *ms = calloc(1, sizeof(*ms));
     if (!ms) {
         close(data_fd);
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(idx_path); free(dat_path);
         return NULL;
     }
@@ -1222,7 +1244,7 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
     size_t init_sz = DAT_INITIAL_MAP_SIZE;
     if (ftruncate(data_fd, (off_t)init_sz) != 0) {
         close(data_fd);
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(ms->idx_path); free(ms->dat_path); free(ms->free_path);
         free(ms);
         return NULL;
@@ -1231,7 +1253,7 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
                          MAP_SHARED, data_fd, 0);
     if (ms->data_base == MAP_FAILED) {
         close(data_fd);
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(ms->idx_path); free(ms->dat_path); free(ms->free_path);
         free(ms);
         return NULL;
@@ -1255,12 +1277,12 @@ mpt_store_t *mpt_store_open(const char *path) {
     char *dat_path = make_path(path, ".dat");
     if (!idx_path || !dat_path) { free(idx_path); free(dat_path); return NULL; }
 
-    disk_hash_t *index = disk_hash_open(idx_path);
+    disk_table_t *index = disk_table_open(idx_path);
     if (!index) { free(idx_path); free(dat_path); return NULL; }
 
     int data_fd = open(dat_path, O_RDWR);
     if (data_fd < 0) {
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(idx_path); free(dat_path);
         return NULL;
     }
@@ -1270,7 +1292,7 @@ mpt_store_t *mpt_store_open(const char *path) {
         hdr.magic != MPT_STORE_MAGIC ||
         hdr.version != MPT_STORE_VERSION) {
         close(data_fd);
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(idx_path); free(dat_path);
         return NULL;
     }
@@ -1278,7 +1300,7 @@ mpt_store_t *mpt_store_open(const char *path) {
     mpt_store_t *ms = calloc(1, sizeof(*ms));
     if (!ms) {
         close(data_fd);
-        disk_hash_destroy(index);
+        disk_table_destroy(index);
         free(idx_path); free(dat_path);
         return NULL;
     }
@@ -1293,7 +1315,7 @@ mpt_store_t *mpt_store_open(const char *path) {
         struct stat sb;
         if (fstat(data_fd, &sb) != 0 || sb.st_size < (off_t)PAGE_SIZE) {
             close(data_fd);
-            disk_hash_destroy(index);
+            disk_table_destroy(index);
             free(ms); free(idx_path); free(dat_path);
             return NULL;
         }
@@ -1302,7 +1324,7 @@ mpt_store_t *mpt_store_open(const char *path) {
                              MAP_SHARED, data_fd, 0);
         if (ms->data_base == MAP_FAILED) {
             close(data_fd);
-            disk_hash_destroy(index);
+            disk_table_destroy(index);
             free(ms); free(idx_path); free(dat_path);
             return NULL;
         }
@@ -1332,10 +1354,10 @@ mpt_store_t *mpt_store_open(const char *path) {
 
     /* Populate bloom filter from existing index entries */
     {
-        uint64_t n = disk_hash_count(ms->index);
+        uint64_t n = disk_table_count(ms->index);
         ms->bloom = bloom_filter_create(n > 100000 ? n * 2 : 100000, 0.01);
         if (ms->bloom)
-            disk_hash_foreach_key(ms->index, bloom_populate_cb, ms->bloom);
+            disk_table_foreach_key(ms->index, bloom_populate_cb, ms->bloom);
     }
 
     def_init(ms);
@@ -1358,7 +1380,9 @@ void mpt_store_destroy(mpt_store_t *ms) {
     for (int i = 0; i < NUM_SIZE_CLASSES; i++)
         free_list_destroy(&ms->free_lists[i]);
     bloom_filter_destroy(ms->bloom);
-    disk_hash_destroy(ms->index);
+    if (ms->ncache_enabled)
+        node_cache_destroy(&ms->ncache);
+    disk_table_destroy(ms->index);
     if (ms->data_base && ms->data_base != MAP_FAILED)
         munmap(ms->data_base, ms->data_mapped);
     close(ms->data_fd);
@@ -1389,8 +1413,12 @@ void mpt_store_reset(mpt_store_t *ms) {
     }
     ms->free_slot_bytes = 0;
 
+    /* Clear node cache */
+    if (ms->ncache_enabled)
+        node_cache_clear(&ms->ncache);
+
     /* Clear disk index in-place */
-    disk_hash_clear(ms->index);
+    disk_table_clear(ms->index);
 
     /* Truncate data file, re-mmap, and rewrite header */
     if (ms->data_base && ms->data_base != MAP_FAILED)
@@ -1460,14 +1488,14 @@ void mpt_store_flush(mpt_store_t *ms) {
         memcpy(ms->data_base + PAGE_SIZE + e->offset, e->rlp, e->rlp_len);
     }
 
-    /* 4. disk_hash_put for each deferred entry */
+    /* 4. disk_table_put for each deferred entry */
     for (size_t i = 0; i < n; i++) {
         deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
         if (!e->rlp) continue;
         node_record_t rec = { .offset = e->offset,
                               .length = e->rlp_len,
                               .refcount = e->refcount };
-        disk_hash_put(ms->index, e->hash, &rec);
+        disk_table_put(ms->index, e->hash, &rec);
         if (ms->bloom)
             bloom_filter_add(ms->bloom, e->hash, 32);
     }
@@ -1476,17 +1504,17 @@ void mpt_store_flush(mpt_store_t *ms) {
     /* 5. Apply pending deletes */
     for (size_t i = 0; i < ms->def_del_count; i++) {
         node_record_t rec;
-        if (disk_hash_get(ms->index, ms->def_deletes[i].hash, &rec)) {
+        if (disk_table_get(ms->index, ms->def_deletes[i].hash, &rec)) {
             if (rec.refcount > 1) {
                 rec.refcount--;
-                disk_hash_put(ms->index, ms->def_deletes[i].hash, &rec);
+                disk_table_put(ms->index, ms->def_deletes[i].hash, &rec);
             } else {
                 if (ms->live_bytes >= rec.length)
                     ms->live_bytes -= rec.length;
                 int sc = size_class_for(rec.length);
                 free_list_push(&ms->free_lists[sc], rec.offset);
                 ms->free_slot_bytes += SIZE_CLASSES[sc];
-                disk_hash_delete(ms->index, ms->def_deletes[i].hash);
+                disk_table_delete(ms->index, ms->def_deletes[i].hash);
             }
         }
     }
@@ -1495,7 +1523,7 @@ void mpt_store_flush(mpt_store_t *ms) {
     def_free_all(ms);
 
     /* Write header (root hash, free lists, data_size) to mmap'd page.
-     * No msync/disk_hash_sync — OS page cache handles writeback. */
+     * No msync/disk_table_sync — OS page cache handles writeback. */
     write_header_dat(ms);
 }
 
@@ -2558,7 +2586,7 @@ bool mpt_store_compact(mpt_store_t *ms) {
     memcpy(tmp_base + base_len, ".compact", 9);
 
     /* Create new store (disable cache — temp store doesn't need it) */
-    mpt_store_t *new_ms = mpt_store_create(tmp_base, disk_hash_count(ms->index));
+    mpt_store_t *new_ms = mpt_store_create(tmp_base, disk_table_count(ms->index));
     if (!new_ms) {
         free(tmp_path); free(tmp_base);
         return false;
@@ -2605,7 +2633,7 @@ bool mpt_store_compact(mpt_store_t *ms) {
     char *new_dat = new_ms->dat_path;
 
     /* Close old files */
-    disk_hash_destroy(ms->index);
+    disk_table_destroy(ms->index);
     if (ms->data_base && ms->data_base != MAP_FAILED)
         munmap(ms->data_base, ms->data_mapped);
     close(ms->data_fd);
@@ -2615,7 +2643,7 @@ bool mpt_store_compact(mpt_store_t *ms) {
     rename(new_dat, old_dat);
 
     /* Reopen */
-    ms->index = disk_hash_open(old_idx);
+    ms->index = disk_table_open(old_idx);
     ms->data_fd = open(old_dat, O_RDWR);
     ms->data_size  = new_ms->data_size;
     ms->live_bytes = new_ms->live_bytes; /* after compact, all data is live */
@@ -2648,7 +2676,7 @@ bool mpt_store_compact(mpt_store_t *ms) {
     if (new_ms->data_base && new_ms->data_base != MAP_FAILED)
         munmap(new_ms->data_base, new_ms->data_mapped);
     close(new_ms->data_fd);
-    disk_hash_destroy(new_ms->index);
+    disk_table_destroy(new_ms->index);
     if (new_ms->free_path) unlink(new_ms->free_path);
     free(new_ms->free_path);
     new_ms->idx_path = NULL;
@@ -2677,7 +2705,7 @@ bool mpt_store_compact_roots(mpt_store_t *ms,
     memcpy(tmp_base, ms->dat_path, base_len);
     memcpy(tmp_base + base_len, ".compact", 9);
 
-    mpt_store_t *new_ms = mpt_store_create(tmp_base, disk_hash_count(ms->index));
+    mpt_store_t *new_ms = mpt_store_create(tmp_base, disk_table_count(ms->index));
     if (!new_ms) { free(tmp_base); return false; }
     mpt_store_set_cache(new_ms, 0);
 
@@ -2718,7 +2746,7 @@ bool mpt_store_compact_roots(mpt_store_t *ms,
     char *new_idx = new_ms->idx_path;
     char *new_dat = new_ms->dat_path;
 
-    disk_hash_destroy(ms->index);
+    disk_table_destroy(ms->index);
     if (ms->data_base && ms->data_base != MAP_FAILED)
         munmap(ms->data_base, ms->data_mapped);
     close(ms->data_fd);
@@ -2726,7 +2754,7 @@ bool mpt_store_compact_roots(mpt_store_t *ms,
     rename(new_idx, old_idx);
     rename(new_dat, old_dat);
 
-    ms->index = disk_hash_open(old_idx);
+    ms->index = disk_table_open(old_idx);
     ms->data_fd = open(old_dat, O_RDWR);
     ms->data_size  = new_ms->data_size;
     ms->live_bytes = new_ms->live_bytes;
@@ -2758,7 +2786,7 @@ bool mpt_store_compact_roots(mpt_store_t *ms,
     if (new_ms->data_base && new_ms->data_base != MAP_FAILED)
         munmap(new_ms->data_base, new_ms->data_mapped);
     close(new_ms->data_fd);
-    disk_hash_destroy(new_ms->index);
+    disk_table_destroy(new_ms->index);
     if (new_ms->free_path) unlink(new_ms->free_path);
     free(new_ms->free_path);
     new_ms->idx_path = NULL;
@@ -2779,8 +2807,19 @@ bool mpt_store_compact_roots(mpt_store_t *ms,
  * Stats
  * ========================================================================= */
 
-void mpt_store_set_cache(mpt_store_t *ms, uint32_t max_entries) {
-    (void)ms; (void)max_entries;
+void mpt_store_set_cache(mpt_store_t *ms, uint64_t max_bytes) {
+    if (!ms) return;
+    if (max_bytes == 0) {
+        if (ms->ncache_enabled) {
+            node_cache_destroy(&ms->ncache);
+            ms->ncache_enabled = false;
+        }
+        return;
+    }
+    if (ms->ncache_enabled)
+        node_cache_destroy(&ms->ncache);
+    if (node_cache_init(&ms->ncache, max_bytes))
+        ms->ncache_enabled = true;
 }
 
 
@@ -2788,7 +2827,7 @@ mpt_store_stats_t mpt_store_stats(const mpt_store_t *ms) {
     mpt_store_stats_t st = {0};
     if (!ms) return st;
 
-    st.node_count = disk_hash_count(ms->index);
+    st.node_count = disk_table_count(ms->index);
 
     struct stat sb;
     if (fstat(ms->data_fd, &sb) == 0)

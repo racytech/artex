@@ -191,8 +191,13 @@ bool mpt_store_walk_leaves(const mpt_store_t *ms, mpt_leaf_cb_t cb,
  * Node Cache (legacy no-ops, retained for API compatibility)
  * ========================================================================= */
 
-/** No-op. LRU cache has been removed; mmap'd .dat replaces it. */
-void mpt_store_set_cache(mpt_store_t *ms, uint32_t max_entries);
+/**
+ * Enable the LRU node cache with the given memory budget in bytes.
+ * Keeps hot trie nodes in memory to avoid disk_table + .dat page faults.
+ * Call after create/open, before any batch operations.
+ * Typical values: 2GB for accounts, 8GB for storage.
+ */
+void mpt_store_set_cache(mpt_store_t *ms, uint64_t max_bytes);
 
 /**
  * Verify trie hash integrity by walking all nodes and recomputing hashes.

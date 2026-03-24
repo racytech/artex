@@ -84,7 +84,7 @@ add_library(code_store STATIC
     database/src/code_store.c
 )
 target_compile_definitions(code_store PRIVATE CCACHE_DEFAULT_CAP=${CODE_CACHE_ENTRIES})
-target_link_libraries(code_store disk_hash pthread)
+target_link_libraries(code_store disk_table pthread)
 
 #==============================================================================
 # Libraries — Common
@@ -159,11 +159,13 @@ add_library(mem_mpt STATIC
 target_link_libraries(mem_mpt common)
 
 # MPT Store (persistent Merkle Patricia Trie with incremental updates)
+add_library(node_cache STATIC database/src/node_cache.c)
+
 add_library(mpt_store STATIC
     database/src/mpt_store.c
 )
 target_include_directories(mpt_store PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-target_link_libraries(mpt_store disk_hash bloom_filter common)
+target_link_libraries(mpt_store disk_table node_cache bloom_filter common)
 
 #==============================================================================
 # Libraries — EVM
