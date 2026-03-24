@@ -51,6 +51,9 @@ typedef struct {
     nc_entry_t  *lru_head;
     nc_entry_t  *lru_tail;
 
+    /* Eviction pointer: last unpinned entry (avoids scanning past pinned tail) */
+    nc_entry_t  *evict_tail;
+
     /* Memory tracking */
     uint64_t     used_bytes;         /* total bytes in cache (entry overhead + rlp) */
     uint64_t     max_bytes;          /* memory budget */

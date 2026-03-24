@@ -19,7 +19,7 @@ set(MPT_ACCOUNT_CAPACITY  500000000)  # account trie (~500M for mainnet)
 set(MPT_STORAGE_CAPACITY  4000000000)  # storage trie (~4B for mainnet)
 
 # MPT node cache sizes (LRU, in bytes)
-set(MPT_ACCOUNT_CACHE_BYTES  2147483648)  # 2 GB
+set(MPT_ACCOUNT_CACHE_BYTES  0)           # disabled — account trie is fast without cache
 set(MPT_STORAGE_CACHE_BYTES  8589934592)  # 8 GB
 
 # Checkpoint interval (blocks between auto-saves)
