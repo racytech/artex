@@ -650,8 +650,24 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
 }
 
 /* =========================================================================
- * Bottom-Up Propagation
+ * Bottom-Up Propagation (sorted — O(N) grouping instead of O(N²))
  * ========================================================================= */
+
+/* Sort by depth descending, then path lexicographic ascending */
+static int cmp_prop_entry(const void *a, const void *b) {
+    const prop_entry_t *ea = (const prop_entry_t *)a;
+    const prop_entry_t *eb = (const prop_entry_t *)b;
+    /* Deeper first */
+    if (ea->depth != eb->depth)
+        return (ea->depth > eb->depth) ? -1 : 1;
+    /* Same depth: sort by path prefix */
+    int cmp_len = ea->depth < eb->depth ? ea->depth : eb->depth;
+    if (cmp_len > 0) {
+        int c = memcmp(ea->path, eb->path, cmp_len);
+        if (c != 0) return c;
+    }
+    return 0;
+}
 
 static bool propagate_internals(verkle_flat_t *vf,
                                  prop_entry_t *entries, int num_entries)
@@ -660,25 +676,28 @@ static bool propagate_internals(verkle_flat_t *vf,
 
     /* Process from deepest to shallowest */
     while (num_entries > 0) {
-        /* Find max depth */
-        int max_depth = 0;
-        for (int i = 0; i < num_entries; i++) {
-            if (entries[i].depth > max_depth)
-                max_depth = entries[i].depth;
-        }
+        /* Sort: deepest first, then by path — groups are now contiguous */
+        qsort(entries, num_entries, sizeof(prop_entry_t), cmp_prop_entry);
+
+        int max_depth = entries[0].depth;
 
         /* Collect parent entries for next round */
         int parent_count = 0;
         prop_entry_t *parents = NULL;
         int parents_cap = 0;
 
-        /* Process all entries at max_depth, grouped by path */
+        /* Process groups at max_depth — contiguous after sort */
         int i = 0;
-        while (i < num_entries) {
-            if (entries[i].depth != max_depth) { i++; continue; }
-
-            /* Collect all entries at this (depth, path) */
+        while (i < num_entries && entries[i].depth == max_depth) {
             int group_start = i;
+
+            /* Find group end: same depth + same path */
+            int group_end = i + 1;
+            while (group_end < num_entries &&
+                   entries[group_end].depth == max_depth &&
+                   (max_depth == 0 ||
+                    memcmp(entries[group_end].path, entries[i].path, max_depth) == 0))
+                group_end++;
 
             /* Load or create internal commitment */
             banderwagon_point_t internal_commit;
@@ -699,21 +718,14 @@ static bool propagate_internals(verkle_flat_t *vf,
 
             banderwagon_point_t old_internal = internal_commit;
 
-            /* Apply all deltas for this group */
-            for (int j = i; j < num_entries; j++) {
-                if (entries[j].depth != max_depth) continue;
-                if (max_depth > 0 &&
-                    memcmp(entries[j].path, entries[i].path, max_depth) != 0)
-                    continue;
-
-                uint8_t old_f[32], new_f[32], delta[32];
+            /* Apply all deltas for this group — entries are contiguous */
+            for (int j = group_start; j < group_end; j++) {
                 const banderwagon_point_t *pair[2] = {
                     &entries[j].old_child, &entries[j].new_child };
                 uint8_t pf[2][32];
                 banderwagon_batch_map_to_field(pf, pair, 2);
-                memcpy(old_f, pf[0], 32);
-                memcpy(new_f, pf[1], 32);
-                pedersen_scalar_diff(delta, new_f, old_f);
+                uint8_t delta[32];
+                pedersen_scalar_diff(delta, pf[1], pf[0]);
                 pedersen_update(&internal_commit, &internal_commit,
                                 entries[j].child_idx, delta);
             }
@@ -740,33 +752,25 @@ static bool propagate_internals(verkle_flat_t *vf,
                 p->new_child = internal_commit;
             }
 
-            /* Mark processed entries (set depth to -1) */
-            for (int j = i; j < num_entries; j++) {
-                if (entries[j].depth != max_depth) continue;
-                if (max_depth > 0 &&
-                    memcmp(entries[j].path, entries[group_start].path, max_depth) != 0)
-                    continue;
-                entries[j].depth = -1;
-            }
-            i++;
+            i = group_end;
         }
 
-        /* Compact: remove processed entries, add parents */
-        int new_count = 0;
-        for (int j = 0; j < num_entries; j++) {
-            if (entries[j].depth >= 0)
-                entries[new_count++] = entries[j];
-        }
+        /* Remaining entries (lower depth) + parents become next round */
+        int remaining = num_entries - i;
+        int new_count = remaining + parent_count;
 
-        /* Merge parents into entries array */
-        if (new_count + parent_count > 0) {
-            prop_entry_t *merged = realloc(entries,
-                (new_count + parent_count + 64) * sizeof(prop_entry_t));
-            if (!merged) { free(parents); return false; }
-            entries = merged;
+        if (new_count > 0) {
+            prop_entry_t *next = malloc((new_count + 64) * sizeof(prop_entry_t));
+            if (!next) { free(parents); return false; }
+            /* Copy remaining lower-depth entries */
+            if (remaining > 0)
+                memcpy(next, entries + i, remaining * sizeof(prop_entry_t));
+            /* Append parents */
             for (int j = 0; j < parent_count; j++)
-                entries[new_count + j] = parents[j];
-            num_entries = new_count + parent_count;
+                next[remaining + j] = parents[j];
+            free(entries);
+            entries = next;
+            num_entries = new_count;
         } else {
             num_entries = 0;
         }
