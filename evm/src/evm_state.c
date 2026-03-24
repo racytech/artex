@@ -550,6 +550,14 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
             return NULL;
         }
         es->code_store = cs;
+
+        /* Enable LRU node caches (build-time configurable) */
+#ifdef MPT_ACCOUNT_CACHE_BYTES
+        mpt_store_set_cache(es->account_mpt, (uint64_t)MPT_ACCOUNT_CACHE_BYTES);
+#endif
+#ifdef MPT_STORAGE_CACHE_BYTES
+        mpt_store_set_cache(es->storage_mpt, (uint64_t)MPT_STORAGE_CACHE_BYTES);
+#endif
     }
     /* else: no mpt_store — use in-memory batch rebuild for compute_mpt_root */
 #endif

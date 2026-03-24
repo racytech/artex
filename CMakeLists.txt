@@ -37,6 +37,12 @@ endif()
 if(NOT DEFINED CHECKPOINT_INTERVAL)
     set(CHECKPOINT_INTERVAL 256)
 endif()
+if(NOT DEFINED MPT_ACCOUNT_CACHE_BYTES)
+    set(MPT_ACCOUNT_CACHE_BYTES 2147483648)  # 2 GB default
+endif()
+if(NOT DEFINED MPT_STORAGE_CACHE_BYTES)
+    set(MPT_STORAGE_CACHE_BYTES 8589934592)  # 8 GB default
+endif()
 
 # Set C standard
 set(CMAKE_C_STANDARD 11)
@@ -226,6 +232,8 @@ endif()
 target_compile_definitions(evm PRIVATE
     MPT_ACCOUNT_CAPACITY=${MPT_ACCOUNT_CAPACITY}
     MPT_STORAGE_CAPACITY=${MPT_STORAGE_CAPACITY}
+    MPT_ACCOUNT_CACHE_BYTES=${MPT_ACCOUNT_CACHE_BYTES}
+    MPT_STORAGE_CACHE_BYTES=${MPT_STORAGE_CACHE_BYTES}
 )
 
 #==============================================================================

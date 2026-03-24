@@ -235,6 +235,18 @@ static void hash_node(const uint8_t *data, uint32_t len, uint8_t out[32]) {
 }
 
 /* =========================================================================
+ * Sorted insert support — sort by first 8 bytes of hash (bucket order)
+ * ========================================================================= */
+
+typedef struct { uint64_t key; uint64_t idx; } sort_entry_t;
+
+static int cmp_sort_by_bucket(const void *a, const void *b) {
+    uint64_t ka = ((const sort_entry_t *)a)->key;
+    uint64_t kb = ((const sort_entry_t *)b)->key;
+    return (ka > kb) - (ka < kb);
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -444,19 +456,52 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Insert all nodes */
+    /* Sort nodes by first 8 bytes of hash (= bucket order in disk_table).
+     * Turns random page writes into sequential writes — critical for large
+     * capacity tables that exceed RAM. */
+    printf("Sorting %" PRIu64 " nodes by bucket order...\n", node_count);
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+    /* Extract sort key (first 8 bytes as uint64) alongside index */
+    sort_entry_t *sort_buf = malloc(node_count * sizeof(sort_entry_t));
+    if (!sort_buf) {
+        fprintf(stderr, "ERROR: malloc failed for sort buffer\n");
+        disk_table_destroy(dh);
+        free(nodes);
+        free(fs.entries);
+        munmap(dat_map, st.st_size);
+        close(dat_fd);
+        return 1;
+    }
+    for (uint64_t i = 0; i < node_count; i++) {
+        memcpy(&sort_buf[i].key, nodes[i].hash, 8);
+        sort_buf[i].idx = i;
+    }
+    qsort(sort_buf, node_count, sizeof(sort_entry_t), cmp_sort_by_bucket);
+
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    printf("  Sort time: %.3f s\n",
+           (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) / 1e9);
+
+    /* Insert in bucket order */
     uint64_t inserted = 0;
     for (uint64_t i = 0; i < node_count; i++) {
+        uint64_t ni = sort_buf[i].idx;
         node_record_t rec = {
-            .offset   = nodes[i].offset,
-            .length   = nodes[i].length,
+            .offset   = nodes[ni].offset,
+            .length   = nodes[ni].length,
             .refcount = 1,
         };
-        if (disk_table_put(dh, nodes[i].hash, &rec))
+        if (disk_table_put(dh, nodes[ni].hash, &rec))
             inserted++;
         else
-            fprintf(stderr, "WARNING: disk_table_put failed for node %" PRIu64 "\n", i);
+            fprintf(stderr, "WARNING: disk_table_put failed for node %" PRIu64 "\n", ni);
+
+        if (inserted % 10000000 == 0)
+            printf("  ... %" PRIu64 "M inserted\n", inserted / 1000000);
     }
+    free(sort_buf);
 
     disk_table_sync(dh);
 
