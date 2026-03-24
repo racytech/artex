@@ -62,7 +62,8 @@ typedef struct {
     uint64_t block_number;
 } vf_block_t;
 
-/* Forward declaration */
+/* Forward declaration — full definition in vf_threadpool.h */
+struct vf_threadpool;
 typedef struct vf_threadpool vf_threadpool_t;
 
 /** Main handle. */

@@ -542,6 +542,12 @@ if(ENABLE_VERKLE_BUILD)
     )
     target_link_libraries(bench_verkle_flat verkle_state)
 
+    # Benchmark: Verkle thread pool (single vs multi-threaded commit)
+    add_executable(bench_verkle_threads
+        verkle/tests/bench_verkle_threads.c
+    )
+    target_link_libraries(bench_verkle_threads verkle_state)
+
     # Test: Verkle reconstruct (diff application + SELFDESTRUCT clearing)
     add_executable(test_verkle_reconstruct
         verkle/tests/test_verkle_reconstruct.c

@@ -925,41 +925,17 @@ static bool propagate_internals(verkle_flat_t *vf,
              * instead of one per entry. */
             int group_size = group_end - group_start;
 
-            if (group_size == 1) {
-                /* Single entry — no batching needed */
+            /* Apply deltas — batch map_to_field for small groups,
+             * per-entry for large groups (avoids huge allocations) */
+            for (int j = group_start; j < group_end; j++) {
                 const banderwagon_point_t *pair[2] = {
-                    &entries[group_start].old_child,
-                    &entries[group_start].new_child };
+                    &entries[j].old_child, &entries[j].new_child };
                 uint8_t pf[2][32];
                 banderwagon_batch_map_to_field(pf, pair, 2);
                 uint8_t delta[32];
                 pedersen_scalar_diff(delta, pf[1], pf[0]);
                 pedersen_update(&internal_commit, &internal_commit,
-                                entries[group_start].child_idx, delta);
-            } else {
-                /* Batch: collect all old/new child pointers */
-                const banderwagon_point_t **pts = malloc(
-                    2 * group_size * sizeof(banderwagon_point_t *));
-                uint8_t (*fields)[32] = malloc(2 * group_size * 32);
-                if (pts && fields) {
-                    for (int j = 0; j < group_size; j++) {
-                        pts[2 * j]     = &entries[group_start + j].old_child;
-                        pts[2 * j + 1] = &entries[group_start + j].new_child;
-                    }
-                    banderwagon_batch_map_to_field(fields, pts,
-                                                    2 * group_size);
-                    for (int j = 0; j < group_size; j++) {
-                        uint8_t delta[32];
-                        pedersen_scalar_diff(delta,
-                                              fields[2 * j + 1],
-                                              fields[2 * j]);
-                        pedersen_update(&internal_commit, &internal_commit,
-                                        entries[group_start + j].child_idx,
-                                        delta);
-                    }
-                }
-                free(pts);
-                free(fields);
+                                entries[j].child_idx, delta);
             }
 
             vcs_put_internal(vf->commit_store, max_depth,

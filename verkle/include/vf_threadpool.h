@@ -21,7 +21,7 @@ typedef struct {
     void      *arg;
 } vf_task_t;
 
-typedef struct {
+typedef struct vf_threadpool {
     /* Worker threads */
     pthread_t   *threads;
     int          thread_count;
