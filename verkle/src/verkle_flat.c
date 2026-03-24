@@ -517,6 +517,19 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
         banderwagon_point_t old_c1 = c1, old_c2 = c2;
         bool c1_changed = false, c2_changed = false;
 
+        /* Collect deltas into 256-element arrays for batched MSM.
+         * For <= 2 changed suffixes, sequential updates are faster
+         * (avoid the 256-slot iteration overhead in precomp_msm). */
+        uint8_t c1_deltas[256][32];
+        uint8_t c2_deltas[256][32];
+        int changed_count = 0;
+        bool use_batch = (sg->suffix_count > 2);
+
+        if (use_batch) {
+            memset(c1_deltas, 0, sizeof(c1_deltas));
+            memset(c2_deltas, 0, sizeof(c2_deltas));
+        }
+
         for (int i = 0; i < sg->suffix_count; i++) {
             uint8_t suffix = (uint8_t)sg->suffixes[i];
             const uint8_t *new_value = vf->changes[sg->change_idx[i]].new_value;
@@ -528,7 +541,7 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             full_key[31] = suffix;
             bool had_old = disk_table_get(vf->value_store, full_key, old_value);
 
-            /* Skip if value unchanged — avoids 2 scalar diffs + 2 scalar muls */
+            /* Skip if value unchanged */
             if (had_old && memcmp(old_value, new_value, 32) == 0)
                 continue;
 
@@ -537,8 +550,8 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             uint8_t old_hi[32] = {0}, new_hi[32] = {0};
             memcpy(old_lo, old_value, 16);
             memcpy(new_lo, new_value, 16);
-            new_lo[16] = 1;  /* EIP-6800 leaf marker */
-            if (had_old) old_lo[16] = 1;  /* marker was present in old commitment */
+            new_lo[16] = 1;
+            if (had_old) old_lo[16] = 1;
             memcpy(old_hi, old_value + 16, 16);
             memcpy(new_hi, new_value + 16, 16);
 
@@ -546,21 +559,50 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             pedersen_scalar_diff(delta_lo, new_lo, old_lo);
             pedersen_scalar_diff(delta_hi, new_hi, old_hi);
 
-            /* Update C1 or C2 */
-            if (suffix < 128) {
-                int rel = suffix;
-                pedersen_update(&c1, &c1, 2 * rel, delta_lo);
-                pedersen_update(&c1, &c1, 2 * rel + 1, delta_hi);
-                c1_changed = true;
+            if (use_batch) {
+                /* Accumulate into delta arrays for batch MSM */
+                if (suffix < 128) {
+                    memcpy(c1_deltas[2 * suffix], delta_lo, 32);
+                    memcpy(c1_deltas[2 * suffix + 1], delta_hi, 32);
+                    c1_changed = true;
+                } else {
+                    int rel = suffix - 128;
+                    memcpy(c2_deltas[2 * rel], delta_lo, 32);
+                    memcpy(c2_deltas[2 * rel + 1], delta_hi, 32);
+                    c2_changed = true;
+                }
             } else {
-                int rel = suffix - 128;
-                pedersen_update(&c2, &c2, 2 * rel, delta_lo);
-                pedersen_update(&c2, &c2, 2 * rel + 1, delta_hi);
-                c2_changed = true;
+                /* Sequential updates for 1-2 suffixes */
+                if (suffix < 128) {
+                    int rel = suffix;
+                    pedersen_update(&c1, &c1, 2 * rel, delta_lo);
+                    pedersen_update(&c1, &c1, 2 * rel + 1, delta_hi);
+                    c1_changed = true;
+                } else {
+                    int rel = suffix - 128;
+                    pedersen_update(&c2, &c2, 2 * rel, delta_lo);
+                    pedersen_update(&c2, &c2, 2 * rel + 1, delta_hi);
+                    c2_changed = true;
+                }
             }
+            changed_count++;
 
             /* Write new value to value store */
             disk_table_put(vf->value_store, full_key, new_value);
+        }
+
+        /* Apply batched deltas via single MSM per commitment */
+        if (use_batch && changed_count > 0) {
+            if (c1_changed) {
+                banderwagon_point_t c1_delta;
+                pedersen_commit(&c1_delta, c1_deltas, 256);
+                banderwagon_add(&c1, &old_c1, &c1_delta);
+            }
+            if (c2_changed) {
+                banderwagon_point_t c2_delta;
+                pedersen_commit(&c2_delta, c2_deltas, 256);
+                banderwagon_add(&c2, &old_c2, &c2_delta);
+            }
         }
 
         /* Update leaf commitment for C1/C2 changes (batch inversions) */
