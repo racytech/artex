@@ -1,21 +1,20 @@
 /*
- * rebuild_idx — Rebuild .idx (disk_hash) from .dat file for MPT store.
+ * rebuild_idx — Rebuild .idx (disk_table) from .dat file for MPT store.
  *
  * Scans the .dat file sequentially, skipping free slots (from .free file
  * and header free lists), hashes each occupied node's RLP, and populates
- * a fresh disk_hash .idx file.
+ * a fresh disk_table .idx file.
  *
  * Usage:
- *   rebuild_idx <base_path> [--verify] [--dry-run]
+ *   rebuild_idx <base_path> [--verify] [--dry-run] [--capacity N]
  *
  * <base_path> is the prefix for .dat/.idx/.free files.
  * --verify: compare rebuilt .idx against existing .idx (does not overwrite)
  * --dry-run: scan and report stats without writing any files
- *
- * SAFETY: refuses to operate on files under ~/.artex.
+ * --capacity N: set hash table capacity (default: node_count)
  */
 
-#include "disk_hash.h"
+#include "disk_table.h"
 #include "keccak256.h"
 
 #include <stdio.h>
@@ -236,22 +235,6 @@ static void hash_node(const uint8_t *data, uint32_t len, uint8_t out[32]) {
 }
 
 /* =========================================================================
- * Safety check
- * ========================================================================= */
-
-static bool is_under_artex(const char *path) {
-    char resolved[PATH_MAX];
-    if (!realpath(path, resolved)) return false;
-
-    const char *home = getenv("HOME");
-    if (!home) return false;
-
-    char artex[PATH_MAX];
-    snprintf(artex, sizeof(artex), "%s/.artex/", home);
-    return strncmp(resolved, artex, strlen(artex)) == 0;
-}
-
-/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -285,13 +268,6 @@ int main(int argc, char **argv) {
     snprintf(dat_path,  sizeof(dat_path),  "%s.dat",  base_path);
     snprintf(idx_path,  sizeof(idx_path),  "%s.idx",  base_path);
     snprintf(free_path, sizeof(free_path), "%s.free", base_path);
-
-    /* Safety: refuse to operate under ~/.artex */
-    if (is_under_artex(dat_path)) {
-        fprintf(stderr, "ERROR: refusing to operate on files under ~/.artex\n");
-        fprintf(stderr, "Copy files to a safe location first.\n");
-        return 1;
-    }
 
     /* Open and mmap .dat read-only */
     int dat_fd = open(dat_path, O_RDONLY);
@@ -457,10 +433,10 @@ int main(int argc, char **argv) {
            out_idx, node_count, capacity);
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    disk_hash_t *dh = disk_hash_create(out_idx, NODE_HASH_SIZE,
+    disk_table_t *dh = disk_table_create(out_idx, NODE_HASH_SIZE,
                                          sizeof(node_record_t), capacity);
     if (!dh) {
-        fprintf(stderr, "ERROR: disk_hash_create failed for %s\n", out_idx);
+        fprintf(stderr, "ERROR: disk_table_create failed for %s\n", out_idx);
         free(nodes);
         free(fs.entries);
         munmap(dat_map, st.st_size);
@@ -476,31 +452,31 @@ int main(int argc, char **argv) {
             .length   = nodes[i].length,
             .refcount = 1,
         };
-        if (disk_hash_put(dh, nodes[i].hash, &rec))
+        if (disk_table_put(dh, nodes[i].hash, &rec))
             inserted++;
         else
-            fprintf(stderr, "WARNING: disk_hash_put failed for node %" PRIu64 "\n", i);
+            fprintf(stderr, "WARNING: disk_table_put failed for node %" PRIu64 "\n", i);
     }
 
-    disk_hash_sync(dh);
+    disk_table_sync(dh);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double build_sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
     printf("  Inserted: %" PRIu64 " / %" PRIu64 "\n", inserted, node_count);
     printf("  Build time: %.3f s\n", build_sec);
-    printf("  Index entries: %" PRIu64 "\n", disk_hash_count(dh));
+    printf("  Index entries: %" PRIu64 "\n", disk_table_count(dh));
 
     /* Verification: compare against original .idx if it exists */
     if (verify) {
         printf("\n=== Verification ===\n");
-        disk_hash_t *orig = disk_hash_open(idx_path);
+        disk_table_t *orig = disk_table_open(idx_path);
         if (!orig) {
             fprintf(stderr, "WARNING: cannot open original %s for verification\n",
                     idx_path);
         } else {
-            uint64_t orig_count = disk_hash_count(orig);
-            uint64_t new_count  = disk_hash_count(dh);
+            uint64_t orig_count = disk_table_count(orig);
+            uint64_t new_count  = disk_table_count(dh);
             printf("Original entries: %" PRIu64 "\n", orig_count);
             printf("Rebuilt entries:  %" PRIu64 "\n", new_count);
 
@@ -509,7 +485,7 @@ int main(int argc, char **argv) {
             uint64_t match = 0, mismatch = 0, missing = 0;
             for (uint64_t i = 0; i < node_count; i++) {
                 node_record_t orig_rec;
-                if (disk_hash_get(orig, nodes[i].hash, &orig_rec)) {
+                if (disk_table_get(orig, nodes[i].hash, &orig_rec)) {
                     node_record_t new_rec = {
                         .offset = nodes[i].offset,
                         .length = nodes[i].length,
@@ -557,14 +533,14 @@ int main(int argc, char **argv) {
                 printf("\n  FAIL: %"PRIu64" mismatches found.\n", mismatch);
             }
 
-            disk_hash_destroy(orig);
+            disk_table_destroy(orig);
 
             /* Clean up the .rebuilt file */
             unlink(out_idx);
         }
     }
 
-    disk_hash_destroy(dh);
+    disk_table_destroy(dh);
     free(nodes);
     free(fs.entries);
     munmap(dat_map, st.st_size);
