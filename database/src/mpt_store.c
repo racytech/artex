@@ -2,7 +2,7 @@
  * MPT Store — Persistent Merkle Patricia Trie with Incremental Updates.
  *
  * Two-file design:
- *   <path>.idx — disk_hash index: node_hash (32B) → {offset, length} (12B)
+ *   <path>.idx — disk_table index: node_hash (32B) → {offset, length} (12B)
  *   <path>.dat — slot-allocated flat file of RLP-encoded trie node data
  *
  * Slot allocation: nodes are stored in size-class slots (64, 128, 256, 512,
@@ -208,7 +208,7 @@ struct mpt_store {
     bool             shared;         /* multi-trie mode: skip node deletion */
 
     /* Deferred write buffer: nodes buffered in memory during commit_batch,
-     * flushed to mmap'd .dat + disk_hash at checkpoint time. */
+     * flushed to mmap'd .dat + disk_table at checkpoint time. */
     deferred_entry_t *def_entries;
     size_t            def_count;
     size_t            def_cap;
@@ -987,7 +987,7 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
 }
 
 /* Write a node: buffer in deferred write buffer (no disk I/O).
- * Actual writes to mmap'd .dat + disk_hash happen at flush time.
+ * Actual writes to mmap'd .dat + disk_table happen at flush time.
  * Returns true on success. */
 static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
                        uint8_t out_hash[32]) {

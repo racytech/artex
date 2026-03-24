@@ -41,7 +41,7 @@ void bloom_filter_add(bloom_filter_t *bf, const uint8_t *key, size_t key_len);
 /**
  * Test if a key might be in the set.
  * Returns false  → definitely not in set.
- * Returns true   → possibly in set (check disk_hash to confirm).
+ * Returns true   → possibly in set (check disk_table to confirm).
  */
 bool bloom_filter_maybe_contains(const bloom_filter_t *bf,
                                   const uint8_t *key, size_t key_len);

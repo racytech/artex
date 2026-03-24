@@ -17,10 +17,10 @@ extern "C" {
  * Replaces the in-memory verkle tree for block execution.
  * RAM usage: O(block_changes) instead of O(total_state).
  *
- * Disk-backed stores (all disk_hash):
- *   - Value store:      disk_hash (key=32B, record=32B) — all state values
+ * Disk-backed stores (all disk_table):
+ *   - Value store:      disk_table (key=32B, record=32B) — all state values
  *   - Commitment store: verkle_commit_store — leaf (C1,C2,commit) + internal
- *   - Slot store:       disk_hash — maps (depth,path,slot) → occupant stem
+ *   - Slot store:       disk_table — maps (depth,path,slot) → occupant stem
  *
  * Per-block flow:
  *   1. begin_block()

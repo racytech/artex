@@ -2,7 +2,7 @@
  * Code Store — Content-Addressed, Append-Only, Deduplicated.
  *
  * Two-file design:
- *   <path>.idx — disk_hash index: code_hash (32B) → {offset, length} (12B)
+ *   <path>.idx — disk_table index: code_hash (32B) → {offset, length} (12B)
  *   <path>.dat — mmap'd append-only flat file of raw code bytes
  *
  * Deduplication is free: same code → same hash → disk_table_contains = true → skip.
@@ -49,7 +49,7 @@ _Static_assert(sizeof(code_store_header_t) == PAGE_SIZE,
                "code_store_header_t must be 4096 bytes");
 
 /* =========================================================================
- * Index record (stored in disk_hash as the record)
+ * Index record (stored in disk_table as the record)
  * ========================================================================= */
 
 typedef struct __attribute__((packed)) {
@@ -63,7 +63,7 @@ _Static_assert(sizeof(code_record_t) == 12, "code_record_t must be 12 bytes");
  * LRU Code Cache
  *
  * In-memory LRU cache for hot contract bytecode, keyed by code_hash.
- * Eliminates disk_hash lookup for frequently-called contracts.
+ * Eliminates disk_table lookup for frequently-called contracts.
  *
  * Layout: flat pre-allocated entry array + hash table + doubly-linked
  * LRU list. All operations O(1). Variable-length code via malloc'd buffers.
@@ -354,7 +354,7 @@ code_store_t *code_store_create(const char *path, uint64_t capacity_hint) {
     char *dat_path = make_path(path, ".dat");
     if (!idx_path || !dat_path) { free(idx_path); free(dat_path); return NULL; }
 
-    /* Create disk_hash index: 32B key → 12B record */
+    /* Create disk_table index: 32B key → 12B record */
     disk_table_t *index = disk_table_create(idx_path, CODE_HASH_SIZE,
                                            sizeof(code_record_t), capacity_hint);
     if (!index) { free(idx_path); free(dat_path); return NULL; }
@@ -416,7 +416,7 @@ code_store_t *code_store_open(const char *path) {
     char *dat_path = make_path(path, ".dat");
     if (!idx_path || !dat_path) { free(idx_path); free(dat_path); return NULL; }
 
-    /* Open disk_hash index */
+    /* Open disk_table index */
     disk_table_t *index = disk_table_open(idx_path);
     if (!index) { free(idx_path); free(dat_path); return NULL; }
 
@@ -534,7 +534,7 @@ bool code_store_put(code_store_t *cs, const uint8_t code_hash[32],
     if (code_len > 0)
         memcpy(cs->data_base + PAGE_SIZE + offset, code, code_len);
 
-    /* Insert into disk_hash index — makes it immediately findable */
+    /* Insert into disk_table index — makes it immediately findable */
     code_record_t rec = { .offset = offset, .length = code_len };
     if (!disk_table_put(cs->index, code_hash, &rec)) {
         fprintf(stderr, "FATAL: code_store disk_table_put failed\n");
@@ -561,7 +561,7 @@ uint32_t code_store_get(const code_store_t *cs, const uint8_t code_hash[32],
         if (cached > 0) return cached;
     }
 
-    /* Look up in disk_hash index */
+    /* Look up in disk_table index */
     code_record_t rec;
     if (!disk_table_get(cs->index, code_hash, &rec))
         return 0;
@@ -593,7 +593,7 @@ bool code_store_contains(const code_store_t *cs, const uint8_t code_hash[32]) {
 uint32_t code_store_get_size(const code_store_t *cs, const uint8_t code_hash[32]) {
     if (!cs || !code_hash) return 0;
 
-    /* Check LRU cache (avoids disk_hash index lookup) */
+    /* Check LRU cache (avoids disk_table index lookup) */
     if (cs->cache) {
         uint32_t cached = ccache_get_size(cs->cache, code_hash);
         if (cached > 0) return cached;

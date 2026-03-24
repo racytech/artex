@@ -10,7 +10,7 @@
  *
  * Stores Ethereum contract bytecode keyed by code hash (32 bytes).
  * Backed by two files:
- *   - Index:  disk_hash mapping code_hash (32B) → {offset, length} (12B)
+ *   - Index:  disk_table mapping code_hash (32B) → {offset, length} (12B)
  *   - Data:   append-only flat file of raw code bytes
  *
  * Properties:
@@ -27,7 +27,7 @@
  *
  * Crash safety:
  *   - Data written before index entry (orphaned bytes on crash = harmless)
- *   - Index inherits disk_hash crash safety (dirty flag + recovery)
+ *   - Index inherits disk_table crash safety (dirty flag + recovery)
  */
 
 typedef struct code_store code_store_t;
@@ -38,8 +38,8 @@ typedef struct code_store code_store_t;
 
 /**
  * Create a new code store.
- * Creates two files: <path>.idx (disk_hash index) and <path>.dat (data).
- * capacity_hint: expected number of unique codes (sizes disk_hash).
+ * Creates two files: <path>.idx (disk_table index) and <path>.dat (data).
+ * capacity_hint: expected number of unique codes (sizes disk_table).
  * Returns NULL on failure.
  */
 code_store_t *code_store_create(const char *path, uint64_t capacity_hint);

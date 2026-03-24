@@ -427,7 +427,7 @@ int main(int argc, char **argv) {
         snprintf(out_idx, sizeof(out_idx), "%s.idx", base_path);
     }
 
-    /* Create fresh disk_hash */
+    /* Create fresh disk_table */
     uint64_t capacity = capacity_override > 0 ? capacity_override : node_count;
     printf("\nBuilding %s (%" PRIu64 " entries, capacity %" PRIu64 ")...\n",
            out_idx, node_count, capacity);

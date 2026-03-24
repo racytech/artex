@@ -11,19 +11,19 @@ extern "C" {
 #endif
 
 /**
- * Verkle Commitment Store — mmap'd disk_hash persistence for commitment points.
+ * Verkle Commitment Store — mmap'd disk_table persistence for commitment points.
  *
  * Persists banderwagon commitment points so they survive restarts,
  * avoiding expensive full MSM recomputation on reload.
- * Uses disk_hash (mmap'd hash table) for O(1) lookups with no syscall overhead.
+ * Uses disk_table (mmap'd hash table) for O(1) lookups with no syscall overhead.
  *
- * Two disk_hash tables with 32-byte keys:
+ * Two disk_table tables with 32-byte keys:
  *   Leaf store:     key=[0x00 || stem (31B)]          → record: C1||C2||commitment (96B)
  *   Internal store: key=[depth+1 || path_prefix (31B)] → record: commitment (32B)
  *
  * Files created inside the given directory:
- *   dir/leaves.idx    — leaf disk_hash (key=32, record=96)
- *   dir/internals.idx — internal disk_hash (key=32, record=32)
+ *   dir/leaves.idx    — leaf disk_table (key=32, record=96)
+ *   dir/internals.idx — internal disk_table (key=32, record=32)
  */
 
 typedef struct {
@@ -82,7 +82,7 @@ bool vcs_get_internal(const verkle_commit_store_t *cs,
  * Durability
  * ========================================================================= */
 
-/** Flush to disk (calls disk_hash_sync on both stores). */
+/** Flush to disk (calls disk_table_sync on both stores). */
 void vcs_sync(verkle_commit_store_t *cs);
 
 #ifdef __cplusplus

@@ -12,7 +12,7 @@
  * state root computation is O(dirty * depth) instead of O(total_accounts).
  *
  * Two files:
- *   <path>.idx — disk_hash index: node_hash[32] → {offset[8], length[4]}
+ *   <path>.idx — disk_table index: node_hash[32] → {offset[8], length[4]}
  *   <path>.dat — slot-allocated flat file of RLP-encoded trie node data
  *
  * Slot allocation: nodes stored in size-class slots (64–1024 bytes).
@@ -25,7 +25,7 @@
  *   3. mpt_store_commit_batch() — walks dirty paths, writes new nodes,
  *      deletes stale nodes, returns new root hash
  *
- * Node reads: root_hash → disk_hash_get → {offset,len} → pread from .dat
+ * Node reads: root_hash → disk_table_get → {offset,len} → pread from .dat
  * Two I/O ops per node, both page-cache friendly.
  *
  */
@@ -38,7 +38,7 @@ typedef struct mpt_store mpt_store_t;
 
 /**
  * Create a new MPT store, creating/truncating files at <path>.idx/.dat.
- * capacity_hint: expected number of trie nodes (sizes the disk_hash).
+ * capacity_hint: expected number of trie nodes (sizes the disk_table).
  * The trie starts empty (root = keccak256(0x80)).
  * Returns NULL on failure.
  */
@@ -69,7 +69,7 @@ void mpt_store_reset(mpt_store_t *ms);
 void mpt_store_sync(mpt_store_t *ms);
 
 /**
- * Flush deferred writes to mmap (page cache) + disk_hash, then free
+ * Flush deferred writes to mmap (page cache) + disk_table, then free
  * deferred buffers. No msync — OS handles writeback asynchronously.
  * Call at checkpoint time before evict_cache.
  */
