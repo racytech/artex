@@ -47,7 +47,7 @@ static uint32_t crc32c(const uint8_t *data, size_t len) {
  * ========================================================================= */
 
 #define HIST_MAGIC   0x54534948  /* "HIST" in little-endian */
-#define HIST_VERSION 3
+#define HIST_VERSION 1
 
 /* Index header: magic(4) + version(4) + first_block(8) = 16 bytes */
 #define IDX_HEADER_SIZE 16
