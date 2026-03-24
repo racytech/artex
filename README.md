@@ -1,11 +1,11 @@
-# artex — Ethereum Execution Client
+# artex — Ethereum Execution Engine
 
 A from-scratch Ethereum execution layer implementation in C. Designed for
 maximum throughput on modern hardware with minimal dependencies.
 
 ## What is artex?
 
-artex is an Ethereum execution client that processes blocks, executes
+artex is an Ethereum execution engine that processes blocks, executes
 transactions via the EVM, and maintains the world state. It validates
 the entire Ethereum chain from genesis through pre-merge (era1 files)
 and post-merge (via Engine API from a Consensus Layer client).
@@ -36,8 +36,10 @@ modexp, BN256, BLAKE2, point evaluation, BLS12-381), and EIP-2929
 warm/cold access tracking.
 
 **State** — Two-tier cache (in-memory ART with two-generation eviction)
-backed by persistent MPT store (mmap'd disk_hash + slot-allocated .dat).
+backed by persistent MPT store (mmap'd disk_table + slot-allocated .dat).
 Incremental Merkle Patricia Trie with per-account storage roots.
+Two-list LRU node cache pins upper-branch trie nodes (depth 0-4) while
+evicting leaves under memory budget — O(1) eviction, no scanning.
 
 **Sync** — Era1-based pre-merge chain replay with 256-block checkpoint
 validation. Supports `--resume` from checkpoint, per-block state root
