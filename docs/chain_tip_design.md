@@ -157,6 +157,98 @@ At chain tip with 64 non-finalized blocks:
 
 Total: ~2MB. Negligible.
 
+## EVM Execution Model
+
+The EVM needs a full working state to execute blocks — it calls
+`evm_state_get_balance`, `evm_state_get_storage`, etc. At chain tip,
+blocks are speculative (may be reorged). The canonical state must not
+be modified by speculative execution.
+
+### Overlay State
+
+Each `newPayload` creates a temporary overlay state for execution:
+
+```
+┌─────────────────────────────────────────────┐
+│ Temporary writes (this block's mutations)   │  ← EVM writes here
+├─────────────────────────────────────────────┤
+│ Pending diffs (finalized+1 .. parent)       │  ← read overlay
+├─────────────────────────────────────────────┤
+│ Canonical mpt_store (finalized block)       │  ← read fallback
+└─────────────────────────────────────────────┘
+```
+
+Read path (same API, layered implementation):
+
+```c
+evm_state_get_balance(addr):
+    if addr in temp_writes:     return temp_writes[addr].balance
+    if addr in pending_diffs:   return pending_diffs[addr].balance
+    return mpt_store_read(addr) // canonical on disk
+```
+
+Write path (never touches canonical):
+
+```c
+evm_state_set_balance(addr, val):
+    temp_writes[addr].balance = val  // in-memory only
+```
+
+The EVM doesn't know the difference — same `evm_state_*` API.
+After execution, temp_writes become the block's diff.
+
+### newPayload Execution Flow
+
+```
+newPayload(block N):
+    1. Find parent state:
+       - parent_diff = exec_cache[block.parent_hash].diff
+       - pending = diffs from finalized+1 to parent
+
+    2. Create overlay evm_state:
+       - base: canonical mpt_store (read-only)
+       - overlay: pending diffs + parent_diff
+       - writes: fresh temp buffer
+
+    3. Execute all transactions in block N:
+       - EVM reads go through overlay chain
+       - EVM writes go to temp buffer
+       - Gas accounting, receipt generation as normal
+
+    4. Compute state root:
+       - Apply temp_writes to a temporary MPT
+       - Or compute incrementally from diffs
+
+    5. Store result:
+       - exec_cache[block_hash] = {diff: temp_writes, root: computed_root}
+       - Discard overlay evm_state
+
+    6. Return VALID if root matches, INVALID otherwise
+```
+
+### Why Not Modify Canonical State?
+
+If newPayload modifies canonical state and the block gets reorged:
+- State is corrupted (wrong nonces, balances)
+- No undo mechanism in mpt_store
+- Must replay from last checkpoint (expensive)
+
+With overlay: canonical state is never touched. Reorg just discards
+the overlay. Zero cost, zero risk.
+
+### Canonical State Advancement
+
+Only `forkchoiceUpdated` moves canonical state forward, and only
+for finalized blocks (guaranteed never reorged):
+
+```
+forkchoiceUpdated(finalized=N-64):
+    for block in (old_finalized+1 .. N-64):
+        apply block's diff to canonical evm_state
+        commit + flush to mpt_store
+    // canonical now at N-64, permanent
+```
+
 ## Commitment Strategy
 
 When forkchoiceUpdated moves finalized forward:
