@@ -936,7 +936,6 @@ static int def_offset_cmp(const void *a, const void *b) {
  * Returns the RLP length, or 0 on failure. */
 static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
                             uint8_t *buf, uint8_t depth) {
-    (void)depth;
     uint64_t _t0 = cstat_now();
     mpt_commit_stats_t *cs = (mpt_commit_stats_t *)&ms->cstats;
 
@@ -976,10 +975,10 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
         return 0;
     memcpy(buf, ms->data_base + dat_off, rec.length);
 
-    /* Insert into LRU cache */
+    /* Insert into LRU cache with depth for pin policy */
     if (ms->ncache_enabled)
         node_cache_put((node_cache_t *)&ms->ncache, hash, buf,
-                        (uint16_t)rec.length);
+                        (uint16_t)rec.length, depth);
 
     cs->load_ns += (double)(cstat_now() - _t0);
     cs->nodes_loaded++;

@@ -132,8 +132,16 @@ static void ht_remove(node_cache_t *nc, nc_entry_t *e) {
  * ========================================================================= */
 
 static void evict_one(node_cache_t *nc) {
+    /* Walk from LRU tail, skip pinned entries */
     nc_entry_t *victim = nc->lru_tail;
-    if (!victim) return;
+    while (victim && victim->depth <= NC_PIN_DEPTH)
+        victim = victim->lru_prev;
+
+    if (!victim) {
+        /* All entries are pinned — evict true tail as fallback */
+        victim = nc->lru_tail;
+        if (!victim) return;
+    }
 
     lru_unlink(nc, victim);
     ht_remove(nc, victim);
@@ -143,11 +151,6 @@ static void evict_one(node_cache_t *nc) {
     nc->evictions++;
 
     free_entry(nc, victim);
-}
-
-static void evict_to_budget(node_cache_t *nc) {
-    while (nc->used_bytes > nc->max_bytes && nc->lru_tail)
-        evict_one(nc);
 }
 
 /* =========================================================================
@@ -242,7 +245,7 @@ uint32_t node_cache_get(node_cache_t *nc, const uint8_t hash[32],
 }
 
 void node_cache_put(node_cache_t *nc, const uint8_t hash[32],
-                     const uint8_t *rlp, uint16_t rlp_len) {
+                     const uint8_t *rlp, uint16_t rlp_len, uint8_t depth) {
     if (rlp_len > NODE_CACHE_MAX_RLP) return;
 
     /* Check if already cached — update in place */
@@ -250,6 +253,8 @@ void node_cache_put(node_cache_t *nc, const uint8_t hash[32],
     if (e) {
         memcpy(e->rlp, rlp, rlp_len);
         e->rlp_len = rlp_len;
+        /* Update depth if we now have better info */
+        if (depth < e->depth) e->depth = depth;
         lru_unlink(nc, e);
         lru_push_front(nc, e);
         return;
@@ -266,6 +271,7 @@ void node_cache_put(node_cache_t *nc, const uint8_t hash[32],
     memcpy(e->hash, hash, 32);
     memcpy(e->rlp, rlp, rlp_len);
     e->rlp_len = rlp_len;
+    e->depth = depth;
 
     ht_insert(nc, e);
     lru_push_front(nc, e);
