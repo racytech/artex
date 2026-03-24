@@ -1,4 +1,5 @@
 #include "verkle_flat.h"
+#include "vf_threadpool.h"
 #include "pedersen.h"
 #include "banderwagon.h"
 
@@ -264,6 +265,7 @@ verkle_flat_t *verkle_flat_open(const char *value_dir,
 
 void verkle_flat_destroy(verkle_flat_t *vf) {
     if (!vf) return;
+    if (vf->pool) vf_threadpool_destroy(vf->pool);
     if (vf->value_store)  disk_table_destroy(vf->value_store);
     if (vf->commit_store) vcs_destroy(vf->commit_store);
     if (vf->slot_store)   disk_table_destroy(vf->slot_store);
@@ -272,6 +274,16 @@ void verkle_flat_destroy(verkle_flat_t *vf) {
     free(vf->commit_undos);
     free(vf->blocks);
     free(vf);
+}
+
+void verkle_flat_set_threads(verkle_flat_t *vf, int num_threads) {
+    if (!vf) return;
+    if (vf->pool) {
+        vf_threadpool_destroy(vf->pool);
+        vf->pool = NULL;
+    }
+    if (num_threads > 0)
+        vf->pool = vf_threadpool_create(num_threads);
 }
 
 /* =========================================================================
@@ -496,6 +508,154 @@ static bool split_leaf(verkle_flat_t *vf,
 
 /* =========================================================================
  * Process Stem — Update leaf commitments
+ * ========================================================================= */
+
+/* =========================================================================
+ * Parallel stem task — pure Pedersen math, no shared state access
+ * ========================================================================= */
+
+typedef struct {
+    /* Input (read-only, set by main thread) */
+    const stem_group_t *sg;
+    banderwagon_point_t c1, c2, leaf_commit;
+    bool leaf_exists;
+
+    /* Per-suffix old values (pre-loaded by main thread) */
+    uint8_t  old_values[VF_WIDTH][32];
+    bool     had_old[VF_WIDTH];
+    const uint8_t *new_values[VF_WIDTH];  /* pointers into changes[] */
+
+    /* Output (written by worker) */
+    banderwagon_point_t out_c1, out_c2, out_leaf;
+    banderwagon_point_t old_leaf;
+    bool c1_changed, c2_changed;
+    bool success;
+} stem_task_t;
+
+static void stem_task_compute(void *arg) {
+    stem_task_t *t = (stem_task_t *)arg;
+    const stem_group_t *sg = t->sg;
+
+    t->success = true;
+    t->c1_changed = false;
+    t->c2_changed = false;
+
+    if (!t->leaf_exists) {
+        /* New leaf handled by main thread (needs I/O for splits) */
+        t->success = false;
+        return;
+    }
+
+    t->old_leaf = t->leaf_commit;
+    banderwagon_point_t c1 = t->c1, c2 = t->c2;
+    banderwagon_point_t old_c1 = c1, old_c2 = c2;
+    banderwagon_point_t leaf_commit = t->leaf_commit;
+
+    uint8_t c1_deltas[256][32];
+    uint8_t c2_deltas[256][32];
+    int changed_count = 0;
+    bool use_batch = (sg->suffix_count > 2);
+
+    if (use_batch) {
+        memset(c1_deltas, 0, sizeof(c1_deltas));
+        memset(c2_deltas, 0, sizeof(c2_deltas));
+    }
+
+    for (int i = 0; i < sg->suffix_count; i++) {
+        uint8_t suffix = (uint8_t)sg->suffixes[i];
+        const uint8_t *new_value = t->new_values[i];
+        const uint8_t *old_value = t->old_values[i];
+        bool had_old = t->had_old[i];
+
+        if (had_old && memcmp(old_value, new_value, 32) == 0)
+            continue;
+
+        uint8_t old_lo[32] = {0}, new_lo[32] = {0};
+        uint8_t old_hi[32] = {0}, new_hi[32] = {0};
+        memcpy(old_lo, old_value, 16);
+        memcpy(new_lo, new_value, 16);
+        new_lo[16] = 1;
+        if (had_old) old_lo[16] = 1;
+        memcpy(old_hi, old_value + 16, 16);
+        memcpy(new_hi, new_value + 16, 16);
+
+        uint8_t delta_lo[32], delta_hi[32];
+        pedersen_scalar_diff(delta_lo, new_lo, old_lo);
+        pedersen_scalar_diff(delta_hi, new_hi, old_hi);
+
+        if (use_batch) {
+            if (suffix < 128) {
+                memcpy(c1_deltas[2 * suffix], delta_lo, 32);
+                memcpy(c1_deltas[2 * suffix + 1], delta_hi, 32);
+                t->c1_changed = true;
+            } else {
+                int rel = suffix - 128;
+                memcpy(c2_deltas[2 * rel], delta_lo, 32);
+                memcpy(c2_deltas[2 * rel + 1], delta_hi, 32);
+                t->c2_changed = true;
+            }
+        } else {
+            if (suffix < 128) {
+                pedersen_update(&c1, &c1, 2 * suffix, delta_lo);
+                pedersen_update(&c1, &c1, 2 * suffix + 1, delta_hi);
+                t->c1_changed = true;
+            } else {
+                int rel = suffix - 128;
+                pedersen_update(&c2, &c2, 2 * rel, delta_lo);
+                pedersen_update(&c2, &c2, 2 * rel + 1, delta_hi);
+                t->c2_changed = true;
+            }
+        }
+        changed_count++;
+    }
+
+    if (use_batch && changed_count > 0) {
+        if (t->c1_changed) {
+            banderwagon_point_t c1_delta;
+            pedersen_commit(&c1_delta, c1_deltas, 256);
+            banderwagon_add(&c1, &old_c1, &c1_delta);
+        }
+        if (t->c2_changed) {
+            banderwagon_point_t c2_delta;
+            pedersen_commit(&c2_delta, c2_deltas, 256);
+            banderwagon_add(&c2, &old_c2, &c2_delta);
+        }
+    }
+
+    /* Update leaf commitment */
+    if (t->c1_changed && t->c2_changed) {
+        const banderwagon_point_t *pts[4] = { &old_c1, &c1, &old_c2, &c2 };
+        uint8_t f[4][32];
+        banderwagon_batch_map_to_field(f, pts, 4);
+        uint8_t delta[32];
+        pedersen_scalar_diff(delta, f[1], f[0]);
+        pedersen_update(&leaf_commit, &leaf_commit, 2, delta);
+        pedersen_scalar_diff(delta, f[3], f[2]);
+        pedersen_update(&leaf_commit, &leaf_commit, 3, delta);
+    } else if (t->c1_changed) {
+        const banderwagon_point_t *pts[2] = { &old_c1, &c1 };
+        uint8_t f[2][32];
+        banderwagon_batch_map_to_field(f, pts, 2);
+        uint8_t delta[32];
+        pedersen_scalar_diff(delta, f[1], f[0]);
+        pedersen_update(&leaf_commit, &leaf_commit, 2, delta);
+    } else if (t->c2_changed) {
+        const banderwagon_point_t *pts[2] = { &old_c2, &c2 };
+        uint8_t f[2][32];
+        banderwagon_batch_map_to_field(f, pts, 2);
+        uint8_t delta[32];
+        pedersen_scalar_diff(delta, f[1], f[0]);
+        pedersen_update(&leaf_commit, &leaf_commit, 3, delta);
+    }
+
+    t->out_c1 = c1;
+    t->out_c2 = c2;
+    t->out_leaf = leaf_commit;
+}
+
+/* =========================================================================
+ * Process Stem (original — handles both cases, used for single-thread
+ * and for new-leaf fallback from parallel path)
  * ========================================================================= */
 
 static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
@@ -922,102 +1082,245 @@ bool verkle_flat_commit_block(verkle_flat_t *vf) {
     if (!prop) { free(groups); return false; }
     int prop_count = 0;
 
-    for (int g = 0; g < group_count; g++) {
-        banderwagon_point_t old_leaf, new_leaf;
+    /* Parallel path: prepare tasks for existing leaves on main thread,
+     * dispatch Pedersen math to worker pool, handle new leaves sequentially. */
+    stem_task_t *tasks = NULL;
+    int *attach_depths = NULL;
+    bool *is_new_leaf = NULL;
 
-        /* Check if leaf already exists (Case A handled inside process_stem) */
-        banderwagon_point_t dummy_c1, dummy_c2, dummy_lc;
-        bool leaf_exists = vcs_get_leaf(vf->commit_store, groups[g].stem,
-                                         &dummy_c1, &dummy_c2, &dummy_lc);
+    if (vf->pool && group_count > 1) {
+        tasks = calloc(group_count, sizeof(stem_task_t));
+        attach_depths = calloc(group_count, sizeof(int));
+        is_new_leaf = calloc(group_count, sizeof(bool));
+    }
 
-        /* Find effective attach depth (handles in-block split gaps) */
-        int attach_depth = find_effective_attach_depth(vf, groups[g].stem);
-        bool did_split = false;
+    if (tasks) {
+        /* --- Parallel path --- */
 
-        if (!leaf_exists) {
-            /* New leaf — check for collision at attach_depth */
-            uint8_t occupant_stem[31];
-            if (slot_get(vf, attach_depth,
-                         (attach_depth > 0) ? groups[g].stem : NULL,
-                         groups[g].stem[attach_depth],
-                         occupant_stem))
-            {
-                /* Collision! Different stem occupies this slot */
-                int diverge_depth;
-                banderwagon_point_t chain_top_commit, existing_leaf_commit;
-                if (!split_leaf(vf, occupant_stem, groups[g].stem,
-                                attach_depth, &diverge_depth,
-                                &chain_top_commit, &existing_leaf_commit))
+        /* Phase A: Main thread — pre-load data, submit existing-leaf tasks */
+        for (int g = 0; g < group_count; g++) {
+            banderwagon_point_t c1, c2, lc;
+            bool leaf_exists = vcs_get_leaf(vf->commit_store, groups[g].stem,
+                                             &c1, &c2, &lc);
+            attach_depths[g] = find_effective_attach_depth(vf, groups[g].stem);
+
+            if (!leaf_exists) {
+                /* Handle splits on main thread */
+                is_new_leaf[g] = true;
+                uint8_t occupant_stem[31];
+                if (slot_get(vf, attach_depths[g],
+                             (attach_depths[g] > 0) ? groups[g].stem : NULL,
+                             groups[g].stem[attach_depths[g]], occupant_stem))
+                {
+                    int diverge_depth;
+                    banderwagon_point_t chain_top, existing_lc;
+                    if (!split_leaf(vf, occupant_stem, groups[g].stem,
+                                    attach_depths[g], &diverge_depth,
+                                    &chain_top, &existing_lc))
+                    {
+                        free(tasks); free(attach_depths); free(is_new_leaf);
+                        free(groups); free(prop);
+                        return false;
+                    }
+                    if (prop_count + 2 >= prop_cap) {
+                        prop_cap = prop_cap * 2 + 64;
+                        prop = realloc(prop, prop_cap * sizeof(prop_entry_t));
+                    }
+                    prop_entry_t *pe1 = &prop[prop_count++];
+                    pe1->depth = attach_depths[g];
+                    if (attach_depths[g] > 0)
+                        memcpy(pe1->path, groups[g].stem, attach_depths[g]);
+                    pe1->child_idx = groups[g].stem[attach_depths[g]];
+                    pe1->old_child = existing_lc;
+                    pe1->new_child = chain_top;
+                    attach_depths[g] = diverge_depth;
+                }
+                continue;
+            }
+
+            /* Existing leaf — prepare task */
+            is_new_leaf[g] = false;
+            stem_task_t *t = &tasks[g];
+            t->sg = &groups[g];
+            t->c1 = c1;
+            t->c2 = c2;
+            t->leaf_commit = lc;
+            t->leaf_exists = true;
+
+            /* Pre-load old values (main thread I/O) */
+            for (int i = 0; i < groups[g].suffix_count; i++) {
+                uint8_t full_key[32];
+                memcpy(full_key, groups[g].stem, 31);
+                full_key[31] = (uint8_t)groups[g].suffixes[i];
+                t->had_old[i] = disk_table_get(vf->value_store, full_key,
+                                                t->old_values[i]);
+                t->new_values[i] = vf->changes[groups[g].change_idx[i]].new_value;
+            }
+
+            /* Submit to pool */
+            vf_threadpool_submit(vf->pool, stem_task_compute, t);
+        }
+
+        /* Wait for all existing-leaf tasks */
+        vf_threadpool_wait(vf->pool);
+
+        /* Phase B: Collect results + handle new leaves sequentially */
+        for (int g = 0; g < group_count; g++) {
+            banderwagon_point_t old_leaf, new_leaf;
+
+            if (is_new_leaf[g]) {
+                /* New leaf — process sequentially (I/O + MSM) */
+                if (!process_stem(vf, &groups[g], &old_leaf, &new_leaf)) {
+                    free(tasks); free(attach_depths); free(is_new_leaf);
+                    free(groups); free(prop);
+                    return false;
+                }
+            } else {
+                stem_task_t *t = &tasks[g];
+                old_leaf = t->old_leaf;
+                new_leaf = t->out_leaf;
+
+                /* Record undo + write results (main thread I/O) */
+                if (!record_leaf_undo(vf, groups[g].stem, true,
+                                       &t->c1, &t->c2, &t->leaf_commit))
+                {
+                    free(tasks); free(attach_depths); free(is_new_leaf);
+                    free(groups); free(prop);
+                    return false;
+                }
+                vcs_put_leaf(vf->commit_store, groups[g].stem,
+                             &t->out_c1, &t->out_c2, &t->out_leaf);
+
+                /* Write new values to value store */
+                for (int i = 0; i < groups[g].suffix_count; i++) {
+                    if (t->had_old[i] &&
+                        memcmp(t->old_values[i], t->new_values[i], 32) == 0)
+                        continue;
+                    uint8_t full_key[32];
+                    memcpy(full_key, groups[g].stem, 31);
+                    full_key[31] = (uint8_t)groups[g].suffixes[i];
+                    disk_table_put(vf->value_store, full_key, t->new_values[i]);
+                }
+            }
+
+            /* Record slot entry for new leaves */
+            if (is_new_leaf[g]) {
+                int ad = attach_depths[g];
+                uint8_t old_slot_stem[31];
+                bool had = slot_get(vf, ad,
+                                     (ad > 0) ? groups[g].stem : NULL,
+                                     groups[g].stem[ad], old_slot_stem);
+                if (!record_slot_undo(vf, ad,
+                                       (ad > 0) ? groups[g].stem : NULL,
+                                       groups[g].stem[ad], had, old_slot_stem))
+                {
+                    free(tasks); free(attach_depths); free(is_new_leaf);
+                    free(groups); free(prop);
+                    return false;
+                }
+                slot_put(vf, ad, (ad > 0) ? groups[g].stem : NULL,
+                         groups[g].stem[ad], groups[g].stem);
+            }
+
+            /* Grow prop array if needed */
+            if (prop_count + 1 >= prop_cap) {
+                prop_cap = prop_cap * 2 + 64;
+                prop = realloc(prop, prop_cap * sizeof(prop_entry_t));
+            }
+
+            /* Prop entry for this leaf */
+            int ad = attach_depths[g];
+            prop_entry_t *pe = &prop[prop_count++];
+            pe->depth = ad;
+            if (ad > 0)
+                memcpy(pe->path, groups[g].stem, ad);
+            pe->child_idx = groups[g].stem[ad];
+            pe->old_child = is_new_leaf[g] ? BANDERWAGON_IDENTITY : old_leaf;
+            pe->new_child = new_leaf;
+        }
+
+        free(tasks);
+        free(attach_depths);
+        free(is_new_leaf);
+
+    } else {
+        /* --- Sequential path (no pool or single group) --- */
+        for (int g = 0; g < group_count; g++) {
+            banderwagon_point_t old_leaf, new_leaf;
+
+            banderwagon_point_t dummy_c1, dummy_c2, dummy_lc;
+            bool leaf_exists = vcs_get_leaf(vf->commit_store, groups[g].stem,
+                                             &dummy_c1, &dummy_c2, &dummy_lc);
+            int attach_depth = find_effective_attach_depth(vf, groups[g].stem);
+            bool did_split = false;
+
+            if (!leaf_exists) {
+                uint8_t occupant_stem[31];
+                if (slot_get(vf, attach_depth,
+                             (attach_depth > 0) ? groups[g].stem : NULL,
+                             groups[g].stem[attach_depth], occupant_stem))
+                {
+                    int diverge_depth;
+                    banderwagon_point_t chain_top, existing_lc;
+                    if (!split_leaf(vf, occupant_stem, groups[g].stem,
+                                    attach_depth, &diverge_depth,
+                                    &chain_top, &existing_lc))
+                    {
+                        free(groups); free(prop);
+                        return false;
+                    }
+                    did_split = true;
+                    if (prop_count + 2 >= prop_cap) {
+                        prop_cap = prop_cap * 2 + 64;
+                        prop = realloc(prop, prop_cap * sizeof(prop_entry_t));
+                    }
+                    prop_entry_t *pe1 = &prop[prop_count++];
+                    pe1->depth = attach_depth;
+                    if (attach_depth > 0)
+                        memcpy(pe1->path, groups[g].stem, attach_depth);
+                    pe1->child_idx = groups[g].stem[attach_depth];
+                    pe1->old_child = existing_lc;
+                    pe1->new_child = chain_top;
+                    attach_depth = diverge_depth;
+                }
+            }
+
+            if (!process_stem(vf, &groups[g], &old_leaf, &new_leaf)) {
+                free(groups); free(prop);
+                return false;
+            }
+
+            if (!leaf_exists) {
+                uint8_t old_slot_stem[31];
+                bool had = slot_get(vf, attach_depth,
+                                     (attach_depth > 0) ? groups[g].stem : NULL,
+                                     groups[g].stem[attach_depth], old_slot_stem);
+                if (!record_slot_undo(vf, attach_depth,
+                                       (attach_depth > 0) ? groups[g].stem : NULL,
+                                       groups[g].stem[attach_depth],
+                                       had, old_slot_stem))
                 {
                     free(groups); free(prop);
                     return false;
                 }
-                did_split = true;
-
-                /* Grow prop array if needed */
-                if (prop_count + 2 >= prop_cap) {
-                    prop_cap = prop_cap * 2 + 64;
-                    prop_entry_t *tmp = realloc(prop, prop_cap * sizeof(prop_entry_t));
-                    if (!tmp) { free(groups); return false; }
-                    prop = tmp;
-                }
-
-                /* Prop entry 1: at attach_depth, replace leaf with chain top */
-                prop_entry_t *pe1 = &prop[prop_count++];
-                pe1->depth = attach_depth;
-                if (attach_depth > 0)
-                    memcpy(pe1->path, groups[g].stem, attach_depth);
-                pe1->child_idx = groups[g].stem[attach_depth];
-                pe1->old_child = existing_leaf_commit;
-                pe1->new_child = chain_top_commit;
-
-                /* Update attach_depth for the new leaf */
-                attach_depth = diverge_depth;
+                slot_put(vf, attach_depth,
+                         (attach_depth > 0) ? groups[g].stem : NULL,
+                         groups[g].stem[attach_depth], groups[g].stem);
             }
-        }
 
-        /* Process the stem group (Case A or Case B) */
-        if (!process_stem(vf, &groups[g], &old_leaf, &new_leaf)) {
-            free(groups); free(prop);
-            return false;
-        }
-
-        /* Record slot entry for new leaves */
-        if (!leaf_exists) {
-            uint8_t old_slot_stem[31];
-            bool had = slot_get(vf, attach_depth,
-                                 (attach_depth > 0) ? groups[g].stem : NULL,
-                                 groups[g].stem[attach_depth],
-                                 old_slot_stem);
-            if (!record_slot_undo(vf, attach_depth,
-                                   (attach_depth > 0) ? groups[g].stem : NULL,
-                                   groups[g].stem[attach_depth],
-                                   had, old_slot_stem))
-            {
-                free(groups); free(prop);
-                return false;
+            if (prop_count + 1 >= prop_cap) {
+                prop_cap = prop_cap * 2 + 64;
+                prop = realloc(prop, prop_cap * sizeof(prop_entry_t));
             }
-            slot_put(vf, attach_depth,
-                     (attach_depth > 0) ? groups[g].stem : NULL,
-                     groups[g].stem[attach_depth], groups[g].stem);
-        }
 
-        /* Grow prop array if needed */
-        if (prop_count + 1 >= prop_cap) {
-            prop_cap = prop_cap * 2 + 64;
-            prop_entry_t *tmp = realloc(prop, prop_cap * sizeof(prop_entry_t));
-            if (!tmp) { free(groups); return false; }
-            prop = tmp;
+            prop_entry_t *pe = &prop[prop_count++];
+            pe->depth = attach_depth;
+            if (attach_depth > 0)
+                memcpy(pe->path, groups[g].stem, attach_depth);
+            pe->child_idx = groups[g].stem[attach_depth];
+            pe->old_child = did_split ? BANDERWAGON_IDENTITY : old_leaf;
+            pe->new_child = new_leaf;
         }
-
-        /* Prop entry for this leaf */
-        prop_entry_t *pe = &prop[prop_count++];
-        pe->depth = attach_depth;
-        if (attach_depth > 0)
-            memcpy(pe->path, groups[g].stem, attach_depth);
-        pe->child_idx = groups[g].stem[attach_depth];
-        pe->old_child = did_split ? BANDERWAGON_IDENTITY : old_leaf;
-        pe->new_child = new_leaf;
     }
 
     free(groups);

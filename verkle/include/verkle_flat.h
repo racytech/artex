@@ -62,12 +62,18 @@ typedef struct {
     uint64_t block_number;
 } vf_block_t;
 
+/* Forward declaration */
+typedef struct vf_threadpool vf_threadpool_t;
+
 /** Main handle. */
 typedef struct {
     /* Stores (owned) */
     disk_table_t            *value_store;
     verkle_commit_store_t   *commit_store;
     disk_table_t            *slot_store;    /* (depth,path,slot) → occupant stem */
+
+    /* Thread pool for parallel stem processing (NULL = single-threaded) */
+    vf_threadpool_t         *pool;
 
     /* Current block changes */
     vf_change_t  *changes;
@@ -150,6 +156,16 @@ void verkle_flat_root_hash(const verkle_flat_t *vf, uint8_t out[32]);
 
 /** Flush all stores to disk. */
 void verkle_flat_sync(verkle_flat_t *vf);
+
+/* =========================================================================
+ * Parallelism
+ * ========================================================================= */
+
+/**
+ * Enable parallel stem processing with `num_threads` workers.
+ * Call after create/open. 0 = single-threaded (default).
+ */
+void verkle_flat_set_threads(verkle_flat_t *vf, int num_threads);
 
 #ifdef __cplusplus
 }

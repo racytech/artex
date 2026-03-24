@@ -148,8 +148,9 @@ if(ENABLE_VERKLE_BUILD)
     # Verkle flat updater (disk-backed commitment updates, O(block) RAM)
     add_library(verkle_flat STATIC
         verkle/src/verkle_flat.c
+        verkle/src/vf_threadpool.c
     )
-    target_link_libraries(verkle_flat verkle_commit_store disk_table pedersen banderwagon)
+    target_link_libraries(verkle_flat verkle_commit_store disk_table pedersen banderwagon pthread)
 
     # Verkle state (typed account/storage interface over flat updater)
     add_library(verkle_state STATIC
