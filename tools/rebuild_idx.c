@@ -6,12 +6,15 @@
  * a fresh disk_table .idx file.
  *
  * Usage:
- *   rebuild_idx <base_path> [--verify] [--dry-run] [--capacity N]
+ *   rebuild_idx <base_path> [--verify] [--dry-run] [--capacity N] [--shared]
  *
  * <base_path> is the prefix for .dat/.idx/.free files.
- * --verify: compare rebuilt .idx against existing .idx (does not overwrite)
- * --dry-run: scan and report stats without writing any files
+ * --verify:    compare rebuilt .idx against existing .idx (does not overwrite)
+ * --dry-run:   scan and report stats without writing any files
  * --capacity N: set hash table capacity (default: node_count)
+ * --shared:    set refcount to UINT32_MAX for shared-mode stores (storage trie).
+ *              Without this, refcounts are set to 1 which breaks shared nodes
+ *              when chain_replay resumes and modifies the trie.
  */
 
 #include "disk_table.h"
@@ -253,12 +256,14 @@ static int cmp_sort_by_bucket(const void *a, const void *b) {
 int main(int argc, char **argv) {
     bool verify  = false;
     bool dry_run = false;
+    bool shared  = false;
     uint64_t capacity_override = 0;
     const char *base_path = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--verify") == 0) verify = true;
         else if (strcmp(argv[i], "--dry-run") == 0) dry_run = true;
+        else if (strcmp(argv[i], "--shared") == 0) shared = true;
         else if (strcmp(argv[i], "--capacity") == 0 && i + 1 < argc) {
             capacity_override = strtoull(argv[++i], NULL, 10);
         }
@@ -270,8 +275,9 @@ int main(int argc, char **argv) {
     }
 
     if (!base_path) {
-        fprintf(stderr, "Usage: rebuild_idx <base_path> [--verify] [--dry-run] [--capacity N]\n");
+        fprintf(stderr, "Usage: rebuild_idx <base_path> [--verify] [--dry-run] [--capacity N] [--shared]\n");
         fprintf(stderr, "  --capacity N  Set hash table capacity (default: node_count, i.e. tight fit)\n");
+        fprintf(stderr, "  --shared      Set refcount to max (for shared storage trie stores)\n");
         return 1;
     }
 
@@ -485,13 +491,14 @@ int main(int argc, char **argv) {
            (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) / 1e9);
 
     /* Insert in bucket order */
+    uint32_t refcount = shared ? UINT32_MAX : 1;
     uint64_t inserted = 0;
     for (uint64_t i = 0; i < node_count; i++) {
         uint64_t ni = sort_buf[i].idx;
         node_record_t rec = {
             .offset   = nodes[ni].offset,
             .length   = nodes[ni].length,
-            .refcount = 1,
+            .refcount = refcount,
         };
         if (disk_table_put(dh, nodes[ni].hash, &rec))
             inserted++;
@@ -534,7 +541,7 @@ int main(int argc, char **argv) {
                     node_record_t new_rec = {
                         .offset = nodes[i].offset,
                         .length = nodes[i].length,
-                        .refcount = 1,
+                        .refcount = refcount,
                     };
                     if (orig_rec.offset == new_rec.offset &&
                         orig_rec.length == new_rec.length) {
