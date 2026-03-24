@@ -15,11 +15,11 @@ set(ENABLE_HISTORY ON)
 set(ENABLE_VERKLE_BUILD OFF)
 
 # MPT disk_table capacity hints (pre-allocated hash table slots)
-set(MPT_ACCOUNT_CAPACITY  500000000)  # account trie (~500M for mainnet)
-set(MPT_STORAGE_CAPACITY  4000000000)  # storage trie (~4B for mainnet)
+set(MPT_ACCOUNT_CAPACITY  300000000)  # ~20GB idx, overflows ~block 15-18M
+set(MPT_STORAGE_CAPACITY  2000000000)  # ~130GB idx, overflows ~block 18-20M
 
 # MPT node cache sizes (LRU, in bytes)
-set(MPT_ACCOUNT_CACHE_BYTES  0)           # disabled — account trie is fast without cache
+set(MPT_ACCOUNT_CACHE_BYTES  0)           # disabled — eviction bug under investigation
 set(MPT_STORAGE_CACHE_BYTES  8589934592)  # 8 GB
 
 # Checkpoint interval (blocks between auto-saves)
@@ -27,4 +27,4 @@ set(CHECKPOINT_INTERVAL 256)
 
 # Debug instrumentation (trace, prestate dump, etc.)
 set(ENABLE_DEBUG OFF)
-set(ENABLE_EVM_TRACE OFF)
+set(ENABLE_EVM_TRACE ON)

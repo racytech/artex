@@ -132,19 +132,9 @@ static void ht_remove(node_cache_t *nc, nc_entry_t *e) {
  * ========================================================================= */
 
 static void evict_one(node_cache_t *nc) {
-    /* O(1) eviction via evict_tail pointer — skips pinned entries */
-    nc_entry_t *victim = nc->evict_tail;
-
-    if (!victim) {
-        /* All entries are pinned — evict true tail as fallback */
-        victim = nc->lru_tail;
-        if (!victim) return;
-    }
-
-    /* Advance evict_tail before unlinking */
-    nc->evict_tail = victim->lru_prev;
-    while (nc->evict_tail && nc->evict_tail->depth <= NC_PIN_DEPTH)
-        nc->evict_tail = nc->evict_tail->lru_prev;
+    /* Plain LRU eviction — evict tail entry */
+    nc_entry_t *victim = nc->lru_tail;
+    if (!victim) return;
 
     lru_unlink(nc, victim);
     ht_remove(nc, victim);
@@ -216,7 +206,6 @@ void node_cache_clear(node_cache_t *nc) {
 
     nc->lru_head = NULL;
     nc->lru_tail = NULL;
-    nc->evict_tail = NULL;
     nc->used_bytes = 0;
     nc->entry_count = 0;
 
@@ -238,20 +227,9 @@ uint32_t node_cache_get(node_cache_t *nc, const uint8_t hash[32],
 
     nc->hits++;
 
-    /* Move to front (most recently used).
-     * If this was the evict_tail, advance it first. */
-    if (e == nc->evict_tail) {
-        nc->evict_tail = e->lru_prev;
-        while (nc->evict_tail && nc->evict_tail->depth <= NC_PIN_DEPTH)
-            nc->evict_tail = nc->evict_tail->lru_prev;
-    }
+    /* Move to front (most recently used) */
     lru_unlink(nc, e);
     lru_push_front(nc, e);
-
-    /* Unpinned entry moved to head — it's now the newest candidate.
-     * If evict_tail was NULL, this entry becomes the new evict_tail. */
-    if (!nc->evict_tail && e->depth > NC_PIN_DEPTH)
-        nc->evict_tail = e;
 
     if (buf && buf_len >= e->rlp_len)
         memcpy(buf, e->rlp, e->rlp_len);
@@ -291,10 +269,6 @@ void node_cache_put(node_cache_t *nc, const uint8_t hash[32],
     ht_insert(nc, e);
     lru_push_front(nc, e);
 
-    /* New unpinned entry — if no evict_tail, this is it */
-    if (!nc->evict_tail && depth > NC_PIN_DEPTH)
-        nc->evict_tail = e;
-
     nc->used_bytes += ENTRY_SIZE;
     nc->entry_count++;
 }
@@ -302,12 +276,6 @@ void node_cache_put(node_cache_t *nc, const uint8_t hash[32],
 void node_cache_remove(node_cache_t *nc, const uint8_t hash[32]) {
     nc_entry_t *e = ht_find(nc, hash);
     if (!e) return;
-
-    if (e == nc->evict_tail) {
-        nc->evict_tail = e->lru_prev;
-        while (nc->evict_tail && nc->evict_tail->depth <= NC_PIN_DEPTH)
-            nc->evict_tail = nc->evict_tail->lru_prev;
-    }
 
     lru_unlink(nc, e);
     ht_remove(nc, e);
