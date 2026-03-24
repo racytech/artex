@@ -416,7 +416,10 @@ static void usage(const char *prog) {
         "\n"
         "Options:\n"
         "  --resume              Resume from existing snapshot (reads .meta)\n"
-        "  --commit-interval N   Commit + sync every N blocks (default: 256)\n",
+        "  --commit-interval N   Sync to disk every N blocks (default: 256)\n"
+        "  --batch-commit N      Commit Verkle tree every N blocks (default: 1)\n"
+        "                        Higher = faster (fewer Pedersen commits),\n"
+        "                        but uses more memory for buffered changes.\n",
         prog);
 }
 
@@ -432,12 +435,16 @@ int main(int argc, char *argv[]) {
     bool        has_target   = false;
     bool        resume_mode  = false;
     uint64_t    commit_interval = 256;
+    uint64_t    batch_commit = 1;
 
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--resume") == 0) {
             resume_mode = true;
         } else if (strcmp(argv[i], "--commit-interval") == 0 && i + 1 < argc) {
             commit_interval = strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--batch-commit") == 0 && i + 1 < argc) {
+            batch_commit = strtoull(argv[++i], NULL, 10);
+            if (batch_commit == 0) batch_commit = 1;
         } else if (argv[i][0] != '-') {
             target_block = strtoull(argv[i], NULL, 10);
             has_target = true;
@@ -491,6 +498,7 @@ int main(int argc, char *argv[]) {
 
     printf("Target block:    %lu\n", target_block);
     printf("Commit interval: %lu blocks\n", commit_interval);
+    printf("Batch commit:    %lu blocks\n", batch_commit);
     printf("Value store:     %s\n", val_dir);
     printf("Commit store:    %s\n", comm_dir);
     printf("Code store:      %s (existing)\n", code_path);
@@ -609,6 +617,8 @@ int main(int argc, char *argv[]) {
     double t0 = now_sec();
     uint64_t applied = 0;
 
+    bool block_open = false;
+
     for (uint64_t bn = start_block; bn <= target_block && !g_stop; bn++) {
         block_diff_t diff;
         if (!state_history_get_diff(sh, bn, &diff)) {
@@ -616,14 +626,29 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        verkle_state_begin_block(vs, bn);
+        /* Open a verkle block if not already open */
+        if (!block_open) {
+            verkle_state_begin_block(vs, bn);
+            block_open = true;
+        }
+
         apply_diff_to_verkle(vs, cs, &tracker, &diff);
-        verkle_state_commit_block(vs);
         block_diff_free(&diff);
         applied++;
 
+        /* Commit the verkle block every batch_commit blocks */
+        if (applied % batch_commit == 0 || bn == target_block) {
+            verkle_state_commit_block(vs);
+            block_open = false;
+        }
+
         /* Periodic sync + progress */
         if (bn % commit_interval == 0) {
+            /* Ensure block is committed before sync */
+            if (block_open) {
+                verkle_state_commit_block(vs);
+                block_open = false;
+            }
             verkle_state_sync(vs);
 
             if (bn % (commit_interval * 40) == 0) {
@@ -643,6 +668,11 @@ int main(int argc, char *argv[]) {
                    bn, target_block, applied, bps, eta);
             fflush(stdout);
         }
+    }
+
+    /* Commit any remaining open block */
+    if (block_open) {
+        verkle_state_commit_block(vs);
     }
 
     double elapsed = now_sec() - t0;
