@@ -475,6 +475,10 @@ target_link_libraries(bench_mpt_store mpt_store common)
 add_executable(rebuild_idx tools/rebuild_idx.c)
 target_link_libraries(rebuild_idx disk_table common)
 
+# Tool: convert .idx from disk_hash to disk_table format
+add_executable(convert_idx tools/convert_idx.c)
+target_link_libraries(convert_idx disk_hash disk_table)
+
 # Tool: verify MPT store hashes from root
 add_executable(verify_mpt tools/verify_mpt.c)
 target_link_libraries(verify_mpt mpt_store common)
