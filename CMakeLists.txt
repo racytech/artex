@@ -462,6 +462,11 @@ add_test(NAME test_mpt_store_vectors
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+# Test: Node cache (two-list LRU with pinning)
+add_executable(test_node_cache database/tests/test_node_cache.c)
+target_link_libraries(test_node_cache node_cache)
+add_test(NAME test_node_cache COMMAND test_node_cache)
+
 add_executable(test_mpt_store_refcount
     database/tests/test_mpt_store_refcount.c
 )
