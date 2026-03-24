@@ -528,6 +528,10 @@ static bool process_stem(verkle_flat_t *vf, const stem_group_t *sg,
             full_key[31] = suffix;
             bool had_old = disk_table_get(vf->value_store, full_key, old_value);
 
+            /* Skip if value unchanged — avoids 2 scalar diffs + 2 scalar muls */
+            if (had_old && memcmp(old_value, new_value, 32) == 0)
+                continue;
+
             /* Split into lo/hi 16-byte halves with EIP-6800 leaf marker */
             uint8_t old_lo[32] = {0}, new_lo[32] = {0};
             uint8_t old_hi[32] = {0}, new_hi[32] = {0};
