@@ -76,6 +76,20 @@ void mpt_store_sync(mpt_store_t *ms);
 void mpt_store_flush(mpt_store_t *ms);
 
 /* =========================================================================
+ * Prefetch
+ * ========================================================================= */
+
+/**
+ * Hint the OS to prefetch a trie node's data pages into the page cache.
+ * Non-blocking: returns immediately. The node data will be available
+ * without a page fault when load_node_rlp reads it later.
+ *
+ * Use this to overlap I/O with computation — e.g., prefetch the next
+ * account's storage root while committing the current account's batch.
+ */
+void mpt_store_prefetch(const mpt_store_t *ms, const uint8_t hash[32]);
+
+/* =========================================================================
  * Trie Root
  * ========================================================================= */
 

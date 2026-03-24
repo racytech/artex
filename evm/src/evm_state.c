@@ -2801,6 +2801,15 @@ static void compute_all_storage_roots(evm_state_t *es) {
             &es->accounts, sv.entries[start].addr, 20, NULL);
         if (!ca) continue;
 
+        // Prefetch next account's storage root while we process this one
+        if (i < sv.count) {
+            size_t next_start = i;
+            cached_account_t *next_ca = (cached_account_t *)mem_art_get_mut(
+                &es->accounts, sv.entries[next_start].addr, 20, NULL);
+            if (next_ca)
+                mpt_store_prefetch(es->storage_mpt, next_ca->storage_root.bytes);
+        }
+
         // Load this account's storage root into the shared store
         mpt_store_set_root(es->storage_mpt, ca->storage_root.bytes);
         if (!mpt_store_begin_batch(es->storage_mpt)) {

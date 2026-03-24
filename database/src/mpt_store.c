@@ -1442,6 +1442,33 @@ void mpt_store_reset(mpt_store_t *ms) {
         bloom_filter_clear(ms->bloom);
 }
 
+void mpt_store_prefetch(const mpt_store_t *ms, const uint8_t hash[32]) {
+    if (!ms || !hash) return;
+
+    /* Check if already in node cache — no prefetch needed */
+    if (ms->ncache_enabled) {
+        uint32_t len = node_cache_get((node_cache_t *)&ms->ncache, hash,
+                                       NULL, 0);
+        if (len > 0) return;
+    }
+
+    /* Look up index to find .dat offset */
+    node_record_t rec;
+    if (!disk_table_get(ms->index, hash, &rec)) return;
+    if (rec.length == 0 || rec.length > MAX_NODE_RLP) return;
+
+    /* Prefetch the .dat page containing this node */
+    size_t dat_off = PAGE_SIZE + rec.offset;
+    if (dat_off + rec.length > ms->data_mapped) return;
+
+    /* MADV_WILLNEED tells the kernel to start reading this page
+     * into the page cache asynchronously */
+    size_t page_start = dat_off & ~(size_t)4095;
+    size_t page_end = (dat_off + rec.length + 4095) & ~(size_t)4095;
+    madvise((void *)(ms->data_base + page_start), page_end - page_start,
+            MADV_WILLNEED);
+}
+
 void mpt_store_sync(mpt_store_t *ms) {
     if (!ms) return;
     write_header_dat(ms);
