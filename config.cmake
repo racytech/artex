@@ -19,7 +19,7 @@ set(MPT_ACCOUNT_CAPACITY  300000000)  # ~20GB idx, overflows ~block 15-18M
 set(MPT_STORAGE_CAPACITY  2000000000)  # ~130GB idx, overflows ~block 18-20M
 
 # MPT node cache sizes (LRU, in bytes)
-set(MPT_ACCOUNT_CACHE_BYTES  2147483648)  # 2 GB
+set(MPT_ACCOUNT_CACHE_BYTES  0)           # disabled — hit rate too low at scale
 set(MPT_STORAGE_CACHE_BYTES  8589934592)  # 8 GB
 
 # Checkpoint interval (blocks between auto-saves)
