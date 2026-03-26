@@ -400,31 +400,10 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
                                  memcmp(frec.code_hash, HASH_EMPTY_CODE.bytes, 32) != 0);
             ca_local.existed = true;
             es->flat_acct_hit++;
-            goto account_loaded;
-        }
-        es->flat_acct_miss++;
-    }
-    // Slow path: MPT trie traversal (5-10 node reads)
-    if (es->account_mpt) {
-        uint8_t rlp_buf[256];
-        uint32_t rlp_len = mpt_store_get(es->account_mpt, ca_local.addr_hash.bytes,
-                                          rlp_buf, sizeof(rlp_buf));
-        if (rlp_len > 0 && rlp_len <= sizeof(rlp_buf)) {
-            mpt_rlp_decode_account(rlp_buf, rlp_len, &ca_local);
-            // Backfill flat state so next lookup is O(1)
-            if (es->flat_state) {
-                flat_account_record_t frec;
-                frec.nonce = ca_local.nonce;
-                uint256_to_bytes(&ca_local.balance, frec.balance);
-                const uint8_t *ch = ca_local.has_code
-                    ? ca_local.code_hash.bytes : HASH_EMPTY_CODE.bytes;
-                memcpy(frec.code_hash, ch, 32);
-                memcpy(frec.storage_root, ca_local.storage_root.bytes, 32);
-                flat_state_put_account(es->flat_state, ca_local.addr_hash.bytes, &frec);
-            }
+        } else {
+            es->flat_acct_miss++;
         }
     }
-account_loaded:
 #endif
 
 #if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
@@ -480,33 +459,11 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
                 cs_local.original = uint256_from_bytes(val_be, 32);
                 cs_local.current = cs_local.original;
                 es->flat_stor_hit++;
-                goto slot_loaded;
-            }
-            es->flat_stor_miss++;
-        }
-    }
-    // Slow path: MPT trie traversal (5-10 node reads)
-    if (es->storage_mpt) {
-        cached_account_t *ca = ensure_account(es, addr);
-        if (ca && memcmp(ca->storage_root.bytes, HASH_EMPTY_STORAGE.bytes, 32) != 0) {
-            mpt_store_set_root(es->storage_mpt, ca->storage_root.bytes);
-            uint8_t val_rlp[64];
-            uint32_t val_len = mpt_store_get(es->storage_mpt, cs_local.slot_hash.bytes,
-                                              val_rlp, sizeof(val_rlp));
-            if (val_len > 0 && val_len <= sizeof(val_rlp)) {
-                cs_local.original = mpt_rlp_decode_storage_value(val_rlp, val_len);
-                cs_local.current = cs_local.original;
-                // Backfill flat state so next lookup is O(1)
-                if (es->flat_state) {
-                    uint8_t val_be[32];
-                    uint256_to_bytes(&cs_local.current, val_be);
-                    flat_state_put_storage(es->flat_state, ca->addr_hash.bytes,
-                                           cs_local.slot_hash.bytes, val_be);
-                }
+            } else {
+                es->flat_stor_miss++;
             }
         }
     }
-slot_loaded:
 #endif
 
 #if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
@@ -712,15 +669,20 @@ static bool evict_account_to_flat_cb(const uint8_t *key, size_t key_len,
     evm_state_t *es = (evm_state_t *)user_data;
     cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
 
-    if (ca->existed && es->flat_state) {
-        flat_account_record_t frec;
-        frec.nonce = ca->nonce;
-        uint256_to_bytes(&ca->balance, frec.balance);
-        const uint8_t *ch = ca->has_code
-            ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
-        memcpy(frec.code_hash, ch, 32);
-        memcpy(frec.storage_root, ca->storage_root.bytes, 32);
-        flat_state_put_account(es->flat_state, ca->addr_hash.bytes, &frec);
+    if (es->flat_state) {
+        if (ca->existed) {
+            flat_account_record_t frec;
+            frec.nonce = ca->nonce;
+            uint256_to_bytes(&ca->balance, frec.balance);
+            const uint8_t *ch = ca->has_code
+                ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
+            memcpy(frec.code_hash, ch, 32);
+            memcpy(frec.storage_root, ca->storage_root.bytes, 32);
+            flat_state_put_account(es->flat_state, ca->addr_hash.bytes, &frec);
+        } else {
+            /* Account was deleted/pruned — remove stale entry from flat_state */
+            flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
+        }
     }
 
     free(ca->code);
@@ -740,10 +702,16 @@ static bool evict_slot_to_flat_cb(const uint8_t *key, size_t key_len,
         cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
             &es->accounts, key, ADDRESS_KEY_SIZE, NULL);
         if (ca) {
-            uint8_t val_be[32];
-            uint256_to_bytes(&cs->current, val_be);
-            flat_state_put_storage(es->flat_state, ca->addr_hash.bytes,
-                                    cs->slot_hash.bytes, val_be);
+            if (uint256_is_zero(&cs->current)) {
+                /* Zero value — remove stale entry from flat_state */
+                flat_state_delete_storage(es->flat_state, ca->addr_hash.bytes,
+                                           cs->slot_hash.bytes);
+            } else {
+                uint8_t val_be[32];
+                uint256_to_bytes(&cs->current, val_be);
+                flat_state_put_storage(es->flat_state, ca->addr_hash.bytes,
+                                        cs->slot_hash.bytes, val_be);
+            }
         }
     }
     return true;
