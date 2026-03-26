@@ -240,6 +240,9 @@ struct mpt_store {
 
     /* Commit-batch profiling (accumulates across calls, reset manually) */
     mpt_commit_stats_t cstats;
+
+    /* Page cache management */
+    uint32_t flushes_since_madvise;
 };
 
 /* Callback for disk_table_foreach_key → bloom_filter_add */
@@ -1551,6 +1554,16 @@ void mpt_store_flush(mpt_store_t *ms) {
     /* Write header (root hash, free lists, data_size) to mmap'd page.
      * No msync/disk_table_sync — OS page cache handles writeback. */
     write_header_dat(ms);
+
+    /* 7. Periodically release stale mmap pages to reduce page cache pressure.
+     * Every 8192 blocks (~32 checkpoints), drop all pages so the OS can
+     * reclaim RAM for more useful data. Not every checkpoint — that would
+     * thrash pages needed by the next checkpoint. */
+    ms->flushes_since_madvise++;
+    if (ms->flushes_since_madvise >= 32 && ms->data_base && ms->data_mapped > 0) {
+        madvise(ms->data_base, ms->data_mapped, MADV_DONTNEED);
+        ms->flushes_since_madvise = 0;
+    }
 }
 
 /* =========================================================================
