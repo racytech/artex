@@ -67,6 +67,20 @@ bool flat_state_delete_storage(flat_state_t *fs,
                                 const uint8_t slot_hash[32]);
 
 /* =========================================================================
+ * Batch Operations (sorted by bucket for sequential I/O)
+ * ========================================================================= */
+
+bool flat_state_batch_put_accounts(flat_state_t *fs,
+                                    const uint8_t *addr_hashes,
+                                    const flat_account_record_t *records,
+                                    uint32_t count);
+
+bool flat_state_batch_put_storage(flat_state_t *fs,
+                                   const uint8_t *keys,
+                                   const uint8_t *values,
+                                   uint32_t count);
+
+/* =========================================================================
  * Stats
  * ========================================================================= */
 
