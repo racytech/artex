@@ -34,6 +34,7 @@ typedef struct {
     const char *verkle_value_dir;
     const char *verkle_commit_dir;
     const char *mpt_path;
+    const char *flat_state_path;   /* flat state store (NULL = disabled) */
     const char *code_store_path;   /* contract bytecode store (NULL = no code persistence) */
 
     /* State history (per-block diff tracking, NULL = disabled) */

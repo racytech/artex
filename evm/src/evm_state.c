@@ -4,6 +4,7 @@
 #ifdef ENABLE_MPT
 #include "mpt_store.h"
 #include "code_store.h"
+#include "flat_state.h"
 #endif
 #include <stdlib.h>
 #include <string.h>
@@ -263,6 +264,7 @@ struct evm_state {
     mpt_store_t      *account_mpt;  // persistent incremental account trie
     mpt_store_t      *storage_mpt;  // shared store for all per-account storage tries
     code_store_t     *code_store;   // content-addressed bytecode store (not owned)
+    flat_state_t     *flat_state;   // O(1) disk-backed state (not owned, optional)
     dirty_account_vec_t dirty_accounts; // accounts with mpt_dirty=true
     dirty_slot_vec_t    dirty_slots;    // slots with mpt_dirty=true
     /* Root computation timing (last compute_mpt_root call) */
@@ -271,6 +273,11 @@ struct evm_state {
     size_t              last_root_dirty_count;
     mpt_commit_stats_t  last_stor_commit;
     mpt_commit_stats_t  last_acct_commit;
+    /* Flat state lookup counters (reset per checkpoint window) */
+    uint64_t flat_acct_hit;
+    uint64_t flat_acct_miss;
+    uint64_t flat_stor_hit;
+    uint64_t flat_stor_miss;
 #endif
 };
 
@@ -414,15 +421,43 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
     ca_local.addr_hash = hash_keccak256(addr->bytes, 20);
 
 #ifdef ENABLE_MPT
-    // MPT trie traversal (5-10 node reads)
+    // Fast path: O(1) flat state lookup (single disk_table read, mmap'd)
+    if (es->flat_state) {
+        flat_account_record_t frec;
+        if (flat_state_get_account(es->flat_state, ca_local.addr_hash.bytes, &frec)) {
+            ca_local.nonce = frec.nonce;
+            ca_local.balance = uint256_from_bytes(frec.balance, 32);
+            memcpy(ca_local.code_hash.bytes, frec.code_hash, 32);
+            memcpy(ca_local.storage_root.bytes, frec.storage_root, 32);
+            ca_local.has_code = (memcmp(frec.code_hash, ((hash_t){0}).bytes, 32) != 0 &&
+                                 memcmp(frec.code_hash, HASH_EMPTY_CODE.bytes, 32) != 0);
+            ca_local.existed = true;
+            es->flat_acct_hit++;
+            goto account_loaded;
+        }
+        es->flat_acct_miss++;
+    }
+    // Slow path: MPT trie traversal (5-10 node reads)
     if (es->account_mpt) {
         uint8_t rlp_buf[256];
         uint32_t rlp_len = mpt_store_get(es->account_mpt, ca_local.addr_hash.bytes,
                                           rlp_buf, sizeof(rlp_buf));
         if (rlp_len > 0 && rlp_len <= sizeof(rlp_buf)) {
             mpt_rlp_decode_account(rlp_buf, rlp_len, &ca_local);
+            // Backfill flat state so next lookup is O(1)
+            if (es->flat_state) {
+                flat_account_record_t frec;
+                frec.nonce = ca_local.nonce;
+                uint256_to_bytes(&ca_local.balance, frec.balance);
+                const uint8_t *ch = ca_local.has_code
+                    ? ca_local.code_hash.bytes : HASH_EMPTY_CODE.bytes;
+                memcpy(frec.code_hash, ch, 32);
+                memcpy(frec.storage_root, ca_local.storage_root.bytes, 32);
+                flat_state_put_account(es->flat_state, ca_local.addr_hash.bytes, &frec);
+            }
         }
     }
+account_loaded:
 #endif
 
 #if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
@@ -488,7 +523,22 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
     // Compute and cache keccak256(slot_be) — reused at MPT write time
     cs_local.slot_hash = hash_keccak256(skey + 20, 32);
 
-    // MPT trie traversal (5-10 node reads)
+    // Fast path: O(1) flat state lookup
+    if (es->flat_state) {
+        cached_account_t *ca = ensure_account(es, addr);
+        if (ca) {
+            uint8_t val_be[32];
+            if (flat_state_get_storage(es->flat_state, ca->addr_hash.bytes,
+                                        cs_local.slot_hash.bytes, val_be)) {
+                cs_local.original = uint256_from_bytes(val_be, 32);
+                cs_local.current = cs_local.original;
+                es->flat_stor_hit++;
+                goto slot_loaded;
+            }
+            es->flat_stor_miss++;
+        }
+    }
+    // Slow path: MPT trie traversal (5-10 node reads)
     if (es->storage_mpt) {
         cached_account_t *ca = ensure_account(es, addr);
         if (ca && memcmp(ca->storage_root.bytes, HASH_EMPTY_STORAGE.bytes, 32) != 0) {
@@ -499,9 +549,17 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
             if (val_len > 0 && val_len <= sizeof(val_rlp)) {
                 cs_local.original = mpt_rlp_decode_storage_value(val_rlp, val_len);
                 cs_local.current = cs_local.original;
+                // Backfill flat state so next lookup is O(1)
+                if (es->flat_state) {
+                    uint8_t val_be[32];
+                    uint256_to_bytes(&cs_local.current, val_be);
+                    flat_state_put_storage(es->flat_state, ca->addr_hash.bytes,
+                                           cs_local.slot_hash.bytes, val_be);
+                }
             }
         }
     }
+slot_loaded:
 #endif
 
 #if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
@@ -723,6 +781,9 @@ void evm_state_evict_cache(evm_state_t *es) {
     /* Dirty lists were cleared by compute_mpt_root before eviction */
     dirty_account_clear(&es->dirty_accounts);
     dirty_slot_clear(&es->dirty_slots);
+    /* Reset flat state counters for next window */
+    es->flat_acct_hit = es->flat_acct_miss = 0;
+    es->flat_stor_hit = es->flat_stor_miss = 0;
 #endif
 }
 
@@ -738,6 +799,12 @@ void evm_state_flush(evm_state_t *es) {
 void evm_state_set_batch_mode(evm_state_t *es, bool enabled) {
     if (es) es->batch_mode = enabled;
 }
+
+#ifdef ENABLE_MPT
+void evm_state_set_flat_state(evm_state_t *es, flat_state_t *fs) {
+    if (es) es->flat_state = fs;
+}
+#endif
 
 
 void evm_state_flush_verkle(evm_state_t *es) {
@@ -2383,6 +2450,10 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
     s.root_dirty_count = es->last_root_dirty_count;
     s.stor_commit      = es->last_stor_commit;
     s.acct_commit      = es->last_acct_commit;
+    s.flat_acct_hit    = es->flat_acct_hit;
+    s.flat_acct_miss   = es->flat_acct_miss;
+    s.flat_stor_hit    = es->flat_stor_hit;
+    s.flat_stor_miss   = es->flat_stor_miss;
 #endif
     return s;
 }

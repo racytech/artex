@@ -110,6 +110,10 @@ void evm_state_flush(evm_state_t *es);
  */
 void evm_state_set_batch_mode(evm_state_t *es, bool enabled);
 
+/** Set flat state backend for O(1) disk-backed lookups (optional, not owned). */
+typedef struct flat_state flat_state_t;
+void evm_state_set_flat_state(evm_state_t *es, flat_state_t *fs);
+
 /**
  * Flush accumulated block-dirty state to verkle backing store.
  * Call at checkpoint boundaries when in batch mode.
@@ -354,6 +358,12 @@ typedef struct {
     /* Commit-batch profiling (from last root computation) */
     mpt_commit_stats_t acct_commit;
     mpt_commit_stats_t stor_commit;
+
+    /* Flat state lookup stats (reset per checkpoint window) */
+    uint64_t flat_acct_hit;
+    uint64_t flat_acct_miss;
+    uint64_t flat_stor_hit;
+    uint64_t flat_stor_miss;
 #endif
 } evm_state_stats_t;
 

@@ -91,6 +91,7 @@ static size_t get_rss_kb(void) {
 static char value_dir[512];
 static char commit_dir[512];
 static char mpt_path[512];
+static char flat_path[512];
 static char code_path[512];
 static char history_path[512];
 
@@ -98,6 +99,7 @@ static void set_data_paths(const char *data_dir) {
     snprintf(value_dir, sizeof(value_dir), "%s/chain_replay_values", data_dir);
     snprintf(commit_dir, sizeof(commit_dir), "%s/chain_replay_commits", data_dir);
     snprintf(mpt_path, sizeof(mpt_path), "%s/chain_replay_mpt", data_dir);
+    snprintf(flat_path, sizeof(flat_path), "%s/chain_replay_flat", data_dir);
     snprintf(code_path, sizeof(code_path), "%s/chain_replay_code", data_dir);
     snprintf(history_path, sizeof(history_path), "%s/chain_replay_history", data_dir);
 }
@@ -663,6 +665,7 @@ int main(int argc, char **argv) {
 #endif
 #ifdef ENABLE_MPT
     cfg.mpt_path = mpt_path;
+    cfg.flat_state_path = flat_path;
     cfg.code_store_path = code_path;
 #endif
 
@@ -1218,6 +1221,16 @@ int main(int argc, char **argv) {
                 printf("  └ mpt: acct %luK nodes, stor %luK nodes\n",
                        ss.acct_mpt_nodes / 1000,
                        ss.stor_mpt_nodes / 1000);
+                if (ss.flat_acct_hit + ss.flat_acct_miss > 0 ||
+                    ss.flat_stor_hit + ss.flat_stor_miss > 0) {
+                    printf("  └ flat: acct %lu/%lu (%.1f%%)  stor %lu/%lu (%.1f%%)\n",
+                           ss.flat_acct_hit, ss.flat_acct_hit + ss.flat_acct_miss,
+                           (ss.flat_acct_hit + ss.flat_acct_miss)
+                               ? 100.0 * ss.flat_acct_hit / (ss.flat_acct_hit + ss.flat_acct_miss) : 0,
+                           ss.flat_stor_hit, ss.flat_stor_hit + ss.flat_stor_miss,
+                           (ss.flat_stor_hit + ss.flat_stor_miss)
+                               ? 100.0 * ss.flat_stor_hit / (ss.flat_stor_hit + ss.flat_stor_miss) : 0);
+                }
                 printf("  └ code: %luK (hit %.1f%%, LRU %u/%uK) disk: %.1fGB/%.1fGB RSS %zuMB\n",
                        ss.code_count / 1000,
                        (ss.code_cache_hits + ss.code_cache_misses)

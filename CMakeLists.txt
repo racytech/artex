@@ -85,6 +85,10 @@ target_link_libraries(disk_hash pthread)
 # Disk Table (mmap-backed hash table optimized for pre-hashed keys)
 add_library(disk_table STATIC database/src/disk_table.c)
 
+# Flat State (O(1) account/storage lookups via disk_table)
+add_library(flat_state STATIC database/src/flat_state.c)
+target_link_libraries(flat_state disk_table)
+
 # Code Store (content-addressed, append-only, deduplicated)
 add_library(code_store STATIC
     database/src/code_store.c
@@ -209,7 +213,7 @@ if(ENABLE_VERKLE)
     list(APPEND EVM_LINK_LIBS verkle_state)
 endif()
 if(ENABLE_MPT)
-    list(APPEND EVM_LINK_LIBS mpt_store code_store)
+    list(APPEND EVM_LINK_LIBS mpt_store code_store flat_state)
 endif()
 target_link_libraries(evm ${EVM_LINK_LIBS})
 if(ENABLE_MPT)
@@ -893,7 +897,7 @@ if(CJSON_FOUND)
         list(APPEND SYNC_LIBS verkle_state)
     endif()
     if(ENABLE_MPT)
-        list(APPEND SYNC_LIBS code_store)
+        list(APPEND SYNC_LIBS code_store flat_state)
     endif()
     target_link_libraries(sync ${SYNC_LIBS})
 
