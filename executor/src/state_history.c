@@ -9,7 +9,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <pthread.h>
-#include <sched.h>
 
 /* =========================================================================
  * CRC-32C (Castagnoli) — hardware-accelerated via SSE4.2
@@ -119,10 +118,26 @@ void block_diff_clone(const block_diff_t *src, block_diff_t *dst) {
  * SPSC ring buffer
  * ========================================================================= */
 
+#ifdef __x86_64__
+#include <immintrin.h>
+#define SPIN_PAUSE() _mm_pause()
+#else
+#define SPIN_PAUSE() ((void)0)
+#endif
+
+#define SPIN_TRIES 64
+
 static void diff_ring_init(diff_ring_t *ring) {
     memset(ring->slots, 0, sizeof(ring->slots));
     atomic_store_explicit(&ring->head, 0, memory_order_relaxed);
     atomic_store_explicit(&ring->tail, 0, memory_order_relaxed);
+    pthread_mutex_init(&ring->mtx, NULL);
+    pthread_cond_init(&ring->not_empty, NULL);
+}
+
+static void diff_ring_destroy(diff_ring_t *ring) {
+    pthread_cond_destroy(&ring->not_empty);
+    pthread_mutex_destroy(&ring->mtx);
 }
 
 static bool diff_ring_try_push(diff_ring_t *ring, const block_diff_t *diff) {
@@ -132,19 +147,43 @@ static bool diff_ring_try_push(diff_ring_t *ring, const block_diff_t *diff) {
         return false;
     ring->slots[h & (DIFF_RING_CAP - 1)] = *diff;
     atomic_store_explicit(&ring->head, h + 1, memory_order_release);
+
+    /* Signal consumer that data is available */
+    pthread_mutex_lock(&ring->mtx);
+    pthread_cond_signal(&ring->not_empty);
+    pthread_mutex_unlock(&ring->mtx);
     return true;
 }
 
 static bool diff_ring_pop(diff_ring_t *ring, block_diff_t *out,
                            const atomic_bool *stop) {
     size_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
-    for (;;) {
+
+    /* Fast path: spin briefly */
+    for (int i = 0; i < SPIN_TRIES; i++) {
         size_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
-        if (h > t) break;
+        if (h > t) goto pop;
         if (stop && atomic_load_explicit(stop, memory_order_relaxed))
             return false;
-        sched_yield();
+        SPIN_PAUSE();
     }
+
+    /* Slow path: block on condvar */
+    pthread_mutex_lock(&ring->mtx);
+    for (;;) {
+        size_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
+        if (h > t) {
+            pthread_mutex_unlock(&ring->mtx);
+            goto pop;
+        }
+        if (stop && atomic_load_explicit(stop, memory_order_relaxed)) {
+            pthread_mutex_unlock(&ring->mtx);
+            return false;
+        }
+        pthread_cond_wait(&ring->not_empty, &ring->mtx);
+    }
+
+pop:
     *out = ring->slots[t & (DIFF_RING_CAP - 1)];
     atomic_store_explicit(&ring->tail, t + 1, memory_order_release);
     return true;
@@ -565,7 +604,14 @@ void state_history_destroy(state_history_t *sh) {
     if (!sh) return;
 
     atomic_store_explicit(&sh->stop, true, memory_order_release);
+
+    /* Wake consumer if blocked on condvar */
+    pthread_mutex_lock(&sh->ring.mtx);
+    pthread_cond_signal(&sh->ring.not_empty);
+    pthread_mutex_unlock(&sh->ring.mtx);
+
     pthread_join(sh->consumer_tid, NULL);
+    diff_ring_destroy(&sh->ring);
 
     if (sh->block_count > 0) {
         uint8_t hdr[IDX_HEADER_SIZE];

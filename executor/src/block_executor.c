@@ -509,6 +509,10 @@ block_result_t block_execute(evm_t *evm,
     if (prep_tid) {
         /* Signal cancel so prep thread stops if it's still working */
         atomic_store_explicit(&prep_ctx.cancel, true, memory_order_relaxed);
+        pthread_mutex_lock(&ring.mtx);
+        pthread_cond_signal(&ring.not_full);
+        pthread_cond_signal(&ring.not_empty);
+        pthread_mutex_unlock(&ring.mtx);
         pthread_join(prep_tid, NULL);
 
         /* Drain remaining entries — after cancel the prep thread has exited
@@ -522,6 +526,7 @@ block_result_t block_execute(evm_t *evm,
             if (drain.done) break;
             if (drain.valid) tx_decoded_free(&drain.tx);
         }
+        tx_ring_destroy(&ring);
     }
 
     /* Pay block reward (PoW only — zero after The Merge) */

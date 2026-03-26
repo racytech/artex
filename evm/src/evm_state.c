@@ -190,6 +190,52 @@ static inline void dirty_slot_free(dirty_slot_vec_t *v) {
     v->count = v->cap = 0;
 }
 
+// --- Per-tx dirty tracking (avoids full cache scan in commit_tx) ---
+
+typedef struct {
+    uint8_t  *keys;       // packed addr[20] keys
+    size_t    count;
+    size_t    cap;
+} tx_dirty_addr_vec_t;
+
+typedef struct {
+    uint8_t  *keys;       // packed skey[52] keys (addr[20] || slot[32])
+    size_t    count;
+    size_t    cap;
+} tx_dirty_slot_vec_t;
+
+static inline void tx_dirty_addr_push(tx_dirty_addr_vec_t *v, const uint8_t *addr) {
+    if (v->count >= v->cap) {
+        size_t nc = v->cap ? v->cap * 2 : 32;
+        uint8_t *nk = realloc(v->keys, nc * ADDRESS_KEY_SIZE);
+        if (!nk) return;
+        v->keys = nk; v->cap = nc;
+    }
+    memcpy(v->keys + v->count * ADDRESS_KEY_SIZE, addr, ADDRESS_KEY_SIZE);
+    v->count++;
+}
+
+static inline void tx_dirty_slot_push(tx_dirty_slot_vec_t *v, const uint8_t *skey) {
+    if (v->count >= v->cap) {
+        size_t nc = v->cap ? v->cap * 2 : 32;
+        uint8_t *nk = realloc(v->keys, nc * SLOT_KEY_SIZE);
+        if (!nk) return;
+        v->keys = nk; v->cap = nc;
+    }
+    memcpy(v->keys + v->count * SLOT_KEY_SIZE, skey, SLOT_KEY_SIZE);
+    v->count++;
+}
+
+static inline void tx_dirty_addr_clear(tx_dirty_addr_vec_t *v) { v->count = 0; }
+static inline void tx_dirty_slot_clear(tx_dirty_slot_vec_t *v) { v->count = 0; }
+
+static inline void tx_dirty_addr_free(tx_dirty_addr_vec_t *v) {
+    free(v->keys); v->keys = NULL; v->count = v->cap = 0;
+}
+static inline void tx_dirty_slot_free(tx_dirty_slot_vec_t *v) {
+    free(v->keys); v->keys = NULL; v->count = v->cap = 0;
+}
+
 // --- Main struct ---
 
 struct evm_state {
@@ -206,6 +252,8 @@ struct evm_state {
     mem_art_t         warm_addrs;   // key: addr[20], value: (none, 0 bytes)
     mem_art_t         warm_slots;   // key: skey[52], value: (none, 0 bytes)
     mem_art_t         transient;    // key: skey[52], value: uint256_t (EIP-1153)
+    tx_dirty_addr_vec_t tx_dirty_accounts;  // accounts dirtied in current tx
+    tx_dirty_slot_vec_t tx_dirty_slots;     // slots dirtied in current tx
     bool              batch_mode;   // skip per-block verkle flush, defer to checkpoint
     bool              discard_on_destroy; // skip MPT flush on destroy (set after failed block)
 #ifdef ENABLE_VERKLE
@@ -251,6 +299,21 @@ static inline void mark_slot_mpt_dirty(evm_state_t *es, cached_slot_t *cs) {
     }
 }
 #endif
+
+// Mark account as tx-dirty (for fast commit_tx iteration).
+// Only pushes on first dirty transition per tx (idempotent).
+static inline void mark_account_tx_dirty(evm_state_t *es, cached_account_t *ca) {
+    if (!ca->dirty) {
+        tx_dirty_addr_push(&es->tx_dirty_accounts, ca->addr.bytes);
+    }
+}
+
+// Mark slot as tx-dirty.
+static inline void mark_slot_tx_dirty(evm_state_t *es, cached_slot_t *cs) {
+    if (!cs->dirty) {
+        tx_dirty_slot_push(&es->tx_dirty_slots, cs->key);
+    }
+}
 
 // ============================================================================
 // Internal helpers
@@ -718,6 +781,9 @@ void evm_state_destroy(evm_state_t *es) {
     dirty_slot_free(&es->dirty_slots);
 #endif
 
+    tx_dirty_addr_free(&es->tx_dirty_accounts);
+    tx_dirty_slot_free(&es->tx_dirty_slots);
+
     // Free code pointers owned by cached accounts (both generations)
     mem_art_foreach(&es->accounts, free_code_cb, NULL);
     mem_art_foreach(&es->prev_accounts, free_code_cb, NULL);
@@ -808,6 +874,7 @@ void evm_state_set_nonce(evm_state_t *es, const address_t *addr, uint64_t nonce)
     journal_push(es, &je);
 
     ca->nonce = nonce;
+    mark_account_tx_dirty(es, ca);
     ca->dirty = true;
     ca->block_dirty = true;
 #if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
@@ -847,6 +914,7 @@ void evm_state_set_balance(evm_state_t *es, const address_t *addr,
     journal_push(es, &je);
 
     ca->balance = *balance;
+    mark_account_tx_dirty(es, ca);
     ca->dirty = true;
     ca->block_dirty = true;
 #if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
@@ -893,6 +961,7 @@ void evm_state_set_code_hash(evm_state_t *es, const address_t *addr,
     ca->code_hash = *code_hash;
     ca->has_code = (memcmp(code_hash->bytes, HASH_EMPTY_CODE.bytes, 32) != 0 &&
                     memcmp(code_hash->bytes, ((hash_t){0}).bytes, 32) != 0);
+    mark_account_tx_dirty(es, ca);
     ca->dirty = true;
     ca->code_dirty = true;
     ca->block_dirty = true;
@@ -1096,6 +1165,7 @@ void evm_state_set_code(evm_state_t *es, const address_t *addr,
         ca->code_hash = hash_zero();
     }
 
+    mark_account_tx_dirty(es, ca);
     ca->dirty = true;
     ca->code_dirty = true;
     ca->block_dirty = true;
@@ -1189,6 +1259,7 @@ void evm_state_set_storage(evm_state_t *es, const address_t *addr,
     journal_push(es, &je);
 
     cs->current = *value;
+    mark_slot_tx_dirty(es, cs);
     cs->dirty = true;
     cs->block_dirty = true;
     mark_slot_mpt_dirty(es, cs);
@@ -1330,6 +1401,7 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
     ca->code = NULL;          // ownership moved to journal entry (or freed above)
     ca->code_size = 0;
     ca->created = true;
+    mark_account_tx_dirty(es, ca);
     ca->dirty = true;
     ca->block_dirty = true;
 #if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
@@ -1399,6 +1471,7 @@ void evm_state_self_destruct(evm_state_t *es, const address_t *addr) {
     journal_push(es, &je);
 
     ca->self_destructed = true;
+    mark_account_tx_dirty(es, ca);
     ca->dirty = true;
     ca->block_dirty = true;
 #if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
@@ -1562,12 +1635,76 @@ static bool commit_tx_slot_cb(const uint8_t *key, size_t key_len,
 void evm_state_commit_tx(evm_state_t *es) {
     if (!es) return;
 
+    /* --- Process only tx-dirty accounts (fast path) --- */
     selfdestructed_ctx_t ctx = { .addrs = NULL, .count = 0, .cap = 0 };
 
-    mem_art_foreach(&es->accounts, commit_tx_account_cb, &ctx);
-    mem_art_foreach(&es->storage, commit_tx_slot_cb, &ctx);
-    free(ctx.addrs);
+    for (size_t i = 0; i < es->tx_dirty_accounts.count; i++) {
+        const uint8_t *addr_key = es->tx_dirty_accounts.keys + i * ADDRESS_KEY_SIZE;
+        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+            &es->accounts, addr_key, ADDRESS_KEY_SIZE, NULL);
+        if (!ca) continue;
 
+        if (ca->self_destructed) {
+            if (ctx.count >= ctx.cap) {
+                size_t nc = ctx.cap ? ctx.cap * 2 : 16;
+                address_t *na = realloc(ctx.addrs, nc * sizeof(*na));
+                if (na) { ctx.addrs = na; ctx.cap = nc; }
+            }
+            if (ctx.count < ctx.cap)
+                ctx.addrs[ctx.count++] = ca->addr;
+
+            ca->balance = UINT256_ZERO;
+            ca->nonce = 0;
+            ca->has_code = false;
+            memset(ca->code_hash.bytes, 0, 32);
+            if (ca->code) { free(ca->code); ca->code = NULL; }
+            ca->code_size = 0;
+            ca->existed = false;
+            ca->created = false;
+            ca->dirty = false;
+            ca->code_dirty = false;
+#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+            ca->block_self_destructed = true;
+#endif
+            ca->block_dirty = false;
+            ca->self_destructed = false;
+            ca->block_code_dirty = false;
+            ca->storage_root = HASH_EMPTY_STORAGE;
+            continue;
+        }
+
+        bool is_empty = (ca->nonce == 0 &&
+                         uint256_is_zero(&ca->balance) &&
+                         !ca->has_code);
+        if ((ca->existed || ca->created || ca->dirty || ca->code_dirty) && !is_empty) {
+            ca->existed = true;
+        }
+        ca->created = false;
+        ca->dirty = false;
+        ca->code_dirty = false;
+        ca->self_destructed = false;
+    }
+
+    /* --- Process storage --- */
+    if (ctx.count > 0) {
+        /* Rare path: self-destructs exist — must scan all slots to zero
+         * storage belonging to destructed addresses */
+        mem_art_foreach(&es->storage, commit_tx_slot_cb, &ctx);
+    } else {
+        /* Fast path: only iterate tx-dirty slots */
+        for (size_t i = 0; i < es->tx_dirty_slots.count; i++) {
+            const uint8_t *skey = es->tx_dirty_slots.keys + i * SLOT_KEY_SIZE;
+            cached_slot_t *cs = (cached_slot_t *)mem_art_get_mut(
+                &es->storage, skey, SLOT_KEY_SIZE, NULL);
+            if (!cs) continue;
+            cs->original = cs->current;
+            cs->dirty = false;
+        }
+    }
+
+    free(ctx.addrs);
+    tx_dirty_addr_clear(&es->tx_dirty_accounts);
+    tx_dirty_slot_clear(&es->tx_dirty_slots);
     es->journal_len = 0;
 
     mem_art_destroy(&es->warm_addrs);

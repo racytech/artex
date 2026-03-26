@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -99,6 +100,8 @@ typedef struct {
     block_diff_t   slots[DIFF_RING_CAP];
     atomic_size_t  head;    /* written by producer only */
     atomic_size_t  tail;    /* written by consumer only */
+    pthread_mutex_t mtx;
+    pthread_cond_t  not_empty;
 } diff_ring_t;
 
 /* ── Opaque handle ────────────────────────────────────────────────────── */

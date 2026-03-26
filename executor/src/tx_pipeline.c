@@ -1,36 +1,72 @@
 #include "tx_pipeline.h"
 #include "tx_decoder.h"
 #include <string.h>
-#include <sched.h>
+
+#ifdef __x86_64__
+#include <immintrin.h>
+#define SPIN_PAUSE() _mm_pause()
+#else
+#define SPIN_PAUSE() ((void)0)
+#endif
+
+#define SPIN_TRIES 64
 
 /* =========================================================================
- * Ring buffer operations (SPSC, lock-free)
+ * Ring buffer operations (SPSC, lock-free fast path, condvar slow path)
  * ========================================================================= */
 
 void tx_ring_init(tx_ring_t *ring) {
     memset(ring->slots, 0, sizeof(ring->slots));
     atomic_store_explicit(&ring->head, 0, memory_order_relaxed);
     atomic_store_explicit(&ring->tail, 0, memory_order_relaxed);
+    pthread_mutex_init(&ring->mtx, NULL);
+    pthread_cond_init(&ring->not_full, NULL);
+    pthread_cond_init(&ring->not_empty, NULL);
+}
+
+void tx_ring_destroy(tx_ring_t *ring) {
+    pthread_cond_destroy(&ring->not_empty);
+    pthread_cond_destroy(&ring->not_full);
+    pthread_mutex_destroy(&ring->mtx);
 }
 
 bool tx_ring_push(tx_ring_t *ring, const prepared_tx_t *ptx,
                   const atomic_bool *cancel) {
     size_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
 
-    /* Spin while ring is full: head - tail == CAP */
-    for (;;) {
+    /* Fast path: spin briefly */
+    for (int i = 0; i < SPIN_TRIES; i++) {
         size_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
         if (h - t < TX_RING_CAP)
-            break;
+            goto push;
         if (cancel && atomic_load_explicit(cancel, memory_order_relaxed))
             return false;
-        sched_yield();
+        SPIN_PAUSE();
     }
 
-    ring->slots[h & (TX_RING_CAP - 1)] = *ptx;
+    /* Slow path: block on condvar */
+    pthread_mutex_lock(&ring->mtx);
+    for (;;) {
+        size_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
+        if (h - t < TX_RING_CAP) {
+            pthread_mutex_unlock(&ring->mtx);
+            goto push;
+        }
+        if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) {
+            pthread_mutex_unlock(&ring->mtx);
+            return false;
+        }
+        pthread_cond_wait(&ring->not_full, &ring->mtx);
+    }
 
-    /* Release: make the slot contents visible before advancing head */
+push:
+    ring->slots[h & (TX_RING_CAP - 1)] = *ptx;
     atomic_store_explicit(&ring->head, h + 1, memory_order_release);
+
+    /* Signal consumer that data is available */
+    pthread_mutex_lock(&ring->mtx);
+    pthread_cond_signal(&ring->not_empty);
+    pthread_mutex_unlock(&ring->mtx);
     return true;
 }
 
@@ -38,20 +74,39 @@ bool tx_ring_pop(tx_ring_t *ring, prepared_tx_t *out,
                  const atomic_bool *cancel) {
     size_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
 
-    /* Spin while ring is empty: head == tail */
-    for (;;) {
+    /* Fast path: spin briefly */
+    for (int i = 0; i < SPIN_TRIES; i++) {
         size_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
         if (h > t)
-            break;
+            goto pop;
         if (cancel && atomic_load_explicit(cancel, memory_order_relaxed))
             return false;
-        sched_yield();
+        SPIN_PAUSE();
     }
 
-    *out = ring->slots[t & (TX_RING_CAP - 1)];
+    /* Slow path: block on condvar */
+    pthread_mutex_lock(&ring->mtx);
+    for (;;) {
+        size_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
+        if (h > t) {
+            pthread_mutex_unlock(&ring->mtx);
+            goto pop;
+        }
+        if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) {
+            pthread_mutex_unlock(&ring->mtx);
+            return false;
+        }
+        pthread_cond_wait(&ring->not_empty, &ring->mtx);
+    }
 
-    /* Release: mark slot as consumed before advancing tail */
+pop:
+    *out = ring->slots[t & (TX_RING_CAP - 1)];
     atomic_store_explicit(&ring->tail, t + 1, memory_order_release);
+
+    /* Signal producer that space is available */
+    pthread_mutex_lock(&ring->mtx);
+    pthread_cond_signal(&ring->not_full);
+    pthread_mutex_unlock(&ring->mtx);
     return true;
 }
 

@@ -36,15 +36,19 @@ typedef struct {
 } prepared_tx_t;
 
 /**
- * Lock-free SPSC ring buffer.
+ * SPSC ring buffer with condvar fallback.
  *
  * Producer (prep thread) writes to slots[head % CAP] and advances head.
  * Consumer (exec thread) reads from slots[tail % CAP] and advances tail.
+ * Fast path is lock-free; slow path (ring full/empty) blocks on condvar.
  */
 typedef struct {
     prepared_tx_t  slots[TX_RING_CAP];
     atomic_size_t  head;    /* written by prep thread only */
     atomic_size_t  tail;    /* written by exec thread only */
+    pthread_mutex_t mtx;
+    pthread_cond_t  not_full;
+    pthread_cond_t  not_empty;
 } tx_ring_t;
 
 /**
@@ -60,8 +64,11 @@ typedef struct {
 
 /* ── Ring buffer operations ─────────────────────────────────────────────── */
 
-/** Initialize ring buffer (zero head/tail). */
+/** Initialize ring buffer (zero head/tail, init condvars). */
 void tx_ring_init(tx_ring_t *ring);
+
+/** Destroy ring buffer (cleanup condvars). */
+void tx_ring_destroy(tx_ring_t *ring);
 
 /**
  * Push a prepared tx into the ring. Spins if ring is full.

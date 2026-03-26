@@ -1341,24 +1341,67 @@ void mem_art_iterator_destroy(mem_art_iterator_t *iter) {
     free(iter);
 }
 
+/* Recursive DFS foreach — no heap allocation, no iterator overhead. */
+static bool foreach_recurse(const mem_art_t *tree, mem_ref_t ref,
+                            mem_art_callback_t callback, void *user_data) {
+    if (ref == MEM_REF_NULL) return true;
+
+    if (MEM_IS_LEAF(ref)) {
+        mem_leaf_t *leaf = leaf_ptr(tree, ref);
+        size_t val_off = leaf_value_offset(leaf->key_len, leaf->value_len);
+        const void *value = (const uint8_t *)leaf + val_off;
+        return callback(leaf->data, leaf->key_len, value, leaf->value_len, user_data);
+    }
+
+    void *node = ref_ptr(tree, ref);
+    switch (node_type(node)) {
+        case MEM_NODE_4: {
+            mem_node4_t *n = node;
+            for (int i = 0; i < n->num_children; i++)
+                if (!foreach_recurse(tree, n->children[i], callback, user_data))
+                    return false;
+            break;
+        }
+        case MEM_NODE_16: {
+            mem_node16_t *n = node;
+            for (int i = 0; i < n->num_children; i++)
+                if (!foreach_recurse(tree, n->children[i], callback, user_data))
+                    return false;
+            break;
+        }
+        case MEM_NODE_32: {
+            mem_node32_t *n = node;
+            for (int i = 0; i < n->num_children; i++)
+                if (!foreach_recurse(tree, n->children[i], callback, user_data))
+                    return false;
+            break;
+        }
+        case MEM_NODE_48: {
+            mem_node48_t *n = node;
+            for (int i = 0; i < 256; i++) {
+                if (n->index[i] != MEM_NODE48_EMPTY)
+                    if (!foreach_recurse(tree, n->children[n->index[i]], callback, user_data))
+                        return false;
+            }
+            break;
+        }
+        case MEM_NODE_256: {
+            mem_node256_t *n = node;
+            for (int i = 0; i < 256; i++) {
+                if (n->children[i] != MEM_REF_NULL)
+                    if (!foreach_recurse(tree, n->children[i], callback, user_data))
+                        return false;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    return true;
+}
+
 void mem_art_foreach(const mem_art_t *tree, mem_art_callback_t callback,
                      void *user_data) {
     if (!tree || !callback) return;
-
-    mem_art_iterator_t *iter = mem_art_iterator_create(tree);
-    if (!iter) return;
-
-    while (mem_art_iterator_next(iter)) {
-        size_t key_len, value_len;
-        const uint8_t *key = mem_art_iterator_key(iter, &key_len);
-        const void *value = mem_art_iterator_value(iter, &value_len);
-
-        if (key && value) {
-            if (!callback(key, key_len, value, value_len, user_data)) {
-                break;
-            }
-        }
-    }
-
-    mem_art_iterator_destroy(iter);
+    foreach_recurse(tree, tree->root, callback, user_data);
 }

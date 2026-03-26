@@ -9,8 +9,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <sched.h>
 #include <stdatomic.h>
+
+#ifdef __x86_64__
+#include <immintrin.h>
+#define SPIN_PAUSE() _mm_pause()
+#else
+#define SPIN_PAUSE() ((void)0)
+#endif
+
+#define SPIN_TRIES 64
 
 /* =========================================================================
  * Slot Tracker (same as verkle_reconstruct — per-account storage index)
@@ -134,6 +142,13 @@ static void ring_init(diff_ring_t *ring) {
     memset(ring->slots, 0, sizeof(ring->slots));
     atomic_store_explicit(&ring->head, 0, memory_order_relaxed);
     atomic_store_explicit(&ring->tail, 0, memory_order_relaxed);
+    pthread_mutex_init(&ring->mtx, NULL);
+    pthread_cond_init(&ring->not_empty, NULL);
+}
+
+static void ring_destroy(diff_ring_t *ring) {
+    pthread_cond_destroy(&ring->not_empty);
+    pthread_mutex_destroy(&ring->mtx);
 }
 
 static bool ring_try_push(diff_ring_t *ring, const block_diff_t *diff) {
@@ -143,19 +158,43 @@ static bool ring_try_push(diff_ring_t *ring, const block_diff_t *diff) {
         return false;
     ring->slots[h & (DIFF_RING_CAP - 1)] = *diff;
     atomic_store_explicit(&ring->head, h + 1, memory_order_release);
+
+    /* Signal consumer that data is available */
+    pthread_mutex_lock(&ring->mtx);
+    pthread_cond_signal(&ring->not_empty);
+    pthread_mutex_unlock(&ring->mtx);
     return true;
 }
 
 static bool ring_pop(diff_ring_t *ring, block_diff_t *out,
                      const atomic_bool *stop) {
     size_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
-    for (;;) {
+
+    /* Fast path: spin briefly */
+    for (int i = 0; i < SPIN_TRIES; i++) {
         size_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
-        if (h > t) break;
+        if (h > t) goto pop;
         if (stop && atomic_load_explicit(stop, memory_order_relaxed))
             return false;
-        sched_yield();
+        SPIN_PAUSE();
     }
+
+    /* Slow path: block on condvar */
+    pthread_mutex_lock(&ring->mtx);
+    for (;;) {
+        size_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
+        if (h > t) {
+            pthread_mutex_unlock(&ring->mtx);
+            goto pop;
+        }
+        if (stop && atomic_load_explicit(stop, memory_order_relaxed)) {
+            pthread_mutex_unlock(&ring->mtx);
+            return false;
+        }
+        pthread_cond_wait(&ring->not_empty, &ring->mtx);
+    }
+
+pop:
     *out = ring->slots[t & (DIFF_RING_CAP - 1)];
     atomic_store_explicit(&ring->tail, t + 1, memory_order_release);
     return true;
@@ -329,7 +368,14 @@ void verkle_builder_destroy(verkle_builder_t *vb) {
     if (!vb) return;
 
     atomic_store_explicit(&vb->stop, true, memory_order_release);
+
+    /* Wake consumer if blocked on condvar */
+    pthread_mutex_lock(&vb->ring.mtx);
+    pthread_cond_signal(&vb->ring.not_empty);
+    pthread_mutex_unlock(&vb->ring.mtx);
+
     pthread_join(vb->thread, NULL);
+    ring_destroy(&vb->ring);
 
     slot_tracker_destroy(&vb->tracker);
     verkle_state_destroy(vb->vs);
