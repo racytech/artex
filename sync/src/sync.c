@@ -39,6 +39,7 @@
 #include <sys/stat.h>
 #include <stddef.h>
 #include <time.h>
+#include <pthread.h>
 
 // ============================================================================
 // Constants
@@ -85,6 +86,15 @@ struct sync {
     double last_evict_ms;
     double last_mpt_flush_ms;
 
+#ifdef ENABLE_MPT
+    /* Background MPT flush thread */
+    pthread_t       flush_thread;
+    pthread_mutex_t flush_mtx;
+    pthread_cond_t  flush_cond;
+    bool            flush_pending;  /* work available for flush thread */
+    bool            flush_stop;     /* signal thread to exit */
+#endif
+
 #ifdef ENABLE_HISTORY
     state_history_t *history;
 #endif
@@ -92,6 +102,68 @@ struct sync {
     verkle_builder_t *verkle_builder;
 #endif
 };
+
+// ============================================================================
+// Background MPT flush
+// ============================================================================
+
+#ifdef ENABLE_MPT
+static void *mpt_flush_thread(void *arg) {
+    sync_t *s = (sync_t *)arg;
+
+    pthread_mutex_lock(&s->flush_mtx);
+    for (;;) {
+        while (!s->flush_pending && !s->flush_stop)
+            pthread_cond_wait(&s->flush_cond, &s->flush_mtx);
+
+        if (s->flush_stop) {
+            /* Final flush before exit */
+            if (s->flush_pending) {
+                pthread_mutex_unlock(&s->flush_mtx);
+                if (s->cs) code_store_flush(s->cs);
+                evm_state_flush(s->state);
+                pthread_mutex_lock(&s->flush_mtx);
+                s->flush_pending = false;
+                pthread_cond_signal(&s->flush_cond);
+            }
+            break;
+        }
+
+        /* Do the flush with mutex unlocked (execution can continue) */
+        pthread_mutex_unlock(&s->flush_mtx);
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (s->cs) code_store_flush(s->cs);
+        evm_state_flush(s->state);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
+        pthread_mutex_lock(&s->flush_mtx);
+        s->last_mpt_flush_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                                (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        s->flush_pending = false;
+        pthread_cond_signal(&s->flush_cond);
+    }
+    pthread_mutex_unlock(&s->flush_mtx);
+    return NULL;
+}
+
+/* Wait for any in-progress background flush to complete */
+static void sync_wait_flush(sync_t *s) {
+    pthread_mutex_lock(&s->flush_mtx);
+    while (s->flush_pending)
+        pthread_cond_wait(&s->flush_cond, &s->flush_mtx);
+    pthread_mutex_unlock(&s->flush_mtx);
+}
+
+/* Signal background thread to start flushing */
+static void sync_start_flush(sync_t *s) {
+    pthread_mutex_lock(&s->flush_mtx);
+    s->flush_pending = true;
+    pthread_cond_signal(&s->flush_cond);
+    pthread_mutex_unlock(&s->flush_mtx);
+}
+#endif
 
 // ============================================================================
 // Helpers
@@ -248,6 +320,12 @@ sync_t *sync_create(const sync_config_t *config) {
             fprintf(stderr, "warning: failed to open/create flat state at %s\n",
                     config->flat_state_path);
     }
+    /* Start background MPT flush thread */
+    pthread_mutex_init(&s->flush_mtx, NULL);
+    pthread_cond_init(&s->flush_cond, NULL);
+    s->flush_pending = false;
+    s->flush_stop = false;
+    pthread_create(&s->flush_thread, NULL, mpt_flush_thread, s);
 #endif
 
     /* Create EVM */
@@ -304,6 +382,16 @@ void sync_destroy(sync_t *sync) {
     if (!sync) return;
 
     if (sync->evm) evm_destroy(sync->evm);
+#ifdef ENABLE_MPT
+    /* Stop background flush thread (flush any pending work first) */
+    pthread_mutex_lock(&sync->flush_mtx);
+    sync->flush_stop = true;
+    pthread_cond_signal(&sync->flush_cond);
+    pthread_mutex_unlock(&sync->flush_mtx);
+    pthread_join(sync->flush_thread, NULL);
+    pthread_cond_destroy(&sync->flush_cond);
+    pthread_mutex_destroy(&sync->flush_mtx);
+#endif
     if (sync->state) evm_state_destroy(sync->state);
 #ifdef ENABLE_VERKLE
     if (sync->vs) verkle_state_destroy(sync->vs);
@@ -406,6 +494,9 @@ bool sync_resume(sync_t *sync, uint64_t last_block,
 static bool sync_validate_batch_root(sync_t *sync,
                                      hash_t *actual_out,
                                      hash_t *expected_out) {
+#ifdef ENABLE_MPT
+    sync_wait_flush(sync);
+#endif
     bool prune_empty = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
     hash_t actual = evm_state_compute_mpt_root(sync->state, prune_empty);
     sync->batch_root_computed = true;
@@ -573,6 +664,7 @@ bool sync_execute_block_live(sync_t *sync,
 #ifdef ENABLE_MPT
     /* Immediate state root validation */
     if (sync->config.validate_state_root) {
+        sync_wait_flush(sync);
         bool prune_empty = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
         hash_t actual = evm_state_compute_mpt_root(sync->state, prune_empty);
 
@@ -616,6 +708,10 @@ static void sync_flush_and_evict(sync_t *sync) {
     if (!sync) return;
 
 #ifdef ENABLE_MPT
+    /* Wait for any previous background flush to complete before
+     * computing a new root (flush modifies mpt_store state) */
+    sync_wait_flush(sync);
+
     /* Compute MPT root before eviction if not already done.
      * This ensures dirty data is captured into deferred buffer
      * before cache entries are dropped. */
@@ -636,7 +732,7 @@ static void sync_flush_and_evict(sync_t *sync) {
 
     /* Evict cache — root computation captured all dirty data into MPT
      * deferred buffer. Safe to drop cached entries now. */
-    struct timespec _ev0, _ev1, _fl0, _fl1;
+    struct timespec _ev0, _ev1;
     clock_gettime(CLOCK_MONOTONIC, &_ev0);
 #ifdef ENABLE_DEBUG
     if (!sync->config.no_evict)
@@ -644,17 +740,14 @@ static void sync_flush_and_evict(sync_t *sync) {
         evm_state_evict_cache(sync->state);
     clock_gettime(CLOCK_MONOTONIC, &_ev1);
 
-#ifdef ENABLE_MPT
-    clock_gettime(CLOCK_MONOTONIC, &_fl0);
-    if (sync->cs) code_store_flush(sync->cs);
-    evm_state_flush(sync->state);
-    clock_gettime(CLOCK_MONOTONIC, &_fl1);
-    sync->last_mpt_flush_ms = (_fl1.tv_sec - _fl0.tv_sec) * 1000.0 +
-                               (_fl1.tv_nsec - _fl0.tv_nsec) / 1e6;
-#endif
-
     sync->last_evict_ms = (_ev1.tv_sec - _ev0.tv_sec) * 1000.0 +
                            (_ev1.tv_nsec - _ev0.tv_nsec) / 1e6;
+
+#ifdef ENABLE_MPT
+    /* Kick off background flush — execution continues immediately */
+    sync_start_flush(sync);
+#endif
+
     sync->batch_root_computed = false;
 }
 
