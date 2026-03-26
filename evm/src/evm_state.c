@@ -253,7 +253,6 @@ struct evm_state {
     mem_art_t         transient;    // key: skey[52], value: uint256_t (EIP-1153)
     tx_dirty_addr_vec_t tx_dirty_accounts;  // accounts dirtied in current tx
     tx_dirty_slot_vec_t tx_dirty_slots;     // slots dirtied in current tx
-    bool              had_self_destruct;   // any self-destruct in this checkpoint window
     bool              batch_mode;   // skip per-block verkle flush, defer to checkpoint
     bool              discard_on_destroy; // skip MPT flush on destroy (set after failed block)
 #ifdef ENABLE_VERKLE
@@ -661,58 +660,32 @@ static bool free_code_cb(const uint8_t *key, size_t key_len,
     return true;
 }
 
-/* Callback: flush ALL storage slots to flat_state (self-destruct fallback) */
-static bool evict_all_slots_cb(const uint8_t *key, size_t key_len,
-                                const void *value, size_t value_len,
-                                void *user_data) {
-    (void)key_len; (void)value_len;
-    evm_state_t *es = (evm_state_t *)user_data;
-    cached_slot_t *cs = (cached_slot_t *)(uintptr_t)value;
-    cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
-        &es->accounts, key, ADDRESS_KEY_SIZE, NULL);
-    if (!ca) return true;
-    if (uint256_is_zero(&cs->current)) {
-        flat_state_delete_storage(es->flat_state, ca->addr_hash.bytes,
-                                   cs->slot_hash.bytes);
-    } else {
-        uint8_t val_be[32];
-        uint256_to_bytes(&cs->current, val_be);
-        flat_state_put_storage(es->flat_state, ca->addr_hash.bytes,
-                                cs->slot_hash.bytes, val_be);
-    }
-    return true;
-}
-
 void evm_state_evict_cache(evm_state_t *es) {
     if (!es) return;
 
 #ifdef ENABLE_MPT
     if (es->flat_state) {
-        /* Storage: flush dirty slots, or ALL slots if self-destruct occurred
-         * (self-destruct zeroes slots without marking them mpt_dirty) */
-        if (es->had_self_destruct) {
-            mem_art_foreach(&es->storage, evict_all_slots_cb, es);
-        } else {
-            for (size_t d = 0; d < es->dirty_slots.count; d++) {
-                const uint8_t *skey = es->dirty_slots.keys + d * SLOT_KEY_SIZE;
-                cached_slot_t *cs = (cached_slot_t *)mem_art_get_mut(
-                    &es->storage, skey, SLOT_KEY_SIZE, NULL);
-                if (!cs) continue;
-                cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
-                    &es->accounts, skey, ADDRESS_KEY_SIZE, NULL);
-                if (!ca) continue;
-                if (uint256_is_zero(&cs->current)) {
-                    flat_state_delete_storage(es->flat_state, ca->addr_hash.bytes,
-                                               cs->slot_hash.bytes);
-                } else {
-                    uint8_t val_be[32];
-                    uint256_to_bytes(&cs->current, val_be);
-                    flat_state_put_storage(es->flat_state, ca->addr_hash.bytes,
-                                            cs->slot_hash.bytes, val_be);
-                }
+        /* Flush only dirty entries to flat_state.
+         * Self-destructed slots are now in dirty_slots (marked mpt_dirty
+         * in commit_tx_slot_cb), so no full iteration fallback needed. */
+        for (size_t d = 0; d < es->dirty_slots.count; d++) {
+            const uint8_t *skey = es->dirty_slots.keys + d * SLOT_KEY_SIZE;
+            cached_slot_t *cs = (cached_slot_t *)mem_art_get_mut(
+                &es->storage, skey, SLOT_KEY_SIZE, NULL);
+            if (!cs) continue;
+            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+                &es->accounts, skey, ADDRESS_KEY_SIZE, NULL);
+            if (!ca) continue;
+            if (uint256_is_zero(&cs->current)) {
+                flat_state_delete_storage(es->flat_state, ca->addr_hash.bytes,
+                                           cs->slot_hash.bytes);
+            } else {
+                uint8_t val_be[32];
+                uint256_to_bytes(&cs->current, val_be);
+                flat_state_put_storage(es->flat_state, ca->addr_hash.bytes,
+                                        cs->slot_hash.bytes, val_be);
             }
         }
-        /* Accounts: always use dirty vec (self-destruct accounts are in dirty vec) */
         for (size_t d = 0; d < es->dirty_accounts.count; d++) {
             const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
             cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
@@ -731,7 +704,6 @@ void evm_state_evict_cache(evm_state_t *es) {
                 flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
             }
         }
-        es->had_self_destruct = false;
     }
     /* Free code pointers for all cached accounts before arena destroy */
     mem_art_foreach(&es->accounts, free_code_cb, NULL);
@@ -1503,7 +1475,6 @@ void evm_state_self_destruct(evm_state_t *es, const address_t *addr) {
     journal_push(es, &je);
 
     ca->self_destructed = true;
-    es->had_self_destruct = true;
     mark_account_tx_dirty(es, ca);
     ca->dirty = true;
     ca->block_dirty = true;
@@ -1585,9 +1556,10 @@ void evm_state_commit(evm_state_t *es) {
 // ============================================================================
 
 typedef struct {
-    address_t *addrs;
-    size_t    count;
-    size_t    cap;
+    address_t   *addrs;
+    size_t       count;
+    size_t       cap;
+    evm_state_t *es;    /* for mark_slot_mpt_dirty on self-destruct */
 } selfdestructed_ctx_t;
 
 static bool commit_tx_account_cb(const uint8_t *key, size_t key_len,
@@ -1655,7 +1627,14 @@ static bool commit_tx_slot_cb(const uint8_t *key, size_t key_len,
             cs->original = UINT256_ZERO;
             cs->dirty = false;
             cs->block_dirty = false;
+#ifdef ENABLE_MPT
+            /* Mark as mpt_dirty so it appears in dirty_slots for eviction
+             * (ensures flat_state deletes this zeroed slot) */
+            if (ctx->es)
+                mark_slot_mpt_dirty(ctx->es, cs);
+#else
             cs->mpt_dirty = false;
+#endif
             return true;
         }
     }
@@ -1669,7 +1648,7 @@ void evm_state_commit_tx(evm_state_t *es) {
     if (!es) return;
 
     /* --- Process only tx-dirty accounts (fast path) --- */
-    selfdestructed_ctx_t ctx = { .addrs = NULL, .count = 0, .cap = 0 };
+    selfdestructed_ctx_t ctx = { .addrs = NULL, .count = 0, .cap = 0, .es = es };
 
     for (size_t i = 0; i < es->tx_dirty_accounts.count; i++) {
         const uint8_t *addr_key = es->tx_dirty_accounts.keys + i * ADDRESS_KEY_SIZE;
