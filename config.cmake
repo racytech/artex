@@ -18,6 +18,10 @@ set(ENABLE_VERKLE_BUILD OFF)
 set(MPT_ACCOUNT_CAPACITY  300000000)  # ~20GB idx, overflows ~block 15-18M
 set(MPT_STORAGE_CAPACITY  2000000000)  # ~130GB idx, overflows ~block 18-20M
 
+# Flat state capacity hints (disk_table slots for O(1) lookups)
+set(FLAT_ACCOUNT_CAPACITY  300000000)  # same as MPT account capacity
+set(FLAT_STORAGE_CAPACITY  2000000000)  # same as MPT storage capacity
+
 # MPT node cache sizes (LRU, in bytes)
 set(MPT_ACCOUNT_CACHE_BYTES  0)           # disabled — hit rate too low at scale
 set(MPT_STORAGE_CACHE_BYTES  0)           # disabled — OS page cache handles it

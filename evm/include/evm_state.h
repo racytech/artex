@@ -364,6 +364,10 @@ typedef struct {
     uint64_t flat_acct_miss;
     uint64_t flat_stor_hit;
     uint64_t flat_stor_miss;
+
+    /* Checkpoint timing (filled by sync, not evm_state) */
+    double   evict_ms;
+    double   mpt_flush_ms;
 #endif
 } evm_state_stats_t;
 

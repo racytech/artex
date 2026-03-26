@@ -31,6 +31,12 @@ endif()
 if(NOT DEFINED MPT_STORAGE_CAPACITY)
     set(MPT_STORAGE_CAPACITY 500000000)
 endif()
+if(NOT DEFINED FLAT_ACCOUNT_CAPACITY)
+    set(FLAT_ACCOUNT_CAPACITY ${MPT_ACCOUNT_CAPACITY})
+endif()
+if(NOT DEFINED FLAT_STORAGE_CAPACITY)
+    set(FLAT_STORAGE_CAPACITY ${MPT_STORAGE_CAPACITY})
+endif()
 if(NOT DEFINED CODE_CACHE_ENTRIES)
     set(CODE_CACHE_ENTRIES 32768)
 endif()
@@ -900,6 +906,10 @@ if(CJSON_FOUND)
         list(APPEND SYNC_LIBS code_store flat_state)
     endif()
     target_link_libraries(sync ${SYNC_LIBS})
+    target_compile_definitions(sync PRIVATE
+        FLAT_ACCOUNT_CAPACITY=${FLAT_ACCOUNT_CAPACITY}
+        FLAT_STORAGE_CAPACITY=${FLAT_STORAGE_CAPACITY}
+    )
 
     # MPT root stress test
     add_executable(stress_mpt_root tools/stress_mpt_root.c)

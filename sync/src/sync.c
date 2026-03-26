@@ -81,6 +81,10 @@ struct sync {
     /* Stats snapshot taken before cache eviction (so callers see useful values) */
     evm_state_stats_t last_stats;
 
+    /* Checkpoint timing (ms) */
+    double last_evict_ms;
+    double last_mpt_flush_ms;
+
 #ifdef ENABLE_HISTORY
     state_history_t *history;
 #endif
@@ -235,7 +239,8 @@ sync_t *sync_create(const sync_config_t *config) {
         s->flat_state = flat_state_open(config->flat_state_path);
         if (!s->flat_state) {
             s->flat_state = flat_state_create(config->flat_state_path,
-                                               2000000, 50000000);
+                                               (uint64_t)FLAT_ACCOUNT_CAPACITY,
+                                               (uint64_t)FLAT_STORAGE_CAPACITY);
         }
         if (s->flat_state)
             evm_state_set_flat_state(s->state, s->flat_state);
@@ -631,16 +636,25 @@ static void sync_flush_and_evict(sync_t *sync) {
 
     /* Evict cache — root computation captured all dirty data into MPT
      * deferred buffer. Safe to drop cached entries now. */
+    struct timespec _ev0, _ev1, _fl0, _fl1;
+    clock_gettime(CLOCK_MONOTONIC, &_ev0);
 #ifdef ENABLE_DEBUG
     if (!sync->config.no_evict)
 #endif
         evm_state_evict_cache(sync->state);
+    clock_gettime(CLOCK_MONOTONIC, &_ev1);
 
 #ifdef ENABLE_MPT
+    clock_gettime(CLOCK_MONOTONIC, &_fl0);
     if (sync->cs) code_store_flush(sync->cs);
     evm_state_flush(sync->state);
+    clock_gettime(CLOCK_MONOTONIC, &_fl1);
+    sync->last_mpt_flush_ms = (_fl1.tv_sec - _fl0.tv_sec) * 1000.0 +
+                               (_fl1.tv_nsec - _fl0.tv_nsec) / 1e6;
 #endif
 
+    sync->last_evict_ms = (_ev1.tv_sec - _ev0.tv_sec) * 1000.0 +
+                           (_ev1.tv_nsec - _ev0.tv_nsec) / 1e6;
     sync->batch_root_computed = false;
 }
 
@@ -668,7 +682,12 @@ sync_status_t sync_get_status(const sync_t *sync) {
 
 evm_state_stats_t sync_get_state_stats(const sync_t *sync) {
     if (!sync) return (evm_state_stats_t){0};
-    return sync->last_stats;
+    evm_state_stats_t st = sync->last_stats;
+#ifdef ENABLE_MPT
+    st.evict_ms = sync->last_evict_ms;
+    st.mpt_flush_ms = sync->last_mpt_flush_ms;
+#endif
+    return st;
 }
 
 sync_history_stats_t sync_get_history_stats(const sync_t *sync) {
