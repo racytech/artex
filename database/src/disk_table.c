@@ -441,9 +441,14 @@ static scan_result_t scan_chain_key(const disk_table_t *dt,
             uint8_t flags = s[0];
 
             if (flags == SLOT_OCCUPIED) {
-                /* Check fingerprint before full key compare */
+                /* Check fingerprint + 8-byte mid-key compare before full memcmp.
+                 * Bytes 16-23 are independent of bucket index (bytes 0-7) and
+                 * fingerprint (byte 8). Eliminates ~all false positive memcmps. */
+                const uint8_t *stored_key = s + 2;
                 if (s[1] == fp &&
-                    memcmp(s + 2, key, dt->key_size) == 0) {
+                    (dt->key_size < 24 ||
+                     *(const uint64_t *)(stored_key + 16) == *(const uint64_t *)(key + 16)) &&
+                    memcmp(stored_key, key, dt->key_size) == 0) {
                     r.found           = true;
                     r.match_bucket_id = bid;
                     r.match_slot      = i;
