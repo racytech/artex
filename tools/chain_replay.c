@@ -1350,6 +1350,8 @@ int main(int argc, char **argv) {
 #endif
             }
 
+            /* Ensure flush before writing .meta */
+            sync_ensure_flushed(sync);
             /* Write .meta so state_reconstruct can rebuild to last good checkpoint */
             {
                 uint64_t safe_block = ((bn - 1) / CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL;
@@ -1563,6 +1565,9 @@ int main(int argc, char **argv) {
         printf("Speed:         %.0f blk/s\n",
                (st.blocks_ok + st.blocks_fail) / (elapsed > 0 ? elapsed : 1));
     }
+
+    /* Ensure background flush is complete before writing .meta */
+    sync_ensure_flushed(sync);
 
     /* Write .meta for resume on success (mismatch handler already wrote its own) */
     if (st.blocks_fail == 0 && st.last_block > 0) {
