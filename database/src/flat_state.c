@@ -223,11 +223,7 @@ bool flat_state_batch_put_accounts(flat_state_t *fs,
                                     const flat_account_record_t *records,
                                     uint32_t count) {
     if (!fs || !addr_hashes || !records || count == 0) return false;
-    for (uint32_t i = 0; i < count; i++) {
-        if (!flat_store_put(fs->accounts, addr_hashes + i * 32, &records[i]))
-            return false;
-    }
-    return true;
+    return flat_store_batch_put(fs->accounts, addr_hashes, records, count);
 }
 
 bool flat_state_batch_put_storage(flat_state_t *fs,
@@ -235,13 +231,14 @@ bool flat_state_batch_put_storage(flat_state_t *fs,
                                    const uint8_t *values,
                                    uint32_t count) {
     if (!fs || !keys || !values || count == 0) return false;
-    for (uint32_t i = 0; i < count; i++) {
-        uint8_t hashed_key[32];
-        make_stor_key(keys + i * 64, keys + i * 64 + 32, hashed_key);
-        if (!flat_store_put(fs->storage, hashed_key, values + i * 32))
-            return false;
-    }
-    return true;
+    /* Build hashed keys */
+    uint8_t *hashed_keys = malloc(count * 32);
+    if (!hashed_keys) return false;
+    for (uint32_t i = 0; i < count; i++)
+        make_stor_key(keys + i * 64, keys + i * 64 + 32, hashed_keys + i * 32);
+    bool ok = flat_store_batch_put(fs->storage, hashed_keys, values, count);
+    free(hashed_keys);
+    return ok;
 }
 
 /* =========================================================================

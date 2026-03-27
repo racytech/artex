@@ -91,6 +91,14 @@ bool flat_store_delete(flat_store_t *store, const uint8_t *key);
  */
 bool flat_store_contains(const flat_store_t *store, const uint8_t *key);
 
+/**
+ * Batch insert/update, sorted by slot offset for sequential page access.
+ * keys: packed array of key_size-byte keys.
+ * records: packed array of record_size-byte records.
+ */
+bool flat_store_batch_put(flat_store_t *store, const uint8_t *keys,
+                           const void *records, uint32_t count);
+
 /* =========================================================================
  * Stats
  * ========================================================================= */

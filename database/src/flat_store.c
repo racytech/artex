@@ -339,6 +339,82 @@ bool flat_store_contains(const flat_store_t *s, const uint8_t *key) {
 }
 
 /* =========================================================================
+ * Batch Operations
+ * ========================================================================= */
+
+typedef struct {
+    uint32_t idx;       /* original index in keys/records array */
+    uint32_t slot_id;   /* existing slot_id (UINT32_MAX = new entry) */
+} batch_sort_t;
+
+static int cmp_batch_slot(const void *a, const void *b) {
+    const batch_sort_t *ea = (const batch_sort_t *)a;
+    const batch_sort_t *eb = (const batch_sort_t *)b;
+    if (ea->slot_id < eb->slot_id) return -1;
+    if (ea->slot_id > eb->slot_id) return  1;
+    return 0;
+}
+
+bool flat_store_batch_put(flat_store_t *s, const uint8_t *keys,
+                           const void *records, uint32_t count) {
+    if (!s || !keys || !records || count == 0) return false;
+
+    /* Pass 1: look up slot_ids from compact_art (in-memory, fast) */
+    batch_sort_t *entries = malloc(count * sizeof(batch_sort_t));
+    if (!entries) return false;
+
+    for (uint32_t i = 0; i < count; i++) {
+        entries[i].idx = i;
+        const void *val = compact_art_get(&s->index,
+                                           keys + (size_t)i * s->key_size);
+        if (val) {
+            uint32_t sid;
+            memcpy(&sid, val, sizeof(uint32_t));
+            entries[i].slot_id = sid;
+        } else {
+            entries[i].slot_id = UINT32_MAX; /* new entry — append at end */
+        }
+    }
+
+    /* Sort by slot_id — clusters writes by page location */
+    qsort(entries, count, sizeof(batch_sort_t), cmp_batch_slot);
+
+    /* Pass 2: write in sorted order */
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t orig = entries[i].idx;
+        const uint8_t *key = keys + (size_t)orig * s->key_size;
+        const uint8_t *rec = (const uint8_t *)records + (size_t)orig * s->record_size;
+
+        if (entries[i].slot_id != UINT32_MAX) {
+            /* Update existing slot — just overwrite record */
+            uint8_t *slot = slot_ptr(s, entries[i].slot_id);
+            memcpy(slot + 1 + s->key_size, rec, s->record_size);
+        } else {
+            /* New entry — allocate and write full slot */
+            uint32_t slot_id;
+            if (s->free_count > 0) {
+                slot_id = free_list_pop(s);
+            } else {
+                slot_id = s->slot_count++;
+                if (!ensure_mapped(s, s->slot_count)) {
+                    free(entries);
+                    return false;
+                }
+            }
+            uint8_t *slot = slot_ptr(s, slot_id);
+            slot[0] = SLOT_FLAG_OCCUPIED;
+            memcpy(slot + 1, key, s->key_size);
+            memcpy(slot + 1 + s->key_size, rec, s->record_size);
+            compact_art_insert(&s->index, key, &slot_id);
+            s->live_count++;
+        }
+    }
+
+    free(entries);
+    return true;
+}
+
+/* =========================================================================
  * Stats
  * ========================================================================= */
 
