@@ -141,7 +141,7 @@ flat_store_t *flat_store_create(const char *path, uint32_t key_size,
     s->record_size = record_size;
     s->slot_size   = 1 + key_size + record_size;
 
-    if (!compact_art_init(&s->index, key_size, sizeof(uint32_t))) {
+    if (!compact_art_init(&s->index, key_size, sizeof(uint32_t), false)) {
         free(s);
         return NULL;
     }
@@ -214,7 +214,7 @@ flat_store_t *flat_store_open(const char *path) {
     s->slot_count  = hdr.slot_count;
     s->live_count  = 0;
 
-    if (!compact_art_init(&s->index, hdr.key_size, sizeof(uint32_t))) {
+    if (!compact_art_init(&s->index, hdr.key_size, sizeof(uint32_t), false)) {
         munmap(base, st.st_size);
         close(fd);
         free(s);

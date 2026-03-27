@@ -946,13 +946,15 @@ static compact_ref_t delete_recursive(compact_art_t *tree, compact_ref_t ref,
 // ============================================================================
 
 bool compact_art_init(compact_art_t *tree, uint32_t key_size,
-                      uint32_t value_size) {
+                      uint32_t value_size, bool compact_leaves) {
     if (!tree || key_size == 0) return false;
+    (void)compact_leaves; /* reserved for future use */
 
     tree->root = COMPACT_REF_NULL;
     tree->size = 0;
     tree->key_size = key_size;
     tree->value_size = value_size;
+    tree->leaf_key_size = key_size;
     tree->leaf_size = key_size + value_size;
     tree->leaf_count = 0;
 

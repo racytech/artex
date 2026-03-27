@@ -156,9 +156,10 @@ typedef struct compact_art_iterator compact_art_iterator_t;
 struct compact_art {
     compact_ref_t root;         // 0 = empty tree
     size_t size;                // Number of key-value pairs
-    uint32_t key_size;          // Fixed key size (e.g., 32)
+    uint32_t key_size;          // Fixed key size for traversal (e.g., 32, 64)
     uint32_t value_size;        // Fixed value size (e.g., 4)
-    uint32_t leaf_size;         // key_size + value_size (cached)
+    uint32_t leaf_key_size;     // Bytes stored in leaf for verification (key_size or 8)
+    uint32_t leaf_size;         // leaf_key_size + value_size (cached)
     uint32_t leaf_count;        // Number of leaves allocated
     compact_pool_t nodes;       // Inner node pool (variable-size, 8-byte aligned)
     compact_pool_t leaves;      // Leaf pool (fixed-size slots)
@@ -170,8 +171,11 @@ struct compact_art {
 
 /**
  * Initialize a compact ART tree with fixed key and value sizes.
+ * If compact_leaves is true, leaves store only an 8-byte verification
+ * hash instead of the full key (saves memory at negligible collision risk).
  */
-bool compact_art_init(compact_art_t *tree, uint32_t key_size, uint32_t value_size);
+bool compact_art_init(compact_art_t *tree, uint32_t key_size, uint32_t value_size,
+                       bool compact_leaves);
 
 /**
  * Destroy the tree and free all pool memory.

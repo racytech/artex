@@ -1,17 +1,18 @@
 /*
  * Flat State — O(1) Account/Storage Lookups via flat_store.
  *
- * Thin wrapper over two flat_store instances:
+ * Two flat_store instances:
  *   accounts: key=32B (keccak256(addr)) → record=104B
- *   storage:  key=64B (addr_hash+slot_hash) → record=32B
+ *   storage:  key=32B (keccak256(addr_hash||slot_hash)) → record=32B
  *
- * flat_store uses flat_index) + flat data file.
- * Lookups are in-memory index → single pread. No random mmap page faults
- * for the index — only the data read touches disk.
+ * Storage keys are hashed from 64→32 bytes to halve compact_art leaf size.
+ * At 1B entries: 36GB leaf memory instead of 68GB.
  */
 
 #include "flat_state.h"
 #include "flat_store.h"
+#include "keccak256.h"
+#include "hash.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +20,7 @@
 
 #define ACCT_KEY_SIZE  32    /* keccak256(addr) */
 #define ACCT_REC_SIZE  104
-#define STOR_KEY_SIZE  64    /* addr_hash[32] + slot_hash[32] */
+#define STOR_KEY_SIZE  32    /* keccak256(addr_hash || slot_hash) */
 #define STOR_REC_SIZE  32
 
 struct flat_state {
@@ -161,14 +162,24 @@ bool flat_state_delete_account(flat_state_t *fs, const uint8_t addr_hash[32]) {
  * Storage Operations
  * ========================================================================= */
 
+/* Hash 64-byte (addr_hash||slot_hash) down to 32-byte storage key */
+static inline void make_stor_key(const uint8_t addr_hash[32],
+                                  const uint8_t slot_hash[32],
+                                  uint8_t out[32]) {
+    uint8_t combined[64];
+    memcpy(combined, addr_hash, 32);
+    memcpy(combined + 32, slot_hash, 32);
+    hash_t h = hash_keccak256(combined, 64);
+    memcpy(out, h.bytes, 32);
+}
+
 bool flat_state_get_storage(const flat_state_t *fs,
                              const uint8_t addr_hash[32],
                              const uint8_t slot_hash[32],
                              uint8_t value[32]) {
     if (!fs || !addr_hash || !slot_hash || !value) return false;
     uint8_t key[STOR_KEY_SIZE];
-    memcpy(key, addr_hash, 32);
-    memcpy(key + 32, slot_hash, 32);
+    make_stor_key(addr_hash, slot_hash, key);
     return flat_store_get(fs->storage, key, value);
 }
 
@@ -178,8 +189,7 @@ bool flat_state_put_storage(flat_state_t *fs,
                              const uint8_t value[32]) {
     if (!fs || !addr_hash || !slot_hash || !value) return false;
     uint8_t key[STOR_KEY_SIZE];
-    memcpy(key, addr_hash, 32);
-    memcpy(key + 32, slot_hash, 32);
+    make_stor_key(addr_hash, slot_hash, key);
     return flat_store_put(fs->storage, key, value);
 }
 
@@ -188,8 +198,7 @@ bool flat_state_delete_storage(flat_state_t *fs,
                                 const uint8_t slot_hash[32]) {
     if (!fs || !addr_hash || !slot_hash) return false;
     uint8_t key[STOR_KEY_SIZE];
-    memcpy(key, addr_hash, 32);
-    memcpy(key + 32, slot_hash, 32);
+    make_stor_key(addr_hash, slot_hash, key);
     return flat_store_delete(fs->storage, key);
 }
 
@@ -225,7 +234,9 @@ bool flat_state_batch_put_storage(flat_state_t *fs,
                                    uint32_t count) {
     if (!fs || !keys || !values || count == 0) return false;
     for (uint32_t i = 0; i < count; i++) {
-        if (!flat_store_put(fs->storage, keys + i * 64, values + i * 32))
+        uint8_t hashed_key[32];
+        make_stor_key(keys + i * 64, keys + i * 64 + 32, hashed_key);
+        if (!flat_store_put(fs->storage, hashed_key, values + i * 32))
             return false;
     }
     return true;
