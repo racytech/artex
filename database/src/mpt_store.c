@@ -104,13 +104,24 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(mpt_store_header_t) == PAGE_SIZE,
                "mpt_store_header_t must be 4096 bytes");
 
-typedef struct __attribute__((packed)) {
-    uint64_t offset;
-    uint32_t length;
-    uint32_t refcount;   /* shared-mode reference count (0 = free) */
-} node_record_t;
+/* Packed node record: 8 bytes instead of 16.
+ * bits 0-39:   offset (40 bits = 1TB addressable)
+ * bits 40-49:  length (10 bits = max 1023)
+ * bits 50-63:  refcount (14 bits = max 16383) */
+typedef uint64_t node_record_t;
 
-_Static_assert(sizeof(node_record_t) == 16, "node_record_t must be 16 bytes");
+static inline node_record_t node_record_pack(uint64_t offset, uint32_t length,
+                                              uint32_t refcount) {
+    return (offset & 0xFFFFFFFFFFULL) |
+           ((uint64_t)(length & 0x3FF) << 40) |
+           ((uint64_t)(refcount & 0x3FFF) << 50);
+}
+
+static inline uint64_t node_record_offset(node_record_t r)   { return r & 0xFFFFFFFFFFULL; }
+static inline uint32_t node_record_length(node_record_t r)   { return (r >> 40) & 0x3FF; }
+static inline uint32_t node_record_refcount(node_record_t r) { return (r >> 50) & 0x3FFF; }
+
+_Static_assert(sizeof(node_record_t) == 8, "node_record_t must be 8 bytes");
 
 /* =========================================================================
  * Dirty entry (staged update/delete)
@@ -982,24 +993,24 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
     node_record_t rec;
     if (!idx_get(ms, hash, &rec))
         return 0;
-    if (rec.length == 0 || rec.length > MAX_NODE_RLP)
+    if (node_record_length(rec) == 0 || node_record_length(rec) > MAX_NODE_RLP)
         return 0;
 
     /* Read from mmap'd .dat (skip slot header) */
-    size_t dat_off = PAGE_SIZE + rec.offset + SLOT_HEADER_SIZE;
-    if (dat_off + rec.length > ms->data_mapped)
+    size_t dat_off = PAGE_SIZE + node_record_offset(rec) + SLOT_HEADER_SIZE;
+    if (dat_off + node_record_length(rec) > ms->data_mapped)
         return 0;
-    memcpy(buf, ms->data_base + dat_off, rec.length);
+    memcpy(buf, ms->data_base + dat_off, node_record_length(rec));
 
     /* Insert into LRU cache with depth for pin policy */
     if (ms->ncache_enabled)
         node_cache_put((node_cache_t *)&ms->ncache, hash, buf,
-                        (uint16_t)rec.length, depth);
+                        (uint16_t)node_record_length(rec), depth);
 
     cs->load_ns += (double)(cstat_now() - _t0);
     cs->nodes_loaded++;
     cs->load_disk_reads++;
-    return rec.length;
+    return node_record_length(rec);
 }
 
 /* Write a node: buffer in deferred write buffer (no disk I/O).
@@ -1026,7 +1037,9 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         {
             node_record_t existing;
             if (idx_get(ms, out_hash, &existing)) {
-                existing.refcount++;
+                existing = node_record_pack(node_record_offset(existing),
+                                           node_record_length(existing),
+                                           node_record_refcount(existing) + 1);
                 idx_put(ms, out_hash, &existing);
                 ms->cstats.check_ns += (double)(cstat_now() - _chk0);
                 ms->cstats.check_hits++;
@@ -1223,9 +1236,9 @@ static bool mpt_key_fetch(const void *value, uint8_t *key_out, void *user_data) 
     mpt_store_t *ms = (mpt_store_t *)user_data;
     node_record_t rec;
     memcpy(&rec, value, sizeof(node_record_t));
-    const uint8_t *rlp = ms->data_base + PAGE_SIZE + rec.offset + SLOT_HEADER_SIZE;
-    if (rec.length > 0 && rec.length <= MAX_NODE_RLP) {
-        keccak(rlp, rec.length, key_out);
+    const uint8_t *rlp = ms->data_base + PAGE_SIZE + node_record_offset(rec) + SLOT_HEADER_SIZE;
+    if (node_record_length(rec) > 0 && node_record_length(rec) <= MAX_NODE_RLP) {
+        keccak(rlp, node_record_length(rec), key_out);
         return true;
     }
     return false;
@@ -1375,9 +1388,7 @@ mpt_store_t *mpt_store_open(const char *path) {
                 uint8_t hash[32];
                 keccak(ms->data_base + PAGE_SIZE + offset + SLOT_HEADER_SIZE,
                        rlp_len, hash);
-                node_record_t rec = { .offset = offset,
-                                      .length = rlp_len,
-                                      .refcount = refcount };
+                node_record_t rec = node_record_pack(offset, rlp_len, refcount);
                 idx_put(ms, hash, &rec);
                 ms->live_bytes += rlp_len;
             } else {
@@ -1480,16 +1491,16 @@ void mpt_store_prefetch(const mpt_store_t *ms, const uint8_t hash[32]) {
     /* Look up index to find .dat offset */
     node_record_t rec;
     if (!idx_get(ms, hash, &rec)) return;
-    if (rec.length == 0 || rec.length > MAX_NODE_RLP) return;
+    if (node_record_length(rec) == 0 || node_record_length(rec) > MAX_NODE_RLP) return;
 
     /* Prefetch the .dat page containing this node (skip slot header) */
-    size_t dat_off = PAGE_SIZE + rec.offset + SLOT_HEADER_SIZE;
-    if (dat_off + rec.length > ms->data_mapped) return;
+    size_t dat_off = PAGE_SIZE + node_record_offset(rec) + SLOT_HEADER_SIZE;
+    if (dat_off + node_record_length(rec) > ms->data_mapped) return;
 
     /* MADV_WILLNEED tells the kernel to start reading this page
      * into the page cache asynchronously */
     size_t page_start = dat_off & ~(size_t)4095;
-    size_t page_end = (dat_off + rec.length + 4095) & ~(size_t)4095;
+    size_t page_end = (dat_off + node_record_length(rec) + 4095) & ~(size_t)4095;
     madvise((void *)(ms->data_base + page_start), page_end - page_start,
             MADV_WILLNEED);
 }
@@ -1549,9 +1560,7 @@ void mpt_store_flush(mpt_store_t *ms) {
     for (size_t i = 0; i < n; i++) {
         deferred_entry_t *e = sorted ? sorted[i] : &ms->def_entries[i];
         if (!e->rlp) continue;
-        node_record_t rec = { .offset = e->offset,
-                              .length = e->rlp_len,
-                              .refcount = e->refcount };
+        node_record_t rec = node_record_pack(e->offset, e->rlp_len, e->refcount);
         idx_put(ms, e->hash, &rec);
     }
     free(sorted);
@@ -1560,23 +1569,25 @@ void mpt_store_flush(mpt_store_t *ms) {
     for (size_t i = 0; i < ms->def_del_count; i++) {
         node_record_t rec;
         if (idx_get(ms, ms->def_deletes[i].hash, &rec)) {
-            if (rec.refcount > 1) {
-                rec.refcount--;
+            if (node_record_refcount(rec) > 1) {
+                rec = node_record_pack(node_record_offset(rec),
+                                       node_record_length(rec),
+                                       node_record_refcount(rec) - 1);
                 idx_put(ms, ms->def_deletes[i].hash, &rec);
                 /* Update slot header refcount on disk */
-                int sc = size_class_for(rec.length);
-                uint32_t shdr = slot_header_pack((uint8_t)sc, (uint16_t)rec.length,
-                                                  (uint16_t)rec.refcount);
-                memcpy(ms->data_base + PAGE_SIZE + rec.offset, &shdr, SLOT_HEADER_SIZE);
+                int sc = size_class_for(node_record_length(rec));
+                uint32_t shdr = slot_header_pack((uint8_t)sc, (uint16_t)node_record_length(rec),
+                                                  (uint16_t)node_record_refcount(rec));
+                memcpy(ms->data_base + PAGE_SIZE + node_record_offset(rec), &shdr, SLOT_HEADER_SIZE);
             } else {
-                if (ms->live_bytes >= rec.length)
-                    ms->live_bytes -= rec.length;
-                int sc = size_class_for(rec.length);
-                free_list_push(&ms->free_lists[sc], rec.offset);
+                if (ms->live_bytes >= node_record_length(rec))
+                    ms->live_bytes -= node_record_length(rec);
+                int sc = size_class_for(node_record_length(rec));
+                free_list_push(&ms->free_lists[sc], node_record_offset(rec));
                 ms->free_slot_bytes += SLOT_HEADER_SIZE + SIZE_CLASSES[sc];
                 /* Zero the slot header to mark as free */
                 uint32_t zero_hdr = 0;
-                memcpy(ms->data_base + PAGE_SIZE + rec.offset, &zero_hdr, SLOT_HEADER_SIZE);
+                memcpy(ms->data_base + PAGE_SIZE + node_record_offset(rec), &zero_hdr, SLOT_HEADER_SIZE);
                 idx_delete(ms, ms->def_deletes[i].hash);
             }
         }
