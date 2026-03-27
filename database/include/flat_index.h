@@ -18,17 +18,18 @@
  */
 
 typedef struct {
-    uint64_t *tags;      /* verification tag (key[8..15]), 0 = empty */
+    uint64_t *tags;      /* verification tag, 0 = empty */
     uint32_t *offsets;   /* slot_id + 1 (0 = empty) */
     uint32_t  capacity;  /* power of 2 */
     uint32_t  mask;      /* capacity - 1 */
     uint32_t  count;     /* live entries */
+    uint32_t  key_size;  /* for tag extraction */
 } flat_index_t;
 
 #define FLAT_INDEX_INITIAL_CAP 1024
 #define FLAT_INDEX_LOAD_PCT    70
 
-bool flat_index_init(flat_index_t *idx, uint32_t capacity);
+bool flat_index_init(flat_index_t *idx, uint32_t capacity, uint32_t key_size);
 void flat_index_destroy(flat_index_t *idx);
 
 /**

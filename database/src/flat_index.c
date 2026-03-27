@@ -6,9 +6,18 @@
 #define TAG_EMPTY     0
 #define TAG_TOMBSTONE UINT64_MAX
 
-static inline uint64_t make_tag(const uint8_t *key) {
+static inline uint64_t make_tag(const uint8_t *key, uint32_t key_size) {
+    /* For short keys (32B): use bytes 8-15 (independent of bucket bytes 0-7).
+     * For long keys (64B): XOR bytes 8-15 with bytes 40-47 so that entries
+     * sharing the same first 32 bytes (e.g., same addr_hash) get different
+     * tags from their second 32 bytes (slot_hash). */
     uint64_t t;
     memcpy(&t, key + 8, 8);
+    if (key_size > 40) {
+        uint64_t t2;
+        memcpy(&t2, key + 40, 8);
+        t ^= t2;
+    }
     if (t == TAG_EMPTY) t = 1;
     if (t == TAG_TOMBSTONE) t = TAG_TOMBSTONE - 1;
     return t;
@@ -20,7 +29,7 @@ static inline uint64_t make_bucket(const uint8_t *key, uint32_t mask) {
     return h & mask;
 }
 
-bool flat_index_init(flat_index_t *idx, uint32_t capacity) {
+bool flat_index_init(flat_index_t *idx, uint32_t capacity, uint32_t key_size) {
     if (capacity < FLAT_INDEX_INITIAL_CAP) capacity = FLAT_INDEX_INITIAL_CAP;
     /* Round up to power of 2 */
     uint32_t cap = 1;
@@ -36,6 +45,7 @@ bool flat_index_init(flat_index_t *idx, uint32_t capacity) {
     idx->capacity = cap;
     idx->mask = cap - 1;
     idx->count = 0;
+    idx->key_size = key_size;
     return true;
 }
 
@@ -49,7 +59,7 @@ void flat_index_destroy(flat_index_t *idx) {
 const uint32_t *flat_index_get(const flat_index_t *idx, const uint8_t *key) {
     if (!idx || !key || idx->count == 0) return NULL;
 
-    uint64_t tag = make_tag(key);
+    uint64_t tag = make_tag(key, idx->key_size);
     uint32_t pos = (uint32_t)make_bucket(key, idx->mask);
 
     for (uint32_t i = 0; i < idx->capacity; i++) {
@@ -67,7 +77,7 @@ const uint32_t *flat_index_get(const flat_index_t *idx, const uint8_t *key) {
 bool flat_index_put(flat_index_t *idx, const uint8_t *key, uint32_t slot_id) {
     if (!idx || !key) return false;
 
-    uint64_t tag = make_tag(key);
+    uint64_t tag = make_tag(key, idx->key_size);
     uint32_t pos = (uint32_t)make_bucket(key, idx->mask);
     int32_t first_tombstone = -1;
 
@@ -101,7 +111,7 @@ bool flat_index_put(flat_index_t *idx, const uint8_t *key, uint32_t slot_id) {
 bool flat_index_delete(flat_index_t *idx, const uint8_t *key) {
     if (!idx || !key || idx->count == 0) return false;
 
-    uint64_t tag = make_tag(key);
+    uint64_t tag = make_tag(key, idx->key_size);
     uint32_t pos = (uint32_t)make_bucket(key, idx->mask);
 
     for (uint32_t i = 0; i < idx->capacity; i++) {

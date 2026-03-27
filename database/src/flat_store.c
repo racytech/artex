@@ -141,7 +141,7 @@ flat_store_t *flat_store_create(const char *path, uint32_t key_size,
     s->record_size = record_size;
     s->slot_size   = 1 + key_size + record_size;
 
-    if (!flat_index_init(&s->index, FLAT_INDEX_INITIAL_CAP)) {
+    if (!flat_index_init(&s->index, FLAT_INDEX_INITIAL_CAP, key_size)) {
         free(s);
         return NULL;
     }
@@ -216,7 +216,7 @@ flat_store_t *flat_store_open(const char *path) {
 
     /* Init index with capacity hint from slot count */
     uint32_t idx_cap = s->slot_count > 1024 ? s->slot_count * 2 : FLAT_INDEX_INITIAL_CAP;
-    if (!flat_index_init(&s->index, idx_cap)) {
+    if (!flat_index_init(&s->index, idx_cap, hdr.key_size)) {
         munmap(base, st.st_size);
         close(fd);
         free(s);
