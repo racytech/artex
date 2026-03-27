@@ -11,9 +11,12 @@
  * Disk-backed Ethereum MPT. Persists trie nodes across blocks so that
  * state root computation is O(dirty * depth) instead of O(total_accounts).
  *
- * Two files:
- *   <path>.idx — disk_table index: node_hash[32] → {offset[8], length[4]}
- *   <path>.dat — slot-allocated flat file of RLP-encoded trie node data
+ * Single file:
+ *   <path>.dat — self-describing slot-allocated file of RLP-encoded trie nodes
+ *
+ * Each slot has a 4-byte header encoding size class, RLP length, and refcount.
+ * Index: in-memory compact_art mapping node_hash(32B) → node_record_t(16B).
+ * Rebuilt on open by scanning .dat slot headers + computing keccak256 per node.
  *
  * Slot allocation: nodes stored in size-class slots (64–1024 bytes).
  * Deleted slots go onto per-class free lists. New writes reuse free
@@ -25,8 +28,8 @@
  *   3. mpt_store_commit_batch() — walks dirty paths, writes new nodes,
  *      deletes stale nodes, returns new root hash
  *
- * Node reads: root_hash → disk_table_get → {offset,len} → pread from .dat
- * Two I/O ops per node, both page-cache friendly.
+ * Node reads: compact_art lookup (in-memory) → read RLP from mmap'd .dat.
+ * Single I/O op per node, page-cache friendly.
  *
  */
 
@@ -37,8 +40,8 @@ typedef struct mpt_store mpt_store_t;
  * ========================================================================= */
 
 /**
- * Create a new MPT store, creating/truncating files at <path>.idx/.dat.
- * capacity_hint: expected number of trie nodes (sizes the disk_table).
+ * Create a new MPT store, creating/truncating <path>.dat.
+ * capacity_hint: unused (compact_art grows dynamically).
  * The trie starts empty (root = keccak256(0x80)).
  * Returns NULL on failure.
  */
@@ -69,7 +72,7 @@ void mpt_store_reset(mpt_store_t *ms);
 void mpt_store_sync(mpt_store_t *ms);
 
 /**
- * Flush deferred writes to mmap (page cache) + disk_table, then free
+ * Flush deferred writes to mmap (page cache) + compact_art index, then free
  * deferred buffers. No msync — OS handles writeback asynchronously.
  * Call at checkpoint time before evict_cache.
  */
@@ -207,7 +210,7 @@ bool mpt_store_walk_leaves(const mpt_store_t *ms, mpt_leaf_cb_t cb,
 
 /**
  * Enable the LRU node cache with the given memory budget in bytes.
- * Keeps hot trie nodes in memory to avoid disk_table + .dat page faults.
+ * Keeps hot trie node RLP in memory to avoid .dat page faults.
  * Call after create/open, before any batch operations.
  * Typical values: 2GB for accounts, 8GB for storage.
  */

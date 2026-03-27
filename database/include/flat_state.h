@@ -5,17 +5,14 @@
 #include <stdbool.h>
 
 /**
- * Flat State — O(1) Account/Storage Lookups via disk_table.
+ * Flat State — O(1) Account/Storage Lookups via flat_store.
  *
- * Backed by disk_table (mmap'd, lock-free, pre-hashed keys).
- * Two tables:
+ * Two flat_store instances (compact_art index + mmap'd data file):
  *   accounts: keccak256(addr)[32] → {nonce, balance, code_hash, storage_root}
- *   storage:  addr_hash[32] + slot_hash[32] → value[32]
+ *   storage:  keccak256(addr_hash||slot_hash)[32] → value[32]
  *
- * Keys are pre-hashed (keccak256), matching disk_table's design for
- * uniform first-8-byte distribution. No additional hashing needed.
- *
- * Single-threaded, no locks. OS page cache manages residency.
+ * Index lookups are in-memory (compact_art). Data reads are single
+ * mmap accesses at known offsets. No hash table bucket scanning.
  */
 
 typedef struct flat_state flat_state_t;

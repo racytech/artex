@@ -519,7 +519,7 @@ target_link_libraries(verify_mpt mpt_store common)
 add_library(mpt_store_pic STATIC database/src/mpt_store.c)
 target_include_directories(mpt_store_pic PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 set_target_properties(mpt_store_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(mpt_store_pic disk_hash bloom_filter common)
+target_link_libraries(mpt_store_pic compact_art node_cache common)
 
 add_library(mem_mpt_pic STATIC database/src/mem_mpt.c)
 set_target_properties(mem_mpt_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
