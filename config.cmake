@@ -14,17 +14,13 @@ set(ENABLE_HISTORY ON)
 # Build verkle libraries for background state building (pre-fork)
 set(ENABLE_VERKLE_BUILD OFF)
 
-# MPT disk_table capacity hints (pre-allocated hash table slots)
-set(MPT_ACCOUNT_CAPACITY  300000000)  # ~20GB idx, overflows ~block 15-18M
-set(MPT_STORAGE_CAPACITY  2000000000)  # ~130GB idx, overflows ~block 18-20M
-
-# Flat state capacity hints (disk_table slots for O(1) lookups)
-set(FLAT_ACCOUNT_CAPACITY  300000000)  # same as MPT account capacity
-set(FLAT_STORAGE_CAPACITY  2000000000)  # same as MPT storage capacity
+# MPT capacity hints (unused — compact_art grows dynamically)
+set(MPT_ACCOUNT_CAPACITY  300000000)
+set(MPT_STORAGE_CAPACITY  2000000000)
 
 # MPT node cache sizes (LRU, in bytes)
-set(MPT_ACCOUNT_CACHE_BYTES  0)           # disabled — hit rate too low at scale
-set(MPT_STORAGE_CACHE_BYTES  0)           # disabled — OS page cache handles it
+set(MPT_ACCOUNT_CACHE_BYTES  0)           # disabled — compact_art index is in-memory
+set(MPT_STORAGE_CACHE_BYTES  0)           # disabled — compact_art index is in-memory
 
 # Checkpoint interval (blocks between auto-saves)
 set(CHECKPOINT_INTERVAL 256)
