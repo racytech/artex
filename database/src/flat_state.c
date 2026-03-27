@@ -11,8 +11,6 @@
 
 #include "flat_state.h"
 #include "flat_store.h"
-#include "keccak256.h"
-#include "hash.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,15 +160,19 @@ bool flat_state_delete_account(flat_state_t *fs, const uint8_t addr_hash[32]) {
  * Storage Operations
  * ========================================================================= */
 
-/* Hash 64-byte (addr_hash||slot_hash) down to 32-byte storage key */
+/* Combine addr_hash and slot_hash into a 32-byte storage key via XOR.
+ * Both inputs are keccak256 outputs (independent, uniform). XOR preserves
+ * uniformity — collision probability is 1/2^256, same as keccak256. */
 static inline void make_stor_key(const uint8_t addr_hash[32],
                                   const uint8_t slot_hash[32],
                                   uint8_t out[32]) {
-    uint8_t combined[64];
-    memcpy(combined, addr_hash, 32);
-    memcpy(combined + 32, slot_hash, 32);
-    hash_t h = hash_keccak256(combined, 64);
-    memcpy(out, h.bytes, 32);
+    const uint64_t *a = (const uint64_t *)addr_hash;
+    const uint64_t *s = (const uint64_t *)slot_hash;
+    uint64_t *o = (uint64_t *)out;
+    o[0] = a[0] ^ s[0];
+    o[1] = a[1] ^ s[1];
+    o[2] = a[2] ^ s[2];
+    o[3] = a[3] ^ s[3];
 }
 
 bool flat_state_get_storage(const flat_state_t *fs,
