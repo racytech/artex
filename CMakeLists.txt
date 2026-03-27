@@ -94,9 +94,12 @@ add_library(disk_table STATIC database/src/disk_table.c)
 # Compact ART (in-memory index)
 add_library(compact_art STATIC database/src/compact_art.c)
 
-# ART Store (compact_art index + flat data file)
+# Flat Index (compact open-addressing hash table)
+add_library(flat_index STATIC database/src/flat_index.c)
+
+# ART Store (flat_index + mmap'd data file)
 add_library(art_store STATIC database/src/art_store.c)
-target_link_libraries(art_store compact_art)
+target_link_libraries(art_store flat_index)
 
 # Flat State (O(1) account/storage lookups via art_store)
 add_library(flat_state STATIC database/src/flat_state.c)

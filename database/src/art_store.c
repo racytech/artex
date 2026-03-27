@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "art_store.h"
-#include "compact_art.h"
+#include "flat_index.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -43,7 +43,7 @@ typedef struct {
  * ========================================================================= */
 
 struct art_store {
-    compact_art_t index;
+    flat_index_t  index;
     int           fd;
     uint32_t      key_size;
     uint32_t      record_size;
@@ -141,14 +141,14 @@ art_store_t *art_store_create(const char *path, uint32_t key_size,
     s->record_size = record_size;
     s->slot_size   = 1 + key_size + record_size;
 
-    if (!compact_art_init(&s->index, key_size, sizeof(uint32_t))) {
+    if (!flat_index_init(&s->index, FLAT_INDEX_INITIAL_CAP)) {
         free(s);
         return NULL;
     }
 
     s->fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (s->fd < 0) {
-        compact_art_destroy(&s->index);
+        flat_index_destroy(&s->index);
         free(s);
         return NULL;
     }
@@ -157,7 +157,7 @@ art_store_t *art_store_create(const char *path, uint32_t key_size,
     size_t init_size = ART_STORE_HEADER_SIZE + (size_t)INITIAL_MMAP_SLOTS * s->slot_size;
     if (ftruncate(s->fd, init_size) != 0) {
         close(s->fd);
-        compact_art_destroy(&s->index);
+        flat_index_destroy(&s->index);
         free(s);
         return NULL;
     }
@@ -165,7 +165,7 @@ art_store_t *art_store_create(const char *path, uint32_t key_size,
     s->base = mmap(NULL, init_size, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0);
     if (s->base == MAP_FAILED) {
         close(s->fd);
-        compact_art_destroy(&s->index);
+        flat_index_destroy(&s->index);
         free(s);
         return NULL;
     }
@@ -214,19 +214,30 @@ art_store_t *art_store_open(const char *path) {
     s->slot_count  = hdr.slot_count;
     s->live_count  = 0;
 
-    if (!compact_art_init(&s->index, hdr.key_size, sizeof(uint32_t))) {
+    /* Init index with capacity hint from slot count */
+    uint32_t idx_cap = s->slot_count > 1024 ? s->slot_count * 2 : FLAT_INDEX_INITIAL_CAP;
+    if (!flat_index_init(&s->index, idx_cap)) {
         munmap(base, st.st_size);
         close(fd);
         free(s);
         return NULL;
     }
 
-    /* Scan all slots: rebuild ART index + free list */
+    /* Scan all slots: rebuild index + free list */
     for (uint32_t i = 0; i < s->slot_count; i++) {
         uint8_t *slot = slot_ptr(s, i);
         if (slot[0] == SLOT_FLAG_OCCUPIED) {
             const uint8_t *key = slot + 1;
-            compact_art_insert(&s->index, key, &i);
+            if (flat_index_needs_grow(&s->index)) {
+                flat_index_grow(&s->index, s->index.capacity * 2);
+                /* Re-insert all previous entries */
+                for (uint32_t j = 0; j < i; j++) {
+                    uint8_t *prev = slot_ptr(s, j);
+                    if (prev[0] == SLOT_FLAG_OCCUPIED)
+                        flat_index_put(&s->index, prev + 1, j);
+                }
+            }
+            flat_index_put(&s->index, key, i);
             s->live_count++;
         } else {
             free_list_push(s, i);
@@ -239,7 +250,7 @@ art_store_t *art_store_open(const char *path) {
 void art_store_destroy(art_store_t *s) {
     if (!s) return;
     write_header(s);
-    compact_art_destroy(&s->index);
+    flat_index_destroy(&s->index);
     if (s->base && s->base != MAP_FAILED)
         munmap(s->base, s->mapped_size);
     if (s->fd >= 0) close(s->fd);
@@ -255,14 +266,26 @@ bool art_store_put(art_store_t *s, const uint8_t *key,
                     const void *record)
 {
     /* Check if key already exists */
-    const void *existing = compact_art_get(&s->index, key);
+    const uint32_t *existing = flat_index_get(&s->index, key);
     if (existing) {
         /* Update: overwrite record data in existing slot */
-        uint32_t slot_id;
-        memcpy(&slot_id, existing, sizeof(uint32_t));
+        uint32_t slot_id = *existing - 1;
         uint8_t *slot = slot_ptr(s, slot_id);
         memcpy(slot + 1 + s->key_size, record, s->record_size);
         return true;
+    }
+
+    /* Grow index if needed */
+    if (flat_index_needs_grow(&s->index)) {
+        uint32_t new_cap = s->index.capacity * 2;
+        if (!flat_index_grow(&s->index, new_cap))
+            return false;
+        /* Re-insert all live entries from data file */
+        for (uint32_t i = 0; i < s->slot_count; i++) {
+            uint8_t *sl = slot_ptr(s, i);
+            if (sl[0] == SLOT_FLAG_OCCUPIED)
+                flat_index_put(&s->index, sl + 1, i);
+        }
     }
 
     /* New key: allocate a slot */
@@ -281,7 +304,7 @@ bool art_store_put(art_store_t *s, const uint8_t *key,
     memcpy(slot + 1, key, s->key_size);
     memcpy(slot + 1 + s->key_size, record, s->record_size);
 
-    if (!compact_art_insert(&s->index, key, &slot_id))
+    if (!flat_index_put(&s->index, key, slot_id))
         return false;
 
     s->live_count++;
@@ -291,35 +314,33 @@ bool art_store_put(art_store_t *s, const uint8_t *key,
 bool art_store_get(const art_store_t *s, const uint8_t *key,
                     void *out)
 {
-    const void *val = compact_art_get(&s->index, key);
+    const uint32_t *val = flat_index_get(&s->index, key);
     if (!val) return false;
 
-    uint32_t slot_id;
-    memcpy(&slot_id, val, sizeof(uint32_t));
+    uint32_t slot_id = *val - 1;
     const uint8_t *slot = slot_ptr(s, slot_id);
     memcpy(out, slot + 1 + s->key_size, s->record_size);
     return true;
 }
 
 bool art_store_delete(art_store_t *s, const uint8_t *key) {
-    const void *val = compact_art_get(&s->index, key);
+    const uint32_t *val = flat_index_get(&s->index, key);
     if (!val) return false;
 
-    uint32_t slot_id;
-    memcpy(&slot_id, val, sizeof(uint32_t));
+    uint32_t slot_id = *val - 1;
 
     /* Mark slot free */
     uint8_t *slot = slot_ptr(s, slot_id);
     slot[0] = SLOT_FLAG_FREE;
 
-    compact_art_delete(&s->index, key);
+    flat_index_delete(&s->index, key);
     free_list_push(s, slot_id);
     s->live_count--;
     return true;
 }
 
 bool art_store_contains(const art_store_t *s, const uint8_t *key) {
-    return compact_art_contains(&s->index, key);
+    return flat_index_contains(&s->index, key);
 }
 
 /* =========================================================================
