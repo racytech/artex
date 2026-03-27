@@ -52,21 +52,22 @@ static const uint16_t SIZE_CLASSES[NUM_SIZE_CLASSES] = {64, 128, 256, 512, 1024}
 
 /* Slot header: 4 bytes prepended to each slot in the .dat file.
  * bits 0-2:   size class index (0-4)
- * bits 3-12:  rlp_len (0-1023, 0 = free slot)
+ * bits 3-13:  rlp_len (0-2047, 0 = free slot)
+ * bits 14-15: reserved
  * bits 16-31: refcount */
 #define SLOT_HEADER_SIZE  4
 
 static inline uint32_t slot_header_pack(uint8_t class_idx, uint16_t rlp_len,
                                          uint16_t refcount) {
     return ((uint32_t)class_idx & 0x7)
-         | (((uint32_t)rlp_len & 0x3FF) << 3)
+         | (((uint32_t)rlp_len & 0x7FF) << 3)
          | ((uint32_t)refcount << 16);
 }
 
 static inline void slot_header_unpack(uint32_t hdr, uint8_t *class_idx,
                                        uint16_t *rlp_len, uint16_t *refcount) {
     *class_idx = hdr & 0x7;
-    *rlp_len   = (hdr >> 3) & 0x3FF;
+    *rlp_len   = (hdr >> 3) & 0x7FF;
     *refcount  = (uint16_t)(hdr >> 16);
 }
 
@@ -106,20 +107,20 @@ _Static_assert(sizeof(mpt_store_header_t) == PAGE_SIZE,
 
 /* Packed node record: 8 bytes instead of 16.
  * bits 0-39:   offset (40 bits = 1TB addressable)
- * bits 40-49:  length (10 bits = max 1023)
- * bits 50-63:  refcount (14 bits = max 16383) */
+ * bits 40-50:  length (11 bits = max 2047)
+ * bits 51-63:  refcount (13 bits = max 8191) */
 typedef uint64_t node_record_t;
 
 static inline node_record_t node_record_pack(uint64_t offset, uint32_t length,
                                               uint32_t refcount) {
     return (offset & 0xFFFFFFFFFFULL) |
-           ((uint64_t)(length & 0x3FF) << 40) |
-           ((uint64_t)(refcount & 0x3FFF) << 50);
+           ((uint64_t)(length & 0x7FF) << 40) |
+           ((uint64_t)(refcount & 0x1FFF) << 51);
 }
 
 static inline uint64_t node_record_offset(node_record_t r)   { return r & 0xFFFFFFFFFFULL; }
-static inline uint32_t node_record_length(node_record_t r)   { return (r >> 40) & 0x3FF; }
-static inline uint32_t node_record_refcount(node_record_t r) { return (r >> 50) & 0x3FFF; }
+static inline uint32_t node_record_length(node_record_t r)   { return (r >> 40) & 0x7FF; }
+static inline uint32_t node_record_refcount(node_record_t r) { return (r >> 51) & 0x1FFF; }
 
 _Static_assert(sizeof(node_record_t) == 8, "node_record_t must be 8 bytes");
 
@@ -1492,6 +1493,8 @@ mpt_store_t *mpt_store_open(const char *path) {
     /* Rebuild index by scanning the .dat file slot headers */
     {
         uint64_t offset = 0;
+        uint32_t scan_live = 0, scan_free = 0;
+        uint64_t scan_live_bytes = 0, scan_total_bytes = 0;
         while (offset + SLOT_HEADER_SIZE <= ms->data_size) {
             uint32_t shdr;
             memcpy(&shdr, ms->data_base + PAGE_SIZE + offset, SLOT_HEADER_SIZE);
@@ -1507,15 +1510,25 @@ mpt_store_t *mpt_store_open(const char *path) {
                 keccak(ms->data_base + PAGE_SIZE + offset + SLOT_HEADER_SIZE,
                        rlp_len, hash);
                 node_record_t rec = node_record_pack(offset, rlp_len, refcount);
-                idx_put(ms, hash, &rec);
+                if (!idx_put(ms, hash, &rec)) {
+                    fprintf(stderr, "  WARN: idx_put failed at offset=%lu rlp_len=%u\n",
+                            (unsigned long)offset, rlp_len);
+                }
                 ms->live_bytes += rlp_len;
+                scan_live++;
+                scan_live_bytes += rlp_len;
             } else {
                 /* Free slot: add to free list */
                 free_list_push(&ms->free_lists[sc], offset);
                 ms->free_slot_bytes += slot_total;
+                scan_free++;
             }
+            scan_total_bytes += slot_total;
             offset += slot_total;
         }
+        fprintf(stderr, "  scan: %u live + %u free slots, scan_live_bytes=%lu scan_total=%lu final_offset=%lu\n",
+                scan_live, scan_free, (unsigned long)scan_live_bytes,
+                (unsigned long)scan_total_bytes, (unsigned long)offset);
     }
 
     fprintf(stderr, "mpt_store_open: scanned %s — data_size=%lu live_bytes=%lu free_bytes=%lu index_size=%zu\n",
