@@ -669,7 +669,7 @@ int main(int argc, char **argv) {
     cfg.code_store_path = code_path;
 #endif
 
-    LOG_INFO("Loading state (bloom filter scan)...");
+    LOG_INFO("Loading state...");
 #ifdef ENABLE_TUI
     if (use_tui) { tui_tick(); }
 #endif
