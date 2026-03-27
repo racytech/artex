@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "art_store.h"
+#include "flat_store.h"
 #include "flat_index.h"
 
 #include <stdlib.h>
@@ -14,9 +14,9 @@
  * Constants
  * ========================================================================= */
 
-#define ART_STORE_MAGIC       "ARTS"
-#define ART_STORE_VERSION     1
-#define ART_STORE_HEADER_SIZE 4096  /* page-aligned header */
+#define FLAT_STORE_MAGIC       "FLST"
+#define FLAT_STORE_VERSION     1
+#define FLAT_STORE_HEADER_SIZE 4096  /* page-aligned header */
 
 #define SLOT_FLAG_FREE        0x00
 #define SLOT_FLAG_OCCUPIED    0x01
@@ -36,13 +36,13 @@ typedef struct {
     uint32_t slot_count;
     uint32_t live_count;
     uint8_t  reserved[40];
-} art_store_header_t;
+} flat_store_header_t;
 
 /* =========================================================================
  * Internal Structure
  * ========================================================================= */
 
-struct art_store {
+struct flat_store {
     flat_index_t  index;
     int           fd;
     uint32_t      key_size;
@@ -63,17 +63,17 @@ struct art_store {
  * Mmap helpers
  * ========================================================================= */
 
-static inline uint8_t *slot_ptr(const art_store_t *s, uint32_t slot_id) {
-    return s->base + ART_STORE_HEADER_SIZE + (size_t)slot_id * s->slot_size;
+static inline uint8_t *slot_ptr(const flat_store_t *s, uint32_t slot_id) {
+    return s->base + FLAT_STORE_HEADER_SIZE + (size_t)slot_id * s->slot_size;
 }
 
-static bool ensure_mapped(art_store_t *s, uint32_t needed_slots) {
-    size_t needed = ART_STORE_HEADER_SIZE + (size_t)needed_slots * s->slot_size;
+static bool ensure_mapped(flat_store_t *s, uint32_t needed_slots) {
+    size_t needed = FLAT_STORE_HEADER_SIZE + (size_t)needed_slots * s->slot_size;
     if (needed <= s->mapped_size) return true;
 
     /* Grow to at least 2x or needed, whichever is larger */
     size_t new_size = s->mapped_size ? s->mapped_size * 2 :
-                      ART_STORE_HEADER_SIZE + (size_t)INITIAL_MMAP_SLOTS * s->slot_size;
+                      FLAT_STORE_HEADER_SIZE + (size_t)INITIAL_MMAP_SLOTS * s->slot_size;
     while (new_size < needed) new_size *= 2;
 
     if (ftruncate(s->fd, new_size) != 0) return false;
@@ -90,20 +90,20 @@ static bool ensure_mapped(art_store_t *s, uint32_t needed_slots) {
  * Header I/O (direct mmap access)
  * ========================================================================= */
 
-static void write_header(art_store_t *s) {
-    art_store_header_t *hdr = (art_store_header_t *)s->base;
-    memcpy(hdr->magic, ART_STORE_MAGIC, 4);
-    hdr->version     = ART_STORE_VERSION;
+static void write_header(flat_store_t *s) {
+    flat_store_header_t *hdr = (flat_store_header_t *)s->base;
+    memcpy(hdr->magic, FLAT_STORE_MAGIC, 4);
+    hdr->version     = FLAT_STORE_VERSION;
     hdr->key_size    = s->key_size;
     hdr->record_size = s->record_size;
     hdr->slot_count  = s->slot_count;
     hdr->live_count  = s->live_count;
 }
 
-static bool read_header(const uint8_t *base, art_store_header_t *out) {
+static bool read_header(const uint8_t *base, flat_store_header_t *out) {
     memcpy(out, base, sizeof(*out));
-    if (memcmp(out->magic, ART_STORE_MAGIC, 4) != 0) return false;
-    if (out->version != ART_STORE_VERSION) return false;
+    if (memcmp(out->magic, FLAT_STORE_MAGIC, 4) != 0) return false;
+    if (out->version != FLAT_STORE_VERSION) return false;
     return true;
 }
 
@@ -111,7 +111,7 @@ static bool read_header(const uint8_t *base, art_store_header_t *out) {
  * Free List
  * ========================================================================= */
 
-static bool free_list_push(art_store_t *s, uint32_t slot_id) {
+static bool free_list_push(flat_store_t *s, uint32_t slot_id) {
     if (s->free_count >= s->free_cap) {
         uint32_t new_cap = s->free_cap ? s->free_cap * 2 : FREE_LIST_INITIAL_CAP;
         uint32_t *tmp = realloc(s->free_slots, new_cap * sizeof(uint32_t));
@@ -123,7 +123,7 @@ static bool free_list_push(art_store_t *s, uint32_t slot_id) {
     return true;
 }
 
-static inline uint32_t free_list_pop(art_store_t *s) {
+static inline uint32_t free_list_pop(flat_store_t *s) {
     return s->free_slots[--s->free_count];
 }
 
@@ -131,10 +131,10 @@ static inline uint32_t free_list_pop(art_store_t *s) {
  * Lifecycle
  * ========================================================================= */
 
-art_store_t *art_store_create(const char *path, uint32_t key_size,
+flat_store_t *flat_store_create(const char *path, uint32_t key_size,
                                uint32_t record_size)
 {
-    art_store_t *s = calloc(1, sizeof(art_store_t));
+    flat_store_t *s = calloc(1, sizeof(flat_store_t));
     if (!s) return NULL;
 
     s->key_size    = key_size;
@@ -154,7 +154,7 @@ art_store_t *art_store_create(const char *path, uint32_t key_size,
     }
 
     /* Initial mmap */
-    size_t init_size = ART_STORE_HEADER_SIZE + (size_t)INITIAL_MMAP_SLOTS * s->slot_size;
+    size_t init_size = FLAT_STORE_HEADER_SIZE + (size_t)INITIAL_MMAP_SLOTS * s->slot_size;
     if (ftruncate(s->fd, init_size) != 0) {
         close(s->fd);
         flat_index_destroy(&s->index);
@@ -175,12 +175,12 @@ art_store_t *art_store_create(const char *path, uint32_t key_size,
     return s;
 }
 
-art_store_t *art_store_open(const char *path) {
+flat_store_t *flat_store_open(const char *path) {
     int fd = open(path, O_RDWR);
     if (fd < 0) return NULL;
 
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < ART_STORE_HEADER_SIZE) {
+    if (fstat(fd, &st) != 0 || st.st_size < FLAT_STORE_HEADER_SIZE) {
         close(fd);
         return NULL;
     }
@@ -191,14 +191,14 @@ art_store_t *art_store_open(const char *path) {
         return NULL;
     }
 
-    art_store_header_t hdr;
+    flat_store_header_t hdr;
     if (!read_header(base, &hdr)) {
         munmap(base, st.st_size);
         close(fd);
         return NULL;
     }
 
-    art_store_t *s = calloc(1, sizeof(art_store_t));
+    flat_store_t *s = calloc(1, sizeof(flat_store_t));
     if (!s) {
         munmap(base, st.st_size);
         close(fd);
@@ -247,7 +247,7 @@ art_store_t *art_store_open(const char *path) {
     return s;
 }
 
-void art_store_destroy(art_store_t *s) {
+void flat_store_destroy(flat_store_t *s) {
     if (!s) return;
     write_header(s);
     flat_index_destroy(&s->index);
@@ -262,7 +262,7 @@ void art_store_destroy(art_store_t *s) {
  * Operations
  * ========================================================================= */
 
-bool art_store_put(art_store_t *s, const uint8_t *key,
+bool flat_store_put(flat_store_t *s, const uint8_t *key,
                     const void *record)
 {
     /* Check if key already exists */
@@ -311,7 +311,7 @@ bool art_store_put(art_store_t *s, const uint8_t *key,
     return true;
 }
 
-bool art_store_get(const art_store_t *s, const uint8_t *key,
+bool flat_store_get(const flat_store_t *s, const uint8_t *key,
                     void *out)
 {
     const uint32_t *val = flat_index_get(&s->index, key);
@@ -323,7 +323,7 @@ bool art_store_get(const art_store_t *s, const uint8_t *key,
     return true;
 }
 
-bool art_store_delete(art_store_t *s, const uint8_t *key) {
+bool flat_store_delete(flat_store_t *s, const uint8_t *key) {
     const uint32_t *val = flat_index_get(&s->index, key);
     if (!val) return false;
 
@@ -339,7 +339,7 @@ bool art_store_delete(art_store_t *s, const uint8_t *key) {
     return true;
 }
 
-bool art_store_contains(const art_store_t *s, const uint8_t *key) {
+bool flat_store_contains(const flat_store_t *s, const uint8_t *key) {
     return flat_index_contains(&s->index, key);
 }
 
@@ -347,19 +347,19 @@ bool art_store_contains(const art_store_t *s, const uint8_t *key) {
  * Stats
  * ========================================================================= */
 
-uint32_t art_store_count(const art_store_t *s) {
+uint32_t flat_store_count(const flat_store_t *s) {
     return s ? s->live_count : 0;
 }
 
-uint32_t art_store_slot_count(const art_store_t *s) {
+uint32_t flat_store_slot_count(const flat_store_t *s) {
     return s ? s->slot_count : 0;
 }
 
-uint32_t art_store_key_size(const art_store_t *s) {
+uint32_t flat_store_key_size(const flat_store_t *s) {
     return s ? s->key_size : 0;
 }
 
-uint32_t art_store_record_size(const art_store_t *s) {
+uint32_t flat_store_record_size(const flat_store_t *s) {
     return s ? s->record_size : 0;
 }
 
@@ -367,7 +367,7 @@ uint32_t art_store_record_size(const art_store_t *s) {
  * Durability
  * ========================================================================= */
 
-void art_store_sync(art_store_t *s) {
+void flat_store_sync(flat_store_t *s) {
     if (!s) return;
     write_header(s);
     /* No msync — OS page cache handles writeback */

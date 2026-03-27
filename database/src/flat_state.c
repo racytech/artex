@@ -1,17 +1,17 @@
 /*
- * Flat State — O(1) Account/Storage Lookups via art_store.
+ * Flat State — O(1) Account/Storage Lookups via flat_store.
  *
- * Thin wrapper over two art_store instances:
+ * Thin wrapper over two flat_store instances:
  *   accounts: key=32B (keccak256(addr)) → record=104B
  *   storage:  key=64B (addr_hash+slot_hash) → record=32B
  *
- * art_store uses compact_art (in-memory ART index) + flat data file.
+ * flat_store uses flat_index) + flat data file.
  * Lookups are in-memory index → single pread. No random mmap page faults
  * for the index — only the data read touches disk.
  */
 
 #include "flat_state.h"
-#include "art_store.h"
+#include "flat_store.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,8 +23,8 @@
 #define STOR_REC_SIZE  32
 
 struct flat_state {
-    art_store_t *accounts;
-    art_store_t *storage;
+    flat_store_t *accounts;
+    flat_store_t *storage;
     char        *acct_path;
     char        *stor_path;
 };
@@ -49,7 +49,7 @@ static char *make_path(const char *base, const char *suffix) {
 
 flat_state_t *flat_state_create(const char *path,
                                  uint64_t account_cap, uint64_t storage_cap) {
-    (void)account_cap; (void)storage_cap;  /* art_store grows dynamically */
+    (void)account_cap; (void)storage_cap;  /* flat_store grows dynamically */
     if (!path) return NULL;
 
     char *acct_path = make_path(path, "_acct.art");
@@ -59,25 +59,25 @@ flat_state_t *flat_state_create(const char *path,
         return NULL;
     }
 
-    art_store_t *accounts = art_store_create(acct_path, ACCT_KEY_SIZE, ACCT_REC_SIZE);
+    flat_store_t *accounts = flat_store_create(acct_path, ACCT_KEY_SIZE, ACCT_REC_SIZE);
     if (!accounts) {
         fprintf(stderr, "flat_state: failed to create account store at %s\n", acct_path);
         free(acct_path); free(stor_path);
         return NULL;
     }
 
-    art_store_t *storage = art_store_create(stor_path, STOR_KEY_SIZE, STOR_REC_SIZE);
+    flat_store_t *storage = flat_store_create(stor_path, STOR_KEY_SIZE, STOR_REC_SIZE);
     if (!storage) {
         fprintf(stderr, "flat_state: failed to create storage store at %s\n", stor_path);
-        art_store_destroy(accounts);
+        flat_store_destroy(accounts);
         free(acct_path); free(stor_path);
         return NULL;
     }
 
     flat_state_t *fs = calloc(1, sizeof(*fs));
     if (!fs) {
-        art_store_destroy(accounts);
-        art_store_destroy(storage);
+        flat_store_destroy(accounts);
+        flat_store_destroy(storage);
         free(acct_path); free(stor_path);
         return NULL;
     }
@@ -99,23 +99,23 @@ flat_state_t *flat_state_open(const char *path) {
         return NULL;
     }
 
-    art_store_t *accounts = art_store_open(acct_path);
+    flat_store_t *accounts = flat_store_open(acct_path);
     if (!accounts) {
         free(acct_path); free(stor_path);
         return NULL;
     }
 
-    art_store_t *storage = art_store_open(stor_path);
+    flat_store_t *storage = flat_store_open(stor_path);
     if (!storage) {
-        art_store_destroy(accounts);
+        flat_store_destroy(accounts);
         free(acct_path); free(stor_path);
         return NULL;
     }
 
     flat_state_t *fs = calloc(1, sizeof(*fs));
     if (!fs) {
-        art_store_destroy(accounts);
-        art_store_destroy(storage);
+        flat_store_destroy(accounts);
+        flat_store_destroy(storage);
         free(acct_path); free(stor_path);
         return NULL;
     }
@@ -129,8 +129,8 @@ flat_state_t *flat_state_open(const char *path) {
 
 void flat_state_destroy(flat_state_t *fs) {
     if (!fs) return;
-    art_store_destroy(fs->accounts);
-    art_store_destroy(fs->storage);
+    flat_store_destroy(fs->accounts);
+    flat_store_destroy(fs->storage);
     free(fs->acct_path);
     free(fs->stor_path);
     free(fs);
@@ -143,18 +143,18 @@ void flat_state_destroy(flat_state_t *fs) {
 bool flat_state_get_account(const flat_state_t *fs, const uint8_t addr_hash[32],
                              flat_account_record_t *out) {
     if (!fs || !addr_hash || !out) return false;
-    return art_store_get(fs->accounts, addr_hash, out);
+    return flat_store_get(fs->accounts, addr_hash, out);
 }
 
 bool flat_state_put_account(flat_state_t *fs, const uint8_t addr_hash[32],
                              const flat_account_record_t *record) {
     if (!fs || !addr_hash || !record) return false;
-    return art_store_put(fs->accounts, addr_hash, record);
+    return flat_store_put(fs->accounts, addr_hash, record);
 }
 
 bool flat_state_delete_account(flat_state_t *fs, const uint8_t addr_hash[32]) {
     if (!fs || !addr_hash) return false;
-    return art_store_delete(fs->accounts, addr_hash);
+    return flat_store_delete(fs->accounts, addr_hash);
 }
 
 /* =========================================================================
@@ -169,7 +169,7 @@ bool flat_state_get_storage(const flat_state_t *fs,
     uint8_t key[STOR_KEY_SIZE];
     memcpy(key, addr_hash, 32);
     memcpy(key + 32, slot_hash, 32);
-    return art_store_get(fs->storage, key, value);
+    return flat_store_get(fs->storage, key, value);
 }
 
 bool flat_state_put_storage(flat_state_t *fs,
@@ -180,7 +180,7 @@ bool flat_state_put_storage(flat_state_t *fs,
     uint8_t key[STOR_KEY_SIZE];
     memcpy(key, addr_hash, 32);
     memcpy(key + 32, slot_hash, 32);
-    return art_store_put(fs->storage, key, value);
+    return flat_store_put(fs->storage, key, value);
 }
 
 bool flat_state_delete_storage(flat_state_t *fs,
@@ -190,7 +190,7 @@ bool flat_state_delete_storage(flat_state_t *fs,
     uint8_t key[STOR_KEY_SIZE];
     memcpy(key, addr_hash, 32);
     memcpy(key + 32, slot_hash, 32);
-    return art_store_delete(fs->storage, key);
+    return flat_store_delete(fs->storage, key);
 }
 
 /* =========================================================================
@@ -198,7 +198,7 @@ bool flat_state_delete_storage(flat_state_t *fs,
  * ========================================================================= */
 
 void flat_state_prefetch_account(const flat_state_t *fs, const uint8_t addr_hash[32]) {
-    /* art_store uses in-memory index — no prefetch needed for lookups.
+    /* flat_store uses in-memory index — no prefetch needed for lookups.
      * The data read is a single pread at a known offset. */
     (void)fs; (void)addr_hash;
 }
@@ -213,7 +213,7 @@ bool flat_state_batch_put_accounts(flat_state_t *fs,
                                     uint32_t count) {
     if (!fs || !addr_hashes || !records || count == 0) return false;
     for (uint32_t i = 0; i < count; i++) {
-        if (!art_store_put(fs->accounts, addr_hashes + i * 32, &records[i]))
+        if (!flat_store_put(fs->accounts, addr_hashes + i * 32, &records[i]))
             return false;
     }
     return true;
@@ -225,7 +225,7 @@ bool flat_state_batch_put_storage(flat_state_t *fs,
                                    uint32_t count) {
     if (!fs || !keys || !values || count == 0) return false;
     for (uint32_t i = 0; i < count; i++) {
-        if (!art_store_put(fs->storage, keys + i * 64, values + i * 32))
+        if (!flat_store_put(fs->storage, keys + i * 64, values + i * 32))
             return false;
     }
     return true;
@@ -236,9 +236,9 @@ bool flat_state_batch_put_storage(flat_state_t *fs,
  * ========================================================================= */
 
 uint64_t flat_state_account_count(const flat_state_t *fs) {
-    return fs ? art_store_count(fs->accounts) : 0;
+    return fs ? flat_store_count(fs->accounts) : 0;
 }
 
 uint64_t flat_state_storage_count(const flat_state_t *fs) {
-    return fs ? art_store_count(fs->storage) : 0;
+    return fs ? flat_store_count(fs->storage) : 0;
 }
