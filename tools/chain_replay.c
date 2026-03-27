@@ -1281,9 +1281,12 @@ int main(int argc, char **argv) {
             clock_gettime(CLOCK_MONOTONIC, &t_window);
         }
 
-        /* Write .meta at every successful checkpoint */
+        /* Write .meta after ensuring all data is on disk.
+         * Wait for background flush to complete first, so the .dat file
+         * is consistent with the recorded block number. */
         if (result.ok && validate_every > 0 &&
             bn % validate_every == 0) {
+            sync_ensure_flushed(sync);
             bool pe = (bn >= 2675000);
             char mp[512];
             snprintf(mp, sizeof(mp), "%s.meta", mpt_path);

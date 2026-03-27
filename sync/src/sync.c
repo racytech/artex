@@ -379,6 +379,14 @@ fail:
     return NULL;
 }
 
+void sync_ensure_flushed(sync_t *sync) {
+#ifdef ENABLE_MPT
+    if (sync) sync_wait_flush(sync);
+#else
+    (void)sync;
+#endif
+}
+
 void sync_destroy(sync_t *sync) {
     if (!sync) return;
 

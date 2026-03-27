@@ -97,6 +97,10 @@ sync_t *sync_create(const sync_config_t *config);
 /** Destroy sync engine. */
 void sync_destroy(sync_t *sync);
 
+/** Wait for any pending background MPT flush to complete.
+ *  Call before writing checkpoint .meta to ensure data is on disk. */
+void sync_ensure_flushed(sync_t *sync);
+
 // ============================================================================
 // Genesis
 // ============================================================================
