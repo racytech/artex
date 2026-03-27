@@ -194,6 +194,15 @@ bool flat_state_delete_storage(flat_state_t *fs,
 }
 
 /* =========================================================================
+ * Prefetch
+ * ========================================================================= */
+
+void flat_state_prefetch_account(const flat_state_t *fs, const uint8_t addr_hash[32]) {
+    if (!fs || !addr_hash) return;
+    disk_table_prefetch(fs->accounts, addr_hash);
+}
+
+/* =========================================================================
  * Batch Operations
  * ========================================================================= */
 

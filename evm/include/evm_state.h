@@ -113,6 +113,7 @@ void evm_state_set_batch_mode(evm_state_t *es, bool enabled);
 /** Set flat state backend for O(1) disk-backed lookups (optional, not owned). */
 typedef struct flat_state flat_state_t;
 void evm_state_set_flat_state(evm_state_t *es, flat_state_t *fs);
+flat_state_t *evm_state_get_flat_state(const evm_state_t *es);
 
 /**
  * Flush accumulated block-dirty state to verkle backing store.

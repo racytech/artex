@@ -770,6 +770,10 @@ void evm_state_set_batch_mode(evm_state_t *es, bool enabled) {
 void evm_state_set_flat_state(evm_state_t *es, flat_state_t *fs) {
     if (es) es->flat_state = fs;
 }
+
+flat_state_t *evm_state_get_flat_state(const evm_state_t *es) {
+    return es ? es->flat_state : NULL;
+}
 #endif
 
 

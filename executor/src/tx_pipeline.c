@@ -1,5 +1,7 @@
 #include "tx_pipeline.h"
 #include "tx_decoder.h"
+#include "flat_state.h"
+#include "keccak256.h"
 #include <string.h>
 
 #ifdef __x86_64__
@@ -128,6 +130,17 @@ void *tx_prep_thread(void *arg) {
         const rlp_item_t *tx_item = block_body_tx(ctx->body, i);
         if (tx_item && tx_decode_rlp(&ptx.tx, tx_item, ctx->chain_id)) {
             ptx.valid = true;
+            /* Prefetch flat_state pages for sender and recipient.
+             * By the time execution needs these accounts, the pages
+             * are warm in the OS page cache. */
+            if (ctx->flat_state) {
+                hash_t sender_hash = hash_keccak256(ptx.tx.sender.bytes, 20);
+                flat_state_prefetch_account(ctx->flat_state, sender_hash.bytes);
+                if (!ptx.tx.is_create) {
+                    hash_t to_hash = hash_keccak256(ptx.tx.to.bytes, 20);
+                    flat_state_prefetch_account(ctx->flat_state, to_hash.bytes);
+                }
+            }
         } else {
             ptx.valid = false;
         }

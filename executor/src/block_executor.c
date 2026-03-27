@@ -1,4 +1,6 @@
 #include "block_executor.h"
+#include "evm.h"
+#include "evm_state.h"
 #ifdef ENABLE_HISTORY
 #include "state_history.h"
 #endif
@@ -396,6 +398,9 @@ block_result_t block_execute(evm_t *evm,
         .tx_count = tx_count,
         .chain_id = chain_id,
         .cancel   = false,
+#ifdef ENABLE_MPT
+        .flat_state = evm_state_get_flat_state(evm->state),
+#endif
     };
 
     pthread_t prep_tid = 0;

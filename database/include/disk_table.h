@@ -97,6 +97,13 @@ void disk_table_foreach_key(const disk_table_t *dt, disk_table_key_cb_t cb,
                             void *user_data);
 
 /* =========================================================================
+ * Prefetch
+ * ========================================================================= */
+
+/** Prefetch the bucket page for a key into OS page cache (non-blocking). */
+void disk_table_prefetch(const disk_table_t *dt, const uint8_t *key);
+
+/* =========================================================================
  * Durability
  * ========================================================================= */
 

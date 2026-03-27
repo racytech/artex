@@ -751,6 +751,15 @@ void disk_table_foreach_key(const disk_table_t *dt, disk_table_key_cb_t cb,
  * Durability
  * ========================================================================= */
 
+void disk_table_prefetch(const disk_table_t *dt, const uint8_t *key) {
+    if (!dt || !key) return;
+    uint64_t bid = key_to_bucket(key, dt->bucket_mask);
+    const uint8_t *page = bucket_ptr_const(dt, bid);
+    /* MADV_WILLNEED tells kernel to asynchronously read this page */
+    uintptr_t aligned = (uintptr_t)page & ~(uintptr_t)4095;
+    madvise((void *)aligned, 4096, MADV_WILLNEED);
+}
+
 void disk_table_sync(disk_table_t *dt) {
     if (!dt) return;
     dt->dirty = false;

@@ -67,6 +67,12 @@ bool flat_state_delete_storage(flat_state_t *fs,
                                 const uint8_t slot_hash[32]);
 
 /* =========================================================================
+ * Prefetch (non-blocking, warm page cache for upcoming reads)
+ * ========================================================================= */
+
+void flat_state_prefetch_account(const flat_state_t *fs, const uint8_t addr_hash[32]);
+
+/* =========================================================================
  * Batch Operations (sorted by bucket for sequential I/O)
  * ========================================================================= */
 

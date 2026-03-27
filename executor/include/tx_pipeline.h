@@ -54,12 +54,14 @@ typedef struct {
 /**
  * Context passed to the prep thread.
  */
+typedef struct flat_state flat_state_t;
 typedef struct {
     tx_ring_t          *ring;
     const block_body_t *body;
     size_t              tx_count;
     uint64_t            chain_id;
     atomic_bool         cancel;     /* exec thread sets to request early stop */
+    flat_state_t       *flat_state; /* optional: prefetch pages for sender/recipient */
 } tx_prep_ctx_t;
 
 /* ── Ring buffer operations ─────────────────────────────────────────────── */
