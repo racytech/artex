@@ -1264,7 +1264,7 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
         return NULL;
     }
 
-    if (!compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), true, mpt_key_fetch, ms)) {
+    if (!compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), false, NULL, NULL)) {
         close(data_fd);
         free(dat_path);
         free(ms);
@@ -1426,7 +1426,8 @@ mpt_store_t *mpt_store_open(const char *path) {
     char *dat_path = make_path(path, ".dat");
 
     /* Auto-compact if > 50% waste */
-    if (dat_path) compact_dat_file(dat_path);
+    /* TODO: disabled pending bug fix — compact_dat_file may corrupt data */
+    /* if (dat_path) compact_dat_file(dat_path); */
     if (!dat_path) return NULL;
 
     int data_fd = open(dat_path, O_RDWR);
@@ -1451,7 +1452,7 @@ mpt_store_t *mpt_store_open(const char *path) {
         return NULL;
     }
 
-    if (!compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), true, mpt_key_fetch, ms)) {
+    if (!compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), false, NULL, NULL)) {
         close(data_fd);
         free(dat_path);
         free(ms);
@@ -1574,7 +1575,7 @@ void mpt_store_reset(mpt_store_t *ms) {
 
     /* Clear in-memory index */
     compact_art_destroy(&ms->index);
-    compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), true, mpt_key_fetch, ms);
+    compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), false, NULL, NULL);
 
     /* Truncate data file, re-mmap, and rewrite header */
     if (ms->data_base && ms->data_base != MAP_FAILED)
