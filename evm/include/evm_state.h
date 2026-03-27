@@ -369,6 +369,7 @@ typedef struct {
     /* Checkpoint timing (filled by sync, not evm_state) */
     double   evict_ms;
     double   mpt_flush_ms;
+    double   wait_flush_ms;
 #endif
 } evm_state_stats_t;
 

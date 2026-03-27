@@ -1265,9 +1265,9 @@ int main(int argc, char **argv) {
                                ac.load_cache_hits, ac.load_disk_reads,
                                ac.check_hits, ac.deletes);
                 }
-                if (ss.evict_ms > 0.1 || ss.mpt_flush_ms > 0.1) {
-                    printf("  └ checkpoint: evict=%.1f ms  mpt_flush=%.1f ms\n",
-                           ss.evict_ms, ss.mpt_flush_ms);
+                if (ss.evict_ms > 0.1 || ss.mpt_flush_ms > 0.1 || ss.wait_flush_ms > 0.1) {
+                    printf("  └ checkpoint: wait=%.1f ms  evict=%.1f ms  mpt_flush=%.1f ms\n",
+                           ss.wait_flush_ms, ss.evict_ms, ss.mpt_flush_ms);
                 }
 
 #else

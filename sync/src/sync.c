@@ -85,6 +85,7 @@ struct sync {
     /* Checkpoint timing (ms) */
     double last_evict_ms;
     double last_mpt_flush_ms;
+    double last_wait_ms;
 
 #ifdef ENABLE_MPT
     /* Background MPT flush thread */
@@ -710,7 +711,14 @@ static void sync_flush_and_evict(sync_t *sync) {
 #ifdef ENABLE_MPT
     /* Wait for any previous background flush to complete before
      * computing a new root (flush modifies mpt_store state) */
-    sync_wait_flush(sync);
+    {
+        struct timespec _w0, _w1;
+        clock_gettime(CLOCK_MONOTONIC, &_w0);
+        sync_wait_flush(sync);
+        clock_gettime(CLOCK_MONOTONIC, &_w1);
+        sync->last_wait_ms = (_w1.tv_sec - _w0.tv_sec) * 1000.0 +
+                              (_w1.tv_nsec - _w0.tv_nsec) / 1e6;
+    }
 
     /* Compute MPT root before eviction if not already done.
      * This ensures dirty data is captured into deferred buffer
@@ -779,6 +787,7 @@ evm_state_stats_t sync_get_state_stats(const sync_t *sync) {
 #ifdef ENABLE_MPT
     st.evict_ms = sync->last_evict_ms;
     st.mpt_flush_ms = sync->last_mpt_flush_ms;
+    st.wait_flush_ms = sync->last_wait_ms;
 #endif
     return st;
 }
