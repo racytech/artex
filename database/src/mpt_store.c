@@ -1306,10 +1306,127 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
     return ms;
 }
 
+/* Compact the .dat file: rewrite with only live slots, eliminating gaps.
+ * Triggered automatically when > 50% of data is dead slots. */
+static void compact_dat_file(const char *dat_path) {
+    int fd = open(dat_path, O_RDONLY);
+    if (fd < 0) return;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)PAGE_SIZE) {
+        close(fd); return;
+    }
+
+    uint8_t *base = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (base == MAP_FAILED) { close(fd); return; }
+
+    mpt_store_header_t hdr;
+    memcpy(&hdr, base, sizeof(hdr));
+    if (hdr.magic != MPT_STORE_MAGIC || hdr.version != MPT_STORE_VERSION) {
+        munmap(base, st.st_size); close(fd); return;
+    }
+
+    /* Count live vs total bytes */
+    uint64_t offset = 0, live_bytes = 0, total_bytes = 0;
+    uint32_t live_count = 0, total_count = 0;
+    while (offset + SLOT_HEADER_SIZE <= hdr.data_size) {
+        uint32_t shdr;
+        memcpy(&shdr, base + PAGE_SIZE + offset, SLOT_HEADER_SIZE);
+        uint8_t class_idx;
+        uint16_t rlp_len, refcount;
+        slot_header_unpack(shdr, &class_idx, &rlp_len, &refcount);
+        int sc = class_idx < NUM_SIZE_CLASSES ? class_idx : 0;
+        uint32_t slot_total = SLOT_HEADER_SIZE + SIZE_CLASSES[sc];
+        total_bytes += slot_total;
+        total_count++;
+        if (rlp_len > 0 && refcount > 0) {
+            live_bytes += slot_total;
+            live_count++;
+        }
+        offset += slot_total;
+    }
+
+    /* Only compact if > 50% waste */
+    if (live_count == 0 || total_bytes < 2 * live_bytes) {
+        munmap(base, st.st_size); close(fd); return;
+    }
+
+    fprintf(stderr, "mpt_store: compacting %s (%u live / %u total slots, %.1f%% waste)\n",
+            dat_path, live_count, total_count,
+            100.0 * (total_bytes - live_bytes) / total_bytes);
+
+    /* Create temp file */
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.compact", dat_path);
+    int tmp_fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (tmp_fd < 0) { munmap(base, st.st_size); close(fd); return; }
+
+    size_t new_file_size = PAGE_SIZE + live_bytes;
+    if (ftruncate(tmp_fd, new_file_size) != 0) {
+        close(tmp_fd); unlink(tmp);
+        munmap(base, st.st_size); close(fd); return;
+    }
+
+    uint8_t *new_base = mmap(NULL, new_file_size, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, tmp_fd, 0);
+    if (new_base == MAP_FAILED) {
+        close(tmp_fd); unlink(tmp);
+        munmap(base, st.st_size); close(fd); return;
+    }
+
+    /* Write header with updated data_size and empty free lists */
+    mpt_store_header_t new_hdr = hdr;
+    new_hdr.data_size = live_bytes;
+    new_hdr.free_slot_bytes = 0;
+    memset(new_hdr.free_counts, 0, sizeof(new_hdr.free_counts));
+    memset(new_hdr.free_data, 0, sizeof(new_hdr.free_data));
+    memcpy(new_base, &new_hdr, sizeof(new_hdr));
+
+    /* Copy live slots sequentially */
+    offset = 0;
+    uint64_t dst_offset = 0;
+    while (offset + SLOT_HEADER_SIZE <= hdr.data_size) {
+        uint32_t shdr;
+        memcpy(&shdr, base + PAGE_SIZE + offset, SLOT_HEADER_SIZE);
+        uint8_t class_idx;
+        uint16_t rlp_len, refcount;
+        slot_header_unpack(shdr, &class_idx, &rlp_len, &refcount);
+        int sc = class_idx < NUM_SIZE_CLASSES ? class_idx : 0;
+        uint32_t slot_total = SLOT_HEADER_SIZE + SIZE_CLASSES[sc];
+
+        if (rlp_len > 0 && refcount > 0) {
+            memcpy(new_base + PAGE_SIZE + dst_offset,
+                   base + PAGE_SIZE + offset, slot_total);
+            dst_offset += slot_total;
+        }
+        offset += slot_total;
+    }
+
+    munmap(new_base, new_file_size);
+    munmap(base, st.st_size);
+    close(tmp_fd);
+    close(fd);
+
+    /* Swap files — also remove stale .free file */
+    rename(tmp, dat_path);
+    char free_path[512];
+    snprintf(free_path, sizeof(free_path), "%.*s.free",
+             (int)(strlen(dat_path) - 4), dat_path);
+    unlink(free_path);
+
+    fprintf(stderr, "mpt_store: compacted %u → %u slots (%.1f MB → %.1f MB)\n",
+            total_count, live_count,
+            (double)st.st_size / (1024*1024),
+            (double)new_file_size / (1024*1024));
+}
+
 mpt_store_t *mpt_store_open(const char *path) {
     if (!path) return NULL;
 
     char *dat_path = make_path(path, ".dat");
+
+    /* Auto-compact if > 50% waste */
+    if (dat_path) compact_dat_file(dat_path);
     if (!dat_path) return NULL;
 
     int data_fd = open(dat_path, O_RDWR);
