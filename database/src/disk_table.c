@@ -622,8 +622,7 @@ uint32_t disk_table_batch_get(const disk_table_t *dt,
 
     qsort(entries, count, sizeof(batch_entry_t), cmp_batch_entry);
 
-    /* Hint sequential access for sorted bucket scan */
-    madvise(dt->base, dt->mapped_size, MADV_SEQUENTIAL);
+    /* Sorted by bucket for I/O locality (no madvise — harmful on large files) */
 
     uint32_t found_count = 0;
     uint32_t gi = 0;
@@ -671,9 +670,6 @@ uint32_t disk_table_batch_get(const disk_table_t *dt,
         while (gi < count && entries[gi].bucket_id == bid) gi++;
     }
 
-    /* Restore random access hint for normal operations */
-    madvise(dt->base, dt->mapped_size, MADV_RANDOM);
-
     free(entries);
     return found_count;
 }
@@ -694,8 +690,8 @@ bool disk_table_batch_put(disk_table_t *dt,
 
     qsort(entries, count, sizeof(batch_entry_t), cmp_batch_entry);
 
-    madvise(dt->base, dt->mapped_size, MADV_SEQUENTIAL);
-
+    /* Write in bucket order for I/O locality (no madvise — harmful on
+     * large files where only a fraction of pages are touched) */
     uint32_t gi = 0;
     bool ok = true;
 
@@ -714,8 +710,6 @@ bool disk_table_batch_put(disk_table_t *dt,
 
         gi = gend;
     }
-
-    madvise(dt->base, dt->mapped_size, MADV_RANDOM);
 
     free(entries);
     return ok;
