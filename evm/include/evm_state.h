@@ -115,27 +115,6 @@ typedef struct flat_state flat_state_t;
 void evm_state_set_flat_state(evm_state_t *es, flat_state_t *fs);
 
 /**
- * Collect dirty entries into flush buffers for background writing to flat_state.
- * Must be called BEFORE evm_state_evict_cache (while mem_art is still alive).
- * Caller owns the returned buffers and must free them after flushing.
- */
-typedef struct {
-    uint8_t  *acct_keys;        /* packed addr_hash[32] for puts */
-    uint8_t  *acct_records;     /* packed flat_account_record_t for puts */
-    uint32_t  acct_put_count;
-    uint8_t  *acct_del_keys;    /* packed addr_hash[32] for deletes */
-    uint32_t  acct_del_count;
-
-    uint8_t  *slot_keys;        /* packed combined_key[64] for puts */
-    uint8_t  *slot_values;      /* packed value[32] for puts */
-    uint32_t  slot_put_count;
-    uint8_t  *slot_del_keys;    /* packed combined_key[64] for deletes */
-    uint32_t  slot_del_count;
-} flat_state_flush_t;
-
-void evm_state_collect_flat_flush(evm_state_t *es, flat_state_flush_t *out);
-
-/**
  * Flush accumulated block-dirty state to verkle backing store.
  * Call at checkpoint boundaries when in batch mode.
  * Clears block_dirty flags after flush.

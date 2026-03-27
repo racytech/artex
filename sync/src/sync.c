@@ -87,25 +87,12 @@ struct sync {
     double last_mpt_flush_ms;
 
 #ifdef ENABLE_MPT
-    /* Background MPT + flat_state flush thread */
+    /* Background MPT flush thread */
     pthread_t       flush_thread;
     pthread_mutex_t flush_mtx;
     pthread_cond_t  flush_cond;
-    bool            flush_pending;
-    bool            flush_stop;
-
-    /* Pending flat_state writes (populated at eviction, flushed by background thread) */
-    uint8_t  *fs_acct_keys;     /* packed addr_hash[32] keys */
-    uint8_t  *fs_acct_records;  /* packed flat_account_record_t */
-    uint32_t  fs_acct_put_count;
-    uint8_t  *fs_acct_del_keys; /* packed addr_hash[32] for deletes */
-    uint32_t  fs_acct_del_count;
-
-    uint8_t  *fs_slot_keys;     /* packed combined_key[64] */
-    uint8_t  *fs_slot_values;   /* packed value[32] */
-    uint32_t  fs_slot_put_count;
-    uint8_t  *fs_slot_del_keys; /* packed combined_key[64] for deletes */
-    uint32_t  fs_slot_del_count;
+    bool            flush_pending;  /* work available for flush thread */
+    bool            flush_stop;     /* signal thread to exit */
 #endif
 
 #ifdef ENABLE_HISTORY
@@ -121,42 +108,6 @@ struct sync {
 // ============================================================================
 
 #ifdef ENABLE_MPT
-/* Flush pending flat_state buffers to disk_table */
-static void flush_flat_state_buffers(sync_t *s) {
-    if (!s->flat_state) return;
-
-    /* Batch put accounts */
-    if (s->fs_acct_put_count > 0) {
-        flat_state_batch_put_accounts(s->flat_state,
-            s->fs_acct_keys, (const flat_account_record_t *)s->fs_acct_records,
-            s->fs_acct_put_count);
-    }
-    /* Delete accounts */
-    for (uint32_t i = 0; i < s->fs_acct_del_count; i++)
-        flat_state_delete_account(s->flat_state, s->fs_acct_del_keys + i * 32);
-
-    /* Batch put storage */
-    if (s->fs_slot_put_count > 0) {
-        flat_state_batch_put_storage(s->flat_state,
-            s->fs_slot_keys, s->fs_slot_values, s->fs_slot_put_count);
-    }
-    /* Delete storage slots */
-    for (uint32_t i = 0; i < s->fs_slot_del_count; i++)
-        flat_state_delete_storage(s->flat_state,
-            s->fs_slot_del_keys + i * 64,
-            s->fs_slot_del_keys + i * 64 + 32);
-
-    /* Free buffers */
-    free(s->fs_acct_keys);     s->fs_acct_keys = NULL;
-    free(s->fs_acct_records);  s->fs_acct_records = NULL;
-    free(s->fs_acct_del_keys); s->fs_acct_del_keys = NULL;
-    free(s->fs_slot_keys);     s->fs_slot_keys = NULL;
-    free(s->fs_slot_values);   s->fs_slot_values = NULL;
-    free(s->fs_slot_del_keys); s->fs_slot_del_keys = NULL;
-    s->fs_acct_put_count = s->fs_acct_del_count = 0;
-    s->fs_slot_put_count = s->fs_slot_del_count = 0;
-}
-
 static void *mpt_flush_thread(void *arg) {
     sync_t *s = (sync_t *)arg;
 
@@ -166,9 +117,9 @@ static void *mpt_flush_thread(void *arg) {
             pthread_cond_wait(&s->flush_cond, &s->flush_mtx);
 
         if (s->flush_stop) {
+            /* Final flush before exit */
             if (s->flush_pending) {
                 pthread_mutex_unlock(&s->flush_mtx);
-                flush_flat_state_buffers(s);
                 if (s->cs) code_store_flush(s->cs);
                 evm_state_flush(s->state);
                 pthread_mutex_lock(&s->flush_mtx);
@@ -183,7 +134,6 @@ static void *mpt_flush_thread(void *arg) {
 
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
-        flush_flat_state_buffers(s);
         if (s->cs) code_store_flush(s->cs);
         evm_state_flush(s->state);
         clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -780,25 +730,8 @@ static void sync_flush_and_evict(sync_t *sync) {
     /* Snapshot stats before eviction clears the cache */
     sync->last_stats = evm_state_get_stats(sync->state);
 
-#ifdef ENABLE_MPT
-    /* Collect dirty entries into flush buffers BEFORE eviction destroys mem_art.
-     * These buffers are written to flat_state by the background thread. */
-    flat_state_flush_t fsf;
-    evm_state_collect_flat_flush(sync->state, &fsf);
-    sync->fs_acct_keys       = fsf.acct_keys;
-    sync->fs_acct_records    = fsf.acct_records;
-    sync->fs_acct_put_count  = fsf.acct_put_count;
-    sync->fs_acct_del_keys   = fsf.acct_del_keys;
-    sync->fs_acct_del_count  = fsf.acct_del_count;
-    sync->fs_slot_keys       = fsf.slot_keys;
-    sync->fs_slot_values     = fsf.slot_values;
-    sync->fs_slot_put_count  = fsf.slot_put_count;
-    sync->fs_slot_del_keys   = fsf.slot_del_keys;
-    sync->fs_slot_del_count  = fsf.slot_del_count;
-#endif
-
     /* Evict cache — root computation captured all dirty data into MPT
-     * deferred buffer. Flat flush data captured above. Safe to drop. */
+     * deferred buffer. Safe to drop cached entries now. */
     struct timespec _ev0, _ev1;
     clock_gettime(CLOCK_MONOTONIC, &_ev0);
 #ifdef ENABLE_DEBUG

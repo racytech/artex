@@ -660,82 +660,77 @@ static bool free_code_cb(const uint8_t *key, size_t key_len,
     return true;
 }
 
-#ifdef ENABLE_MPT
-void evm_state_collect_flat_flush(evm_state_t *es, flat_state_flush_t *out) {
-    memset(out, 0, sizeof(*out));
-    if (!es || !es->flat_state) return;
-
-    /* Collect dirty storage slots */
-    if (es->dirty_slots.count > 0) {
-        out->slot_keys   = malloc(es->dirty_slots.count * 64);
-        out->slot_values = malloc(es->dirty_slots.count * 32);
-        out->slot_del_keys = malloc(es->dirty_slots.count * 64);
-    }
-    for (size_t d = 0; d < es->dirty_slots.count; d++) {
-        const uint8_t *skey = es->dirty_slots.keys + d * SLOT_KEY_SIZE;
-        cached_slot_t *cs = (cached_slot_t *)mem_art_get_mut(
-            &es->storage, skey, SLOT_KEY_SIZE, NULL);
-        if (!cs) continue;
-        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
-            &es->accounts, skey, ADDRESS_KEY_SIZE, NULL);
-        if (!ca) continue;
-        if (uint256_is_zero(&cs->current)) {
-            if (out->slot_del_keys) {
-                memcpy(out->slot_del_keys + out->slot_del_count * 64,
-                       ca->addr_hash.bytes, 32);
-                memcpy(out->slot_del_keys + out->slot_del_count * 64 + 32,
-                       cs->slot_hash.bytes, 32);
-                out->slot_del_count++;
-            }
-        } else if (out->slot_keys && out->slot_values) {
-            memcpy(out->slot_keys + out->slot_put_count * 64,
-                   ca->addr_hash.bytes, 32);
-            memcpy(out->slot_keys + out->slot_put_count * 64 + 32,
-                   cs->slot_hash.bytes, 32);
-            uint256_to_bytes(&cs->current,
-                             out->slot_values + out->slot_put_count * 32);
-            out->slot_put_count++;
-        }
-    }
-
-    /* Collect dirty accounts */
-    if (es->dirty_accounts.count > 0) {
-        out->acct_keys    = malloc(es->dirty_accounts.count * 32);
-        out->acct_records = malloc(es->dirty_accounts.count * sizeof(flat_account_record_t));
-        out->acct_del_keys = malloc(es->dirty_accounts.count * 32);
-    }
-    for (size_t d = 0; d < es->dirty_accounts.count; d++) {
-        const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
-        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
-            &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
-        if (!ca) continue;
-        if (ca->existed) {
-            if (out->acct_keys && out->acct_records) {
-                memcpy(out->acct_keys + out->acct_put_count * 32,
-                       ca->addr_hash.bytes, 32);
-                flat_account_record_t *frec = (flat_account_record_t *)out->acct_records
-                    + out->acct_put_count;
-                frec->nonce = ca->nonce;
-                uint256_to_bytes(&ca->balance, frec->balance);
-                const uint8_t *ch = ca->has_code
-                    ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
-                memcpy(frec->code_hash, ch, 32);
-                memcpy(frec->storage_root, ca->storage_root.bytes, 32);
-                out->acct_put_count++;
-            }
-        } else if (out->acct_del_keys) {
-            memcpy(out->acct_del_keys + out->acct_del_count * 32,
-                   ca->addr_hash.bytes, 32);
-            out->acct_del_count++;
-        }
-    }
-}
-#endif
-
 void evm_state_evict_cache(evm_state_t *es) {
     if (!es) return;
 
 #ifdef ENABLE_MPT
+    if (es->flat_state) {
+        /* Phase 1: Collect dirty storage — separate puts from deletes */
+        uint32_t slot_put_count = 0;
+        uint8_t *slot_keys = NULL;
+        uint8_t *slot_vals = NULL;
+        if (es->dirty_slots.count > 0) {
+            slot_keys = malloc(es->dirty_slots.count * 64);
+            slot_vals = malloc(es->dirty_slots.count * 32);
+        }
+        for (size_t d = 0; d < es->dirty_slots.count; d++) {
+            const uint8_t *skey = es->dirty_slots.keys + d * SLOT_KEY_SIZE;
+            cached_slot_t *cs = (cached_slot_t *)mem_art_get_mut(
+                &es->storage, skey, SLOT_KEY_SIZE, NULL);
+            if (!cs) continue;
+            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+                &es->accounts, skey, ADDRESS_KEY_SIZE, NULL);
+            if (!ca) continue;
+            if (uint256_is_zero(&cs->current)) {
+                flat_state_delete_storage(es->flat_state, ca->addr_hash.bytes,
+                                           cs->slot_hash.bytes);
+            } else if (slot_keys && slot_vals) {
+                memcpy(slot_keys + slot_put_count * 64, ca->addr_hash.bytes, 32);
+                memcpy(slot_keys + slot_put_count * 64 + 32, cs->slot_hash.bytes, 32);
+                uint256_to_bytes(&cs->current, slot_vals + slot_put_count * 32);
+                slot_put_count++;
+            }
+        }
+        /* Batch put — sorted by bucket for sequential I/O */
+        if (slot_put_count > 0)
+            flat_state_batch_put_storage(es->flat_state, slot_keys, slot_vals, slot_put_count);
+        free(slot_keys);
+        free(slot_vals);
+
+        /* Phase 2: Collect dirty accounts — separate puts from deletes */
+        uint32_t acct_put_count = 0;
+        uint8_t *acct_keys = NULL;
+        flat_account_record_t *acct_recs = NULL;
+        if (es->dirty_accounts.count > 0) {
+            acct_keys = malloc(es->dirty_accounts.count * 32);
+            acct_recs = malloc(es->dirty_accounts.count * sizeof(flat_account_record_t));
+        }
+        for (size_t d = 0; d < es->dirty_accounts.count; d++) {
+            const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+                &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
+            if (!ca) continue;
+            if (ca->existed) {
+                if (acct_keys && acct_recs) {
+                    memcpy(acct_keys + acct_put_count * 32, ca->addr_hash.bytes, 32);
+                    flat_account_record_t *frec = &acct_recs[acct_put_count];
+                    frec->nonce = ca->nonce;
+                    uint256_to_bytes(&ca->balance, frec->balance);
+                    const uint8_t *ch = ca->has_code
+                        ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
+                    memcpy(frec->code_hash, ch, 32);
+                    memcpy(frec->storage_root, ca->storage_root.bytes, 32);
+                    acct_put_count++;
+                }
+            } else {
+                flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
+            }
+        }
+        if (acct_put_count > 0)
+            flat_state_batch_put_accounts(es->flat_state, acct_keys, acct_recs, acct_put_count);
+        free(acct_keys);
+        free(acct_recs);
+    }
     /* Free code pointers for all cached accounts before arena destroy */
     mem_art_foreach(&es->accounts, free_code_cb, NULL);
     dirty_account_clear(&es->dirty_accounts);
