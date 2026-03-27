@@ -190,7 +190,100 @@ flat_store_t *flat_store_create(const char *path, uint32_t key_size,
     return s;
 }
 
+/* Compact the data file: rewrite with only live entries, eliminating gaps.
+ * Returns true if compaction was performed. */
+static bool compact_file(const char *path) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return false;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < FLAT_STORE_HEADER_SIZE) {
+        close(fd);
+        return false;
+    }
+
+    uint8_t *base = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (base == MAP_FAILED) { close(fd); return false; }
+
+    flat_store_header_t hdr;
+    if (!read_header(base, &hdr)) {
+        munmap(base, st.st_size); close(fd); return false;
+    }
+
+    uint32_t slot_size = 1 + hdr.key_size + hdr.record_size;
+    uint32_t live = 0, total = hdr.slot_count;
+    for (uint32_t i = 0; i < total; i++) {
+        if (base[FLAT_STORE_HEADER_SIZE + (size_t)i * slot_size] == SLOT_FLAG_OCCUPIED)
+            live++;
+    }
+
+    /* Only compact if > 50% waste */
+    if (live == 0 || total < 2 * live) {
+        munmap(base, st.st_size); close(fd);
+        return false;
+    }
+
+    fprintf(stderr, "flat_store: compacting %s (%u live / %u total slots, %.1f%% waste)\n",
+            path, live, total, 100.0 * (total - live) / total);
+
+    /* Create temp file */
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.compact", path);
+    int tmp_fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (tmp_fd < 0) { munmap(base, st.st_size); close(fd); return false; }
+
+    /* Write header + live slots sequentially */
+    size_t new_size = FLAT_STORE_HEADER_SIZE + (size_t)live * slot_size;
+    if (ftruncate(tmp_fd, new_size) != 0) {
+        close(tmp_fd); unlink(tmp);
+        munmap(base, st.st_size); close(fd);
+        return false;
+    }
+
+    uint8_t *new_base = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, tmp_fd, 0);
+    if (new_base == MAP_FAILED) {
+        close(tmp_fd); unlink(tmp);
+        munmap(base, st.st_size); close(fd);
+        return false;
+    }
+
+    /* Copy header with updated counts */
+    flat_store_header_t new_hdr = hdr;
+    new_hdr.slot_count = live;
+    new_hdr.live_count = live;
+    memcpy(new_base, &new_hdr, sizeof(new_hdr));
+
+    /* Copy live slots sequentially */
+    uint32_t dst = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        const uint8_t *slot = base + FLAT_STORE_HEADER_SIZE + (size_t)i * slot_size;
+        if (slot[0] == SLOT_FLAG_OCCUPIED) {
+            memcpy(new_base + FLAT_STORE_HEADER_SIZE + (size_t)dst * slot_size,
+                   slot, slot_size);
+            dst++;
+        }
+    }
+
+    munmap(new_base, new_size);
+    munmap(base, st.st_size);
+    close(tmp_fd);
+    close(fd);
+
+    /* Swap files */
+    rename(tmp, path);
+
+    fprintf(stderr, "flat_store: compacted %u → %u slots (%.1f MB → %.1f MB)\n",
+            total, live,
+            (double)(FLAT_STORE_HEADER_SIZE + (size_t)total * slot_size) / (1024*1024),
+            (double)new_size / (1024*1024));
+    return true;
+}
+
 flat_store_t *flat_store_open(const char *path) {
+    /* Auto-compact if > 50% waste */
+    compact_file(path);
+
     int fd = open(path, O_RDWR);
     if (fd < 0) return NULL;
 
