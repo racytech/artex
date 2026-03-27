@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "art_store.h"
 #include "compact_art.h"
 
@@ -6,6 +7,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 /* =========================================================================
  * Constants
@@ -13,16 +16,16 @@
 
 #define ART_STORE_MAGIC       "ARTS"
 #define ART_STORE_VERSION     1
-#define ART_STORE_HEADER_SIZE 64
+#define ART_STORE_HEADER_SIZE 4096  /* page-aligned header */
 
 #define SLOT_FLAG_FREE        0x00
 #define SLOT_FLAG_OCCUPIED    0x01
 
 #define FREE_LIST_INITIAL_CAP 1024
-#define STACK_BUF_SIZE        4096
+#define INITIAL_MMAP_SLOTS    65536  /* initial capacity before first remap */
 
 /* =========================================================================
- * On-Disk Header (64 bytes)
+ * On-Disk Header (within first 4096-byte page)
  * ========================================================================= */
 
 typedef struct {
@@ -48,43 +51,60 @@ struct art_store {
     uint32_t      slot_count;   /* total allocated slots */
     uint32_t      live_count;   /* occupied slots */
 
+    uint8_t      *base;         /* mmap base */
+    size_t        mapped_size;  /* current mmap size */
+
     uint32_t     *free_slots;   /* recycled slot IDs (LIFO stack) */
     uint32_t      free_count;
     uint32_t      free_cap;
 };
 
 /* =========================================================================
- * Header I/O
+ * Mmap helpers
  * ========================================================================= */
 
-static bool write_header(art_store_t *s) {
-    art_store_header_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    memcpy(hdr.magic, ART_STORE_MAGIC, 4);
-    hdr.version     = ART_STORE_VERSION;
-    hdr.key_size    = s->key_size;
-    hdr.record_size = s->record_size;
-    hdr.slot_count  = s->slot_count;
-    hdr.live_count  = s->live_count;
-    return pwrite(s->fd, &hdr, sizeof(hdr), 0) == sizeof(hdr);
+static inline uint8_t *slot_ptr(const art_store_t *s, uint32_t slot_id) {
+    return s->base + ART_STORE_HEADER_SIZE + (size_t)slot_id * s->slot_size;
 }
 
-static bool read_header(int fd, art_store_header_t *hdr) {
-    if (pread(fd, hdr, sizeof(*hdr), 0) != sizeof(*hdr))
-        return false;
-    if (memcmp(hdr->magic, ART_STORE_MAGIC, 4) != 0)
-        return false;
-    if (hdr->version != ART_STORE_VERSION)
-        return false;
+static bool ensure_mapped(art_store_t *s, uint32_t needed_slots) {
+    size_t needed = ART_STORE_HEADER_SIZE + (size_t)needed_slots * s->slot_size;
+    if (needed <= s->mapped_size) return true;
+
+    /* Grow to at least 2x or needed, whichever is larger */
+    size_t new_size = s->mapped_size ? s->mapped_size * 2 :
+                      ART_STORE_HEADER_SIZE + (size_t)INITIAL_MMAP_SLOTS * s->slot_size;
+    while (new_size < needed) new_size *= 2;
+
+    if (ftruncate(s->fd, new_size) != 0) return false;
+
+    uint8_t *new_base = mremap(s->base, s->mapped_size, new_size, MREMAP_MAYMOVE);
+    if (new_base == MAP_FAILED) return false;
+
+    s->base = new_base;
+    s->mapped_size = new_size;
     return true;
 }
 
 /* =========================================================================
- * Slot Offset
+ * Header I/O (direct mmap access)
  * ========================================================================= */
 
-static inline off_t slot_offset(const art_store_t *s, uint32_t slot_id) {
-    return (off_t)ART_STORE_HEADER_SIZE + (off_t)slot_id * s->slot_size;
+static void write_header(art_store_t *s) {
+    art_store_header_t *hdr = (art_store_header_t *)s->base;
+    memcpy(hdr->magic, ART_STORE_MAGIC, 4);
+    hdr->version     = ART_STORE_VERSION;
+    hdr->key_size    = s->key_size;
+    hdr->record_size = s->record_size;
+    hdr->slot_count  = s->slot_count;
+    hdr->live_count  = s->live_count;
+}
+
+static bool read_header(const uint8_t *base, art_store_header_t *out) {
+    memcpy(out, base, sizeof(*out));
+    if (memcmp(out->magic, ART_STORE_MAGIC, 4) != 0) return false;
+    if (out->version != ART_STORE_VERSION) return false;
+    return true;
 }
 
 /* =========================================================================
@@ -133,13 +153,25 @@ art_store_t *art_store_create(const char *path, uint32_t key_size,
         return NULL;
     }
 
-    if (!write_header(s)) {
+    /* Initial mmap */
+    size_t init_size = ART_STORE_HEADER_SIZE + (size_t)INITIAL_MMAP_SLOTS * s->slot_size;
+    if (ftruncate(s->fd, init_size) != 0) {
         close(s->fd);
         compact_art_destroy(&s->index);
         free(s);
         return NULL;
     }
 
+    s->base = mmap(NULL, init_size, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd, 0);
+    if (s->base == MAP_FAILED) {
+        close(s->fd);
+        compact_art_destroy(&s->index);
+        free(s);
+        return NULL;
+    }
+    s->mapped_size = init_size;
+
+    write_header(s);
     return s;
 }
 
@@ -147,16 +179,35 @@ art_store_t *art_store_open(const char *path) {
     int fd = open(path, O_RDWR);
     if (fd < 0) return NULL;
 
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < ART_STORE_HEADER_SIZE) {
+        close(fd);
+        return NULL;
+    }
+
+    uint8_t *base = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        close(fd);
+        return NULL;
+    }
+
     art_store_header_t hdr;
-    if (!read_header(fd, &hdr)) {
+    if (!read_header(base, &hdr)) {
+        munmap(base, st.st_size);
         close(fd);
         return NULL;
     }
 
     art_store_t *s = calloc(1, sizeof(art_store_t));
-    if (!s) { close(fd); return NULL; }
+    if (!s) {
+        munmap(base, st.st_size);
+        close(fd);
+        return NULL;
+    }
 
     s->fd          = fd;
+    s->base        = base;
+    s->mapped_size = st.st_size;
     s->key_size    = hdr.key_size;
     s->record_size = hdr.record_size;
     s->slot_size   = 1 + hdr.key_size + hdr.record_size;
@@ -164,51 +215,22 @@ art_store_t *art_store_open(const char *path) {
     s->live_count  = 0;
 
     if (!compact_art_init(&s->index, hdr.key_size, sizeof(uint32_t))) {
+        munmap(base, st.st_size);
         close(fd);
         free(s);
         return NULL;
     }
 
     /* Scan all slots: rebuild ART index + free list */
-    if (s->slot_count > 0) {
-        /* Batch read for efficiency: read up to 256 slots at a time */
-        uint32_t batch = 256;
-        uint32_t buf_size = batch * s->slot_size;
-        uint8_t *buf = malloc(buf_size);
-        if (!buf) {
-            compact_art_destroy(&s->index);
-            close(fd);
-            free(s);
-            return NULL;
+    for (uint32_t i = 0; i < s->slot_count; i++) {
+        uint8_t *slot = slot_ptr(s, i);
+        if (slot[0] == SLOT_FLAG_OCCUPIED) {
+            const uint8_t *key = slot + 1;
+            compact_art_insert(&s->index, key, &i);
+            s->live_count++;
+        } else {
+            free_list_push(s, i);
         }
-
-        for (uint32_t base = 0; base < s->slot_count; base += batch) {
-            uint32_t n = s->slot_count - base;
-            if (n > batch) n = batch;
-
-            off_t off = slot_offset(s, base);
-            ssize_t bytes_needed = (ssize_t)n * s->slot_size;
-            ssize_t r = pread(fd, buf, bytes_needed, off);
-            if (r != bytes_needed) {
-                s->slot_count = base;
-                break;
-            }
-
-            for (uint32_t j = 0; j < n; j++) {
-                uint8_t *slot = buf + j * s->slot_size;
-                uint32_t slot_id = base + j;
-
-                if (slot[0] == SLOT_FLAG_OCCUPIED) {
-                    const uint8_t *key = slot + 1;
-                    compact_art_insert(&s->index, key, &slot_id);
-                    s->live_count++;
-                } else {
-                    free_list_push(s, slot_id);
-                }
-            }
-        }
-
-        free(buf);
     }
 
     return s;
@@ -216,7 +238,10 @@ art_store_t *art_store_open(const char *path) {
 
 void art_store_destroy(art_store_t *s) {
     if (!s) return;
+    write_header(s);
     compact_art_destroy(&s->index);
+    if (s->base && s->base != MAP_FAILED)
+        munmap(s->base, s->mapped_size);
     if (s->fd >= 0) close(s->fd);
     free(s->free_slots);
     free(s);
@@ -235,10 +260,9 @@ bool art_store_put(art_store_t *s, const uint8_t *key,
         /* Update: overwrite record data in existing slot */
         uint32_t slot_id;
         memcpy(&slot_id, existing, sizeof(uint32_t));
-
-        off_t data_off = slot_offset(s, slot_id) + 1 + s->key_size;
-        return pwrite(s->fd, record, s->record_size, data_off) ==
-               (ssize_t)s->record_size;
+        uint8_t *slot = slot_ptr(s, slot_id);
+        memcpy(slot + 1 + s->key_size, record, s->record_size);
+        return true;
     }
 
     /* New key: allocate a slot */
@@ -247,29 +271,15 @@ bool art_store_put(art_store_t *s, const uint8_t *key,
         slot_id = free_list_pop(s);
     } else {
         slot_id = s->slot_count++;
+        if (!ensure_mapped(s, s->slot_count))
+            return false;
     }
 
-    /* Build slot: [0x01 | key | record] */
-    uint8_t stack_buf[STACK_BUF_SIZE];
-    uint8_t *buf;
-    bool heap = s->slot_size > STACK_BUF_SIZE;
-
-    if (heap) {
-        buf = malloc(s->slot_size);
-        if (!buf) return false;
-    } else {
-        buf = stack_buf;
-    }
-
-    buf[0] = SLOT_FLAG_OCCUPIED;
-    memcpy(buf + 1, key, s->key_size);
-    memcpy(buf + 1 + s->key_size, record, s->record_size);
-
-    off_t off = slot_offset(s, slot_id);
-    ssize_t w = pwrite(s->fd, buf, s->slot_size, off);
-
-    if (heap) free(buf);
-    if (w != (ssize_t)s->slot_size) return false;
+    /* Write slot: [0x01 | key | record] */
+    uint8_t *slot = slot_ptr(s, slot_id);
+    slot[0] = SLOT_FLAG_OCCUPIED;
+    memcpy(slot + 1, key, s->key_size);
+    memcpy(slot + 1 + s->key_size, record, s->record_size);
 
     if (!compact_art_insert(&s->index, key, &slot_id))
         return false;
@@ -286,10 +296,9 @@ bool art_store_get(const art_store_t *s, const uint8_t *key,
 
     uint32_t slot_id;
     memcpy(&slot_id, val, sizeof(uint32_t));
-
-    off_t data_off = slot_offset(s, slot_id) + 1 + s->key_size;
-    return pread(s->fd, out, s->record_size, data_off) ==
-           (ssize_t)s->record_size;
+    const uint8_t *slot = slot_ptr(s, slot_id);
+    memcpy(out, slot + 1 + s->key_size, s->record_size);
+    return true;
 }
 
 bool art_store_delete(art_store_t *s, const uint8_t *key) {
@@ -299,10 +308,9 @@ bool art_store_delete(art_store_t *s, const uint8_t *key) {
     uint32_t slot_id;
     memcpy(&slot_id, val, sizeof(uint32_t));
 
-    /* Mark slot free on disk */
-    uint8_t flag = SLOT_FLAG_FREE;
-    if (pwrite(s->fd, &flag, 1, slot_offset(s, slot_id)) != 1)
-        return false;
+    /* Mark slot free */
+    uint8_t *slot = slot_ptr(s, slot_id);
+    slot[0] = SLOT_FLAG_FREE;
 
     compact_art_delete(&s->index, key);
     free_list_push(s, slot_id);
@@ -341,5 +349,5 @@ uint32_t art_store_record_size(const art_store_t *s) {
 void art_store_sync(art_store_t *s) {
     if (!s) return;
     write_header(s);
-    fsync(s->fd);
+    /* No msync — OS page cache handles writeback */
 }
