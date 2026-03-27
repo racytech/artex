@@ -189,7 +189,7 @@ add_library(mpt_store STATIC
     database/src/mpt_store.c
 )
 target_include_directories(mpt_store PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-target_link_libraries(mpt_store disk_table node_cache bloom_filter common)
+target_link_libraries(mpt_store compact_art node_cache common)
 
 #==============================================================================
 # Libraries — EVM
