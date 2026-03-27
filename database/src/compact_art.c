@@ -94,8 +94,13 @@ static inline compact_ref_t alloc_leaf(compact_art_t *tree,
         tree->leaves.used = offset + tree->leaf_size;
 
     uint8_t *leaf = tree->leaves.base + offset;
-    memcpy(leaf, key, tree->key_size);
-    memcpy(leaf + tree->key_size, value, tree->value_size);
+    if (tree->leaf_key_size < tree->key_size) {
+        /* Compact mode: store only last leaf_key_size bytes as verification hash */
+        memcpy(leaf, key + tree->key_size - tree->leaf_key_size, tree->leaf_key_size);
+    } else {
+        memcpy(leaf, key, tree->key_size);
+    }
+    memcpy(leaf + tree->leaf_key_size, value, tree->value_size);
 
     return COMPACT_MAKE_LEAF_REF(idx);
 }
@@ -107,12 +112,18 @@ static inline const uint8_t *leaf_key(const compact_art_t *tree,
 
 static inline const void *leaf_value(const compact_art_t *tree,
                                       compact_ref_t ref) {
-    return leaf_ptr(tree, ref) + tree->key_size;
+    return leaf_ptr(tree, ref) + tree->leaf_key_size;
 }
 
 static inline bool leaf_matches(const compact_art_t *tree,
                                  compact_ref_t ref,
                                  const uint8_t *key) {
+    if (tree->leaf_key_size < tree->key_size) {
+        /* Compact mode: compare last leaf_key_size bytes of search key */
+        return memcmp(leaf_key(tree, ref),
+                      key + tree->key_size - tree->leaf_key_size,
+                      tree->leaf_key_size) == 0;
+    }
     return memcmp(leaf_key(tree, ref), key, tree->key_size) == 0;
 }
 
@@ -120,7 +131,22 @@ static inline void leaf_set_value(const compact_art_t *tree,
                                    compact_ref_t ref,
                                    const void *value) {
     uint8_t *leaf = leaf_ptr(tree, ref);
-    memcpy(leaf + tree->key_size, value, tree->value_size);
+    memcpy(leaf + tree->leaf_key_size, value, tree->value_size);
+}
+
+// Fetch the full key for a leaf. In compact mode, calls the key_fetch callback.
+// In normal mode, returns the leaf_key pointer directly.
+// buf must be at least key_size bytes. Returns pointer to the full key.
+static inline const uint8_t *leaf_full_key(const compact_art_t *tree,
+                                            compact_ref_t ref,
+                                            uint8_t *buf) {
+    if (tree->leaf_key_size < tree->key_size && tree->key_fetch) {
+        const void *val = leaf_value(tree, ref);
+        if (tree->key_fetch(val, buf, tree->key_fetch_ctx))
+            return buf;
+        return NULL;  /* fetch failed */
+    }
+    return leaf_key(tree, ref);
 }
 
 // ============================================================================
@@ -266,7 +292,9 @@ static int check_prefix(const compact_art_t *tree, compact_ref_t ref,
     if (max_cmp > COMPACT_MAX_PREFIX) {
         compact_ref_t min_leaf = find_minimum_leaf(tree, ref);
         if (min_leaf == COMPACT_REF_NULL) return COMPACT_MAX_PREFIX;
-        const uint8_t *lk = leaf_key(tree, min_leaf);
+        uint8_t lk_buf[64];
+        const uint8_t *lk = leaf_full_key(tree, min_leaf, lk_buf);
+        if (!lk) return COMPACT_MAX_PREFIX;
         for (int idx = COMPACT_MAX_PREFIX; idx < max_cmp; idx++) {
             if (lk[depth + idx] != key[depth + idx]) return idx;
         }
@@ -709,7 +737,9 @@ static compact_ref_t insert_recursive(compact_art_t *tree, compact_ref_t ref,
         compact_ref_t new_leaf = alloc_leaf(tree, key, value);
         if (new_leaf == COMPACT_REF_NULL) return ref;
 
-        const uint8_t *existing_key = leaf_key(tree, ref);
+        uint8_t existing_key_buf[64];
+        const uint8_t *existing_key = leaf_full_key(tree, ref, existing_key_buf);
+        if (!existing_key) return ref;  /* fetch failed */
 
         // Find common prefix from current depth
         size_t limit = tree->key_size;
@@ -756,12 +786,14 @@ static compact_ref_t insert_recursive(compact_art_t *tree, compact_ref_t ref,
             // Otherwise, find a leaf and read from the leaf key.
             uint8_t *partial = node_partial_mut(node);
             uint8_t old_byte;
+            uint8_t leaf_k_buf[64];
             const uint8_t *leaf_k = NULL;
             if (prefix_len < COMPACT_MAX_PREFIX) {
                 old_byte = partial[prefix_len];
             } else {
                 compact_ref_t min_leaf = find_minimum_leaf(tree, ref);
-                leaf_k = leaf_key(tree, min_leaf);
+                leaf_k = leaf_full_key(tree, min_leaf, leaf_k_buf);
+                if (!leaf_k) return ref;
                 old_byte = leaf_k[depth + prefix_len];
             }
 
@@ -793,7 +825,8 @@ static compact_ref_t insert_recursive(compact_art_t *tree, compact_ref_t ref,
                 if ((size_t)new_partial_len > avail) {
                     if (!leaf_k) {
                         compact_ref_t min_leaf = find_minimum_leaf(tree, ref);
-                        leaf_k = leaf_key(tree, min_leaf);
+                        leaf_k = leaf_full_key(tree, min_leaf, leaf_k_buf);
+                        if (!leaf_k) return ref;
                     }
                     size_t fill = COMPACT_MAX_PREFIX - keep;
                     memcpy(partial + keep,
@@ -803,7 +836,8 @@ static compact_ref_t insert_recursive(compact_art_t *tree, compact_ref_t ref,
                 // All stored bytes consumed — repopulate from leaf
                 if (!leaf_k) {
                     compact_ref_t min_leaf = find_minimum_leaf(tree, ref);
-                    leaf_k = leaf_key(tree, min_leaf);
+                    leaf_k = leaf_full_key(tree, min_leaf, leaf_k_buf);
+                    if (!leaf_k) return ref;
                 }
                 size_t store = (size_t)new_partial_len < COMPACT_MAX_PREFIX
                                ? (size_t)new_partial_len : COMPACT_MAX_PREFIX;
@@ -925,7 +959,9 @@ static compact_ref_t delete_recursive(compact_art_t *tree, compact_ref_t ref,
             uint32_t new_len = (uint32_t)n4->partial_len + 1 + child_plen;
             if (new_len <= 255) {
                 compact_ref_t min_leaf = find_minimum_leaf(tree, only_child);
-                const uint8_t *lk = leaf_key(tree, min_leaf);
+                uint8_t lk_buf[64];
+                const uint8_t *lk = leaf_full_key(tree, min_leaf, lk_buf);
+                if (!lk) return ref;
                 uint8_t *child_partial = node_partial_mut(child_node);
                 size_t store = (size_t)new_len < COMPACT_MAX_PREFIX
                                ? (size_t)new_len : COMPACT_MAX_PREFIX;
@@ -946,17 +982,19 @@ static compact_ref_t delete_recursive(compact_art_t *tree, compact_ref_t ref,
 // ============================================================================
 
 bool compact_art_init(compact_art_t *tree, uint32_t key_size,
-                      uint32_t value_size, bool compact_leaves) {
+                      uint32_t value_size, bool compact_leaves,
+                      compact_art_key_fetch_t key_fetch, void *key_fetch_ctx) {
     if (!tree || key_size == 0) return false;
-    (void)compact_leaves; /* reserved for future use */
 
     tree->root = COMPACT_REF_NULL;
     tree->size = 0;
     tree->key_size = key_size;
     tree->value_size = value_size;
-    tree->leaf_key_size = key_size;
-    tree->leaf_size = key_size + value_size;
+    tree->leaf_key_size = compact_leaves ? 8 : key_size;
+    tree->leaf_size = tree->leaf_key_size + value_size;
     tree->leaf_count = 0;
+    tree->key_fetch = key_fetch;
+    tree->key_fetch_ctx = key_fetch_ctx;
 
     if (!pool_init(&tree->nodes, COMPACT_NODE_POOL_RESERVE)) return false;
     // Skip offset 0 so ref=0 means NULL
@@ -1199,7 +1237,9 @@ static int compare_prefix_seek(const compact_art_t *tree, compact_ref_t ref,
     if (cmp_len > COMPACT_MAX_PREFIX) {
         compact_ref_t min_leaf = find_minimum_leaf(tree, ref);
         if (min_leaf == COMPACT_REF_NULL) return 0;
-        const uint8_t *lk = leaf_key(tree, min_leaf);
+        uint8_t lk_buf[64];
+        const uint8_t *lk = leaf_full_key(tree, min_leaf, lk_buf);
+        if (!lk) return 0;
         for (int i = COMPACT_MAX_PREFIX; i < cmp_len; i++) {
             if (lk[depth + i] != key[depth + i])
                 return (int)lk[depth + i] - (int)key[depth + i];
@@ -1386,14 +1426,16 @@ bool compact_art_iterator_seek(compact_art_iterator_t *iter,
     while (ref != COMPACT_REF_NULL) {
         // Leaf: compare directly
         if (COMPACT_IS_LEAF_REF(ref)) {
-            const uint8_t *lk = leaf_key(tree, ref);
+            uint8_t lk_buf[64];
+            const uint8_t *lk = leaf_full_key(tree, ref, lk_buf);
+            if (!lk) { s->done = true; return false; }
             if (memcmp(lk, key, tree->key_size) >= 0) {
                 // leaf >= key: this is our answer
                 s->depth++;
                 if (s->depth >= 64) { s->done = true; return false; }
                 s->stack[s->depth].ref = ref;
                 s->stack[s->depth].child_idx = -1;
-                s->key = lk;
+                s->key = leaf_key(tree, ref);
                 s->value = leaf_value(tree, ref);
                 return true;
             }

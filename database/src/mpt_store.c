@@ -1218,6 +1218,19 @@ static node_ref_t make_extension(mpt_store_t *ms, const uint8_t *path,
  * Lifecycle
  * ========================================================================= */
 
+/* Key fetch callback for compact leaf mode: recompute keccak256 from node RLP */
+static bool mpt_key_fetch(const void *value, uint8_t *key_out, void *user_data) {
+    mpt_store_t *ms = (mpt_store_t *)user_data;
+    node_record_t rec;
+    memcpy(&rec, value, sizeof(node_record_t));
+    const uint8_t *rlp = ms->data_base + PAGE_SIZE + rec.offset + SLOT_HEADER_SIZE;
+    if (rec.length > 0 && rec.length <= MAX_NODE_RLP) {
+        keccak(rlp, rec.length, key_out);
+        return true;
+    }
+    return false;
+}
+
 mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
     (void)capacity_hint;
     if (!path) return NULL;
@@ -1238,7 +1251,7 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
         return NULL;
     }
 
-    if (!compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), false)) {
+    if (!compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), true, mpt_key_fetch, ms)) {
         close(data_fd);
         free(dat_path);
         free(ms);
@@ -1308,7 +1321,7 @@ mpt_store_t *mpt_store_open(const char *path) {
         return NULL;
     }
 
-    if (!compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), false)) {
+    if (!compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), true, mpt_key_fetch, ms)) {
         close(data_fd);
         free(dat_path);
         free(ms);
@@ -1433,7 +1446,7 @@ void mpt_store_reset(mpt_store_t *ms) {
 
     /* Clear in-memory index */
     compact_art_destroy(&ms->index);
-    compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), false);
+    compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), true, mpt_key_fetch, ms);
 
     /* Truncate data file, re-mmap, and rewrite header */
     if (ms->data_base && ms->data_base != MAP_FAILED)

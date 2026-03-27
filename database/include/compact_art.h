@@ -147,6 +147,18 @@ typedef struct {
 } compact_node256_t;
 
 // ============================================================================
+// Key Fetch Callback (compact leaf mode)
+// ============================================================================
+
+/* Callback to fetch full key from external storage (for compact leaf mode).
+ * Called during insert when leaf splitting needs the existing leaf's full key.
+ * value: pointer to the stored leaf value (e.g., slot_id or node_record_t)
+ * key_out: buffer of key_size bytes to fill with the full key
+ * user_data: opaque context (e.g., pointer to flat_store or mpt_store)
+ * Returns true on success. */
+typedef bool (*compact_art_key_fetch_t)(const void *value, uint8_t *key_out, void *user_data);
+
+// ============================================================================
 // Tree Structure
 // ============================================================================
 
@@ -163,6 +175,8 @@ struct compact_art {
     uint32_t leaf_count;        // Number of leaves allocated
     compact_pool_t nodes;       // Inner node pool (variable-size, 8-byte aligned)
     compact_pool_t leaves;      // Leaf pool (fixed-size slots)
+    compact_art_key_fetch_t key_fetch;  /* fetch full key for split (compact mode only) */
+    void *key_fetch_ctx;                /* user context for key_fetch */
 };
 
 // ============================================================================
@@ -175,7 +189,8 @@ struct compact_art {
  * hash instead of the full key (saves memory at negligible collision risk).
  */
 bool compact_art_init(compact_art_t *tree, uint32_t key_size, uint32_t value_size,
-                       bool compact_leaves);
+                       bool compact_leaves,
+                       compact_art_key_fetch_t key_fetch, void *key_fetch_ctx);
 
 /**
  * Destroy the tree and free all pool memory.

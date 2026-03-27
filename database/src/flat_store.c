@@ -128,6 +128,20 @@ static inline uint32_t free_list_pop(flat_store_t *s) {
 }
 
 /* =========================================================================
+ * Key Fetch Callback (compact leaf mode)
+ * ========================================================================= */
+
+static bool flat_store_key_fetch(const void *value, uint8_t *key_out, void *user_data) {
+    flat_store_t *s = (flat_store_t *)user_data;
+    uint32_t slot_id;
+    memcpy(&slot_id, value, sizeof(uint32_t));
+    const uint8_t *slot = slot_ptr(s, slot_id);
+    /* slot layout: [1B flag][key_size B key][record_size B data] */
+    memcpy(key_out, slot + 1, s->key_size);
+    return true;
+}
+
+/* =========================================================================
  * Lifecycle
  * ========================================================================= */
 
@@ -141,7 +155,8 @@ flat_store_t *flat_store_create(const char *path, uint32_t key_size,
     s->record_size = record_size;
     s->slot_size   = 1 + key_size + record_size;
 
-    if (!compact_art_init(&s->index, key_size, sizeof(uint32_t), false)) {
+    if (!compact_art_init(&s->index, key_size, sizeof(uint32_t),
+                          true, flat_store_key_fetch, s)) {
         free(s);
         return NULL;
     }
@@ -214,7 +229,8 @@ flat_store_t *flat_store_open(const char *path) {
     s->slot_count  = hdr.slot_count;
     s->live_count  = 0;
 
-    if (!compact_art_init(&s->index, hdr.key_size, sizeof(uint32_t), false)) {
+    if (!compact_art_init(&s->index, hdr.key_size, sizeof(uint32_t),
+                          true, flat_store_key_fetch, s)) {
         munmap(base, st.st_size);
         close(fd);
         free(s);
