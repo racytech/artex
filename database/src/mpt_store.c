@@ -1626,7 +1626,9 @@ void mpt_store_prefetch(const mpt_store_t *ms, const uint8_t hash[32]) {
 void mpt_store_sync(mpt_store_t *ms) {
     if (!ms) return;
     write_header_dat(ms);
-    /* No msync — OS page cache handles writeback */
+    /* Force dirty mmap pages to disk for crash safety */
+    if (ms->data_base && ms->data_mapped > 0)
+        msync(ms->data_base, ms->data_mapped, MS_SYNC);
 }
 
 void mpt_store_flush(mpt_store_t *ms) {
@@ -1714,9 +1716,13 @@ void mpt_store_flush(mpt_store_t *ms) {
     /* 6. Free deferred buffers */
     def_free_all(ms);
 
-    /* Write header (root hash, free lists, data_size) to mmap'd page.
-     * No msync — OS page cache handles writeback. */
+    /* Write header (root hash, free lists, data_size) to mmap'd page. */
     write_header_dat(ms);
+
+    /* Ensure data is on disk for crash safety.
+     * MS_ASYNC returns immediately — kernel schedules writeback. */
+    if (ms->data_base && ms->data_mapped > 0)
+        msync(ms->data_base, ms->data_mapped, MS_ASYNC);
 
     /* Disabled: let OS page cache manage eviction via LRU.
      * MADV_DONTNEED was dropping pages that the next checkpoint needed,
