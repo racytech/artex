@@ -91,9 +91,16 @@ target_link_libraries(disk_hash pthread)
 # Disk Table (mmap-backed hash table optimized for pre-hashed keys)
 add_library(disk_table STATIC database/src/disk_table.c)
 
-# Flat State (O(1) account/storage lookups via disk_table)
+# Compact ART (in-memory index)
+add_library(compact_art STATIC database/src/compact_art.c)
+
+# ART Store (compact_art index + flat data file)
+add_library(art_store STATIC database/src/art_store.c)
+target_link_libraries(art_store compact_art)
+
+# Flat State (O(1) account/storage lookups via art_store)
 add_library(flat_state STATIC database/src/flat_state.c)
-target_link_libraries(flat_state disk_table)
+target_link_libraries(flat_state art_store)
 
 # Code Store (content-addressed, append-only, deduplicated)
 add_library(code_store STATIC
