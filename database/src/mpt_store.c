@@ -1555,15 +1555,14 @@ void mpt_store_flush(mpt_store_t *ms) {
      * No msync/disk_table_sync — OS page cache handles writeback. */
     write_header_dat(ms);
 
-    /* 7. Periodically release stale mmap pages to reduce page cache pressure.
-     * Every 8192 blocks (~32 checkpoints), drop all pages so the OS can
-     * reclaim RAM for more useful data. Not every checkpoint — that would
-     * thrash pages needed by the next checkpoint. */
-    ms->flushes_since_madvise++;
+    /* Disabled: let OS page cache manage eviction via LRU.
+     * MADV_DONTNEED was dropping pages that the next checkpoint needed,
+     * causing slower performance around 3.8M-4M blocks. */
+    /* ms->flushes_since_madvise++;
     if (ms->flushes_since_madvise >= 32 && ms->data_base && ms->data_mapped > 0) {
         madvise(ms->data_base, ms->data_mapped, MADV_DONTNEED);
         ms->flushes_since_madvise = 0;
-    }
+    } */
 }
 
 /* =========================================================================
