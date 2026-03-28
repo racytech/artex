@@ -2,8 +2,13 @@
  * Flat State — O(1) Account/Storage Lookups via flat_store.
  *
  * Two flat_store instances:
- *   accounts: key=32B (keccak256(addr)) → record=104B
+ *   accounts: key=32B (keccak256(addr)) → record=up to 104B (variable via size classes)
  *   storage:  key=32B (keccak256(addr_hash||slot_hash)) → record=32B
+ *
+ * Account records use size classes to save space:
+ *   - Empty EOAs (nonce + small balance): ~12 bytes
+ *   - Funded EOAs (nonce + balance + code_hash): ~44 bytes
+ *   - Full contracts (nonce + balance + code_hash + storage_root): 104 bytes
  *
  * Storage keys are hashed from 64→32 bytes to halve compact_art leaf size.
  * At 1B entries: 36GB leaf memory instead of 68GB.
@@ -16,10 +21,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ACCT_KEY_SIZE  32    /* keccak256(addr) */
-#define ACCT_REC_SIZE  104
-#define STOR_KEY_SIZE  32    /* keccak256(addr_hash || slot_hash) */
-#define STOR_REC_SIZE  32
+#define ACCT_KEY_SIZE      32    /* keccak256(addr) */
+#define ACCT_MAX_REC_SIZE  104   /* sizeof(flat_account_record_t) */
+#define STOR_KEY_SIZE      32    /* keccak256(addr_hash || slot_hash) */
+#define STOR_MAX_REC_SIZE  32
 
 struct flat_state {
     flat_store_t *accounts;
@@ -58,14 +63,14 @@ flat_state_t *flat_state_create(const char *path,
         return NULL;
     }
 
-    flat_store_t *accounts = flat_store_create(acct_path, ACCT_KEY_SIZE, ACCT_REC_SIZE);
+    flat_store_t *accounts = flat_store_create(acct_path, ACCT_KEY_SIZE, ACCT_MAX_REC_SIZE);
     if (!accounts) {
         fprintf(stderr, "flat_state: failed to create account store at %s\n", acct_path);
         free(acct_path); free(stor_path);
         return NULL;
     }
 
-    flat_store_t *storage = flat_store_create(stor_path, STOR_KEY_SIZE, STOR_REC_SIZE);
+    flat_store_t *storage = flat_store_create(stor_path, STOR_KEY_SIZE, STOR_MAX_REC_SIZE);
     if (!storage) {
         fprintf(stderr, "flat_state: failed to create storage store at %s\n", stor_path);
         flat_store_destroy(accounts);
@@ -142,13 +147,19 @@ void flat_state_destroy(flat_state_t *fs) {
 bool flat_state_get_account(const flat_state_t *fs, const uint8_t addr_hash[32],
                              flat_account_record_t *out) {
     if (!fs || !addr_hash || !out) return false;
-    return flat_store_get(fs->accounts, addr_hash, out);
+    uint32_t out_len = 0;
+    /* Zero the output first so missing fields default to zero */
+    memset(out, 0, sizeof(*out));
+    if (!flat_store_get(fs->accounts, addr_hash, out, sizeof(*out), &out_len))
+        return false;
+    return true;
 }
 
 bool flat_state_put_account(flat_state_t *fs, const uint8_t addr_hash[32],
                              const flat_account_record_t *record) {
     if (!fs || !addr_hash || !record) return false;
-    return flat_store_put(fs->accounts, addr_hash, record);
+    return flat_store_put(fs->accounts, addr_hash, record,
+                          (uint32_t)sizeof(*record));
 }
 
 bool flat_state_delete_account(flat_state_t *fs, const uint8_t addr_hash[32]) {
@@ -182,7 +193,9 @@ bool flat_state_get_storage(const flat_state_t *fs,
     if (!fs || !addr_hash || !slot_hash || !value) return false;
     uint8_t key[STOR_KEY_SIZE];
     make_stor_key(addr_hash, slot_hash, key);
-    return flat_store_get(fs->storage, key, value);
+    memset(value, 0, 32);
+    uint32_t out_len = 0;
+    return flat_store_get(fs->storage, key, value, 32, &out_len);
 }
 
 bool flat_state_put_storage(flat_state_t *fs,
@@ -192,7 +205,7 @@ bool flat_state_put_storage(flat_state_t *fs,
     if (!fs || !addr_hash || !slot_hash || !value) return false;
     uint8_t key[STOR_KEY_SIZE];
     make_stor_key(addr_hash, slot_hash, key);
-    return flat_store_put(fs->storage, key, value);
+    return flat_store_put(fs->storage, key, value, 32);
 }
 
 bool flat_state_delete_storage(flat_state_t *fs,
@@ -223,7 +236,16 @@ bool flat_state_batch_put_accounts(flat_state_t *fs,
                                     const flat_account_record_t *records,
                                     uint32_t count) {
     if (!fs || !addr_hashes || !records || count == 0) return false;
-    return flat_store_batch_put(fs->accounts, addr_hashes, records, count);
+
+    /* All account records are the same size (full struct) */
+    uint32_t *lens = malloc(count * sizeof(uint32_t));
+    if (!lens) return false;
+    for (uint32_t i = 0; i < count; i++)
+        lens[i] = (uint32_t)sizeof(flat_account_record_t);
+
+    bool ok = flat_store_batch_put(fs->accounts, addr_hashes, records, lens, count);
+    free(lens);
+    return ok;
 }
 
 bool flat_state_batch_put_storage(flat_state_t *fs,
@@ -231,13 +253,22 @@ bool flat_state_batch_put_storage(flat_state_t *fs,
                                    const uint8_t *values,
                                    uint32_t count) {
     if (!fs || !keys || !values || count == 0) return false;
+
     /* Build hashed keys */
     uint8_t *hashed_keys = malloc(count * 32);
     if (!hashed_keys) return false;
     for (uint32_t i = 0; i < count; i++)
         make_stor_key(keys + i * 64, keys + i * 64 + 32, hashed_keys + i * 32);
-    bool ok = flat_store_batch_put(fs->storage, hashed_keys, values, count);
+
+    /* All storage records are 32 bytes */
+    uint32_t *lens = malloc(count * sizeof(uint32_t));
+    if (!lens) { free(hashed_keys); return false; }
+    for (uint32_t i = 0; i < count; i++)
+        lens[i] = 32;
+
+    bool ok = flat_store_batch_put(fs->storage, hashed_keys, values, lens, count);
     free(hashed_keys);
+    free(lens);
     return ok;
 }
 
