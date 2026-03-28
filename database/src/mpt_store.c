@@ -46,9 +46,10 @@
 #define DIRTY_INIT_CAP     256
 
 /* Size-class slot allocator: nodes are padded to the smallest class that fits.
- * Freed slots form intrusive linked lists (next-pointer stored in first 8B). */
-#define NUM_SIZE_CLASSES    5
-static const uint16_t SIZE_CLASSES[NUM_SIZE_CLASSES] = {64, 128, 256, 512, 1024};
+ * 8 classes (3-bit class_idx in slot header). Optimized for Ethereum MPT node
+ * size distribution: 92% of nodes are 80-120B, rest are 200-530B. */
+#define NUM_SIZE_CLASSES    8
+static const uint16_t SIZE_CLASSES[NUM_SIZE_CLASSES] = {64, 96, 128, 256, 384, 544, 768, 1024};
 
 /* Slot header: 4 bytes prepended to each slot in the .dat file.
  * bits 0-2:   size class index (0-4)
@@ -90,7 +91,7 @@ static const uint8_t EMPTY_ROOT[32] = {
 
 /* Max free offsets that fit in the header (4096 - 76 = 4020 bytes = 502 offsets).
  * Overflow is silently dropped on sync — lost slots become padding waste. */
-#define MAX_HDR_FREE_OFFSETS  502
+#define MAX_HDR_FREE_OFFSETS  501  /* 4008 / 8 = 501 */
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -98,8 +99,8 @@ typedef struct __attribute__((packed)) {
     uint8_t  root_hash[32];
     uint64_t data_size;                        /* total bytes allocated after header */
     uint64_t free_slot_bytes;                  /* total bytes on free lists */
-    uint32_t free_counts[NUM_SIZE_CLASSES];    /* entries per size class (20 bytes) */
-    uint8_t  free_data[4020];                  /* packed uint64_t offsets per class */
+    uint32_t free_counts[NUM_SIZE_CLASSES];    /* entries per size class (32 bytes) */
+    uint8_t  free_data[4008];                  /* packed uint64_t offsets per class */
 } mpt_store_header_t;
 
 _Static_assert(sizeof(mpt_store_header_t) == PAGE_SIZE,
