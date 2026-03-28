@@ -713,9 +713,7 @@ void evm_state_evict_cache(evm_state_t *es) {
 #ifdef ENABLE_MPT
     if (es->flat_state) {
         /* Flush ALL cached entries to flat_state (not just dirty).
-         * Ensures flat_state is complete for resume after restart.
-         * With compact_art index, each put is an in-memory lookup +
-         * mmap write — fast even for 100K+ entries. */
+         * Ensures flat_state is complete for resume after restart. */
         mem_art_foreach(&es->storage, evict_all_slots_cb, es);
         mem_art_foreach(&es->accounts, evict_all_accounts_cb, es);
     } else {
