@@ -16,15 +16,170 @@
 
 #include "flat_state.h"
 #include "flat_store.h"
+#include "hash.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define ACCT_KEY_SIZE      32    /* keccak256(addr) */
-#define ACCT_MAX_REC_SIZE  104   /* sizeof(flat_account_record_t) */
-#define STOR_KEY_SIZE      32    /* keccak256(addr_hash || slot_hash) */
+#define ACCT_KEY_SIZE      32
+#define ACCT_MAX_REC_SIZE  104   /* max compressed account record */
+#define STOR_KEY_SIZE      32
 #define STOR_MAX_REC_SIZE  32
+
+/* =========================================================================
+ * Account Record Compression
+ *
+ * Encoded format:
+ *   [1B flags][variable fields]
+ *     bit 0: has_nonce (nonce > 0) → 4B or 8B follows
+ *     bit 1: has_balance (balance != 0) → 8B or 32B follows
+ *     bit 2: balance_is_full (needs 32B, not 8B)
+ *     bit 3: has_code (code_hash != EMPTY_CODE && != zero)  → 32B follows
+ *     bit 4: has_storage (storage_root != EMPTY_STORAGE && != zero) → 32B follows
+ *     bit 5: nonce_is_big (needs 8B, not 4B)
+ *
+ * Sizes:
+ *   Empty EOA:        1 byte
+ *   Funded EOA:       1 + 4 + 8 = 13 bytes
+ *   Full contract:    1 + 4 + 8 + 32 + 32 = 77 bytes
+ * ========================================================================= */
+
+#define ACCT_FLAG_HAS_NONCE      0x01
+#define ACCT_FLAG_HAS_BALANCE    0x02
+#define ACCT_FLAG_BALANCE_FULL   0x04
+#define ACCT_FLAG_HAS_CODE       0x08
+#define ACCT_FLAG_HAS_STORAGE    0x10
+#define ACCT_FLAG_NONCE_BIG      0x20
+
+static inline bool is_zero_32(const uint8_t v[32]) {
+    const uint64_t *p = (const uint64_t *)v;
+    return (p[0] | p[1] | p[2] | p[3]) == 0;
+}
+
+/* Returns true if balance fits in 8 bytes (first 24 bytes are zero) */
+static inline bool balance_fits_8(const uint8_t bal[32]) {
+    const uint64_t *p = (const uint64_t *)bal;
+    return (p[0] | p[1] | p[2]) == 0;
+}
+
+static uint32_t encode_account(const flat_account_record_t *rec, uint8_t *buf) {
+    uint8_t flags = 0;
+    uint32_t pos = 1; /* skip flags byte */
+
+    if (rec->nonce > 0) {
+        flags |= ACCT_FLAG_HAS_NONCE;
+        if (rec->nonce > UINT32_MAX) {
+            flags |= ACCT_FLAG_NONCE_BIG;
+            uint64_t n = rec->nonce;
+            memcpy(buf + pos, &n, 8);
+            pos += 8;
+        } else {
+            uint32_t n = (uint32_t)rec->nonce;
+            memcpy(buf + pos, &n, 4);
+            pos += 4;
+        }
+    }
+
+    if (!is_zero_32(rec->balance)) {
+        flags |= ACCT_FLAG_HAS_BALANCE;
+        if (balance_fits_8(rec->balance)) {
+            memcpy(buf + pos, rec->balance + 24, 8);
+            pos += 8;
+        } else {
+            flags |= ACCT_FLAG_BALANCE_FULL;
+            memcpy(buf + pos, rec->balance, 32);
+            pos += 32;
+        }
+    }
+
+    if (!is_zero_32(rec->code_hash) &&
+        memcmp(rec->code_hash, HASH_EMPTY_CODE.bytes, 32) != 0) {
+        flags |= ACCT_FLAG_HAS_CODE;
+        memcpy(buf + pos, rec->code_hash, 32);
+        pos += 32;
+    }
+
+    if (!is_zero_32(rec->storage_root) &&
+        memcmp(rec->storage_root, HASH_EMPTY_STORAGE.bytes, 32) != 0) {
+        flags |= ACCT_FLAG_HAS_STORAGE;
+        memcpy(buf + pos, rec->storage_root, 32);
+        pos += 32;
+    }
+
+    buf[0] = flags;
+    return pos;
+}
+
+static void decode_account(const uint8_t *buf, uint32_t len,
+                            flat_account_record_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (len == 0) return;
+
+    uint8_t flags = buf[0];
+    uint32_t pos = 1;
+
+    if (flags & ACCT_FLAG_HAS_NONCE) {
+        if (flags & ACCT_FLAG_NONCE_BIG) {
+            memcpy(&out->nonce, buf + pos, 8);
+            pos += 8;
+        } else {
+            uint32_t n;
+            memcpy(&n, buf + pos, 4);
+            out->nonce = n;
+            pos += 4;
+        }
+    }
+
+    if (flags & ACCT_FLAG_HAS_BALANCE) {
+        if (flags & ACCT_FLAG_BALANCE_FULL) {
+            memcpy(out->balance, buf + pos, 32);
+            pos += 32;
+        } else {
+            /* 8 bytes in last position of 32-byte big-endian */
+            memcpy(out->balance + 24, buf + pos, 8);
+            pos += 8;
+        }
+    }
+
+    if (flags & ACCT_FLAG_HAS_CODE) {
+        memcpy(out->code_hash, buf + pos, 32);
+        pos += 32;
+    } else {
+        memcpy(out->code_hash, HASH_EMPTY_CODE.bytes, 32);
+    }
+
+    if (flags & ACCT_FLAG_HAS_STORAGE) {
+        memcpy(out->storage_root, buf + pos, 32);
+        pos += 32;
+    } else {
+        memcpy(out->storage_root, HASH_EMPTY_STORAGE.bytes, 32);
+    }
+
+    (void)len; /* consumed by pos */
+}
+
+/* =========================================================================
+ * Storage Value Compression
+ *
+ * Strip leading zeros from 32-byte big-endian value.
+ * Encoded: just the significant bytes (length from slot header).
+ * ========================================================================= */
+
+static uint32_t encode_storage(const uint8_t value[32], uint8_t *buf) {
+    /* Find first non-zero byte */
+    int start = 0;
+    while (start < 32 && value[start] == 0) start++;
+    uint32_t len = 32 - start;
+    if (len > 0) memcpy(buf, value + start, len);
+    return len;
+}
+
+static void decode_storage(const uint8_t *buf, uint32_t len, uint8_t value[32]) {
+    memset(value, 0, 32);
+    if (len > 0 && len <= 32)
+        memcpy(value + 32 - len, buf, len);
+}
 
 struct flat_state {
     flat_store_t *accounts;
@@ -147,19 +302,20 @@ void flat_state_destroy(flat_state_t *fs) {
 bool flat_state_get_account(const flat_state_t *fs, const uint8_t addr_hash[32],
                              flat_account_record_t *out) {
     if (!fs || !addr_hash || !out) return false;
+    uint8_t buf[ACCT_MAX_REC_SIZE];
     uint32_t out_len = 0;
-    /* Zero the output first so missing fields default to zero */
-    memset(out, 0, sizeof(*out));
-    if (!flat_store_get(fs->accounts, addr_hash, out, sizeof(*out), &out_len))
+    if (!flat_store_get(fs->accounts, addr_hash, buf, sizeof(buf), &out_len))
         return false;
+    decode_account(buf, out_len, out);
     return true;
 }
 
 bool flat_state_put_account(flat_state_t *fs, const uint8_t addr_hash[32],
                              const flat_account_record_t *record) {
     if (!fs || !addr_hash || !record) return false;
-    return flat_store_put(fs->accounts, addr_hash, record,
-                          (uint32_t)sizeof(*record));
+    uint8_t buf[ACCT_MAX_REC_SIZE];
+    uint32_t len = encode_account(record, buf);
+    return flat_store_put(fs->accounts, addr_hash, buf, len);
 }
 
 bool flat_state_delete_account(flat_state_t *fs, const uint8_t addr_hash[32]) {
@@ -193,9 +349,12 @@ bool flat_state_get_storage(const flat_state_t *fs,
     if (!fs || !addr_hash || !slot_hash || !value) return false;
     uint8_t key[STOR_KEY_SIZE];
     make_stor_key(addr_hash, slot_hash, key);
-    memset(value, 0, 32);
+    uint8_t buf[32];
     uint32_t out_len = 0;
-    return flat_store_get(fs->storage, key, value, 32, &out_len);
+    if (!flat_store_get(fs->storage, key, buf, sizeof(buf), &out_len))
+        return false;
+    decode_storage(buf, out_len, value);
+    return true;
 }
 
 bool flat_state_put_storage(flat_state_t *fs,
@@ -205,7 +364,9 @@ bool flat_state_put_storage(flat_state_t *fs,
     if (!fs || !addr_hash || !slot_hash || !value) return false;
     uint8_t key[STOR_KEY_SIZE];
     make_stor_key(addr_hash, slot_hash, key);
-    return flat_store_put(fs->storage, key, value, 32);
+    uint8_t buf[32];
+    uint32_t len = encode_storage(value, buf);
+    return flat_store_put(fs->storage, key, buf, len);
 }
 
 bool flat_state_delete_storage(flat_state_t *fs,
@@ -236,16 +397,13 @@ bool flat_state_batch_put_accounts(flat_state_t *fs,
                                     const flat_account_record_t *records,
                                     uint32_t count) {
     if (!fs || !addr_hashes || !records || count == 0) return false;
-
-    /* All account records are the same size (full struct) */
-    uint32_t *lens = malloc(count * sizeof(uint32_t));
-    if (!lens) return false;
-    for (uint32_t i = 0; i < count; i++)
-        lens[i] = (uint32_t)sizeof(flat_account_record_t);
-
-    bool ok = flat_store_batch_put(fs->accounts, addr_hashes, records, lens, count);
-    free(lens);
-    return ok;
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t buf[ACCT_MAX_REC_SIZE];
+        uint32_t len = encode_account(&records[i], buf);
+        if (!flat_store_put(fs->accounts, addr_hashes + i * 32, buf, len))
+            return false;
+    }
+    return true;
 }
 
 bool flat_state_batch_put_storage(flat_state_t *fs,
@@ -253,23 +411,15 @@ bool flat_state_batch_put_storage(flat_state_t *fs,
                                    const uint8_t *values,
                                    uint32_t count) {
     if (!fs || !keys || !values || count == 0) return false;
-
-    /* Build hashed keys */
-    uint8_t *hashed_keys = malloc(count * 32);
-    if (!hashed_keys) return false;
-    for (uint32_t i = 0; i < count; i++)
-        make_stor_key(keys + i * 64, keys + i * 64 + 32, hashed_keys + i * 32);
-
-    /* All storage records are 32 bytes */
-    uint32_t *lens = malloc(count * sizeof(uint32_t));
-    if (!lens) { free(hashed_keys); return false; }
-    for (uint32_t i = 0; i < count; i++)
-        lens[i] = 32;
-
-    bool ok = flat_store_batch_put(fs->storage, hashed_keys, values, lens, count);
-    free(hashed_keys);
-    free(lens);
-    return ok;
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t hkey[32];
+        make_stor_key(keys + i * 64, keys + i * 64 + 32, hkey);
+        uint8_t buf[32];
+        uint32_t len = encode_storage(values + i * 32, buf);
+        if (!flat_store_put(fs->storage, hkey, buf, len))
+            return false;
+    }
+    return true;
 }
 
 /* =========================================================================
