@@ -105,24 +105,22 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(mpt_store_header_t) == PAGE_SIZE,
                "mpt_store_header_t must be 4096 bytes");
 
-/* Packed node record: 8 bytes instead of 16.
- * bits 0-39:   offset (40 bits = 1TB addressable)
- * bits 40-50:  length (11 bits = max 2047)
- * bits 51-63:  refcount (13 bits = max 8191) */
-typedef uint64_t node_record_t;
+typedef struct __attribute__((packed)) {
+    uint64_t offset;
+    uint32_t length;
+    uint32_t refcount;
+} node_record_t;
 
 static inline node_record_t node_record_pack(uint64_t offset, uint32_t length,
                                               uint32_t refcount) {
-    return (offset & 0xFFFFFFFFFFULL) |
-           ((uint64_t)(length & 0x7FF) << 40) |
-           ((uint64_t)(refcount & 0x1FFF) << 51);
+    return (node_record_t){ .offset = offset, .length = length, .refcount = refcount };
 }
 
-static inline uint64_t node_record_offset(node_record_t r)   { return r & 0xFFFFFFFFFFULL; }
-static inline uint32_t node_record_length(node_record_t r)   { return (r >> 40) & 0x7FF; }
-static inline uint32_t node_record_refcount(node_record_t r) { return (r >> 51) & 0x1FFF; }
+static inline uint64_t node_record_offset(node_record_t r)   { return r.offset; }
+static inline uint32_t node_record_length(node_record_t r)   { return r.length; }
+static inline uint32_t node_record_refcount(node_record_t r) { return r.refcount; }
 
-_Static_assert(sizeof(node_record_t) == 8, "node_record_t must be 8 bytes");
+_Static_assert(sizeof(node_record_t) == 16, "node_record_t must be 16 bytes");
 
 /* =========================================================================
  * Dirty entry (staged update/delete)
