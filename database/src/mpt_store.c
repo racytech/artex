@@ -1543,6 +1543,9 @@ mpt_store_t *mpt_store_open(const char *path) {
 void mpt_store_destroy(mpt_store_t *ms) {
     if (!ms) return;
 
+    /* Write final header state */
+    write_header_dat(ms);
+
     /* Free deferred write buffer */
     def_free_all(ms);
 
@@ -1557,8 +1560,12 @@ void mpt_store_destroy(mpt_store_t *ms) {
     if (ms->ncache_enabled)
         node_cache_destroy(&ms->ncache);
     compact_art_destroy(&ms->index);
-    if (ms->data_base && ms->data_base != MAP_FAILED)
+    if (ms->data_base && ms->data_base != MAP_FAILED) {
+        /* Sync mmap to disk before closing — ensures data file is
+         * consistent for resume. Only done at shutdown. */
+        msync(ms->data_base, ms->data_mapped, MS_SYNC);
         munmap(ms->data_base, ms->data_mapped);
+    }
     close(ms->data_fd);
     free(ms->dat_path);
     free(ms->free_path);
