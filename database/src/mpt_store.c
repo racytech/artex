@@ -107,21 +107,21 @@ _Static_assert(sizeof(mpt_store_header_t) == PAGE_SIZE,
                "mpt_store_header_t must be 4096 bytes");
 
 /* Packed node record: 8 bytes.
- * bits 0-36:   offset (37 bits = 128GB addressable)
- * bits 37-47:  length (11 bits = max 2047)
- * bits 48-63:  refcount (16 bits = max 65535) */
+ * bits 0-37:   offset (38 bits = 256GB addressable)
+ * bits 38-48:  length (11 bits = max 2047)
+ * bits 49-63:  refcount (15 bits = max 32767) */
 typedef uint64_t node_record_t;
 
 static inline node_record_t node_record_pack(uint64_t offset, uint32_t length,
                                               uint32_t refcount) {
-    return (offset & 0x1FFFFFFFFFULL) |
-           ((uint64_t)(length & 0x7FF) << 37) |
-           ((uint64_t)(refcount & 0xFFFF) << 48);
+    return (offset & 0x3FFFFFFFFFULL) |
+           ((uint64_t)(length & 0x7FF) << 38) |
+           ((uint64_t)(refcount & 0x7FFF) << 49);
 }
 
-static inline uint64_t node_record_offset(node_record_t r)   { return r & 0x1FFFFFFFFFULL; }
-static inline uint32_t node_record_length(node_record_t r)   { return (r >> 37) & 0x7FF; }
-static inline uint32_t node_record_refcount(node_record_t r) { return (r >> 48) & 0xFFFF; }
+static inline uint64_t node_record_offset(node_record_t r)   { return r & 0x3FFFFFFFFFULL; }
+static inline uint32_t node_record_length(node_record_t r)   { return (r >> 38) & 0x7FF; }
+static inline uint32_t node_record_refcount(node_record_t r) { return (r >> 49) & 0x7FFF; }
 
 _Static_assert(sizeof(node_record_t) == 8, "node_record_t must be 8 bytes");
 
