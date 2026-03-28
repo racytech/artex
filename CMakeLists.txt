@@ -914,6 +914,10 @@ if(CJSON_FOUND)
     add_executable(stress_mpt_root tools/stress_mpt_root.c)
     target_link_libraries(stress_mpt_root evm common)
 
+    # Test: mpt_store node persistence across checkpoints
+    add_executable(test_mpt_store_resume database/tests/test_mpt_store_resume.c)
+    target_link_libraries(test_mpt_store_resume mpt_store common)
+
     # TUI (ncurses terminal UI, optional)
     find_package(Curses QUIET)
     if(CURSES_FOUND)

@@ -993,15 +993,33 @@ static size_t load_node_rlp(const mpt_store_t *ms, const uint8_t hash[32],
 
     /* Look up in compact_art index → offset/length */
     node_record_t rec;
-    if (!idx_get(ms, hash, &rec))
+    if (!idx_get(ms, hash, &rec)) {
+        /* Node not in index — was it deleted or never inserted? */
+        static int lost_log_count = 0;
+        if (lost_log_count < 5) {
+            fprintf(stderr, "DBG load_node_rlp: NOT IN INDEX hash=");
+            for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%02x", hash[_i]);
+            fprintf(stderr, " (deferred=%s)\n", def_find(ms, hash) ? "yes" : "no");
+            lost_log_count++;
+        }
         return 0;
-    if (node_record_length(rec) == 0 || node_record_length(rec) > MAX_NODE_RLP)
+    }
+    if (node_record_length(rec) == 0 || node_record_length(rec) > MAX_NODE_RLP) {
+        fprintf(stderr, "DBG load_node_rlp: BAD RECORD hash=");
+        for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%02x", hash[_i]);
+        fprintf(stderr, " offset=%lu length=%u\n",
+                (unsigned long)node_record_offset(rec), node_record_length(rec));
         return 0;
+    }
 
     /* Read from mmap'd .dat (skip slot header) */
     size_t dat_off = PAGE_SIZE + node_record_offset(rec) + SLOT_HEADER_SIZE;
-    if (dat_off + node_record_length(rec) > ms->data_mapped)
+    if (dat_off + node_record_length(rec) > ms->data_mapped) {
+        fprintf(stderr, "DBG load_node_rlp: OUT OF RANGE hash=");
+        for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%02x", hash[_i]);
+        fprintf(stderr, " dat_off=%zu mapped=%zu\n", dat_off, ms->data_mapped);
         return 0;
+    }
     memcpy(buf, ms->data_base + dat_off, node_record_length(rec));
 
     /* Insert into LRU cache with depth for pin policy */
@@ -1720,14 +1738,13 @@ void mpt_store_flush(mpt_store_t *ms) {
                 uint32_t shdr = slot_header_pack((uint8_t)sc, (uint16_t)node_record_length(rec),
                                                   (uint16_t)node_record_refcount(rec));
                 memcpy(ms->data_base + PAGE_SIZE + node_record_offset(rec), &shdr, SLOT_HEADER_SIZE);
-            } else {
+            } else if (!ms->shared) {
+                /* Non-shared mode: safe to delete (only one trie references this node) */
                 if (ms->live_bytes >= node_record_length(rec))
                     ms->live_bytes -= node_record_length(rec);
                 int sc = size_class_for(node_record_length(rec));
                 free_list_push(&ms->free_lists[sc], node_record_offset(rec));
                 ms->free_slot_bytes += SLOT_HEADER_SIZE + SIZE_CLASSES[sc];
-                /* Mark slot as free but PRESERVE class_idx so the scan
-                 * can determine the correct slot size for stepping */
                 uint32_t free_hdr = slot_header_pack((uint8_t)sc, 0, 0);
                 memcpy(ms->data_base + PAGE_SIZE + node_record_offset(rec), &free_hdr, SLOT_HEADER_SIZE);
                 idx_delete(ms, ms->def_deletes[i].hash);
