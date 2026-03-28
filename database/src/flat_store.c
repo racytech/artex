@@ -403,8 +403,10 @@ void flat_store_destroy(flat_store_t *s) {
     if (!s) return;
     write_header(s);
     compact_art_destroy(&s->index);
-    if (s->base && s->base != MAP_FAILED)
+    if (s->base && s->base != MAP_FAILED) {
+        msync(s->base, s->mapped_size, MS_SYNC);
         munmap(s->base, s->mapped_size);
+    }
     if (s->fd >= 0) close(s->fd);
     for (int i = 0; i < MAX_SIZE_CLASSES; i++)
         free_list_destroy(&s->free_lists[i]);

@@ -1566,10 +1566,12 @@ int main(int argc, char **argv) {
                (st.blocks_ok + st.blocks_fail) / (elapsed > 0 ? elapsed : 1));
     }
 
-    /* Ensure background flush is complete before writing .meta */
+    /* Stop prefetch and destroy sync (flushes + msyncs all data to disk) */
+    prefetch_stop(&prefetch);
     sync_ensure_flushed(sync);
+    sync_destroy(sync);
 
-    /* Write .meta for resume on success (mismatch handler already wrote its own) */
+    /* Write .meta AFTER all data is on disk (sync_destroy msyncs mmap pages) */
     if (st.blocks_fail == 0 && st.last_block > 0) {
         bool pe = (st.last_block >= 2675000);
         uint8_t root[32] = {0};
@@ -1588,9 +1590,6 @@ int main(int argc, char **argv) {
         snprintf(mp, sizeof(mp), "%s.meta", mpt_path);
         meta_write(mp, st.last_block, root, pe);
     }
-
-    prefetch_stop(&prefetch);
-    sync_destroy(sync);  /* saves final checkpoint */
     archive_close(&archive);
 
     return st.blocks_fail > 0 ? 1 : 0;
