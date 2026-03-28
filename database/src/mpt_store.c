@@ -105,22 +105,24 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(mpt_store_header_t) == PAGE_SIZE,
                "mpt_store_header_t must be 4096 bytes");
 
-typedef struct __attribute__((packed)) {
-    uint64_t offset;
-    uint32_t length;
-    uint32_t refcount;
-} node_record_t;
+/* Packed node record: 8 bytes instead of 16.
+ * bits 0-39:   offset (40 bits = 1TB addressable)
+ * bits 40-50:  length (11 bits = max 2047)
+ * bits 51-63:  refcount (13 bits = max 8191) */
+typedef uint64_t node_record_t;
 
 static inline node_record_t node_record_pack(uint64_t offset, uint32_t length,
                                               uint32_t refcount) {
-    return (node_record_t){ .offset = offset, .length = length, .refcount = refcount };
+    return (offset & 0xFFFFFFFFFFULL) |
+           ((uint64_t)(length & 0x7FF) << 40) |
+           ((uint64_t)(refcount & 0x1FFF) << 51);
 }
 
-static inline uint64_t node_record_offset(node_record_t r)   { return r.offset; }
-static inline uint32_t node_record_length(node_record_t r)   { return r.length; }
-static inline uint32_t node_record_refcount(node_record_t r) { return r.refcount; }
+static inline uint64_t node_record_offset(node_record_t r)   { return r & 0xFFFFFFFFFFULL; }
+static inline uint32_t node_record_length(node_record_t r)   { return (r >> 40) & 0x7FF; }
+static inline uint32_t node_record_refcount(node_record_t r) { return (r >> 51) & 0x1FFF; }
 
-_Static_assert(sizeof(node_record_t) == 16, "node_record_t must be 16 bytes");
+_Static_assert(sizeof(node_record_t) == 8, "node_record_t must be 8 bytes");
 
 /* =========================================================================
  * Dirty entry (staged update/delete)
@@ -1263,7 +1265,7 @@ mpt_store_t *mpt_store_create(const char *path, uint64_t capacity_hint) {
         return NULL;
     }
 
-    if (!compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), false, NULL, NULL)) {
+    if (!compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), true, mpt_key_fetch, ms)) {
         close(data_fd);
         free(dat_path);
         free(ms);
@@ -1425,8 +1427,7 @@ mpt_store_t *mpt_store_open(const char *path) {
     char *dat_path = make_path(path, ".dat");
 
     /* Auto-compact if > 50% waste */
-    /* TODO: disabled pending bug fix — compact_dat_file may corrupt data */
-    /* if (dat_path) compact_dat_file(dat_path); */
+    if (dat_path) compact_dat_file(dat_path);
     if (!dat_path) return NULL;
 
     int data_fd = open(dat_path, O_RDWR);
@@ -1451,7 +1452,7 @@ mpt_store_t *mpt_store_open(const char *path) {
         return NULL;
     }
 
-    if (!compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), false, NULL, NULL)) {
+    if (!compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), true, mpt_key_fetch, ms)) {
         close(data_fd);
         free(dat_path);
         free(ms);
@@ -1590,7 +1591,7 @@ void mpt_store_reset(mpt_store_t *ms) {
 
     /* Clear in-memory index */
     compact_art_destroy(&ms->index);
-    compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), false, NULL, NULL);
+    compact_art_init(&ms->index, NODE_HASH_SIZE, sizeof(node_record_t), true, mpt_key_fetch, ms);
 
     /* Truncate data file, re-mmap, and rewrite header */
     if (ms->data_base && ms->data_base != MAP_FAILED)
@@ -1717,9 +1718,10 @@ void mpt_store_flush(mpt_store_t *ms) {
                 int sc = size_class_for(node_record_length(rec));
                 free_list_push(&ms->free_lists[sc], node_record_offset(rec));
                 ms->free_slot_bytes += SLOT_HEADER_SIZE + SIZE_CLASSES[sc];
-                /* Zero the slot header to mark as free */
-                uint32_t zero_hdr = 0;
-                memcpy(ms->data_base + PAGE_SIZE + node_record_offset(rec), &zero_hdr, SLOT_HEADER_SIZE);
+                /* Mark slot as free but PRESERVE class_idx so the scan
+                 * can determine the correct slot size for stepping */
+                uint32_t free_hdr = slot_header_pack((uint8_t)sc, 0, 0);
+                memcpy(ms->data_base + PAGE_SIZE + node_record_offset(rec), &free_hdr, SLOT_HEADER_SIZE);
                 idx_delete(ms, ms->def_deletes[i].hash);
             }
         }

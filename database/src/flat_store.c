@@ -282,8 +282,7 @@ static bool compact_file(const char *path) {
 
 flat_store_t *flat_store_open(const char *path) {
     /* Auto-compact if > 50% waste */
-    /* TODO: disabled pending bug fix */
-    /* compact_file(path); */
+    compact_file(path);
 
     int fd = open(path, O_RDWR);
     if (fd < 0) return NULL;
