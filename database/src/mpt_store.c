@@ -114,6 +114,7 @@ typedef uint64_t node_record_t;
 
 static inline node_record_t node_record_pack(uint64_t offset, uint32_t length,
                                               uint32_t refcount) {
+    if (refcount > 0x7FFF) refcount = 0x7FFF;  /* cap at max, never wrap */
     return (offset & 0x3FFFFFFFFFULL) |
            ((uint64_t)(length & 0x7FF) << 38) |
            ((uint64_t)(refcount & 0x7FFF) << 49);
@@ -1171,9 +1172,9 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
 
     ms->live_bytes += rlp_len;
 
-    /* Shared mode: bump refcount for each child hash referenced by this node. */
-    if (ms->shared && rlp_len > 32)
-        adjust_child_refcounts(ms, rlp, rlp_len, +1);
+    /* Shared mode: no child refcount tracking. Refcount only counts
+     * how many times write_node was called with this exact hash.
+     * Nodes with high refcount are never freed (capped at max). */
 
     return true;
 }
@@ -1186,9 +1187,6 @@ static void delete_node(mpt_store_t *ms, const uint8_t hash[32]) {
     if (ms->shared) {
         deferred_entry_t *def = def_find_mut(ms, hash);
         if (def) {
-            /* Decrement children's refcounts (symmetric with write_node) */
-            if (def->rlp && def->rlp_len > 32)
-                adjust_child_refcounts(ms, def->rlp, def->rlp_len, -1);
             if (def->refcount > 1) {
                 def->refcount--;
             } else {
@@ -1198,11 +1196,6 @@ static void delete_node(mpt_store_t *ms, const uint8_t hash[32]) {
             ms->cstats.deletes++;
             return;
         }
-        /* On-disk node: load RLP to decrement children before deferring delete */
-        uint8_t buf[MAX_NODE_RLP];
-        size_t buf_len = load_node_rlp(ms, hash, buf, 0);
-        if (buf_len > 32)
-            adjust_child_refcounts(ms, buf, buf_len, -1);
     } else {
         /* Non-shared: refcount always 1, remove directly */
         if (def_remove(ms, hash)) {
@@ -1818,9 +1811,9 @@ void mpt_store_flush(mpt_store_t *ms) {
                                                   (uint16_t)node_record_refcount(rec));
                 memcpy(ms->data_base + PAGE_SIZE + node_record_offset(rec), &shdr, SLOT_HEADER_SIZE);
             } else {
-                /* Refcount reached 0: safe to delete. In shared mode,
-                 * write_node bumps child refcounts, so this node is
-                 * truly unreferenced. */
+                /* Refcount reached 0: delete the node.
+                 * In shared mode, highly-shared nodes have capped refcount
+                 * (never reaches 0), so only low-refcount nodes are freed. */
                 if (ms->live_bytes >= node_record_length(rec))
                     ms->live_bytes -= node_record_length(rec);
                 int sc = size_class_for(node_record_length(rec));
