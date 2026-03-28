@@ -1050,6 +1050,11 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         deferred_entry_t *def = def_find_mut(ms, out_hash);
         if (def) {
             def->refcount++;
+            if (def->refcount > 8000) {
+                fprintf(stderr, "WARN: deferred refcount overflow risk: hash=");
+                for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%02x", out_hash[_i]);
+                fprintf(stderr, " refcount=%u\n", def->refcount);
+            }
             ms->cstats.check_ns += (double)(cstat_now() - _chk0);
             ms->cstats.check_hits++;
             return true;
@@ -1057,9 +1062,15 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         {
             node_record_t existing;
             if (idx_get(ms, out_hash, &existing)) {
+                uint32_t new_rc = node_record_refcount(existing) + 1;
+                if (new_rc > 8000) {
+                    fprintf(stderr, "WARN: refcount overflow risk: hash=");
+                    for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%02x", out_hash[_i]);
+                    fprintf(stderr, " refcount=%u\n", new_rc);
+                }
                 existing = node_record_pack(node_record_offset(existing),
                                            node_record_length(existing),
-                                           node_record_refcount(existing) + 1);
+                                           new_rc);
                 idx_put(ms, out_hash, &existing);
                 ms->cstats.check_ns += (double)(cstat_now() - _chk0);
                 ms->cstats.check_hits++;
@@ -1102,6 +1113,67 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         return false;
 
     ms->live_bytes += rlp_len;
+
+    /* Shared mode: bump refcount for each child hash referenced by this node.
+     * When a new parent is created (e.g., new branch after child update),
+     * unchanged children are carried over but their refcount wasn't bumped.
+     * The old parent's delete decrements the child's refcount. Without this
+     * increment, the child's refcount can reach 0 prematurely (LOST NODE). */
+    if (ms->shared && rlp_len > 32) {
+        /* Parse RLP to find 32-byte hash references.
+         * In MPT nodes, 32-byte hashes appear as: 0xa0 followed by 32 bytes.
+         * Scan for this pattern in the RLP payload. */
+        size_t pos = 0;
+        /* Skip the list header */
+        if (rlp[0] >= 0xc0 && rlp[0] <= 0xf7) {
+            pos = 1;
+        } else if (rlp[0] >= 0xf8) {
+            pos = 1 + (rlp[0] - 0xf7);
+        }
+        while (pos + 33 <= rlp_len) {
+            if (rlp[pos] == 0xa0) {
+                /* 32-byte string — could be a child hash */
+                const uint8_t *child_hash = rlp + pos + 1;
+                /* Bump refcount if this hash exists in deferred or index */
+                deferred_entry_t *def = def_find_mut(ms, child_hash);
+                if (def) {
+                    def->refcount++;
+                } else {
+                    node_record_t child_rec;
+                    if (idx_get(ms, child_hash, &child_rec)) {
+                        child_rec = node_record_pack(
+                            node_record_offset(child_rec),
+                            node_record_length(child_rec),
+                            node_record_refcount(child_rec) + 1);
+                        idx_put(ms, child_hash, &child_rec);
+                    }
+                }
+                pos += 33;
+            } else if (rlp[pos] == 0x80) {
+                pos += 1;  /* empty string */
+            } else if (rlp[pos] <= 0x7f) {
+                pos += 1;  /* single byte */
+            } else if (rlp[pos] >= 0x81 && rlp[pos] <= 0xb7) {
+                pos += 1 + (rlp[pos] - 0x80);  /* short string */
+            } else if (rlp[pos] >= 0xb8 && rlp[pos] <= 0xbf) {
+                size_t len_bytes = rlp[pos] - 0xb7;
+                size_t data_len = 0;
+                for (size_t k = 0; k < len_bytes && pos + 1 + k < rlp_len; k++)
+                    data_len = (data_len << 8) | rlp[pos + 1 + k];
+                pos += 1 + len_bytes + data_len;
+            } else if (rlp[pos] >= 0xc0 && rlp[pos] <= 0xf7) {
+                pos += 1 + (rlp[pos] - 0xc0);  /* short list (inline node) */
+            } else if (rlp[pos] >= 0xf8) {
+                size_t len_bytes = rlp[pos] - 0xf7;
+                size_t data_len = 0;
+                for (size_t k = 0; k < len_bytes && pos + 1 + k < rlp_len; k++)
+                    data_len = (data_len << 8) | rlp[pos + 1 + k];
+                pos += 1 + len_bytes + data_len;  /* long list (inline node) */
+            } else {
+                pos++;
+            }
+        }
+    }
 
     return true;
 }
@@ -1738,8 +1810,10 @@ void mpt_store_flush(mpt_store_t *ms) {
                 uint32_t shdr = slot_header_pack((uint8_t)sc, (uint16_t)node_record_length(rec),
                                                   (uint16_t)node_record_refcount(rec));
                 memcpy(ms->data_base + PAGE_SIZE + node_record_offset(rec), &shdr, SLOT_HEADER_SIZE);
-            } else if (!ms->shared) {
-                /* Non-shared mode: safe to delete (only one trie references this node) */
+            } else {
+                /* Refcount reached 0: safe to delete. In shared mode,
+                 * write_node bumps child refcounts, so this node is
+                 * truly unreferenced. */
                 if (ms->live_bytes >= node_record_length(rec))
                     ms->live_bytes -= node_record_length(rec);
                 int sc = size_class_for(node_record_length(rec));
