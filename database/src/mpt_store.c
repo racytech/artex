@@ -1108,11 +1108,6 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         deferred_entry_t *def = def_find_mut(ms, out_hash);
         if (def) {
             def->refcount++;
-            if (def->refcount > 8000) {
-                fprintf(stderr, "WARN: deferred refcount overflow risk: hash=");
-                for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%02x", out_hash[_i]);
-                fprintf(stderr, " refcount=%u\n", def->refcount);
-            }
             ms->cstats.check_ns += (double)(cstat_now() - _chk0);
             ms->cstats.check_hits++;
             return true;
@@ -1120,15 +1115,9 @@ static bool write_node(mpt_store_t *ms, const uint8_t *rlp, size_t rlp_len,
         {
             node_record_t existing;
             if (idx_get(ms, out_hash, &existing)) {
-                uint32_t new_rc = node_record_refcount(existing) + 1;
-                if (new_rc > 8000) {
-                    fprintf(stderr, "WARN: refcount overflow risk: hash=");
-                    for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%02x", out_hash[_i]);
-                    fprintf(stderr, " refcount=%u\n", new_rc);
-                }
                 existing = node_record_pack(node_record_offset(existing),
                                            node_record_length(existing),
-                                           new_rc);
+                                           node_record_refcount(existing) + 1);
                 idx_put(ms, out_hash, &existing);
                 ms->cstats.check_ns += (double)(cstat_now() - _chk0);
                 ms->cstats.check_hits++;
@@ -1231,8 +1220,36 @@ static bool encode_child_ref(rlp_buf_t *buf, const node_ref_t *ref) {
 }
 
 /* Build a branch node RLP and write to store. Returns the node_ref. */
+/* Bump refcount for a child node referenced by a new parent (shared mode).
+ * Called from make_branch/make_extension when a REF_HASH child is included
+ * in a new parent node. This ensures the child isn't prematurely deleted
+ * when other parents that also reference it are replaced. */
+static void ref_retain(mpt_store_t *ms, const node_ref_t *child) {
+    if (!ms->shared || child->type != REF_HASH) return;
+    /* Check deferred buffer first */
+    deferred_entry_t *def = def_find_mut(ms, child->hash);
+    if (def) {
+        def->refcount++;
+        return;
+    }
+    /* Check on-disk index */
+    node_record_t rec;
+    if (idx_get(ms, child->hash, &rec)) {
+        rec = node_record_pack(node_record_offset(rec),
+                               node_record_length(rec),
+                               node_record_refcount(rec) + 1);
+        idx_put(ms, child->hash, &rec);
+    }
+}
+
 static node_ref_t make_branch(mpt_store_t *ms, const node_ref_t children[16]) {
     node_ref_t result = { .type = REF_EMPTY };
+
+    /* Retain all REF_HASH children before creating the branch.
+     * This bumps their refcount so they survive when old parents
+     * that also reference them are deleted. */
+    for (int i = 0; i < 16; i++)
+        ref_retain(ms, &children[i]);
 
     rlp_buf_t payload; rbuf_reset(&payload);
     for (int i = 0; i < 16; i++) {
@@ -1295,6 +1312,9 @@ static node_ref_t make_extension(mpt_store_t *ms, const uint8_t *path,
         /* Degenerate: no extension needed, return child directly */
         return *child;
     }
+
+    /* Retain child before creating extension */
+    ref_retain(ms, child);
 
     uint8_t encoded_path[33];
     size_t enc_len = hex_prefix_encode(path, path_len, false, encoded_path);
