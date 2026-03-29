@@ -45,6 +45,7 @@ typedef struct cached_account {
     bool existed;               // existed in backing store before
     bool mpt_dirty;             // needs update in account_mpt
     bool storage_dirty;         // any storage slot changed (triggers storage root recompute)
+    bool storage_cleared;       // storage was wiped (self-destruct or CREATE) — delete all from flat_state
     bool has_code;
     bool created;               // newly created this execution
     bool self_destructed;
@@ -127,6 +128,7 @@ typedef struct {
 #endif
             hash_t     old_storage_root;
             bool       old_storage_dirty;
+            bool       old_storage_cleared;
         } create;
     } data;
 } journal_entry_t;
@@ -1208,6 +1210,7 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
 #endif
             .old_storage_root   = ca->storage_root,
             .old_storage_dirty  = ca->storage_dirty,
+            .old_storage_cleared = ca->storage_cleared,
         },
     };
     if (!journal_push(es, &je)) {
@@ -1237,6 +1240,7 @@ void evm_state_create_account(evm_state_t *es, const address_t *addr) {
     ca->self_destructed = false;
     ca->storage_root = HASH_EMPTY_STORAGE;
     ca->storage_dirty = true;
+    ca->storage_cleared = true;
 }
 
 void evm_state_mark_existed(evm_state_t *es, const address_t *addr) {
@@ -1498,6 +1502,8 @@ void evm_state_commit_tx(evm_state_t *es) {
             ca->self_destructed = false;
             ca->block_code_dirty = false;
             ca->storage_root = HASH_EMPTY_STORAGE;
+            ca->storage_cleared = true;  /* signal to delete all storage at checkpoint */
+            ca->storage_dirty = true;    /* trigger storage root recomputation */
             continue;
         }
 
@@ -1507,6 +1513,10 @@ void evm_state_commit_tx(evm_state_t *es) {
         if ((ca->existed || ca->created || ca->dirty || ca->code_dirty) && !is_empty) {
             ca->existed = true;
         }
+        /* If account was created (CREATE/CREATE2), delete old storage from flat_state.
+         * New storage slots will be flushed at checkpoint. Old uncached slots from
+         * previous checkpoints would otherwise survive as orphans. */
+        /* storage_cleared was set by create_account — handled at checkpoint */
         ca->created = false;
         ca->dirty = false;
         ca->code_dirty = false;
@@ -1645,6 +1655,7 @@ void evm_state_revert(evm_state_t *es, uint32_t snap_id) {
 #endif
                 ca->storage_root    = je->data.create.old_storage_root;
                 ca->storage_dirty   = je->data.create.old_storage_dirty;
+                ca->storage_cleared = je->data.create.old_storage_cleared;
             }
             je->data.create.old_code = NULL;
             break;
@@ -2615,11 +2626,13 @@ void evm_state_apply_diff_bulk(evm_state_t *es, const block_diff_t *diff) {
             ca->has_code = false;
             ca->storage_root = HASH_EMPTY_STORAGE;
 
-            /* Clear mpt_dirty on all previously-dirty cached slots for this
-             * account. In chain_replay, commit_tx_slot_cb zeros self-destructed
-             * account slots and clears mpt_dirty. Without this, stale slot
-             * values from earlier blocks survive destruction in batch mode and
-             * pollute the storage trie at checkpoint time. */
+            /* Delete ALL storage for this account from flat_state.
+             * Orphaned slots from previous checkpoints (not in cache) would
+             * otherwise survive and pollute the storage trie. */
+            if (es->flat_state)
+                flat_state_delete_all_storage(es->flat_state, ca->addr_hash.bytes);
+
+            /* Clear mpt_dirty on all previously-dirty cached slots */
             for (size_t d = 0; d < es->dirty_slots.count; d++) {
                 const uint8_t *skey = es->dirty_slots.keys + d * SLOT_KEY_SIZE;
                 if (memcmp(skey, g->addr.bytes, ADDRESS_SIZE) == 0) {
@@ -2775,17 +2788,37 @@ static void compute_all_storage_roots(evm_state_t *es) {
             &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
         if (!ca || !ca->storage_dirty) continue;
 
+        /* If storage was cleared (self-destruct or CREATE), delete ALL
+         * old storage from flat_state before computing the new root.
+         * This removes orphaned slots from previous checkpoints. */
+        if (ca->storage_cleared) {
+            flat_state_delete_all_storage(es->flat_state, ca->addr_hash.bytes);
+            /* Re-flush dirty non-zero slots for this account */
+            for (size_t sd = 0; sd < es->dirty_slots.count; sd++) {
+                const uint8_t *sk = es->dirty_slots.keys + sd * SLOT_KEY_SIZE;
+                if (memcmp(sk, akey, ADDRESS_KEY_SIZE) != 0) continue;
+                cached_slot_t *cs2 = (cached_slot_t *)mem_art_get_mut(
+                    &es->storage, sk, SLOT_KEY_SIZE, NULL);
+                if (!cs2 || uint256_is_zero(&cs2->current)) continue;
+                uint8_t vbe[32];
+                uint256_to_bytes(&cs2->current, vbe);
+                flat_state_put_storage(es->flat_state, ca->addr_hash.bytes,
+                                        cs2->slot_hash.bytes, vbe);
+            }
+            ca->storage_cleared = false;
+        }
+
         storage_trie_root(es->storage_trie, ca->addr_hash.bytes,
                            ca->storage_root.bytes);
     }
 
 clear:
-    // 3. Clear storage_dirty on dirty accounts
+    // 3. Clear storage_dirty + storage_cleared on dirty accounts
     for (size_t d = 0; d < es->dirty_accounts.count; d++) {
         const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
         cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
             &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
-        if (ca) ca->storage_dirty = false;
+        if (ca) { ca->storage_dirty = false; ca->storage_cleared = false; }
     }
 }
 
@@ -2801,16 +2834,14 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     struct timespec _rt0, _rt1, _rt2;
     clock_gettime(CLOCK_MONOTONIC, &_rt0);
 
-    /* 0. Flush ALL cached state to flat_state */
-    mem_art_foreach(&es->storage, evict_slot_cb, es);
+    /* 1. Flush ALL cached accounts — deletes orphaned storage for !existed */
     mem_art_foreach(&es->accounts, evict_account_cb, es);
 
-    /* 1. Compute per-account storage roots from flat_state compact_art */
+    /* 2. Compute per-account storage roots (dirty slots flushed inside) */
     compute_all_storage_roots(es);
     clock_gettime(CLOCK_MONOTONIC, &_rt1);
 
-    /* 2. Flush dirty accounts to flat_state → account compact_art.
-     *    account_trie reads account data from the compact_art. */
+    /* 3. Promote existed flags for dirty accounts */
     size_t _acct_dirty_count = es->dirty_accounts.count;
     for (size_t d = 0; d < es->dirty_accounts.count; d++) {
         const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
@@ -2819,7 +2850,6 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
         if (!ca) continue;
         if (!ca->mpt_dirty) continue;
 
-        /* Promote block_dirty accounts to existed */
         if (ca->block_dirty || ca->block_code_dirty) {
             if (ca->self_destructed) {
                 ca->existed = false;
@@ -2832,37 +2862,15 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
             }
         }
 
-        bool is_empty = (ca->nonce == 0 &&
-                         uint256_is_zero(&ca->balance) &&
-                         !ca->has_code);
-
-        if (!ca->existed || (is_empty && prune_empty)) {
-            /* Delete account AND all its storage from flat_state.
-             * Without this, orphaned storage slots survive self-destruct
-             * across evict boundaries (they weren't in cache to be zeroed). */
-            flat_state_delete_all_storage(es->flat_state, ca->addr_hash.bytes);
-            flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
-        } else {
-            flat_account_record_t frec;
-            frec.nonce = ca->nonce;
-            uint256_to_bytes(&ca->balance, frec.balance);
-            const uint8_t *ch = ca->has_code
-                ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
-            memcpy(frec.code_hash, ch, 32);
-            memcpy(frec.storage_root, ca->storage_root.bytes, 32);
-            flat_state_put_account(es->flat_state, ca->addr_hash.bytes, &frec);
-        }
-
         ca->mpt_dirty = false;
         ca->block_dirty = false;
         ca->block_code_dirty = false;
     }
 
-    /* 3. Flush ALL cached accounts AGAIN (with updated storage_root + existed).
-     * The first flush (step 0) may have stale storage_root. This overwrites. */
+    /* 4. Flush ALL cached accounts to flat_state (with promoted existed + updated storage_root) */
     mem_art_foreach(&es->accounts, evict_account_cb, es);
 
-    /* 4. Compute account trie root from flat_state's compact_art */
+    /* 5. Compute account trie root from flat_state's compact_art */
     account_trie_root(es->account_trie, root.bytes);
     clock_gettime(CLOCK_MONOTONIC, &_rt2);
 
