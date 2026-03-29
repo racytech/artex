@@ -462,18 +462,52 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
     }
 
     /* --- Cache check ---
-     * Only use cache for non-dirty nodes (dirty flag checked inside cache_get).
-     * Cache stores the node's own RLP (without accumulated prefix). */
+     * Cache stores the BRANCH RLP (without any prefix — neither the
+     * incoming nib_prefix nor the node's own partial).
+     * On cache hit, we re-read the partial from the ART node and
+     * build the full prefix (incoming + partial) before wrapping. */
     {
         uint8_t cached_rlp[MAX_NODE_RLP];
         size_t cached_len;
         if (cache_get(am, ref, byte_depth, cached_rlp, &cached_len)) {
             am->stats.cache_hits++;
-            if (nib_prefix_len == 0) {
-                memcpy(rlp_out, cached_rlp, cached_len);
-                return cached_len;
+
+            /* Re-read partial from the ART node */
+            const void *cnode = node_ptr(am->tree, ref);
+            uint8_t cpartial_len;
+            const uint8_t *cpartial = get_partial(cnode, &cpartial_len);
+
+            uint8_t cfull_partial[64];
+            if (cpartial_len > COMPACT_MAX_PREFIX) {
+                compact_ref_t probe = ref;
+                while (!COMPACT_IS_LEAF_REF(probe) && probe != COMPACT_REF_NULL) {
+                    const void *pn = node_ptr(am->tree, probe);
+                    uint8_t pk[256]; compact_ref_t pr[256];
+                    int pc = get_art_children(am->tree, pn, pk, pr);
+                    if (pc == 0) break;
+                    probe = pr[0];
+                }
+                if (COMPACT_IS_LEAF_REF(probe)) {
+                    uint8_t lk[64];
+                    if (get_leaf_key(am->tree, probe, lk))
+                        memcpy(cfull_partial, lk + byte_depth, cpartial_len);
+                    cpartial = cfull_partial;
+                }
             }
-            return encode_extension(nib_prefix, nib_prefix_len,
+
+            /* Build full prefix: incoming nib_prefix + partial nibbles */
+            uint8_t full_pfx[MAX_NIBBLES * 2];
+            size_t full_pfx_len = 0;
+            if (nib_prefix_len > 0) {
+                memcpy(full_pfx, nib_prefix, nib_prefix_len);
+                full_pfx_len = nib_prefix_len;
+            }
+            for (size_t i = 0; i < cpartial_len; i++) {
+                full_pfx[full_pfx_len++] = (cpartial[i] >> 4) & 0x0F;
+                full_pfx[full_pfx_len++] =  cpartial[i]       & 0x0F;
+            }
+
+            return encode_extension(full_pfx, full_pfx_len,
                                      cached_rlp, cached_len, rlp_out);
         }
     }
@@ -579,10 +613,11 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
 
     node_rlp_len = encode_branch(hi_children, hi_child_lens, node_rlp);
 
-    /* Cache the node's RLP (without prefix) */
+    /* Cache the branch RLP (without any prefix).
+     * On cache hit, the partial will be re-read from the ART node. */
     cache_put(am, ref, byte_depth, node_rlp, node_rlp_len);
 
-    /* Wrap with accumulated prefix */
+    /* Wrap with accumulated prefix (incoming + partial) */
     return encode_extension(prefix, prefix_len, node_rlp, node_rlp_len, rlp_out);
 }
 
