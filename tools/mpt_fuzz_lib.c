@@ -11,6 +11,7 @@
 #include <string.h>
 #include "mpt_store.h"
 #include "mpt_arena.h"
+#include "art_mpt.h"
 #include "mem_mpt.h"
 
 /* =========================================================================
@@ -87,4 +88,69 @@ void batch_destroy(batch_ctx_t *ctx) {
     free(ctx->entries);
     free(ctx->values);
     free(ctx);
+}
+
+/* =========================================================================
+ * art_mpt wrapper
+ *
+ * Maintains a compact_art with (key[32] → value record).
+ * The value record stores the raw leaf value bytes for MPT hashing.
+ * ========================================================================= */
+
+#define ART_MPT_MAX_VAL 256
+
+typedef struct {
+    uint16_t len;
+    uint8_t  data[ART_MPT_MAX_VAL];
+} art_val_rec_t;
+
+typedef struct {
+    compact_art_t tree;
+} art_mpt_ctx_t;
+
+static bool art_mpt_dummy_fetch(const void *v, uint8_t *k, void *c) {
+    (void)v; (void)k; (void)c; return false;
+}
+
+static uint32_t art_mpt_encode_val(const uint8_t *key, const void *leaf_val,
+                                    uint32_t val_size, uint8_t *rlp_out,
+                                    void *ctx) {
+    (void)key; (void)ctx; (void)val_size;
+    const art_val_rec_t *r = leaf_val;
+    memcpy(rlp_out, r->data, r->len);
+    return r->len;
+}
+
+art_mpt_ctx_t *art_mpt_ctx_create(void) {
+    art_mpt_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) return NULL;
+    if (!compact_art_init(&ctx->tree, 32, sizeof(art_val_rec_t),
+                          false, art_mpt_dummy_fetch, NULL)) {
+        free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+void art_mpt_ctx_destroy(art_mpt_ctx_t *ctx) {
+    if (!ctx) return;
+    compact_art_destroy(&ctx->tree);
+    free(ctx);
+}
+
+void art_mpt_ctx_insert(art_mpt_ctx_t *ctx, const uint8_t *key,
+                         const uint8_t *value, size_t value_len) {
+    art_val_rec_t rec = {0};
+    rec.len = (uint16_t)(value_len <= ART_MPT_MAX_VAL ? value_len : ART_MPT_MAX_VAL);
+    memcpy(rec.data, value, rec.len);
+    compact_art_insert(&ctx->tree, key, &rec);
+}
+
+void art_mpt_ctx_delete(art_mpt_ctx_t *ctx, const uint8_t *key) {
+    compact_art_delete(&ctx->tree, key);
+}
+
+bool art_mpt_ctx_root(art_mpt_ctx_t *ctx, uint8_t *out) {
+    art_mpt_root_hash(&ctx->tree, art_mpt_encode_val, NULL, out);
+    return true;
 }

@@ -578,10 +578,19 @@ target_include_directories(mpt_arena_pic PUBLIC ${CMAKE_SOURCE_DIR}/database/inc
 set_target_properties(mpt_arena_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(mpt_arena_pic compact_art common)
 
+add_library(art_mpt_pic STATIC database/src/art_mpt.c)
+target_include_directories(art_mpt_pic PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+set_target_properties(art_mpt_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(art_mpt_pic compact_art common)
+
+add_library(compact_art_pic STATIC database/src/compact_art.c)
+target_include_directories(compact_art_pic PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+set_target_properties(compact_art_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(mpt_fuzz SHARED tools/mpt_fuzz_lib.c)
 target_link_libraries(mpt_fuzz
     -Wl,--whole-archive
-    mpt_store_pic mpt_arena_pic mem_mpt_pic common_pic disk_hash_pic
+    mpt_store_pic mpt_arena_pic art_mpt_pic compact_art_pic mem_mpt_pic common_pic disk_hash_pic
     -Wl,--no-whole-archive
     pthread snappy)
 

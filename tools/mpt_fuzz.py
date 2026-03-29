@@ -98,6 +98,24 @@ def load_lib(path):
     lib.mpt_arena_root.restype  = None
     lib.mpt_arena_root.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 
+    # --- art_mpt (compact_art → MPT hash) ---
+    lib.art_mpt_ctx_create.restype  = ctypes.c_void_p
+    lib.art_mpt_ctx_create.argtypes = []
+
+    lib.art_mpt_ctx_destroy.restype  = None
+    lib.art_mpt_ctx_destroy.argtypes = [ctypes.c_void_p]
+
+    lib.art_mpt_ctx_insert.restype  = None
+    lib.art_mpt_ctx_insert.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t
+    ]
+
+    lib.art_mpt_ctx_delete.restype  = None
+    lib.art_mpt_ctx_delete.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+    lib.art_mpt_ctx_root.restype  = ctypes.c_bool
+    lib.art_mpt_ctx_root.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
     return lib
 
 
@@ -122,7 +140,7 @@ def keccak(data):
 # One round
 # ============================================================================
 
-def run_round(lib, rnd, n, state, ms, ma, tmpdir):
+def run_round(lib, rnd, n, state, ms, ma, art_ctx, tmpdir):
     """
     Insert/update N random keys across all three tries.
     On odd rounds, also delete ~10% of existing keys.
@@ -205,9 +223,19 @@ def run_round(lib, rnd, n, state, ms, ma, tmpdir):
     lib.mpt_arena_root(ma, arena_root)
     arena_root = arena_root.raw
 
+    # --- art_mpt (compact_art → MPT hash) ---
+    for k, v in ops:
+        if v is None:
+            lib.art_mpt_ctx_delete(art_ctx, k)
+        else:
+            lib.art_mpt_ctx_insert(art_ctx, k, v, len(v))
+    art_root = ctypes.create_string_buffer(32)
+    lib.art_mpt_ctx_root(art_ctx, art_root)
+    art_root = art_root.raw
+
     # --- Compare ---
-    match = (py_root == mem_root == store_root == arena_root)
-    return state, py_root, mem_root, store_root, arena_root, match
+    match = (py_root == mem_root == store_root == arena_root == art_root)
+    return state, py_root, mem_root, store_root, arena_root, art_root, match
 
 
 # ============================================================================
@@ -247,14 +275,17 @@ def main():
     ma = lib.mpt_arena_create()
     assert ma, "mpt_arena_create failed"
 
+    art_ctx = lib.art_mpt_ctx_create()
+    assert art_ctx, "art_mpt_ctx_create failed"
+
     state = {}
     rnd = 0
 
     try:
         while True:
             t0 = time.monotonic()
-            state, py, mem, store, arena, match = run_round(
-                lib, rnd, args.n, state, ms, ma, tmpdir)
+            state, py, mem, store, arena, art, match = run_round(
+                lib, rnd, args.n, state, ms, ma, art_ctx, tmpdir)
             dt = time.monotonic() - t0
 
             status = "OK" if match else "MISMATCH"
@@ -266,6 +297,7 @@ def main():
                 print(f"  mem_mpt:   {mem.hex()}")
                 print(f"  mpt_store: {store.hex()}")
                 print(f"  mpt_arena: {arena.hex()}")
+                print(f"  art_mpt:   {art.hex()}")
                 print(f"  seed={seed}")
                 sys.exit(1)
 
@@ -276,6 +308,7 @@ def main():
     finally:
         lib.mpt_store_destroy(ms)
         lib.mpt_arena_destroy(ma)
+        lib.art_mpt_ctx_destroy(art_ctx)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
