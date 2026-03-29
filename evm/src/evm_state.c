@@ -2692,6 +2692,48 @@ void evm_state_apply_diff_bulk(evm_state_t *es, const block_diff_t *diff) {
 
 // Compute storage roots incrementally using storage_trie (flat_state compact_art).
 // Flush dirty storage slots to flat_state (which inserts into the shared
+/* Flush callback: write every cached account to flat_state */
+static bool evict_account_cb(const uint8_t *key, size_t key_len,
+                              const void *value, size_t value_len,
+                              void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    evm_state_t *es = user_data;
+    const cached_account_t *ca = value;
+    if (!ca->existed) {
+        flat_state_delete_all_storage(es->flat_state, ca->addr_hash.bytes);
+        flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
+        return true;
+    }
+    flat_account_record_t frec;
+    frec.nonce = ca->nonce;
+    uint256_to_bytes(&ca->balance, frec.balance);
+    const uint8_t *ch = ca->has_code ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
+    memcpy(frec.code_hash, ch, 32);
+    memcpy(frec.storage_root, ca->storage_root.bytes, 32);
+    flat_state_put_account(es->flat_state, ca->addr_hash.bytes, &frec);
+    return true;
+}
+
+/* Flush callback: write every cached storage slot to flat_state */
+static bool evict_slot_cb(const uint8_t *key, size_t key_len,
+                           const void *value, size_t value_len,
+                           void *user_data) {
+    (void)key_len; (void)value_len;
+    evm_state_t *es = user_data;
+    const cached_slot_t *cs = value;
+    const cached_account_t *ca = (const cached_account_t *)mem_art_get(
+        &es->accounts, key, ADDRESS_KEY_SIZE, NULL);
+    if (!ca) return true;
+    if (uint256_is_zero(&cs->current)) {
+        flat_state_delete_storage(es->flat_state, ca->addr_hash.bytes, cs->slot_hash.bytes);
+    } else {
+        uint8_t vbe[32];
+        uint256_to_bytes(&cs->current, vbe);
+        flat_state_put_storage(es->flat_state, ca->addr_hash.bytes, cs->slot_hash.bytes, vbe);
+    }
+    return true;
+}
+
 // compact_art), then compute per-account storage roots via storage_trie.
 static void compute_all_storage_roots(evm_state_t *es) {
     struct timespec _sr_t0, _sr_t1;
@@ -2758,6 +2800,12 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
 
     struct timespec _rt0, _rt1, _rt2;
     clock_gettime(CLOCK_MONOTONIC, &_rt0);
+
+    /* 0. Flush ALL cached slots and accounts to flat_state (not just dirty).
+     * This ensures flat_state has complete data including accounts that were
+     * loaded after evict and modified but whose changes only exist in cache. */
+    mem_art_foreach(&es->storage, evict_slot_cb, es);
+    mem_art_foreach(&es->accounts, evict_account_cb, es);
 
     /* 1. Compute per-account storage roots (flushes dirty slots to flat_state) */
     compute_all_storage_roots(es);
