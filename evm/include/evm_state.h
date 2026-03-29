@@ -16,7 +16,7 @@ typedef struct verkle_state_fwd verkle_state_t;
 #endif
 
 #ifdef ENABLE_MPT
-#include "mpt_store.h"
+#include "mpt_arena.h"
 #endif
 
 /* Forward declaration — code_store lifecycle is managed by caller */
@@ -365,8 +365,8 @@ typedef struct {
     size_t   root_dirty_count;
 
     /* Commit-batch profiling (from last root computation) */
-    mpt_commit_stats_t acct_commit;
-    mpt_commit_stats_t stor_commit;
+    mpt_arena_commit_stats_t acct_commit;
+    mpt_arena_commit_stats_t stor_commit;
 
     /* Flat state lookup stats (reset per checkpoint window) */
     uint64_t flat_acct_hit;

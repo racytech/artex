@@ -2,7 +2,7 @@
 #include "mem_art.h"
 #include "keccak256.h"
 #ifdef ENABLE_MPT
-#include "mpt_store.h"
+#include "mpt_arena.h"
 #include "code_store.h"
 #include "flat_state.h"
 #endif
@@ -259,8 +259,8 @@ struct evm_state {
     witness_gas_t     witness_gas;  // EIP-4762 verkle witness gas tracker
 #endif
 #ifdef ENABLE_MPT
-    mpt_store_t      *account_mpt;  // persistent incremental account trie
-    mpt_store_t      *storage_mpt;  // shared store for all per-account storage tries
+    mpt_arena_t      *account_mpt;  // persistent incremental account trie
+    mpt_arena_t      *storage_mpt;  // shared store for all per-account storage tries
     code_store_t     *code_store;   // content-addressed bytecode store (not owned)
     flat_state_t     *flat_state;   // O(1) disk-backed state (not owned, optional)
     dirty_account_vec_t dirty_accounts; // accounts with mpt_dirty=true
@@ -269,8 +269,8 @@ struct evm_state {
     double              last_root_stor_ms;
     double              last_root_acct_ms;
     size_t              last_root_dirty_count;
-    mpt_commit_stats_t  last_stor_commit;
-    mpt_commit_stats_t  last_acct_commit;
+    mpt_arena_commit_stats_t  last_stor_commit;
+    mpt_arena_commit_stats_t  last_acct_commit;
     /* Flat state lookup counters (reset per checkpoint window) */
     uint64_t flat_acct_hit;
     uint64_t flat_acct_miss;
@@ -527,15 +527,10 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
 
 #ifdef ENABLE_MPT
     if (mpt_path) {
-        /* Open or create persistent account MPT store */
-        es->account_mpt = mpt_store_open(mpt_path);
-        if (!es->account_mpt)
-            es->account_mpt = mpt_store_create(mpt_path, (uint64_t)MPT_ACCOUNT_CAPACITY);
+        (void)mpt_path; /* path unused — arena is in-memory */
+        es->account_mpt = mpt_arena_create();
         if (!es->account_mpt) {
-            fprintf(stderr, "FATAL: failed to open/create account MPT at '%s'\n"
-                    "  hint: check path exists, disk space, file permissions\n"
-                    "  hint: delete '%s.idx' and '%s.dat' to start fresh\n",
-                    mpt_path, mpt_path, mpt_path);
+            fprintf(stderr, "FATAL: failed to create account MPT arena\n");
             mem_art_destroy(&es->accounts);
             mem_art_destroy(&es->storage);
             mem_art_destroy(&es->warm_addrs);
@@ -546,21 +541,10 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
             return NULL;
         }
 
-        /* Open or create shared storage MPT store */
-        char storage_path[512];
-        snprintf(storage_path, sizeof(storage_path), "%s_storage", mpt_path);
-        es->storage_mpt = mpt_store_open(storage_path);
-        if (!es->storage_mpt)
-            es->storage_mpt = mpt_store_create(storage_path, (uint64_t)MPT_STORAGE_CAPACITY);
-        if (es->storage_mpt) {
-            mpt_store_set_shared(es->storage_mpt, true);
-        }
+        es->storage_mpt = mpt_arena_create();
         if (!es->storage_mpt) {
-            fprintf(stderr, "FATAL: failed to open/create storage MPT at '%s_storage'\n"
-                    "  hint: check disk space, file permissions\n"
-                    "  hint: delete '%s_storage.idx' and '%s_storage.dat' to start fresh\n",
-                    mpt_path, mpt_path, mpt_path);
-            mpt_store_destroy(es->account_mpt);
+            fprintf(stderr, "FATAL: failed to create storage MPT arena\n");
+            mpt_arena_destroy(es->account_mpt);
             mem_art_destroy(&es->accounts);
             mem_art_destroy(&es->storage);
             mem_art_destroy(&es->warm_addrs);
@@ -570,17 +554,9 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
             free(es);
             return NULL;
         }
+        mpt_arena_set_shared(es->storage_mpt, true);
         es->code_store = cs;
-
-        /* Enable LRU node caches (build-time configurable) */
-#ifdef MPT_ACCOUNT_CACHE_BYTES
-        mpt_store_set_cache(es->account_mpt, (uint64_t)MPT_ACCOUNT_CACHE_BYTES);
-#endif
-#ifdef MPT_STORAGE_CACHE_BYTES
-        mpt_store_set_cache(es->storage_mpt, (uint64_t)MPT_STORAGE_CACHE_BYTES);
-#endif
     }
-    /* else: no mpt_store — use in-memory batch rebuild for compute_mpt_root */
 #endif
 
     return es;
@@ -589,20 +565,19 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
 bool evm_state_init_mpt_stores(evm_state_t *es, const char *path,
                                 uint64_t acct_cap, uint64_t stor_cap) {
 #ifdef ENABLE_MPT
-    if (!es || !path) return false;
+    (void)path; (void)acct_cap; (void)stor_cap;
+    if (!es) return false;
     if (es->account_mpt || es->storage_mpt) return false;
 
-    es->account_mpt = mpt_store_create(path, acct_cap);
+    es->account_mpt = mpt_arena_create();
     if (!es->account_mpt) return false;
-    char storage_path[512];
-    snprintf(storage_path, sizeof(storage_path), "%s_storage", path);
-    es->storage_mpt = mpt_store_create(storage_path, stor_cap);
+    es->storage_mpt = mpt_arena_create();
     if (!es->storage_mpt) {
-        mpt_store_destroy(es->account_mpt);
+        mpt_arena_destroy(es->account_mpt);
         es->account_mpt = NULL;
         return false;
     }
-    mpt_store_set_shared(es->storage_mpt, true);
+    mpt_arena_set_shared(es->storage_mpt, true);
     return true;
 #else
     (void)es; (void)path; (void)acct_cap; (void)stor_cap;
@@ -613,8 +588,8 @@ bool evm_state_init_mpt_stores(evm_state_t *es, const char *path,
 void evm_state_reset_mpt_stores(evm_state_t *es) {
 #ifdef ENABLE_MPT
     if (!es) return;
-    if (es->account_mpt) mpt_store_reset(es->account_mpt);
-    if (es->storage_mpt) mpt_store_reset(es->storage_mpt);
+    if (es->account_mpt) mpt_arena_reset(es->account_mpt);
+    if (es->storage_mpt) mpt_arena_reset(es->storage_mpt);
 #else
     (void)es;
 #endif
@@ -652,11 +627,11 @@ void evm_state_attach_mpt_stores(evm_state_t *es,
                                    void *account_mpt, void *storage_mpt) {
 #ifdef ENABLE_MPT
     if (!es) return;
-    es->account_mpt = (mpt_store_t *)account_mpt;
-    es->storage_mpt = (mpt_store_t *)storage_mpt;
-    if (es->account_mpt) mpt_store_reset(es->account_mpt);
-    if (es->storage_mpt) mpt_store_reset(es->storage_mpt);
-    if (es->storage_mpt) mpt_store_set_shared(es->storage_mpt, true);
+    es->account_mpt = (mpt_arena_t *)account_mpt;
+    es->storage_mpt = (mpt_arena_t *)storage_mpt;
+    if (es->account_mpt) mpt_arena_reset(es->account_mpt);
+    if (es->storage_mpt) mpt_arena_reset(es->storage_mpt);
+    if (es->storage_mpt) mpt_arena_set_shared(es->storage_mpt, true);
 #else
     (void)es; (void)account_mpt; (void)storage_mpt;
 #endif
@@ -706,17 +681,6 @@ void evm_state_evict_cache(evm_state_t *es) {
                 &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
             if (!ca) continue;
 
-            /* Read old storage_root from flat_state before overwriting */
-            uint8_t old_storage_root[32];
-            bool had_old = false;
-            if (es->storage_mpt) {
-                flat_account_record_t old_frec;
-                if (flat_state_get_account(es->flat_state, ca->addr_hash.bytes, &old_frec)) {
-                    memcpy(old_storage_root, old_frec.storage_root, 32);
-                    had_old = true;
-                }
-            }
-
             if (ca->existed) {
                 flat_account_record_t frec;
                 frec.nonce = ca->nonce;
@@ -726,19 +690,8 @@ void evm_state_evict_cache(evm_state_t *es) {
                 memcpy(frec.code_hash, ch, 32);
                 memcpy(frec.storage_root, ca->storage_root.bytes, 32);
                 flat_state_put_account(es->flat_state, ca->addr_hash.bytes, &frec);
-
-                /* Retain new root, release old root in shared storage MPT */
-                if (es->storage_mpt) {
-                    mpt_store_ref_inc(es->storage_mpt, ca->storage_root.bytes);
-                    if (had_old)
-                        mpt_store_ref_dec(es->storage_mpt, old_storage_root);
-
-                }
             } else {
                 flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
-                /* Release old root if account is being deleted */
-                if (es->storage_mpt && had_old)
-                    mpt_store_ref_dec(es->storage_mpt, old_storage_root);
             }
         }
     }
@@ -767,8 +720,7 @@ void evm_state_evict_cache(evm_state_t *es) {
 void evm_state_flush(evm_state_t *es) {
     if (!es) return;
 #ifdef ENABLE_MPT
-    if (es->account_mpt) mpt_store_flush(es->account_mpt);
-    if (es->storage_mpt) mpt_store_flush(es->storage_mpt);
+    /* mpt_arena: no flush needed — all data is in memory */
 #endif
 }
 
@@ -816,14 +768,10 @@ void evm_state_destroy(evm_state_t *es) {
     // Flush deferred writes and destroy persistent MPT stores.
     // Skip flush if discard_on_destroy is set (failed block — don't corrupt disk state).
     if (es->account_mpt) {
-        if (!es->discard_on_destroy)
-            mpt_store_flush(es->account_mpt);
-        mpt_store_destroy(es->account_mpt);
+        mpt_arena_destroy(es->account_mpt);
     }
     if (es->storage_mpt) {
-        if (!es->discard_on_destroy)
-            mpt_store_flush(es->storage_mpt);
-        mpt_store_destroy(es->storage_mpt);
+        mpt_arena_destroy(es->storage_mpt);
     }
     dirty_account_free(&es->dirty_accounts);
     dirty_slot_free(&es->dirty_slots);
@@ -2414,14 +2362,14 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
 
 #ifdef ENABLE_MPT
     if (es->account_mpt) {
-        mpt_store_stats_t ms = mpt_store_stats(es->account_mpt);
+        mpt_arena_stats_t ms = mpt_arena_stats(es->account_mpt);
         s.acct_mpt_nodes       = ms.node_count;
-        s.acct_mpt_data_bytes  = ms.data_file_size;
+        s.acct_mpt_data_bytes  = ms.arena_bytes;
     }
     if (es->storage_mpt) {
-        mpt_store_stats_t ms = mpt_store_stats(es->storage_mpt);
+        mpt_arena_stats_t ms = mpt_arena_stats(es->storage_mpt);
         s.stor_mpt_nodes       = ms.node_count;
-        s.stor_mpt_data_bytes  = ms.data_file_size;
+        s.stor_mpt_data_bytes  = ms.arena_bytes;
     }
     if (es->code_store) {
         code_store_cache_stats_t cs = code_store_cache_stats(es->code_store);
@@ -2488,15 +2436,15 @@ void evm_state_print_mpt_stats(evm_state_t *es) {
 #ifdef ENABLE_MPT
     if (!es) return;
     const char *names[] = {"account", "storage"};
-    mpt_store_t *stores[] = {es->account_mpt, es->storage_mpt};
+    mpt_arena_t *stores[] = {es->account_mpt, es->storage_mpt};
     for (int i = 0; i < 2; i++) {
         if (!stores[i]) continue;
-        mpt_store_stats_t st = mpt_store_stats(stores[i]);
+        mpt_arena_stats_t st = mpt_arena_stats(stores[i]);
         fprintf(stderr,
-            "  %s MPT: %llu nodes, free=%llu B\n",
+            "  %s MPT: %llu nodes, arena=%llu B\n",
             names[i],
             (unsigned long long)st.node_count,
-            (unsigned long long)st.free_bytes);
+            (unsigned long long)st.arena_bytes);
     }
 #else
     (void)es;
@@ -3009,13 +2957,13 @@ static void compute_all_storage_roots(evm_state_t *es) {
             cached_account_t *next_ca = (cached_account_t *)mem_art_get_mut(
                 &es->accounts, sv.entries[next_start].addr, 20, NULL);
             if (next_ca)
-                mpt_store_prefetch(es->storage_mpt, next_ca->storage_root.bytes);
+                (void)next_ca; /* no prefetch needed — arena is in memory */
         }
 
         // Load this account's storage root into the shared store
-        mpt_store_set_root(es->storage_mpt, ca->storage_root.bytes);
-        if (!mpt_store_begin_batch(es->storage_mpt)) {
-            fprintf(stderr, "FATAL: mpt_store_begin_batch failed for storage trie\n"
+        mpt_arena_set_root(es->storage_mpt, ca->storage_root.bytes);
+        if (!mpt_arena_begin_batch(es->storage_mpt)) {
+            fprintf(stderr, "FATAL: mpt_arena_begin_batch failed for storage trie\n"
                     "  hint: another batch may already be in progress (double begin)\n");
             free(sv.entries);
             goto clear;
@@ -3023,21 +2971,21 @@ static void compute_all_storage_roots(evm_state_t *es) {
 
         for (size_t j = start; j < i; j++) {
             if (sv.entries[j].value_len == 0) {
-                mpt_store_delete(es->storage_mpt, sv.entries[j].slot_hash);
+                mpt_arena_delete(es->storage_mpt, sv.entries[j].slot_hash);
             } else {
-                mpt_store_update(es->storage_mpt, sv.entries[j].slot_hash,
+                mpt_arena_update(es->storage_mpt, sv.entries[j].slot_hash,
                                  sv.entries[j].value_rlp, sv.entries[j].value_len);
             }
         }
 
-        if (!mpt_store_commit_batch(es->storage_mpt)) {
-            fprintf(stderr, "FATAL: mpt_store_commit_batch failed for storage trie\n"
+        if (!mpt_arena_commit_batch(es->storage_mpt)) {
+            fprintf(stderr, "FATAL: mpt_arena_commit_batch failed for storage trie\n"
                     "  hint: likely OOM (deferred buffer alloc) or corrupt trie node on disk\n"
                     "  hint: delete storage MPT files and replay to rebuild\n");
             free(sv.entries);
             goto clear;
         }
-        mpt_store_root(es->storage_mpt, ca->storage_root.bytes);
+        mpt_arena_root(es->storage_mpt, ca->storage_root.bytes);
     }
 
     free(sv.entries);
@@ -3065,16 +3013,16 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
 
     if (es->account_mpt) {
         /* Reset commit stats for this root computation window */
-        mpt_store_reset_commit_stats(es->storage_mpt);
-        mpt_store_reset_commit_stats(es->account_mpt);
+        mpt_arena_reset_commit_stats(es->storage_mpt);
+        mpt_arena_reset_commit_stats(es->account_mpt);
 
         struct timespec _rt0, _rt1, _rt2;
         clock_gettime(CLOCK_MONOTONIC, &_rt0);
         compute_all_storage_roots(es);
         clock_gettime(CLOCK_MONOTONIC, &_rt1);
 
-        if (!mpt_store_begin_batch(es->account_mpt)) {
-            fprintf(stderr, "FATAL: mpt_store_begin_batch failed for account trie\n"
+        if (!mpt_arena_begin_batch(es->account_mpt)) {
+            fprintf(stderr, "FATAL: mpt_arena_begin_batch failed for account trie\n"
                     "  hint: another batch may already be in progress (double begin)\n");
             return root;
         }
@@ -3112,11 +3060,11 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
                              !ca->has_code);
 
             if (!ca->existed || (is_empty && prune_empty)) {
-                mpt_store_delete(es->account_mpt, ca->addr_hash.bytes);
+                mpt_arena_delete(es->account_mpt, ca->addr_hash.bytes);
             } else {
                 uint8_t rlp[120];
                 size_t rlp_len = mpt_rlp_account(ca->nonce, &ca->balance, sr, code_hash, rlp);
-                mpt_store_update(es->account_mpt, ca->addr_hash.bytes, rlp, rlp_len);
+                mpt_arena_update(es->account_mpt, ca->addr_hash.bytes, rlp, rlp_len);
             }
 
             ca->mpt_dirty = false;
@@ -3125,8 +3073,8 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
         }
         /* NOTE: dirty_accounts cleared in evm_state_evict_cache after flat_state flush */
 
-        if (!mpt_store_commit_batch(es->account_mpt)) {
-            fprintf(stderr, "FATAL: mpt_store_commit_batch failed for account trie\n"
+        if (!mpt_arena_commit_batch(es->account_mpt)) {
+            fprintf(stderr, "FATAL: mpt_arena_commit_batch failed for account trie\n"
                     "  hint: likely OOM (deferred buffer alloc) or corrupt trie node on disk\n"
                     "  hint: delete account MPT files and replay to rebuild\n");
             return root;
@@ -3138,10 +3086,10 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
         es->last_root_acct_ms = (_rt2.tv_sec - _rt1.tv_sec) * 1000.0 +
                                 (_rt2.tv_nsec - _rt1.tv_nsec) / 1e6;
         es->last_root_dirty_count = _acct_dirty_count;
-        es->last_stor_commit = mpt_store_get_commit_stats(es->storage_mpt);
-        es->last_acct_commit = mpt_store_get_commit_stats(es->account_mpt);
+        es->last_stor_commit = mpt_arena_get_commit_stats(es->storage_mpt);
+        es->last_acct_commit = mpt_arena_get_commit_stats(es->account_mpt);
 
-        mpt_store_root(es->account_mpt, root.bytes);
+        mpt_arena_root(es->account_mpt, root.bytes);
         return root;
     }
 

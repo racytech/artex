@@ -191,6 +191,16 @@ add_library(mpt_store STATIC
 target_include_directories(mpt_store PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 target_link_libraries(mpt_store compact_art node_cache common)
 
+# MPT Arena (in-memory Merkle Patricia Trie — no disk files)
+add_library(mpt_arena STATIC database/src/mpt_arena.c)
+target_include_directories(mpt_arena PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+target_link_libraries(mpt_arena compact_art common)
+
+# MPT Trie (native in-memory trie — no index, no arena, just pointers)
+add_library(mpt_trie STATIC database/src/mpt_trie.c)
+target_include_directories(mpt_trie PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+target_link_libraries(mpt_trie common)
+
 #==============================================================================
 # Libraries — EVM
 #==============================================================================
@@ -226,7 +236,7 @@ if(ENABLE_VERKLE)
     list(APPEND EVM_LINK_LIBS verkle_state)
 endif()
 if(ENABLE_MPT)
-    list(APPEND EVM_LINK_LIBS mpt_store code_store flat_state)
+    list(APPEND EVM_LINK_LIBS mpt_arena code_store flat_state)
 endif()
 target_link_libraries(evm ${EVM_LINK_LIBS})
 if(ENABLE_MPT)
@@ -479,6 +489,24 @@ add_test(NAME test_mpt_store_vectors
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+# Test: MPT Arena cross-validation against Python reference vectors
+add_executable(test_mpt_arena_vectors
+    database/tests/test_mpt_arena_vectors.c
+)
+target_link_libraries(test_mpt_arena_vectors mpt_arena common)
+add_test(NAME test_mpt_arena_vectors
+    COMMAND test_mpt_arena_vectors
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# Test: MPT Trie (native) cross-validation against Python reference vectors
+add_executable(test_mpt_trie_vectors database/tests/test_mpt_trie_vectors.c)
+target_link_libraries(test_mpt_trie_vectors mpt_trie common)
+add_test(NAME test_mpt_trie_vectors
+    COMMAND test_mpt_trie_vectors
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
 # Test: Node cache (two-list LRU with pinning)
 add_executable(test_node_cache database/tests/test_node_cache.c)
 target_link_libraries(test_node_cache node_cache)
@@ -532,10 +560,15 @@ target_link_libraries(disk_hash_pic pthread)
 add_executable(profile_mpt_root tools/profile_mpt_root.c)
 target_link_libraries(profile_mpt_root mpt_store common)
 
+add_library(mpt_arena_pic STATIC database/src/mpt_arena.c)
+target_include_directories(mpt_arena_pic PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+set_target_properties(mpt_arena_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(mpt_arena_pic compact_art common)
+
 add_library(mpt_fuzz SHARED tools/mpt_fuzz_lib.c)
 target_link_libraries(mpt_fuzz
     -Wl,--whole-archive
-    mpt_store_pic mem_mpt_pic common_pic disk_hash_pic
+    mpt_store_pic mpt_arena_pic mem_mpt_pic common_pic disk_hash_pic
     -Wl,--no-whole-archive
     pthread snappy)
 

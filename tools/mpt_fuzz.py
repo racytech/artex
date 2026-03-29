@@ -36,8 +36,8 @@ def load_lib(path):
     lib.mpt_store_destroy.restype  = None
     lib.mpt_store_destroy.argtypes = [ctypes.c_void_p]
 
-    lib.mpt_store_set_cache_mb.restype  = None
-    lib.mpt_store_set_cache_mb.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    lib.mpt_store_set_cache.restype  = None
+    lib.mpt_store_set_cache.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
 
     lib.mpt_store_begin_batch.restype  = ctypes.c_bool
     lib.mpt_store_begin_batch.argtypes = [ctypes.c_void_p]
@@ -74,6 +74,30 @@ def load_lib(path):
     lib.batch_destroy.restype  = None
     lib.batch_destroy.argtypes = [ctypes.c_void_p]
 
+    # --- mpt_arena ---
+    lib.mpt_arena_create.restype  = ctypes.c_void_p
+    lib.mpt_arena_create.argtypes = []
+
+    lib.mpt_arena_destroy.restype  = None
+    lib.mpt_arena_destroy.argtypes = [ctypes.c_void_p]
+
+    lib.mpt_arena_begin_batch.restype  = ctypes.c_bool
+    lib.mpt_arena_begin_batch.argtypes = [ctypes.c_void_p]
+
+    lib.mpt_arena_update.restype  = ctypes.c_bool
+    lib.mpt_arena_update.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t
+    ]
+
+    lib.mpt_arena_delete.restype  = ctypes.c_bool
+    lib.mpt_arena_delete.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+    lib.mpt_arena_commit_batch.restype  = ctypes.c_bool
+    lib.mpt_arena_commit_batch.argtypes = [ctypes.c_void_p]
+
+    lib.mpt_arena_root.restype  = None
+    lib.mpt_arena_root.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
     return lib
 
 
@@ -98,7 +122,7 @@ def keccak(data):
 # One round
 # ============================================================================
 
-def run_round(lib, rnd, n, state, ms, tmpdir):
+def run_round(lib, rnd, n, state, ms, ma, tmpdir):
     """
     Insert/update N random keys across all three tries.
     On odd rounds, also delete ~10% of existing keys.
@@ -166,9 +190,24 @@ def run_round(lib, rnd, n, state, ms, tmpdir):
     lib.mpt_store_root(ms, store_root)
     store_root = store_root.raw
 
+    # --- mpt_arena (incremental, in-memory) ---
+    ok = lib.mpt_arena_begin_batch(ma)
+    assert ok, "mpt_arena_begin_batch failed"
+    for k, v in ops:
+        if v is None:
+            ok = lib.mpt_arena_delete(ma, k)
+        else:
+            ok = lib.mpt_arena_update(ma, k, v, len(v))
+        assert ok, "mpt_arena_update/delete failed"
+    ok = lib.mpt_arena_commit_batch(ma)
+    assert ok, "mpt_arena_commit_batch failed"
+    arena_root = ctypes.create_string_buffer(32)
+    lib.mpt_arena_root(ma, arena_root)
+    arena_root = arena_root.raw
+
     # --- Compare ---
-    match = (py_root == mem_root == store_root)
-    return state, py_root, mem_root, store_root, match
+    match = (py_root == mem_root == store_root == arena_root)
+    return state, py_root, mem_root, store_root, arena_root, match
 
 
 # ============================================================================
@@ -203,7 +242,10 @@ def main():
     ms_path = os.path.join(tmpdir, "mpt").encode()
     ms = lib.mpt_store_create(ms_path, 1000000)
     assert ms, "mpt_store_create failed"
-    lib.mpt_store_set_cache_mb(ms, 64)
+    lib.mpt_store_set_cache(ms, 64 * 1024 * 1024)
+
+    ma = lib.mpt_arena_create()
+    assert ma, "mpt_arena_create failed"
 
     state = {}
     rnd = 0
@@ -211,8 +253,8 @@ def main():
     try:
         while True:
             t0 = time.monotonic()
-            state, py, mem, store, match = run_round(
-                lib, rnd, args.n, state, ms, tmpdir)
+            state, py, mem, store, arena, match = run_round(
+                lib, rnd, args.n, state, ms, ma, tmpdir)
             dt = time.monotonic() - t0
 
             status = "OK" if match else "MISMATCH"
@@ -223,6 +265,7 @@ def main():
                 print(f"  python:    {py.hex()}")
                 print(f"  mem_mpt:   {mem.hex()}")
                 print(f"  mpt_store: {store.hex()}")
+                print(f"  mpt_arena: {arena.hex()}")
                 print(f"  seed={seed}")
                 sys.exit(1)
 
@@ -232,6 +275,7 @@ def main():
         print(f"\nStopped after {rnd} rounds. All matched.")
     finally:
         lib.mpt_store_destroy(ms)
+        lib.mpt_arena_destroy(ma)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 

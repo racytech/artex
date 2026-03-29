@@ -21,7 +21,7 @@
  */
 
 #include "evm_state.h"
-#include "mpt_store.h"
+#include "mpt_arena.h"
 #include "flat_state.h"
 #include "keccak256.h"
 #include "hash.h"
@@ -311,8 +311,8 @@ int main(int argc, char **argv) {
             evm_state_get_mpt_stores(es, &ampt_ptr, &smpt_ptr);
 
             uint32_t s_lost = 0, a_lost = 0;
-            if (smpt_ptr) s_lost = mpt_store_get_commit_stats((mpt_store_t *)smpt_ptr).lost_nodes;
-            if (ampt_ptr) a_lost = mpt_store_get_commit_stats((mpt_store_t *)ampt_ptr).lost_nodes;
+            if (smpt_ptr) s_lost = mpt_arena_get_commit_stats((mpt_arena_t *)smpt_ptr).lost_nodes;
+            if (ampt_ptr) a_lost = mpt_arena_get_commit_stats((mpt_arena_t *)ampt_ptr).lost_nodes;
 
             total_lost += s_lost + a_lost;
 
