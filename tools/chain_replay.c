@@ -1384,16 +1384,10 @@ int main(int argc, char **argv) {
                     d_total_slots += n;
                 }
 
-                /* Recreate sync from checkpoint for clean pre-state */
-                sync_destroy(sync);
-                sync = sync_create(&cfg);
-                if (!sync) {
-                    LOG_ERROR("failed to recreate sync for prestate dump");
-                    free(d_addrs); free(d_aslots); free(d_sbuf);
-                    archive_close(&archive);
-                    return 1;
-                }
-                es = sync_get_state(sync);
+                /* Write alloc.json from current state.
+                 * The evm_state cache still has accounts/storage from
+                 * this batch (evict hasn't happened yet). For accounts
+                 * not in cache, flat_state serves as fallback. */
 
                 /* Write alloc.json */
                 char alloc_p[512];
@@ -1487,7 +1481,6 @@ int main(int argc, char **argv) {
                 }
 
                 free(d_addrs); free(d_aslots); free(d_sbuf);
-                /* sync was recreated — don't use old state after this */
             }
 
             /* Discard dirty state so destroy doesn't flush failing block to MPT.
