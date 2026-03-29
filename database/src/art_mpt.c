@@ -35,9 +35,9 @@ static const uint8_t EMPTY_ROOT[32] = {
  * ========================================================================= */
 
 typedef struct {
-    uint8_t hash[32];
-    uint8_t rlp_len;    /* 0 = not cached, 1-31 = inline RLP length, 32 = hashed */
-    uint8_t depth;      /* byte_depth when this hash was computed */
+    uint8_t data[32];   /* inline RLP (len < 32) or keccak hash (len == 32) */
+    uint8_t len;        /* 0 = not cached, 1-31 = inline, 32 = hash */
+    uint8_t depth;      /* byte_depth when computed */
 } hash_entry_t;
 
 /* =========================================================================
@@ -49,14 +49,10 @@ struct art_mpt {
     art_mpt_value_encode_t  encode;
     void                   *encode_ctx;
 
-    /* Hash cache: indexed by compact_ref_t / 8 for inner nodes */
+    /* Hash cache: indexed by compact_ref_t / 8 for inner nodes.
+     * Stores either inline RLP (< 32 bytes) or keccak hash (32 bytes). */
     hash_entry_t *cache;
-    size_t        cache_cap;   /* number of entries */
-
-    /* Inline RLP cache for small nodes (RLP < 32 bytes) */
-    /* These nodes are embedded in their parent's RLP, not hashed */
-    uint8_t     *inline_cache;  /* inline_cache[ref_idx * 31] */
-    size_t       inline_cap;
+    size_t        cache_cap;
 
     bool             no_cache;   /* disable caching (for stateless full recompute) */
     art_mpt_stats_t stats;
@@ -141,13 +137,38 @@ static size_t hex_prefix_encode(const uint8_t *nibbles, size_t nibble_len,
     }
 }
 
+/* Convert full RLP to hash_ref return convention:
+ * < 32 bytes: return as-is (inline)
+ * >= 32 bytes: return keccak hash (32 bytes) */
+static size_t rlp_to_hashref(const uint8_t *rlp, size_t rlp_len,
+                               uint8_t *out) {
+    if (rlp_len < 32) {
+        memcpy(out, rlp, rlp_len);
+        return rlp_len;
+    }
+    keccak(rlp, rlp_len, out);
+    return 32;
+}
+
+/* Encode a child reference for embedding in a parent node's RLP.
+ * New convention: child_rlp_len < 32 = inline RLP, embed as-is.
+ *                 child_rlp_len == 32 = already a keccak hash, encode as 0xa0+hash.
+ *                 child_rlp_len > 32  = full RLP, hash it then encode as 0xa0+hash. */
 static size_t encode_child_ref(const uint8_t *child_rlp, size_t child_rlp_len,
                                 uint8_t *ref_out) {
     if (child_rlp_len == 0) { ref_out[0] = 0x80; return 1; }
     if (child_rlp_len < 32) {
+        /* Inline: embed raw RLP bytes */
         memcpy(ref_out, child_rlp, child_rlp_len);
         return child_rlp_len;
     }
+    if (child_rlp_len == 32) {
+        /* Already a hash — just wrap with 0xa0 prefix */
+        ref_out[0] = 0xa0;
+        memcpy(ref_out + 1, child_rlp, 32);
+        return 33;
+    }
+    /* Full RLP >= 33 bytes — hash it */
     ref_out[0] = 0xa0;
     keccak(child_rlp, child_rlp_len, ref_out + 1);
     return 33;
@@ -290,49 +311,28 @@ static inline size_t ref_to_idx(compact_ref_t ref) {
 }
 
 static bool cache_get(art_mpt_t *am, compact_ref_t ref,
-                       size_t byte_depth, uint8_t *rlp_out, size_t *rlp_len) {
+                       size_t byte_depth, uint8_t *out, size_t *out_len) {
     if (COMPACT_IS_LEAF_REF(ref)) return false;
     if (node_is_dirty(am->tree, ref)) return false;
     size_t idx = ref_to_idx(ref);
     if (idx >= am->cache_cap) return false;
     const hash_entry_t *e = &am->cache[idx];
-    if (e->rlp_len == 0) return false;
+    if (e->len == 0) return false;
     if (e->depth != (uint8_t)byte_depth) return false;
 
-    if (e->rlp_len <= 31) {
-        /* Inline RLP: small node stored directly */
-        if (idx < am->inline_cap && am->inline_cache) {
-            memcpy(rlp_out, am->inline_cache + idx * 31, e->rlp_len);
-            *rlp_len = e->rlp_len;
-            return true;
-        }
-        return false;
-    }
-    /* Large node: hash stored. Reconstruct the full RLP?
-     * We can't — we only stored the 32-byte hash.
-     * Return as a SPECIAL marker that the caller handles. */
-    /* Actually: we need to return something that encode_child_ref
-     * can use correctly. The parent calls encode_child_ref(our_result).
-     * If our_result >= 32 bytes, encode_child_ref hashes it.
-     * We need to AVOID double-hashing.
-     *
-     * Solution: return a 32-byte value that IS the hash.
-     * But 32 bytes triggers encode_child_ref to hash again. Wrong.
-     *
-     * Real solution: don't let the parent call encode_child_ref on us.
-     * Return the CHILD REFERENCE directly (33 bytes: 0xa0 + hash).
-     * The parent must detect this and embed it as-is.
-     *
-     * Simplest fix: store the full RLP in the cache. */
-    return false; /* TODO: store full RLP for large nodes */
+    /* Return in hash_ref convention: < 32 = inline RLP, 32 = keccak hash */
+    memcpy(out, e->data, e->len);
+    *out_len = e->len;
+    return true;
 }
 
 static void cache_put(art_mpt_t *am, compact_ref_t ref,
-                       size_t byte_depth, const uint8_t *rlp, size_t rlp_len) {
+                       size_t byte_depth, const uint8_t *data, size_t data_len) {
     if (COMPACT_IS_LEAF_REF(ref)) return;
     if (am->no_cache) return;
-    size_t idx = ref_to_idx(ref);
+    if (data_len == 0 || data_len > 32) return;
 
+    size_t idx = ref_to_idx(ref);
     if (idx >= am->cache_cap) {
         size_t new_cap = am->cache_cap ? am->cache_cap * 2 : 4096;
         while (new_cap <= idx) new_cap *= 2;
@@ -344,26 +344,10 @@ static void cache_put(art_mpt_t *am, compact_ref_t ref,
     }
 
     hash_entry_t *e = &am->cache[idx];
-    if (rlp_len < 32) {
-        e->rlp_len = (uint8_t)rlp_len;
-        if (idx >= am->inline_cap) {
-            size_t new_cap = am->inline_cap ? am->inline_cap * 2 : 4096;
-            while (new_cap <= idx) new_cap *= 2;
-            uint8_t *p = realloc(am->inline_cache, new_cap * 31);
-            if (!p) return;
-            memset(p + am->inline_cap * 31, 0, (new_cap - am->inline_cap) * 31);
-            am->inline_cache = p;
-            am->inline_cap = new_cap;
-        }
-        memcpy(am->inline_cache + idx * 31, rlp, rlp_len);
-    } else {
-        e->rlp_len = 32;
-        keccak(rlp, rlp_len, e->hash);
-    }
-
+    memcpy(e->data, data, data_len);
+    e->len = (uint8_t)data_len;
     e->depth = (uint8_t)byte_depth;
 
-    /* Clear dirty — this node's hash is now cached at this depth */
     node_clear_dirty(am->tree, ref);
 }
 
@@ -408,8 +392,7 @@ static size_t encode_leaf(art_mpt_t *am, compact_ref_t leaf_ref,
 
     rlp_buf_t encoded; rbuf_reset(&encoded);
     rbuf_list_wrap(&encoded, &payload);
-    memcpy(rlp_out, encoded.data, encoded.len);
-    return encoded.len;
+    return rlp_to_hashref(encoded.data, encoded.len, rlp_out);
 }
 
 static size_t encode_extension(const uint8_t *nibbles, size_t nibble_len,
@@ -425,8 +408,7 @@ static size_t encode_extension(const uint8_t *nibbles, size_t nibble_len,
     rbuf_append(&payload, child_ref, ref_len);
     rlp_buf_t encoded; rbuf_reset(&encoded);
     rbuf_list_wrap(&encoded, &payload);
-    memcpy(rlp_out, encoded.data, encoded.len);
-    return encoded.len;
+    return rlp_to_hashref(encoded.data, encoded.len, rlp_out);
 }
 
 static size_t encode_branch(uint8_t child_rlps[16][MAX_NODE_RLP],
@@ -443,8 +425,7 @@ static size_t encode_branch(uint8_t child_rlps[16][MAX_NODE_RLP],
     rbuf_encode_empty(&payload);
     rlp_buf_t encoded; rbuf_reset(&encoded);
     rbuf_list_wrap(&encoded, &payload);
-    memcpy(rlp_out, encoded.data, encoded.len);
-    return encoded.len;
+    return rlp_to_hashref(encoded.data, encoded.len, rlp_out);
 }
 
 static size_t hash_lo_group(art_mpt_t *am, uint8_t *lo_nibs,
@@ -623,7 +604,6 @@ art_mpt_t *art_mpt_create(compact_art_t *tree,
 void art_mpt_destroy(art_mpt_t *am) {
     if (!am) return;
     free(am->cache);
-    free(am->inline_cache);
     free(am);
 }
 
@@ -665,7 +645,11 @@ void art_mpt_root_hash(art_mpt_t *am, uint8_t out[32]) {
 
     if (rlp_len == 0) {
         memcpy(out, EMPTY_ROOT, 32);
+    } else if (rlp_len == 32) {
+        /* Root returned its hash directly */
+        memcpy(out, rlp, 32);
     } else {
+        /* Root is inline (< 32 bytes) — hash it */
         keccak(rlp, rlp_len, out);
     }
 
