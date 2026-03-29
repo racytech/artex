@@ -2834,10 +2834,11 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     struct timespec _rt0, _rt1, _rt2;
     clock_gettime(CLOCK_MONOTONIC, &_rt0);
 
-    /* 1. Flush ALL cached accounts — deletes orphaned storage for !existed */
+    /* 1. Flush ALL cached state to flat_state */
+    mem_art_foreach(&es->storage, evict_slot_cb, es);
     mem_art_foreach(&es->accounts, evict_account_cb, es);
 
-    /* 2. Compute per-account storage roots (dirty slots flushed inside) */
+    /* 2. Compute per-account storage roots from flat_state */
     compute_all_storage_roots(es);
     clock_gettime(CLOCK_MONOTONIC, &_rt1);
 
