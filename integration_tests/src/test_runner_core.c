@@ -523,7 +523,7 @@ void test_runner_destroy(test_runner_t *runner) {
 void test_runner_reset(test_runner_t *runner) {
     if (!runner) return;
 
-    // Destroy old state (detach flat_state first — runner owns it)
+    // Destroy old state and flat_state (stale data from previous test)
     if (runner->evm) {
         evm_destroy(runner->evm);
         runner->evm = NULL;
@@ -533,6 +533,12 @@ void test_runner_reset(test_runner_t *runner) {
         evm_state_destroy(runner->state);
         runner->state = NULL;
     }
+#ifdef ENABLE_MPT
+    if (runner->flat_state) {
+        flat_state_destroy((flat_state_t *)runner->flat_state);
+        runner->flat_state = NULL;
+    }
+#endif
 #ifdef ENABLE_VERKLE
     if (runner->vs) {
         verkle_state_destroy(runner->vs);
@@ -557,9 +563,12 @@ void test_runner_reset(test_runner_t *runner) {
             NULL   /* no code_store for tests */
         );
         if (runner->state) {
-            /* Re-attach runner-owned flat_state (creates tries lazily) */
+#ifdef ENABLE_MPT
+            /* Fresh flat_state for this test case */
+            runner->flat_state = flat_state_create("/dev/shm/test_runner_flat", 4096, 65536);
             if (runner->flat_state)
                 evm_state_set_flat_state(runner->state, (flat_state_t *)runner->flat_state);
+#endif
             runner->evm = evm_create(runner->state, NULL);
         }
 #ifdef ENABLE_VERKLE
