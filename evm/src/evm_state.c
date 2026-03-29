@@ -2795,13 +2795,6 @@ static void compute_all_storage_roots(evm_state_t *es) {
                            ca->storage_root.bytes);
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &_sr_t1);
-    double _sr_ms = (_sr_t1.tv_sec - _sr_t0.tv_sec) * 1000.0 +
-                    (_sr_t1.tv_nsec - _sr_t0.tv_nsec) / 1e6;
-    if (_sr_ms > 100.0)
-        fprintf(stderr, "  └ storage_roots: %.1f ms, %zu dirty slots, %zu dirty accts\n",
-                _sr_ms, es->dirty_slots.count, es->dirty_accounts.count);
-
 clear:
     // 3. Clear storage_dirty on dirty accounts
     for (size_t d = 0; d < es->dirty_accounts.count; d++) {
