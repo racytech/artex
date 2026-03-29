@@ -234,6 +234,18 @@ size_t compact_art_size(const compact_art_t *tree);
  */
 bool compact_art_is_empty(const compact_art_t *tree);
 
+/**
+ * Navigate to the subtree rooted at the given key prefix.
+ * Follows `prefix_len` bytes from the root, returning the compact_ref_t
+ * of the node (or leaf) at that depth.
+ * Returns COMPACT_REF_NULL if the prefix does not exist.
+ * `depth_out` receives the actual byte depth reached.
+ */
+compact_ref_t compact_art_find_subtree(const compact_art_t *tree,
+                                        const uint8_t *prefix,
+                                        uint32_t prefix_len,
+                                        uint32_t *depth_out);
+
 // ============================================================================
 // Iterator (ordered traversal)
 // ============================================================================

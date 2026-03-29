@@ -736,6 +736,111 @@ static const void *search(const compact_art_t *tree, compact_ref_t ref,
 }
 
 // ============================================================================
+// find_subtree — navigate to subtree at a given key prefix
+// ============================================================================
+
+compact_ref_t compact_art_find_subtree(const compact_art_t *tree,
+                                        const uint8_t *prefix,
+                                        uint32_t prefix_len,
+                                        uint32_t *depth_out) {
+    if (!tree || !prefix || prefix_len == 0) {
+        if (depth_out) *depth_out = 0;
+        return tree ? tree->root : COMPACT_REF_NULL;
+    }
+
+    compact_ref_t ref = tree->root;
+    size_t depth = 0;
+
+    while (ref != COMPACT_REF_NULL) {
+        if (COMPACT_IS_LEAF_REF(ref)) {
+            /* Leaf before we consumed the full prefix.
+             * Verify the leaf key actually starts with the prefix. */
+            uint8_t lk_buf[64];
+            const uint8_t *lk = leaf_full_key(tree, ref, lk_buf);
+            if (!lk || memcmp(lk + depth, prefix + depth, prefix_len - depth) != 0) {
+                if (depth_out) *depth_out = (uint32_t)depth;
+                return COMPACT_REF_NULL;
+            }
+            if (depth_out) *depth_out = (uint32_t)depth;
+            return ref;
+        }
+
+        void *node = node_ptr(tree, ref);
+        uint8_t plen = node_partial_len(node);
+
+        if (plen > 0) {
+            /* Check how much of the partial matches the prefix */
+            const uint8_t *partial = node_partial(node);
+            int cmp_len = plen;
+            if (depth + cmp_len > prefix_len)
+                cmp_len = (int)(prefix_len - depth);
+
+            /* Compare stored bytes */
+            int stored = cmp_len < COMPACT_MAX_PREFIX ? cmp_len : COMPACT_MAX_PREFIX;
+            for (int i = 0; i < stored; i++) {
+                if (partial[i] != prefix[depth + i]) {
+                    if (depth_out) *depth_out = (uint32_t)depth;
+                    return COMPACT_REF_NULL;
+                }
+            }
+
+            /* Long prefix: compare against leaf key */
+            if (cmp_len > COMPACT_MAX_PREFIX) {
+                compact_ref_t min_leaf = find_minimum_leaf(tree, ref);
+                if (min_leaf == COMPACT_REF_NULL) {
+                    if (depth_out) *depth_out = (uint32_t)depth;
+                    return COMPACT_REF_NULL;
+                }
+                uint8_t lk_buf[64];
+                const uint8_t *lk = leaf_full_key(tree, min_leaf, lk_buf);
+                if (!lk) {
+                    if (depth_out) *depth_out = (uint32_t)depth;
+                    return COMPACT_REF_NULL;
+                }
+                for (int i = COMPACT_MAX_PREFIX; i < cmp_len; i++) {
+                    if (lk[depth + i] != prefix[depth + i]) {
+                        if (depth_out) *depth_out = (uint32_t)depth;
+                        return COMPACT_REF_NULL;
+                    }
+                }
+            }
+
+            depth += plen;
+
+            /* If partial extended past prefix_len, this node IS the subtree */
+            if (depth >= prefix_len) {
+                if (depth_out) *depth_out = (uint32_t)(depth - plen);
+                return ref;
+            }
+        }
+
+        /* Reached prefix_len exactly at this node? */
+        if (depth >= prefix_len) {
+            if (depth_out) *depth_out = (uint32_t)depth;
+            return ref;
+        }
+
+        uint8_t byte = prefix[depth];
+        compact_ref_t child = find_child(tree, ref, byte);
+        if (child == COMPACT_REF_NULL) {
+            if (depth_out) *depth_out = (uint32_t)depth;
+            return COMPACT_REF_NULL;
+        }
+
+        ref = child;
+        depth++;
+
+        if (depth >= prefix_len) {
+            if (depth_out) *depth_out = (uint32_t)depth;
+            return ref;
+        }
+    }
+
+    if (depth_out) *depth_out = (uint32_t)depth;
+    return COMPACT_REF_NULL;
+}
+
+// ============================================================================
 // insert_recursive
 // ============================================================================
 

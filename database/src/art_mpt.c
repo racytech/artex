@@ -21,7 +21,7 @@
  * ========================================================================= */
 
 #define MAX_NODE_RLP  1024
-#define MAX_NIBBLES   64
+#define MAX_NIBBLES   128   /* supports up to 64-byte keys */
 
 static const uint8_t EMPTY_ROOT[32] = {
     0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6,
@@ -55,6 +55,7 @@ struct art_mpt {
     size_t        cache_cap;
 
     bool             no_cache;   /* disable caching (for stateless full recompute) */
+    uint32_t         mpt_key_offset; /* for subtree mode: MPT key starts at this byte offset */
     art_mpt_stats_t stats;
 };
 
@@ -372,7 +373,10 @@ static size_t encode_leaf(art_mpt_t *am, compact_ref_t leaf_ref,
     uint8_t path[MAX_NIBBLES * 2];
     size_t path_len = 0;
     if (nib_prefix_len > 0) { memcpy(path, nib_prefix, nib_prefix_len); path_len = nib_prefix_len; }
-    for (size_t i = byte_depth; i < am->tree->key_size; i++) {
+    /* In subtree mode, MPT key starts at mpt_key_offset (e.g., 32 for storage).
+     * Skip prefix bytes that are part of the subtree address, not the MPT key. */
+    size_t path_start = byte_depth > am->mpt_key_offset ? byte_depth : am->mpt_key_offset;
+    for (size_t i = path_start; i < am->tree->key_size; i++) {
         path[path_len++] = (key[i] >> 4) & 0x0F;
         path[path_len++] =  key[i]       & 0x0F;
     }
@@ -495,7 +499,8 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
                 }
             }
 
-            /* Build full prefix: incoming nib_prefix + partial nibbles */
+            /* Build full prefix: incoming nib_prefix + partial nibbles.
+             * In subtree mode, skip partial bytes before mpt_key_offset. */
             uint8_t full_pfx[MAX_NIBBLES * 2];
             size_t full_pfx_len = 0;
             if (nib_prefix_len > 0) {
@@ -503,8 +508,10 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
                 full_pfx_len = nib_prefix_len;
             }
             for (size_t i = 0; i < cpartial_len; i++) {
-                full_pfx[full_pfx_len++] = (cpartial[i] >> 4) & 0x0F;
-                full_pfx[full_pfx_len++] =  cpartial[i]       & 0x0F;
+                if (byte_depth + i >= am->mpt_key_offset) {
+                    full_pfx[full_pfx_len++] = (cpartial[i] >> 4) & 0x0F;
+                    full_pfx[full_pfx_len++] =  cpartial[i]       & 0x0F;
+                }
             }
 
             return encode_extension(full_pfx, full_pfx_len,
@@ -542,12 +549,17 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
     uint8_t prefix[MAX_NIBBLES * 2];
     size_t prefix_len = 0;
     if (nib_prefix_len > 0) { memcpy(prefix, nib_prefix, nib_prefix_len); prefix_len = nib_prefix_len; }
+    /* In subtree mode, skip partial bytes before mpt_key_offset */
     for (size_t i = 0; i < partial_len; i++) {
-        prefix[prefix_len++] = (partial[i] >> 4) & 0x0F;
-        prefix[prefix_len++] =  partial[i]       & 0x0F;
+        if (byte_depth + i >= am->mpt_key_offset) {
+            prefix[prefix_len++] = (partial[i] >> 4) & 0x0F;
+            prefix[prefix_len++] =  partial[i]       & 0x0F;
+        }
     }
 
     size_t next_byte_depth = byte_depth + partial_len + 1;
+    /* The child byte position in the key */
+    size_t child_byte_pos = byte_depth + partial_len;
 
     uint8_t child_keys[256];
     compact_ref_t child_refs[256];
@@ -558,8 +570,10 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
     size_t node_rlp_len;
 
     if (nchildren == 1) {
-        prefix[prefix_len++] = child_keys[0] >> 4;
-        prefix[prefix_len++] = child_keys[0] & 0x0F;
+        if (child_byte_pos >= am->mpt_key_offset) {
+            prefix[prefix_len++] = child_keys[0] >> 4;
+            prefix[prefix_len++] = child_keys[0] & 0x0F;
+        }
         size_t result = hash_ref(am, child_refs[0], next_byte_depth,
                                   prefix, prefix_len, rlp_out);
         /* Cache: we cache the node's contribution without the incoming prefix.
@@ -585,7 +599,8 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
     }
 
     if (hi_occupied == 1) {
-        prefix[prefix_len++] = (uint8_t)single_hi;
+        if (child_byte_pos >= am->mpt_key_offset)
+            prefix[prefix_len++] = (uint8_t)single_hi;
         uint8_t lo_nibs[16]; compact_ref_t lo_refs[16];
         for (int j = 0; j < gcounts[single_hi]; j++) {
             lo_nibs[j] = groups[single_hi][j].lo;
@@ -705,6 +720,43 @@ art_mpt_stats_t art_mpt_get_stats(const art_mpt_t *am) {
 
 void art_mpt_reset_stats(art_mpt_t *am) {
     if (am) memset(&am->stats, 0, sizeof(am->stats));
+}
+
+/* =========================================================================
+ * Subtree hash — compute MPT root for a prefix-identified subtree
+ * ========================================================================= */
+
+void art_mpt_subtree_hash(art_mpt_t *am,
+                            const uint8_t *prefix, uint32_t prefix_len,
+                            uint8_t out[32]) {
+    if (!am || !am->tree || !prefix) {
+        memcpy(out, EMPTY_ROOT, 32);
+        return;
+    }
+
+    uint32_t depth_out;
+    compact_ref_t subtree = compact_art_find_subtree(am->tree, prefix,
+                                                      prefix_len, &depth_out);
+    if (subtree == COMPACT_REF_NULL) {
+        memcpy(out, EMPTY_ROOT, 32);
+        return;
+    }
+
+    uint32_t saved_offset = am->mpt_key_offset;
+    am->mpt_key_offset = prefix_len;
+
+    uint8_t rlp[MAX_NODE_RLP];
+    size_t rlp_len = hash_ref(am, subtree, depth_out, NULL, 0, rlp);
+
+    am->mpt_key_offset = saved_offset;
+
+    if (rlp_len == 0) {
+        memcpy(out, EMPTY_ROOT, 32);
+    } else if (rlp_len == 32) {
+        memcpy(out, rlp, 32);
+    } else {
+        keccak(rlp, rlp_len, out);
+    }
 }
 
 /* =========================================================================

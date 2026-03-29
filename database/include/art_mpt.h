@@ -87,6 +87,20 @@ art_mpt_stats_t art_mpt_get_stats(const art_mpt_t *am);
 void art_mpt_reset_stats(art_mpt_t *am);
 
 /**
+ * Compute MPT root hash for a subtree identified by a key prefix.
+ * The MPT is computed over the key suffix (key[prefix_len..key_size]).
+ *
+ * Enables per-account storage roots from a single 64-byte-keyed compact_art:
+ *   prefix = addr_hash[32], MPT key = slot_hash[32].
+ *
+ * Uses the same incremental caching as art_mpt_root_hash.
+ * Returns EMPTY_ROOT if the subtree is empty or prefix not found.
+ */
+void art_mpt_subtree_hash(art_mpt_t *am,
+                            const uint8_t *prefix, uint32_t prefix_len,
+                            uint8_t out[32]);
+
+/**
  * Non-incremental: compute full MPT hash without persistent context.
  * Creates a temporary context, computes, destroys. For tests/one-shot use.
  */
