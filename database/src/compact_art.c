@@ -119,10 +119,21 @@ static inline bool leaf_matches(const compact_art_t *tree,
                                  compact_ref_t ref,
                                  const uint8_t *key) {
     if (tree->leaf_key_size < tree->key_size) {
-        /* Compact mode: compare last leaf_key_size bytes of search key */
-        return memcmp(leaf_key(tree, ref),
-                      key + tree->key_size - tree->leaf_key_size,
-                      tree->leaf_key_size) == 0;
+        /* Compact mode: quick check on stored suffix */
+        if (memcmp(leaf_key(tree, ref),
+                   key + tree->key_size - tree->leaf_key_size,
+                   tree->leaf_key_size) != 0)
+            return false;
+        /* Suffix matched — verify full key via key_fetch to avoid
+         * false positives on long composite keys (e.g., 64-byte
+         * addr_hash||slot_hash where suffix = slot_hash tail). */
+        if (tree->key_fetch) {
+            uint8_t full[64];
+            const void *val = leaf_value(tree, ref);
+            if (tree->key_fetch(val, full, tree->key_fetch_ctx))
+                return memcmp(full, key, tree->key_size) == 0;
+        }
+        return true; /* no key_fetch — trust suffix */
     }
     return memcmp(leaf_key(tree, ref), key, tree->key_size) == 0;
 }
