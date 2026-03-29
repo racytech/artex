@@ -794,7 +794,6 @@ evm_state_stats_t sync_get_state_stats(const sync_t *sync) {
     evm_state_stats_t st = sync->last_stats;
 #ifdef ENABLE_MPT
     st.evict_ms = sync->last_evict_ms;
-    st.mpt_flush_ms = sync->last_mpt_flush_ms;
     st.wait_flush_ms = sync->last_wait_ms;
 #endif
     return st;

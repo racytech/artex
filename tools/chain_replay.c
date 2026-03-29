@@ -1121,10 +1121,8 @@ int main(int argc, char **argv) {
                     .root_stor_ms     = lss.root_stor_ms,
                     .root_acct_ms     = lss.root_acct_ms,
                     .root_dirty_count = lss.root_dirty_count,
-                    .acct_mpt_nodes   = lss.acct_mpt_nodes,
-                    .stor_mpt_nodes   = lss.stor_mpt_nodes,
-                    .acct_mpt_gb      = lss.acct_mpt_data_bytes / 1e9,
-                    .stor_mpt_gb      = lss.stor_mpt_data_bytes / 1e9,
+                    .flat_acct_count = lss.flat_acct_count,
+                    .flat_stor_count = lss.flat_stor_count,
                     .code_count       = lss.code_count,
                     .code_cache_hit_pct = (lss.code_cache_hits + lss.code_cache_misses)
                         ? 100.0 * lss.code_cache_hits / (lss.code_cache_hits + lss.code_cache_misses) : 0,
@@ -1189,10 +1187,8 @@ int main(int argc, char **argv) {
                     .root_stor_ms     = ss.root_stor_ms,
                     .root_acct_ms     = ss.root_acct_ms,
                     .root_dirty_count = ss.root_dirty_count,
-                    .acct_mpt_nodes   = ss.acct_mpt_nodes,
-                    .stor_mpt_nodes   = ss.stor_mpt_nodes,
-                    .acct_mpt_gb      = ss.acct_mpt_data_bytes / 1e9,
-                    .stor_mpt_gb      = ss.stor_mpt_data_bytes / 1e9,
+                    .flat_acct_count = ss.flat_acct_count,
+                    .flat_stor_count = ss.flat_stor_count,
                     .code_count       = ss.code_count,
                     .code_cache_hit_pct = (ss.code_cache_hits + ss.code_cache_misses)
                         ? 100.0 * ss.code_cache_hits / (ss.code_cache_hits + ss.code_cache_misses) : 0,
@@ -1218,9 +1214,9 @@ int main(int argc, char **argv) {
                        ss.cache_accounts / 1000, ss.cache_slots / 1000,
                        ss.cache_arena_bytes / (1024*1024));
 #ifdef ENABLE_MPT
-                printf("  └ mpt: acct %luK nodes, stor %luK nodes\n",
-                       ss.acct_mpt_nodes / 1000,
-                       ss.stor_mpt_nodes / 1000);
+                printf("  └ flat: %luK accts, %luK slots\n",
+                       ss.flat_acct_count / 1000,
+                       ss.flat_stor_count / 1000);
                 if (ss.flat_acct_hit + ss.flat_acct_miss > 0 ||
                     ss.flat_stor_hit + ss.flat_stor_miss > 0) {
                     printf("  └ flat: acct %lu/%lu (%.1f%%)  stor %lu/%lu (%.1f%%)\n",
@@ -1231,12 +1227,11 @@ int main(int argc, char **argv) {
                            (ss.flat_stor_hit + ss.flat_stor_miss)
                                ? 100.0 * ss.flat_stor_hit / (ss.flat_stor_hit + ss.flat_stor_miss) : 0);
                 }
-                printf("  └ code: %luK (hit %.1f%%, LRU %u/%uK) disk: %.1fGB/%.1fGB RSS %zuMB\n",
+                printf("  └ code: %luK (hit %.1f%%, LRU %u/%uK) RSS %zuMB\n",
                        ss.code_count / 1000,
                        (ss.code_cache_hits + ss.code_cache_misses)
                            ? 100.0 * ss.code_cache_hits / (ss.code_cache_hits + ss.code_cache_misses) : 0,
                        ss.code_cache_count / 1000, ss.code_cache_capacity / 1000,
-                       ss.acct_mpt_data_bytes / 1e9, ss.stor_mpt_data_bytes / 1e9,
                        rss_mb);
 
                 double root_total = ss.root_stor_ms + ss.root_acct_ms;
@@ -1246,9 +1241,9 @@ int main(int argc, char **argv) {
                            ss.root_dirty_count);
                     /* art_mpt: no per-commit stats — trie is computed from compact_art */
                 }
-                if (ss.evict_ms > 0.1 || ss.mpt_flush_ms > 0.1 || ss.wait_flush_ms > 0.1) {
-                    printf("  └ checkpoint: wait=%.1f ms  evict=%.1f ms  mpt_flush=%.1f ms\n",
-                           ss.wait_flush_ms, ss.evict_ms, ss.mpt_flush_ms);
+                if (ss.evict_ms > 0.1 || ss.wait_flush_ms > 0.1) {
+                    printf("  └ checkpoint: wait=%.1f ms  evict=%.1f ms\n",
+                           ss.wait_flush_ms, ss.evict_ms);
                 }
 
 #else

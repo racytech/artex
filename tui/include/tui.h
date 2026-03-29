@@ -40,11 +40,9 @@ typedef struct {
     size_t   cache_slots;
     size_t   cache_arena_mb;
 
-    /* MPT store */
-    uint64_t acct_mpt_nodes;
-    uint64_t stor_mpt_nodes;
-    double   acct_mpt_gb;
-    double   stor_mpt_gb;
+    /* Flat state */
+    uint64_t flat_acct_count;
+    uint64_t flat_stor_count;
 
     /* Code store */
     uint64_t code_count;

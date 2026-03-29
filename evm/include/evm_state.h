@@ -303,13 +303,9 @@ typedef struct {
     size_t   cache_arena_bytes;   /* total arena bytes (accounts + storage) */
 
 #ifdef ENABLE_MPT
-    /* Account MPT store */
-    uint64_t acct_mpt_nodes;
-    uint64_t acct_mpt_data_bytes;
-
-    /* Storage MPT store */
-    uint64_t stor_mpt_nodes;
-    uint64_t stor_mpt_data_bytes;
+    /* Flat state (persistent, compact_art + mmap data files) */
+    uint64_t flat_acct_count;     /* accounts in flat_state */
+    uint64_t flat_stor_count;     /* storage slots in flat_state */
 
     /* Code store */
     uint64_t code_count;
@@ -323,8 +319,6 @@ typedef struct {
     double   root_acct_ms;
     size_t   root_dirty_count;
 
-    /* Commit-batch profiling (from last root computation) */
-
     /* Flat state lookup stats (reset per checkpoint window) */
     uint64_t flat_acct_hit;
     uint64_t flat_acct_miss;
@@ -333,7 +327,6 @@ typedef struct {
 
     /* Checkpoint timing (filled by sync, not evm_state) */
     double   evict_ms;
-    double   mpt_flush_ms;
     double   wait_flush_ms;
 #endif
 } evm_state_stats_t;

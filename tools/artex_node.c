@@ -170,15 +170,14 @@ static void print_stats(sync_t *sync) {
            ss.cache_accounts / 1000, ss.cache_slots / 1000,
            ss.cache_arena_bytes / (1024*1024));
 #ifdef ENABLE_MPT
-    printf("  | mpt: acct %luK nodes, stor %luK nodes\n",
-           ss.acct_mpt_nodes / 1000,
-           ss.stor_mpt_nodes / 1000);
-    printf("  | code: %luK (hit %.1f%%, LRU %u/%uK) | disk: %.1fGB/%.1fGB | RSS %zuMB\n",
+    printf("  | flat: %luK accts, %luK slots\n",
+           ss.flat_acct_count / 1000,
+           ss.flat_stor_count / 1000);
+    printf("  | code: %luK (hit %.1f%%, LRU %u/%uK) | RSS %zuMB\n",
            ss.code_count / 1000,
            (ss.code_cache_hits + ss.code_cache_misses)
                ? 100.0 * ss.code_cache_hits / (ss.code_cache_hits + ss.code_cache_misses) : 0,
            ss.code_cache_count / 1000, ss.code_cache_capacity / 1000,
-           ss.acct_mpt_data_bytes / 1e9, ss.stor_mpt_data_bytes / 1e9,
            rss_mb);
 #else
     printf("  | RSS %zuMB\n", rss_mb);

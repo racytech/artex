@@ -238,8 +238,8 @@ static void draw_stats(void) {
 
         int cx = 1;
         mvwprintw(g.stats_win, row, cx,
-                  " %3dh %02dm %02ds   DISK: %5.1f/%5.1fGB   RSS: %5zuMB   BLK/S: %6.0f   %10lu OK   %10lu FAIL",
-                  hr, mn, sec, s->acct_mpt_gb, s->stor_mpt_gb, s->rss_mb,
+                  " %3dh %02dm %02ds   ACCTS: %luK  SLOTS: %luK   RSS: %5zuMB   BLK/S: %6.0f   %10lu OK   %10lu FAIL",
+                  hr, mn, sec, s->flat_acct_count / 1000, s->flat_stor_count / 1000, s->rss_mb,
                   s->blocks_per_sec, s->total_blocks_ok, s->total_blocks_fail);
         if (s->history_blocks > 0) {
             int cur_x = getcurx(g.stats_win);
@@ -409,17 +409,13 @@ static void draw_detail(void) {
     /* Section: MPT Store */
     row++;
     if (row < h) { wattron(g.log_win, A_BOLD);
-                    mvwprintw(g.log_win, row, col1, "MPT Store");
+                    mvwprintw(g.log_win, row, col1, "Flat State");
                     wattroff(g.log_win, A_BOLD); row++; }
 
-    if (row < h) { mvwprintw(g.log_win, row, col1, "acct nodes:");
-                    mvwprintw(g.log_win, row, col2, "%8lu", s->acct_mpt_nodes);
-                    mvwprintw(g.log_win, row, col3, "stor nodes:");
-                    mvwprintw(g.log_win, row, col4, "%8lu", s->stor_mpt_nodes); row++; }
-    if (row < h) { mvwprintw(g.log_win, row, col1, "acct disk:");
-                    mvwprintw(g.log_win, row, col2, "%7.2f GB", s->acct_mpt_gb);
-                    mvwprintw(g.log_win, row, col3, "stor disk:");
-                    mvwprintw(g.log_win, row, col4, "%7.2f GB", s->stor_mpt_gb); row++; }
+    if (row < h) { mvwprintw(g.log_win, row, col1, "accounts:");
+                    mvwprintw(g.log_win, row, col2, "%8lu", s->flat_acct_count);
+                    mvwprintw(g.log_win, row, col3, "stor slots:");
+                    mvwprintw(g.log_win, row, col4, "%8lu", s->flat_stor_count); row++; }
 
     /* Section: Code Store */
     row++;
