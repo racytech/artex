@@ -150,6 +150,27 @@ static inline const uint8_t *leaf_full_key(const compact_art_t *tree,
 }
 
 // ============================================================================
+// Node flags access (works for all node types — flags field at same semantic position)
+// ============================================================================
+
+static inline uint8_t *node_flags_ptr(void *node) {
+    uint8_t type = *(uint8_t *)node;
+    switch (type) {
+    case COMPACT_NODE_4:   return &((compact_node4_t *)node)->flags;
+    case COMPACT_NODE_16:  return &((compact_node16_t *)node)->flags;
+    case COMPACT_NODE_32:  return &((compact_node32_t *)node)->flags;
+    case COMPACT_NODE_48:  return &((compact_node48_t *)node)->flags;
+    case COMPACT_NODE_256: return &((compact_node256_t *)node)->flags;
+    }
+    return NULL;
+}
+
+static inline void node_set_flags(void *node, uint8_t bits) {
+    uint8_t *fp = node_flags_ptr(node);
+    if (fp) *fp |= bits;
+}
+
+// ============================================================================
 // Inner Node Allocation
 // ============================================================================
 
@@ -173,6 +194,9 @@ static compact_ref_t alloc_node(compact_art_t *tree, compact_node_type_t type) {
     void *node = pool->base + aligned;
     memset(node, 0, size);
     ((uint8_t *)node)[0] = (uint8_t)type;
+
+    /* New nodes are born dirty (subtree hash needs computation) */
+    node_set_flags(node, COMPACT_NODE_FLAG_DIRTY);
 
     if (type == COMPACT_NODE_48) {
         compact_node48_t *n48 = node;
@@ -770,8 +794,10 @@ static compact_ref_t insert_recursive(compact_art_t *tree, compact_ref_t ref,
         return result;
     }
 
-    // Inner node: check compressed path
+    // Inner node: mark dirty (subtree is being modified)
     void *node = node_ptr(tree, ref);
+    node_set_flags(node, COMPACT_NODE_FLAG_DIRTY);
+
     uint8_t plen = node_partial_len(node);
     if (plen > 0) {
         int prefix_len = check_prefix(tree, ref, node, key,
@@ -904,6 +930,9 @@ static compact_ref_t delete_recursive(compact_art_t *tree, compact_ref_t ref,
     }
 
     void *node = node_ptr(tree, ref);
+
+    // Mark dirty (subtree is being modified)
+    node_set_flags(node, COMPACT_NODE_FLAG_DIRTY);
 
     // Check compressed path
     uint8_t plen = node_partial_len(node);

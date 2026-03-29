@@ -69,12 +69,16 @@ typedef enum {
 // Node48 empty index marker
 #define COMPACT_NODE48_EMPTY 255
 
+// Node flags (stored in the former _pad byte)
+#define COMPACT_NODE_FLAG_DIRTY  0x01   // subtree modified, hash needs recomputation
+
 // ============================================================================
 // Compact Inner Node Structures
 // ============================================================================
 
 // With compact_ref_t (uint32_t) children, alignment requirement drops from
 // 8 bytes (void*) to 4 bytes (uint32_t). Padding is just 1 byte per node.
+// The `flags` byte (formerly _pad) carries per-node state bits (e.g., dirty).
 
 /**
  * Node4: Up to 4 children
@@ -85,7 +89,7 @@ typedef struct {
     uint8_t num_children;
     uint8_t partial_len;
     uint8_t keys[4];
-    uint8_t _pad[1];
+    uint8_t flags;
     compact_ref_t children[4];
     uint8_t partial[COMPACT_MAX_PREFIX];
 } compact_node4_t;
@@ -99,7 +103,7 @@ typedef struct {
     uint8_t num_children;
     uint8_t partial_len;
     uint8_t keys[16];
-    uint8_t _pad[1];
+    uint8_t flags;
     compact_ref_t children[16];
     uint8_t partial[COMPACT_MAX_PREFIX];
 } compact_node16_t;
@@ -114,7 +118,7 @@ typedef struct {
     uint8_t num_children;
     uint8_t partial_len;
     uint8_t keys[32];
-    uint8_t _pad[1];
+    uint8_t flags;
     compact_ref_t children[32];
     uint8_t partial[COMPACT_MAX_PREFIX];
 } compact_node32_t;
@@ -128,7 +132,7 @@ typedef struct {
     uint8_t num_children;
     uint8_t partial_len;
     uint8_t index[256];
-    uint8_t _pad[1];
+    uint8_t flags;
     compact_ref_t children[48];
     uint8_t partial[COMPACT_MAX_PREFIX];
 } compact_node48_t;
@@ -141,7 +145,7 @@ typedef struct {
     uint8_t type;
     uint8_t num_children;   // 0 means 256 (wraps)
     uint8_t partial_len;
-    uint8_t _pad[1];
+    uint8_t flags;
     compact_ref_t children[256];
     uint8_t partial[COMPACT_MAX_PREFIX];
 } compact_node256_t;

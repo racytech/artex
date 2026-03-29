@@ -7,29 +7,30 @@
 #include "compact_art.h"
 
 /**
- * ART→MPT Hash — compute Ethereum MPT root hash from a compact_art tree.
+ * ART→MPT — Incremental Ethereum MPT root hash from compact_art.
  *
- * Walks the ART structure directly and maps it to MPT semantics:
- *   - ART byte-level branching → two levels of MPT nibble branching
- *   - ART partial keys → MPT extension nodes
- *   - ART leaves → MPT leaf nodes (path + RLP value)
+ * Wraps a compact_art tree (owned by flat_state) and computes MPT root
+ * hashes incrementally: only dirty paths are rehashed, clean subtrees
+ * return cached 32-byte hashes in O(1).
  *
- * The leaf's RLP value is provided by a callback (value_encode) since
- * compact_art stores raw data, not RLP-encoded MPT leaf values.
+ * Does NOT own the compact_art — just holds a pointer + side hash cache.
  *
- * Non-incremental version: recomputes entire trie hash.
- * For 250M accounts: ~5-10 seconds. For per-account storage tries
- * (typically < 1000 entries): microseconds.
+ * Usage:
+ *   art_mpt_t *am = art_mpt_create(tree, encoder, ctx);
+ *   // ... mutate via art_mpt_insert / art_mpt_delete ...
+ *   art_mpt_root_hash(am, root_out);  // incremental
+ *   art_mpt_destroy(am);
  */
 
+typedef struct art_mpt art_mpt_t;
+
 /**
- * Callback to produce the RLP-encoded value for an MPT leaf.
- *
- * key:      full 32-byte key (the ART leaf's key).
- * leaf_val: pointer to the compact_art leaf value data.
- * val_size: size of the leaf value data.
- * rlp_out:  buffer to write RLP-encoded value (max 1024 bytes).
- * Returns the RLP length written, or 0 on failure.
+ * Callback to produce RLP-encoded value for an MPT leaf.
+ * key:      32-byte leaf key.
+ * leaf_val: pointer to compact_art leaf value data.
+ * val_size: size of leaf value data.
+ * rlp_out:  buffer to write RLP (max 1024 bytes).
+ * Returns RLP length, or 0 on failure.
  */
 typedef uint32_t (*art_mpt_value_encode_t)(const uint8_t *key,
                                             const void *leaf_val,
@@ -38,18 +39,59 @@ typedef uint32_t (*art_mpt_value_encode_t)(const uint8_t *key,
                                             void *user_ctx);
 
 /**
- * Compute the MPT root hash from a compact_art tree.
- *
- * tree:     the compact_art to walk.
- * key_size: bytes per key (must match tree->key_size, typically 32).
- * encode:   callback to RLP-encode each leaf's value.
- * ctx:      user context passed to encode callback.
- * out:      receives the 32-byte MPT root hash.
- *
- * If the tree is empty, out is set to EMPTY_ROOT (keccak256(0x80)).
+ * Create an art_mpt context over an existing compact_art tree.
+ * The tree is NOT owned — caller manages its lifetime.
+ * encode: callback for leaf value → RLP conversion.
+ * ctx: user context passed to encode.
  */
-void art_mpt_root_hash(const compact_art_t *tree,
-                        art_mpt_value_encode_t encode, void *ctx,
-                        uint8_t out[32]);
+art_mpt_t *art_mpt_create(compact_art_t *tree,
+                            art_mpt_value_encode_t encode, void *ctx);
+
+/** Free the hash cache. Does NOT destroy the compact_art tree. */
+void art_mpt_destroy(art_mpt_t *am);
+
+/**
+ * Insert or update a key in the underlying compact_art, then mark
+ * the path from root to key as dirty (invalidate cached hashes).
+ */
+bool art_mpt_insert(art_mpt_t *am, const uint8_t key[32],
+                     const void *value, uint32_t value_size);
+
+/**
+ * Delete a key from the underlying compact_art, then mark
+ * the path as dirty.
+ */
+bool art_mpt_delete(art_mpt_t *am, const uint8_t key[32]);
+
+/**
+ * Compute MPT root hash incrementally.
+ * Only rehashes nodes whose subtree changed since the last call.
+ * Clean subtrees return cached hashes in O(1).
+ */
+void art_mpt_root_hash(art_mpt_t *am, uint8_t out[32]);
+
+/**
+ * Invalidate all cached hashes. Forces full recomputation on next root_hash.
+ * Use after external modifications to the compact_art (e.g., bulk load).
+ */
+void art_mpt_invalidate_all(art_mpt_t *am);
+
+/** Stats */
+typedef struct {
+    uint64_t cache_hits;      /** Nodes with valid cached hash (skipped) */
+    uint64_t cache_misses;    /** Nodes recomputed this root_hash call */
+    uint64_t invalidations;   /** Nodes invalidated since last root_hash */
+} art_mpt_stats_t;
+
+art_mpt_stats_t art_mpt_get_stats(const art_mpt_t *am);
+void art_mpt_reset_stats(art_mpt_t *am);
+
+/**
+ * Non-incremental: compute full MPT hash without persistent context.
+ * Creates a temporary context, computes, destroys. For tests/one-shot use.
+ */
+void art_mpt_root_hash_full(const compact_art_t *tree,
+                              art_mpt_value_encode_t encode, void *ctx,
+                              uint8_t out[32]);
 
 #endif /* ART_MPT_H */

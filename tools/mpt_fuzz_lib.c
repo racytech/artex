@@ -106,6 +106,7 @@ typedef struct {
 
 typedef struct {
     compact_art_t tree;
+    art_mpt_t    *am;
 } art_mpt_ctx_t;
 
 static bool art_mpt_dummy_fetch(const void *v, uint8_t *k, void *c) {
@@ -129,11 +130,18 @@ art_mpt_ctx_t *art_mpt_ctx_create(void) {
         free(ctx);
         return NULL;
     }
+    ctx->am = art_mpt_create(&ctx->tree, art_mpt_encode_val, NULL);
+    if (!ctx->am) {
+        compact_art_destroy(&ctx->tree);
+        free(ctx);
+        return NULL;
+    }
     return ctx;
 }
 
 void art_mpt_ctx_destroy(art_mpt_ctx_t *ctx) {
     if (!ctx) return;
+    art_mpt_destroy(ctx->am);
     compact_art_destroy(&ctx->tree);
     free(ctx);
 }
@@ -143,14 +151,14 @@ void art_mpt_ctx_insert(art_mpt_ctx_t *ctx, const uint8_t *key,
     art_val_rec_t rec = {0};
     rec.len = (uint16_t)(value_len <= ART_MPT_MAX_VAL ? value_len : ART_MPT_MAX_VAL);
     memcpy(rec.data, value, rec.len);
-    compact_art_insert(&ctx->tree, key, &rec);
+    art_mpt_insert(ctx->am, key, &rec, sizeof(rec));
 }
 
 void art_mpt_ctx_delete(art_mpt_ctx_t *ctx, const uint8_t *key) {
-    compact_art_delete(&ctx->tree, key);
+    art_mpt_delete(ctx->am, key);
 }
 
 bool art_mpt_ctx_root(art_mpt_ctx_t *ctx, uint8_t *out) {
-    art_mpt_root_hash(&ctx->tree, art_mpt_encode_val, NULL, out);
+    art_mpt_root_hash(ctx->am, out);
     return true;
 }

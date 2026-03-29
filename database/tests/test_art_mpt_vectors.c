@@ -118,7 +118,7 @@ int main(int argc, char **argv) {
         }
 
         uint8_t got_root[32];
-        art_mpt_root_hash(&tree, test_value_encode, NULL, got_root);
+        art_mpt_root_hash_full(&tree, test_value_encode, NULL, got_root);
         assertions++;
 
         bool build_ok = (memcmp(got_root, expected_root, 32) == 0);
@@ -167,7 +167,7 @@ int main(int argc, char **argv) {
                 }
             }
 
-            art_mpt_root_hash(&tree, test_value_encode, NULL, got_root);
+            art_mpt_root_hash_full(&tree, test_value_encode, NULL, got_root);
             assertions++;
 
             if (memcmp(got_root, expected_updated, 32) == 0) {
@@ -220,7 +220,7 @@ int main(int argc, char **argv) {
                         }
                     }
 
-                    art_mpt_root_hash(&tree, test_value_encode, NULL, got_root);
+                    art_mpt_root_hash_full(&tree, test_value_encode, NULL, got_root);
                     assertions++;
 
                     if (memcmp(got_root, exp_round, 32) != 0) {
