@@ -718,7 +718,7 @@ static void sync_flush_and_evict(sync_t *sync) {
 
 #ifdef ENABLE_MPT
     /* Wait for any previous background flush to complete before
-     * computing a new root (flush modifies mpt_store state) */
+     * computing a new root (flush modifies flat_state) */
     {
         struct timespec _w0, _w1;
         clock_gettime(CLOCK_MONOTONIC, &_w0);

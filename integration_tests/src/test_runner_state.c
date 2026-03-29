@@ -123,7 +123,7 @@ bool test_runner_run_state_test(test_runner_t *runner,
             // Commit pre-state as "original" for EIP-2200 storage tracking
             evm_state_commit(runner->state);
 
-            // Flush pre-state to mpt_store (so unmodified accounts
+            // Flush pre-state to flat_state (so unmodified accounts
             // are in the trie before we clear dirty flags)
 #ifdef ENABLE_MPT
             evm_state_compute_mpt_root(runner->state, false);

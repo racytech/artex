@@ -1,5 +1,5 @@
 /**
- * Full-Stack MPT Stress Test — exercises evm_state → mpt_store → disk
+ * Full-Stack Stress Test — exercises evm_state → flat_state → art_mpt
  * without actual EVM execution.
  *
  * Simulates chain_replay's exact checkpoint loop:
@@ -21,7 +21,6 @@
  */
 
 #include "evm_state.h"
-#include "mpt_arena.h"
 #include "flat_state.h"
 #include "keccak256.h"
 #include "hash.h"
@@ -306,26 +305,7 @@ int main(int argc, char **argv) {
             bool prune = (block >= 2675000);
             hash_t root = evm_state_compute_mpt_root(es, prune);
 
-            /* Check for LOST NODEs in account MPT arena */
-            void *ampt_ptr = NULL;
-            evm_state_get_mpt_stores(es, &ampt_ptr, NULL);
-
-            uint32_t a_lost = 0;
-            if (ampt_ptr) a_lost = mpt_arena_get_commit_stats((mpt_arena_t *)ampt_ptr).lost_nodes;
-
-            total_lost += a_lost;
-
-            if (a_lost > 0) {
-                fprintf(stderr,
-                    "** LOST NODE at block %lu: account=%u (total=%lu) **\n",
-                    (unsigned long)block, a_lost,
-                    (unsigned long)total_lost);
-                fprintf(stderr, "  root: 0x");
-                for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", root.bytes[i]);
-                fprintf(stderr, "\n");
-                fprintf(stderr, "  FAIL FAST — aborting\n");
-                break;
-            }
+            /* No LOST NODE check needed — art_mpt computes from compact_art directly */
 
             evm_state_flush(es);
             evm_state_evict_cache(es);

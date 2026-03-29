@@ -176,25 +176,8 @@ if(ENABLE_VERKLE_BUILD)
     target_link_libraries(verkle_state verkle_key verkle_flat)
 endif()
 
-# In-Memory Batch MPT (testing only — used by test runner for state root verification)
-add_library(mem_mpt STATIC
-    database/src/mem_mpt.c
-)
-target_link_libraries(mem_mpt common)
-
-# MPT Store (persistent Merkle Patricia Trie with incremental updates)
+# Node cache (two-list LRU with pinning)
 add_library(node_cache STATIC database/src/node_cache.c)
-
-add_library(mpt_store STATIC
-    database/src/mpt_store.c
-)
-target_include_directories(mpt_store PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-target_link_libraries(mpt_store compact_art node_cache common)
-
-# MPT Arena (in-memory Merkle Patricia Trie — no disk files)
-add_library(mpt_arena STATIC database/src/mpt_arena.c)
-target_include_directories(mpt_arena PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-target_link_libraries(mpt_arena compact_art common)
 
 # MPT Trie (native in-memory trie — no index, no arena, just pointers)
 add_library(mpt_trie STATIC database/src/mpt_trie.c)
@@ -202,6 +185,9 @@ target_include_directories(mpt_trie PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 target_link_libraries(mpt_trie common)
 
 # ART→MPT (compute MPT hashes from compact_art structure)
+add_library(mem_mpt STATIC database/src/mem_mpt.c)
+target_link_libraries(mem_mpt common)
+
 add_library(art_mpt STATIC database/src/art_mpt.c)
 target_include_directories(art_mpt PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 target_link_libraries(art_mpt compact_art common)
@@ -249,7 +235,7 @@ if(ENABLE_VERKLE)
     list(APPEND EVM_LINK_LIBS verkle_state)
 endif()
 if(ENABLE_MPT)
-    list(APPEND EVM_LINK_LIBS mpt_arena code_store flat_state storage_trie account_trie)
+    list(APPEND EVM_LINK_LIBS code_store flat_state storage_trie account_trie)
 endif()
 target_link_libraries(evm ${EVM_LINK_LIBS})
 if(ENABLE_MPT)
@@ -492,26 +478,6 @@ endif()
 target_link_libraries(test_evm_state_audit ${TEST_EVM_AUDIT_LIBS})
 add_test(NAME test_evm_state_audit COMMAND test_evm_state_audit)
 
-# Test: MPT Store cross-validation against Python reference vectors
-add_executable(test_mpt_store_vectors
-    database/tests/test_mpt_store_vectors.c
-)
-target_link_libraries(test_mpt_store_vectors mpt_store common)
-add_test(NAME test_mpt_store_vectors
-    COMMAND test_mpt_store_vectors
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-)
-
-# Test: MPT Arena cross-validation against Python reference vectors
-add_executable(test_mpt_arena_vectors
-    database/tests/test_mpt_arena_vectors.c
-)
-target_link_libraries(test_mpt_arena_vectors mpt_arena common)
-add_test(NAME test_mpt_arena_vectors
-    COMMAND test_mpt_arena_vectors
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-)
-
 # Test: MPT Trie (native) cross-validation against Python reference vectors
 add_executable(test_mpt_trie_vectors database/tests/test_mpt_trie_vectors.c)
 target_link_libraries(test_mpt_trie_vectors mpt_trie common)
@@ -532,75 +498,6 @@ add_test(NAME test_art_mpt_vectors
 add_executable(test_node_cache database/tests/test_node_cache.c)
 target_link_libraries(test_node_cache node_cache)
 add_test(NAME test_node_cache COMMAND test_node_cache)
-
-add_executable(test_mpt_store_refcount
-    database/tests/test_mpt_store_refcount.c
-)
-target_link_libraries(test_mpt_store_refcount mpt_store common)
-add_test(NAME test_mpt_store_refcount COMMAND test_mpt_store_refcount)
-
-add_executable(test_mpt_store_stress
-    database/tests/test_mpt_store_stress.c
-)
-target_link_libraries(test_mpt_store_stress mpt_store common)
-add_test(NAME test_mpt_store_stress COMMAND test_mpt_store_stress)
-
-# Benchmark: MPT Store at scale (realistic Ethereum workload)
-add_executable(bench_mpt_store
-    tools/bench_mpt_store.c
-)
-target_link_libraries(bench_mpt_store mpt_store common)
-
-# Tool: verify MPT store hashes from root
-add_executable(verify_mpt tools/verify_mpt.c)
-target_link_libraries(verify_mpt mpt_store common)
-
-# Shared library for Python differential fuzzing (mpt_store + mem_mpt)
-# Build PIC versions of dependencies for the shared library
-add_library(mpt_store_pic STATIC database/src/mpt_store.c)
-target_include_directories(mpt_store_pic PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-set_target_properties(mpt_store_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(mpt_store_pic compact_art node_cache common)
-
-add_library(mem_mpt_pic STATIC database/src/mem_mpt.c)
-set_target_properties(mem_mpt_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(mem_mpt_pic common)
-
-add_library(common_pic STATIC
-    common/src/keccak256.c common/src/hash.c common/src/rlp.c
-    common/src/bytes.c common/src/uint256.c common/src/address.c
-    common/src/logger.c common/src/snappy_decode.c)
-set_target_properties(common_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(common_pic snappy)
-
-add_library(disk_hash_pic STATIC database/src/disk_hash_mmap.c)
-set_target_properties(disk_hash_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(disk_hash_pic pthread)
-
-# Benchmark: profile MPT root computation phases
-add_executable(profile_mpt_root tools/profile_mpt_root.c)
-target_link_libraries(profile_mpt_root mpt_store common)
-
-add_library(mpt_arena_pic STATIC database/src/mpt_arena.c)
-target_include_directories(mpt_arena_pic PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-set_target_properties(mpt_arena_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(mpt_arena_pic compact_art common)
-
-add_library(art_mpt_pic STATIC database/src/art_mpt.c)
-target_include_directories(art_mpt_pic PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-set_target_properties(art_mpt_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(art_mpt_pic compact_art common)
-
-add_library(compact_art_pic STATIC database/src/compact_art.c)
-target_include_directories(compact_art_pic PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-set_target_properties(compact_art_pic PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-add_library(mpt_fuzz SHARED tools/mpt_fuzz_lib.c)
-target_link_libraries(mpt_fuzz
-    -Wl,--whole-archive
-    mpt_store_pic mpt_arena_pic art_mpt_pic compact_art_pic mem_mpt_pic common_pic disk_hash_pic
-    -Wl,--no-whole-archive
-    pthread snappy)
 
 if(ENABLE_VERKLE_BUILD)
     # Test: Verkle flat (go-verkle cross-validation + revert + determinism)
@@ -973,22 +870,6 @@ if(CJSON_FOUND)
         FLAT_STORAGE_CAPACITY=${FLAT_STORAGE_CAPACITY}
     )
 
-    # MPT root stress test
-    add_executable(stress_mpt_root tools/stress_mpt_root.c)
-    target_link_libraries(stress_mpt_root evm common)
-
-    # Full-stack MPT stress (evm_state → mpt_store, no execution)
-    add_executable(stress_fullstack tools/stress_fullstack.c)
-    target_link_libraries(stress_fullstack evm common)
-
-    # Test: mpt_store node persistence across checkpoints
-    add_executable(test_mpt_store_resume database/tests/test_mpt_store_resume.c)
-    target_link_libraries(test_mpt_store_resume mpt_store common)
-
-    # Test: mpt_store scale stress (Ethereum-realistic shared storage)
-    add_executable(test_mpt_store_scale database/tests/test_mpt_store_scale.c)
-    target_link_libraries(test_mpt_store_scale mpt_store common)
-
     # TUI (ncurses terminal UI, optional)
     find_package(Curses QUIET)
     if(CURSES_FOUND)
@@ -1005,6 +886,10 @@ if(CJSON_FOUND)
         target_link_libraries(chain_replay tui)
         target_compile_definitions(chain_replay PRIVATE ENABLE_TUI=1)
     endif()
+
+    # Full-stack stress test (evm_state → flat_state → account_trie + storage_trie)
+    add_executable(stress_fullstack tools/stress_fullstack.c)
+    target_link_libraries(stress_fullstack evm)
 
     # Artex Node — full execution client (era1 replay + CL sync)
     add_executable(artex_node tools/artex_node.c)

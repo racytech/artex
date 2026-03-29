@@ -16,7 +16,7 @@
  * Cache hits move entry to head of its own list.
  *
  * Each entry holds the full RLP bytes inline (up to 1024 bytes).
- * Thread safety: none (single-threaded, same as mpt_store).
+ * Thread safety: none (single-threaded).
  */
 
 #define NODE_CACHE_MAX_RLP   1024

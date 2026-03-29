@@ -445,7 +445,7 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
 #else
         NULL,
 #endif
-        NULL,  /* no mpt_store path — init stores separately below */
+        NULL,  /* no mpt path — tries created via flat_state */
         NULL   /* no code_store for tests */
     );
     if (!runner->state) {

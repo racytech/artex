@@ -28,7 +28,7 @@
 #include "verkle_state.h"
 #endif
 #include "fork.h"
-#include "mem_mpt.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

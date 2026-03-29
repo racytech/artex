@@ -158,7 +158,7 @@ typedef struct {
  * Called during insert when leaf splitting needs the existing leaf's full key.
  * value: pointer to the stored leaf value (e.g., slot_id or node_record_t)
  * key_out: buffer of key_size bytes to fill with the full key
- * user_data: opaque context (e.g., pointer to flat_store or mpt_store)
+ * user_data: opaque context (e.g., pointer to flat_store)
  * Returns true on success. */
 typedef bool (*compact_art_key_fetch_t)(const void *value, uint8_t *key_out, void *user_data);
 

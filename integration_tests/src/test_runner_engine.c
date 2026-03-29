@@ -1,3 +1,4 @@
+#include "mem_mpt.h"
 /**
  * Test Runner - Engine Test Execution (blockchain_tests_engine format)
  *
@@ -11,7 +12,7 @@
 #include "test_runner.h"
 #include "block.h"
 #include "block_executor.h"
-#include "mem_mpt.h"
+
 #include "rlp.h"
 #include "fork.h"
 #include "uint256.h"

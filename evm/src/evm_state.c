@@ -2,7 +2,6 @@
 #include "mem_art.h"
 #include "keccak256.h"
 #ifdef ENABLE_MPT
-#include "mpt_arena.h"
 #include "code_store.h"
 #include "flat_state.h"
 #include "storage_trie.h"
@@ -46,7 +45,7 @@ typedef struct cached_account {
     bool block_dirty;           // survives commit_tx, cleared at block end
     bool existed;               // existed in backing store before
     bool mpt_dirty;             // needs update in account_mpt
-    bool storage_dirty;         // any storage slot changed (for mpt_store)
+    bool storage_dirty;         // any storage slot changed (triggers storage root recompute)
     bool has_code;
     bool created;               // newly created this execution
     bool self_destructed;
@@ -79,7 +78,7 @@ typedef struct cached_slot {
     uint256_t current;
     bool dirty;
     bool block_dirty;           // survives commit_tx, cleared at block end
-    bool mpt_dirty;             // needs update in storage mpt_store (cleared after storage root compute)
+    bool mpt_dirty;             // needs flush to flat_state (cleared after storage root compute)
     hash_t slot_hash;           // cached keccak256(slot_be) — computed once on first load
 #if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
     uint256_t block_original;   // value at start of block (for state diff tracking)
@@ -272,7 +271,6 @@ struct evm_state {
     double              last_root_stor_ms;
     double              last_root_acct_ms;
     size_t              last_root_dirty_count;
-    /* mpt_arena commit stats no longer needed — using art_mpt */
     /* Flat state lookup counters (reset per checkpoint window) */
     uint64_t flat_acct_hit;
     uint64_t flat_acct_miss;
@@ -539,66 +537,6 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
     return es;
 }
 
-bool evm_state_init_mpt_stores(evm_state_t *es, const char *path,
-                                uint64_t acct_cap, uint64_t stor_cap) {
-#ifdef ENABLE_MPT
-    (void)path; (void)acct_cap; (void)stor_cap;
-    if (!es) return false;
-    /* account_trie and storage_trie created lazily when flat_state is set */
-    return true;
-#else
-    (void)es; (void)path; (void)acct_cap; (void)stor_cap;
-    return false;
-#endif
-}
-
-void evm_state_reset_mpt_stores(evm_state_t *es) {
-#ifdef ENABLE_MPT
-    if (!es) return;
-    if (es->account_trie) account_trie_invalidate_all(es->account_trie);
-    if (es->storage_trie) storage_trie_invalidate_all(es->storage_trie);
-#else
-    (void)es;
-#endif
-}
-
-void evm_state_get_mpt_stores(const evm_state_t *es,
-                                void **out_account_mpt,
-                                void **out_storage_mpt) {
-#ifdef ENABLE_MPT
-    if (out_account_mpt) *out_account_mpt = NULL; /* account_trie replaces account_mpt */
-    if (out_storage_mpt) *out_storage_mpt = NULL; /* storage_trie replaces storage_mpt */
-#else
-    if (out_account_mpt) *out_account_mpt = NULL;
-    if (out_storage_mpt) *out_storage_mpt = NULL;
-#endif
-}
-
-void evm_state_detach_mpt_stores(evm_state_t *es,
-                                   void **out_account_mpt,
-                                   void **out_storage_mpt) {
-#ifdef ENABLE_MPT
-    if (!es) return;
-    if (out_account_mpt) *out_account_mpt = NULL;
-    if (out_storage_mpt) *out_storage_mpt = NULL;
-#else
-    (void)es;
-    if (out_account_mpt) *out_account_mpt = NULL;
-    if (out_storage_mpt) *out_storage_mpt = NULL;
-#endif
-}
-
-void evm_state_attach_mpt_stores(evm_state_t *es,
-                                   void *account_mpt, void *storage_mpt) {
-#ifdef ENABLE_MPT
-    if (!es) return;
-    (void)account_mpt; (void)storage_mpt;
-    /* account_trie and storage_trie are managed via flat_state, not externally */
-#else
-    (void)es; (void)account_mpt; (void)storage_mpt;
-#endif
-}
-
 // Callback: free heap-allocated code pointers before arena destroy
 static bool free_code_cb(const uint8_t *key, size_t key_len,
                           const void *value, size_t value_len,
@@ -642,7 +580,6 @@ void evm_state_evict_cache(evm_state_t *es) {
 void evm_state_flush(evm_state_t *es) {
     if (!es) return;
 #ifdef ENABLE_MPT
-    /* mpt_arena: no flush needed — all data is in memory */
 #endif
 }
 
@@ -1192,7 +1129,7 @@ void evm_state_set_storage(evm_state_t *es, const address_t *addr,
     cs->block_dirty = true;
     mark_slot_mpt_dirty(es, cs);
 
-    // Mark the owning account as having dirty storage (for mpt_store)
+    // Mark the owning account as having dirty storage
     cached_account_t *ca = ensure_account(es, addr);
     if (ca) {
         ca->storage_dirty = true;
@@ -2296,10 +2233,8 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
     s.cache_arena_bytes = es->accounts.arena_used + es->storage.arena_used;
 
 #ifdef ENABLE_MPT
-    /* account_trie: no mpt_arena stats — uses flat_state's compact_art */
     s.acct_mpt_nodes = 0;
     s.acct_mpt_data_bytes = 0;
-    /* storage_trie: no mpt_arena stats — uses flat_state's compact_art */
     s.stor_mpt_nodes = 0;
     s.stor_mpt_data_bytes = 0;
     if (es->code_store) {
@@ -2313,8 +2248,6 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
     s.root_stor_ms     = es->last_root_stor_ms;
     s.root_acct_ms     = es->last_root_acct_ms;
     s.root_dirty_count = es->last_root_dirty_count;
-    s.stor_commit      = (mpt_arena_commit_stats_t){0};
-    s.acct_commit      = (mpt_arena_commit_stats_t){0};
     s.flat_acct_hit    = es->flat_acct_hit;
     s.flat_acct_miss   = es->flat_acct_miss;
     s.flat_stor_hit    = es->flat_stor_hit;
@@ -2815,7 +2748,7 @@ void evm_state_apply_diff_bulk(evm_state_t *es, const block_diff_t *diff) {
 
 #endif /* ENABLE_HISTORY || ENABLE_VERKLE_BUILD */
 
-// Compute storage roots incrementally using shared storage mpt_store.
+// Compute storage roots incrementally using storage_trie (flat_state compact_art).
 // Flush dirty storage slots to flat_state (which inserts into the shared
 // compact_art), then compute per-account storage roots via storage_trie.
 static void compute_all_storage_roots(evm_state_t *es) {

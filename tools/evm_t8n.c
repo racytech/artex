@@ -14,6 +14,7 @@
 #include "transaction.h"
 #include "evm.h"
 #include "evm_state.h"
+#include "flat_state.h"
 #include "fork.h"
 #include "hash.h"
 #include "uint256.h"
@@ -518,9 +519,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: failed to create EVM state\n");
         return 1;
     }
-    /* Fresh MPT stores in RAM for state root computation */
-    evm_state_init_mpt_stores(state, "/dev/shm/evm_t8n_mpt",
-                               account_count * 4, account_count * 16);
+    /* Fresh flat_state in RAM for state root computation */
+    {
+        flat_state_t *fs = flat_state_create("/dev/shm/evm_t8n_flat", 4096, 65536);
+        if (fs) evm_state_set_flat_state(state, fs);
+    }
 
     evm_t *evm = evm_create(state, chain_config);
     if (!evm) {

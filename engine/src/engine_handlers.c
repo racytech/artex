@@ -1,3 +1,4 @@
+#include "mem_mpt.h"
 /*
  * Engine Handlers — All versions (Paris V1 → Prague V4).
  *
@@ -17,7 +18,7 @@
 #include "rlp.h"
 #include "hash.h"
 #include "uint256.h"
-#include "mem_mpt.h"
+
 #include "tx_decoder.h"
 #include "sync.h"
 

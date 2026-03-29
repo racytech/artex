@@ -16,7 +16,6 @@ typedef struct verkle_state_fwd verkle_state_t;
 #endif
 
 #ifdef ENABLE_MPT
-#include "mpt_arena.h"
 #endif
 
 /* Forward declaration — code_store lifecycle is managed by caller */
@@ -62,47 +61,7 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
 void evm_state_destroy(evm_state_t *es);
 
 /**
- * Initialize persistent MPT stores on an existing evm_state (for testing).
- * Creates fresh (truncated) stores at <path>.idx/.dat and <path>_storage.*.
- * Uses small capacity hints suitable for test fixtures (not mainnet scale).
- * Must be called BEFORE any state operations. Returns false on failure.
- */
-bool evm_state_init_mpt_stores(evm_state_t *es, const char *path,
-                                uint64_t acct_cap, uint64_t stor_cap);
-
-/**
- * Reset persistent MPT stores to empty state in-place (for testing).
- * Much faster than destroy + init cycle. No-op if stores not initialized.
- */
-void evm_state_reset_mpt_stores(evm_state_t *es);
-
-/**
- * Get read-only pointers to the MPT stores (no ownership transfer).
- * Use for inspecting stats without detaching/resetting.
- */
-void evm_state_get_mpt_stores(const evm_state_t *es,
-                                void **out_account_mpt,
-                                void **out_storage_mpt);
-
-/**
- * Detach MPT stores from evm_state so evm_state_destroy won't free them.
- * Returns pointers via out params. Caller takes ownership.
- * Use evm_state_attach_mpt_stores() to re-attach to a fresh evm_state.
- */
-void evm_state_detach_mpt_stores(evm_state_t *es,
-                                   void **out_account_mpt,
-                                   void **out_storage_mpt);
-
-/**
- * Attach previously detached MPT stores to a fresh evm_state.
- * Resets both stores to empty state before attaching.
- */
-void evm_state_attach_mpt_stores(evm_state_t *es,
-                                   void *account_mpt, void *storage_mpt);
-
-/**
  * Mark state to discard pending writes on destroy.
- * Call after a failed block to prevent corrupting the on-disk MPT state.
  */
 void evm_state_discard_pending(evm_state_t *es);
 
@@ -365,8 +324,6 @@ typedef struct {
     size_t   root_dirty_count;
 
     /* Commit-batch profiling (from last root computation) */
-    mpt_arena_commit_stats_t acct_commit;
-    mpt_arena_commit_stats_t stor_commit;
 
     /* Flat state lookup stats (reset per checkpoint window) */
     uint64_t flat_acct_hit;

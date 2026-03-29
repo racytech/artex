@@ -1,3 +1,4 @@
+#include "mem_mpt.h"
 #include "block_executor.h"
 #ifdef ENABLE_HISTORY
 #include "state_history.h"
@@ -11,7 +12,7 @@
 #include "fork.h"
 #include "transaction.h"
 #include "verkle_key.h"
-#include "mem_mpt.h"
+
 #include "rlp.h"
 #include "hash.h"
 #include "evm_state.h"
