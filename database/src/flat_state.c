@@ -3,15 +3,15 @@
  *
  * Two flat_store instances:
  *   accounts: key=32B (keccak256(addr)) → record=up to 104B (variable via size classes)
- *   storage:  key=32B (keccak256(addr_hash||slot_hash)) → record=32B
+ *   storage:  key=64B (addr_hash||slot_hash) → record=32B
  *
  * Account records use size classes to save space:
  *   - Empty EOAs (nonce + small balance): ~12 bytes
  *   - Funded EOAs (nonce + balance + code_hash): ~44 bytes
  *   - Full contracts (nonce + balance + code_hash + storage_root): 104 bytes
  *
- * Storage keys are hashed from 64→32 bytes to halve compact_art leaf size.
- * At 1B entries: 36GB leaf memory instead of 68GB.
+ * Storage keys are 64-byte composites (addr_hash || slot_hash).
+ * With compact_leaves=true, leaf size is 8 bytes regardless of key size.
  */
 
 #include "flat_state.h"
@@ -24,7 +24,7 @@
 
 #define ACCT_KEY_SIZE      32
 #define ACCT_MAX_REC_SIZE  104   /* max compressed account record */
-#define STOR_KEY_SIZE      32
+#define STOR_KEY_SIZE      64   /* addr_hash[32] || slot_hash[32] */
 #define STOR_MAX_REC_SIZE  32
 
 /* =========================================================================
@@ -332,14 +332,9 @@ bool flat_state_delete_account(flat_state_t *fs, const uint8_t addr_hash[32]) {
  * uniformity — collision probability is 1/2^256, same as keccak256. */
 static inline void make_stor_key(const uint8_t addr_hash[32],
                                   const uint8_t slot_hash[32],
-                                  uint8_t out[32]) {
-    const uint64_t *a = (const uint64_t *)addr_hash;
-    const uint64_t *s = (const uint64_t *)slot_hash;
-    uint64_t *o = (uint64_t *)out;
-    o[0] = a[0] ^ s[0];
-    o[1] = a[1] ^ s[1];
-    o[2] = a[2] ^ s[2];
-    o[3] = a[3] ^ s[3];
+                                  uint8_t out[64]) {
+    memcpy(out, addr_hash, 32);
+    memcpy(out + 32, slot_hash, 32);
 }
 
 bool flat_state_get_storage(const flat_state_t *fs,
@@ -412,14 +407,27 @@ bool flat_state_batch_put_storage(flat_state_t *fs,
                                    uint32_t count) {
     if (!fs || !keys || !values || count == 0) return false;
     for (uint32_t i = 0; i < count; i++) {
-        uint8_t hkey[32];
-        make_stor_key(keys + i * 64, keys + i * 64 + 32, hkey);
+        uint8_t ckey[64];
+        make_stor_key(keys + i * 64, keys + i * 64 + 32, ckey);
         uint8_t buf[32];
         uint32_t len = encode_storage(values + i * 32, buf);
-        if (!flat_store_put(fs->storage, hkey, buf, len))
+        if (!flat_store_put(fs->storage, ckey, buf, len))
             return false;
     }
     return true;
+}
+
+/* =========================================================================
+ * Internal Access
+ * ========================================================================= */
+
+compact_art_t *flat_state_storage_art(flat_state_t *fs) {
+    if (!fs || !fs->storage) return NULL;
+    return flat_store_get_art(fs->storage);
+}
+
+flat_store_t *flat_state_storage_store(flat_state_t *fs) {
+    return fs ? fs->storage : NULL;
 }
 
 /* =========================================================================

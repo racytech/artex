@@ -675,6 +675,32 @@ uint32_t flat_store_max_record_size(const flat_store_t *s) {
 }
 
 /* =========================================================================
+ * Internal Access
+ * ========================================================================= */
+
+compact_art_t *flat_store_get_art(flat_store_t *s) {
+    return s ? &s->index : NULL;
+}
+
+uint32_t flat_store_read_leaf_record(const flat_store_t *s,
+                                      const void *leaf_val,
+                                      uint8_t *buf, uint32_t buf_size) {
+    if (!s || !leaf_val || !buf) return 0;
+    uint64_t offset;
+    memcpy(&offset, leaf_val, sizeof(uint64_t));
+    const uint8_t *slot = data_ptr(s, offset);
+    uint32_t shdr;
+    memcpy(&shdr, slot, SLOT_HEADER_SIZE);
+    uint8_t class_idx;
+    uint16_t data_len;
+    slot_header_unpack(shdr, &class_idx, &data_len);
+    if (data_len == 0) return 0;
+    if (data_len > buf_size) data_len = (uint16_t)buf_size;
+    memcpy(buf, slot + SLOT_HEADER_SIZE + s->key_size, data_len);
+    return data_len;
+}
+
+/* =========================================================================
  * Durability
  * ========================================================================= */
 

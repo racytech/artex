@@ -9,7 +9,7 @@
  *
  * Two flat_store instances (compact_art index + mmap'd data file):
  *   accounts: keccak256(addr)[32] → {nonce, balance, code_hash, storage_root}
- *   storage:  keccak256(addr_hash||slot_hash)[32] → value[32]
+ *   storage:  addr_hash[32]||slot_hash[32] → value[32]
  *
  * Index lookups are in-memory (compact_art). Data reads are single
  * mmap accesses at known offsets. No hash table bucket scanning.
@@ -82,6 +82,19 @@ bool flat_state_batch_put_storage(flat_state_t *fs,
                                    const uint8_t *keys,
                                    const uint8_t *values,
                                    uint32_t count);
+
+/* =========================================================================
+ * Internal Access (for storage_trie / art_mpt integration)
+ * ========================================================================= */
+
+struct compact_art;
+struct flat_store;
+
+/** Get the compact_art index for storage (non-owning). */
+struct compact_art *flat_state_storage_art(flat_state_t *fs);
+
+/** Get the flat_store for storage (non-owning). */
+struct flat_store *flat_state_storage_store(flat_state_t *fs);
 
 /* =========================================================================
  * Stats

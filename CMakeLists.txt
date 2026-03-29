@@ -206,6 +206,10 @@ add_library(art_mpt STATIC database/src/art_mpt.c)
 target_include_directories(art_mpt PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 target_link_libraries(art_mpt compact_art common)
 
+add_library(storage_trie STATIC database/src/storage_trie.c)
+target_include_directories(storage_trie PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+target_link_libraries(storage_trie art_mpt flat_store)
+
 #==============================================================================
 # Libraries — EVM
 #==============================================================================

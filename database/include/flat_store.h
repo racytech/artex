@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include "compact_art.h"
 
 /**
  * ART Store — ART-indexed persistent record store with size classes.
@@ -125,6 +126,23 @@ uint32_t flat_store_key_size(const flat_store_t *store);
 
 /** Maximum record size in bytes. */
 uint32_t flat_store_max_record_size(const flat_store_t *store);
+
+/* =========================================================================
+ * Internal Access (for art_mpt integration)
+ * ========================================================================= */
+
+/** Get the compact_art index (non-owning pointer). */
+compact_art_t *flat_store_get_art(flat_store_t *store);
+
+/**
+ * Read the raw record for a compact_art leaf value.
+ * leaf_val: pointer to the leaf value in the ART (uint64_t offset).
+ * buf/buf_size: output buffer.
+ * Returns actual record length, or 0 on error.
+ */
+uint32_t flat_store_read_leaf_record(const flat_store_t *store,
+                                      const void *leaf_val,
+                                      uint8_t *buf, uint32_t buf_size);
 
 /* =========================================================================
  * Durability
