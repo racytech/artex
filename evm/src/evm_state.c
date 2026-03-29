@@ -2774,6 +2774,67 @@ static bool flush_account_cb(const uint8_t *key, size_t key_len,
     return true;
 }
 
+/**
+ * Prune ALL empty accounts from flat_state.
+ * Empty = nonce 0, balance 0, no code, no storage.
+ * Called at the EIP-161 (Spurious Dragon) transition to remove DoS-era empties.
+ * Can also be called manually for maintenance.
+ */
+void evm_state_prune_empty_accounts(evm_state_t *es) {
+    if (!es || !es->flat_state) return;
+
+    compact_art_t *art = flat_state_account_art(es->flat_state);
+    if (!art) return;
+
+    /* Collect keys first — can't delete while iterating */
+    uint8_t **del_keys = NULL;
+    size_t del_count = 0, del_cap = 0;
+
+    compact_art_iterator_t *it = compact_art_iterator_create(art);
+    while (compact_art_iterator_next(it)) {
+        const void *lv = compact_art_iterator_value(it);
+        uint8_t fk[32];
+        if (!art->key_fetch(lv, fk, art->key_fetch_ctx)) continue;
+
+        flat_account_record_t fr;
+        if (!flat_state_get_account(es->flat_state, fk, &fr)) continue;
+
+        /* Check empty: nonce=0, balance=0, no code, no storage */
+        if (fr.nonce != 0) continue;
+
+        uint8_t zero[32] = {0};
+        if (memcmp(fr.balance, zero, 32) != 0) continue;
+
+        if (memcmp(fr.code_hash, HASH_EMPTY_CODE.bytes, 32) != 0 &&
+            memcmp(fr.code_hash, zero, 32) != 0) continue;
+
+        if (memcmp(fr.storage_root, HASH_EMPTY_STORAGE.bytes, 32) != 0) continue;
+
+        /* Empty — schedule for deletion */
+        if (del_count >= del_cap) {
+            size_t nc = del_cap ? del_cap * 2 : 4096;
+            uint8_t **nk = realloc(del_keys, nc * sizeof(uint8_t *));
+            if (!nk) break;
+            del_keys = nk; del_cap = nc;
+        }
+        del_keys[del_count] = malloc(32);
+        if (del_keys[del_count]) {
+            memcpy(del_keys[del_count], fk, 32);
+            del_count++;
+        }
+    }
+    compact_art_iterator_destroy(it);
+
+    for (size_t i = 0; i < del_count; i++) {
+        flat_state_delete_account(es->flat_state, del_keys[i]);
+        free(del_keys[i]);
+    }
+    free(del_keys);
+
+    if (del_count > 0)
+        fprintf(stderr, "EIP-161: pruned %zu empty accounts from flat_state\n", del_count);
+}
+
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     hash_t root = hash_zero();
     if (!es) return root;
@@ -2786,6 +2847,15 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     struct timespec _rt0, _rt1, _rt2;
     clock_gettime(CLOCK_MONOTONIC, &_rt0);
     size_t _acct_dirty_count = es->dirty_accounts.count;
+
+    /* Step 0. EIP-161: prune empty accounts on first prune_empty=true call */
+    if (prune_empty) {
+        static bool _eip161_cleaned = false;
+        if (!_eip161_cleaned) {
+            evm_state_prune_empty_accounts(es);
+            _eip161_cleaned = true;
+        }
+    }
 
     /* ================================================================
      * Step 1. Promote 'existed' on dirty accounts.

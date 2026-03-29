@@ -287,6 +287,13 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
  * @param prune_empty  If true (EIP-161+), exclude empty accounts from the trie.
  */
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty);
+
+/**
+ * Prune ALL empty accounts from flat_state.
+ * Empty = nonce 0, balance 0, no code, no storage.
+ * Called at EIP-161 transition. Can also be called for maintenance.
+ */
+void evm_state_prune_empty_accounts(evm_state_t *es);
 // ============================================================================
 // Cache / Store Statistics
 // ============================================================================
