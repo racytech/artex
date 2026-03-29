@@ -2880,7 +2880,8 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     }
 
     /* ================================================================
-     * Step 2. Clean flat_state for dead and storage-cleared accounts.
+     * Step 2. Clean orphaned storage for dead / storage-cleared accounts.
+     * Must happen before slot flush so orphans don't survive.
      * ================================================================ */
     for (size_t d = 0; d < es->dirty_accounts.count; d++) {
         const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
@@ -2888,17 +2889,17 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
             &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
         if (!ca || !ca->mpt_dirty) continue;
 
+        if (!ca->existed || ca->storage_cleared) {
+            flat_state_delete_all_storage(es->flat_state, ca->addr_hash.bytes);
+        }
         if (!ca->existed) {
-            flat_state_delete_all_storage(es->flat_state, ca->addr_hash.bytes);
             flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
-        } else if (ca->storage_cleared) {
-            flat_state_delete_all_storage(es->flat_state, ca->addr_hash.bytes);
         }
     }
 
     /* ================================================================
      * Step 3. Flush ALL cached slots to flat_state.
-     * Skips dead accounts (storage deleted in step 2).
+     * Skips dead accounts (existed=false after step 1).
      * ================================================================ */
     mem_art_foreach(&es->storage, flush_slot_cb, es);
 
@@ -2916,9 +2917,9 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     clock_gettime(CLOCK_MONOTONIC, &_rt1);
 
     /* ================================================================
-     * Step 5. Flush ALL cached accounts to flat_state.
-     * Skips dead accounts (deleted in step 2).
-     * storage_root is now up-to-date from step 4.
+     * Step 5. Flush ALL cached accounts to flat_state (single pass).
+     * Dead accounts already deleted in step 2. Alive accounts written
+     * with final storage_root from step 4.
      * ================================================================ */
     mem_art_foreach(&es->accounts, flush_account_cb, es);
 
