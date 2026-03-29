@@ -12,6 +12,7 @@
 #include "art_mpt.h"
 #include "keccak256.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -35,7 +36,8 @@ static const uint8_t EMPTY_ROOT[32] = {
 
 typedef struct {
     uint8_t hash[32];
-    uint8_t rlp_len;    /* 0 = not cached, 1-31 = inline RLP length, 32+ = hashed */
+    uint8_t rlp_len;    /* 0 = not cached, 1-31 = inline RLP length, 32 = hashed */
+    uint8_t depth;      /* byte_depth when this hash was computed */
 } hash_entry_t;
 
 /* =========================================================================
@@ -286,14 +288,17 @@ static inline size_t ref_to_idx(compact_ref_t ref) {
     return (size_t)(ref & 0x7FFFFFFFU);
 }
 
-static bool cache_get(const art_mpt_t *am, compact_ref_t ref,
-                       uint8_t *rlp_out, size_t *rlp_len) {
+static bool cache_get(art_mpt_t *am, compact_ref_t ref,
+                       size_t byte_depth, uint8_t *rlp_out, size_t *rlp_len) {
+    return false; /* DISABLED */
     if (COMPACT_IS_LEAF_REF(ref)) return false;
     if (node_is_dirty(am->tree, ref)) return false;
     size_t idx = ref_to_idx(ref);
     if (idx >= am->cache_cap) return false;
     const hash_entry_t *e = &am->cache[idx];
     if (e->rlp_len == 0) return false;
+    /* Depth must match — same subtree at different depth produces different hash */
+    if (e->depth != (uint8_t)byte_depth) return false;
 
     if (e->rlp_len < 32) {
         if (idx < am->inline_cap && am->inline_cache) {
@@ -310,7 +315,7 @@ static bool cache_get(const art_mpt_t *am, compact_ref_t ref,
 }
 
 static void cache_put(art_mpt_t *am, compact_ref_t ref,
-                       const uint8_t *rlp, size_t rlp_len) {
+                       size_t byte_depth, const uint8_t *rlp, size_t rlp_len) {
     if (COMPACT_IS_LEAF_REF(ref)) return;
     size_t idx = ref_to_idx(ref);
 
@@ -342,10 +347,10 @@ static void cache_put(art_mpt_t *am, compact_ref_t ref,
         keccak(rlp, rlp_len, e->hash);
     }
 
-    /* Don't clear dirty here — let root_hash do a separate pass after.
-     * Clearing during the walk can cause issues if the same ref appears
-     * in different contexts during structural changes. */
-    /* node_clear_dirty(am->tree, ref); */
+    e->depth = (uint8_t)byte_depth;
+
+    /* Clear dirty — this node's hash is now cached at this depth */
+    node_clear_dirty(am->tree, ref);
 }
 
 /* Dirty marking is handled by compact_art itself (in insert_recursive /
@@ -461,23 +466,18 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
         return encode_leaf(am, ref, byte_depth, nib_prefix, nib_prefix_len, rlp_out);
     }
 
-    /* --- Cache check (only when no accumulated prefix) ---
-     * When nib_prefix_len > 0, we're in the middle of collapsing
-     * single-child paths. The cached value is for the node alone,
-     * not including the prefix. We can still use it — the prefix
-     * becomes an extension wrapping the cached result. */
-    if (nib_prefix_len == 0) {
-        size_t cached_len;
-        if (cache_get(am, ref, rlp_out, &cached_len)) {
-            am->stats.cache_hits++;
-            return cached_len;
-        }
-    } else {
-        /* Check cache for the node without prefix */
+    /* --- Cache check ---
+     * Only use cache for non-dirty nodes (dirty flag checked inside cache_get).
+     * Cache stores the node's own RLP (without accumulated prefix). */
+    {
         uint8_t cached_rlp[MAX_NODE_RLP];
         size_t cached_len;
-        if (cache_get(am, ref, cached_rlp, &cached_len)) {
+        if (cache_get(am, ref, byte_depth, cached_rlp, &cached_len)) {
             am->stats.cache_hits++;
+            if (nib_prefix_len == 0) {
+                memcpy(rlp_out, cached_rlp, cached_len);
+                return cached_len;
+            }
             return encode_extension(nib_prefix, nib_prefix_len,
                                      cached_rlp, cached_len, rlp_out);
         }
@@ -585,7 +585,7 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
     node_rlp_len = encode_branch(hi_children, hi_child_lens, node_rlp);
 
     /* Cache the node's RLP (without prefix) */
-    cache_put(am, ref, node_rlp, node_rlp_len);
+    cache_put(am, ref, byte_depth, node_rlp, node_rlp_len);
 
     /* Wrap with accumulated prefix */
     return encode_extension(prefix, prefix_len, node_rlp, node_rlp_len, rlp_out);
@@ -655,8 +655,8 @@ void art_mpt_root_hash(art_mpt_t *am, uint8_t out[32]) {
         keccak(rlp, rlp_len, out);
     }
 
-    /* Clear dirty flags after all hashes are computed and cached */
-    clear_dirty_recursive(am, am->tree->root);
+    /* Dirty flags are cleared by cache_put during the hash walk.
+     * Nodes not visited (clean subtrees) keep their clean state. */
 }
 
 void art_mpt_invalidate_all(art_mpt_t *am) {

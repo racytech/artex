@@ -998,6 +998,8 @@ static compact_ref_t delete_recursive(compact_art_t *tree, compact_ref_t ref,
                 // covers key bytes [depth .. depth+new_len-1]
                 memcpy(child_partial, lk + depth, store);
                 ((uint8_t *)child_node)[2] = (uint8_t)new_len;
+                /* Child's partial changed — mark dirty so cached hash is invalidated */
+                node_set_flags(child_node, COMPACT_NODE_FLAG_DIRTY);
                 return only_child;
             }
         }
