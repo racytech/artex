@@ -63,6 +63,14 @@ bool flat_state_delete_storage(flat_state_t *fs,
                                 const uint8_t addr_hash[32],
                                 const uint8_t slot_hash[32]);
 
+/**
+ * Delete ALL storage slots for an account (self-destruct).
+ * Walks the storage compact_art subtree at addr_hash prefix and
+ * removes all entries. Returns number of slots deleted.
+ */
+uint64_t flat_state_delete_all_storage(flat_state_t *fs,
+                                        const uint8_t addr_hash[32]);
+
 /* =========================================================================
  * Prefetch (non-blocking, warm page cache for upcoming reads)
  * ========================================================================= */

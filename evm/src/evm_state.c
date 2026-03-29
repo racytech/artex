@@ -2791,6 +2791,10 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
                          !ca->has_code);
 
         if (!ca->existed || (is_empty && prune_empty)) {
+            /* Delete account AND all its storage from flat_state.
+             * Without this, orphaned storage slots survive self-destruct
+             * across evict boundaries (they weren't in cache to be zeroed). */
+            flat_state_delete_all_storage(es->flat_state, ca->addr_hash.bytes);
             flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
         } else {
             flat_account_record_t frec;
