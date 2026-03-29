@@ -530,10 +530,10 @@ static bool free_code_cb(const uint8_t *key, size_t key_len,
 }
 
 /* Forward declarations for flush callbacks (defined near compute_mpt_root) */
-static bool evict_account_cb(const uint8_t *key, size_t key_len,
-                              const void *value, size_t value_len, void *user_data);
-static bool evict_slot_cb(const uint8_t *key, size_t key_len,
-                           const void *value, size_t value_len, void *user_data);
+static bool flush_slot_cb(const uint8_t *key, size_t key_len,
+                            const void *value, size_t value_len, void *user_data);
+static bool flush_account_cb(const uint8_t *key, size_t key_len,
+                               const void *value, size_t value_len, void *user_data);
 
 void evm_state_evict_cache(evm_state_t *es) {
     if (!es) return;
@@ -541,10 +541,9 @@ void evm_state_evict_cache(evm_state_t *es) {
     if (es->flat_state) {
         /* Flush ALL cached state to flat_state before destroying cache.
          * ensure_slot/ensure_account read from flat_state after evict —
-         * stale data would cause wrong SSTORE gas (EIP-2200 depends on
-         * original value) and wrong execution behavior. */
-        mem_art_foreach(&es->storage, evict_slot_cb, es);
-        mem_art_foreach(&es->accounts, evict_account_cb, es);
+         * stale data would cause wrong SSTORE gas (EIP-2200). */
+        mem_art_foreach(&es->storage, flush_slot_cb, es);
+        mem_art_foreach(&es->accounts, flush_account_cb, es);
 
         /* Flush deferred writes to disk */
         flat_store_flush_deferred(flat_state_account_store(es->flat_state));
@@ -2715,123 +2714,64 @@ void evm_state_apply_diff_bulk(evm_state_t *es, const block_diff_t *diff) {
 
 #endif /* ENABLE_HISTORY || ENABLE_VERKLE_BUILD */
 
-// Compute storage roots incrementally using storage_trie (flat_state compact_art).
-// Flush dirty storage slots to flat_state (which inserts into the shared
-/* Flush callback: write every cached account to flat_state */
-static bool evict_account_cb(const uint8_t *key, size_t key_len,
-                              const void *value, size_t value_len,
-                              void *user_data) {
-    (void)key; (void)key_len; (void)value_len;
-    evm_state_t *es = user_data;
-    const cached_account_t *ca = value;
-    if (!ca->existed) {
-        flat_state_delete_all_storage(es->flat_state, ca->addr_hash.bytes);
-        flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
-        return true;
-    }
-    flat_account_record_t frec;
-    frec.nonce = ca->nonce;
-    uint256_to_bytes(&ca->balance, frec.balance);
-    const uint8_t *ch = ca->has_code ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
-    memcpy(frec.code_hash, ch, 32);
-    memcpy(frec.storage_root, ca->storage_root.bytes, 32);
-    flat_state_put_account(es->flat_state, ca->addr_hash.bytes, &frec);
-    return true;
-}
+/*
+ * ============================================================================
+ * compute_mpt_root — Compute the Ethereum state trie root hash.
+ *
+ * Invariant: when account_trie_root() is called, flat_state must contain
+ * the EXACT state that belongs in the Ethereum trie at this block.
+ *
+ * Flow:
+ *   Step 1. Promote 'existed' flags on dirty accounts (determines live/dead)
+ *   Step 2. For dead accounts: delete account + ALL storage from flat_state
+ *           For storage_cleared accounts: delete ALL old storage
+ *   Step 3. Flush ALL cached slots to flat_state (skip dead accounts)
+ *   Step 4. Compute storage_trie_root for storage_dirty accounts
+ *   Step 5. Flush ALL cached accounts to flat_state (with final storage_root)
+ *   Step 6. Compute account_trie_root from flat_state
+ *   Step 7. Clear dirty flags
+ * ============================================================================
+ */
 
-/* Flush callback: write every cached storage slot to flat_state */
-static bool evict_slot_cb(const uint8_t *key, size_t key_len,
-                           const void *value, size_t value_len,
-                           void *user_data) {
+/* Step 3: flush cached slot to flat_state. Skip dead accounts. */
+static bool flush_slot_cb(const uint8_t *key, size_t key_len,
+                            const void *value, size_t value_len,
+                            void *user_data) {
     (void)key_len; (void)value_len;
     evm_state_t *es = user_data;
     const cached_slot_t *cs = value;
     const cached_account_t *ca = (const cached_account_t *)mem_art_get(
         &es->accounts, key, ADDRESS_KEY_SIZE, NULL);
-    if (!ca) return true;
+    if (!ca || !ca->existed) return true;
     if (uint256_is_zero(&cs->current)) {
-        flat_state_delete_storage(es->flat_state, ca->addr_hash.bytes, cs->slot_hash.bytes);
+        flat_state_delete_storage(es->flat_state,
+                                   ca->addr_hash.bytes, cs->slot_hash.bytes);
     } else {
         uint8_t vbe[32];
         uint256_to_bytes(&cs->current, vbe);
-        flat_state_put_storage(es->flat_state, ca->addr_hash.bytes, cs->slot_hash.bytes, vbe);
+        flat_state_put_storage(es->flat_state,
+                                ca->addr_hash.bytes, cs->slot_hash.bytes, vbe);
     }
     return true;
 }
 
-// compact_art), then compute per-account storage roots via storage_trie.
-static void compute_all_storage_roots(evm_state_t *es) {
-    struct timespec _sr_t0, _sr_t1;
-    clock_gettime(CLOCK_MONOTONIC, &_sr_t0);
-
-    if (!es->flat_state || !es->storage_trie) goto clear;
-
-    // 1. Flush dirty slots to flat_state → shared compact_art
-    //    (storage_trie reads values from this compact_art)
-    for (size_t d = 0; d < es->dirty_slots.count; d++) {
-        const uint8_t *skey = es->dirty_slots.keys + d * SLOT_KEY_SIZE;
-        cached_slot_t *cs = (cached_slot_t *)mem_art_get_mut(
-            &es->storage, skey, SLOT_KEY_SIZE, NULL);
-        if (!cs) continue;
-        if (!cs->mpt_dirty) continue;
-
-        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
-            &es->accounts, skey, ADDRESS_KEY_SIZE, NULL);
-        if (!ca) continue;
-
-        if (uint256_is_zero(&cs->current)) {
-            flat_state_delete_storage(es->flat_state,
-                                       ca->addr_hash.bytes, cs->slot_hash.bytes);
-        } else {
-            uint8_t vbe[32];
-            uint256_to_bytes(&cs->current, vbe);
-            flat_state_put_storage(es->flat_state,
-                                    ca->addr_hash.bytes, cs->slot_hash.bytes, vbe);
-        }
-
-        cs->mpt_dirty = false;
-        cs->block_dirty = false;
-    }
-
-    // 2. Compute storage root per dirty account via storage_trie
-    for (size_t d = 0; d < es->dirty_accounts.count; d++) {
-        const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
-        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
-            &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
-        if (!ca || !ca->storage_dirty) continue;
-
-        /* If storage was cleared (self-destruct or CREATE), delete ALL
-         * old storage from flat_state before computing the new root.
-         * This removes orphaned slots from previous checkpoints. */
-        if (ca->storage_cleared) {
-            flat_state_delete_all_storage(es->flat_state, ca->addr_hash.bytes);
-            /* Re-flush dirty non-zero slots for this account */
-            for (size_t sd = 0; sd < es->dirty_slots.count; sd++) {
-                const uint8_t *sk = es->dirty_slots.keys + sd * SLOT_KEY_SIZE;
-                if (memcmp(sk, akey, ADDRESS_KEY_SIZE) != 0) continue;
-                cached_slot_t *cs2 = (cached_slot_t *)mem_art_get_mut(
-                    &es->storage, sk, SLOT_KEY_SIZE, NULL);
-                if (!cs2 || uint256_is_zero(&cs2->current)) continue;
-                uint8_t vbe[32];
-                uint256_to_bytes(&cs2->current, vbe);
-                flat_state_put_storage(es->flat_state, ca->addr_hash.bytes,
-                                        cs2->slot_hash.bytes, vbe);
-            }
-            ca->storage_cleared = false;
-        }
-
-        storage_trie_root(es->storage_trie, ca->addr_hash.bytes,
-                           ca->storage_root.bytes);
-    }
-
-clear:
-    // 3. Clear storage_dirty + storage_cleared on dirty accounts
-    for (size_t d = 0; d < es->dirty_accounts.count; d++) {
-        const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
-        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
-            &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
-        if (ca) { ca->storage_dirty = false; ca->storage_cleared = false; }
-    }
+/* Step 5: flush cached account to flat_state. Skip dead accounts. */
+static bool flush_account_cb(const uint8_t *key, size_t key_len,
+                               const void *value, size_t value_len,
+                               void *user_data) {
+    (void)key; (void)key_len; (void)value_len;
+    evm_state_t *es = user_data;
+    const cached_account_t *ca = value;
+    if (!ca->existed) return true; /* dead — already deleted in step 2 */
+    flat_account_record_t frec;
+    frec.nonce = ca->nonce;
+    uint256_to_bytes(&ca->balance, frec.balance);
+    const uint8_t *ch = ca->has_code
+        ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
+    memcpy(frec.code_hash, ch, 32);
+    memcpy(frec.storage_root, ca->storage_root.bytes, 32);
+    flat_state_put_account(es->flat_state, ca->addr_hash.bytes, &frec);
+    return true;
 }
 
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
@@ -2845,47 +2785,93 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
 
     struct timespec _rt0, _rt1, _rt2;
     clock_gettime(CLOCK_MONOTONIC, &_rt0);
-
-    /* 1. Promote existed flags FIRST (before any flush that checks existed) */
     size_t _acct_dirty_count = es->dirty_accounts.count;
+
+    /* ================================================================
+     * Step 1. Promote 'existed' on dirty accounts.
+     * ================================================================ */
     for (size_t d = 0; d < es->dirty_accounts.count; d++) {
         const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
         cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
             &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
-        if (!ca) continue;
-        if (!ca->mpt_dirty) continue;
+        if (!ca || !ca->mpt_dirty) continue;
 
         if (ca->block_dirty || ca->block_code_dirty) {
             if (ca->self_destructed) {
                 ca->existed = false;
             } else {
-                bool is_empty_check = (ca->nonce == 0 &&
-                                       uint256_is_zero(&ca->balance) &&
-                                       !ca->has_code);
-                if (!(!ca->existed && !ca->created && is_empty_check && prune_empty))
+                bool is_empty = (ca->nonce == 0 &&
+                                 uint256_is_zero(&ca->balance) &&
+                                 !ca->has_code);
+                if (!(!ca->existed && !ca->created && is_empty && prune_empty))
                     ca->existed = true;
             }
         }
+    }
 
+    /* ================================================================
+     * Step 2. Clean flat_state for dead and storage-cleared accounts.
+     * ================================================================ */
+    for (size_t d = 0; d < es->dirty_accounts.count; d++) {
+        const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+            &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
+        if (!ca || !ca->mpt_dirty) continue;
+
+        if (!ca->existed) {
+            flat_state_delete_all_storage(es->flat_state, ca->addr_hash.bytes);
+            flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
+        } else if (ca->storage_cleared) {
+            flat_state_delete_all_storage(es->flat_state, ca->addr_hash.bytes);
+        }
+    }
+
+    /* ================================================================
+     * Step 3. Flush ALL cached slots to flat_state.
+     * Skips dead accounts (storage deleted in step 2).
+     * ================================================================ */
+    mem_art_foreach(&es->storage, flush_slot_cb, es);
+
+    /* ================================================================
+     * Step 4. Compute storage roots for storage_dirty accounts.
+     * ================================================================ */
+    for (size_t d = 0; d < es->dirty_accounts.count; d++) {
+        const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+            &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
+        if (!ca || !ca->storage_dirty || !ca->existed) continue;
+        storage_trie_root(es->storage_trie, ca->addr_hash.bytes,
+                           ca->storage_root.bytes);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &_rt1);
+
+    /* ================================================================
+     * Step 5. Flush ALL cached accounts to flat_state.
+     * Skips dead accounts (deleted in step 2).
+     * storage_root is now up-to-date from step 4.
+     * ================================================================ */
+    mem_art_foreach(&es->accounts, flush_account_cb, es);
+
+    /* ================================================================
+     * Step 6. Compute account trie root from flat_state.
+     * ================================================================ */
+    account_trie_root(es->account_trie, root.bytes);
+    clock_gettime(CLOCK_MONOTONIC, &_rt2);
+
+    /* ================================================================
+     * Step 7. Clear dirty flags.
+     * ================================================================ */
+    for (size_t d = 0; d < es->dirty_accounts.count; d++) {
+        const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+            &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
+        if (!ca) continue;
         ca->mpt_dirty = false;
         ca->block_dirty = false;
         ca->block_code_dirty = false;
+        ca->storage_dirty = false;
+        ca->storage_cleared = false;
     }
-
-    /* 2. Flush ALL cached slots to flat_state (existed is now promoted) */
-    mem_art_foreach(&es->storage, evict_slot_cb, es);
-    mem_art_foreach(&es->accounts, evict_account_cb, es);
-
-    /* 3. Compute per-account storage roots from flat_state */
-    compute_all_storage_roots(es);
-    clock_gettime(CLOCK_MONOTONIC, &_rt1);
-
-    /* 4. Flush ALL cached accounts AGAIN (with updated storage_root) */
-    mem_art_foreach(&es->accounts, evict_account_cb, es);
-
-    /* 5. Compute account trie root from flat_state's compact_art */
-    account_trie_root(es->account_trie, root.bytes);
-    clock_gettime(CLOCK_MONOTONIC, &_rt2);
 
     es->last_root_stor_ms = (_rt1.tv_sec - _rt0.tv_sec) * 1000.0 +
                            (_rt1.tv_nsec - _rt0.tv_nsec) / 1e6;
