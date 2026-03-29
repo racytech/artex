@@ -697,20 +697,17 @@ uint32_t flat_store_read_leaf_record(const flat_store_t *s,
 void flat_store_flush_deferred(flat_store_t *s) {
     if (!s || !s->deferred.data || s->deferred.used == 0) return;
 
-    /* Walk ALL entries in compact_art. For each with a deferred offset,
-     * write to the data file and update the leaf to the file offset. */
-    compact_art_iterator_t *it = compact_art_iterator_create(&s->index);
-    if (!it) return;
+    /* Phase 1: Scan deferred buffer sequentially (NOT via compact_art iterator).
+     * The deferred buffer has slots packed sequentially. Walk it directly. */
+    typedef struct { uint8_t *key; uint64_t file_offset; } _flush_entry_t;
+    size_t max_entries = s->live_count + 1;
+    _flush_entry_t *entries = malloc(max_entries * sizeof(_flush_entry_t));
+    if (!entries) { s->deferred.used = 0; return; }
 
-    while (compact_art_iterator_next(it)) {
-        const void *leaf_val = compact_art_iterator_value(it);
-        uint64_t offset;
-        memcpy(&offset, leaf_val, sizeof(uint64_t));
-
-        if (!(offset & DEFERRED_BIT)) continue; /* already on disk */
-
-        /* Read from deferred buffer */
-        uint8_t *src = s->deferred.data + (offset & ~DEFERRED_BIT);
+    size_t count = 0;
+    size_t pos = 0;
+    while (pos < s->deferred.used && count < max_entries) {
+        uint8_t *src = s->deferred.data + pos;
         uint32_t shdr;
         memcpy(&shdr, src, SLOT_HEADER_SIZE);
         uint8_t class_idx;
@@ -720,19 +717,24 @@ void flat_store_flush_deferred(flat_store_t *s) {
 
         /* Allocate a file slot and copy */
         uint64_t file_offset = alloc_slot(s, class_idx);
-        if (file_offset == UINT64_MAX) continue; /* OOM — skip */
+        if (file_offset != UINT64_MAX) {
+            uint8_t *dst = s->base + FLAT_STORE_HEADER_SIZE + file_offset;
+            memcpy(dst, src, slot_size);
 
-        uint8_t *dst = s->base + FLAT_STORE_HEADER_SIZE + file_offset;
-        memcpy(dst, src, slot_size);
+            entries[count].key = src + SLOT_HEADER_SIZE;
+            entries[count].file_offset = file_offset;
+            count++;
+        }
 
-        /* We need to get the full key to update the compact_art.
-         * The key is stored in the slot after the header. */
-        const uint8_t *key = src + SLOT_HEADER_SIZE;
-
-        /* Update compact_art leaf: deferred → file offset */
-        compact_art_insert(&s->index, key, &file_offset);
+        pos += slot_size;
     }
-    compact_art_iterator_destroy(it);
+
+    /* Phase 2: Update compact_art leaves to point to file offsets */
+    for (size_t i = 0; i < count; i++) {
+        compact_art_insert(&s->index, entries[i].key, &entries[i].file_offset);
+    }
+
+    free(entries);
 
     /* Reset deferred buffer */
     s->deferred.used = 0;
