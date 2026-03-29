@@ -2801,13 +2801,11 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     struct timespec _rt0, _rt1, _rt2;
     clock_gettime(CLOCK_MONOTONIC, &_rt0);
 
-    /* 0. Flush ALL cached slots and accounts to flat_state (not just dirty).
-     * This ensures flat_state has complete data including accounts that were
-     * loaded after evict and modified but whose changes only exist in cache. */
+    /* 0. Flush ALL cached state to flat_state */
     mem_art_foreach(&es->storage, evict_slot_cb, es);
     mem_art_foreach(&es->accounts, evict_account_cb, es);
 
-    /* 1. Compute per-account storage roots (flushes dirty slots to flat_state) */
+    /* 1. Compute per-account storage roots from flat_state compact_art */
     compute_all_storage_roots(es);
     clock_gettime(CLOCK_MONOTONIC, &_rt1);
 
@@ -2860,7 +2858,11 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
         ca->block_code_dirty = false;
     }
 
-    /* 3. Compute account trie root from flat_state's compact_art */
+    /* 3. Flush ALL cached accounts AGAIN (with updated storage_root + existed).
+     * The first flush (step 0) may have stale storage_root. This overwrites. */
+    mem_art_foreach(&es->accounts, evict_account_cb, es);
+
+    /* 4. Compute account trie root from flat_state's compact_art */
     account_trie_root(es->account_trie, root.bytes);
     clock_gettime(CLOCK_MONOTONIC, &_rt2);
 
