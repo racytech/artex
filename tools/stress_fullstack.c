@@ -306,20 +306,19 @@ int main(int argc, char **argv) {
             bool prune = (block >= 2675000);
             hash_t root = evm_state_compute_mpt_root(es, prune);
 
-            /* Check for LOST NODEs via the public getter (evm_state.h) */
-            void *smpt_ptr = NULL, *ampt_ptr = NULL;
-            evm_state_get_mpt_stores(es, &ampt_ptr, &smpt_ptr);
+            /* Check for LOST NODEs in account MPT arena */
+            void *ampt_ptr = NULL;
+            evm_state_get_mpt_stores(es, &ampt_ptr, NULL);
 
-            uint32_t s_lost = 0, a_lost = 0;
-            if (smpt_ptr) s_lost = mpt_arena_get_commit_stats((mpt_arena_t *)smpt_ptr).lost_nodes;
+            uint32_t a_lost = 0;
             if (ampt_ptr) a_lost = mpt_arena_get_commit_stats((mpt_arena_t *)ampt_ptr).lost_nodes;
 
-            total_lost += s_lost + a_lost;
+            total_lost += a_lost;
 
-            if (s_lost > 0 || a_lost > 0) {
+            if (a_lost > 0) {
                 fprintf(stderr,
-                    "** LOST NODE at block %lu: storage=%u account=%u (total=%lu) **\n",
-                    (unsigned long)block, s_lost, a_lost,
+                    "** LOST NODE at block %lu: account=%u (total=%lu) **\n",
+                    (unsigned long)block, a_lost,
                     (unsigned long)total_lost);
                 fprintf(stderr, "  root: 0x");
                 for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", root.bytes[i]);
