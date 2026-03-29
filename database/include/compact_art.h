@@ -169,6 +169,15 @@ typedef bool (*compact_art_key_fetch_t)(const void *value, uint8_t *key_out, voi
 typedef struct compact_art compact_art_t;
 typedef struct compact_art_iterator compact_art_iterator_t;
 
+#define COMPACT_NODE_TYPE_COUNT 5
+
+/* Per-type free list for recycling abandoned inner nodes */
+typedef struct {
+    compact_ref_t *refs;
+    uint32_t count;
+    uint32_t cap;
+} compact_free_list_t;
+
 struct compact_art {
     compact_ref_t root;         // 0 = empty tree
     size_t size;                // Number of key-value pairs
@@ -179,6 +188,7 @@ struct compact_art {
     uint32_t leaf_count;        // Number of leaves allocated
     compact_pool_t nodes;       // Inner node pool (variable-size, 8-byte aligned)
     compact_pool_t leaves;      // Leaf pool (fixed-size slots)
+    compact_free_list_t free_nodes[COMPACT_NODE_TYPE_COUNT]; // Recycled inner nodes
     compact_art_key_fetch_t key_fetch;  /* fetch full key for split (compact mode only) */
     void *key_fetch_ctx;                /* user context for key_fetch */
 };

@@ -185,6 +185,23 @@ static inline void node_set_flags(void *node, uint8_t bits) {
 // Inner Node Allocation
 // ============================================================================
 
+static void free_node(compact_art_t *tree, compact_ref_t ref) {
+    if (COMPACT_IS_LEAF_REF(ref) || ref == COMPACT_REF_NULL) return;
+    void *node = node_ptr(tree, ref);
+    int type_idx = (int)(*(const uint8_t *)node);
+    if (type_idx < 0 || type_idx >= COMPACT_NODE_TYPE_COUNT) return;
+
+    compact_free_list_t *fl = &tree->free_nodes[type_idx];
+    if (fl->count >= fl->cap) {
+        uint32_t nc = fl->cap ? fl->cap * 2 : 64;
+        compact_ref_t *nr = realloc(fl->refs, nc * sizeof(compact_ref_t));
+        if (!nr) return; /* leak this node — better than crash */
+        fl->refs = nr;
+        fl->cap = nc;
+    }
+    fl->refs[fl->count++] = ref;
+}
+
 static compact_ref_t alloc_node(compact_art_t *tree, compact_node_type_t type) {
     size_t size;
     switch (type) {
@@ -194,6 +211,21 @@ static compact_ref_t alloc_node(compact_art_t *tree, compact_node_type_t type) {
         case COMPACT_NODE_48:  size = sizeof(compact_node48_t);  break;
         case COMPACT_NODE_256: size = sizeof(compact_node256_t); break;
         default: return COMPACT_REF_NULL;
+    }
+
+    /* Try free list first */
+    compact_free_list_t *fl = &tree->free_nodes[(int)type];
+    if (fl->count > 0) {
+        compact_ref_t ref = fl->refs[--fl->count];
+        void *node = node_ptr(tree, ref);
+        memset(node, 0, size);
+        ((uint8_t *)node)[0] = (uint8_t)type;
+        node_set_flags(node, COMPACT_NODE_FLAG_DIRTY);
+        if (type == COMPACT_NODE_48) {
+            compact_node48_t *n48 = node;
+            memset(n48->index, COMPACT_NODE48_EMPTY, 256);
+        }
+        return ref;
     }
 
     // 8-byte aligned bump allocation
@@ -455,7 +487,6 @@ static compact_ref_t add_child(compact_art_t *tree, compact_ref_t node_ref,
             // Grow to Node16
             compact_ref_t n16_ref = alloc_node(tree, COMPACT_NODE_16);
             if (n16_ref == COMPACT_REF_NULL) return node_ref;
-            // Re-resolve after alloc (pool is contiguous, no move, but good hygiene)
             n = node_ptr(tree, node_ref);
             compact_node16_t *n16 = node_ptr(tree, n16_ref);
             copy_header(n16, n);
@@ -463,6 +494,7 @@ static compact_ref_t add_child(compact_art_t *tree, compact_ref_t node_ref,
             memcpy(n16->children, n->children,
                    COMPACT_NODE4_MAX * sizeof(compact_ref_t));
             n16->num_children = COMPACT_NODE4_MAX;
+            free_node(tree, node_ref);
             return add_child(tree, n16_ref, byte, child);
         }
 
@@ -494,6 +526,7 @@ static compact_ref_t add_child(compact_art_t *tree, compact_ref_t node_ref,
             memcpy(n32->children, n->children,
                    COMPACT_NODE16_MAX * sizeof(compact_ref_t));
             n32->num_children = COMPACT_NODE16_MAX;
+            free_node(tree, node_ref);
             return add_child(tree, n32_ref, byte, child);
         }
 
@@ -526,6 +559,7 @@ static compact_ref_t add_child(compact_art_t *tree, compact_ref_t node_ref,
                 n48->children[i] = n->children[i];
             }
             n48->num_children = COMPACT_NODE32_MAX;
+            free_node(tree, node_ref);
             return add_child(tree, n48_ref, byte, child);
         }
 
@@ -553,6 +587,7 @@ static compact_ref_t add_child(compact_art_t *tree, compact_ref_t node_ref,
                 }
             }
             n256->num_children = n->num_children;
+            free_node(tree, node_ref);
             return add_child(tree, n256_ref, byte, child);
         }
 
@@ -611,6 +646,7 @@ static compact_ref_t remove_child(compact_art_t *tree, compact_ref_t node_ref,
                             memcpy(n4->keys, n->keys, n->num_children);
                             memcpy(n4->children, n->children,
                                    n->num_children * sizeof(compact_ref_t));
+                            free_node(tree, node_ref);
                             return n4_ref;
                         }
                     }
@@ -638,6 +674,7 @@ static compact_ref_t remove_child(compact_art_t *tree, compact_ref_t node_ref,
                             memcpy(n16->keys, n->keys, n->num_children);
                             memcpy(n16->children, n->children,
                                    n->num_children * sizeof(compact_ref_t));
+                            free_node(tree, node_ref);
                             return n16_ref;
                         }
                     }
@@ -668,6 +705,7 @@ static compact_ref_t remove_child(compact_art_t *tree, compact_ref_t node_ref,
                                 n32->num_children++;
                             }
                         }
+                        free_node(tree, node_ref);
                         return n32_ref;
                     }
                 }
@@ -693,6 +731,7 @@ static compact_ref_t remove_child(compact_art_t *tree, compact_ref_t node_ref,
                             n48->num_children++;
                         }
                     }
+                    free_node(tree, node_ref);
                     return n48_ref;
                 }
             }
@@ -1094,6 +1133,7 @@ static compact_ref_t delete_recursive(compact_art_t *tree, compact_ref_t ref,
             compact_ref_t only_child = n4->children[0];
 
             if (COMPACT_IS_LEAF_REF(only_child)) {
+                free_node(tree, ref);
                 return only_child;
             }
 
@@ -1110,12 +1150,11 @@ static compact_ref_t delete_recursive(compact_art_t *tree, compact_ref_t ref,
                 uint8_t *child_partial = node_partial_mut(child_node);
                 size_t store = (size_t)new_len < COMPACT_MAX_PREFIX
                                ? (size_t)new_len : COMPACT_MAX_PREFIX;
-                // depth is where the parent node sits; merged prefix
-                // covers key bytes [depth .. depth+new_len-1]
                 memcpy(child_partial, lk + depth, store);
                 ((uint8_t *)child_node)[2] = (uint8_t)new_len;
                 /* Child's partial changed — mark dirty so cached hash is invalidated */
                 node_set_flags(child_node, COMPACT_NODE_FLAG_DIRTY);
+                free_node(tree, ref);
                 return only_child;
             }
         }
@@ -1133,6 +1172,7 @@ bool compact_art_init(compact_art_t *tree, uint32_t key_size,
                       compact_art_key_fetch_t key_fetch, void *key_fetch_ctx) {
     if (!tree || key_size == 0) return false;
 
+    memset(tree, 0, sizeof(*tree));
     tree->root = COMPACT_REF_NULL;
     tree->size = 0;
     tree->key_size = key_size;
@@ -1164,6 +1204,10 @@ void compact_art_destroy(compact_art_t *tree) {
     if (!tree) return;
     pool_destroy(&tree->nodes);
     pool_destroy(&tree->leaves);
+    for (int i = 0; i < COMPACT_NODE_TYPE_COUNT; i++) {
+        free(tree->free_nodes[i].refs);
+        tree->free_nodes[i] = (compact_free_list_t){0};
+    }
     tree->root = COMPACT_REF_NULL;
     tree->size = 0;
     tree->leaf_count = 0;
