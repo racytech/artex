@@ -77,6 +77,7 @@ struct mpt_trie {
 static trie_node_t *node_alloc(node_type_t type) {
     trie_node_t *n = calloc(1, sizeof(*n));
     if (!n) return NULL;
+    /* Extra safety: ensure all fields are zero */
     n->type = type;
     n->dirty = true;
     return n;
@@ -625,7 +626,7 @@ static size_t hex_prefix_encode(const uint8_t *nibbles, size_t nibble_len,
 
 /* Encode a child reference: either inline RLP or keccak hash.
  * Returns the encoded bytes in `out`, sets `out_len`. */
-static void encode_child_ref(const trie_node_t *child,
+static void encode_child_ref(trie_node_t *child,
                               uint8_t *out, size_t *out_len);
 
 /* Compute hash of a node, encode its RLP. Sets node->hash.
@@ -734,7 +735,7 @@ static void hash_node(trie_node_t *node, uint8_t *rlp_out, size_t *rlp_len) {
     }
 }
 
-static void encode_child_ref(const trie_node_t *child,
+static void encode_child_ref(trie_node_t *child,
                               uint8_t *out, size_t *out_len) {
     if (!child) {
         out[0] = 0x80;
@@ -744,7 +745,7 @@ static void encode_child_ref(const trie_node_t *child,
 
     uint8_t rlp[MAX_NODE_RLP];
     size_t rlp_len;
-    hash_node((trie_node_t *)child, rlp, &rlp_len);
+    hash_node(child, rlp, &rlp_len);
 
     if (rlp_len < 32) {
         /* Inline */
@@ -770,6 +771,15 @@ mpt_trie_t *mpt_trie_create(void) {
 void mpt_trie_destroy(mpt_trie_t *t) {
     if (!t) return;
     node_free(t->root);
+    /* Temporarily: zero the root pointer to detect stale use */
+    t->root = NULL;
+    free(t);
+}
+
+/* Debug: leak-based destroy (skip node_free) */
+void mpt_trie_destroy_leak(mpt_trie_t *t) {
+    if (!t) return;
+    t->root = NULL;
     free(t);
 }
 

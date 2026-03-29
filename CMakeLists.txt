@@ -201,6 +201,11 @@ add_library(mpt_trie STATIC database/src/mpt_trie.c)
 target_include_directories(mpt_trie PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 target_link_libraries(mpt_trie common)
 
+# ART→MPT (compute MPT hashes from compact_art structure)
+add_library(art_mpt STATIC database/src/art_mpt.c)
+target_include_directories(art_mpt PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+target_link_libraries(art_mpt compact_art common)
+
 #==============================================================================
 # Libraries — EVM
 #==============================================================================
@@ -504,6 +509,14 @@ add_executable(test_mpt_trie_vectors database/tests/test_mpt_trie_vectors.c)
 target_link_libraries(test_mpt_trie_vectors mpt_trie common)
 add_test(NAME test_mpt_trie_vectors
     COMMAND test_mpt_trie_vectors
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# Test: ART→MPT cross-validation against Python reference vectors
+add_executable(test_art_mpt_vectors database/tests/test_art_mpt_vectors.c)
+target_link_libraries(test_art_mpt_vectors art_mpt compact_art common)
+add_test(NAME test_art_mpt_vectors
+    COMMAND test_art_mpt_vectors
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
