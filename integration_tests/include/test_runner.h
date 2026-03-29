@@ -106,9 +106,8 @@ typedef struct {
     evm_t *evm;                 // EVM instance
     test_runner_config_t config;
 
-    // Persistent MPT stores (reused across resets to avoid file recreation)
-    void *account_mpt;          // mpt_store_t* (opaque, owned by runner)
-    void *storage_mpt;          // mpt_store_t* (opaque, owned by runner)
+    // Persistent flat_state (reused across resets — owns compact_arts for tries)
+    void *flat_state;           // flat_state_t* (opaque, owned by runner)
 
     // Statistics
     uint64_t total_gas_used;

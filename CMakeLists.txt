@@ -1027,7 +1027,7 @@ if(CJSON_FOUND)
             executor/include
             ${CJSON_INCLUDE_DIRS}
         )
-        set(INTEG_TEST_LIBS evm block_executor common ${CJSON_LIBRARIES})
+        set(INTEG_TEST_LIBS evm block_executor flat_state common ${CJSON_LIBRARIES})
         if(ENABLE_VERKLE)
             list(APPEND INTEG_TEST_LIBS verkle_state)
         endif()

@@ -4,6 +4,9 @@
 
 #include "test_runner.h"
 #include "fork.h"
+#ifdef ENABLE_MPT
+#include "flat_state.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -454,26 +457,23 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
         return false;
     }
 
-    // Initialize persistent mpt_store for state root computation
+    // Initialize flat_state for MPT root computation (owns the compact_arts)
 #ifdef ENABLE_MPT
-    if (!evm_state_init_mpt_stores(runner->state, "/dev/shm/test_runner_mpt",
-                                    4096, 65536)) {
-        fprintf(stderr, "ERROR: Failed to initialize mpt_store\n");
-        evm_state_destroy(runner->state);
-        runner->state = NULL;
+    {
+        runner->flat_state = flat_state_create("/dev/shm/test_runner_flat", 4096, 65536);
+        if (!runner->flat_state) {
+            fprintf(stderr, "ERROR: Failed to create flat_state\n");
+            evm_state_destroy(runner->state);
+            runner->state = NULL;
 #ifdef ENABLE_VERKLE
-        verkle_state_destroy(runner->vs);
-        runner->vs = NULL;
-        cleanup_flat_dirs();
+            verkle_state_destroy(runner->vs);
+            runner->vs = NULL;
+            cleanup_flat_dirs();
 #endif
-        return false;
+            return false;
+        }
+        evm_state_set_flat_state(runner->state, (flat_state_t *)runner->flat_state);
     }
-    // Save mpt_store pointers for reuse across resets (avoids file recreation)
-    evm_state_detach_mpt_stores(runner->state,
-                                 &runner->account_mpt, &runner->storage_mpt);
-    // Re-attach (they're now owned by runner, detach prevents double-free)
-    evm_state_attach_mpt_stores(runner->state,
-                                 runner->account_mpt, runner->storage_mpt);
 #endif
 
     // Initialize EVM
@@ -499,18 +499,14 @@ void test_runner_destroy(test_runner_t *runner) {
         evm_destroy(runner->evm);
     }
 
-    // Detach mpt stores before destroying state (runner owns them)
     if (runner->state) {
-        evm_state_detach_mpt_stores(runner->state, NULL, NULL);
+        evm_state_set_flat_state(runner->state, NULL); /* detach before destroy */
         evm_state_destroy(runner->state);
     }
 
 #ifdef ENABLE_MPT
-    // Destroy runner-owned mpt stores
-    if (runner->account_mpt)
-        mpt_store_destroy((mpt_store_t *)runner->account_mpt);
-    if (runner->storage_mpt)
-        mpt_store_destroy((mpt_store_t *)runner->storage_mpt);
+    if (runner->flat_state)
+        flat_state_destroy((flat_state_t *)runner->flat_state);
 #endif
 
 #ifdef ENABLE_VERKLE
@@ -527,13 +523,13 @@ void test_runner_destroy(test_runner_t *runner) {
 void test_runner_reset(test_runner_t *runner) {
     if (!runner) return;
 
-    // Destroy old state (detach mpt stores first — runner owns them)
+    // Destroy old state (detach flat_state first — runner owns it)
     if (runner->evm) {
         evm_destroy(runner->evm);
         runner->evm = NULL;
     }
     if (runner->state) {
-        evm_state_detach_mpt_stores(runner->state, NULL, NULL);
+        evm_state_set_flat_state(runner->state, NULL);
         evm_state_destroy(runner->state);
         runner->state = NULL;
     }
@@ -557,16 +553,13 @@ void test_runner_reset(test_runner_t *runner) {
 #else
             NULL,
 #endif
-            NULL,  /* no mpt_store — runner owns stores separately */
+            NULL,  /* no mpt path — tries created via flat_state */
             NULL   /* no code_store for tests */
         );
         if (runner->state) {
-            // Re-attach runner-owned mpt stores (resets them in-place)
-            if (runner->account_mpt && runner->storage_mpt) {
-                evm_state_attach_mpt_stores(runner->state,
-                                             runner->account_mpt,
-                                             runner->storage_mpt);
-            }
+            /* Re-attach runner-owned flat_state (creates tries lazily) */
+            if (runner->flat_state)
+                evm_state_set_flat_state(runner->state, (flat_state_t *)runner->flat_state);
             runner->evm = evm_create(runner->state, NULL);
         }
 #ifdef ENABLE_VERKLE

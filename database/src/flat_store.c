@@ -482,6 +482,8 @@ bool flat_store_put(flat_store_t *s, const uint8_t *key,
                 memset(data_ptr(s, old_offset) + SLOT_HEADER_SIZE + s->key_size + record_len,
                        0, capacity - record_len);
             }
+            /* Re-insert to set dirty flags on ART path (for art_mpt) */
+            compact_art_insert(&s->index, key, &old_offset);
             return true;
         }
 
