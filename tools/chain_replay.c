@@ -1214,9 +1214,11 @@ int main(int argc, char **argv) {
                        ss.cache_accounts / 1000, ss.cache_slots / 1000,
                        ss.cache_arena_bytes / (1024*1024));
 #ifdef ENABLE_MPT
-                printf("  └ flat: %luK accts, %luK slots\n",
+                printf("  └ flat: %luK accts (%zuMB), %luK slots (%zuMB)\n",
                        ss.flat_acct_count / 1000,
-                       ss.flat_stor_count / 1000);
+                       ss.flat_acct_mem / (1024*1024),
+                       ss.flat_stor_count / 1000,
+                       ss.flat_stor_mem / (1024*1024));
                 if (ss.flat_acct_hit + ss.flat_acct_miss > 0 ||
                     ss.flat_stor_hit + ss.flat_stor_miss > 0) {
                     printf("  └ flat: acct %lu/%lu (%.1f%%)  stor %lu/%lu (%.1f%%)\n",

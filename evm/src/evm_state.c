@@ -2235,6 +2235,8 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
 #ifdef ENABLE_MPT
     s.flat_acct_count = es->flat_state ? flat_state_account_count(es->flat_state) : 0;
     s.flat_stor_count = es->flat_state ? flat_state_storage_count(es->flat_state) : 0;
+    s.flat_acct_mem = es->flat_state ? compact_art_memory_usage(flat_state_account_art(es->flat_state)) : 0;
+    s.flat_stor_mem = es->flat_state ? compact_art_memory_usage(flat_state_storage_art(es->flat_state)) : 0;
     if (es->code_store) {
         code_store_cache_stats_t cs = code_store_cache_stats(es->code_store);
         s.code_count       = code_store_count(es->code_store);

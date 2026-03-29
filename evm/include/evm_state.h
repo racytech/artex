@@ -306,6 +306,8 @@ typedef struct {
     /* Flat state (persistent, compact_art + mmap data files) */
     uint64_t flat_acct_count;     /* accounts in flat_state */
     uint64_t flat_stor_count;     /* storage slots in flat_state */
+    size_t   flat_acct_mem;       /* account compact_art memory (bytes) */
+    size_t   flat_stor_mem;       /* storage compact_art memory (bytes) */
 
     /* Code store */
     uint64_t code_count;

@@ -256,6 +256,11 @@ compact_ref_t compact_art_find_subtree(const compact_art_t *tree,
                                         uint32_t prefix_len,
                                         uint32_t *depth_out);
 
+/** Get memory usage: nodes pool + leaves pool (committed bytes). */
+static inline size_t compact_art_memory_usage(const compact_art_t *tree) {
+    return tree ? tree->nodes.used + tree->leaves.used : 0;
+}
+
 // ============================================================================
 // Iterator (ordered traversal)
 // ============================================================================
