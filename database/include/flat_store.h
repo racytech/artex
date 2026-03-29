@@ -145,11 +145,25 @@ uint32_t flat_store_read_leaf_record(const flat_store_t *store,
                                       uint8_t *buf, uint32_t buf_size);
 
 /* =========================================================================
+ * Deferred Buffer
+ * ========================================================================= */
+
+/**
+ * Flush deferred (in-memory) writes to the data file.
+ * Updates compact_art leaves to point to file offsets.
+ * Call at checkpoint/evict time.
+ */
+void flat_store_flush_deferred(flat_store_t *store);
+
+/** Discard all deferred writes without flushing. */
+void flat_store_clear_deferred(flat_store_t *store);
+
+/* =========================================================================
  * Durability
  * ========================================================================= */
 
 /**
- * Write header and fsync the data file.
+ * Flush deferred buffer + write header.
  */
 void flat_store_sync(flat_store_t *store);
 

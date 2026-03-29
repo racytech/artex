@@ -531,8 +531,10 @@ void evm_state_evict_cache(evm_state_t *es) {
     if (!es) return;
 
     if (es->flat_state) {
-        /* Both storage slots and accounts are flushed to flat_state
-         * during compute_mpt_root (before trie hash computation). */
+        /* Flush deferred writes to disk — data was accumulated in memory
+         * during compute_mpt_root. Now persist to the data files. */
+        flat_store_flush_deferred(flat_state_account_store(es->flat_state));
+        flat_store_flush_deferred(flat_state_storage_store(es->flat_state));
     }
     /* Free code pointers for all cached accounts before arena destroy */
     mem_art_foreach(&es->accounts, free_code_cb, NULL);
