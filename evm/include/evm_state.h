@@ -15,9 +15,6 @@
 typedef struct verkle_state_fwd verkle_state_t;
 #endif
 
-#ifdef ENABLE_MPT
-#endif
-
 /* Forward declaration — code_store lifecycle is managed by caller */
 typedef struct code_store code_store_t;
 
@@ -282,7 +279,6 @@ bool evm_state_finalize(evm_state_t *es);
  */
 hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
 
-#ifdef ENABLE_MPT
 /**
  * Compute MPT (Merkle Patricia Trie) state root from the in-memory caches.
  * Used for pre-Verkle block validation against block headers.
@@ -291,7 +287,6 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
  * @param prune_empty  If true (EIP-161+), exclude empty accounts from the trie.
  */
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty);
-#endif
 // ============================================================================
 // Cache / Store Statistics
 // ============================================================================
@@ -302,7 +297,6 @@ typedef struct {
     size_t   cache_slots;         /* entries in storage slot cache */
     size_t   cache_arena_bytes;   /* total arena bytes (accounts + storage) */
 
-#ifdef ENABLE_MPT
     /* Flat state (persistent, compact_art + mmap data files) */
     uint64_t flat_acct_count;     /* accounts in flat_state */
     uint64_t flat_stor_count;     /* storage slots in flat_state */
@@ -330,7 +324,6 @@ typedef struct {
     /* Checkpoint timing (filled by sync, not evm_state) */
     double   evict_ms;
     double   wait_flush_ms;
-#endif
 } evm_state_stats_t;
 
 evm_state_stats_t evm_state_get_stats(const evm_state_t *es);

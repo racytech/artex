@@ -1,13 +1,12 @@
 #include "evm_state.h"
 #include "mem_art.h"
 #include "keccak256.h"
-#ifdef ENABLE_MPT
 #include "code_store.h"
 #include "flat_state.h"
+#include "compact_art.h"
 #include "storage_trie.h"
 #include "account_trie.h"
 #include "flat_store.h"
-#endif
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -260,7 +259,6 @@ struct evm_state {
 #ifdef ENABLE_VERKLE
     witness_gas_t     witness_gas;  // EIP-4762 verkle witness gas tracker
 #endif
-#ifdef ENABLE_MPT
     account_trie_t   *account_trie; // account MPT root from flat_state's compact_art
     storage_trie_t   *storage_trie; // per-account storage roots from flat_state's compact_art
     code_store_t     *code_store;   // content-addressed bytecode store (not owned)
@@ -276,13 +274,11 @@ struct evm_state {
     uint64_t flat_acct_miss;
     uint64_t flat_stor_hit;
     uint64_t flat_stor_miss;
-#endif
 };
 
 // ============================================================================
 // Forward declarations (MPT read-through helpers defined later)
 // ============================================================================
-#ifdef ENABLE_MPT
 static bool mpt_rlp_decode_account(const uint8_t *rlp, size_t len,
                                      cached_account_t *ca);
 static uint256_t mpt_rlp_decode_storage_value(const uint8_t *rlp, size_t len);
@@ -303,7 +299,6 @@ static inline void mark_slot_mpt_dirty(evm_state_t *es, cached_slot_t *cs) {
         dirty_slot_push(&es->dirty_slots, cs->key);
     }
 }
-#endif
 
 // Mark account as tx-dirty (for fast commit_tx iteration).
 // Only pushes on first dirty transition per tx (idempotent).
@@ -387,7 +382,6 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
     ca_local.storage_root = HASH_EMPTY_STORAGE;
     ca_local.addr_hash = hash_keccak256(addr->bytes, 20);
 
-#ifdef ENABLE_MPT
     // Fast path: O(1) flat state lookup (single disk_table read, mmap'd)
     if (es->flat_state) {
         flat_account_record_t frec;
@@ -404,7 +398,6 @@ static cached_account_t *ensure_account(evm_state_t *es, const address_t *addr) 
             es->flat_acct_miss++;
         }
     }
-#endif
 
 #if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
     ca_local.original_nonce = ca_local.nonce;
@@ -445,7 +438,6 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
     cs_local.current = cs_local.original;
 #endif
 
-#ifdef ENABLE_MPT
     // Compute and cache keccak256(slot_be) — reused at MPT write time
     cs_local.slot_hash = hash_keccak256(skey + 20, 32);
 
@@ -464,7 +456,6 @@ static cached_slot_t *ensure_slot(evm_state_t *es, const address_t *addr,
             }
         }
     }
-#endif
 
 #if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
     cs_local.block_original = cs_local.original;
@@ -486,12 +477,8 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
 #else
     (void)vs;
 #endif
-#ifdef ENABLE_MPT
-    (void)cs;  /* stored after MPT init */
-#else
     (void)mpt_path;
-    (void)cs;
-#endif
+    (void)cs;  /* stored after init */
 
     evm_state_t *es = calloc(1, sizeof(evm_state_t));
     if (!es) return NULL;
@@ -525,14 +512,7 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
     witness_gas_init(&es->witness_gas);
 #endif
 
-#ifdef ENABLE_MPT
-    if (mpt_path) {
-        (void)mpt_path; /* path unused — tries created lazily via flat_state */
-        /* account_trie and storage_trie are created when flat_state is set
-         * (they need flat_state's compact_art and flat_store) */
-        es->code_store = cs;
-    }
-#endif
+    es->code_store = cs;
 
     return es;
 }
@@ -550,7 +530,6 @@ static bool free_code_cb(const uint8_t *key, size_t key_len,
 void evm_state_evict_cache(evm_state_t *es) {
     if (!es) return;
 
-#ifdef ENABLE_MPT
     if (es->flat_state) {
         /* Both storage slots and accounts are flushed to flat_state
          * during compute_mpt_root (before trie hash computation). */
@@ -559,9 +538,6 @@ void evm_state_evict_cache(evm_state_t *es) {
     mem_art_foreach(&es->accounts, free_code_cb, NULL);
     dirty_account_clear(&es->dirty_accounts);
     dirty_slot_clear(&es->dirty_slots);
-#else
-    mem_art_foreach(&es->accounts, free_code_cb, NULL);
-#endif
 
     mem_art_destroy(&es->accounts);
     mem_art_destroy(&es->storage);
@@ -570,17 +546,13 @@ void evm_state_evict_cache(evm_state_t *es) {
     mem_art_init(&es->accounts);
     mem_art_init(&es->storage);
 
-#ifdef ENABLE_MPT
     /* Reset flat state counters for next window */
     es->flat_acct_hit = es->flat_acct_miss = 0;
     es->flat_stor_hit = es->flat_stor_miss = 0;
-#endif
 }
 
 void evm_state_flush(evm_state_t *es) {
     if (!es) return;
-#ifdef ENABLE_MPT
-#endif
 }
 
 
@@ -588,7 +560,6 @@ void evm_state_set_batch_mode(evm_state_t *es, bool enabled) {
     if (es) es->batch_mode = enabled;
 }
 
-#ifdef ENABLE_MPT
 void evm_state_set_flat_state(evm_state_t *es, flat_state_t *fs) {
     if (!es) return;
     es->flat_state = fs;
@@ -613,7 +584,6 @@ void evm_state_set_flat_state(evm_state_t *es, flat_state_t *fs) {
 flat_state_t *evm_state_get_flat_state(const evm_state_t *es) {
     return es ? es->flat_state : NULL;
 }
-#endif
 
 
 void evm_state_flush_verkle(evm_state_t *es) {
@@ -640,14 +610,11 @@ void evm_state_flush_verkle(evm_state_t *es) {
 void evm_state_destroy(evm_state_t *es) {
     if (!es) return;
 
-#ifdef ENABLE_MPT
-    // Flush deferred writes and destroy persistent MPT stores.
-    // Skip flush if discard_on_destroy is set (failed block — don't corrupt disk state).
+    // Destroy persistent MPT trie handles.
     if (es->account_trie) account_trie_destroy(es->account_trie);
     if (es->storage_trie) storage_trie_destroy(es->storage_trie);
     dirty_account_free(&es->dirty_accounts);
     dirty_slot_free(&es->dirty_slots);
-#endif
 
     tx_dirty_addr_free(&es->tx_dirty_accounts);
     tx_dirty_slot_free(&es->tx_dirty_slots);
@@ -851,7 +818,7 @@ uint32_t evm_state_get_code_size(evm_state_t *es, const address_t *addr) {
 #ifdef ENABLE_VERKLE
     // Load code size from verkle_state
     ca->code_size = (uint32_t)verkle_state_get_code_size(es->vs, addr->bytes);
-#elif defined(ENABLE_MPT)
+#else
     // Load code from code_store to get the size (also caches the code)
     if (es->code_store && ca->code_size == 0) {
         uint32_t size = code_store_get_size(es->code_store,
@@ -894,7 +861,7 @@ bool evm_state_get_code(evm_state_t *es, const address_t *addr,
 
         uint64_t got = verkle_state_get_code(es->vs, addr->bytes, ca->code, len);
         ca->code_size = (uint32_t)got;
-#elif defined(ENABLE_MPT)
+#else
         if (es->code_store) {
             uint32_t size = code_store_get_size(es->code_store,
                                                  ca->code_hash.bytes);
@@ -911,9 +878,6 @@ bool evm_state_get_code(evm_state_t *es, const address_t *addr,
             if (out_len) *out_len = 0;
             return true;
         }
-#else
-        if (out_len) *out_len = 0;
-        return true;
 #endif
     }
 
@@ -958,7 +922,7 @@ const uint8_t *evm_state_get_code_ptr(evm_state_t *es, const address_t *addr,
 
         uint64_t got = verkle_state_get_code(es->vs, addr->bytes, ca->code, len);
         ca->code_size = (uint32_t)got;
-#elif defined(ENABLE_MPT)
+#else
         if (es->code_store) {
             uint32_t size = code_store_get_size(es->code_store,
                                                  ca->code_hash.bytes);
@@ -975,9 +939,6 @@ const uint8_t *evm_state_get_code_ptr(evm_state_t *es, const address_t *addr,
             if (out_len) *out_len = 0;
             return NULL;
         }
-#else
-        if (out_len) *out_len = 0;
-        return NULL;
 #endif
     }
 
@@ -1021,10 +982,8 @@ void evm_state_set_code(evm_state_t *es, const address_t *addr,
         }
         ca->has_code = true;
         ca->code_hash = hash_keccak256(code, len);
-#ifdef ENABLE_MPT
         if (es->code_store)
             code_store_put(es->code_store, ca->code_hash.bytes, code, len);
-#endif
     } else {
         ca->has_code = false;
         ca->code_hash = hash_zero();
@@ -1140,14 +1099,12 @@ void evm_state_set_storage(evm_state_t *es, const address_t *addr,
 bool evm_state_has_storage(evm_state_t *es, const address_t *addr) {
     if (!es || !addr) return false;
 
-#ifdef ENABLE_MPT
     // Fast path: check cached storage_root from the account.
     // After cache eviction, in-memory slots are gone but the account's
     // storage_root (loaded from the MPT) tells us if storage exists on disk.
     cached_account_t *ca = ensure_account(es, addr);
     if (ca && memcmp(ca->storage_root.bytes, HASH_EMPTY_STORAGE.bytes, 32) != 0)
         return true;
-#endif
 
     // Scan the storage cache for any entry belonging to this address
     mem_art_iterator_t *iter = mem_art_iterator_create(&es->storage);
@@ -1488,14 +1445,10 @@ static bool commit_tx_slot_cb(const uint8_t *key, size_t key_len,
             cs->original = UINT256_ZERO;
             cs->dirty = false;
             cs->block_dirty = false;
-#ifdef ENABLE_MPT
             /* Mark as mpt_dirty so it appears in dirty_slots for eviction
              * (ensures flat_state deletes this zeroed slot) */
             if (ctx->es)
                 mark_slot_mpt_dirty(ctx->es, cs);
-#else
-            cs->mpt_dirty = false;
-#endif
             return true;
         }
     }
@@ -2043,16 +1996,13 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     // MPT path: delegate to compute_mpt_root which handles promotion,
     // block_dirty clearing, and EIP-161 pruning.
     // In batch mode, defer to checkpoint — dirty flags must accumulate.
-#ifdef ENABLE_MPT
     if (es->account_trie && !es->batch_mode)
         return evm_state_compute_mpt_root(es, prune_empty);
-#endif
     (void)prune_empty;
     return hash_zero();
 #endif
 }
 
-#ifdef ENABLE_MPT
 // ============================================================================
 // MPT State Root Computation (pre-Verkle block validation)
 // ============================================================================
@@ -2232,7 +2182,6 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
     s.cache_slots      = mem_art_size(&es->storage);
     s.cache_arena_bytes = es->accounts.arena_used + es->storage.arena_used;
 
-#ifdef ENABLE_MPT
     s.flat_acct_count = es->flat_state ? flat_state_account_count(es->flat_state) : 0;
     s.flat_stor_count = es->flat_state ? flat_state_storage_count(es->flat_state) : 0;
     s.flat_acct_mem = es->flat_state ? compact_art_memory_usage(flat_state_account_art(es->flat_state)) : 0;
@@ -2252,7 +2201,6 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
     s.flat_acct_miss   = es->flat_acct_miss;
     s.flat_stor_hit    = es->flat_stor_hit;
     s.flat_stor_miss   = es->flat_stor_miss;
-#endif
     return s;
 }
 
@@ -2297,13 +2245,9 @@ static bool debug_dump_all_slot_cb(const uint8_t *key, size_t key_len,
     return true;
 }
 void evm_state_print_mpt_stats(evm_state_t *es) {
-#ifdef ENABLE_MPT
     if (!es) return;
     fprintf(stderr, "  account: via account_trie (flat_state compact_art)\n");
     fprintf(stderr, "  storage: via storage_trie (flat_state compact_art)\n");
-#else
-    (void)es;
-#endif
 }
 
 void evm_state_debug_dump(evm_state_t *es) {
@@ -2561,7 +2505,6 @@ void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
     if (!groups) return;
 
     /* --- Phase 1: account diffs → create groups --- */
-#ifdef ENABLE_MPT
     for (size_t d = 0; d < es->dirty_accounts.count; d++) {
         const uint8_t *akey = es->dirty_accounts.keys + d * 20;
         const cached_account_t *ca = (const cached_account_t *)mem_art_get(
@@ -2611,10 +2554,8 @@ void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
             g->code_hash = ca->code_hash;
         }
     }
-#endif
 
     /* --- Phase 2: storage diffs → assign to groups --- */
-#ifdef ENABLE_MPT
     for (size_t d = 0; d < es->dirty_slots.count; d++) {
         const uint8_t *skey = es->dirty_slots.keys + d * SLOT_KEY_SIZE;
         const cached_slot_t *cs = (const cached_slot_t *)mem_art_get(
@@ -2650,7 +2591,6 @@ void evm_state_collect_block_diff(evm_state_t *es, block_diff_t *out) {
         s->slot = uint256_from_bytes(skey + 20, 32);
         s->value = cs->current;
     }
-#endif
 
     out->groups = groups;
     out->group_count = group_count;
@@ -2878,7 +2818,6 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
 
     return root;
 }
-#endif /* ENABLE_MPT */
 
 // ============================================================================
 // Witness Gas (EIP-4762)
