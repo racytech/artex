@@ -58,6 +58,7 @@ struct art_mpt {
     uint8_t     *inline_cache;  /* inline_cache[ref_idx * 31] */
     size_t       inline_cap;
 
+    bool             no_cache;   /* disable caching (for stateless full recompute) */
     art_mpt_stats_t stats;
 };
 
@@ -290,17 +291,16 @@ static inline size_t ref_to_idx(compact_ref_t ref) {
 
 static bool cache_get(art_mpt_t *am, compact_ref_t ref,
                        size_t byte_depth, uint8_t *rlp_out, size_t *rlp_len) {
-    return false; /* DISABLED */
     if (COMPACT_IS_LEAF_REF(ref)) return false;
     if (node_is_dirty(am->tree, ref)) return false;
     size_t idx = ref_to_idx(ref);
     if (idx >= am->cache_cap) return false;
     const hash_entry_t *e = &am->cache[idx];
     if (e->rlp_len == 0) return false;
-    /* Depth must match — same subtree at different depth produces different hash */
     if (e->depth != (uint8_t)byte_depth) return false;
 
-    if (e->rlp_len < 32) {
+    if (e->rlp_len <= 31) {
+        /* Inline RLP: small node stored directly */
         if (idx < am->inline_cap && am->inline_cache) {
             memcpy(rlp_out, am->inline_cache + idx * 31, e->rlp_len);
             *rlp_len = e->rlp_len;
@@ -308,15 +308,29 @@ static bool cache_get(art_mpt_t *am, compact_ref_t ref,
         }
         return false;
     }
-    rlp_out[0] = 0xa0;
-    memcpy(rlp_out + 1, e->hash, 32);
-    *rlp_len = 33;
-    return true;
+    /* Large node: hash stored. Reconstruct the full RLP?
+     * We can't — we only stored the 32-byte hash.
+     * Return as a SPECIAL marker that the caller handles. */
+    /* Actually: we need to return something that encode_child_ref
+     * can use correctly. The parent calls encode_child_ref(our_result).
+     * If our_result >= 32 bytes, encode_child_ref hashes it.
+     * We need to AVOID double-hashing.
+     *
+     * Solution: return a 32-byte value that IS the hash.
+     * But 32 bytes triggers encode_child_ref to hash again. Wrong.
+     *
+     * Real solution: don't let the parent call encode_child_ref on us.
+     * Return the CHILD REFERENCE directly (33 bytes: 0xa0 + hash).
+     * The parent must detect this and embed it as-is.
+     *
+     * Simplest fix: store the full RLP in the cache. */
+    return false; /* TODO: store full RLP for large nodes */
 }
 
 static void cache_put(art_mpt_t *am, compact_ref_t ref,
                        size_t byte_depth, const uint8_t *rlp, size_t rlp_len) {
     if (COMPACT_IS_LEAF_REF(ref)) return;
+    if (am->no_cache) return;
     size_t idx = ref_to_idx(ref);
 
     if (idx >= am->cache_cap) {
@@ -681,9 +695,12 @@ void art_mpt_reset_stats(art_mpt_t *am) {
 void art_mpt_root_hash_full(const compact_art_t *tree,
                               art_mpt_value_encode_t encode, void *ctx,
                               uint8_t out[32]) {
-    /* Create temporary context, compute, destroy */
+    /* Stateless: create temp context with caching disabled.
+     * Does NOT modify dirty flags on the tree — safe to call
+     * alongside an incremental art_mpt_t on the same tree. */
     art_mpt_t *am = art_mpt_create((compact_art_t *)tree, encode, ctx);
     if (!am) { memcpy(out, EMPTY_ROOT, 32); return; }
+    am->no_cache = true;  /* disable cache_put (and node_clear_dirty) */
     art_mpt_root_hash(am, out);
     art_mpt_destroy(am);
 }
