@@ -2799,16 +2799,16 @@ void evm_state_prune_empty_accounts(evm_state_t *es) {
         flat_account_record_t fr;
         if (!flat_state_get_account(es->flat_state, fk, &fr)) continue;
 
-        /* Check empty: nonce=0, balance=0, no code, no storage */
+        /* EIP-161 empty: nonce=0, balance=0, no code.
+         * Storage is irrelevant — empty accounts are pruned regardless. */
         if (fr.nonce != 0) continue;
 
         uint8_t zero[32] = {0};
         if (memcmp(fr.balance, zero, 32) != 0) continue;
 
+        /* Code check: EMPTY_CODE hash or zero hash (never-set internal default) */
         if (memcmp(fr.code_hash, HASH_EMPTY_CODE.bytes, 32) != 0 &&
             memcmp(fr.code_hash, zero, 32) != 0) continue;
-
-        if (memcmp(fr.storage_root, HASH_EMPTY_STORAGE.bytes, 32) != 0) continue;
 
         /* Empty — schedule for deletion */
         if (del_count >= del_cap) {
@@ -2826,6 +2826,7 @@ void evm_state_prune_empty_accounts(evm_state_t *es) {
     compact_art_iterator_destroy(it);
 
     for (size_t i = 0; i < del_count; i++) {
+        flat_state_delete_all_storage(es->flat_state, del_keys[i]);
         flat_state_delete_account(es->flat_state, del_keys[i]);
         free(del_keys[i]);
     }
@@ -2833,6 +2834,20 @@ void evm_state_prune_empty_accounts(evm_state_t *es) {
 
     if (del_count > 0)
         fprintf(stderr, "EIP-161: pruned %zu empty accounts from flat_state\n", del_count);
+}
+
+/* EIP-161: mark cached empty accounts as !existed so they're not re-written */
+static bool prune_empty_cache_cb(const uint8_t *key, size_t key_len,
+                                   const void *value, size_t value_len,
+                                   void *user_data) {
+    (void)key; (void)key_len; (void)value_len; (void)user_data;
+    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
+    if (!ca->existed) return true;
+    bool is_empty = (ca->nonce == 0 &&
+                     uint256_is_zero(&ca->balance) &&
+                     !ca->has_code);
+    if (is_empty) ca->existed = false;
+    return true;
 }
 
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
@@ -2848,14 +2863,11 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     clock_gettime(CLOCK_MONOTONIC, &_rt0);
     size_t _acct_dirty_count = es->dirty_accounts.count;
 
-    /* Step 0. EIP-161: prune empty accounts on first prune_empty=true call */
-    if (prune_empty) {
-        static bool _eip161_cleaned = false;
-        if (!_eip161_cleaned) {
-            evm_state_prune_empty_accounts(es);
-            _eip161_cleaned = true;
-        }
-    }
+    /* Note: EIP-161 empty account pruning is handled per-block by the
+     * promotion logic in step 1 (prune_empty flag prevents empty accounts
+     * from being promoted to existed=true). Untouched empty accounts from
+     * pre-SD blocks remain in flat_state — this is correct per Ethereum
+     * spec (they're only removed when touched post-SD). */
 
     /* ================================================================
      * Step 1. Promote 'existed' on dirty accounts.

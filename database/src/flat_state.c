@@ -380,54 +380,46 @@ uint64_t flat_state_delete_all_storage(flat_state_t *fs,
     compact_art_t *art = flat_store_get_art(fs->storage);
     if (!art) return 0;
 
-    /* Find the subtree for this addr_hash */
+    /* Quick check: does this account have any storage? */
     uint32_t depth_out;
     compact_ref_t subtree = compact_art_find_subtree(art, addr_hash, 32, &depth_out);
     if (subtree == COMPACT_REF_NULL) return 0;
 
-    /* Collect all keys under this prefix, then delete them.
-     * Can't delete while iterating — collect first. */
-    uint8_t **keys = NULL;
-    size_t count = 0, cap = 0;
+    /* Collect keys into a flat buffer (one alloc, no per-key malloc) */
+    size_t cap = 64;
+    size_t count = 0;
+    uint8_t *keys = malloc(cap * STOR_KEY_SIZE);
+    if (!keys) return 0;
 
-    /* Use iterator starting from a seek to addr_hash||00..00 */
     compact_art_iterator_t *it = compact_art_iterator_create(art);
-    if (!it) return 0;
+    if (!it) { free(keys); return 0; }
 
-    /* Seek to first key >= addr_hash || 00..00 */
-    uint8_t seek_key[64];
+    uint8_t seek_key[STOR_KEY_SIZE];
     memcpy(seek_key, addr_hash, 32);
     memset(seek_key + 32, 0, 32);
     compact_art_iterator_seek(it, seek_key);
 
     while (compact_art_iterator_next(it)) {
         const void *leaf_val = compact_art_iterator_value(it);
-        uint8_t full_key[64];
+        uint8_t full_key[STOR_KEY_SIZE];
         if (!art->key_fetch(leaf_val, full_key, art->key_fetch_ctx))
             continue;
-
-        /* Check prefix matches */
         if (memcmp(full_key, addr_hash, 32) != 0)
-            break; /* past this account's entries */
+            break;
 
         if (count >= cap) {
-            size_t nc = cap ? cap * 2 : 64;
-            uint8_t **nk = realloc(keys, nc * sizeof(uint8_t *));
+            size_t nc = cap * 2;
+            uint8_t *nk = realloc(keys, nc * STOR_KEY_SIZE);
             if (!nk) break;
             keys = nk; cap = nc;
         }
-        keys[count] = malloc(64);
-        if (keys[count]) {
-            memcpy(keys[count], full_key, 64);
-            count++;
-        }
+        memcpy(keys + count * STOR_KEY_SIZE, full_key, STOR_KEY_SIZE);
+        count++;
     }
     compact_art_iterator_destroy(it);
 
-    /* Delete collected keys */
     for (size_t i = 0; i < count; i++) {
-        flat_store_delete(fs->storage, keys[i]);
-        free(keys[i]);
+        flat_store_delete(fs->storage, keys + i * STOR_KEY_SIZE);
     }
     free(keys);
 
