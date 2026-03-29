@@ -430,6 +430,15 @@ flat_store_t *flat_state_storage_store(flat_state_t *fs) {
     return fs ? fs->storage : NULL;
 }
 
+compact_art_t *flat_state_account_art(flat_state_t *fs) {
+    if (!fs || !fs->accounts) return NULL;
+    return flat_store_get_art(fs->accounts);
+}
+
+flat_store_t *flat_state_account_store(flat_state_t *fs) {
+    return fs ? fs->accounts : NULL;
+}
+
 /* =========================================================================
  * Stats
  * ========================================================================= */

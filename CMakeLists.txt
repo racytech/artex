@@ -210,6 +210,10 @@ add_library(storage_trie STATIC database/src/storage_trie.c)
 target_include_directories(storage_trie PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 target_link_libraries(storage_trie art_mpt flat_store)
 
+add_library(account_trie STATIC database/src/account_trie.c)
+target_include_directories(account_trie PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+target_link_libraries(account_trie art_mpt flat_store flat_state)
+
 #==============================================================================
 # Libraries — EVM
 #==============================================================================
@@ -245,7 +249,7 @@ if(ENABLE_VERKLE)
     list(APPEND EVM_LINK_LIBS verkle_state)
 endif()
 if(ENABLE_MPT)
-    list(APPEND EVM_LINK_LIBS mpt_arena code_store flat_state storage_trie)
+    list(APPEND EVM_LINK_LIBS mpt_arena code_store flat_state storage_trie account_trie)
 endif()
 target_link_libraries(evm ${EVM_LINK_LIBS})
 if(ENABLE_MPT)

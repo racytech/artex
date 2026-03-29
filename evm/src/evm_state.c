@@ -6,6 +6,7 @@
 #include "code_store.h"
 #include "flat_state.h"
 #include "storage_trie.h"
+#include "account_trie.h"
 #include "flat_store.h"
 #endif
 #include <stdlib.h>
@@ -261,7 +262,7 @@ struct evm_state {
     witness_gas_t     witness_gas;  // EIP-4762 verkle witness gas tracker
 #endif
 #ifdef ENABLE_MPT
-    mpt_arena_t      *account_mpt;  // persistent incremental account trie
+    account_trie_t   *account_trie; // account MPT root from flat_state's compact_art
     storage_trie_t   *storage_trie; // per-account storage roots from flat_state's compact_art
     code_store_t     *code_store;   // content-addressed bytecode store (not owned)
     flat_state_t     *flat_state;   // O(1) disk-backed state (not owned, optional)
@@ -271,7 +272,7 @@ struct evm_state {
     double              last_root_stor_ms;
     double              last_root_acct_ms;
     size_t              last_root_dirty_count;
-    mpt_arena_commit_stats_t  last_acct_commit;
+    /* mpt_arena commit stats no longer needed — using art_mpt */
     /* Flat state lookup counters (reset per checkpoint window) */
     uint64_t flat_acct_hit;
     uint64_t flat_acct_miss;
@@ -528,22 +529,9 @@ evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
 
 #ifdef ENABLE_MPT
     if (mpt_path) {
-        (void)mpt_path; /* path unused — arena is in-memory */
-        es->account_mpt = mpt_arena_create();
-        if (!es->account_mpt) {
-            fprintf(stderr, "FATAL: failed to create account MPT arena\n");
-            mem_art_destroy(&es->accounts);
-            mem_art_destroy(&es->storage);
-            mem_art_destroy(&es->warm_addrs);
-            mem_art_destroy(&es->warm_slots);
-            mem_art_destroy(&es->transient);
-            free(es->journal);
-            free(es);
-            return NULL;
-        }
-
-        /* storage_trie is created lazily when flat_state is set
-         * (it needs flat_state's compact_art and flat_store) */
+        (void)mpt_path; /* path unused — tries created lazily via flat_state */
+        /* account_trie and storage_trie are created when flat_state is set
+         * (they need flat_state's compact_art and flat_store) */
         es->code_store = cs;
     }
 #endif
@@ -556,11 +544,7 @@ bool evm_state_init_mpt_stores(evm_state_t *es, const char *path,
 #ifdef ENABLE_MPT
     (void)path; (void)acct_cap; (void)stor_cap;
     if (!es) return false;
-    if (es->account_mpt) return false;
-
-    es->account_mpt = mpt_arena_create();
-    if (!es->account_mpt) return false;
-    /* storage_trie created lazily when flat_state is set */
+    /* account_trie and storage_trie created lazily when flat_state is set */
     return true;
 #else
     (void)es; (void)path; (void)acct_cap; (void)stor_cap;
@@ -571,7 +555,7 @@ bool evm_state_init_mpt_stores(evm_state_t *es, const char *path,
 void evm_state_reset_mpt_stores(evm_state_t *es) {
 #ifdef ENABLE_MPT
     if (!es) return;
-    if (es->account_mpt) mpt_arena_reset(es->account_mpt);
+    if (es->account_trie) account_trie_invalidate_all(es->account_trie);
     if (es->storage_trie) storage_trie_invalidate_all(es->storage_trie);
 #else
     (void)es;
@@ -582,7 +566,7 @@ void evm_state_get_mpt_stores(const evm_state_t *es,
                                 void **out_account_mpt,
                                 void **out_storage_mpt) {
 #ifdef ENABLE_MPT
-    if (out_account_mpt) *out_account_mpt = es ? es->account_mpt : NULL;
+    if (out_account_mpt) *out_account_mpt = NULL; /* account_trie replaces account_mpt */
     if (out_storage_mpt) *out_storage_mpt = NULL; /* storage_trie replaces storage_mpt */
 #else
     if (out_account_mpt) *out_account_mpt = NULL;
@@ -595,9 +579,8 @@ void evm_state_detach_mpt_stores(evm_state_t *es,
                                    void **out_storage_mpt) {
 #ifdef ENABLE_MPT
     if (!es) return;
-    if (out_account_mpt) *out_account_mpt = es->account_mpt;
+    if (out_account_mpt) *out_account_mpt = NULL;
     if (out_storage_mpt) *out_storage_mpt = NULL;
-    es->account_mpt = NULL;
 #else
     (void)es;
     if (out_account_mpt) *out_account_mpt = NULL;
@@ -609,9 +592,8 @@ void evm_state_attach_mpt_stores(evm_state_t *es,
                                    void *account_mpt, void *storage_mpt) {
 #ifdef ENABLE_MPT
     if (!es) return;
-    (void)storage_mpt; /* storage_trie replaces storage_mpt */
-    es->account_mpt = (mpt_arena_t *)account_mpt;
-    if (es->account_mpt) mpt_arena_reset(es->account_mpt);
+    (void)account_mpt; (void)storage_mpt;
+    /* account_trie and storage_trie are managed via flat_state, not externally */
 #else
     (void)es; (void)account_mpt; (void)storage_mpt;
 #endif
@@ -632,32 +614,8 @@ void evm_state_evict_cache(evm_state_t *es) {
 
 #ifdef ENABLE_MPT
     if (es->flat_state) {
-        /* Storage slots already flushed to flat_state in compute_all_storage_roots.
-         * Only flush dirty accounts here. */
-
-        /* Flush dirty accounts to flat_state.
-         * For shared storage MPT: manage external refcounts so that
-         * storage root nodes referenced by flat_state are not freed
-         * by other accounts' commits in future checkpoints. */
-        for (size_t d = 0; d < es->dirty_accounts.count; d++) {
-            const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
-            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
-                &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
-            if (!ca) continue;
-
-            if (ca->existed) {
-                flat_account_record_t frec;
-                frec.nonce = ca->nonce;
-                uint256_to_bytes(&ca->balance, frec.balance);
-                const uint8_t *ch = ca->has_code
-                    ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
-                memcpy(frec.code_hash, ch, 32);
-                memcpy(frec.storage_root, ca->storage_root.bytes, 32);
-                flat_state_put_account(es->flat_state, ca->addr_hash.bytes, &frec);
-            } else {
-                flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
-            }
-        }
+        /* Both storage slots and accounts are flushed to flat_state
+         * during compute_mpt_root (before trie hash computation). */
     }
     /* Free code pointers for all cached accounts before arena destroy */
     mem_art_foreach(&es->accounts, free_code_cb, NULL);
@@ -698,17 +656,20 @@ void evm_state_set_flat_state(evm_state_t *es, flat_state_t *fs) {
     if (!es) return;
     es->flat_state = fs;
 
-    /* Create or destroy storage_trie based on flat_state availability */
+    /* Create or destroy tries based on flat_state availability */
     if (fs) {
-        compact_art_t *art = flat_state_storage_art(fs);
-        flat_store_t *store = flat_state_storage_store(fs);
-        if (art && store && !es->storage_trie)
-            es->storage_trie = storage_trie_create(art, store);
+        compact_art_t *s_art = flat_state_storage_art(fs);
+        flat_store_t  *s_store = flat_state_storage_store(fs);
+        if (s_art && s_store && !es->storage_trie)
+            es->storage_trie = storage_trie_create(s_art, s_store);
+
+        compact_art_t *a_art = flat_state_account_art(fs);
+        flat_store_t  *a_store = flat_state_account_store(fs);
+        if (a_art && a_store && !es->account_trie)
+            es->account_trie = account_trie_create(a_art, a_store);
     } else {
-        if (es->storage_trie) {
-            storage_trie_destroy(es->storage_trie);
-            es->storage_trie = NULL;
-        }
+        if (es->storage_trie) { storage_trie_destroy(es->storage_trie); es->storage_trie = NULL; }
+        if (es->account_trie) { account_trie_destroy(es->account_trie); es->account_trie = NULL; }
     }
 }
 
@@ -745,12 +706,8 @@ void evm_state_destroy(evm_state_t *es) {
 #ifdef ENABLE_MPT
     // Flush deferred writes and destroy persistent MPT stores.
     // Skip flush if discard_on_destroy is set (failed block — don't corrupt disk state).
-    if (es->account_mpt) {
-        mpt_arena_destroy(es->account_mpt);
-    }
-    if (es->storage_trie) {
-        storage_trie_destroy(es->storage_trie);
-    }
+    if (es->account_trie) account_trie_destroy(es->account_trie);
+    if (es->storage_trie) storage_trie_destroy(es->storage_trie);
     dirty_account_free(&es->dirty_accounts);
     dirty_slot_free(&es->dirty_slots);
 #endif
@@ -2150,7 +2107,7 @@ hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty) {
     // block_dirty clearing, and EIP-161 pruning.
     // In batch mode, defer to checkpoint — dirty flags must accumulate.
 #ifdef ENABLE_MPT
-    if (es->account_mpt && !es->batch_mode)
+    if (es->account_trie && !es->batch_mode)
         return evm_state_compute_mpt_root(es, prune_empty);
 #endif
     (void)prune_empty;
@@ -2339,11 +2296,9 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
     s.cache_arena_bytes = es->accounts.arena_used + es->storage.arena_used;
 
 #ifdef ENABLE_MPT
-    if (es->account_mpt) {
-        mpt_arena_stats_t ms = mpt_arena_stats(es->account_mpt);
-        s.acct_mpt_nodes       = ms.node_count;
-        s.acct_mpt_data_bytes  = ms.arena_bytes;
-    }
+    /* account_trie: no mpt_arena stats — uses flat_state's compact_art */
+    s.acct_mpt_nodes = 0;
+    s.acct_mpt_data_bytes = 0;
     /* storage_trie: no mpt_arena stats — uses flat_state's compact_art */
     s.stor_mpt_nodes = 0;
     s.stor_mpt_data_bytes = 0;
@@ -2359,7 +2314,7 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
     s.root_acct_ms     = es->last_root_acct_ms;
     s.root_dirty_count = es->last_root_dirty_count;
     s.stor_commit      = (mpt_arena_commit_stats_t){0};
-    s.acct_commit      = es->last_acct_commit;
+    s.acct_commit      = (mpt_arena_commit_stats_t){0};
     s.flat_acct_hit    = es->flat_acct_hit;
     s.flat_acct_miss   = es->flat_acct_miss;
     s.flat_stor_hit    = es->flat_stor_hit;
@@ -2411,12 +2366,7 @@ static bool debug_dump_all_slot_cb(const uint8_t *key, size_t key_len,
 void evm_state_print_mpt_stats(evm_state_t *es) {
 #ifdef ENABLE_MPT
     if (!es) return;
-    if (es->account_mpt) {
-        mpt_arena_stats_t st = mpt_arena_stats(es->account_mpt);
-        fprintf(stderr, "  account MPT: %llu nodes, arena=%llu B\n",
-                (unsigned long long)st.node_count,
-                (unsigned long long)st.arena_bytes);
-    }
+    fprintf(stderr, "  account: via account_trie (flat_state compact_art)\n");
     fprintf(stderr, "  storage: via storage_trie (flat_state compact_art)\n");
 #else
     (void)es;
@@ -2933,87 +2883,73 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     hash_t root = hash_zero();
     if (!es) return root;
 
-    if (es->account_mpt) {
-        /* Reset commit stats for this root computation window */
-        mpt_arena_reset_commit_stats(es->account_mpt);
-
-        struct timespec _rt0, _rt1, _rt2;
-        clock_gettime(CLOCK_MONOTONIC, &_rt0);
-        compute_all_storage_roots(es);
-        clock_gettime(CLOCK_MONOTONIC, &_rt1);
-
-        if (!mpt_arena_begin_batch(es->account_mpt)) {
-            fprintf(stderr, "FATAL: mpt_arena_begin_batch failed for account trie\n"
-                    "  hint: another batch may already be in progress (double begin)\n");
-            return root;
-        }
-
-        size_t _acct_dirty_count = es->dirty_accounts.count;
-        // Iterate dirty account list directly — O(dirty) instead of O(total_cached)
-        for (size_t d = 0; d < es->dirty_accounts.count; d++) {
-            const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
-            cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
-                &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
-            if (!ca) continue;
-            if (!ca->mpt_dirty) continue;
-
-            // Promote block_dirty accounts to existed:
-            // - Self-destructed accounts: set existed = false
-            // - Don't promote new empty accounts when pruning (EIP-161)
-            if (ca->block_dirty || ca->block_code_dirty) {
-                if (ca->self_destructed) {
-                    ca->existed = false;
-                } else {
-                    bool is_empty_check = (ca->nonce == 0 &&
-                                           uint256_is_zero(&ca->balance) &&
-                                           !ca->has_code);
-                    if (!(!ca->existed && !ca->created && is_empty_check && prune_empty))
-                        ca->existed = true;
-                }
-            }
-
-            const uint8_t *sr = ca->storage_root.bytes;
-            const uint8_t *code_hash = ca->has_code
-                ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
-
-            bool is_empty = (ca->nonce == 0 &&
-                             uint256_is_zero(&ca->balance) &&
-                             !ca->has_code);
-
-            if (!ca->existed || (is_empty && prune_empty)) {
-                mpt_arena_delete(es->account_mpt, ca->addr_hash.bytes);
-            } else {
-                uint8_t rlp[120];
-                size_t rlp_len = mpt_rlp_account(ca->nonce, &ca->balance, sr, code_hash, rlp);
-                mpt_arena_update(es->account_mpt, ca->addr_hash.bytes, rlp, rlp_len);
-            }
-
-            ca->mpt_dirty = false;
-            ca->block_dirty = false;
-            ca->block_code_dirty = false;
-        }
-        /* NOTE: dirty_accounts cleared in evm_state_evict_cache after flat_state flush */
-
-        if (!mpt_arena_commit_batch(es->account_mpt)) {
-            fprintf(stderr, "FATAL: mpt_arena_commit_batch failed for account trie\n"
-                    "  hint: likely OOM (deferred buffer alloc) or corrupt trie node on disk\n"
-                    "  hint: delete account MPT files and replay to rebuild\n");
-            return root;
-        }
-        clock_gettime(CLOCK_MONOTONIC, &_rt2);
-
-        es->last_root_stor_ms = (_rt1.tv_sec - _rt0.tv_sec) * 1000.0 +
-                               (_rt1.tv_nsec - _rt0.tv_nsec) / 1e6;
-        es->last_root_acct_ms = (_rt2.tv_sec - _rt1.tv_sec) * 1000.0 +
-                                (_rt2.tv_nsec - _rt1.tv_nsec) / 1e6;
-        es->last_root_dirty_count = _acct_dirty_count;
-        es->last_acct_commit = mpt_arena_get_commit_stats(es->account_mpt);
-
-        mpt_arena_root(es->account_mpt, root.bytes);
+    if (!es->flat_state || !es->account_trie) {
+        fprintf(stderr, "FATAL: compute_mpt_root called without flat_state/account_trie\n");
         return root;
     }
 
-    fprintf(stderr, "FATAL: compute_mpt_root called without mpt_store\n");
+    struct timespec _rt0, _rt1, _rt2;
+    clock_gettime(CLOCK_MONOTONIC, &_rt0);
+
+    /* 1. Compute per-account storage roots (flushes dirty slots to flat_state) */
+    compute_all_storage_roots(es);
+    clock_gettime(CLOCK_MONOTONIC, &_rt1);
+
+    /* 2. Flush dirty accounts to flat_state → account compact_art.
+     *    account_trie reads account data from the compact_art. */
+    size_t _acct_dirty_count = es->dirty_accounts.count;
+    for (size_t d = 0; d < es->dirty_accounts.count; d++) {
+        const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+            &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
+        if (!ca) continue;
+        if (!ca->mpt_dirty) continue;
+
+        /* Promote block_dirty accounts to existed */
+        if (ca->block_dirty || ca->block_code_dirty) {
+            if (ca->self_destructed) {
+                ca->existed = false;
+            } else {
+                bool is_empty_check = (ca->nonce == 0 &&
+                                       uint256_is_zero(&ca->balance) &&
+                                       !ca->has_code);
+                if (!(!ca->existed && !ca->created && is_empty_check && prune_empty))
+                    ca->existed = true;
+            }
+        }
+
+        bool is_empty = (ca->nonce == 0 &&
+                         uint256_is_zero(&ca->balance) &&
+                         !ca->has_code);
+
+        if (!ca->existed || (is_empty && prune_empty)) {
+            flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
+        } else {
+            flat_account_record_t frec;
+            frec.nonce = ca->nonce;
+            uint256_to_bytes(&ca->balance, frec.balance);
+            const uint8_t *ch = ca->has_code
+                ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
+            memcpy(frec.code_hash, ch, 32);
+            memcpy(frec.storage_root, ca->storage_root.bytes, 32);
+            flat_state_put_account(es->flat_state, ca->addr_hash.bytes, &frec);
+        }
+
+        ca->mpt_dirty = false;
+        ca->block_dirty = false;
+        ca->block_code_dirty = false;
+    }
+
+    /* 3. Compute account trie root from flat_state's compact_art */
+    account_trie_root(es->account_trie, root.bytes);
+    clock_gettime(CLOCK_MONOTONIC, &_rt2);
+
+    es->last_root_stor_ms = (_rt1.tv_sec - _rt0.tv_sec) * 1000.0 +
+                           (_rt1.tv_nsec - _rt0.tv_nsec) / 1e6;
+    es->last_root_acct_ms = (_rt2.tv_sec - _rt1.tv_sec) * 1000.0 +
+                            (_rt2.tv_nsec - _rt1.tv_nsec) / 1e6;
+    es->last_root_dirty_count = _acct_dirty_count;
+
     return root;
 }
 #endif /* ENABLE_MPT */

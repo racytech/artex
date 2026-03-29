@@ -96,6 +96,12 @@ struct compact_art *flat_state_storage_art(flat_state_t *fs);
 /** Get the flat_store for storage (non-owning). */
 struct flat_store *flat_state_storage_store(flat_state_t *fs);
 
+/** Get the compact_art index for accounts (non-owning). */
+struct compact_art *flat_state_account_art(flat_state_t *fs);
+
+/** Get the flat_store for accounts (non-owning). */
+struct flat_store *flat_state_account_store(flat_state_t *fs);
+
 /* =========================================================================
  * Stats
  * ========================================================================= */
