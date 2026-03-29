@@ -1881,6 +1881,55 @@ void mpt_store_set_shared(mpt_store_t *ms, bool shared) {
     ms->shared = shared;
 }
 
+void mpt_store_ref_inc(mpt_store_t *ms, const uint8_t hash[32]) {
+    if (!ms || memcmp(hash, EMPTY_ROOT, 32) == 0) return;
+    node_record_t rec;
+    if (!idx_get(ms, hash, &rec)) return;
+    {
+        uint32_t rc = node_record_refcount(rec);
+        if (rc < 0x7FFF) {
+            rec = node_record_pack(node_record_offset(rec),
+                                   node_record_length(rec), rc + 1);
+            idx_put(ms, hash, &rec);
+            /* Update slot header on disk */
+            int sc = size_class_for(node_record_length(rec));
+            uint32_t shdr = slot_header_pack((uint8_t)sc,
+                (uint16_t)node_record_length(rec), (uint16_t)(rc + 1));
+            memcpy(ms->data_base + PAGE_SIZE + node_record_offset(rec),
+                   &shdr, SLOT_HEADER_SIZE);
+        }
+    }
+}
+
+void mpt_store_ref_dec(mpt_store_t *ms, const uint8_t hash[32]) {
+    if (!ms || memcmp(hash, EMPTY_ROOT, 32) == 0) return;
+    node_record_t rec;
+    if (idx_get(ms, hash, &rec)) {
+        uint32_t rc = node_record_refcount(rec);
+        if (rc > 1) {
+            rec = node_record_pack(node_record_offset(rec),
+                                   node_record_length(rec), rc - 1);
+            idx_put(ms, hash, &rec);
+            int sc = size_class_for(node_record_length(rec));
+            uint32_t shdr = slot_header_pack((uint8_t)sc,
+                (uint16_t)node_record_length(rec), (uint16_t)(rc - 1));
+            memcpy(ms->data_base + PAGE_SIZE + node_record_offset(rec),
+                   &shdr, SLOT_HEADER_SIZE);
+        } else {
+            /* refcount → 0: free the slot */
+            if (ms->live_bytes >= node_record_length(rec))
+                ms->live_bytes -= node_record_length(rec);
+            int sc = size_class_for(node_record_length(rec));
+            free_list_push(&ms->free_lists[sc], node_record_offset(rec));
+            ms->free_slot_bytes += SLOT_HEADER_SIZE + SIZE_CLASSES[sc];
+            uint32_t free_hdr = slot_header_pack((uint8_t)sc, 0, 0);
+            memcpy(ms->data_base + PAGE_SIZE + node_record_offset(rec),
+                   &free_hdr, SLOT_HEADER_SIZE);
+            idx_delete(ms, hash);
+        }
+    }
+}
+
 /* =========================================================================
  * Batch staging
  * ========================================================================= */
@@ -2500,6 +2549,7 @@ static node_ref_t update_subtrie(mpt_store_t *ms, const node_ref_t *current,
             fprintf(stderr, "DBG update_subtrie: LOST NODE hash=");
             for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%02x", current->hash[_i]);
             fprintf(stderr, "... depth=%zu entries=%zu\n", depth, end - start);
+            ms->cstats.lost_nodes++;
         }
         return build_fresh(ms, entries, start, end, depth);
     }
@@ -2624,8 +2674,16 @@ bool mpt_store_commit_batch(mpt_store_t *ms) {
     } else if (new_root.type == REF_EMPTY) {
         memcpy(ms->root_hash, EMPTY_ROOT, 32);
     } else {
-        /* Root is inline (< 32 bytes RLP) — hash it for the root hash */
-        keccak(new_root.raw.data, new_root.raw.len, ms->root_hash);
+        /* Root is inline (< 32 bytes RLP). Store it as a regular node
+         * so that it can be loaded when this root hash is used with
+         * set_root() in a future commit_batch (e.g., after flat_state
+         * reload following cache eviction). */
+        uint8_t root_hash[32];
+        if (write_node(ms, new_root.raw.data, new_root.raw.len, root_hash)) {
+            memcpy(ms->root_hash, root_hash, 32);
+        } else {
+            keccak(new_root.raw.data, new_root.raw.len, ms->root_hash);
+        }
     }
 
     /* Reset dirty state — arena pages kept for reuse */

@@ -914,9 +914,17 @@ if(CJSON_FOUND)
     add_executable(stress_mpt_root tools/stress_mpt_root.c)
     target_link_libraries(stress_mpt_root evm common)
 
+    # Full-stack MPT stress (evm_state → mpt_store, no execution)
+    add_executable(stress_fullstack tools/stress_fullstack.c)
+    target_link_libraries(stress_fullstack evm common)
+
     # Test: mpt_store node persistence across checkpoints
     add_executable(test_mpt_store_resume database/tests/test_mpt_store_resume.c)
     target_link_libraries(test_mpt_store_resume mpt_store common)
+
+    # Test: mpt_store scale stress (Ethereum-realistic shared storage)
+    add_executable(test_mpt_store_scale database/tests/test_mpt_store_scale.c)
+    target_link_libraries(test_mpt_store_scale mpt_store common)
 
     # TUI (ncurses terminal UI, optional)
     find_package(Curses QUIET)

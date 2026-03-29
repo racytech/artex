@@ -620,6 +620,18 @@ void evm_state_reset_mpt_stores(evm_state_t *es) {
 #endif
 }
 
+void evm_state_get_mpt_stores(const evm_state_t *es,
+                                void **out_account_mpt,
+                                void **out_storage_mpt) {
+#ifdef ENABLE_MPT
+    if (out_account_mpt) *out_account_mpt = es ? es->account_mpt : NULL;
+    if (out_storage_mpt) *out_storage_mpt = es ? es->storage_mpt : NULL;
+#else
+    if (out_account_mpt) *out_account_mpt = NULL;
+    if (out_storage_mpt) *out_storage_mpt = NULL;
+#endif
+}
+
 void evm_state_detach_mpt_stores(evm_state_t *es,
                                    void **out_account_mpt,
                                    void **out_storage_mpt) {
@@ -684,12 +696,27 @@ void evm_state_evict_cache(evm_state_t *es) {
                                         cs->slot_hash.bytes, val_be);
             }
         }
-        /* Flush dirty accounts to flat_state */
+        /* Flush dirty accounts to flat_state.
+         * For shared storage MPT: manage external refcounts so that
+         * storage root nodes referenced by flat_state are not freed
+         * by other accounts' commits in future checkpoints. */
         for (size_t d = 0; d < es->dirty_accounts.count; d++) {
             const uint8_t *akey = es->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
             cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
                 &es->accounts, akey, ADDRESS_KEY_SIZE, NULL);
             if (!ca) continue;
+
+            /* Read old storage_root from flat_state before overwriting */
+            uint8_t old_storage_root[32];
+            bool had_old = false;
+            if (es->storage_mpt) {
+                flat_account_record_t old_frec;
+                if (flat_state_get_account(es->flat_state, ca->addr_hash.bytes, &old_frec)) {
+                    memcpy(old_storage_root, old_frec.storage_root, 32);
+                    had_old = true;
+                }
+            }
+
             if (ca->existed) {
                 flat_account_record_t frec;
                 frec.nonce = ca->nonce;
@@ -699,8 +726,19 @@ void evm_state_evict_cache(evm_state_t *es) {
                 memcpy(frec.code_hash, ch, 32);
                 memcpy(frec.storage_root, ca->storage_root.bytes, 32);
                 flat_state_put_account(es->flat_state, ca->addr_hash.bytes, &frec);
+
+                /* Retain new root, release old root in shared storage MPT */
+                if (es->storage_mpt) {
+                    mpt_store_ref_inc(es->storage_mpt, ca->storage_root.bytes);
+                    if (had_old)
+                        mpt_store_ref_dec(es->storage_mpt, old_storage_root);
+
+                }
             } else {
                 flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
+                /* Release old root if account is being deleted */
+                if (es->storage_mpt && had_old)
+                    mpt_store_ref_dec(es->storage_mpt, old_storage_root);
             }
         }
     }

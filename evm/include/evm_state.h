@@ -77,6 +77,14 @@ bool evm_state_init_mpt_stores(evm_state_t *es, const char *path,
 void evm_state_reset_mpt_stores(evm_state_t *es);
 
 /**
+ * Get read-only pointers to the MPT stores (no ownership transfer).
+ * Use for inspecting stats without detaching/resetting.
+ */
+void evm_state_get_mpt_stores(const evm_state_t *es,
+                                void **out_account_mpt,
+                                void **out_storage_mpt);
+
+/**
  * Detach MPT stores from evm_state so evm_state_destroy won't free them.
  * Returns pointers via out params. Caller takes ownership.
  * Use evm_state_attach_mpt_stores() to re-attach to a fresh evm_state.

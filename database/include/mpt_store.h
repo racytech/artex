@@ -116,6 +116,26 @@ void mpt_store_set_root(mpt_store_t *ms, const uint8_t root[32]);
  */
 void mpt_store_set_shared(mpt_store_t *ms, bool shared);
 
+/**
+ * External reference counting for shared mode.
+ *
+ * Use these when an external system (e.g., flat_state) holds a root hash
+ * that must survive across checkpoint windows. Without external refs,
+ * a shared node's refcount only reflects in-flight commit_batch references,
+ * and it can be freed while an external system still needs it.
+ *
+ * mpt_store_ref_inc: bump refcount by 1. Call when persisting a root hash
+ *                    externally (e.g., saving storage_root to flat_state).
+ * mpt_store_ref_dec: decrement refcount by 1 (free slot if reaches 0).
+ *                    Call when the external reference is released
+ *                    (e.g., flat_state entry overwritten with new root).
+ *
+ * Must be called AFTER flush (operates on the on-disk index, not deferred).
+ * Skips EMPTY_ROOT silently.
+ */
+void mpt_store_ref_inc(mpt_store_t *ms, const uint8_t hash[32]);
+void mpt_store_ref_dec(mpt_store_t *ms, const uint8_t hash[32]);
+
 /* =========================================================================
  * Batch Update Interface
  * ========================================================================= */
@@ -247,6 +267,7 @@ typedef struct {
     uint32_t check_hits;      /** Existence checks that found the node */
     uint32_t deletes;         /** Nodes deleted (delete_ref calls) */
     uint32_t commits;         /** Number of commit_batch calls */
+    uint32_t lost_nodes;      /** Nodes that couldn't be loaded (LOST NODE) */
 } mpt_commit_stats_t;
 
 void mpt_store_reset_commit_stats(mpt_store_t *ms);
