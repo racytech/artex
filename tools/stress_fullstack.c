@@ -35,6 +35,19 @@
 #include <unistd.h>
 
 /* =========================================================================
+ * RSS helper
+ * ========================================================================= */
+
+static size_t get_rss_kb(void) {
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    unsigned long pages = 0, rss = 0;
+    fscanf(f, "%lu %lu", &pages, &rss);
+    fclose(f);
+    return rss * 4; /* pages → KB (4K pages) */
+}
+
+/* =========================================================================
  * RNG (xoshiro256**)
  * ========================================================================= */
 
@@ -317,6 +330,8 @@ int main(int argc, char **argv) {
                              (now.tv_nsec - t0.tv_nsec) / 1e9;
             double bps = block / elapsed;
 
+            evm_state_stats_t ss = evm_state_get_stats(es);
+
             fprintf(stderr,
                 "  block %lu: live=%u updates=%lu root=0x%02x%02x..%02x%02x "
                 "%.0f blk/s (%.1fs)\n",
@@ -325,6 +340,16 @@ int main(int argc, char **argv) {
                 root.bytes[0], root.bytes[1],
                 root.bytes[30], root.bytes[31],
                 bps, elapsed);
+            fprintf(stderr,
+                "    flat: %luK accts (%zuMB), %luK slots (%zuMB) | "
+                "root: stor=%.1fms acct=%.1fms (%zu dirty) | RSS %zuMB\n",
+                ss.flat_acct_count / 1000,
+                ss.flat_acct_mem / (1024*1024),
+                ss.flat_stor_count / 1000,
+                ss.flat_stor_mem / (1024*1024),
+                ss.root_stor_ms, ss.root_acct_ms,
+                ss.root_dirty_count,
+                get_rss_kb() / 1024);
         }
 
         block++;
