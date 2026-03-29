@@ -1244,26 +1244,7 @@ int main(int argc, char **argv) {
                     printf("  └ root: stor=%.1f ms  acct=%.1f ms  total=%.1f ms (%zu dirty)\n",
                            ss.root_stor_ms, ss.root_acct_ms, root_total,
                            ss.root_dirty_count);
-                    mpt_commit_stats_t sc = ss.stor_commit;
-                    if (sc.commits > 0)
-                        printf("    └ stor: keccak=%.1f  load=%.1f  check=%.1f  del=%.1f  enc=%.1f  sort=%.1f ms"
-                               "  nodes=%u  loaded=%u (cache=%u disk=%u)  chk_hit=%u  del=%u  commits=%u\n",
-                               sc.keccak_ns / 1e6, sc.load_ns / 1e6,
-                               sc.check_ns / 1e6, sc.delete_ns / 1e6,
-                               sc.encode_ns / 1e6, sc.sort_ns / 1e6,
-                               sc.nodes_hashed, sc.nodes_loaded,
-                               sc.load_cache_hits, sc.load_disk_reads,
-                               sc.check_hits, sc.deletes, sc.commits);
-                    mpt_commit_stats_t ac = ss.acct_commit;
-                    if (ac.commits > 0)
-                        printf("    └ acct: keccak=%.1f  load=%.1f  check=%.1f  del=%.1f  enc=%.1f  sort=%.1f ms"
-                               "  nodes=%u  loaded=%u (cache=%u disk=%u)  chk_hit=%u  del=%u\n",
-                               ac.keccak_ns / 1e6, ac.load_ns / 1e6,
-                               ac.check_ns / 1e6, ac.delete_ns / 1e6,
-                               ac.encode_ns / 1e6, ac.sort_ns / 1e6,
-                               ac.nodes_hashed, ac.nodes_loaded,
-                               ac.load_cache_hits, ac.load_disk_reads,
-                               ac.check_hits, ac.deletes);
+                    /* art_mpt: no per-commit stats — trie is computed from compact_art */
                 }
                 if (ss.evict_ms > 0.1 || ss.mpt_flush_ms > 0.1 || ss.wait_flush_ms > 0.1) {
                     printf("  └ checkpoint: wait=%.1f ms  evict=%.1f ms  mpt_flush=%.1f ms\n",
