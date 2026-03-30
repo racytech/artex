@@ -663,6 +663,343 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
 }
 
 /* =========================================================================
+ * Code — read (lazy-load from code_store)
+ * ========================================================================= */
+
+static void load_code(state_overlay_t *so, cached_account_t *ca) {
+    if (ca->code || !ca->has_code || !so->code_store) return;
+    uint32_t size = code_store_get_size(so->code_store, ca->code_hash.bytes);
+    if (size == 0) return;
+    ca->code = malloc(size);
+    if (!ca->code) return;
+    code_store_get(so->code_store, ca->code_hash.bytes, ca->code, size);
+    ca->code_size = size;
+}
+
+uint32_t state_overlay_get_code_size(state_overlay_t *so, const address_t *addr) {
+    if (!so || !addr) return 0;
+    cached_account_t *ca = ensure_account(so, addr);
+    if (!ca || !ca->has_code) return 0;
+    load_code(so, ca);
+    return ca->code_size;
+}
+
+bool state_overlay_get_code(state_overlay_t *so, const address_t *addr,
+                             uint8_t *out, uint32_t *out_len) {
+    if (!so || !addr) return false;
+    cached_account_t *ca = ensure_account(so, addr);
+    if (!ca || !ca->has_code) { if (out_len) *out_len = 0; return true; }
+    load_code(so, ca);
+    if (!ca->code) { if (out_len) *out_len = 0; return true; }
+    if (out && out_len) {
+        uint32_t n = ca->code_size < *out_len ? ca->code_size : *out_len;
+        memcpy(out, ca->code, n);
+        *out_len = ca->code_size;
+    } else if (out_len) {
+        *out_len = ca->code_size;
+    }
+    return true;
+}
+
+const uint8_t *state_overlay_get_code_ptr(state_overlay_t *so, const address_t *addr,
+                                           uint32_t *out_len) {
+    if (!so || !addr) { if (out_len) *out_len = 0; return NULL; }
+    cached_account_t *ca = ensure_account(so, addr);
+    if (!ca || !ca->has_code) { if (out_len) *out_len = 0; return NULL; }
+    load_code(so, ca);
+    if (!ca->code) { if (out_len) *out_len = 0; return NULL; }
+    if (out_len) *out_len = ca->code_size;
+    return ca->code;
+}
+
+/* =========================================================================
+ * Code — write (journaled)
+ * ========================================================================= */
+
+void state_overlay_set_code(state_overlay_t *so, const address_t *addr,
+                             const uint8_t *code, uint32_t len) {
+    if (!so || !addr) return;
+    cached_account_t *ca = ensure_account(so, addr);
+    if (!ca) return;
+
+    journal_entry_t je = {
+        .type = JOURNAL_CODE, .addr = *addr,
+        .data.code = { .old_hash = ca->code_hash, .old_has_code = ca->has_code,
+                        .old_code = ca->code, .old_code_size = ca->code_size }
+    };
+    if (!journal_push(so, &je))
+        free(ca->code);
+
+    ca->code = NULL;
+    ca->code_size = 0;
+
+    if (code && len > 0) {
+        ca->code = malloc(len);
+        if (ca->code) { memcpy(ca->code, code, len); ca->code_size = len; }
+        ca->has_code = true;
+        ca->code_hash = hash_keccak256(code, len);
+        if (so->code_store)
+            code_store_put(so->code_store, ca->code_hash.bytes, code, len);
+    } else {
+        ca->has_code = false;
+        ca->code_hash = hash_zero();
+    }
+
+    mark_account_tx_dirty(so, ca);
+    ca->dirty = true;
+    ca->code_dirty = true;
+    ca->block_dirty = true;
+    ca->block_code_dirty = true;
+#ifdef ENABLE_HISTORY
+    ca->block_accessed = true;
+#endif
+    mark_account_mpt_dirty(so, ca);
+}
+
+void state_overlay_set_code_hash(state_overlay_t *so, const address_t *addr,
+                                  const hash_t *code_hash) {
+    if (!so || !addr || !code_hash) return;
+    cached_account_t *ca = ensure_account(so, addr);
+    if (!ca) return;
+    ca->code_hash = *code_hash;
+    ca->has_code = (memcmp(code_hash->bytes, HASH_EMPTY_CODE.bytes, 32) != 0 &&
+                    memcmp(code_hash->bytes, ((hash_t){0}).bytes, 32) != 0);
+    ca->code_dirty = true;
+    ca->block_code_dirty = true;
+    mark_account_mpt_dirty(so, ca);
+}
+
+/* =========================================================================
+ * SLOAD / SSTORE combined operations
+ * ========================================================================= */
+
+uint256_t state_overlay_sload(state_overlay_t *so, const address_t *addr,
+                               const uint256_t *key, bool *was_warm) {
+    if (!so || !addr || !key) { if (was_warm) *was_warm = false; return UINT256_ZERO_INIT; }
+    cached_slot_t *cs = ensure_slot(so, addr, key);
+    if (!cs) { if (was_warm) *was_warm = false; return UINT256_ZERO_INIT; }
+    if (was_warm)
+        *was_warm = mem_art_contains(&so->warm_slots, cs->key, SLOT_KEY_SIZE);
+    return cs->current;
+}
+
+void state_overlay_sstore_lookup(state_overlay_t *so, const address_t *addr,
+                                  const uint256_t *key,
+                                  uint256_t *current, uint256_t *original,
+                                  bool *was_warm) {
+    if (!so || !addr || !key) {
+        if (current) *current = UINT256_ZERO_INIT;
+        if (original) *original = UINT256_ZERO_INIT;
+        if (was_warm) *was_warm = false;
+        return;
+    }
+    cached_slot_t *cs = ensure_slot(so, addr, key);
+    if (!cs) {
+        if (current) *current = UINT256_ZERO_INIT;
+        if (original) *original = UINT256_ZERO_INIT;
+        if (was_warm) *was_warm = false;
+        return;
+    }
+    if (current) *current = cs->current;
+    if (original) *original = cs->original;
+    if (was_warm)
+        *was_warm = mem_art_contains(&so->warm_slots, cs->key, SLOT_KEY_SIZE);
+}
+
+/* =========================================================================
+ * Account lifecycle
+ * ========================================================================= */
+
+void state_overlay_create_account(state_overlay_t *so, const address_t *addr) {
+    if (!so || !addr) return;
+    cached_account_t *ca = ensure_account(so, addr);
+    if (!ca) return;
+
+    journal_entry_t je = {
+        .type = JOURNAL_ACCOUNT_CREATE, .addr = *addr,
+        .data.create = {
+            .old_nonce = ca->nonce, .old_balance = ca->balance,
+            .old_code_hash = ca->code_hash, .old_has_code = ca->has_code,
+            .old_code = ca->code, .old_code_size = ca->code_size,
+            .old_dirty = ca->dirty, .old_code_dirty = ca->code_dirty,
+            .old_block_dirty = ca->block_dirty, .old_block_code_dirty = ca->block_code_dirty,
+            .old_created = ca->created, .old_existed = ca->existed,
+            .old_self_destructed = ca->self_destructed,
+            .old_storage_root = ca->storage_root,
+            .old_storage_dirty = ca->storage_dirty,
+            .old_storage_cleared = ca->storage_cleared,
+#ifdef ENABLE_HISTORY
+            .old_block_created = ca->block_created,
+#endif
+        }
+    };
+    if (!journal_push(so, &je)) free(ca->code);
+
+    uint256_t bal = ca->balance; /* preserve existing balance */
+    ca->nonce = 0;
+    ca->balance = bal;
+    ca->code_hash = hash_zero();
+    ca->has_code = false;
+    ca->code = NULL;
+    ca->code_size = 0;
+    ca->created = true;
+    mark_account_tx_dirty(so, ca);
+    ca->dirty = true;
+    ca->block_dirty = true;
+#ifdef ENABLE_HISTORY
+    ca->block_created = true;
+    ca->block_accessed = true;
+#endif
+    mark_account_mpt_dirty(so, ca);
+    ca->code_dirty = false;
+    ca->self_destructed = false;
+    ca->storage_root = HASH_EMPTY_STORAGE;
+    ca->storage_dirty = true;
+    ca->storage_cleared = true;
+}
+
+void state_overlay_self_destruct(state_overlay_t *so, const address_t *addr) {
+    if (!so || !addr) return;
+    cached_account_t *ca = ensure_account(so, addr);
+    if (!ca) return;
+
+    journal_entry_t je = {
+        .type = JOURNAL_SELF_DESTRUCT, .addr = *addr,
+        .data.old_self_destructed = ca->self_destructed,
+    };
+    journal_push(so, &je);
+
+    ca->self_destructed = true;
+    mark_account_tx_dirty(so, ca);
+    ca->dirty = true;
+    ca->block_dirty = true;
+#ifdef ENABLE_HISTORY
+    ca->block_accessed = true;
+#endif
+    mark_account_mpt_dirty(so, ca);
+}
+
+void state_overlay_mark_existed(state_overlay_t *so, const address_t *addr) {
+    if (!so || !addr) return;
+    cached_account_t *ca = ensure_account(so, addr);
+    if (ca) ca->existed = true;
+}
+
+bool state_overlay_is_self_destructed(state_overlay_t *so, const address_t *addr) {
+    if (!so || !addr) return false;
+    const cached_account_t *ca = (const cached_account_t *)mem_art_get(
+        &so->accounts, addr->bytes, ADDRESS_SIZE, NULL);
+    return ca ? ca->self_destructed : false;
+}
+
+bool state_overlay_is_created(state_overlay_t *so, const address_t *addr) {
+    if (!so || !addr) return false;
+    const cached_account_t *ca = (const cached_account_t *)mem_art_get(
+        &so->accounts, addr->bytes, ADDRESS_SIZE, NULL);
+    return ca ? ca->created : false;
+}
+
+bool state_overlay_has_storage(state_overlay_t *so, const address_t *addr) {
+    if (!so || !addr) return false;
+    cached_account_t *ca = ensure_account(so, addr);
+    if (ca && memcmp(ca->storage_root.bytes, HASH_EMPTY_STORAGE.bytes, 32) != 0)
+        return true;
+    /* Scan cached slots */
+    mem_art_iterator_t *iter = mem_art_iterator_create(&so->storage);
+    if (!iter) return false;
+    bool found = false;
+    while (!mem_art_iterator_done(iter)) {
+        size_t klen;
+        const uint8_t *key = mem_art_iterator_key(iter, &klen);
+        if (key && klen == SLOT_KEY_SIZE &&
+            memcmp(key, addr->bytes, ADDRESS_SIZE) == 0) {
+            size_t vlen;
+            const cached_slot_t *cs = (const cached_slot_t *)
+                mem_art_iterator_value(iter, &vlen);
+            if (cs && !uint256_is_zero(&cs->current)) { found = true; break; }
+        }
+        mem_art_iterator_next(iter);
+    }
+    mem_art_iterator_destroy(iter);
+    return found;
+}
+
+/* =========================================================================
+ * Access lists (EIP-2929)
+ * ========================================================================= */
+
+bool state_overlay_warm_address(state_overlay_t *so, const address_t *addr) {
+    if (!so || !addr) return false;
+    bool was_new = false;
+    mem_art_insert_check(&so->warm_addrs, addr->bytes, ADDRESS_SIZE,
+                         NULL, 0, &was_new);
+    if (!was_new) return true;
+    journal_entry_t je = { .type = JOURNAL_WARM_ADDR, .addr = *addr };
+    journal_push(so, &je);
+    return false;
+}
+
+bool state_overlay_warm_slot(state_overlay_t *so, const address_t *addr,
+                              const uint256_t *key) {
+    if (!so || !addr || !key) return false;
+    uint8_t skey[SLOT_KEY_SIZE];
+    make_slot_key(addr, key, skey);
+    bool was_new = false;
+    mem_art_insert_check(&so->warm_slots, skey, SLOT_KEY_SIZE,
+                         NULL, 0, &was_new);
+    if (!was_new) return true;
+    journal_entry_t je = { .type = JOURNAL_WARM_SLOT, .addr = *addr, .data.slot = *key };
+    journal_push(so, &je);
+    return false;
+}
+
+bool state_overlay_is_address_warm(const state_overlay_t *so, const address_t *addr) {
+    if (!so || !addr) return false;
+    return mem_art_contains(&so->warm_addrs, addr->bytes, ADDRESS_SIZE);
+}
+
+bool state_overlay_is_slot_warm(const state_overlay_t *so, const address_t *addr,
+                                 const uint256_t *key) {
+    if (!so || !addr || !key) return false;
+    uint8_t skey[SLOT_KEY_SIZE];
+    make_slot_key(addr, key, skey);
+    return mem_art_contains(&so->warm_slots, skey, SLOT_KEY_SIZE);
+}
+
+/* =========================================================================
+ * Transient storage (EIP-1153)
+ * ========================================================================= */
+
+uint256_t state_overlay_tload(state_overlay_t *so, const address_t *addr,
+                               const uint256_t *key) {
+    if (!so || !addr || !key) return UINT256_ZERO_INIT;
+    uint8_t skey[SLOT_KEY_SIZE];
+    make_slot_key(addr, key, skey);
+    const uint256_t *val = (const uint256_t *)mem_art_get(
+        &so->transient, skey, SLOT_KEY_SIZE, NULL);
+    return val ? *val : UINT256_ZERO_INIT;
+}
+
+void state_overlay_tstore(state_overlay_t *so, const address_t *addr,
+                           const uint256_t *key, const uint256_t *value) {
+    if (!so || !addr || !key || !value) return;
+    uint8_t skey[SLOT_KEY_SIZE];
+    make_slot_key(addr, key, skey);
+
+    uint256_t old = UINT256_ZERO_INIT;
+    const uint256_t *existing = (const uint256_t *)mem_art_get(
+        &so->transient, skey, SLOT_KEY_SIZE, NULL);
+    if (existing) old = *existing;
+
+    journal_entry_t je = {
+        .type = JOURNAL_TRANSIENT_STORAGE, .addr = *addr,
+        .data = { .old_transient_value = old }
+    };
+    journal_push(so, &je);
+    mem_art_insert(&so->transient, skey, SLOT_KEY_SIZE, value, sizeof(uint256_t));
+}
+
+/* =========================================================================
  * EIP-161
  * ========================================================================= */
 
@@ -671,9 +1008,202 @@ void state_overlay_set_prune_empty(state_overlay_t *so, bool enabled) {
 }
 
 /* =========================================================================
- * TODO: remaining functions
- *
- * Next: set_code, get_code, create_account, self_destruct,
- *       access lists, transient storage, commit_tx, commit,
- *       compute_mpt_root, evict, stats
+ * Begin block
+ * ========================================================================= */
+
+void state_overlay_begin_block(state_overlay_t *so, uint64_t block_number) {
+    (void)so; (void)block_number;
+}
+
+/* =========================================================================
+ * Commit — per-block (EIP-2200 originals)
+ * ========================================================================= */
+
+static bool commit_slot_cb(const uint8_t *key, size_t key_len,
+                           const void *value, size_t value_len, void *ud) {
+    (void)key; (void)key_len; (void)value_len; (void)ud;
+    cached_slot_t *cs = (cached_slot_t *)(uintptr_t)value;
+    cs->original = cs->current;
+    cs->dirty = false;
+#ifdef ENABLE_HISTORY
+    cs->block_original = cs->current;
+#endif
+    return true;
+}
+
+static bool commit_account_cb(const uint8_t *key, size_t key_len,
+                               const void *value, size_t value_len, void *ud) {
+    (void)key; (void)key_len; (void)value_len; (void)ud;
+    cached_account_t *ca = (cached_account_t *)(uintptr_t)value;
+    bool is_empty = (ca->nonce == 0 && uint256_is_zero(&ca->balance) && !ca->has_code);
+    if ((ca->existed || ca->created || ca->dirty || ca->code_dirty) && !is_empty)
+        ca->existed = true;
+    ca->created = false;
+    ca->dirty = false;
+    ca->code_dirty = false;
+    ca->self_destructed = false;
+#ifdef ENABLE_HISTORY
+    ca->original_nonce = ca->nonce;
+    ca->original_balance = ca->balance;
+    ca->original_code_hash = ca->code_hash;
+    ca->block_accessed = false;
+    ca->block_created = false;
+    ca->block_self_destructed = false;
+#endif
+    return true;
+}
+
+void state_overlay_commit(state_overlay_t *so) {
+    if (!so) return;
+    mem_art_foreach(&so->storage, commit_slot_cb, NULL);
+    mem_art_foreach(&so->accounts, commit_account_cb, NULL);
+    so->journal_len = 0;
+}
+
+/* =========================================================================
+ * Commit TX — per-transaction
+ * ========================================================================= */
+
+typedef struct {
+    address_t *addrs;
+    size_t count, cap;
+    state_overlay_t *so;
+} sd_ctx_t;
+
+static bool commit_tx_slot_cb(const uint8_t *key, size_t key_len,
+                               const void *value, size_t value_len, void *ud) {
+    (void)key; (void)key_len; (void)value_len;
+    cached_slot_t *cs = (cached_slot_t *)(uintptr_t)value;
+    sd_ctx_t *ctx = (sd_ctx_t *)ud;
+    for (size_t i = 0; i < ctx->count; i++) {
+        if (memcmp(cs->key, ctx->addrs[i].bytes, ADDRESS_SIZE) == 0) {
+            cs->current = UINT256_ZERO;
+            cs->original = UINT256_ZERO;
+            cs->dirty = false;
+            cs->block_dirty = false;
+            if (ctx->so) mark_slot_mpt_dirty(ctx->so, cs);
+            return true;
+        }
+    }
+    cs->original = cs->current;
+    cs->dirty = false;
+    return true;
+}
+
+static void sd_ctx_push(sd_ctx_t *ctx, const address_t *addr) {
+    if (ctx->count >= ctx->cap) {
+        size_t nc = ctx->cap ? ctx->cap * 2 : 16;
+        address_t *na = realloc(ctx->addrs, nc * sizeof(*na));
+        if (!na) return;
+        ctx->addrs = na; ctx->cap = nc;
+    }
+    ctx->addrs[ctx->count++] = *addr;
+}
+
+void state_overlay_commit_tx(state_overlay_t *so) {
+    if (!so) return;
+
+    sd_ctx_t ctx = { .addrs = NULL, .count = 0, .cap = 0, .so = so };
+
+    for (size_t i = 0; i < so->tx_dirty_accounts.count; i++) {
+        const uint8_t *akey = so->tx_dirty_accounts.keys + i * ADDRESS_KEY_SIZE;
+        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+            &so->accounts, akey, ADDRESS_KEY_SIZE, NULL);
+        if (!ca) continue;
+
+        if (ca->self_destructed) {
+            sd_ctx_push(&ctx, &ca->addr);
+            ca->balance = UINT256_ZERO;
+            ca->nonce = 0;
+            ca->has_code = false;
+            memset(ca->code_hash.bytes, 0, 32);
+            if (ca->code) { free(ca->code); ca->code = NULL; }
+            ca->code_size = 0;
+            ca->existed = false;
+            ca->created = false;
+            ca->dirty = false;
+            ca->code_dirty = false;
+#ifdef ENABLE_HISTORY
+            ca->block_self_destructed = true;
+#endif
+            ca->block_dirty = false;
+            ca->self_destructed = false;
+            ca->block_code_dirty = false;
+            ca->storage_root = HASH_EMPTY_STORAGE;
+            ca->storage_cleared = true;
+            ca->storage_dirty = true;
+            continue;
+        }
+
+        bool is_empty = (ca->nonce == 0 && uint256_is_zero(&ca->balance) && !ca->has_code);
+        if ((ca->existed || ca->created || ca->dirty || ca->code_dirty) && !is_empty)
+            ca->existed = true;
+
+        /* EIP-161: touched empty → prune */
+        if (so->prune_empty && is_empty && (ca->dirty || ca->code_dirty)) {
+            ca->existed = false;
+            mark_account_mpt_dirty(so, ca);
+        }
+
+        ca->created = false;
+        ca->dirty = false;
+        ca->code_dirty = false;
+        ca->self_destructed = false;
+    }
+
+    /* Process storage */
+    if (ctx.count > 0) {
+        mem_art_foreach(&so->storage, commit_tx_slot_cb, &ctx);
+    } else {
+        for (size_t i = 0; i < so->tx_dirty_slots.count; i++) {
+            const uint8_t *skey = so->tx_dirty_slots.keys + i * SLOT_KEY_SIZE;
+            cached_slot_t *cs = (cached_slot_t *)mem_art_get_mut(
+                &so->storage, skey, SLOT_KEY_SIZE, NULL);
+            if (!cs) continue;
+            cs->original = cs->current;
+            cs->dirty = false;
+        }
+    }
+
+    free(ctx.addrs);
+    dirty_clear(&so->tx_dirty_accounts);
+    dirty_clear(&so->tx_dirty_slots);
+    so->journal_len = 0;
+
+    mem_art_destroy(&so->warm_addrs);  mem_art_init(&so->warm_addrs);
+    mem_art_destroy(&so->warm_slots);  mem_art_init(&so->warm_slots);
+    mem_art_destroy(&so->transient);   mem_art_init(&so->transient);
+}
+
+/* =========================================================================
+ * Clear prestate dirty (for test_runner pre-state setup)
+ * ========================================================================= */
+
+static bool clear_prestate_acct_cb(const uint8_t *k, size_t kl,
+                                    const void *v, size_t vl, void *u) {
+    (void)k; (void)kl; (void)vl; (void)u;
+    cached_account_t *ca = (cached_account_t *)(uintptr_t)v;
+    ca->block_dirty = false;
+    ca->block_code_dirty = false;
+    ca->mpt_dirty = false;
+#ifdef ENABLE_HISTORY
+    ca->block_self_destructed = false;
+    ca->block_created = false;
+#endif
+    return true;
+}
+
+static bool clear_prestate_slot_cb(const uint8_t *k, size_t kl,
+                                    const void *v, size_t vl, void *u) {
+    (void)k; (void)kl; (void)vl; (void)u;
+    cached_slot_t *cs = (cached_slot_t *)(uintptr_t)v;
+    cs->block_dirty = false;
+    cs->mpt_dirty = false;
+    return true;
+}
+
+/* TODO: expose via header if needed by test_runner */
+
+/* =========================================================================
+ * TODO: compute_mpt_root, evict, stats, prefetch, collect_*
  * ========================================================================= */
