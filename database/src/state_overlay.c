@@ -421,7 +421,13 @@ void state_overlay_set_flat_state(state_overlay_t *so, flat_state_t *fs) {
 bool state_overlay_exists(state_overlay_t *so, const address_t *addr) {
     if (!so || !addr) return false;
     cached_account_t *ca = ensure_account(so, addr);
-    return ca && ca->existed;
+    if (!ca) return false;
+    /* Account "exists" if it was in the trie (existed), was created this tx
+     * (CREATE), was touched this tx (dirty via add_balance(0) from CALL),
+     * or was touched in an earlier tx this block (block_dirty). Without
+     * dirty/block_dirty, non-existent addresses get charged 25000 new-account
+     * gas on every CALL within the same tx. */
+    return ca->existed || ca->created || ca->dirty || ca->block_dirty;
 }
 
 bool state_overlay_is_empty(state_overlay_t *so, const address_t *addr) {
