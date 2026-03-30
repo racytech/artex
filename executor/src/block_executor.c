@@ -328,6 +328,9 @@ block_result_t block_execute(evm_t *evm,
     /* Determine chain ID */
     uint64_t chain_id = evm->chain_config ? evm->chain_config->chain_id : 1;
 
+    /* EIP-161: enable empty account pruning at Spurious Dragon */
+    evm_state_set_prune_empty(evm->state, evm->fork >= FORK_SPURIOUS_DRAGON);
+
     /* Commit state before executing transactions (EIP-2200 original values) */
     evm_state_commit(evm->state);
 

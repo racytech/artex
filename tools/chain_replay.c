@@ -669,6 +669,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     LOG_INFO("State loaded successfully");
+    {
+        evm_state_stats_t dbg_ss = sync_get_state_stats(sync);
+        LOG_INFO("flat_state: %lu accts, %lu slots",
+                 (unsigned long)dbg_ss.flat_acct_count,
+                 (unsigned long)dbg_ss.flat_stor_count);
+    }
 
     uint64_t start_block = (user_start > 0) ? user_start : 1;
 

@@ -15,6 +15,7 @@
 
 #include "state_history.h"
 #include "evm_state.h"
+#include "flat_state.h"
 #include "era1.h"
 #include "block.h"
 #include "hash.h"
@@ -409,6 +410,21 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Create flat_state for MPT root computation */
+    char flat_path[512];
+    snprintf(flat_path, sizeof(flat_path), "%s/reconstruct_flat", data_dir);
+    flat_state_t *fs = flat_state_open(flat_path);
+    if (!fs) fs = flat_state_create(flat_path);
+    if (!fs) {
+        fprintf(stderr, "Failed to create flat_state at %s\n", flat_path);
+        evm_state_destroy(es);
+        code_store_destroy(cs);
+        state_history_destroy(sh);
+        return 1;
+    }
+    evm_state_set_flat_state(es, fs);
+    printf("Flat state: %s\n", flat_path);
+
     if (!resume_mode) {
         /* ── Load genesis ──────────────────────────────────────────── */
         printf("\nLoading genesis...\n");
@@ -528,7 +544,9 @@ int main(int argc, char *argv[]) {
 
     /* ── Cleanup ─────────────────────────────────────────────────────── */
     archive_close(&archive);
+    evm_state_set_flat_state(es, NULL);
     evm_state_destroy(es);
+    flat_state_destroy(fs);
     code_store_destroy(cs);
     state_history_destroy(sh);
 

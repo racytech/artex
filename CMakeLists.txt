@@ -304,6 +304,12 @@ add_executable(test_evm_state_audit
 target_link_libraries(test_evm_state_audit evm)
 add_test(NAME test_evm_state_audit COMMAND test_evm_state_audit)
 
+add_executable(test_flat_state_roundtrip
+    evm/tests/test_flat_state_roundtrip.c
+)
+target_link_libraries(test_flat_state_roundtrip evm)
+add_test(NAME test_flat_state_roundtrip COMMAND test_flat_state_roundtrip)
+
 # Test: ART→MPT cross-validation against Python reference vectors
 add_executable(test_art_mpt_vectors database/tests/test_art_mpt_vectors.c)
 target_link_libraries(test_art_mpt_vectors art_mpt compact_art common)

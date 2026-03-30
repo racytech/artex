@@ -62,6 +62,9 @@ void evm_state_flush(evm_state_t *es);
  */
 void evm_state_set_batch_mode(evm_state_t *es, bool enabled);
 
+/** EIP-161: when enabled, touched empty accounts are pruned from state. */
+void evm_state_set_prune_empty(evm_state_t *es, bool enabled);
+
 /** Set flat state backend for O(1) disk-backed lookups (optional, not owned). */
 typedef struct flat_state flat_state_t;
 void evm_state_set_flat_state(evm_state_t *es, flat_state_t *fs);

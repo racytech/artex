@@ -255,7 +255,7 @@ struct evm_state {
     tx_dirty_slot_vec_t tx_dirty_slots;     // slots dirtied in current tx
     bool              batch_mode;   // skip per-block verkle flush, defer to checkpoint
     bool              discard_on_destroy; // skip MPT flush on destroy (set after failed block)
-    bool              eip161_pruned; // one-time flat_state prune done (Spurious Dragon)
+    bool              prune_empty;  // EIP-161: touched empty accounts get existed=false
     account_trie_t   *account_trie; // account MPT root from flat_state's compact_art
     storage_trie_t   *storage_trie; // per-account storage roots from flat_state's compact_art
     code_store_t     *code_store;   // content-addressed bytecode store (not owned)
@@ -519,6 +519,10 @@ void evm_state_flush(evm_state_t *es) {
 
 void evm_state_set_batch_mode(evm_state_t *es, bool enabled) {
     if (es) es->batch_mode = enabled;
+}
+
+void evm_state_set_prune_empty(evm_state_t *es, bool enabled) {
+    if (es) es->prune_empty = enabled;
 }
 
 void evm_state_set_flat_state(evm_state_t *es, flat_state_t *fs) {
@@ -1414,10 +1418,15 @@ void evm_state_commit_tx(evm_state_t *es) {
         if ((ca->existed || ca->created || ca->dirty || ca->code_dirty) && !is_empty) {
             ca->existed = true;
         }
-        /* If account was created (CREATE/CREATE2), delete old storage from flat_state.
-         * New storage slots will be flushed at checkpoint. Old uncached slots from
-         * previous checkpoints would otherwise survive as orphans. */
-        /* storage_cleared was set by create_account — handled at checkpoint */
+        /* EIP-161: touched empty account → remove from trie.
+         * Pre-SD: empty accounts stay (prune_empty=false).
+         * Post-SD: touched (dirty) empty accounts are pruned. */
+        if (es->prune_empty && is_empty && (ca->dirty || ca->code_dirty)) {
+            ca->existed = false;
+            mark_account_mpt_dirty(es, ca);
+        }
+        /* Note: stale cached slots from before CREATE are handled by
+         * flush_slot_cb (checks storage_cleared && !mpt_dirty). */
         ca->created = false;
         ca->dirty = false;
         ca->code_dirty = false;
@@ -2457,6 +2466,10 @@ static bool flush_slot_cb(const uint8_t *key, size_t key_len,
     const cached_account_t *ca = (const cached_account_t *)mem_art_get(
         &es->accounts, key, ADDRESS_KEY_SIZE, NULL);
     if (!ca || !ca->existed) return true;
+    /* Skip stale slots for storage_cleared accounts (CREATE/self-destruct).
+     * Step 2 already deleted all storage from flat_state for these accounts.
+     * Only write back slots that were dirtied AFTER the clear (mpt_dirty). */
+    if (ca->storage_cleared && !cs->mpt_dirty) return true;
     if (uint256_is_zero(&cs->current)) {
         flat_state_delete_storage(es->flat_state,
                                    ca->addr_hash.bytes, cs->slot_hash.bytes);
@@ -2469,7 +2482,8 @@ static bool flush_slot_cb(const uint8_t *key, size_t key_len,
     return true;
 }
 
-/* Step 5: flush cached account to flat_state. Skip dead accounts. */
+/* Step 5: flush cached account to flat_state. Skip dead accounts.
+ * Also deletes touched empty accounts when prune_empty is set (EIP-161). */
 static bool flush_account_cb(const uint8_t *key, size_t key_len,
                                const void *value, size_t value_len,
                                void *user_data) {
@@ -2477,6 +2491,11 @@ static bool flush_account_cb(const uint8_t *key, size_t key_len,
     evm_state_t *es = user_data;
     const cached_account_t *ca = value;
     if (!ca->existed) return true; /* dead — already deleted in step 2 */
+
+    /* EIP-161 pruning is handled per-tx by commit_tx, which sets
+     * existed=false for touched empty accounts when prune_empty=true.
+     * We just respect the existed flag here — no additional empty check. */
+
     flat_account_record_t frec;
     frec.nonce = ca->nonce;
     uint256_to_bytes(&ca->balance, frec.balance);
@@ -2537,28 +2556,6 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
         }
         if (!ca->existed) {
             flat_state_delete_account(es->flat_state, ca->addr_hash.bytes);
-        }
-    }
-
-    /* ================================================================
-     * Step 2b. EIP-161 empty account pruning.
-     * When prune_empty=true (Spurious Dragon+), remove ALL empty
-     * accounts from both cache and flat_state. This handles:
-     *   - Pre-existing empty accounts from the DoS era (one-time at SD)
-     *   - Accounts that became empty and were touched this window
-     * Must run BEFORE flush (steps 3+5) so pruned accounts aren't
-     * written back to flat_state.
-     * ================================================================ */
-    if (prune_empty) {
-        /* Mark cached empty accounts as !existed */
-        mem_art_foreach(&es->accounts, prune_empty_cache_cb, NULL);
-        /* One-time full flat_state scan at Spurious Dragon activation.
-         * Removes ~19M empty DoS accounts that aren't in cache.
-         * After this, ongoing pruning is handled by Step 1 promotion
-         * (prevents new empty accounts from getting existed=true). */
-        if (!es->eip161_pruned) {
-            evm_state_prune_empty_accounts(es);
-            es->eip161_pruned = true;
         }
     }
 

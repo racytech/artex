@@ -511,8 +511,23 @@ bool flat_store_put(flat_store_t *s, const uint8_t *key,
     /* Check if key already exists */
     const void *existing = compact_art_get(&s->index, key);
     if (existing) {
-        /* Key exists — just update the compact_art leaf to point to new buffer slot.
-         * Old slot (file or buffer) becomes orphaned — reclaimed on flush. */
+        uint64_t old_offset;
+        memcpy(&old_offset, existing, sizeof(uint64_t));
+
+        /* Free old file slot if it's on disk (not deferred) */
+        if (!(old_offset & DEFERRED_BIT)) {
+            uint32_t old_hdr;
+            memcpy(&old_hdr, s->base + FLAT_STORE_HEADER_SIZE + old_offset,
+                   SLOT_HEADER_SIZE);
+            uint8_t old_class;
+            uint16_t old_len;
+            slot_header_unpack(old_hdr, &old_class, &old_len);
+            uint32_t free_hdr = slot_header_pack(old_class, 0);
+            memcpy(s->base + FLAT_STORE_HEADER_SIZE + old_offset,
+                   &free_hdr, SLOT_HEADER_SIZE);
+            free_list_push(&s->free_lists[old_class], old_offset);
+        }
+
         compact_art_insert(&s->index, key, &new_offset);
         return true;
     }
@@ -697,17 +712,38 @@ uint32_t flat_store_read_leaf_record(const flat_store_t *s,
 void flat_store_flush_deferred(flat_store_t *s) {
     if (!s || !s->deferred.data || s->deferred.used == 0) return;
 
-    /* Phase 1: Scan deferred buffer sequentially (NOT via compact_art iterator).
-     * The deferred buffer has slots packed sequentially. Walk it directly. */
-    typedef struct { uint8_t *key; uint64_t file_offset; } _flush_entry_t;
+    /* Phase 1: Collect deferred entries from the index.
+     * The index has exactly one entry per key — no duplicates. */
+    typedef struct { uint64_t buf_pos; } _deferred_entry_t;
     size_t max_entries = s->live_count + 1;
-    _flush_entry_t *entries = malloc(max_entries * sizeof(_flush_entry_t));
-    if (!entries) { s->deferred.used = 0; return; }
+    uint8_t **keys = malloc(max_entries * sizeof(uint8_t *));
+    uint64_t *buf_offsets = malloc(max_entries * sizeof(uint64_t));
+    if (!keys || !buf_offsets) {
+        free(keys); free(buf_offsets);
+        s->deferred.used = 0;
+        return;
+    }
 
     size_t count = 0;
-    size_t pos = 0;
-    while (pos < s->deferred.used && count < max_entries) {
-        uint8_t *src = s->deferred.data + pos;
+    compact_art_iterator_t *it = compact_art_iterator_create(&s->index);
+    while (compact_art_iterator_next(it) && count < max_entries) {
+        const void *val = compact_art_iterator_value(it);
+        uint64_t offset;
+        memcpy(&offset, val, sizeof(uint64_t));
+
+        if (!(offset & DEFERRED_BIT)) continue;
+
+        uint64_t buf_pos = offset & ~DEFERRED_BIT;
+        uint8_t *src = s->deferred.data + buf_pos;
+        keys[count] = src + SLOT_HEADER_SIZE;
+        buf_offsets[count] = buf_pos;
+        count++;
+    }
+    compact_art_iterator_destroy(it);
+
+    /* Phase 2: Flush collected entries to disk (safe to modify index now) */
+    for (size_t i = 0; i < count; i++) {
+        uint8_t *src = s->deferred.data + buf_offsets[i];
         uint32_t shdr;
         memcpy(&shdr, src, SLOT_HEADER_SIZE);
         uint8_t class_idx;
@@ -715,26 +751,19 @@ void flat_store_flush_deferred(flat_store_t *s) {
         slot_header_unpack(shdr, &class_idx, &data_len);
         uint32_t slot_size = s->slot_sizes[class_idx];
 
-        /* Allocate a file slot and copy */
+        /* Allocate file slot and copy */
         uint64_t file_offset = alloc_slot(s, class_idx);
-        if (file_offset != UINT64_MAX) {
-            uint8_t *dst = s->base + FLAT_STORE_HEADER_SIZE + file_offset;
-            memcpy(dst, src, slot_size);
+        if (file_offset == UINT64_MAX) continue;
 
-            entries[count].key = src + SLOT_HEADER_SIZE;
-            entries[count].file_offset = file_offset;
-            count++;
-        }
+        uint8_t *dst = s->base + FLAT_STORE_HEADER_SIZE + file_offset;
+        memcpy(dst, src, slot_size);
 
-        pos += slot_size;
+        /* Update index to file offset */
+        compact_art_insert(&s->index, keys[i], &file_offset);
     }
 
-    /* Phase 2: Update compact_art leaves to point to file offsets */
-    for (size_t i = 0; i < count; i++) {
-        compact_art_insert(&s->index, entries[i].key, &entries[i].file_offset);
-    }
-
-    free(entries);
+    free(keys);
+    free(buf_offsets);
 
     /* Reset deferred buffer */
     s->deferred.used = 0;
