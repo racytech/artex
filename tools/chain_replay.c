@@ -622,12 +622,13 @@ int main(int argc, char **argv) {
     /* Clean up old state if requested */
     if (force_clean) {
         printf("--clean: removing existing state files\n");
-        char cmd[512];
+        char cmd[1024];
         snprintf(cmd, sizeof(cmd),
-                 "rm -rf %s %s %s.idx %s.dat %s_storage.idx %s_storage.dat %s.idx %s.dat"
+                 "rm -rf %s %s %s.idx %s.dat %s_storage.idx %s_storage.dat"
+                 " %s.idx %s.dat %s_acct.art %s_stor.art %s.meta"
                  " 2>/dev/null",
                  value_dir, commit_dir, mpt_path, mpt_path, mpt_path, mpt_path,
-                 code_path, code_path);
+                 code_path, code_path, flat_path, flat_path, mpt_path);
         (void)system(cmd);
 #ifdef ENABLE_HISTORY
         snprintf(cmd, sizeof(cmd), "rm -rf %s 2>/dev/null", history_path);

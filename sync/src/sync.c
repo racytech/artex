@@ -165,6 +165,8 @@ sync_t *sync_create(const sync_config_t *config) {
         s->config.mpt_path = strdup(config->mpt_path);
     if (config->code_store_path)
         s->config.code_store_path = strdup(config->code_store_path);
+    if (config->flat_state_path)
+        s->config.flat_state_path = strdup(config->flat_state_path);
     if (config->history_dir)
         s->config.history_dir = strdup(config->history_dir);
     if (config->verkle_builder_value_dir)
