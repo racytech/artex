@@ -92,19 +92,42 @@ static void free_list_destroy(free_list_t *fl) {
 }
 
 /* =========================================================================
- * Internal Structure
+ * Overlay — per-entry in-memory cache (replaces deferred buffer).
+ *
+ * compact_art leaf values:
+ *   bit 63 clear → file offset into mmap'd data region
+ *   bit 63 set   → overlay entry index (bits 0-30)
  * ========================================================================= */
 
-/* Deferred write buffer — accumulates puts in memory.
- * Offsets with the high bit set (DEFERRED_BIT) point into this buffer
- * instead of the mmap'd data file. Flushed to file on flat_store_flush_deferred(). */
-#define DEFERRED_BIT (1ULL << 63)
+#define OVERLAY_BIT      (1ULL << 63)
+#define OVERLAY_IDX(v)   ((uint32_t)((v) & 0x7FFFFFFF))
+#define LRU_NONE         UINT32_MAX
+#define OVERLAY_INIT_CAP 4096
 
 typedef struct {
-    uint8_t  *data;       /* buffer memory */
-    size_t    used;       /* bytes used */
-    size_t    cap;        /* bytes allocated */
-} deferred_buf_t;
+    uint8_t  *data;        /* slot-format: [4B hdr][key][record][padding] */
+    uint32_t  slot_size;
+    uint32_t  lru_prev;
+    uint32_t  lru_next;
+    uint64_t  file_offset; /* previous disk slot (UINT64_MAX if new) */
+    bool      dirty;
+    bool      occupied;
+} overlay_entry_t;
+
+typedef struct {
+    overlay_entry_t *entries;
+    uint32_t  count;       /* occupied entries */
+    uint32_t  high_water;  /* next fresh index (grows monotonically) */
+    uint32_t  capacity;
+    uint32_t *free_stack;
+    uint32_t  free_count;
+    uint32_t  lru_head;
+    uint32_t  lru_tail;
+} overlay_pool_t;
+
+/* =========================================================================
+ * Internal Structure
+ * ========================================================================= */
 
 struct flat_store {
     compact_art_t index;
@@ -112,16 +135,15 @@ struct flat_store {
     uint32_t      key_size;
     uint32_t      max_record_size;
     uint8_t       num_classes;
-    uint32_t      slot_sizes[MAX_SIZE_CLASSES]; /* total slot size per class */
+    uint32_t      slot_sizes[MAX_SIZE_CLASSES];
     uint32_t      live_count;
 
-    uint8_t      *base;         /* mmap base */
-    size_t        mapped_size;  /* current mmap size */
-    uint64_t      data_size;    /* bytes used in data region (append offset) */
+    uint8_t      *base;
+    size_t        mapped_size;
+    uint64_t      data_size;
 
     free_list_t   free_lists[MAX_SIZE_CLASSES];
-
-    deferred_buf_t deferred;    /* in-memory write buffer */
+    overlay_pool_t overlay;
 };
 
 /* =========================================================================
@@ -189,28 +211,96 @@ static inline uint32_t class_record_capacity(const flat_store_t *s, int class_id
  * Mmap helpers
  * ========================================================================= */
 
-/* Resolve an offset to a data pointer — deferred buffer or mmap'd file */
-static inline uint8_t *data_ptr(const flat_store_t *s, uint64_t offset) {
-    if (offset & DEFERRED_BIT) {
-        return s->deferred.data + (offset & ~DEFERRED_BIT);
+/* =========================================================================
+ * Overlay pool operations
+ * ========================================================================= */
+
+static void overlay_pool_init(overlay_pool_t *p) {
+    memset(p, 0, sizeof(*p));
+    p->lru_head = LRU_NONE;
+    p->lru_tail = LRU_NONE;
+}
+
+static void overlay_pool_destroy(overlay_pool_t *p) {
+    for (uint32_t i = 0; i < p->high_water; i++)
+        if (p->entries[i].occupied) free(p->entries[i].data);
+    free(p->entries);
+    free(p->free_stack);
+    overlay_pool_init(p);
+}
+
+static uint32_t overlay_alloc(overlay_pool_t *p) {
+    if (p->free_count > 0) { p->count++; return p->free_stack[--p->free_count]; }
+    if (p->high_water >= p->capacity) {
+        uint32_t nc = p->capacity ? p->capacity * 2 : OVERLAY_INIT_CAP;
+        overlay_entry_t *ne = realloc(p->entries, nc * sizeof(*ne));
+        if (!ne) return UINT32_MAX;
+        memset(ne + p->capacity, 0, (nc - p->capacity) * sizeof(*ne));
+        p->entries = ne;
+        uint32_t *nf = realloc(p->free_stack, nc * sizeof(uint32_t));
+        if (!nf) return UINT32_MAX;
+        p->free_stack = nf;
+        p->capacity = nc;
     }
+    p->count++;
+    return p->high_water++;
+}
+
+static void overlay_release(overlay_pool_t *p, uint32_t idx) {
+    overlay_entry_t *e = &p->entries[idx];
+    free(e->data);
+    memset(e, 0, sizeof(*e));
+    p->free_stack[p->free_count++] = idx;
+    p->count--;
+}
+
+/* LRU doubly-linked list */
+static void lru_remove(overlay_pool_t *p, uint32_t idx) {
+    overlay_entry_t *e = &p->entries[idx];
+    if (e->lru_prev != LRU_NONE) p->entries[e->lru_prev].lru_next = e->lru_next;
+    else p->lru_head = e->lru_next;
+    if (e->lru_next != LRU_NONE) p->entries[e->lru_next].lru_prev = e->lru_prev;
+    else p->lru_tail = e->lru_prev;
+    e->lru_prev = e->lru_next = LRU_NONE;
+}
+
+static void lru_push_front(overlay_pool_t *p, uint32_t idx) {
+    overlay_entry_t *e = &p->entries[idx];
+    e->lru_prev = LRU_NONE;
+    e->lru_next = p->lru_head;
+    if (p->lru_head != LRU_NONE) p->entries[p->lru_head].lru_prev = idx;
+    else p->lru_tail = idx;
+    p->lru_head = idx;
+}
+
+static void lru_touch(overlay_pool_t *p, uint32_t idx) {
+    if (p->lru_head == idx) return;
+    lru_remove(p, idx);
+    lru_push_front(p, idx);
+}
+
+/* =========================================================================
+ * Resolve offset → data pointer (overlay or mmap)
+ * ========================================================================= */
+
+static inline uint8_t *data_ptr(const flat_store_t *s, uint64_t offset) {
+    if (offset & OVERLAY_BIT)
+        return s->overlay.entries[OVERLAY_IDX(offset)].data;
     return s->base + FLAT_STORE_HEADER_SIZE + offset;
 }
 
-/* Allocate a slot in the deferred buffer */
-static uint64_t deferred_alloc(flat_store_t *s, size_t slot_size) {
-    deferred_buf_t *d = &s->deferred;
-    if (d->used + slot_size > d->cap) {
-        size_t nc = d->cap ? d->cap * 2 : (4ULL * 1024 * 1024);
-        while (nc < d->used + slot_size) nc *= 2;
-        uint8_t *nd = realloc(d->data, nc);
-        if (!nd) return UINT64_MAX;
-        d->data = nd;
-        d->cap = nc;
-    }
-    uint64_t off = (uint64_t)d->used | DEFERRED_BIT;
-    d->used += slot_size;
-    return off;
+/* Helper: build a slot buffer (shared by put paths) */
+static void build_slot(uint8_t *slot, uint8_t class_idx, uint16_t record_len,
+                       const uint8_t *key, uint32_t key_size,
+                       const void *record, uint32_t capacity) {
+    uint32_t shdr = slot_header_pack(class_idx, record_len);
+    memcpy(slot, &shdr, SLOT_HEADER_SIZE);
+    memcpy(slot + SLOT_HEADER_SIZE, key, key_size);
+    if (record_len > 0)
+        memcpy(slot + SLOT_HEADER_SIZE + key_size, record, record_len);
+    if (record_len < capacity)
+        memset(slot + SLOT_HEADER_SIZE + key_size + record_len, 0,
+               capacity - record_len);
 }
 
 static bool ensure_mapped(flat_store_t *s, uint64_t needed_data_end) {
@@ -302,6 +392,7 @@ flat_store_t *flat_store_create(const char *path, uint32_t key_size,
 {
     flat_store_t *s = calloc(1, sizeof(flat_store_t));
     if (!s) return NULL;
+    overlay_pool_init(&s->overlay);
 
     s->key_size        = key_size;
     s->max_record_size = max_record_size;
@@ -444,7 +535,7 @@ void flat_store_destroy(flat_store_t *s) {
     if (s->fd >= 0) close(s->fd);
     for (int i = 0; i < MAX_SIZE_CLASSES; i++)
         free_list_destroy(&s->free_lists[i]);
-    free(s->deferred.data);
+    overlay_pool_destroy(&s->overlay);
     free(s);
 }
 
@@ -490,52 +581,70 @@ bool flat_store_put(flat_store_t *s, const uint8_t *key,
 
     int new_class = class_for_record(s, record_len);
     uint32_t slot_size = s->slot_sizes[new_class];
-
-    /* Always write to deferred buffer — fast, in-memory */
-    uint64_t new_offset = deferred_alloc(s, slot_size);
-    if (new_offset == UINT64_MAX) return false;
-
-    uint8_t *slot = data_ptr(s, new_offset);
-    uint32_t shdr = slot_header_pack((uint8_t)new_class, (uint16_t)record_len);
-    memcpy(slot, &shdr, SLOT_HEADER_SIZE);
-    memcpy(slot + SLOT_HEADER_SIZE, key, s->key_size);
-    if (record_len > 0) {
-        memcpy(slot + SLOT_HEADER_SIZE + s->key_size, record, record_len);
-    }
     uint32_t capacity = class_record_capacity(s, new_class);
-    if (record_len < capacity) {
-        memset(slot + SLOT_HEADER_SIZE + s->key_size + record_len,
-               0, capacity - record_len);
-    }
 
-    /* Check if key already exists */
     const void *existing = compact_art_get(&s->index, key);
     if (existing) {
         uint64_t old_offset;
         memcpy(&old_offset, existing, sizeof(uint64_t));
 
-        /* Free old file slot if it's on disk (not deferred) */
-        if (!(old_offset & DEFERRED_BIT)) {
-            uint32_t old_hdr;
-            memcpy(&old_hdr, s->base + FLAT_STORE_HEADER_SIZE + old_offset,
-                   SLOT_HEADER_SIZE);
-            uint8_t old_class;
-            uint16_t old_len;
-            slot_header_unpack(old_hdr, &old_class, &old_len);
-            uint32_t free_hdr = slot_header_pack(old_class, 0);
-            memcpy(s->base + FLAT_STORE_HEADER_SIZE + old_offset,
-                   &free_hdr, SLOT_HEADER_SIZE);
-            free_list_push(&s->free_lists[old_class], old_offset);
+        if (old_offset & OVERLAY_BIT) {
+            /* Already in overlay — update in place or realloc */
+            uint32_t idx = OVERLAY_IDX(old_offset);
+            overlay_entry_t *e = &s->overlay.entries[idx];
+            if (e->slot_size < slot_size) {
+                uint8_t *nd = realloc(e->data, slot_size);
+                if (!nd) return false;
+                e->data = nd;
+                e->slot_size = slot_size;
+            }
+            build_slot(e->data, (uint8_t)new_class, (uint16_t)record_len,
+                       key, s->key_size, record, capacity);
+            e->dirty = true;
+            lru_touch(&s->overlay, idx);
+            return true;
         }
 
-        compact_art_insert(&s->index, key, &new_offset);
+        /* On disk → create overlay entry, remember old file offset */
+        uint32_t idx = overlay_alloc(&s->overlay);
+        if (idx == UINT32_MAX) return false;
+        overlay_entry_t *e = &s->overlay.entries[idx];
+        e->data = malloc(slot_size);
+        if (!e->data) { overlay_release(&s->overlay, idx); return false; }
+        e->slot_size = slot_size;
+        e->file_offset = old_offset;
+        e->dirty = true;
+        e->occupied = true;
+        e->lru_prev = e->lru_next = LRU_NONE;
+        lru_push_front(&s->overlay, idx);
+        build_slot(e->data, (uint8_t)new_class, (uint16_t)record_len,
+                   key, s->key_size, record, capacity);
+
+        uint64_t ov = (uint64_t)idx | OVERLAY_BIT;
+        compact_art_insert(&s->index, key, &ov);
         return true;
     }
 
-    /* New key */
-    if (!compact_art_insert(&s->index, key, &new_offset))
-        return false;
+    /* New key → create overlay entry */
+    uint32_t idx = overlay_alloc(&s->overlay);
+    if (idx == UINT32_MAX) return false;
+    overlay_entry_t *e = &s->overlay.entries[idx];
+    e->data = malloc(slot_size);
+    if (!e->data) { overlay_release(&s->overlay, idx); return false; }
+    e->slot_size = slot_size;
+    e->file_offset = UINT64_MAX;
+    e->dirty = true;
+    e->occupied = true;
+    e->lru_prev = e->lru_next = LRU_NONE;
+    lru_push_front(&s->overlay, idx);
+    build_slot(e->data, (uint8_t)new_class, (uint16_t)record_len,
+               key, s->key_size, record, capacity);
 
+    uint64_t ov = (uint64_t)idx | OVERLAY_BIT;
+    if (!compact_art_insert(&s->index, key, &ov)) {
+        overlay_release(&s->overlay, idx);
+        return false;
+    }
     s->live_count++;
     return true;
 }
@@ -577,18 +686,31 @@ bool flat_store_delete(flat_store_t *s, const uint8_t *key) {
     uint64_t offset;
     memcpy(&offset, val, sizeof(uint64_t));
 
-    /* Only free file slots — deferred slots are reclaimed on flush */
-    if (!(offset & DEFERRED_BIT)) {
+    /* Delete from index FIRST — leaf_matches needs data_ptr during delete */
+    compact_art_delete(&s->index, key);
+    s->live_count--;
+
+    if (offset & OVERLAY_BIT) {
+        uint32_t idx = OVERLAY_IDX(offset);
+        overlay_entry_t *e = &s->overlay.entries[idx];
+        /* Free old file slot if entry was loaded from disk */
+        if (e->file_offset != UINT64_MAX) {
+            uint32_t fhdr;
+            memcpy(&fhdr, s->base + FLAT_STORE_HEADER_SIZE + e->file_offset,
+                   SLOT_HEADER_SIZE);
+            uint8_t fc; uint16_t fl;
+            slot_header_unpack(fhdr, &fc, &fl);
+            free_slot(s, e->file_offset, fc);
+        }
+        lru_remove(&s->overlay, idx);
+        overlay_release(&s->overlay, idx);
+    } else {
         uint32_t shdr;
-        memcpy(&shdr, data_ptr(s, offset), SLOT_HEADER_SIZE);
-        uint8_t class_idx;
-        uint16_t data_len;
+        memcpy(&shdr, s->base + FLAT_STORE_HEADER_SIZE + offset, SLOT_HEADER_SIZE);
+        uint8_t class_idx; uint16_t data_len;
         slot_header_unpack(shdr, &class_idx, &data_len);
         free_slot(s, offset, class_idx);
     }
-
-    compact_art_delete(&s->index, key);
-    s->live_count--;
     return true;
 }
 
@@ -710,68 +832,46 @@ uint32_t flat_store_read_leaf_record(const flat_store_t *s,
  * ========================================================================= */
 
 void flat_store_flush_deferred(flat_store_t *s) {
-    if (!s || !s->deferred.data || s->deferred.used == 0) return;
+    if (!s) return;
+    overlay_pool_t *p = &s->overlay;
 
-    /* Phase 1: Collect deferred entries from the index.
-     * The index has exactly one entry per key — no duplicates. */
-    typedef struct { uint64_t buf_pos; } _deferred_entry_t;
-    size_t max_entries = s->live_count + 1;
-    uint8_t **keys = malloc(max_entries * sizeof(uint8_t *));
-    uint64_t *buf_offsets = malloc(max_entries * sizeof(uint64_t));
-    if (!keys || !buf_offsets) {
-        free(keys); free(buf_offsets);
-        s->deferred.used = 0;
-        return;
-    }
+    for (uint32_t i = 0; i < p->high_water; i++) {
+        overlay_entry_t *e = &p->entries[i];
+        if (!e->occupied || !e->dirty) continue;
 
-    size_t count = 0;
-    compact_art_iterator_t *it = compact_art_iterator_create(&s->index);
-    while (compact_art_iterator_next(it) && count < max_entries) {
-        const void *val = compact_art_iterator_value(it);
-        uint64_t offset;
-        memcpy(&offset, val, sizeof(uint64_t));
-
-        if (!(offset & DEFERRED_BIT)) continue;
-
-        uint64_t buf_pos = offset & ~DEFERRED_BIT;
-        uint8_t *src = s->deferred.data + buf_pos;
-        keys[count] = src + SLOT_HEADER_SIZE;
-        buf_offsets[count] = buf_pos;
-        count++;
-    }
-    compact_art_iterator_destroy(it);
-
-    /* Phase 2: Flush collected entries to disk (safe to modify index now) */
-    for (size_t i = 0; i < count; i++) {
-        uint8_t *src = s->deferred.data + buf_offsets[i];
         uint32_t shdr;
-        memcpy(&shdr, src, SLOT_HEADER_SIZE);
-        uint8_t class_idx;
-        uint16_t data_len;
+        memcpy(&shdr, e->data, SLOT_HEADER_SIZE);
+        uint8_t class_idx; uint16_t data_len;
         slot_header_unpack(shdr, &class_idx, &data_len);
-        uint32_t slot_size = s->slot_sizes[class_idx];
 
-        /* Allocate file slot and copy */
+        /* Free old file slot */
+        if (e->file_offset != UINT64_MAX) {
+            uint32_t old_hdr;
+            memcpy(&old_hdr, s->base + FLAT_STORE_HEADER_SIZE + e->file_offset,
+                   SLOT_HEADER_SIZE);
+            uint8_t oc; uint16_t ol;
+            slot_header_unpack(old_hdr, &oc, &ol);
+            free_slot(s, e->file_offset, oc);
+        }
+
+        /* Write to disk */
         uint64_t file_offset = alloc_slot(s, class_idx);
         if (file_offset == UINT64_MAX) continue;
-
-        uint8_t *dst = s->base + FLAT_STORE_HEADER_SIZE + file_offset;
-        memcpy(dst, src, slot_size);
+        memcpy(s->base + FLAT_STORE_HEADER_SIZE + file_offset, e->data, e->slot_size);
 
         /* Update index to file offset */
-        compact_art_insert(&s->index, keys[i], &file_offset);
+        uint8_t *key_ptr = e->data + SLOT_HEADER_SIZE;
+        compact_art_insert(&s->index, key_ptr, &file_offset);
+
+        e->file_offset = file_offset;
+        e->dirty = false;
     }
-
-    free(keys);
-    free(buf_offsets);
-
-    /* Reset deferred buffer */
-    s->deferred.used = 0;
 }
 
 void flat_store_clear_deferred(flat_store_t *s) {
     if (!s) return;
-    s->deferred.used = 0;
+    overlay_pool_destroy(&s->overlay);
+    overlay_pool_init(&s->overlay);
 }
 
 /* =========================================================================
@@ -782,5 +882,24 @@ void flat_store_sync(flat_store_t *s) {
     if (!s) return;
     flat_store_flush_deferred(s);
     write_header(s);
-    /* No msync — OS page cache handles writeback */
+}
+
+uint32_t flat_store_evict_clean(flat_store_t *s) {
+    if (!s) return 0;
+    overlay_pool_t *p = &s->overlay;
+    uint32_t evicted = 0;
+
+    uint32_t idx = p->lru_tail;
+    while (idx != LRU_NONE) {
+        overlay_entry_t *e = &p->entries[idx];
+        uint32_t prev = e->lru_prev;
+        if (!e->dirty && e->occupied && e->file_offset != UINT64_MAX) {
+            /* Clean + backed by disk → safe to evict */
+            lru_remove(p, idx);
+            overlay_release(p, idx);
+            evicted++;
+        }
+        idx = prev;
+    }
+    return evicted;
 }

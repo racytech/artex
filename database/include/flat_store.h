@@ -145,18 +145,17 @@ uint32_t flat_store_read_leaf_record(const flat_store_t *store,
                                       uint8_t *buf, uint32_t buf_size);
 
 /* =========================================================================
- * Deferred Buffer
+ * Overlay (in-memory cache)
  * ========================================================================= */
 
-/**
- * Flush deferred (in-memory) writes to the data file.
- * Updates compact_art leaves to point to file offsets.
- * Call at checkpoint/evict time.
- */
+/** Flush dirty overlay entries to disk. Entries stay cached (clean). */
 void flat_store_flush_deferred(flat_store_t *store);
 
-/** Discard all deferred writes without flushing. */
+/** Drop all overlay entries without flushing. */
 void flat_store_clear_deferred(flat_store_t *store);
+
+/** Evict clean overlay entries. Returns count evicted. */
+uint32_t flat_store_evict_clean(flat_store_t *store);
 
 /* =========================================================================
  * Durability
