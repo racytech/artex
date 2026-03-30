@@ -80,10 +80,6 @@ add_library(art_database STATIC
     database/src/mem_art.c
 )
 
-# Bloom Filter (probabilistic set membership)
-add_library(bloom_filter STATIC database/src/bloom_filter.c)
-target_link_libraries(bloom_filter m)
-
 # Disk Table (mmap-backed hash table optimized for pre-hashed keys)
 add_library(disk_table STATIC database/src/disk_table.c)
 
@@ -171,14 +167,6 @@ if(ENABLE_VERKLE_BUILD)
     )
     target_link_libraries(verkle_state verkle_key verkle_flat)
 endif()
-
-# Node cache (two-list LRU with pinning)
-add_library(node_cache STATIC database/src/node_cache.c)
-
-# MPT Trie (native in-memory trie — no index, no arena, just pointers)
-add_library(mpt_trie STATIC database/src/mpt_trie.c)
-target_include_directories(mpt_trie PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-target_link_libraries(mpt_trie common)
 
 # ART→MPT (compute MPT hashes from compact_art structure)
 add_library(mem_mpt STATIC database/src/mem_mpt.c)
@@ -399,13 +387,6 @@ add_executable(bench_mem_art_index
 )
 target_link_libraries(bench_mem_art_index art_database)
 
-# Test: Disk Hash (zero-RAM disk-backed hash table)
-add_executable(test_bloom_filter
-    database/tests/test_bloom_filter.c
-)
-target_link_libraries(test_bloom_filter bloom_filter m)
-add_test(NAME test_bloom_filter COMMAND test_bloom_filter)
-
 # Test: Code Store (content-addressed bytecode storage)
 add_executable(test_code_store
     database/tests/test_code_store.c
@@ -450,14 +431,6 @@ endif()
 target_link_libraries(test_evm_state_audit ${TEST_EVM_AUDIT_LIBS})
 add_test(NAME test_evm_state_audit COMMAND test_evm_state_audit)
 
-# Test: MPT Trie (native) cross-validation against Python reference vectors
-add_executable(test_mpt_trie_vectors database/tests/test_mpt_trie_vectors.c)
-target_link_libraries(test_mpt_trie_vectors mpt_trie common)
-add_test(NAME test_mpt_trie_vectors
-    COMMAND test_mpt_trie_vectors
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-)
-
 # Test: ART→MPT cross-validation against Python reference vectors
 add_executable(test_art_mpt_vectors database/tests/test_art_mpt_vectors.c)
 target_link_libraries(test_art_mpt_vectors art_mpt compact_art common)
@@ -465,11 +438,6 @@ add_test(NAME test_art_mpt_vectors
     COMMAND test_art_mpt_vectors
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
-
-# Test: Node cache (two-list LRU with pinning)
-add_executable(test_node_cache database/tests/test_node_cache.c)
-target_link_libraries(test_node_cache node_cache)
-add_test(NAME test_node_cache COMMAND test_node_cache)
 
 if(ENABLE_VERKLE_BUILD)
     # Test: Verkle flat (go-verkle cross-validation + revert + determinism)
