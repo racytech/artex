@@ -1202,8 +1202,175 @@ static bool clear_prestate_slot_cb(const uint8_t *k, size_t kl,
     return true;
 }
 
-/* TODO: expose via header if needed by test_runner */
+/* TODO: expose clear_prestate via header if needed by test_runner */
 
 /* =========================================================================
- * TODO: compute_mpt_root, evict, stats, prefetch, collect_*
+ * flush callbacks for compute_mpt_root
  * ========================================================================= */
+
+static bool flush_slot_cb(const uint8_t *key, size_t key_len,
+                            const void *value, size_t value_len, void *ud) {
+    (void)key_len; (void)value_len;
+    state_overlay_t *so = ud;
+    const cached_slot_t *cs = value;
+    const cached_account_t *ca = (const cached_account_t *)mem_art_get(
+        &so->accounts, key, ADDRESS_KEY_SIZE, NULL);
+    if (!ca || !ca->existed) return true;
+    if (ca->storage_cleared && !cs->mpt_dirty) return true;
+    if (uint256_is_zero(&cs->current)) {
+        flat_state_delete_storage(so->flat_state,
+                                   ca->addr_hash.bytes, cs->slot_hash.bytes);
+    } else {
+        uint8_t vbe[32];
+        uint256_to_bytes(&cs->current, vbe);
+        flat_state_put_storage(so->flat_state,
+                                ca->addr_hash.bytes, cs->slot_hash.bytes, vbe);
+    }
+    return true;
+}
+
+static bool flush_account_cb(const uint8_t *key, size_t key_len,
+                               const void *value, size_t value_len, void *ud) {
+    (void)key; (void)key_len; (void)value_len;
+    state_overlay_t *so = ud;
+    const cached_account_t *ca = value;
+    if (!ca->existed) return true;
+
+    flat_account_record_t frec;
+    frec.nonce = ca->nonce;
+    uint256_to_bytes(&ca->balance, frec.balance);
+    const uint8_t *ch = ca->has_code
+        ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
+    memcpy(frec.code_hash, ch, 32);
+    memcpy(frec.storage_root, ca->storage_root.bytes, 32);
+    flat_state_put_account(so->flat_state, ca->addr_hash.bytes, &frec);
+    return true;
+}
+
+/* =========================================================================
+ * compute_mpt_root — 7-step checkpoint flow
+ * ========================================================================= */
+
+hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
+    hash_t root = hash_zero();
+    if (!so) return root;
+    if (!so->flat_state || !so->account_trie) {
+        fprintf(stderr, "FATAL: compute_mpt_root without flat_state/account_trie\n");
+        return root;
+    }
+
+    struct timespec t0, t1, t2;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    size_t dirty_count = so->dirty_accounts.count;
+
+    /* Step 1. Promote existed on dirty accounts */
+    for (size_t d = 0; d < so->dirty_accounts.count; d++) {
+        const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+            &so->accounts, akey, ADDRESS_KEY_SIZE, NULL);
+        if (!ca || !ca->mpt_dirty) continue;
+        if (ca->block_dirty || ca->block_code_dirty) {
+            if (ca->self_destructed) {
+                ca->existed = false;
+            } else {
+                bool is_empty = (ca->nonce == 0 &&
+                                 uint256_is_zero(&ca->balance) && !ca->has_code);
+                if (!(!ca->existed && !ca->created && is_empty && prune_empty))
+                    ca->existed = true;
+            }
+        }
+    }
+
+    /* Step 2. Delete orphaned storage for dead/storage-cleared accounts */
+    for (size_t d = 0; d < so->dirty_accounts.count; d++) {
+        const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+            &so->accounts, akey, ADDRESS_KEY_SIZE, NULL);
+        if (!ca || !ca->mpt_dirty) continue;
+        if (!ca->existed || ca->storage_cleared)
+            flat_state_delete_all_storage(so->flat_state, ca->addr_hash.bytes);
+        if (!ca->existed)
+            flat_state_delete_account(so->flat_state, ca->addr_hash.bytes);
+    }
+
+    /* Step 3. Flush ALL cached slots to flat_state */
+    mem_art_foreach(&so->storage, flush_slot_cb, so);
+
+    /* Step 4. Compute storage roots for storage_dirty accounts */
+    for (size_t d = 0; d < so->dirty_accounts.count; d++) {
+        const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+            &so->accounts, akey, ADDRESS_KEY_SIZE, NULL);
+        if (!ca || !ca->storage_dirty || !ca->existed) continue;
+        storage_trie_root(so->storage_trie, ca->addr_hash.bytes,
+                           ca->storage_root.bytes);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    /* Step 5. Flush ALL cached accounts to flat_state */
+    mem_art_foreach(&so->accounts, flush_account_cb, so);
+
+    /* Step 6. Compute account trie root */
+    account_trie_root(so->account_trie, root.bytes);
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+
+    /* Step 7. Clear dirty flags */
+    for (size_t d = 0; d < so->dirty_accounts.count; d++) {
+        const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+        cached_account_t *ca = (cached_account_t *)mem_art_get_mut(
+            &so->accounts, akey, ADDRESS_KEY_SIZE, NULL);
+        if (!ca) continue;
+        ca->mpt_dirty = false;
+        ca->block_dirty = false;
+        ca->block_code_dirty = false;
+        ca->storage_dirty = false;
+        ca->storage_cleared = false;
+    }
+
+    so->last_root_stor_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                            (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    so->last_root_acct_ms = (t2.tv_sec - t1.tv_sec) * 1000.0 +
+                            (t2.tv_nsec - t1.tv_nsec) / 1e6;
+    so->last_root_dirty_count = dirty_count;
+    return root;
+}
+
+/* =========================================================================
+ * Evict
+ * ========================================================================= */
+
+void state_overlay_evict(state_overlay_t *so) {
+    if (!so) return;
+    if (so->flat_state) {
+        mem_art_foreach(&so->storage, flush_slot_cb, so);
+        mem_art_foreach(&so->accounts, flush_account_cb, so);
+        flat_store_flush_deferred(flat_state_account_store(so->flat_state));
+        flat_store_flush_deferred(flat_state_storage_store(so->flat_state));
+    }
+    mem_art_foreach(&so->accounts, free_code_cb, NULL);
+    dirty_clear(&so->dirty_accounts);
+    dirty_clear(&so->dirty_slots);
+    mem_art_destroy(&so->accounts);  mem_art_init(&so->accounts);
+    mem_art_destroy(&so->storage);   mem_art_init(&so->storage);
+}
+
+/* =========================================================================
+ * Stats
+ * ========================================================================= */
+
+state_overlay_stats_t state_overlay_get_stats(const state_overlay_t *so) {
+    state_overlay_stats_t s = {0};
+    if (!so) return s;
+    s.overlay_accounts = mem_art_size(&so->accounts);
+    s.overlay_slots = mem_art_size(&so->storage);
+    if (so->flat_state) {
+        s.flat_acct_count = flat_state_account_count(so->flat_state);
+        s.flat_stor_count = flat_state_storage_count(so->flat_state);
+        s.flat_acct_mem = compact_art_memory_usage(flat_state_account_art(so->flat_state));
+        s.flat_stor_mem = compact_art_memory_usage(flat_state_storage_art(so->flat_state));
+    }
+    s.root_stor_ms = so->last_root_stor_ms;
+    s.root_acct_ms = so->last_root_acct_ms;
+    s.root_dirty_count = so->last_root_dirty_count;
+    return s;
+}
