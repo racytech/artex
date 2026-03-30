@@ -1,247 +1,123 @@
-# Unified State Store — Eliminating mem_art
+# Unified State Store
 
-## Problem
+## Status: Phase 2 Complete (overlay-dev-0 branch)
 
-Current architecture has two redundant layers:
+### What's Done
 
-```
-EVM execution
-    ↓
-mem_art cache (accounts + storage)     ← in-memory ART, per-entry flags, journal
-    ↓
-flat_store (accounts + storage)        ← compact_art index + mmap'd data + deferred buffer
-    ↓
-disk (mmap'd .art files)
-```
+**Phase 1: flat_store overlay pool** (replaces deferred buffer)
+- Per-entry overlay with dirty tracking and LRU links
+- `OVERLAY_BIT` encoding in compact_art leaf values
+- `flat_store_ensure_overlay` / `overlay_record` / `mark_dirty` API
+- No duplicates by design (one entry per key)
+- `flat_store_evict_clean` for granular LRU eviction
 
-This causes:
-- **Double memory** for hot entries (mem_art arena + flat_store deferred buffer)
-- **Complex flush dance** (flush_slot_cb, flush_account_cb, evict_cache)
-- **Stale data bugs** (cached slots surviving CREATE, evict writing back stale entries)
-- **Flag management complexity** (mpt_dirty, block_dirty, storage_cleared across two layers)
+**Phase 2: state_overlay without mem_art** (replaces evm_state.c internals)
+- `state_overlay.c` (~1400 lines): full EVM state API
+- `evm_state.c` (~300 lines): thin forwarder (public API unchanged)
+- Meta sidecar arrays (`account_meta_pool`, `slot_meta_pool`) for typed access
+- Deferred sync: mutations update meta only, flat_store synced at checkpoint
+- compute_mpt_root simplified: promote → delete orphans → sync dirty → hash
+- No full-flush (old Steps 3+5 eliminated)
 
-## Proposed Architecture
-
-Merge mem_art into flat_store. One data structure per domain:
+### Current Architecture
 
 ```
 EVM execution
-    ↓
-flat_store (accounts)     ← compact_art index + mmap'd data + overlay + journal
-flat_store (storage)      ← compact_art index + mmap'd data + overlay + journal
-    ↓
-disk (mmap'd .art files)
+    ↓ typed access (nonce, balance, flags)
+state_overlay meta arrays (account_meta_pool, slot_meta_pool)
+    ↓ sync dirty entries at checkpoint
+flat_store overlay (compressed records, in-memory)
+    ↓ flush to disk at checkpoint/evict
+flat_store data file (mmap'd .art files)
+    ↓ art_mpt walks compact_art directly
+account_trie / storage_trie → MPT root hash
 ```
 
-### compact_art leaf values
+### Remaining mem_art Usage
 
-Currently: `uint64_t offset` (file offset or DEFERRED_BIT | buffer_offset)
+| Structure | Purpose | Can be eliminated? |
+|-----------|---------|-------------------|
+| `acct_index` | addr[20] → meta index | Yes: use flat_store overlay with phantom flag |
+| `slot_index` | skey[52] → meta index | Yes: same approach |
+| `warm_addrs` | EIP-2929 warm addresses | No: ephemeral per-tx, not persisted |
+| `warm_slots` | EIP-2929 warm slots | No: ephemeral per-tx |
+| `transient` | EIP-1153 transient storage | No: ephemeral per-tx |
 
-Proposed: `uint64_t` encoding three states:
-- `FILE_BIT`:     offset into mmap'd data file (cold, on disk)
-- `OVERLAY_BIT`:  index into overlay array (hot, in memory)
-- `DELETED_BIT`:  tombstone (entry deleted, pending disk cleanup)
+### Test Status
 
-### Overlay Entry
+~1873 failures across state_tests (0 on mpt-arena-dev-0 baseline):
+- Homestead, Byzantium, Istanbul: **pass fully**
+- Constantinople: 7 (CREATE2+REVERT edge case)
+- London: 5 (EIP-1559 valid tx)
+- Shanghai: 3 (stack overflow)
+- Berlin: 590, Cancun: 480, Frontier (Berlin+ variants): 788
 
-Replaces `cached_account_t` / `cached_slot_t` and the deferred buffer:
+Root cause: sync flow between meta and flat_store. Accounts written to
+flat_state before `existed` promotion pollute the trie. Need systematic
+debugging of the sync → promote → delete → trie-hash flow.
 
-```c
-typedef struct {
-    uint8_t  *data;          // serialized record (same format as disk)
-    uint32_t  data_len;
-    uint32_t  lru_prev;      // LRU doubly-linked list
-    uint32_t  lru_next;
+## Remaining Work
 
-    // Journal support
-    uint8_t  *original_data; // pre-tx value (for EIP-2200 / revert)
+### Phase 3: Eliminate meta duplication
+- Store typed fields directly in overlay entry (not separate meta array)
+- One allocation per account instead of two (meta + overlay)
+- Encode callback serializes from typed struct on-the-fly
 
-    // Flags (replace cached_account_t flags)
-    uint16_t  flags;         // DIRTY, EXISTED, CREATED, SELF_DESTRUCTED,
-                             // STORAGE_CLEARED, STORAGE_DIRTY, HAS_CODE, etc.
-} overlay_entry_t;
+### Phase 4: Eliminate acct_index / slot_index mem_arts
+- Add phantom flag to flat_store overlay entries
+- Phantom entries: in overlay (for typed access) but not in compact_art (not in trie)
+- art_mpt skips phantoms during hash computation
+- Removes last non-ephemeral mem_art usage
+
+### Phase 5: Per-account storage (Option A)
+Each account owns a per-account compact_art for its storage:
+
+```
+flat_store (accounts): 32-byte keys → { account_record, compact_art *storage }
 ```
 
-### Operations
-
-**Read (ensure_account / ensure_slot)**:
-1. `compact_art_get(key)` → leaf value
-2. If OVERLAY_BIT: return overlay entry (hot path, no copy)
-3. If FILE_BIT: read from mmap, create overlay entry, update leaf to OVERLAY_BIT
-4. If not found: create empty overlay entry
-
-**Write (set_balance, set_storage, etc.)**:
-1. Ensure entry is in overlay (step above)
-2. Journal old value if snapshot active
-3. Update data in overlay entry
-4. Set DIRTY flag
-
-**Snapshot / Revert**:
-- Snapshot: record journal position
-- Revert: walk journal backwards, restore original_data for each entry
-
-**Checkpoint (compute_mpt_root)**:
-1. Iterate dirty overlay entries (dirty list, not full scan)
-2. Compute storage roots for storage_dirty accounts
-3. Flush dirty entries to disk (write to mmap, update leaf to FILE_BIT)
-4. Compute account trie root from compact_art
-5. Clear dirty flags
-
-**LRU Eviction**:
-- Only evict CLEAN overlay entries (dirty must stay until checkpoint)
-- Update leaf from OVERLAY_BIT back to FILE_BIT
-- Free overlay entry memory
-- Can happen anytime under memory pressure
-
-### What This Eliminates
-
-| Current                          | Proposed                         |
-|----------------------------------|----------------------------------|
-| mem_art (2 instances)            | Gone                             |
-| cached_account_t struct          | overlay_entry_t (generic)        |
-| cached_slot_t struct             | overlay_entry_t (generic)        |
-| flush_slot_cb / flush_account_cb | Direct dirty-list flush          |
-| evict_cache (destroy + rebuild)  | LRU eviction (granular)          |
-| Deferred buffer                  | Overlay IS the deferred buffer   |
-| flat_store_flush_deferred        | Part of checkpoint flush         |
-| Stale slot bugs                  | Impossible (one source of truth) |
-
-### What This Keeps
-
-- compact_art as the unified index (already exists)
-- mmap'd data files for cold storage (already exists)
-- art_mpt for hash computation (walks compact_art, unchanged)
-- account_trie / storage_trie (unchanged)
-
-### EIP-2200 Original Values
-
-SSTORE gas calculation needs the "original" storage value (at transaction start).
-Two options:
-
-**Option A**: Store `original_data` in overlay entry. Set at commit_tx time
-(original = current). On revert, restore from journal.
-
-**Option B**: On first SLOAD/SSTORE per-tx, read from disk (the committed value).
-Cache it as original. This avoids storing originals for unmodified slots.
-
-Option A matches current code. Option B saves memory but adds a disk read.
-
-### Per-Account Storage Trie (Future)
-
-This design naturally extends to per-account storage compact_arts (Option A from
-the earlier discussion). Each account's overlay entry could hold a pointer to
-its storage compact_art. Benefits:
-
-- Storage root = `art_mpt_hash(account.storage_art)` — no subtree walk
-- Self-destruct = destroy per-account compact_art — O(1)
+Benefits:
+- Storage root = `art_mpt_hash(account.storage_art)` — trivial
+- Self-destruct = `compact_art_destroy` — O(1)
+- delete_all_storage = destroy + recreate — O(1)
 - No 32-byte addr_hash prefix duplication in storage keys
+- No sentinel keys, no mixed sizes, no filtered walks
 
-### Migration Path
+### Phase 6: LRU eviction policy
+- Evict cold overlay entries under memory pressure
+- Only clean entries (dirty must stay until checkpoint)
+- Keeps hot set in memory, cold on disk
+- At 250M accounts: ~100K hot vs 250M total — 2500x reduction
 
-1. Add overlay + journal to flat_store (new fields, backward compatible)
-2. Move flag management from cached_account_t to overlay_entry_t
-3. Redirect evm_state read/write functions to flat_store overlay
-4. Remove mem_art usage from evm_state
-5. Remove evict_cache flush dance
-6. Add LRU eviction
+### Phase 7: Eliminate full-flush in evict_cache
+- Currently evict flushes ALL cached entries to disk
+- With deferred sync, only dirty entries need flushing
+- Clean entries already backed by disk — just drop meta
 
-Steps 1-3 can be done incrementally. Step 4 is the breaking change.
+## Key Bugs Found During Development
 
-### Performance Expectations
+### flat_store
+- Deferred buffer duplicates: same key written multiple times created orphaned file slots
+- Fix: free old file slot in `put()` when overwriting disk entry
+- Fix: `flush_deferred` collects from compact_art iterator (dedup), not buffer scan
 
-- **Hot path (SLOAD/SSTORE)**: Same or faster. Currently: mem_art lookup (O(key_len)).
-  Proposed: compact_art lookup (O(key_len)) + overlay dereference. The compact_art
-  is the same ART structure, just with 4-byte refs instead of pointer-sized.
+### EIP-161 (Spurious Dragon)
+- Mass prune wrong: Ethereum doesn't mass-prune at SD, only prunes touched accounts
+- Fix: per-tx pruning in `commit_tx` with `prune_empty` flag from block_executor
+- Checkpoint window spanning SD boundary: pre-SD touched accounts must not be pruned
+- Fix: `commit_tx` uses per-block `prune_empty` value (set before each block)
 
-- **Checkpoint**: Faster. Currently: scan ALL cached entries (flush_slot_cb,
-  flush_account_cb). Proposed: iterate dirty list only.
+### State management
+- `evm_state_exists` must check `dirty || created || block_dirty` (not just `existed`)
+- Stale slots after CREATE: cached slots from before CREATE survive in cache
+- Fix: `flush_slot_cb` skips `storage_cleared && !mpt_dirty` slots
+- JOURNAL_TRANSIENT_STORAGE must store slot key in storage union member
+- `sync_account_to_overlay` must skip empty non-existed accounts (precompile touches)
+- `flat_store_ensure_overlay` for NOT FOUND must NOT insert into compact_art
 
-- **Memory**: Lower. No duplication between mem_art and deferred buffer.
-  Clean overlay entries can be evicted under pressure.
+## SD Boundary (block 2,675,200)
 
-- **Eviction**: Granular. Currently: destroy entire cache every 256 blocks.
-  Proposed: LRU eviction of individual cold entries anytime.
-
-## Future: Per-Account Storage (Option A)
-
-Once the unified overlay is stable, replace the single 64-byte-key storage
-flat_store with per-account storage compact_arts embedded in account entries.
-
-### Current
-
-```
-flat_store (accounts):  32-byte keys → account_record
-flat_store (storage):   64-byte keys (addr_hash[32] || slot_hash[32]) → value[32]
-```
-
-Two separate stores. Storage keys duplicate the 32-byte addr_hash prefix.
-delete_all_storage walks a subtree. Storage root uses art_mpt_subtree_hash.
-
-### Proposed
-
-```
-flat_store (accounts):  32-byte keys → { account_record, compact_art *storage }
-```
-
-Each account overlay entry owns a per-account compact_art for its storage.
-Storage keys are 32 bytes (slot_hash only).
-
-### Why per-account (not unified 64-byte key)
-
-A single 64-byte-key compact_art was considered and rejected:
-
-| Concern                | Unified 64B key           | Per-account 32B key      |
-|------------------------|---------------------------|--------------------------|
-| Account lookup speed   | 64-byte (2x slower)       | 32-byte (same as now)    |
-| Storage root           | Filtered subtree walk     | `art_mpt_hash(art)` — trivial |
-| Self-destruct          | Walk subtree + skip sentinel | `compact_art_destroy` — O(1) |
-| delete_all_storage     | Walk subtree              | Destroy + recreate — O(1) |
-| Mixed record sizes     | 104B accounts + 32B slots | Separate — no waste      |
-| MPT computation        | Needs filtered walks      | Natural — matches Ethereum model |
-
-Two sequential 32-byte lookups (account → per-account slot) equals the same
-total key bytes as one 64-byte lookup, but the account lookup is shared across
-BALANCE, EXTCODESIZE, CALL, etc.
-
-### Per-Account Storage Design
-
-```c
-typedef struct {
-    overlay_entry_t base;        // account data, flags, LRU
-    compact_art_t  *storage;     // NULL until first SLOAD/SSTORE
-    art_mpt_t      *storage_mpt; // NULL until storage root needed
-} account_overlay_entry_t;
-```
-
-**SLOAD**: `compact_art_get(account.storage, slot_hash)` — 32-byte lookup.
-If storage is NULL, account has no storage (return 0).
-
-**SSTORE**: ensure storage compact_art exists (lazy create), insert slot.
-
-**Storage root**: `art_mpt_hash(account.storage_mpt)` — hash the per-account
-compact_art directly. No subtree prefix walk needed.
-
-**Self-destruct / CREATE**: `compact_art_destroy(account.storage)` — O(1).
-Set storage = NULL. No walking, no orphan cleanup.
-
-**Persistence**: Per-account storage compact_arts serialize to a shared arena
-file (single mmap). Account record stores an offset/handle to its storage
-arena region. On load, deserialize lazily on first SLOAD.
-
-### Memory at Scale
-
-At 250M accounts, ~5M have storage. Per-account compact_art overhead:
-- Empty accounts: storage = NULL, 0 bytes
-- Accounts with storage: ~64 bytes struct + ART nodes for their slots
-- Total: ~5M * 64B = ~320MB overhead for structs
-- ART nodes: same total as current 64-byte key ART minus the addr_hash
-  prefix layer (~200-500MB saved)
-- Net: roughly break-even on base memory, but with granular eviction
-  (evict cold accounts' storage independently)
-
-### Implementation Order
-
-1. Unified overlay (this document, phase 1)
-2. Per-account storage compact_art (replace 64-byte key storage)
-3. Lazy storage loading (deserialize from arena on first access)
-4. Per-account LRU eviction (drop cold accounts' storage trees)
+Still failing on mpt-arena-dev-0 with root `0xcba578...`. The SD mismatch
+predates the overlay refactor. Analysis suggests it's in the interaction
+between flush ordering and EIP-161 at the SD checkpoint boundary.
+Will revisit after overlay is stable and producing correct roots.
