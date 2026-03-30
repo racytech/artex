@@ -602,6 +602,9 @@ bool flat_store_put(flat_store_t *s, const uint8_t *key,
                        key, s->key_size, record, capacity);
             e->dirty = true;
             lru_touch(&s->overlay, idx);
+            /* Re-insert same value to mark compact_art path as dirty
+             * so art_mpt knows to rehash this subtree. */
+            compact_art_insert(&s->index, key, &old_offset);
             return true;
         }
 
