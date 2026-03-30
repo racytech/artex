@@ -707,6 +707,7 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
                 ca->nonce = je->data.nonce.val;
                 ca->dirty = je->data.nonce.dirty;
                 ca->block_dirty = je->data.nonce.block_dirty;
+                sync_account_to_overlay(so, ca);
             }
             break;
         }
@@ -716,6 +717,7 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
                 ca->balance = je->data.balance.val;
                 ca->dirty = je->data.balance.dirty;
                 ca->block_dirty = je->data.balance.block_dirty;
+                sync_account_to_overlay(so, ca);
             }
             break;
         }
@@ -727,6 +729,7 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
                 ca->code_size = je->data.code.old_code_size;
                 ca->code_hash = je->data.code.old_hash;
                 ca->has_code = je->data.code.old_has_code;
+                sync_account_to_overlay(so, ca);
             }
             je->data.code.old_code = NULL;
             break;
@@ -738,6 +741,9 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
             if (cs) {
                 cs->current = je->data.storage.old_value;
                 cs->mpt_dirty = je->data.storage.old_mpt_dirty;
+                /* Re-sync reverted value to flat_store overlay */
+                cached_account_t *ca = find_account_meta(so, je->addr.bytes);
+                if (ca) sync_slot_to_overlay(so, ca, cs);
             }
             break;
         }
@@ -764,6 +770,7 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
 #ifdef ENABLE_HISTORY
                 ca->block_created   = je->data.create.old_block_created;
 #endif
+                sync_account_to_overlay(so, ca);
             }
             je->data.create.old_code = NULL;
             break;
