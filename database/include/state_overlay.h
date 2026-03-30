@@ -134,6 +134,9 @@ void state_overlay_commit_tx(state_overlay_t *so);
 /** Per-block commit: clear block flags, set EIP-2200 originals. */
 void state_overlay_commit(state_overlay_t *so);
 
+/** Clear pre-state dirty flags (after test_runner pre-state setup). */
+void state_overlay_clear_prestate_dirty(state_overlay_t *so);
+
 /** Begin a new block. */
 void state_overlay_begin_block(state_overlay_t *so, uint64_t block_number);
 

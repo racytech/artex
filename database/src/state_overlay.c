@@ -672,12 +672,12 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
         }
         case JOURNAL_TRANSIENT_STORAGE: {
             uint8_t skey[SLOT_KEY_SIZE];
-            make_slot_key(&je->addr, &je->data.slot, skey);
-            if (uint256_is_zero(&je->data.old_transient_value))
+            make_slot_key(&je->addr, &je->data.storage.slot, skey);
+            if (uint256_is_zero(&je->data.storage.old_value))
                 mem_art_delete(&so->transient, skey, SLOT_KEY_SIZE);
             else
                 mem_art_upsert(&so->transient, skey, SLOT_KEY_SIZE,
-                               &je->data.old_transient_value, sizeof(uint256_t));
+                               &je->data.storage.old_value, sizeof(uint256_t));
             break;
         }
         }
@@ -1015,7 +1015,7 @@ void state_overlay_tstore(state_overlay_t *so, const address_t *addr,
 
     journal_entry_t je = {
         .type = JOURNAL_TRANSIENT_STORAGE, .addr = *addr,
-        .data = { .old_transient_value = old }
+        .data.storage = { .slot = *key, .old_value = old }
     };
     journal_push(so, &je);
     mem_art_insert(&so->transient, skey, SLOT_KEY_SIZE, value, sizeof(uint256_t));
@@ -1224,7 +1224,13 @@ static bool clear_prestate_slot_cb(const uint8_t *k, size_t kl,
     return true;
 }
 
-/* TODO: expose clear_prestate via header if needed by test_runner */
+void state_overlay_clear_prestate_dirty(state_overlay_t *so) {
+    if (!so) return;
+    mem_art_foreach(&so->accounts, clear_prestate_acct_cb, NULL);
+    mem_art_foreach(&so->storage, clear_prestate_slot_cb, NULL);
+    dirty_clear(&so->dirty_accounts);
+    dirty_clear(&so->dirty_slots);
+}
 
 /* =========================================================================
  * flush callbacks for compute_mpt_root

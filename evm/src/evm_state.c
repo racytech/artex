@@ -217,8 +217,7 @@ void evm_state_mark_existed(evm_state_t *es, const address_t *addr) {
 }
 
 void evm_state_clear_prestate_dirty(evm_state_t *es) {
-    /* TODO: expose from state_overlay */
-    (void)es;
+    if (es) state_overlay_clear_prestate_dirty(es->so);
 }
 
 void evm_state_self_destruct(evm_state_t *es, const address_t *addr) {
