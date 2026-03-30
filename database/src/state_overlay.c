@@ -224,6 +224,9 @@ struct state_overlay {
     dirty_vec_t dirty_accounts;
     dirty_vec_t dirty_slots;
 
+    uint32_t next_acct_idx;
+    uint32_t next_slot_idx;
+
     bool prune_empty;
     bool batch_mode;
 
@@ -349,8 +352,7 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
     if (existing) return existing;
 
     /* Allocate new meta entry */
-    static uint32_t next_acct_idx = 0; /* TODO: proper pool allocator */
-    uint32_t idx = next_acct_idx++;
+    uint32_t idx = so->next_acct_idx++;
     cached_account_t *ca = acct_meta_ensure(&so->acct_meta, idx);
     if (!ca) return NULL;
 
@@ -408,8 +410,7 @@ static cached_slot_t *ensure_slot(state_overlay_t *so, const address_t *addr,
     if (existing) return existing;
 
     /* Allocate new meta entry */
-    static uint32_t next_slot_idx = 0;
-    uint32_t idx = next_slot_idx++;
+    uint32_t idx = so->next_slot_idx++;
     cached_slot_t *cs = slot_meta_ensure(&so->slot_meta, idx);
     if (!cs) return NULL;
 
