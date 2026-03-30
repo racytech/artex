@@ -363,16 +363,14 @@ void evm_state_dump_alloc_json(evm_state_t *es, const char *path) {
 }
 
 size_t evm_state_collect_addresses(evm_state_t *es, address_t *out, size_t max) {
-    /* TODO */
-    (void)es; (void)out; (void)max;
-    return 0;
+    if (!es || !es->so) return 0;
+    return state_overlay_collect_addresses(es->so, out, max);
 }
 
 size_t evm_state_collect_storage_keys(evm_state_t *es, const address_t *addr,
                                        uint256_t *out, size_t max) {
-    /* TODO */
-    (void)es; (void)addr; (void)out; (void)max;
-    return 0;
+    if (!es || !es->so) return 0;
+    return state_overlay_collect_storage_keys(es->so, addr, out, max);
 }
 
 #ifdef ENABLE_HISTORY

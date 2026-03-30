@@ -311,6 +311,12 @@ add_executable(test_evm_state_audit
 target_link_libraries(test_evm_state_audit evm)
 add_test(NAME test_evm_state_audit COMMAND test_evm_state_audit)
 
+add_executable(test_state_overlay_stress
+    evm/tests/test_state_overlay_stress.c
+)
+target_link_libraries(test_state_overlay_stress evm)
+add_test(NAME test_state_overlay_stress COMMAND test_state_overlay_stress)
+
 add_executable(test_flat_state_roundtrip
     evm/tests/test_flat_state_roundtrip.c
 )

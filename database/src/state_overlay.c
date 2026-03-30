@@ -1550,3 +1550,33 @@ state_overlay_stats_t state_overlay_get_stats(const state_overlay_t *so) {
     s.root_dirty_count = so->last_root_dirty_count;
     return s;
 }
+
+/* =========================================================================
+ * Collect — enumerate cached accounts/slots for prestate dump
+ * ========================================================================= */
+
+size_t state_overlay_collect_addresses(state_overlay_t *so,
+                                        address_t *out, size_t max) {
+    if (!so || !out || max == 0) return 0;
+    size_t n = 0;
+    for (uint32_t i = 0; i < so->next_acct_idx && n < max; i++) {
+        cached_account_t *ca = &so->acct_meta.entries[i];
+        if (ca->existed || ca->dirty || ca->block_dirty || ca->created)
+            out[n++] = ca->addr;
+    }
+    return n;
+}
+
+size_t state_overlay_collect_storage_keys(state_overlay_t *so,
+                                           const address_t *addr,
+                                           uint256_t *out, size_t max) {
+    if (!so || !addr || !out || max == 0) return 0;
+    size_t n = 0;
+    for (uint32_t i = 0; i < so->next_slot_idx && n < max; i++) {
+        cached_slot_t *cs = &so->slot_meta.entries[i];
+        if (memcmp(cs->key, addr->bytes, ADDRESS_SIZE) != 0) continue;
+        if (uint256_is_zero(&cs->current) && uint256_is_zero(&cs->original)) continue;
+        out[n++] = uint256_from_bytes(cs->key + ADDRESS_SIZE, 32);
+    }
+    return n;
+}
