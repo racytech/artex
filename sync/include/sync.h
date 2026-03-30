@@ -12,7 +12,7 @@
 /**
  * Sync Engine — block execution + validation.
  *
- * Owns the full state lifecycle (evm_state, evm, verkle_state).
+ * Owns the full state lifecycle (evm_state, evm).
  * Callers provide decoded block headers and bodies from any source
  * (era1 files, Engine API, p2p, etc).
  *

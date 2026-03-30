@@ -411,7 +411,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    evm_state_t *es = evm_state_create(NULL, mpt_path, cs);
+    evm_state_t *es = evm_state_create(cs);
     if (!es) {
         fprintf(stderr, "Failed to create evm_state\n");
 #ifdef ENABLE_MPT

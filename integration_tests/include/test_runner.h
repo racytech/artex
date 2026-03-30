@@ -10,9 +10,6 @@
 
 #include "test_fixtures.h"
 #include "evm_state.h"
-#ifdef ENABLE_VERKLE
-#include "verkle_state.h"
-#endif
 #include "evm.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -100,9 +97,6 @@ typedef struct {
  */
 typedef struct {
     evm_state_t *state;         // Typed EVM state interface
-#ifdef ENABLE_VERKLE
-    verkle_state_t *vs;         // Underlying verkle state (lifecycle)
-#endif
     evm_t *evm;                 // EVM instance
     test_runner_config_t config;
 

@@ -15,7 +15,6 @@
 #include "uint256.h"
 #include "address.h"
 #include "gas.h"
-#include "verkle_key.h"
 #include "precompile.h"
 #include <string.h>
 
@@ -53,14 +52,7 @@ static evm_status_t op_balance(evm_t *evm)
 
     // Charge gas based on fork
     uint64_t gas_cost;
-    if (evm->fork >= FORK_VERKLE) {
-        // EIP-4762: witness gas replaces cold/warm
-        uint8_t vk[32];
-        verkle_account_basic_data_key(vk, addr.bytes);
-        gas_cost = evm_state_witness_gas_access(evm->state, vk, false, false);
-        // Warm fallback: if fully warm, charge WarmStorageReadCost
-        if (gas_cost == 0) gas_cost = GAS_SLOAD_WARM;
-    } else if (evm->fork >= FORK_BERLIN) {
+    if (evm->fork >= FORK_BERLIN) {
         // EIP-2929: cold/warm access model
         bool is_warm = evm_is_address_warm(evm, &addr);
         gas_cost = is_warm ? GAS_WARM_ACCOUNT_ACCESS : GAS_COLD_ACCOUNT_ACCESS;
@@ -193,38 +185,6 @@ static evm_status_t op_codecopy(evm_t *evm)
         return EVM_OUT_OF_GAS;
     }
 
-    // EIP-4762 (Verkle): charge code chunk witness gas for copied range.
-    // Skip during deployment (initcode) and system calls.
-    if (evm->fork >= FORK_VERKLE && size > 0 &&
-        evm->msg.kind != EVM_CREATE && evm->msg.kind != EVM_CREATE2) {
-        // Adjust bounds: only charge for actual code bytes, not zero-padding
-        uint64_t code_offset = 0;
-        bool offset_valid = (offset_256.high == 0 &&
-                            (uint64_t)(offset_256.low >> 64) == 0);
-        if (offset_valid)
-            code_offset = uint256_to_uint64(&offset_256);
-
-        if (offset_valid && code_offset < evm->code_size) {
-            uint64_t copy_end = code_offset + size;
-            if (copy_end > evm->code_size)
-                copy_end = evm->code_size;
-            uint64_t non_padded_len = copy_end - code_offset;
-
-            if (non_padded_len > 0) {
-                uint32_t start_chunk = (uint32_t)(code_offset / 31);
-                uint32_t end_chunk = (uint32_t)((code_offset + non_padded_len - 1) / 31);
-                uint64_t wgas = 0;
-                for (uint32_t c = start_chunk; c <= end_chunk; c++) {
-                    uint8_t ck[32];
-                    verkle_code_chunk_key(ck, evm->msg.code_addr.bytes, c);
-                    wgas += evm_state_witness_gas_access(evm->state, ck, false, false);
-                }
-                if (!evm_use_gas(evm, wgas))
-                    return EVM_OUT_OF_GAS;
-            }
-        }
-    }
-
     if (size == 0)
         return EVM_SUCCESS;
 
@@ -350,17 +310,7 @@ static evm_status_t op_extcodesize(evm_t *evm)
 
     // Charge gas based on fork
     uint64_t gas_cost;
-    if (evm->fork >= FORK_VERKLE) {
-        // EIP-4762: precompiles and system contracts get warm cost only
-        if (is_precompile(&addr, evm->fork) || is_system_contract(&addr)) {
-            gas_cost = GAS_SLOAD_WARM;
-        } else {
-            uint8_t vk[32];
-            verkle_account_basic_data_key(vk, addr.bytes);
-            gas_cost = evm_state_witness_gas_access(evm->state, vk, false, false);
-            if (gas_cost == 0) gas_cost = GAS_SLOAD_WARM;
-        }
-    } else if (evm->fork >= FORK_BERLIN) {
+    if (evm->fork >= FORK_BERLIN) {
         bool is_warm = evm_is_address_warm(evm, &addr);
         gas_cost = is_warm ? GAS_WARM_ACCOUNT_ACCESS : GAS_COLD_ACCOUNT_ACCESS;
         if (!is_warm) evm_mark_address_warm(evm, &addr);
@@ -422,17 +372,7 @@ static evm_status_t op_extcodecopy(evm_t *evm)
 
     // Charge gas based on fork
     uint64_t access_cost;
-    if (evm->fork >= FORK_VERKLE) {
-        // EIP-4762: precompiles and system contracts get warm cost only
-        if (is_precompile(&addr, evm->fork) || is_system_contract(&addr)) {
-            access_cost = GAS_SLOAD_WARM;
-        } else {
-            uint8_t vk[32];
-            verkle_account_basic_data_key(vk, addr.bytes);
-            access_cost = evm_state_witness_gas_access(evm->state, vk, false, false);
-            if (access_cost == 0) access_cost = GAS_SLOAD_WARM;
-        }
-    } else if (evm->fork >= FORK_BERLIN) {
+    if (evm->fork >= FORK_BERLIN) {
         bool is_warm = evm_is_address_warm(evm, &addr);
         access_cost = is_warm ? GAS_WARM_ACCOUNT_ACCESS : GAS_COLD_ACCOUNT_ACCESS;
         if (!is_warm) evm_mark_address_warm(evm, &addr);
@@ -450,39 +390,7 @@ static evm_status_t op_extcodecopy(evm_t *evm)
         return EVM_OUT_OF_GAS;
     }
 
-    // EIP-4762 (Verkle): code chunk witness gas for EXTCODECOPY.
-    // Skipped for precompiles (no code). System contracts have real
-    // code, so code chunks ARE charged for EXTCODECOPY.
-    if (evm->fork >= FORK_VERKLE && size > 0) {
-        if (!is_precompile(&addr, evm->fork)) {
-            uint32_t ext_code_size = evm_state_get_code_size(evm->state, &addr);
-            if (ext_code_size > 0) {
-                uint64_t code_offset = 0;
-                bool off_valid = (offset_u256.high == 0 &&
-                                  (uint64_t)(offset_u256.low >> 64) == 0);
-                if (off_valid)
-                    code_offset = uint256_to_uint64(&offset_u256);
 
-                if (off_valid && code_offset < ext_code_size) {
-                    uint64_t copy_end = code_offset + size;
-                    if (copy_end > ext_code_size) copy_end = ext_code_size;
-                    uint64_t non_padded = copy_end - code_offset;
-                    if (non_padded > 0) {
-                        uint32_t start_chunk = (uint32_t)(code_offset / 31);
-                        uint32_t end_chunk = (uint32_t)((code_offset + non_padded - 1) / 31);
-                        uint64_t wgas = 0;
-                        for (uint32_t c = start_chunk; c <= end_chunk; c++) {
-                            uint8_t ck[32];
-                            verkle_code_chunk_key(ck, addr.bytes, c);
-                            wgas += evm_state_witness_gas_access(evm->state, ck, false, false);
-                        }
-                        if (!evm_use_gas(evm, wgas))
-                            return EVM_OUT_OF_GAS;
-                    }
-                }
-            }
-        }
-    }
 
     // Expand memory if needed
     if (size > 0)
@@ -541,17 +449,7 @@ static evm_status_t op_extcodehash(evm_t *evm)
 
     // Charge gas based on fork
     uint64_t gas_cost;
-    if (evm->fork >= FORK_VERKLE) {
-        // EIP-4762: precompiles and system contracts get warm cost only
-        if (is_precompile(&addr, evm->fork) || is_system_contract(&addr)) {
-            gas_cost = GAS_SLOAD_WARM;
-        } else {
-            uint8_t vk[32];
-            verkle_account_code_hash_key(vk, addr.bytes);
-            gas_cost = evm_state_witness_gas_access(evm->state, vk, false, false);
-            if (gas_cost == 0) gas_cost = GAS_SLOAD_WARM;
-        }
-    } else if (evm->fork >= FORK_BERLIN) {
+    if (evm->fork >= FORK_BERLIN) {
         bool is_warm = evm_is_address_warm(evm, &addr);
         gas_cost = is_warm ? GAS_WARM_ACCOUNT_ACCESS : GAS_COLD_ACCOUNT_ACCESS;
         if (!is_warm) evm_mark_address_warm(evm, &addr);

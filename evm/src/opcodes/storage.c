@@ -7,7 +7,6 @@
 #include "opcodes/storage.h"
 #include "evm_stack.h"
 #include "gas.h"
-#include "verkle_key.h"
 #include <stdlib.h>
 #include <stdio.h>
 // g_trace_calls declared in interpreter.c (unity build)
@@ -63,10 +62,7 @@ static uint64_t calculate_sstore_gas(
 
     uint64_t cost = 0;
 
-    // Verkle (EIP-4762): no cold/warm — witness gas charged separately
-    if (evm->fork >= FORK_VERKLE) {
-        // cost stays 0 — witness gas handled in op_sstore
-    } else if (evm->fork >= FORK_BERLIN) {
+    if (evm->fork >= FORK_BERLIN) {
         // Berlin+ (EIP-2929): cold/warm access
         // Warm status passed in from caller (already checked via sstore_lookup)
         if (!is_warm) {
@@ -161,17 +157,7 @@ static evm_status_t op_sload(evm_t *evm)
 
     // Check if storage slot is cold/warm and charge appropriate gas (EIP-2929)
     uint64_t gas_cost;
-    if (evm->fork >= FORK_VERKLE)
-    {
-        // EIP-4762: witness gas replaces cold/warm
-        uint8_t slot_le[32], vk[32];
-        uint256_to_bytes_le(&key, slot_le);
-        verkle_storage_key(vk, evm->msg.recipient.bytes, slot_le);
-        gas_cost = evm_state_witness_gas_access(evm->state, vk, false, false);
-        // Warm fallback: if fully warm (witness gas=0), charge WarmStorageReadCost
-        if (gas_cost == 0) gas_cost = GAS_SLOAD_WARM;
-    }
-    else if (evm->fork >= FORK_BERLIN)
+    if (evm->fork >= FORK_BERLIN)
     {
         // Combined lookup: ensure_slot + warm check in one pass
         // (avoids double make_slot_key + double ART traversal)
@@ -276,18 +262,7 @@ static evm_status_t op_sstore(evm_t *evm)
     evm_state_sstore_lookup(evm->state, &evm->msg.recipient, &key,
                              &current_value, &original_value, &was_warm);
 
-    if (evm->fork >= FORK_VERKLE) {
-        // EIP-4762 (Verkle): witness gas is the COMPLETE SSTORE cost.
-        // No EIP-2200 gas (SSTORE_SET/RESET), no refunds.
-        uint8_t slot_le[32], vk[32];
-        uint256_to_bytes_le(&key, slot_le);
-        verkle_storage_key(vk, evm->msg.recipient.bytes, slot_le);
-        uint64_t wgas = evm_state_witness_gas_access(evm->state, vk, true, false);
-        // Warm fallback: if fully warm (witness gas=0), charge WarmStorageReadCost
-        if (wgas == 0) wgas = GAS_SLOAD_WARM;
-        if (!evm_use_gas(evm, wgas))
-            return EVM_OUT_OF_GAS;
-    } else {
+    {
         // Calculate fork-specific SSTORE gas cost and refund (EIP-2200)
         int64_t gas_refund = 0;
         uint64_t gas_cost = calculate_sstore_gas(evm, &key, &current_value, &original_value, &value, was_warm, &gas_refund);

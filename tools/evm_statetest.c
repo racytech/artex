@@ -166,7 +166,7 @@ static int run_statetest_file(const char *filepath, const statetest_args_t *args
             const test_post_condition_t *post_cond = &test->post[fi].conditions[ci];
 
             /* Create fresh state + EVM for each subtest */
-            evm_state_t *state = evm_state_create(NULL, NULL, NULL);
+            evm_state_t *state = evm_state_create(NULL);
             if (!state) {
                 results[ri].name = test->name ? strdup(test->name) : NULL;
                 results[ri].fork = fork_name ? strdup(fork_name) : NULL;
@@ -177,7 +177,7 @@ static int run_statetest_file(const char *filepath, const statetest_args_t *args
             }
 #ifdef ENABLE_MPT
             {
-                flat_state_t *fs = flat_state_create("/dev/shm/evm_statetest_flat", 4096, 65536);
+                flat_state_t *fs = flat_state_create("/dev/shm/evm_statetest_flat");
                 if (fs) evm_state_set_flat_state(state, fs);
             }
 #endif

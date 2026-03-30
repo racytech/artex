@@ -514,14 +514,14 @@ int main(int argc, char **argv) {
     }
     chain_config->chain_id = args.chain_id;
 
-    evm_state_t *state = evm_state_create(NULL, NULL, NULL);
+    evm_state_t *state = evm_state_create(NULL);
     if (!state) {
         fprintf(stderr, "Error: failed to create EVM state\n");
         return 1;
     }
     /* Fresh flat_state in RAM for state root computation */
     {
-        flat_state_t *fs = flat_state_create("/dev/shm/evm_t8n_flat", 4096, 65536);
+        flat_state_t *fs = flat_state_create("/dev/shm/evm_t8n_flat");
         if (fs) evm_state_set_flat_state(state, fs);
     }
 

@@ -580,11 +580,7 @@ int main(int argc, char **argv) {
 #else
                 "off",
 #endif
-#ifdef ENABLE_VERKLE
-                "ON",
-#else
                 "off",
-#endif
 #ifdef ENABLE_HISTORY
                 "ON",
 #else
@@ -655,10 +651,6 @@ int main(int argc, char **argv) {
         .no_evict            = no_evict,
 #endif
     };
-#ifdef ENABLE_VERKLE
-    cfg.verkle_value_dir  = value_dir;
-    cfg.verkle_commit_dir = commit_dir;
-#endif
 #ifdef ENABLE_HISTORY
     if (!no_history)
         cfg.history_dir = history_path;

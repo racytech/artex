@@ -11,7 +11,6 @@
 #include "evm_tracer.h"
 #include "uint256.h"
 #include "gas.h"
-#include "verkle_key.h"
 #include "precompile.h"
 #include <stdlib.h>
 #include <string.h>
@@ -132,51 +131,7 @@ static evm_status_t prepare_call(
     // Calculate stipend (bonus gas for value transfers)
     uint64_t stipend = has_value ? gas_call_stipend(value) : 0;
 
-    if (evm->fork >= FORK_VERKLE) {
-        // EIP-4762: witness gas replaces cold/warm access cost entirely.
-        // go-ethereum's makeCallVariantGasEIP4762 wraps gasCall (NOT gasCallEIP2929),
-        // so there's NO EIP-2929 cold/warm charge — only witness gas.
-        // CallValueTransferGas (9000) is also skipped in EIP-4762 mode.
-        uint64_t wgas = 0;
-
-        // Check if target is a precompile or system contract
-        bool is_precomp = is_precompile(target_addr, evm->fork);
-        static const uint8_t HISTORY_ADDR[20] = {
-            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-            0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xfe
-        };
-        bool is_system = (memcmp(target_addr->bytes, HISTORY_ADDR, 20) == 0);
-
-        if (has_value && can_create_account) {
-            // CALL with value: use ValueTransferGas pattern
-            // Write access for both caller and target basic_data
-            uint8_t caller_vk[32], target_vk[32];
-            verkle_account_basic_data_key(caller_vk, evm->msg.recipient.bytes);
-            verkle_account_basic_data_key(target_vk, target_addr->bytes);
-            uint64_t g1 = evm_state_witness_gas_access(evm->state, caller_vk, true, false);
-            uint64_t g2 = evm_state_witness_gas_access(evm->state, target_vk, true, false);
-            if (g1 + g2 == 0) wgas = GAS_SLOAD_WARM;  // warm fallback
-            else wgas = g1 + g2;
-        } else if (is_precomp || is_system) {
-            // Precompile/system: charge only WarmStorageReadCost
-            wgas = GAS_SLOAD_WARM;
-        } else {
-            // No value transfer (or CALLCODE/DELEGATECALL/STATICCALL):
-            // MessageCallGas pattern — read target basic_data
-            uint8_t vk[32];
-            verkle_account_basic_data_key(vk, target_addr->bytes);
-            wgas = evm_state_witness_gas_access(evm->state, vk, false, false);
-            if (wgas == 0) wgas = GAS_SLOAD_WARM;  // warm fallback
-        }
-
-        // EIP-4762: CallValueTransferGas (9000) is NOT charged in Verkle.
-        // CallNewAccountGas (25000) IS still charged.
-        uint64_t extra = 0;
-        if (!account_exists && has_value && can_create_account) extra += 25000;
-
-        if (!evm_use_gas(evm, wgas + extra))
-            return EVM_OUT_OF_GAS;
-    } else {
+    {
         // Cold/warm access (Berlin+)
         bool is_cold = !evm_is_address_warm(evm, target_addr);
         if (is_cold)

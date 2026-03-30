@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
     cleanup_files(base_path);
 
     /* Create evm_state with MPT */
-    evm_state_t *es = evm_state_create(NULL, base_path, NULL);
+    evm_state_t *es = evm_state_create(NULL);
     if (!es) {
         fprintf(stderr, "Failed to create evm_state\n");
         return 1;

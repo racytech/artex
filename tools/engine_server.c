@@ -310,7 +310,7 @@ int main(int argc, char **argv) {
     evm_t *evm = NULL;
 
     if (fixture_path) {
-        state = evm_state_create(NULL, NULL, NULL);
+        state = evm_state_create(NULL);
         if (!state) {
             fprintf(stderr, "Failed to create EVM state\n");
             return 1;

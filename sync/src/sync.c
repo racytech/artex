@@ -1,7 +1,7 @@
 /**
  * Sync Engine — block execution + validation.
  *
- * Owns the full state lifecycle (evm_state, evm, verkle_state).
+ * Owns the full state lifecycle (evm_state, evm).
  * Callers provide decoded block headers and bodies from any source.
  *
  * Two-phase sync:
@@ -15,18 +15,12 @@
 #include "evm.h"
 #include "evm_state.h"
 #include "block_executor.h"
-#ifdef ENABLE_VERKLE
-#include "verkle_state.h"
-#endif
 #ifdef ENABLE_MPT
 #include "code_store.h"
 #include "flat_state.h"
 #endif
 #ifdef ENABLE_HISTORY
 #include "state_history.h"
-#endif
-#ifdef ENABLE_VERKLE_BUILD
-#include "verkle_builder.h"
 #endif
 #include "uint256.h"
 #include "address.h"
@@ -57,9 +51,6 @@ static void sync_flush_and_evict(sync_t *sync);
 struct sync {
     sync_config_t config;
 
-#ifdef ENABLE_VERKLE
-    verkle_state_t *vs;
-#endif
 #ifdef ENABLE_MPT
     code_store_t  *cs;
     flat_state_t  *flat_state;
@@ -87,9 +78,6 @@ struct sync {
 
 #ifdef ENABLE_HISTORY
     state_history_t *history;
-#endif
-#ifdef ENABLE_VERKLE_BUILD
-    verkle_builder_t *verkle_builder;
 #endif
 };
 
@@ -191,18 +179,6 @@ sync_t *sync_create(const sync_config_t *config) {
 
     bool resumed = false;
 
-#ifdef ENABLE_VERKLE
-    /* Create fresh verkle state */
-    if (s->config.verkle_value_dir && s->config.verkle_commit_dir) {
-        s->vs = verkle_state_create_flat(s->config.verkle_value_dir,
-                                         s->config.verkle_commit_dir);
-        if (!s->vs) {
-            fprintf(stderr, "Failed to create verkle state\n");
-            goto fail;
-        }
-    }
-#endif
-
 #ifdef ENABLE_MPT
     /* Open or create code store */
     if (s->config.code_store_path) {
@@ -219,16 +195,9 @@ sync_t *sync_create(const sync_config_t *config) {
 
     /* Create evm_state */
     s->state = evm_state_create(
-#ifdef ENABLE_VERKLE
-        s->vs,
-#else
-        NULL,
-#endif
 #ifdef ENABLE_MPT
-        s->config.mpt_path,
         s->cs
 #else
-        NULL,
         NULL
 #endif
     );
@@ -248,9 +217,7 @@ sync_t *sync_create(const sync_config_t *config) {
     if (config->flat_state_path) {
         s->flat_state = flat_state_open(config->flat_state_path);
         if (!s->flat_state) {
-            s->flat_state = flat_state_create(config->flat_state_path,
-                                               (uint64_t)FLAT_ACCOUNT_CAPACITY,
-                                               (uint64_t)FLAT_STORAGE_CAPACITY);
+            s->flat_state = flat_state_create(config->flat_state_path);
         }
         if (s->flat_state)
             evm_state_set_flat_state(s->state, s->flat_state);
@@ -276,30 +243,12 @@ sync_t *sync_create(const sync_config_t *config) {
     }
 #endif
 
-#ifdef ENABLE_VERKLE_BUILD
-    if (s->config.verkle_builder_value_dir && s->config.verkle_builder_commit_dir) {
-        /* Try open first (resume), fall back to create */
-        s->verkle_builder = verkle_builder_open(s->config.verkle_builder_value_dir,
-                                                 s->config.verkle_builder_commit_dir,
-                                                 s->cs);
-        if (!s->verkle_builder)
-            s->verkle_builder = verkle_builder_create(s->config.verkle_builder_value_dir,
-                                                       s->config.verkle_builder_commit_dir,
-                                                       s->cs);
-        if (!s->verkle_builder)
-            fprintf(stderr, "Warning: failed to create verkle builder\n");
-    }
-#endif
-
     (void)resumed;
     return s;
 
 fail:
     if (s->evm) evm_destroy(s->evm);
     if (s->state) evm_state_destroy(s->state);
-#ifdef ENABLE_VERKLE
-    if (s->vs) verkle_state_destroy(s->vs);
-#endif
     free((char *)s->config.verkle_value_dir);
     free((char *)s->config.verkle_commit_dir);
     free((char *)s->config.mpt_path);
@@ -327,9 +276,6 @@ void sync_destroy(sync_t *sync) {
     sync_flush_code(sync);
 #endif
     if (sync->state) evm_state_destroy(sync->state);
-#ifdef ENABLE_VERKLE
-    if (sync->vs) verkle_state_destroy(sync->vs);
-#endif
 #ifdef ENABLE_MPT
     if (sync->cs) code_store_destroy(sync->cs);
     if (sync->flat_state) flat_state_destroy(sync->flat_state);
@@ -337,10 +283,6 @@ void sync_destroy(sync_t *sync) {
 #ifdef ENABLE_HISTORY
     if (sync->history) state_history_destroy(sync->history);
 #endif
-#ifdef ENABLE_VERKLE_BUILD
-    if (sync->verkle_builder) verkle_builder_destroy(sync->verkle_builder);
-#endif
-
     free((char *)sync->config.verkle_value_dir);
     free((char *)sync->config.verkle_commit_dir);
     free((char *)sync->config.mpt_path);
@@ -378,10 +320,6 @@ bool sync_load_genesis(sync_t *sync, const char *genesis_json_path,
     /* Store genesis block hash */
     if (genesis_hash)
         sync->block_hashes[0] = *genesis_hash;
-
-#ifdef ENABLE_VERKLE
-    if (sync->vs) verkle_state_sync(sync->vs);
-#endif
 
     sync->genesis_loaded = true;
     return true;
@@ -466,9 +404,6 @@ bool sync_execute_block(sync_t *sync,
 #ifdef ENABLE_HISTORY
                                       , sync->history
 #endif
-#ifdef ENABLE_VERKLE_BUILD
-                                      , sync->verkle_builder
-#endif
                                       );
 
     /* Store current block's hash AFTER execution so it doesn't overwrite
@@ -513,12 +448,6 @@ bool sync_execute_block(sync_t *sync,
 
     sync->total_gas += br.gas_used;
     sync->last_block = bn;
-
-    if (!result->ok) {
-#ifdef ENABLE_VERKLE
-        if (sync->vs) verkle_state_revert_block(sync->vs);
-#endif
-    }
 
     /* Periodic root validation + flush + evict */
     if (result->ok &&
@@ -567,9 +496,6 @@ bool sync_execute_block_live(sync_t *sync,
                                       sync->block_hashes
 #ifdef ENABLE_HISTORY
                                       , sync->history
-#endif
-#ifdef ENABLE_VERKLE_BUILD
-                                      , sync->verkle_builder
 #endif
                                       );
 
@@ -650,11 +576,6 @@ static void sync_flush_and_evict(sync_t *sync) {
         evm_state_compute_mpt_root(sync->state, prune_empty);
         sync->batch_root_computed = true;
     }
-#endif
-
-#ifdef ENABLE_VERKLE
-    evm_state_flush_verkle(sync->state);
-    if (sync->vs) verkle_state_sync(sync->vs);
 #endif
 
     /* Snapshot stats before eviction clears the cache */

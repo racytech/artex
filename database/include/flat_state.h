@@ -32,8 +32,7 @@ _Static_assert(sizeof(flat_account_record_t) == 104,
  * Lifecycle
  * ========================================================================= */
 
-flat_state_t *flat_state_create(const char *path,
-                                 uint64_t account_cap, uint64_t storage_cap);
+flat_state_t *flat_state_create(const char *path);
 flat_state_t *flat_state_open(const char *path);
 void          flat_state_destroy(flat_state_t *fs);
 

@@ -206,9 +206,7 @@ static char *make_path(const char *base, const char *suffix) {
  * Lifecycle
  * ========================================================================= */
 
-flat_state_t *flat_state_create(const char *path,
-                                 uint64_t account_cap, uint64_t storage_cap) {
-    (void)account_cap; (void)storage_cap;  /* flat_store grows dynamically */
+flat_state_t *flat_state_create(const char *path) {
     if (!path) return NULL;
 
     char *acct_path = make_path(path, "_acct.art");

@@ -90,7 +90,7 @@ static void test_direct_roundtrip(void) {
     TEST("direct roundtrip");
     cleanup_test_dir();
 
-    evm_state_t *es = evm_state_create(NULL, NULL, NULL);
+    evm_state_t *es = evm_state_create(NULL);
     ASSERT(es != NULL, "evm_state_create");
 
     evm_state_begin_block(es, 100);
@@ -176,7 +176,7 @@ static void test_multiple_blocks(void) {
     TEST("multiple blocks");
     cleanup_test_dir();
 
-    evm_state_t *es = evm_state_create(NULL, NULL, NULL);
+    evm_state_t *es = evm_state_create(NULL);
     ASSERT(es != NULL, "evm_state_create");
 
     state_history_t *sh = state_history_create(TEST_DIR);
@@ -242,7 +242,7 @@ static void test_empty_diff(void) {
     TEST("empty diff");
     cleanup_test_dir();
 
-    evm_state_t *es = evm_state_create(NULL, NULL, NULL);
+    evm_state_t *es = evm_state_create(NULL);
     ASSERT(es != NULL, "evm_state_create");
 
     state_history_t *sh = state_history_create(TEST_DIR);

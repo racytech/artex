@@ -197,7 +197,7 @@ int main(int argc, char **argv) {
     snprintf(mpt_path, sizeof(mpt_path), "%s/account_mpt", state_dir);
 
     /* Create evm_state with MPT stores */
-    evm_state_t *es = evm_state_create(NULL, mpt_path, NULL);
+    evm_state_t *es = evm_state_create(NULL);
     if (!es) {
         fprintf(stderr, "FAIL: evm_state_create\n");
         return 1;

@@ -7,34 +7,25 @@
 #include "address.h"
 #include "hash.h"
 
-#ifdef ENABLE_VERKLE
-#include "verkle_state.h"
-#include "witness_gas.h"
-#else
-/* Forward declaration for API compatibility when verkle is disabled */
-typedef struct verkle_state_fwd verkle_state_t;
-#endif
-
 /* Forward declaration — code_store lifecycle is managed by caller */
 typedef struct code_store code_store_t;
 
 /**
- * EVM State — Typed, in-memory state interface above verkle_state.
+ * EVM State — Typed, in-memory state interface backed by flat_state.
  *
  * Architecture:
- *   - Account cache (mem_art by address_t): load-on-demand from verkle_state
+ *   - Account cache (mem_art by address_t): load-on-demand from flat_state
  *   - Storage cache (mem_art by addr[20]+slot[32]): load-on-demand
  *   - Journal (dynamic array): snapshot = journal position, revert = undo
  *   - Access lists (mem_art sets): EIP-2929 warm/cold tracking
  *   - Transient storage (mem_art): EIP-1153 per-transaction storage
  *
  * Lifecycle:
- *   1. evm_state_create(vs) — create for block execution
+ *   1. evm_state_create() — create for block execution
  *   2. Execute transactions (get/set nonce, balance, storage, etc.)
  *   3. Use snapshot/revert for transaction boundaries
- *   4. evm_state_finalize(es) — flush dirty state to verkle_state
- *   5. evm_state_compute_state_root_ex(es) — get verkle root
- *   6. evm_state_destroy(es) — free in-memory caches
+ *   4. evm_state_compute_mpt_root(es) — compute state root
+ *   5. evm_state_destroy(es) — free in-memory caches
  *
  * Opaque handle — struct defined in evm_state.c.
  */
@@ -46,13 +37,10 @@ typedef struct evm_state evm_state_t;
 // ============================================================================
 
 /**
- * Create EVM state over an existing verkle_state. vs is NOT owned.
- * mpt_path: if non-NULL, enables persistent incremental MPT for state root
- * computation. If NULL, falls back to batch root rebuild (slow at scale).
+ * Create EVM state.
  * cs: if non-NULL, enables read-through for contract bytecode (not owned).
  */
-evm_state_t *evm_state_create(verkle_state_t *vs, const char *mpt_path,
-                               code_store_t *cs);
+evm_state_t *evm_state_create(code_store_t *cs);
 
 /** Destroy EVM state and free all in-memory caches. */
 void evm_state_destroy(evm_state_t *es);
@@ -245,22 +233,11 @@ void      evm_state_tstore(evm_state_t *es, const address_t *addr,
                             const uint256_t *key, const uint256_t *value);
 
 // ============================================================================
-// Witness Gas (EIP-4762, Verkle+)
-// ============================================================================
-
-/** Verkle witness gas access event. Returns gas to charge.
- *  key must be a 32-byte verkle tree key (key[0:31] = stem). */
-uint64_t evm_state_witness_gas_access(evm_state_t *es,
-                                       const uint8_t key[32],
-                                       bool is_write,
-                                       bool value_was_empty);
-
-// ============================================================================
 // Finalize
 // ============================================================================
 
 /**
- * Flush all dirty state to verkle_state.
+ * Flush all dirty state to backing store.
  * - Writes dirty account fields (nonce, balance)
  * - Writes dirty storage slots
  * - Writes new code
@@ -273,19 +250,10 @@ bool evm_state_finalize(evm_state_t *es);
 // ============================================================================
 
 /**
- * Compute verkle state root from the backing verkle_state.
- * Must call evm_state_finalize() first to flush dirty state.
- * @param prune_empty  Ignored for verkle (kept for API compatibility)
- */
-hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
-
-/**
- * Compute MPT (Merkle Patricia Trie) state root from the in-memory caches.
- * Used for pre-Verkle block validation against block headers.
- * Must be called AFTER evm_state_compute_state_root_ex() (which flushes
- * dirty state and sets existed flags).
+ * Compute MPT (Merkle Patricia Trie) state root from flat_state.
  * @param prune_empty  If true (EIP-161+), exclude empty accounts from the trie.
  */
+hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty);
 
 /**
@@ -360,7 +328,7 @@ size_t evm_state_collect_addresses(evm_state_t *es, address_t *out, size_t max_c
 size_t evm_state_collect_storage_keys(evm_state_t *es, const address_t *addr,
                                        uint256_t *out, size_t max_count);
 
-#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+#ifdef ENABLE_HISTORY
 /**
  * Collect per-block state diffs from dirty accounts and storage slots.
  * Must be called after finalize() but before compute_state_root_ex().

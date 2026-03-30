@@ -76,15 +76,13 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
     // Reset state
     test_runner_reset(runner);
 
-    // Skip Verkle tests when built without Verkle backend
-#ifndef ENABLE_VERKLE
+    // Skip Verkle tests (Verkle backend removed)
     if (test->network && strcasecmp(test->network, "Verkle") == 0) {
         result->status = TEST_SKIP;
         result->skip_reason = strdup("Verkle backend not enabled");
         result->duration_us = get_time_microseconds() - start_time;
         return true;
     }
-#endif
 
     // Setup fork/chain config
     chain_config_t *fork_config = create_test_chain_config(test->network);
@@ -209,9 +207,6 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
         // Execute block (pass block hashes for BLOCKHASH opcode)
         block_result_t block_result = block_execute(runner->evm, &hdr, &body, block_hashes
 #ifdef ENABLE_HISTORY
-            , NULL
-#endif
-#ifdef ENABLE_VERKLE_BUILD
             , NULL
 #endif
             );

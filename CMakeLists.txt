@@ -9,45 +9,16 @@ project(art_database C)
 
 # Backend options (overridable via config.cmake or -D flags)
 option(ENABLE_MPT "Enable MPT (Merkle Patricia Trie) state root" ON)
-option(ENABLE_VERKLE "Enable Verkle as active state backend (post-fork)" OFF)
-option(ENABLE_VERKLE_BUILD "Build verkle libraries for background state building (pre-fork)" OFF)
 option(ENABLE_EVM_TRACE "Enable EIP-3155 EVM execution tracing" OFF)
 option(ENABLE_DEBUG "Enable debug instrumentation (g_trace_calls, state dump, --no-evict)" OFF)
 option(ENABLE_HISTORY "Enable per-block state diff history tracking" OFF)
 
-# ENABLE_VERKLE implies ENABLE_VERKLE_BUILD
-if(ENABLE_VERKLE)
-    set(ENABLE_VERKLE_BUILD ON)
-endif()
-
-if(NOT ENABLE_MPT AND NOT ENABLE_VERKLE)
-    message(FATAL_ERROR "At least one state backend must be enabled (ENABLE_MPT or ENABLE_VERKLE)")
-endif()
-
 # Tunable parameters (overridable via config.cmake or -D flags)
-if(NOT DEFINED MPT_ACCOUNT_CAPACITY)
-    set(MPT_ACCOUNT_CAPACITY 500000000)
-endif()
-if(NOT DEFINED MPT_STORAGE_CAPACITY)
-    set(MPT_STORAGE_CAPACITY 500000000)
-endif()
-if(NOT DEFINED FLAT_ACCOUNT_CAPACITY)
-    set(FLAT_ACCOUNT_CAPACITY ${MPT_ACCOUNT_CAPACITY})
-endif()
-if(NOT DEFINED FLAT_STORAGE_CAPACITY)
-    set(FLAT_STORAGE_CAPACITY ${MPT_STORAGE_CAPACITY})
-endif()
 if(NOT DEFINED CODE_CACHE_ENTRIES)
     set(CODE_CACHE_ENTRIES 32768)
 endif()
 if(NOT DEFINED CHECKPOINT_INTERVAL)
     set(CHECKPOINT_INTERVAL 256)
-endif()
-if(NOT DEFINED MPT_ACCOUNT_CACHE_BYTES)
-    set(MPT_ACCOUNT_CACHE_BYTES 2147483648)  # 2 GB default
-endif()
-if(NOT DEFINED MPT_STORAGE_CACHE_BYTES)
-    set(MPT_STORAGE_CACHE_BYTES 8589934592)  # 8 GB default
 endif()
 
 # Set C standard
@@ -62,7 +33,6 @@ set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG -flto -march=na
 # Include directories
 include_directories(
     ${CMAKE_SOURCE_DIR}/database/include
-    ${CMAKE_SOURCE_DIR}/verkle/include
     ${CMAKE_SOURCE_DIR}/common/include
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/executor/include
@@ -119,7 +89,7 @@ add_library(common STATIC
 target_link_libraries(common snappy)
 
 #==============================================================================
-# Libraries — Verkle State
+# Libraries — Crypto
 #==============================================================================
 
 # blst (BLS12-381 field arithmetic — pre-built static library)
@@ -127,46 +97,6 @@ add_library(blst STATIC IMPORTED)
 set_target_properties(blst PROPERTIES
     IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/third_party/blst/libblst.a
 )
-
-# Banderwagon curve arithmetic (twisted Edwards over blst_fr)
-add_library(banderwagon STATIC
-    verkle/src/banderwagon.c
-)
-target_link_libraries(banderwagon blst)
-
-# Pedersen commitment (CRS + vector commitment over banderwagon)
-add_library(pedersen STATIC
-    verkle/src/pedersen.c
-)
-target_link_libraries(pedersen banderwagon blst)
-
-# Verkle key derivation (pedersen hash for address/storage → tree key mapping)
-add_library(verkle_key STATIC
-    verkle/src/verkle_key.c
-)
-target_link_libraries(verkle_key pedersen)
-
-# Verkle flat backend (only built when ENABLE_VERKLE_BUILD or ENABLE_VERKLE)
-if(ENABLE_VERKLE_BUILD)
-    # Verkle commitment store (disk_hash-backed commitment persistence)
-    add_library(verkle_commit_store STATIC
-        verkle/src/verkle_commit_store.c
-    )
-    target_link_libraries(verkle_commit_store banderwagon disk_table)
-
-    # Verkle flat updater (disk-backed commitment updates, O(block) RAM)
-    add_library(verkle_flat STATIC
-        verkle/src/verkle_flat.c
-        verkle/src/vf_threadpool.c
-    )
-    target_link_libraries(verkle_flat verkle_commit_store disk_table pedersen banderwagon pthread)
-
-    # Verkle state (typed account/storage interface over flat updater)
-    add_library(verkle_state STATIC
-        verkle/src/verkle_state.c
-    )
-    target_link_libraries(verkle_state verkle_key verkle_flat)
-endif()
 
 # ART→MPT (compute MPT hashes from compact_art structure)
 add_library(mem_mpt STATIC database/src/mem_mpt.c)
@@ -199,7 +129,6 @@ add_library(evm STATIC
     evm/src/evm.c
     evm/src/evm_state.c
     evm/src/evm_tracer.c
-    evm/src/witness_gas.c
     evm/src/evm_stack.c
     evm/src/evm_memory.c
     evm/src/gas.c
@@ -214,22 +143,13 @@ target_include_directories(evm PUBLIC
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/evm/vendor
 )
-set(EVM_LINK_LIBS verkle_key pedersen banderwagon art_database common ssl crypto secp256k1 blst)
-if(ENABLE_VERKLE)
-    list(APPEND EVM_LINK_LIBS verkle_state)
-endif()
+set(EVM_LINK_LIBS art_database common ssl crypto secp256k1 blst)
 if(ENABLE_MPT)
     list(APPEND EVM_LINK_LIBS code_store flat_state storage_trie account_trie)
 endif()
 target_link_libraries(evm ${EVM_LINK_LIBS})
 if(ENABLE_MPT)
     target_compile_definitions(evm PUBLIC ENABLE_MPT=1)
-endif()
-if(ENABLE_VERKLE)
-    target_compile_definitions(evm PUBLIC ENABLE_VERKLE=1)
-endif()
-if(ENABLE_VERKLE_BUILD)
-    target_compile_definitions(evm PUBLIC ENABLE_VERKLE_BUILD=1)
 endif()
 if(ENABLE_EVM_TRACE)
     target_compile_definitions(evm PUBLIC ENABLE_EVM_TRACE=1)
@@ -241,10 +161,6 @@ if(ENABLE_HISTORY)
     target_compile_definitions(evm PUBLIC ENABLE_HISTORY=1)
 endif()
 target_compile_definitions(evm PRIVATE
-    MPT_ACCOUNT_CAPACITY=${MPT_ACCOUNT_CAPACITY}
-    MPT_STORAGE_CAPACITY=${MPT_STORAGE_CAPACITY}
-    MPT_ACCOUNT_CACHE_BYTES=${MPT_ACCOUNT_CACHE_BYTES}
-    MPT_STORAGE_CACHE_BYTES=${MPT_STORAGE_CACHE_BYTES}
 )
 
 #==============================================================================
@@ -262,17 +178,11 @@ set(BLOCK_EXECUTOR_SOURCES
 if(ENABLE_HISTORY)
     list(APPEND BLOCK_EXECUTOR_SOURCES executor/src/state_history.c)
 endif()
-if(ENABLE_VERKLE_BUILD)
-    list(APPEND BLOCK_EXECUTOR_SOURCES executor/src/verkle_builder.c)
-endif()
 add_library(block_executor STATIC ${BLOCK_EXECUTOR_SOURCES})
 target_include_directories(block_executor PUBLIC
     ${CMAKE_SOURCE_DIR}/executor/include
 )
 set(BLOCK_EXECUTOR_LIBS evm mem_mpt common secp256k1 pthread)
-if(ENABLE_VERKLE_BUILD)
-    list(APPEND BLOCK_EXECUTOR_LIBS verkle_state verkle_flat verkle_key pedersen)
-endif()
 target_link_libraries(block_executor ${BLOCK_EXECUTOR_LIBS})
 
 #==============================================================================
@@ -394,41 +304,11 @@ add_executable(test_code_store
 target_link_libraries(test_code_store code_store)
 add_test(NAME test_code_store COMMAND test_code_store)
 
-#==============================================================================
-# Tests — Verkle State
-#==============================================================================
-
-# Test: Banderwagon curve arithmetic (twisted Edwards + blst)
-add_executable(test_banderwagon
-    verkle/tests/test_banderwagon.c
-)
-target_link_libraries(test_banderwagon banderwagon)
-add_test(NAME test_banderwagon COMMAND test_banderwagon)
-
-# Test: Pedersen commitment (CRS generation + commit/update)
-add_executable(test_pedersen
-    verkle/tests/test_pedersen.c
-)
-target_link_libraries(test_pedersen pedersen)
-add_test(NAME test_pedersen COMMAND test_pedersen)
-
-# Test: Verkle key derivation (pedersen hash → tree key mapping)
-add_executable(test_verkle_key
-    verkle/tests/test_verkle_key.c
-)
-target_link_libraries(test_verkle_key verkle_key)
-add_test(NAME test_verkle_key COMMAND test_verkle_key)
-
-
 # Test: EVM state management audit
 add_executable(test_evm_state_audit
     evm/tests/test_evm_state_audit.c
 )
-set(TEST_EVM_AUDIT_LIBS evm)
-if(ENABLE_VERKLE)
-    list(APPEND TEST_EVM_AUDIT_LIBS verkle_state)
-endif()
-target_link_libraries(test_evm_state_audit ${TEST_EVM_AUDIT_LIBS})
+target_link_libraries(test_evm_state_audit evm)
 add_test(NAME test_evm_state_audit COMMAND test_evm_state_audit)
 
 # Test: ART→MPT cross-validation against Python reference vectors
@@ -438,37 +318,6 @@ add_test(NAME test_art_mpt_vectors
     COMMAND test_art_mpt_vectors
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
-
-if(ENABLE_VERKLE_BUILD)
-    # Test: Verkle flat (go-verkle cross-validation + revert + determinism)
-    add_executable(test_verkle_flat
-        verkle/tests/test_verkle_flat.c
-    )
-    target_link_libraries(test_verkle_flat verkle_flat)
-    add_test(NAME test_verkle_flat
-        COMMAND test_verkle_flat
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    )
-
-    # Benchmark: Verkle flat scale (disk-backed block simulation)
-    add_executable(bench_verkle_flat
-        verkle/tests/bench_verkle_flat.c
-    )
-    target_link_libraries(bench_verkle_flat verkle_state)
-
-    # Benchmark: Verkle thread pool (single vs multi-threaded commit)
-    add_executable(bench_verkle_threads
-        verkle/tests/bench_verkle_threads.c
-    )
-    target_link_libraries(bench_verkle_threads verkle_state)
-
-    # Test: Verkle reconstruct (diff application + SELFDESTRUCT clearing)
-    add_executable(test_verkle_reconstruct
-        verkle/tests/test_verkle_reconstruct.c
-    )
-    target_link_libraries(test_verkle_reconstruct verkle_state art_database common)
-    add_test(NAME test_verkle_reconstruct COMMAND test_verkle_reconstruct)
-endif()
 
 #==============================================================================
 # Tests — Networking
@@ -600,11 +449,7 @@ add_test(NAME test_loopback COMMAND test_loopback)
 add_executable(test_block_executor
     executor/tests/test_block_executor.c
 )
-set(TEST_BLOCK_EXEC_LIBS block_executor evm common)
-if(ENABLE_VERKLE)
-    list(APPEND TEST_BLOCK_EXEC_LIBS verkle_state)
-endif()
-target_link_libraries(test_block_executor ${TEST_BLOCK_EXEC_LIBS})
+target_link_libraries(test_block_executor block_executor evm common)
 add_test(NAME test_block_executor COMMAND test_block_executor)
 
 if(ENABLE_HISTORY)
@@ -619,21 +464,6 @@ if(ENABLE_HISTORY)
     target_include_directories(state_reconstruct PRIVATE ${CJSON_INCLUDE_DIRS})
     target_link_libraries(state_reconstruct block_executor evm common ${CJSON_LIBRARIES})
 
-    if(ENABLE_VERKLE_BUILD)
-        add_executable(verkle_build tools/verkle_build.c)
-        target_link_libraries(verkle_build block_executor evm verkle_flat verkle_key pedersen common)
-
-        add_executable(verkle_reconstruct tools/verkle_reconstruct.c)
-        target_include_directories(verkle_reconstruct PRIVATE ${CJSON_INCLUDE_DIRS})
-        target_link_libraries(verkle_reconstruct
-            verkle_state verkle_flat verkle_key pedersen
-            code_store
-            block_executor evm common
-            ${CJSON_LIBRARIES})
-
-        add_executable(verify_verkle tools/verify_verkle.c)
-        target_link_libraries(verify_verkle verkle_state verkle_flat verkle_key pedersen common)
-    endif()
 endif()
 
 add_executable(test_uint256_div common/tests/test_uint256_div.c)
@@ -798,18 +628,10 @@ if(CJSON_FOUND)
     target_include_directories(sync PUBLIC ${CMAKE_SOURCE_DIR}/sync/include)
     target_include_directories(sync PRIVATE ${CJSON_INCLUDE_DIRS})
     set(SYNC_LIBS block_executor evm common ${CJSON_LIBRARIES})
-    if(ENABLE_VERKLE)
-        list(APPEND SYNC_LIBS verkle_state)
-    endif()
     if(ENABLE_MPT)
         list(APPEND SYNC_LIBS code_store flat_state)
     endif()
     target_link_libraries(sync ${SYNC_LIBS})
-    target_compile_definitions(sync PRIVATE
-        FLAT_ACCOUNT_CAPACITY=${FLAT_ACCOUNT_CAPACITY}
-        FLAT_STORAGE_CAPACITY=${FLAT_STORAGE_CAPACITY}
-    )
-
     # TUI (ncurses terminal UI, optional)
     find_package(Curses QUIET)
     if(CURSES_FOUND)
@@ -853,9 +675,6 @@ if(CJSON_FOUND)
             ${CJSON_INCLUDE_DIRS}
         )
         set(INTEG_TEST_LIBS evm block_executor flat_state common ${CJSON_LIBRARIES})
-        if(ENABLE_VERKLE)
-            list(APPEND INTEG_TEST_LIBS verkle_state)
-        endif()
         target_link_libraries(integration_tests PUBLIC ${INTEG_TEST_LIBS})
 
         add_executable(test_parser_verify integration_tests/test_parser_verify.c)
@@ -902,20 +721,15 @@ message(STATUS "Build type:        ${CMAKE_BUILD_TYPE}")
 message(STATUS "C Compiler:        ${CMAKE_C_COMPILER}")
 message(STATUS "C Flags:           ${CMAKE_C_FLAGS}")
 message(STATUS "MPT backend:       ${ENABLE_MPT}")
-message(STATUS "Verkle backend:    ${ENABLE_VERKLE}")
-message(STATUS "Verkle build:      ${ENABLE_VERKLE_BUILD}")
 message(STATUS "State history:     ${ENABLE_HISTORY}")
 message(STATUS "")
 message(STATUS "Tuning:")
-message(STATUS "  Account capacity:${MPT_ACCOUNT_CAPACITY}")
-message(STATUS "  Storage capacity:${MPT_STORAGE_CAPACITY}")
 message(STATUS "  Code cache:      ${CODE_CACHE_ENTRIES} entries")
 message(STATUS "  Checkpoint every:${CHECKPOINT_INTERVAL} blocks")
 message(STATUS "")
 message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
 message(STATUS "  - code_store (content-addressed bytecode storage)")
-message(STATUS "  - verkle_flat (disk-backed verkle state with Pedersen commitments)")
 message(STATUS "  - evm (Ethereum Virtual Machine)")
 message(STATUS "  - block_executor (block decode + execution)")
 message(STATUS "  - sync (block execution + validation + checkpointing)")

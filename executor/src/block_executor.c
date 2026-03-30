@@ -3,15 +3,11 @@
 #ifdef ENABLE_HISTORY
 #include "state_history.h"
 #endif
-#ifdef ENABLE_VERKLE_BUILD
-#include "verkle_builder.h"
-#endif
 #include "tx_pipeline.h"
 #include "dao_fork.h"
 #include "tx_decoder.h"
 #include "fork.h"
 #include "transaction.h"
-#include "verkle_key.h"
 
 #include "rlp.h"
 #include "hash.h"
@@ -247,15 +243,6 @@ static void system_call(evm_t *evm, const uint8_t addr_bytes[20],
 
     evm_set_tx_context(evm, &sys_tx);
 
-    /* EIP-4762: record witness access for the target contract's basic_data.
-     * System calls don't charge gas, but the access events must be recorded
-     * so subsequent transactions see the address as warm. */
-    if (evm->fork >= FORK_VERKLE) {
-        uint8_t vk[32];
-        verkle_account_basic_data_key(vk, addr_bytes);
-        evm_state_witness_gas_access(evm->state, vk, false, false);
-    }
-
     /* Execute: caller=SYSTEM_ADDRESS, generous gas, depth=0 */
     uint256_t zero = UINT256_ZERO;
     evm_message_t msg = evm_message_call(
@@ -303,9 +290,6 @@ block_result_t block_execute(evm_t *evm,
                              const hash_t *block_hashes
 #ifdef ENABLE_HISTORY
                              , state_history_t *history
-#endif
-#ifdef ENABLE_VERKLE_BUILD
-                             , verkle_builder_t *verkle_builder
 #endif
                              ) {
     block_result_t result;
@@ -701,16 +685,13 @@ block_result_t block_execute(evm_t *evm,
     /* Finalize state: flush dirty accounts/storage to state_db */
     evm_state_finalize(evm->state);
 
-#if defined(ENABLE_HISTORY) || defined(ENABLE_VERKLE_BUILD)
+#ifdef ENABLE_HISTORY
     /* Capture state diff before dirty flags are cleared by compute_state_root.
      * Collect once, push to both consumers independently. */
     {
         bool need_diff = false;
 #ifdef ENABLE_HISTORY
         if (history) need_diff = true;
-#endif
-#ifdef ENABLE_VERKLE_BUILD
-        if (verkle_builder) need_diff = true;
 #endif
         if (need_diff) {
             block_diff_t diff;
@@ -723,13 +704,6 @@ block_result_t block_execute(evm_t *evm,
                 block_diff_t hist_diff;
                 block_diff_clone(&diff, &hist_diff);
                 state_history_push(history, &hist_diff);
-            }
-#endif
-#ifdef ENABLE_VERKLE_BUILD
-            if (verkle_builder) {
-                block_diff_t vb_diff;
-                block_diff_clone(&diff, &vb_diff);
-                verkle_builder_push(verkle_builder, &vb_diff);
             }
 #endif
             block_diff_free(&diff);

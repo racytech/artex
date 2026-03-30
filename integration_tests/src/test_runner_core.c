@@ -378,36 +378,6 @@ uint64_t get_time_microseconds(void) {
 }
 
 //==============================================================================
-// Temp directory helpers (for flat verkle backend)
-//==============================================================================
-
-#ifdef ENABLE_VERKLE
-static void rm_rf(const char *path) {
-    if (!path || !path[0]) return;
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    system(cmd);
-}
-
-/* Flat backend temp dirs — stored per runner instance */
-static __thread char flat_value_dir[256];
-static __thread char flat_commit_dir[256];
-
-static void make_flat_dirs(void) {
-    snprintf(flat_value_dir, sizeof(flat_value_dir), "/tmp/vk_val_XXXXXX");
-    snprintf(flat_commit_dir, sizeof(flat_commit_dir), "/tmp/vk_com_XXXXXX");
-    mkdtemp(flat_value_dir);
-    mkdtemp(flat_commit_dir);
-}
-
-static void cleanup_flat_dirs(void) {
-    rm_rf(flat_value_dir);
-    rm_rf(flat_commit_dir);
-    flat_value_dir[0] = '\0';
-    flat_commit_dir[0] = '\0';
-}
-#endif /* ENABLE_VERKLE */
-
 //==============================================================================
 // Test Runner Lifecycle
 //==============================================================================
@@ -430,46 +400,19 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
     }
 
     // Initialize state backends + EVM State
-#ifdef ENABLE_VERKLE
-    make_flat_dirs();
-    runner->vs = verkle_state_create_flat(flat_value_dir, flat_commit_dir);
-    if (!runner->vs) {
-        cleanup_flat_dirs();
-        return false;
-    }
-#endif
-
-    runner->state = evm_state_create(
-#ifdef ENABLE_VERKLE
-        runner->vs,
-#else
-        NULL,
-#endif
-        NULL,  /* no mpt path — tries created via flat_state */
-        NULL   /* no code_store for tests */
-    );
+    runner->state = evm_state_create(NULL   /* no code_store for tests */);
     if (!runner->state) {
-#ifdef ENABLE_VERKLE
-        verkle_state_destroy(runner->vs);
-        runner->vs = NULL;
-        cleanup_flat_dirs();
-#endif
         return false;
     }
 
     // Initialize flat_state for MPT root computation (owns the compact_arts)
 #ifdef ENABLE_MPT
     {
-        runner->flat_state = flat_state_create("/dev/shm/test_runner_flat", 4096, 65536);
+        runner->flat_state = flat_state_create("/dev/shm/test_runner_flat");
         if (!runner->flat_state) {
             fprintf(stderr, "ERROR: Failed to create flat_state\n");
             evm_state_destroy(runner->state);
             runner->state = NULL;
-#ifdef ENABLE_VERKLE
-            verkle_state_destroy(runner->vs);
-            runner->vs = NULL;
-            cleanup_flat_dirs();
-#endif
             return false;
         }
         evm_state_set_flat_state(runner->state, (flat_state_t *)runner->flat_state);
@@ -481,11 +424,6 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
     if (!runner->evm) {
         evm_state_destroy(runner->state);
         runner->state = NULL;
-#ifdef ENABLE_VERKLE
-        verkle_state_destroy(runner->vs);
-        runner->vs = NULL;
-        cleanup_flat_dirs();
-#endif
         return false;
     }
 
@@ -507,14 +445,6 @@ void test_runner_destroy(test_runner_t *runner) {
 #ifdef ENABLE_MPT
     if (runner->flat_state)
         flat_state_destroy((flat_state_t *)runner->flat_state);
-#endif
-
-#ifdef ENABLE_VERKLE
-    if (runner->vs) {
-        verkle_state_destroy(runner->vs);
-    }
-
-    cleanup_flat_dirs();
 #endif
 
     memset(runner, 0, sizeof(*runner));
@@ -539,41 +469,18 @@ void test_runner_reset(test_runner_t *runner) {
         runner->flat_state = NULL;
     }
 #endif
-#ifdef ENABLE_VERKLE
-    if (runner->vs) {
-        verkle_state_destroy(runner->vs);
-        runner->vs = NULL;
-    }
-    cleanup_flat_dirs();
-#endif
 
     // Recreate fresh
-#ifdef ENABLE_VERKLE
-    make_flat_dirs();
-    runner->vs = verkle_state_create_flat(flat_value_dir, flat_commit_dir);
-    if (runner->vs) {
-#endif
-        runner->state = evm_state_create(
-#ifdef ENABLE_VERKLE
-            runner->vs,
-#else
-            NULL,
-#endif
-            NULL,  /* no mpt path — tries created via flat_state */
-            NULL   /* no code_store for tests */
-        );
-        if (runner->state) {
+    runner->state = evm_state_create(NULL   /* no code_store for tests */);
+    if (runner->state) {
 #ifdef ENABLE_MPT
-            /* Fresh flat_state for this test case */
-            runner->flat_state = flat_state_create("/dev/shm/test_runner_flat", 4096, 65536);
-            if (runner->flat_state)
-                evm_state_set_flat_state(runner->state, (flat_state_t *)runner->flat_state);
+        /* Fresh flat_state for this test case */
+        runner->flat_state = flat_state_create("/dev/shm/test_runner_flat");
+        if (runner->flat_state)
+            evm_state_set_flat_state(runner->state, (flat_state_t *)runner->flat_state);
 #endif
-            runner->evm = evm_create(runner->state, NULL);
-        }
-#ifdef ENABLE_VERKLE
+        runner->evm = evm_create(runner->state, NULL);
     }
-#endif
 
     runner->total_gas_used = 0;
     runner->total_transactions = 0;

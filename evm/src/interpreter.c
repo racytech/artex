@@ -20,7 +20,6 @@
 #include "opcodes/logging.h"
 #include "opcodes/call.h"
 #include "opcodes/create.h"
-#include "verkle_key.h"
 #include "evm_state.h"
 #include "evm_tracer.h"
 #include <stdio.h>
@@ -90,55 +89,11 @@ static inline uint256_t addr_to_u256(const address_t *addr) {
     };
 }
 
-#ifdef ENABLE_VERKLE
-// Verkle witness gas for PUSH data bytes (cold path, only called in Verkle mode)
-static bool push_verkle_data_gas(evm_t *evm, uint8_t num_bytes,
-                                  const address_t *code_addr_p) {
-    uint64_t data_start = evm->pc + 1;
-    if (data_start >= evm->code_size) return true;
-    uint64_t data_end = data_start + num_bytes;
-    if (data_end > evm->code_size) data_end = evm->code_size;
-    uint32_t start_chunk = (uint32_t)(data_start / 31);
-    uint32_t end_chunk   = (uint32_t)((data_end - 1) / 31);
-    for (uint32_t c = start_chunk; c <= end_chunk; c++) {
-        uint8_t ck[32];
-        verkle_code_chunk_key(ck, code_addr_p->bytes, c);
-        uint64_t cwg = evm_state_witness_gas_access(evm->state, ck, false, false);
-        if (cwg > 0 && !evm_use_gas(evm, cwg)) return false;
-    }
-    return true;
-}
-#endif
 
 //==============================================================================
 // Dispatch Table - Maps opcodes to label addresses
 //==============================================================================
 
-#ifdef ENABLE_VERKLE
-#define DISPATCH()                                                  \
-    do                                                              \
-    {                                                               \
-        if (__builtin_expect(evm->pc >= evm->code_size, 0))          \
-        {                                                           \
-            EVM_TRACE_IMPLICIT_STOP(evm);                           \
-            if (evm->return_data) { free(evm->return_data);         \
-                                    evm->return_data = NULL; }      \
-            evm->return_data_size = 0;                              \
-            goto done;                                              \
-        }                                                           \
-        if (__builtin_expect(verkle_chunk_mode, 0)) {                \
-            uint8_t ck[32];                                         \
-            verkle_code_chunk_key(ck, code_addr.bytes,              \
-                                 (uint32_t)(evm->pc / 31));         \
-            uint64_t cwg = evm_state_witness_gas_access(            \
-                evm->state, ck, false, false);                      \
-            if (cwg > 0 && !evm_use_gas(evm, cwg))                  \
-                goto done_oog;                                      \
-        }                                                           \
-        EVM_TRACE_DISPATCH(evm);                                    \
-        goto *dispatch_table[evm->code[evm->pc]];                  \
-    } while (0)
-#else
 #define DISPATCH()                                                  \
     do                                                              \
     {                                                               \
@@ -153,15 +108,8 @@ static bool push_verkle_data_gas(evm_t *evm, uint8_t num_bytes,
         EVM_TRACE_DISPATCH(evm);                                    \
         goto *dispatch_table[evm->code[evm->pc]];                  \
     } while (0)
-#endif
 
-#ifdef ENABLE_VERKLE
-#define VERKLE_PUSH_GAS(N) \
-        if (__builtin_expect(verkle_chunk_mode, 0))                            \
-            if (!push_verkle_data_gas(evm, (N), &code_addr)) goto done_oog;
-#else
 #define VERKLE_PUSH_GAS(N) /* no-op */
-#endif
 
 #define NEXT()      \
     do              \
@@ -215,18 +163,6 @@ evm_result_t evm_interpret(evm_t *evm)
     printf("\n");
     } // end debug output
 
-    // EIP-4762 (Verkle): code chunk witness gas per instruction.
-#ifdef ENABLE_VERKLE
-    // Verkle code-chunk witness gas — skip for deployment and system calls.
-    bool is_deployment = (evm->msg.kind == EVM_CREATE || evm->msg.kind == EVM_CREATE2);
-    static const uint8_t SYSTEM_ADDR[20] = {
-        0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-        0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xfe
-    };
-    bool is_system_call = (memcmp(evm->msg.caller.bytes, SYSTEM_ADDR, 20) == 0);
-    bool verkle_chunk_mode = (evm->fork >= FORK_VERKLE && !is_deployment && !is_system_call);
-    address_t code_addr = evm->msg.code_addr;
-#endif
 
     // Build JUMPDEST bitmap for O(1) jump validation
     uint8_t *jumpdest_bitmap = build_jumpdest_bitmap(evm->code, evm->code_size);
@@ -1171,10 +1107,6 @@ op_push1:
     evm->stack->items[evm->stack->size++] = (uint256_t){
         (evm->pc + 1 < evm->code_size) ? (uint128_t)evm->code[evm->pc + 1] : 0, 0
     };
-#ifdef ENABLE_VERKLE
-    if (__builtin_expect(verkle_chunk_mode, 0))
-        if (!push_verkle_data_gas(evm, 1, &code_addr)) goto done_oog;
-#endif
     evm->pc += 2;
     DISPATCH();
 
