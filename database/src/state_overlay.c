@@ -1475,14 +1475,59 @@ void state_overlay_evict(state_overlay_t *so) {
         flat_store_evict_clean(flat_state_account_store(so->flat_state));
         flat_store_evict_clean(flat_state_storage_store(so->flat_state));
     }
+
     /* Free code pointers */
-    for (uint32_t i = 0; i < so->acct_meta.capacity; i++)
+    for (uint32_t i = 0; i < so->next_acct_idx; i++)
         free(so->acct_meta.entries[i].code);
-    /* Reset meta arrays */
-    memset(so->acct_meta.entries, 0, so->acct_meta.capacity * sizeof(cached_account_t));
-    memset(so->slot_meta.entries, 0, so->slot_meta.capacity * sizeof(cached_slot_t));
+
+    /* Reset meta arrays — zero only the used portion */
+    if (so->next_acct_idx > 0)
+        memset(so->acct_meta.entries, 0,
+               so->next_acct_idx * sizeof(cached_account_t));
+    if (so->next_slot_idx > 0)
+        memset(so->slot_meta.entries, 0,
+               so->next_slot_idx * sizeof(cached_slot_t));
+
+    /* Shrink meta arrays if they grew large (keep at most 2x the typical
+     * working set, but never below 4096 initial capacity) */
+    const uint32_t MIN_META_CAP = 4096;
+    if (so->acct_meta.capacity > MIN_META_CAP &&
+        so->next_acct_idx < so->acct_meta.capacity / 4) {
+        uint32_t new_cap = so->acct_meta.capacity / 2;
+        if (new_cap < MIN_META_CAP) new_cap = MIN_META_CAP;
+        cached_account_t *na = realloc(so->acct_meta.entries,
+                                        new_cap * sizeof(cached_account_t));
+        if (na) {
+            so->acct_meta.entries = na;
+            so->acct_meta.capacity = new_cap;
+        }
+    }
+    if (so->slot_meta.capacity > MIN_META_CAP &&
+        so->next_slot_idx < so->slot_meta.capacity / 4) {
+        uint32_t new_cap = so->slot_meta.capacity / 2;
+        if (new_cap < MIN_META_CAP) new_cap = MIN_META_CAP;
+        cached_slot_t *ns = realloc(so->slot_meta.entries,
+                                     new_cap * sizeof(cached_slot_t));
+        if (ns) {
+            so->slot_meta.entries = ns;
+            so->slot_meta.capacity = new_cap;
+        }
+    }
+
+    /* Reset sequential counters — next checkpoint starts from index 0 */
+    so->next_acct_idx = 0;
+    so->next_slot_idx = 0;
+
+    /* Rebuild index tables — old entries pointed at now-stale meta slots */
+    mem_art_destroy(&so->acct_index);
+    mem_art_init(&so->acct_index);
+    mem_art_destroy(&so->slot_index);
+    mem_art_init(&so->slot_index);
+
     dirty_clear(&so->dirty_accounts);
     dirty_clear(&so->dirty_slots);
+
+    so->journal_len = 0;
 }
 
 /* =========================================================================
