@@ -45,7 +45,8 @@ typedef struct {
     const char *verkle_builder_commit_dir;
 
     /* Behavior */
-    uint32_t checkpoint_interval;   /* validate root + flush every N blocks (0 = never) */
+    uint32_t checkpoint_interval;   /* validate root every N blocks (0 = never) */
+    uint32_t evict_interval;        /* flush + evict every N blocks (0 = same as checkpoint) */
     bool     validate_state_root;   /* compare computed root against header */
 #ifdef ENABLE_DEBUG
     bool     no_evict;              /* skip cache eviction at interval boundaries */

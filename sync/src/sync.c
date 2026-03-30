@@ -423,7 +423,7 @@ bool sync_execute_block(sync_t *sync,
     sync->total_gas += br.gas_used;
     sync->last_block = bn;
 
-    /* Periodic root validation + flush + evict */
+    /* Periodic root validation */
     if (result->ok &&
         sync->config.checkpoint_interval > 0 &&
         sync->blocks_fail == 0 &&
@@ -441,7 +441,16 @@ bool sync_execute_block(sync_t *sync,
             block_result_free(&br);
             return true;
         }
-        sync_flush_and_evict(sync);
+    }
+
+    /* Periodic flush + evict (decoupled from validation) */
+    {
+        uint32_t ei = sync->config.evict_interval > 0
+                    ? sync->config.evict_interval
+                    : (sync->config.checkpoint_interval > 0
+                       ? sync->config.checkpoint_interval : 256);
+        if (bn % ei == 0)
+            sync_flush_and_evict(sync);
     }
 
     block_result_free(&br);
