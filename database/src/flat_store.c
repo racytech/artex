@@ -884,6 +884,106 @@ void flat_store_sync(flat_store_t *s) {
     write_header(s);
 }
 
+/* =========================================================================
+ * Overlay direct access (for state_overlay Phase 2)
+ * ========================================================================= */
+
+uint32_t flat_store_ensure_overlay(flat_store_t *s, const uint8_t *key) {
+    if (!s || !key) return UINT32_MAX;
+
+    const void *val = compact_art_get(&s->index, key);
+    if (val) {
+        uint64_t offset;
+        memcpy(&offset, val, sizeof(offset));
+        if (offset & OVERLAY_BIT) {
+            /* Already in overlay */
+            uint32_t idx = OVERLAY_IDX(offset);
+            lru_touch(&s->overlay, idx);
+            return idx;
+        }
+        /* On disk — load into overlay */
+        uint32_t shdr;
+        memcpy(&shdr, s->base + FLAT_STORE_HEADER_SIZE + offset, SLOT_HEADER_SIZE);
+        uint8_t class_idx; uint16_t data_len;
+        slot_header_unpack(shdr, &class_idx, &data_len);
+        uint32_t slot_size = s->slot_sizes[class_idx];
+
+        uint32_t idx = overlay_alloc(&s->overlay);
+        if (idx == UINT32_MAX) return UINT32_MAX;
+        overlay_entry_t *e = &s->overlay.entries[idx];
+        e->data = malloc(slot_size);
+        if (!e->data) { overlay_release(&s->overlay, idx); return UINT32_MAX; }
+        memcpy(e->data, s->base + FLAT_STORE_HEADER_SIZE + offset, slot_size);
+        e->slot_size = slot_size;
+        e->file_offset = offset;
+        e->dirty = false;
+        e->occupied = true;
+        e->lru_prev = e->lru_next = LRU_NONE;
+        lru_push_front(&s->overlay, idx);
+
+        uint64_t ov = (uint64_t)idx | OVERLAY_BIT;
+        compact_art_insert(&s->index, key, &ov);
+        return idx;
+    }
+
+    /* Not found — create empty overlay entry with zero-length record */
+    int new_class = 0; /* smallest class */
+    uint32_t slot_size = s->slot_sizes[new_class];
+
+    uint32_t idx = overlay_alloc(&s->overlay);
+    if (idx == UINT32_MAX) return UINT32_MAX;
+    overlay_entry_t *e = &s->overlay.entries[idx];
+    e->data = calloc(1, slot_size);
+    if (!e->data) { overlay_release(&s->overlay, idx); return UINT32_MAX; }
+    /* Write slot header with data_len=0 (empty record) + key */
+    uint32_t shdr = slot_header_pack((uint8_t)new_class, 0);
+    memcpy(e->data, &shdr, SLOT_HEADER_SIZE);
+    memcpy(e->data + SLOT_HEADER_SIZE, key, s->key_size);
+    e->slot_size = slot_size;
+    e->file_offset = UINT64_MAX;
+    e->dirty = false;
+    e->occupied = true;
+    e->lru_prev = e->lru_next = LRU_NONE;
+    lru_push_front(&s->overlay, idx);
+
+    /* Don't insert into compact_art for empty entries — they don't exist yet.
+     * The caller will flat_store_put when they want to persist. */
+    return idx;
+}
+
+uint8_t *flat_store_overlay_data(flat_store_t *s, uint32_t idx) {
+    if (!s || idx >= s->overlay.high_water) return NULL;
+    return s->overlay.entries[idx].data;
+}
+
+uint8_t *flat_store_overlay_record(flat_store_t *s, uint32_t idx,
+                                    uint32_t *out_len) {
+    if (!s || idx >= s->overlay.high_water) { if (out_len) *out_len = 0; return NULL; }
+    overlay_entry_t *e = &s->overlay.entries[idx];
+    if (!e->occupied || !e->data) { if (out_len) *out_len = 0; return NULL; }
+    uint32_t shdr;
+    memcpy(&shdr, e->data, SLOT_HEADER_SIZE);
+    uint8_t ci; uint16_t dl;
+    slot_header_unpack(shdr, &ci, &dl);
+    if (out_len) *out_len = dl;
+    return e->data + SLOT_HEADER_SIZE + s->key_size;
+}
+
+void flat_store_overlay_mark_dirty(flat_store_t *s, uint32_t idx) {
+    if (!s || idx >= s->overlay.high_water) return;
+    s->overlay.entries[idx].dirty = true;
+}
+
+uint32_t flat_store_overlay_index(const flat_store_t *s, const uint8_t *key) {
+    if (!s || !key) return UINT32_MAX;
+    const void *val = compact_art_get(&s->index, key);
+    if (!val) return UINT32_MAX;
+    uint64_t offset;
+    memcpy(&offset, val, sizeof(offset));
+    if (!(offset & OVERLAY_BIT)) return UINT32_MAX;
+    return OVERLAY_IDX(offset);
+}
+
 uint32_t flat_store_evict_clean(flat_store_t *s) {
     if (!s) return 0;
     overlay_pool_t *p = &s->overlay;

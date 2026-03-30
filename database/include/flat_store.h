@@ -144,6 +144,38 @@ uint32_t flat_store_read_leaf_record(const flat_store_t *store,
                                       const void *leaf_val,
                                       uint8_t *buf, uint32_t buf_size);
 
+/**
+ * Ensure a key is in the overlay. If on disk, loads into overlay.
+ * If not found, creates an empty overlay entry.
+ * Returns overlay index, or UINT32_MAX on failure.
+ * Use flat_store_overlay_data() to access the entry's data.
+ */
+uint32_t flat_store_ensure_overlay(flat_store_t *store, const uint8_t *key);
+
+/**
+ * Get the data pointer for an overlay entry by index.
+ * Returns pointer to [slot_header + key + record] in overlay memory.
+ * Valid until the entry is released.
+ */
+uint8_t *flat_store_overlay_data(flat_store_t *store, uint32_t idx);
+
+/**
+ * Get the record portion of an overlay entry (skip header + key).
+ * out_len receives the record length.
+ */
+uint8_t *flat_store_overlay_record(flat_store_t *store, uint32_t idx,
+                                    uint32_t *out_len);
+
+/**
+ * Mark an overlay entry as dirty (needs flush to disk).
+ */
+void flat_store_overlay_mark_dirty(flat_store_t *store, uint32_t idx);
+
+/**
+ * Get overlay index for a key, or UINT32_MAX if not in overlay.
+ */
+uint32_t flat_store_overlay_index(const flat_store_t *store, const uint8_t *key);
+
 /* =========================================================================
  * Overlay (in-memory cache)
  * ========================================================================= */
