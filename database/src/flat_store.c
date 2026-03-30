@@ -946,8 +946,9 @@ uint32_t flat_store_ensure_overlay(flat_store_t *s, const uint8_t *key) {
     e->lru_prev = e->lru_next = LRU_NONE;
     lru_push_front(&s->overlay, idx);
 
-    /* Don't insert into compact_art for empty entries — they don't exist yet.
-     * The caller will flat_store_put when they want to persist. */
+    /* Do NOT insert into compact_art — empty entries don't exist in the trie.
+     * flat_store_put will create a proper entry when data is written.
+     * The meta sidecar tracks this entry by its overlay index. */
     return idx;
 }
 

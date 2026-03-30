@@ -200,11 +200,15 @@ struct state_overlay {
     account_trie_t   *account_trie;
     storage_trie_t   *storage_trie;
 
-    /* Meta arrays — indexed by flat_store overlay pool index.
-     * Persistent fields (nonce, balance, etc.) are ALSO in the flat_store
-     * overlay entry as compressed records. Meta holds typed access + flags. */
+    /* Meta arrays — indexed by sequential meta index (NOT flat_store overlay index).
+     * Meta holds typed access + flags. Persistent records in flat_store overlay
+     * are synced at checkpoint time. */
     account_meta_pool_t acct_meta;
     slot_meta_pool_t    slot_meta;
+
+    /* Lookup tables: addr/skey → meta index */
+    mem_art_t acct_index;   /* addr[20] → uint32_t meta index */
+    mem_art_t slot_index;   /* skey[52] → uint32_t meta index */
 
     journal_entry_t *journal;
     uint32_t journal_len;
@@ -277,26 +281,22 @@ static inline void mark_slot_tx_dirty(state_overlay_t *so, cached_slot_t *cs) {
         dirty_push(&so->tx_dirty_slots, cs->key, SLOT_KEY_SIZE);
 }
 
-/* Lookup helpers: find meta by key via flat_store overlay index */
+/* Lookup helpers: find meta by key via local index tables */
 static cached_account_t *find_account_meta(state_overlay_t *so, const uint8_t *addr) {
-    if (!so->flat_state) return NULL;
-    hash_t ah = hash_keccak256(addr, 20);
-    flat_store_t *store = flat_state_account_store(so->flat_state);
-    uint32_t idx = flat_store_overlay_index(store, ah.bytes);
-    if (idx == UINT32_MAX || idx >= so->acct_meta.capacity) return NULL;
+    const uint32_t *pidx = (const uint32_t *)mem_art_get(
+        &so->acct_index, addr, ADDRESS_KEY_SIZE, NULL);
+    if (!pidx) return NULL;
+    uint32_t idx = *pidx;
+    if (idx >= so->acct_meta.capacity) return NULL;
     return &so->acct_meta.entries[idx];
 }
 
 static cached_slot_t *find_slot_meta(state_overlay_t *so, const uint8_t *skey) {
-    if (!so->flat_state) return NULL;
-    hash_t ah = hash_keccak256(skey, 20);
-    hash_t sh = hash_keccak256(skey + 20, 32);
-    uint8_t stor_key[64];
-    memcpy(stor_key, ah.bytes, 32);
-    memcpy(stor_key + 32, sh.bytes, 32);
-    flat_store_t *store = flat_state_storage_store(so->flat_state);
-    uint32_t idx = flat_store_overlay_index(store, stor_key);
-    if (idx == UINT32_MAX || idx >= so->slot_meta.capacity) return NULL;
+    const uint32_t *pidx = (const uint32_t *)mem_art_get(
+        &so->slot_index, skey, SLOT_KEY_SIZE, NULL);
+    if (!pidx) return NULL;
+    uint32_t idx = *pidx;
+    if (idx >= so->slot_meta.capacity) return NULL;
     return &so->slot_meta.entries[idx];
 }
 
@@ -307,6 +307,11 @@ static cached_slot_t *find_slot_meta(state_overlay_t *so, const uint8_t *skey) {
 
 static void sync_account_to_overlay(state_overlay_t *so, cached_account_t *ca) {
     if (!so->flat_state) return;
+    /* Only sync to flat_state if account should appear in the trie.
+     * Don't write empty accounts that haven't been promoted yet —
+     * they'll be promoted by commit_tx/commit, then synced at checkpoint. */
+    bool is_empty = (ca->nonce == 0 && uint256_is_zero(&ca->balance) && !ca->has_code);
+    if (!ca->existed && is_empty) return;
     flat_account_record_t frec;
     frec.nonce = ca->nonce;
     uint256_to_bytes(&ca->balance, frec.balance);
@@ -339,37 +344,30 @@ static void sync_slot_to_overlay(state_overlay_t *so, cached_account_t *ca,
  * ========================================================================= */
 
 static cached_account_t *ensure_account(state_overlay_t *so, const address_t *addr) {
-    if (!so->flat_state) return NULL; /* flat_state required */
+    /* Check local index first */
+    cached_account_t *existing = find_account_meta(so, addr->bytes);
+    if (existing) return existing;
 
-    hash_t addr_hash = hash_keccak256(addr->bytes, 20);
-    flat_store_t *acct_store = flat_state_account_store(so->flat_state);
-
-    /* Check if already in overlay */
-    uint32_t idx = flat_store_overlay_index(acct_store, addr_hash.bytes);
-    if (idx != UINT32_MAX) {
-        cached_account_t *ca = acct_meta_ensure(&so->acct_meta, idx);
-        return ca;
-    }
-
-    /* Load from disk or create new */
-    idx = flat_store_ensure_overlay(acct_store, addr_hash.bytes);
-    if (idx == UINT32_MAX) return NULL;
-
+    /* Allocate new meta entry */
+    static uint32_t next_acct_idx = 0; /* TODO: proper pool allocator */
+    uint32_t idx = next_acct_idx++;
     cached_account_t *ca = acct_meta_ensure(&so->acct_meta, idx);
     if (!ca) return NULL;
 
-    /* Initialize meta from the overlay record */
+    /* Register in index */
+    mem_art_insert(&so->acct_index, addr->bytes, ADDRESS_KEY_SIZE,
+                   &idx, sizeof(idx));
+
+    /* Initialize meta */
     memset(ca, 0, sizeof(*ca));
     address_copy(&ca->addr, addr);
-    ca->addr_hash = addr_hash;
+    ca->addr_hash = hash_keccak256(addr->bytes, 20);
     ca->storage_root = HASH_EMPTY_STORAGE;
 
-    /* Read persistent fields from overlay entry */
-    uint32_t rec_len;
-    uint8_t *rec = flat_store_overlay_record(acct_store, idx, &rec_len);
-    if (rec && rec_len > 0) {
+    /* Load from flat_state if available */
+    if (so->flat_state) {
         flat_account_record_t frec;
-        if (flat_state_get_account(so->flat_state, addr_hash.bytes, &frec)) {
+        if (flat_state_get_account(so->flat_state, ca->addr_hash.bytes, &frec)) {
             ca->nonce = frec.nonce;
             ca->balance = uint256_from_bytes(frec.balance, 32);
             memcpy(ca->code_hash.bytes, frec.code_hash, 32);
@@ -378,9 +376,9 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
                             memcmp(frec.code_hash, HASH_EMPTY_CODE.bytes, 32) != 0);
             ca->existed = true;
             so->flat_acct_hit++;
+        } else {
+            so->flat_acct_miss++;
         }
-    } else {
-        so->flat_acct_miss++;
     }
 
 #ifdef ENABLE_HISTORY
@@ -398,49 +396,42 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
 
 static cached_slot_t *ensure_slot(state_overlay_t *so, const address_t *addr,
                                   const uint256_t *slot) {
-    if (!so->flat_state) return NULL;
-
     cached_account_t *ca = ensure_account(so, addr);
     if (!ca) return NULL;
 
-    hash_t slot_hash = hash_keccak256((const uint8_t *)slot, 32);
+    /* Build skey for index lookup */
+    uint8_t skey[SLOT_KEY_SIZE];
+    make_slot_key(addr, slot, skey);
 
-    /* Build 64-byte storage key: addr_hash[32] || slot_hash[32] */
-    uint8_t stor_key[64];
-    memcpy(stor_key, ca->addr_hash.bytes, 32);
-    memcpy(stor_key + 32, slot_hash.bytes, 32);
+    /* Check local index */
+    cached_slot_t *existing = find_slot_meta(so, skey);
+    if (existing) return existing;
 
-    flat_store_t *stor_store = flat_state_storage_store(so->flat_state);
-
-    /* Check if already in overlay */
-    uint32_t idx = flat_store_overlay_index(stor_store, stor_key);
-    if (idx != UINT32_MAX) {
-        return slot_meta_ensure(&so->slot_meta, idx);
-    }
-
-    /* Load from disk or create new */
-    idx = flat_store_ensure_overlay(stor_store, stor_key);
-    if (idx == UINT32_MAX) return NULL;
-
+    /* Allocate new meta entry */
+    static uint32_t next_slot_idx = 0;
+    uint32_t idx = next_slot_idx++;
     cached_slot_t *cs = slot_meta_ensure(&so->slot_meta, idx);
     if (!cs) return NULL;
 
+    /* Register in index */
+    mem_art_insert(&so->slot_index, skey, SLOT_KEY_SIZE, &idx, sizeof(idx));
+
     /* Initialize meta */
     memset(cs, 0, sizeof(*cs));
-    /* Store addr[20] || slot_be[32] as the SLOT_KEY for dirty tracking */
-    memcpy(cs->key, addr->bytes, ADDRESS_SIZE);
-    uint256_to_bytes(slot, cs->key + ADDRESS_SIZE);
-    cs->slot_hash = slot_hash;
+    memcpy(cs->key, skey, SLOT_KEY_SIZE);
+    cs->slot_hash = hash_keccak256(skey + ADDRESS_SIZE, 32);
 
-    /* Read value from overlay entry */
-    uint32_t rec_len;
-    uint8_t *rec = flat_store_overlay_record(stor_store, idx, &rec_len);
-    if (rec && rec_len == 32) {
-        cs->original = uint256_from_bytes(rec, 32);
-        cs->current = cs->original;
-        so->flat_stor_hit++;
-    } else {
-        so->flat_stor_miss++;
+    /* Load from flat_state */
+    if (so->flat_state) {
+        uint8_t val_be[32];
+        if (flat_state_get_storage(so->flat_state, ca->addr_hash.bytes,
+                                   cs->slot_hash.bytes, val_be)) {
+            cs->original = uint256_from_bytes(val_be, 32);
+            cs->current = cs->original;
+            so->flat_stor_hit++;
+        } else {
+            so->flat_stor_miss++;
+        }
     }
 
 #ifdef ENABLE_HISTORY
@@ -473,6 +464,8 @@ state_overlay_t *state_overlay_create(flat_state_t *fs, code_store_t *cs) {
     so->flat_state = fs;
     so->code_store = cs;
 
+    mem_art_init(&so->acct_index);
+    mem_art_init(&so->slot_index);
     mem_art_init(&so->warm_addrs);
     mem_art_init(&so->warm_slots);
     mem_art_init(&so->transient);
@@ -499,6 +492,8 @@ void state_overlay_destroy(state_overlay_t *so) {
     if (so->storage_trie) storage_trie_destroy(so->storage_trie);
     if (so->account_trie) account_trie_destroy(so->account_trie);
 
+    mem_art_destroy(&so->acct_index);
+    mem_art_destroy(&so->slot_index);
     mem_art_destroy(&so->warm_addrs);
     mem_art_destroy(&so->warm_slots);
     mem_art_destroy(&so->transient);
@@ -684,6 +679,7 @@ void state_overlay_set_storage(state_overlay_t *so, const address_t *addr,
         ca->storage_dirty = true;
         mark_account_mpt_dirty(so, ca);
         sync_slot_to_overlay(so, ca, cs);
+    sync_account_to_overlay(so, ca);
     }
 }
 
@@ -992,12 +988,12 @@ void state_overlay_create_account(state_overlay_t *so, const address_t *addr) {
     ca->block_accessed = true;
 #endif
     mark_account_mpt_dirty(so, ca);
+    sync_account_to_overlay(so, ca);
     ca->code_dirty = false;
     ca->self_destructed = false;
     ca->storage_root = HASH_EMPTY_STORAGE;
     ca->storage_dirty = true;
     ca->storage_cleared = true;
-    sync_account_to_overlay(so, ca);
 }
 
 void state_overlay_self_destruct(state_overlay_t *so, const address_t *addr) {
@@ -1019,6 +1015,7 @@ void state_overlay_self_destruct(state_overlay_t *so, const address_t *addr) {
     ca->block_accessed = true;
 #endif
     mark_account_mpt_dirty(so, ca);
+    sync_account_to_overlay(so, ca);
 }
 
 void state_overlay_mark_existed(state_overlay_t *so, const address_t *addr) {
@@ -1234,7 +1231,6 @@ void state_overlay_commit_tx(state_overlay_t *so) {
             ca->storage_root = HASH_EMPTY_STORAGE;
             ca->storage_cleared = true;
             ca->storage_dirty = true;
-            sync_account_to_overlay(so, ca);
             continue;
         }
 
@@ -1245,6 +1241,7 @@ void state_overlay_commit_tx(state_overlay_t *so) {
         if (so->prune_empty && is_empty && (ca->dirty || ca->code_dirty)) {
             ca->existed = false;
             mark_account_mpt_dirty(so, ca);
+    sync_account_to_overlay(so, ca);
         }
 
         ca->created = false;
@@ -1403,23 +1400,40 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
             flat_state_delete_account(so->flat_state, ca->addr_hash.bytes);
     }
 
-    /* Step 3. Compute storage roots for storage_dirty accounts */
+    /* Step 3. Sync dirty slots to flat_state */
+    for (size_t d = 0; d < so->dirty_slots.count; d++) {
+        const uint8_t *skey = so->dirty_slots.keys + d * SLOT_KEY_SIZE;
+        cached_slot_t *cs = find_slot_meta(so, skey);
+        if (!cs || !cs->mpt_dirty) continue;
+        cached_account_t *ca = find_account_meta(so, skey); /* first 20 bytes = addr */
+        if (!ca || !ca->existed) continue;
+        if (ca->storage_cleared && !cs->mpt_dirty) continue;
+        sync_slot_to_overlay(so, ca, cs);
+    }
+
+    /* Step 4. Compute storage roots for storage_dirty accounts */
     for (size_t d = 0; d < so->dirty_accounts.count; d++) {
         const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
         cached_account_t *ca = find_account_meta(so, akey);
         if (!ca || !ca->storage_dirty || !ca->existed) continue;
         storage_trie_root(so->storage_trie, ca->addr_hash.bytes,
                            ca->storage_root.bytes);
-        /* Re-sync account with updated storage_root */
+    }
+
+    /* Step 5. Sync dirty accounts to flat_state (with final storage_root) */
+    for (size_t d = 0; d < so->dirty_accounts.count; d++) {
+        const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+        cached_account_t *ca = find_account_meta(so, akey);
+        if (!ca || !ca->mpt_dirty || !ca->existed) continue;
         sync_account_to_overlay(so, ca);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
-    /* Step 4. Compute account trie root from flat_state */
+    /* Step 6. Compute account trie root from flat_state */
     account_trie_root(so->account_trie, root.bytes);
     clock_gettime(CLOCK_MONOTONIC, &t2);
 
-    /* Step 5. Clear dirty flags */
+    /* Step 7. Clear dirty flags */
     for (size_t d = 0; d < so->dirty_accounts.count; d++) {
         const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
         cached_account_t *ca = find_account_meta(so, akey);
