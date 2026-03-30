@@ -84,10 +84,6 @@ add_library(art_database STATIC
 add_library(bloom_filter STATIC database/src/bloom_filter.c)
 target_link_libraries(bloom_filter m)
 
-# Disk Hash (mmap-backed hash table)
-add_library(disk_hash STATIC database/src/disk_hash_mmap.c)
-target_link_libraries(disk_hash pthread)
-
 # Disk Table (mmap-backed hash table optimized for pre-hashed keys)
 add_library(disk_table STATIC database/src/disk_table.c)
 
@@ -410,30 +406,6 @@ add_executable(test_bloom_filter
 target_link_libraries(test_bloom_filter bloom_filter m)
 add_test(NAME test_bloom_filter COMMAND test_bloom_filter)
 
-add_executable(test_disk_hash
-    database/tests/test_disk_hash.c
-)
-target_link_libraries(test_disk_hash disk_hash)
-add_test(NAME test_disk_hash COMMAND test_disk_hash)
-
-# Stress Test: Disk Hash (correctness at scale, fail-fast)
-add_executable(test_stress_disk_hash
-    database/tests/test_stress_disk_hash.c
-)
-target_link_libraries(test_stress_disk_hash disk_hash)
-
-# Crash Simulation Test: Disk Hash (fork + kill -9 + recovery)
-add_executable(test_crash_disk_hash
-    database/tests/test_crash_disk_hash.c
-)
-target_link_libraries(test_crash_disk_hash disk_hash)
-
-# Multi-Threaded Stress Test: Disk Hash (1 writer + N readers)
-add_executable(test_mt_disk_hash
-    database/tests/test_mt_disk_hash.c
-)
-target_link_libraries(test_mt_disk_hash disk_hash pthread)
-
 # Test: Code Store (content-addressed bytecode storage)
 add_executable(test_code_store
     database/tests/test_code_store.c
@@ -687,7 +659,7 @@ if(ENABLE_HISTORY)
         target_include_directories(verkle_reconstruct PRIVATE ${CJSON_INCLUDE_DIRS})
         target_link_libraries(verkle_reconstruct
             verkle_state verkle_flat verkle_key pedersen
-            code_store disk_hash
+            code_store
             block_executor evm common
             ${CJSON_LIBRARIES})
 
@@ -974,7 +946,6 @@ message(STATUS "  Checkpoint every:${CHECKPOINT_INTERVAL} blocks")
 message(STATUS "")
 message(STATUS "Libraries:")
 message(STATUS "  - art_database (in-memory ART tree)")
-message(STATUS "  - disk_hash (mmap-backed hash table)")
 message(STATUS "  - code_store (content-addressed bytecode storage)")
 message(STATUS "  - verkle_flat (disk-backed verkle state with Pedersen commitments)")
 message(STATUS "  - evm (Ethereum Virtual Machine)")
