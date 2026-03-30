@@ -19,9 +19,7 @@
 #include "block.h"
 #include "hash.h"
 #include "fork.h"
-#ifdef ENABLE_MPT
 #include "code_store.h"
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -367,16 +365,12 @@ int main(int argc, char *argv[]) {
     printf("Code store: %s (existing)\n", code_path);
 
     /* ── Create evm_state (fresh or resume) ──────────────────────────── */
-#ifdef ENABLE_MPT
     code_store_t *cs = code_store_open(code_path);
     if (!cs) {
         fprintf(stderr, "Failed to open code store at %s\n", code_path);
         state_history_destroy(sh);
         return 1;
     }
-#else
-    void *cs = NULL;
-#endif
 
     uint64_t start_block = hist_first;  /* first block to replay */
 
@@ -385,9 +379,7 @@ int main(int argc, char *argv[]) {
         reconstruct_meta_t meta;
         if (!meta_read(mpt_path, &meta)) {
             fprintf(stderr, "No valid .meta file at %s — cannot resume\n", mpt_path);
-#ifdef ENABLE_MPT
             code_store_destroy(cs);
-#endif
             state_history_destroy(sh);
             return 1;
         }
@@ -403,9 +395,7 @@ int main(int argc, char *argv[]) {
 
         if (start_block > target_block) {
             printf("Snapshot already at or past target block — nothing to do\n");
-#ifdef ENABLE_MPT
             code_store_destroy(cs);
-#endif
             state_history_destroy(sh);
             return 0;
         }
@@ -414,9 +404,7 @@ int main(int argc, char *argv[]) {
     evm_state_t *es = evm_state_create(cs);
     if (!es) {
         fprintf(stderr, "Failed to create evm_state\n");
-#ifdef ENABLE_MPT
         code_store_destroy(cs);
-#endif
         state_history_destroy(sh);
         return 1;
     }
@@ -429,9 +417,7 @@ int main(int argc, char *argv[]) {
         if (!load_genesis(es, genesis_path)) {
             fprintf(stderr, "Failed to load genesis\n");
             evm_state_destroy(es);
-#ifdef ENABLE_MPT
             code_store_destroy(cs);
-#endif
             state_history_destroy(sh);
             return 1;
         }
@@ -439,12 +425,10 @@ int main(int argc, char *argv[]) {
         evm_state_commit(es);
         evm_state_finalize(es);
 
-#ifdef ENABLE_MPT
         {
             hash_t genesis_root = evm_state_compute_mpt_root(es, false);
             printf("Genesis root: 0x"); print_hash(&genesis_root); printf("\n");
         }
-#endif
     }
 
     /* ── Replay diffs ────────────────────────────────────────────────── */
@@ -507,7 +491,6 @@ int main(int argc, char *argv[]) {
            applied, elapsed, applied / elapsed);
 
     /* ── Compute MPT root ────────────────────────────────────────────── */
-#ifdef ENABLE_MPT
     printf("\nComputing MPT root...\n");
     struct timespec tr0, tr1;
     clock_gettime(CLOCK_MONOTONIC, &tr0);
@@ -531,12 +514,8 @@ int main(int argc, char *argv[]) {
     } else {
         printf("\n** STATE ROOT MISMATCH — reconstruction failed **\n");
     }
-#else
-    printf("MPT not enabled — cannot compute root\n");
-#endif
 
     /* ── Flush to disk + write metadata ─────────────────────────────── */
-#ifdef ENABLE_MPT
     if (memcmp(actual_root.bytes, expected_root.bytes, 32) == 0) {
         printf("\nFlushing reconstructed state to disk...\n");
         evm_state_flush(es);
@@ -546,14 +525,11 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Warning: state flushed but meta write failed\n");
         }
     }
-#endif
 
     /* ── Cleanup ─────────────────────────────────────────────────────── */
     archive_close(&archive);
     evm_state_destroy(es);
-#ifdef ENABLE_MPT
     code_store_destroy(cs);
-#endif
     state_history_destroy(sh);
 
     return 0;

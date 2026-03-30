@@ -575,11 +575,7 @@ int main(int argc, char **argv) {
             char build[256];
             snprintf(build, sizeof(build), "ARTEX  "
                 "MPT:%s  VERKLE:%s  HISTORY:%s  DEBUG:%s  EVM_TRACE:%s  CKPT:%d",
-#ifdef ENABLE_MPT
                 "ON",
-#else
-                "off",
-#endif
                 "off",
 #ifdef ENABLE_HISTORY
                 "ON",
@@ -655,11 +651,9 @@ int main(int argc, char **argv) {
     if (!no_history)
         cfg.history_dir = history_path;
 #endif
-#ifdef ENABLE_MPT
     cfg.mpt_path = mpt_path;
     cfg.flat_state_path = flat_path;
     cfg.code_store_path = code_path;
-#endif
 
     LOG_INFO("Loading state...");
 #ifdef ENABLE_TUI
@@ -1109,7 +1103,6 @@ int main(int argc, char **argv) {
                     .total_blocks_ok  = lst.blocks_ok,
                     .total_blocks_fail = lst.blocks_fail,
                     .elapsed_secs     = elapsed,
-#ifdef ENABLE_MPT
                     .root_stor_ms     = lss.root_stor_ms,
                     .root_acct_ms     = lss.root_acct_ms,
                     .root_dirty_count = lss.root_dirty_count,
@@ -1120,7 +1113,6 @@ int main(int argc, char **argv) {
                         ? 100.0 * lss.code_cache_hits / (lss.code_cache_hits + lss.code_cache_misses) : 0,
                     .flush_ms         = 0,
                     .checkpoint_total_ms = 0,
-#endif
                     .history_blocks   = lhs.blocks,
                     .history_mb       = lhs.disk_mb,
                 };
@@ -1175,7 +1167,6 @@ int main(int argc, char **argv) {
                     .total_blocks_ok  = st.blocks_ok,
                     .total_blocks_fail = st.blocks_fail,
                     .elapsed_secs     = elapsed,
-#ifdef ENABLE_MPT
                     .root_stor_ms     = ss.root_stor_ms,
                     .root_acct_ms     = ss.root_acct_ms,
                     .root_dirty_count = ss.root_dirty_count,
@@ -1186,7 +1177,6 @@ int main(int argc, char **argv) {
                         ? 100.0 * ss.code_cache_hits / (ss.code_cache_hits + ss.code_cache_misses) : 0,
                     .flush_ms         = 0,
                     .checkpoint_total_ms = 0,
-#endif
                     .history_blocks   = hs.blocks,
                     .history_mb       = hs.disk_mb,
                 };
@@ -1205,7 +1195,6 @@ int main(int argc, char **argv) {
                 printf("  └ cache: %zuK accts, %zuK slots (%zuMB arena)\n",
                        ss.cache_accounts / 1000, ss.cache_slots / 1000,
                        ss.cache_arena_bytes / (1024*1024));
-#ifdef ENABLE_MPT
                 printf("  └ flat: %luK accts (%zuMB), %luK slots (%zuMB)\n",
                        ss.flat_acct_count / 1000,
                        ss.flat_acct_mem / (1024*1024),
@@ -1239,10 +1228,6 @@ int main(int argc, char **argv) {
                     printf("  └ checkpoint: wait=%.1f ms  evict=%.1f ms\n",
                            ss.wait_flush_ms, ss.evict_ms);
                 }
-
-#else
-                printf("  └ RSS %zuMB\n", rss_mb);
-#endif
             }
             window_txs = 0;
             window_gas = 0;

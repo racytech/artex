@@ -125,9 +125,7 @@ bool test_runner_run_state_test(test_runner_t *runner,
 
             // Flush pre-state to flat_state (so unmodified accounts
             // are in the trie before we clear dirty flags)
-#ifdef ENABLE_MPT
             evm_state_compute_mpt_root(runner->state, false);
-#endif
             evm_state_clear_prestate_dirty(runner->state);
 
             // Get transaction parameters for this test case
@@ -361,11 +359,7 @@ bool test_runner_run_state_test(test_runner_t *runner,
             // Verify state root
             // EIP-161 (Spurious Dragon+): prune empty accounts from state trie
             bool prune_empty = (runner->evm->fork >= FORK_SPURIOUS_DRAGON);
-#ifdef ENABLE_MPT
             hash_t actual_root = evm_state_compute_mpt_root(runner->state, prune_empty);
-#else
-            hash_t actual_root = evm_state_compute_state_root_ex(runner->state, prune_empty);
-#endif
             if (!hash_equals(&actual_root, &post_cond->state_root)) {
                 result->status = TEST_FAIL;
 

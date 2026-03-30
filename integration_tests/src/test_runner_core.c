@@ -4,9 +4,7 @@
 
 #include "test_runner.h"
 #include "fork.h"
-#ifdef ENABLE_MPT
 #include "flat_state.h"
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -406,7 +404,6 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
     }
 
     // Initialize flat_state for MPT root computation (owns the compact_arts)
-#ifdef ENABLE_MPT
     {
         runner->flat_state = flat_state_create("/dev/shm/test_runner_flat");
         if (!runner->flat_state) {
@@ -417,7 +414,6 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
         }
         evm_state_set_flat_state(runner->state, (flat_state_t *)runner->flat_state);
     }
-#endif
 
     // Initialize EVM
     runner->evm = evm_create(runner->state, NULL); // NULL = use default mainnet config
@@ -442,10 +438,8 @@ void test_runner_destroy(test_runner_t *runner) {
         evm_state_destroy(runner->state);
     }
 
-#ifdef ENABLE_MPT
     if (runner->flat_state)
         flat_state_destroy((flat_state_t *)runner->flat_state);
-#endif
 
     memset(runner, 0, sizeof(*runner));
 }
@@ -463,22 +457,18 @@ void test_runner_reset(test_runner_t *runner) {
         evm_state_destroy(runner->state);
         runner->state = NULL;
     }
-#ifdef ENABLE_MPT
     if (runner->flat_state) {
         flat_state_destroy((flat_state_t *)runner->flat_state);
         runner->flat_state = NULL;
     }
-#endif
 
     // Recreate fresh
     runner->state = evm_state_create(NULL   /* no code_store for tests */);
     if (runner->state) {
-#ifdef ENABLE_MPT
         /* Fresh flat_state for this test case */
         runner->flat_state = flat_state_create("/dev/shm/test_runner_flat");
         if (runner->flat_state)
             evm_state_set_flat_state(runner->state, (flat_state_t *)runner->flat_state);
-#endif
         runner->evm = evm_create(runner->state, NULL);
     }
 
@@ -536,11 +526,7 @@ bool test_runner_verify_state_root(evm_state_t *state,
                                    hash_t *actual_root) {
     if (!state || !expected_root) return false;
 
-#ifdef ENABLE_MPT
     hash_t computed_root = evm_state_compute_mpt_root(state, true);
-#else
-    hash_t computed_root = evm_state_compute_state_root_ex(state, true);
-#endif
 
     if (actual_root) {
         *actual_root = computed_root;

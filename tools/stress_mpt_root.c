@@ -115,10 +115,6 @@ int main(int argc, char **argv) {
     printf("  checkpoints:    %d\n", num_checkpoints);
     printf("\n");
 
-#ifndef ENABLE_MPT
-    fprintf(stderr, "ERROR: ENABLE_MPT is required for this test\n");
-    return 1;
-#else
     /* Clean up from previous run */
     cleanup_files(base_path);
 
@@ -298,5 +294,4 @@ int main(int argc, char **argv) {
     cleanup_files(base_path);
 
     return 0;
-#endif /* ENABLE_MPT */
 }

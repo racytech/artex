@@ -169,7 +169,6 @@ static void print_stats(sync_t *sync) {
     printf("  | cache: %zuK accts, %zuK slots (%zuMB arena)\n",
            ss.cache_accounts / 1000, ss.cache_slots / 1000,
            ss.cache_arena_bytes / (1024*1024));
-#ifdef ENABLE_MPT
     printf("  | flat: %luK accts, %luK slots\n",
            ss.flat_acct_count / 1000,
            ss.flat_stor_count / 1000);
@@ -179,9 +178,6 @@ static void print_stats(sync_t *sync) {
                ? 100.0 * ss.code_cache_hits / (ss.code_cache_hits + ss.code_cache_misses) : 0,
            ss.code_cache_count / 1000, ss.code_cache_capacity / 1000,
            rss_mb);
-#else
-    printf("  | RSS %zuMB\n", rss_mb);
-#endif
 }
 
 /* =========================================================================
@@ -451,10 +447,8 @@ int main(int argc, char **argv) {
         .checkpoint_interval = args.checkpoint_interval,
         .validate_state_root = true,
     };
-#ifdef ENABLE_MPT
     cfg.mpt_path = mpt_path;
     cfg.code_store_path = code_path;
-#endif
 
     sync_t *sync = sync_create(&cfg);
     if (!sync) {

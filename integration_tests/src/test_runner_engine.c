@@ -263,11 +263,7 @@ bool test_runner_run_engine_test(test_runner_t *runner,
         if (fork >= FORK_SPURIOUS_DRAGON)
             prune_empty = true;
 
-#ifdef ENABLE_MPT
         hash_t actual_genesis_root = evm_state_compute_mpt_root(runner->state, prune_empty);
-#else
-        hash_t actual_genesis_root = evm_state_compute_state_root_ex(runner->state, prune_empty);
-#endif
 
         if (runner->config.verbose) {
             char *expected_str = hash_to_hex_string(&test->genesis_header.state_root);
@@ -392,11 +388,7 @@ bool test_runner_run_engine_test(test_runner_t *runner,
 
         /* Verify state root */
         bool prune = (runner->evm->fork >= FORK_SPURIOUS_DRAGON);
-#ifdef ENABLE_MPT
         hash_t computed_root = evm_state_compute_mpt_root(runner->state, prune);
-#else
-        hash_t computed_root = evm_state_compute_state_root_ex(runner->state, prune);
-#endif
         hash_t expected_root;
         memcpy(expected_root.bytes, payload->state_root, 32);
 

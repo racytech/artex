@@ -15,10 +15,8 @@
 #include "evm.h"
 #include "evm_state.h"
 #include "block_executor.h"
-#ifdef ENABLE_MPT
 #include "code_store.h"
 #include "flat_state.h"
-#endif
 #ifdef ENABLE_HISTORY
 #include "state_history.h"
 #endif
@@ -51,10 +49,9 @@ static void sync_flush_and_evict(sync_t *sync);
 struct sync {
     sync_config_t config;
 
-#ifdef ENABLE_MPT
     code_store_t  *cs;
     flat_state_t  *flat_state;
-#endif
+
     evm_state_t *state;
     evm_t       *evm;
 
@@ -85,11 +82,9 @@ struct sync {
 // Flush helpers (code_store only — flat_state is mmap'd, no explicit flush)
 // ============================================================================
 
-#ifdef ENABLE_MPT
 static void sync_flush_code(sync_t *s) {
     if (s->cs) code_store_flush(s->cs);
 }
-#endif
 
 // ============================================================================
 // Helpers
@@ -179,7 +174,6 @@ sync_t *sync_create(const sync_config_t *config) {
 
     bool resumed = false;
 
-#ifdef ENABLE_MPT
     /* Open or create code store */
     if (s->config.code_store_path) {
         s->cs = code_store_open(s->config.code_store_path);
@@ -191,15 +185,10 @@ sync_t *sync_create(const sync_config_t *config) {
                     s->config.code_store_path);
     }
 
-#endif
 
     /* Create evm_state */
     s->state = evm_state_create(
-#ifdef ENABLE_MPT
         s->cs
-#else
-        NULL
-#endif
     );
     if (!s->state) {
         fprintf(stderr, "FATAL: failed to create EVM state\n"
@@ -212,7 +201,6 @@ sync_t *sync_create(const sync_config_t *config) {
     /* Batch mode: defer per-block verkle/MPT flush to checkpoint boundaries */
     evm_state_set_batch_mode(s->state, true);
 
-#ifdef ENABLE_MPT
     /* Flat state: O(1) disk-backed lookups for cache misses */
     if (config->flat_state_path) {
         s->flat_state = flat_state_open(config->flat_state_path);
@@ -226,7 +214,6 @@ sync_t *sync_create(const sync_config_t *config) {
                     config->flat_state_path);
     }
     /* No background flush thread — flat_state is mmap'd */
-#endif
 
     /* Create EVM */
     s->evm = evm_create(s->state, config->chain_config);
@@ -261,25 +248,17 @@ fail:
 }
 
 void sync_ensure_flushed(sync_t *sync) {
-#ifdef ENABLE_MPT
     if (sync) sync_flush_code(sync);
-#else
-    (void)sync;
-#endif
 }
 
 void sync_destroy(sync_t *sync) {
     if (!sync) return;
 
     if (sync->evm) evm_destroy(sync->evm);
-#ifdef ENABLE_MPT
     sync_flush_code(sync);
-#endif
     if (sync->state) evm_state_destroy(sync->state);
-#ifdef ENABLE_MPT
     if (sync->cs) code_store_destroy(sync->cs);
     if (sync->flat_state) flat_state_destroy(sync->flat_state);
-#endif
 #ifdef ENABLE_HISTORY
     if (sync->history) state_history_destroy(sync->history);
 #endif
@@ -354,7 +333,6 @@ bool sync_resume(sync_t *sync, uint64_t last_block,
 // Batch MPT root validation (internal)
 // ============================================================================
 
-#ifdef ENABLE_MPT
 /**
  * Compute MPT state root and validate against the pending expected root
  * (saved from the last block's header). Called at checkpoint boundaries.
@@ -366,9 +344,6 @@ bool sync_resume(sync_t *sync, uint64_t last_block,
 static bool sync_validate_batch_root(sync_t *sync,
                                      hash_t *actual_out,
                                      hash_t *expected_out) {
-#ifdef ENABLE_MPT
-    
-#endif
     bool prune_empty = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
     hash_t actual = evm_state_compute_mpt_root(sync->state, prune_empty);
     sync->batch_root_computed = true;
@@ -381,7 +356,6 @@ static bool sync_validate_batch_root(sync_t *sync,
 
     return memcmp(actual.bytes, sync->pending_expected_root.bytes, 32) == 0;
 }
-#endif
 
 // ============================================================================
 // Block Execution
@@ -423,11 +397,9 @@ bool sync_execute_block(sync_t *sync,
     /* MPT root: deferred to checkpoint boundaries (not per-block).
      * Save the expected root from each block header — at checkpoint time
      * we validate against the last block's root. */
-#ifdef ENABLE_MPT
     if (sync->config.validate_state_root) {
         sync->pending_expected_root = header->state_root;
     }
-#endif
 
 
     /* Determine outcome (gas only — root validated at checkpoint) */
@@ -455,7 +427,6 @@ bool sync_execute_block(sync_t *sync,
         sync->blocks_fail == 0 &&
         bn % sync->config.checkpoint_interval == 0) {
 
-#ifdef ENABLE_MPT
         /* Validate MPT root at interval boundary */
         hash_t actual_root, expected_root;
         if (!sync_validate_batch_root(sync, &actual_root, &expected_root)) {
@@ -468,7 +439,6 @@ bool sync_execute_block(sync_t *sync,
             block_result_free(&br);
             return true;
         }
-#endif
         sync_flush_and_evict(sync);
     }
 
@@ -521,10 +491,9 @@ bool sync_execute_block_live(sync_t *sync,
         return true;
     }
 
-#ifdef ENABLE_MPT
     /* Immediate state root validation */
     if (sync->config.validate_state_root) {
-        
+
         bool prune_empty = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
         hash_t actual = evm_state_compute_mpt_root(sync->state, prune_empty);
 
@@ -544,7 +513,6 @@ bool sync_execute_block_live(sync_t *sync,
     /* Synchronous flush — data on disk before returning VALID */
     evm_state_flush(sync->state);
     if (sync->cs) code_store_flush(sync->cs);
-#endif
 
     sync->blocks_ok++;
     sync->total_gas += br.gas_used;
@@ -567,7 +535,6 @@ void sync_set_live_mode(sync_t *sync, bool live) {
 static void sync_flush_and_evict(sync_t *sync) {
     if (!sync) return;
 
-#ifdef ENABLE_MPT
     /* Compute MPT root before eviction if not already done.
      * This ensures dirty data is captured into deferred buffer
      * before cache entries are dropped. */
@@ -576,7 +543,6 @@ static void sync_flush_and_evict(sync_t *sync) {
         evm_state_compute_mpt_root(sync->state, prune_empty);
         sync->batch_root_computed = true;
     }
-#endif
 
     /* Snapshot stats before eviction clears the cache */
     sync->last_stats = evm_state_get_stats(sync->state);
@@ -594,10 +560,8 @@ static void sync_flush_and_evict(sync_t *sync) {
     sync->last_evict_ms = (_ev1.tv_sec - _ev0.tv_sec) * 1000.0 +
                            (_ev1.tv_nsec - _ev0.tv_nsec) / 1e6;
 
-#ifdef ENABLE_MPT
     /* Kick off background flush — execution continues immediately */
     sync_flush_code(sync);
-#endif
 
     sync->batch_root_computed = false;
 }
@@ -627,10 +591,8 @@ sync_status_t sync_get_status(const sync_t *sync) {
 evm_state_stats_t sync_get_state_stats(const sync_t *sync) {
     if (!sync) return (evm_state_stats_t){0};
     evm_state_stats_t st = sync->last_stats;
-#ifdef ENABLE_MPT
     st.evict_ms = sync->last_evict_ms;
     st.wait_flush_ms = 0;
-#endif
     return st;
 }
 

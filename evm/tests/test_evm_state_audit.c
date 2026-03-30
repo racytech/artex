@@ -383,7 +383,6 @@ cleanup:
     free_state(&ts);
 }
 
-#ifdef ENABLE_MPT
 /* =========================================================================
  * Test 8: MPT root consistency
  * ========================================================================= */
@@ -423,7 +422,6 @@ static void test_mpt_root_consistency(void) {
 cleanup:
     free_state(&ts);
 }
-#endif /* ENABLE_MPT */
 
 /* =========================================================================
  * Test 9: Storage visible across transactions
@@ -588,9 +586,7 @@ int main(void) {
     test_flush_sets_existed();
     test_prune_empty_frontier();
     test_prune_empty_eip161();
-#ifdef ENABLE_MPT
     test_mpt_root_consistency();
-#endif
     test_storage_across_txs();
     test_snapshot_revert_storage();
     test_balance_revert_restores_block_dirty();

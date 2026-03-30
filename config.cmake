@@ -4,9 +4,6 @@
 
 set(CMAKE_BUILD_TYPE Release)
 
-# State backend
-set(ENABLE_MPT ON)
-
 # Per-block state diff history
 set(ENABLE_HISTORY ON)
 

@@ -175,12 +175,10 @@ static int run_statetest_file(const char *filepath, const statetest_args_t *args
                 ri++;
                 continue;
             }
-#ifdef ENABLE_MPT
             {
                 flat_state_t *fs = flat_state_create("/dev/shm/evm_statetest_flat");
                 if (fs) evm_state_set_flat_state(state, fs);
             }
-#endif
             evm_t *evm = evm_create(state, fork_config);
             if (!evm) {
                 evm_state_destroy(state);
@@ -203,12 +201,10 @@ static int run_statetest_file(const char *filepath, const statetest_args_t *args
             /* Setup pre-state */
             test_runner_setup_state(state, test->pre_state, test->pre_state_count);
             evm_state_commit(state);
-#ifdef ENABLE_MPT
             /* Flush pre-state to flat_state before clearing dirty flags.
              * Without this, pre-state accounts not modified during execution
              * would be missing from the incremental account trie. */
             evm_state_compute_mpt_root(state, false);
-#endif
             evm_state_clear_prestate_dirty(state);
 
             /* Set block environment */
@@ -374,11 +370,7 @@ static int run_statetest_file(const char *filepath, const statetest_args_t *args
 
             /* Compute state root */
             bool prune_empty = (evm->fork >= FORK_SPURIOUS_DRAGON);
-#ifdef ENABLE_MPT
             hash_t state_root = evm_state_compute_mpt_root(state, prune_empty);
-#else
-            hash_t state_root = evm_state_compute_state_root_ex(state, prune_empty);
-#endif
 
             char root_hex[67];
             hash_to_hex(&state_root, root_hex);

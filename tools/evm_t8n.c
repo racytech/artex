@@ -660,11 +660,7 @@ int main(int argc, char **argv) {
 
     /* --- Compute state root --- */
     bool prune_empty = (evm->fork >= FORK_SPURIOUS_DRAGON);
-#ifdef ENABLE_MPT
     hash_t state_root = evm_state_compute_mpt_root(state, prune_empty);
-#else
-    hash_t state_root = evm_state_compute_state_root_ex(state, prune_empty);
-#endif
 
     /* --- Build result JSON --- */
     cJSON *result = cJSON_CreateObject();

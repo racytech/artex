@@ -589,14 +589,12 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
                 );
 
             /* Step 8: Compute state root (MPT path returns zero from block_execute) */
-#ifdef ENABLE_MPT
             if (result.success && ctx->state) {
                 evm_t *e = (evm_t *)ctx->evm;
                 bool prune = (e->fork >= FORK_SPURIOUS_DRAGON);
                 result.state_root = evm_state_compute_mpt_root(
                     (evm_state_t *)ctx->state, prune);
             }
-#endif
 
             /* Step 9: Validate results */
             if (!result.success) {
