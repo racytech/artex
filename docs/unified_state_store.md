@@ -161,3 +161,87 @@ Steps 1-3 can be done incrementally. Step 4 is the breaking change.
 
 - **Eviction**: Granular. Currently: destroy entire cache every 256 blocks.
   Proposed: LRU eviction of individual cold entries anytime.
+
+## Future: Per-Account Storage (Option A)
+
+Once the unified overlay is stable, replace the single 64-byte-key storage
+flat_store with per-account storage compact_arts embedded in account entries.
+
+### Current
+
+```
+flat_store (accounts):  32-byte keys → account_record
+flat_store (storage):   64-byte keys (addr_hash[32] || slot_hash[32]) → value[32]
+```
+
+Two separate stores. Storage keys duplicate the 32-byte addr_hash prefix.
+delete_all_storage walks a subtree. Storage root uses art_mpt_subtree_hash.
+
+### Proposed
+
+```
+flat_store (accounts):  32-byte keys → { account_record, compact_art *storage }
+```
+
+Each account overlay entry owns a per-account compact_art for its storage.
+Storage keys are 32 bytes (slot_hash only).
+
+### Why per-account (not unified 64-byte key)
+
+A single 64-byte-key compact_art was considered and rejected:
+
+| Concern                | Unified 64B key           | Per-account 32B key      |
+|------------------------|---------------------------|--------------------------|
+| Account lookup speed   | 64-byte (2x slower)       | 32-byte (same as now)    |
+| Storage root           | Filtered subtree walk     | `art_mpt_hash(art)` — trivial |
+| Self-destruct          | Walk subtree + skip sentinel | `compact_art_destroy` — O(1) |
+| delete_all_storage     | Walk subtree              | Destroy + recreate — O(1) |
+| Mixed record sizes     | 104B accounts + 32B slots | Separate — no waste      |
+| MPT computation        | Needs filtered walks      | Natural — matches Ethereum model |
+
+Two sequential 32-byte lookups (account → per-account slot) equals the same
+total key bytes as one 64-byte lookup, but the account lookup is shared across
+BALANCE, EXTCODESIZE, CALL, etc.
+
+### Per-Account Storage Design
+
+```c
+typedef struct {
+    overlay_entry_t base;        // account data, flags, LRU
+    compact_art_t  *storage;     // NULL until first SLOAD/SSTORE
+    art_mpt_t      *storage_mpt; // NULL until storage root needed
+} account_overlay_entry_t;
+```
+
+**SLOAD**: `compact_art_get(account.storage, slot_hash)` — 32-byte lookup.
+If storage is NULL, account has no storage (return 0).
+
+**SSTORE**: ensure storage compact_art exists (lazy create), insert slot.
+
+**Storage root**: `art_mpt_hash(account.storage_mpt)` — hash the per-account
+compact_art directly. No subtree prefix walk needed.
+
+**Self-destruct / CREATE**: `compact_art_destroy(account.storage)` — O(1).
+Set storage = NULL. No walking, no orphan cleanup.
+
+**Persistence**: Per-account storage compact_arts serialize to a shared arena
+file (single mmap). Account record stores an offset/handle to its storage
+arena region. On load, deserialize lazily on first SLOAD.
+
+### Memory at Scale
+
+At 250M accounts, ~5M have storage. Per-account compact_art overhead:
+- Empty accounts: storage = NULL, 0 bytes
+- Accounts with storage: ~64 bytes struct + ART nodes for their slots
+- Total: ~5M * 64B = ~320MB overhead for structs
+- ART nodes: same total as current 64-byte key ART minus the addr_hash
+  prefix layer (~200-500MB saved)
+- Net: roughly break-even on base memory, but with granular eviction
+  (evict cold accounts' storage independently)
+
+### Implementation Order
+
+1. Unified overlay (this document, phase 1)
+2. Per-account storage compact_art (replace 64-byte key storage)
+3. Lazy storage loading (deserialize from arena on first access)
+4. Per-account LRU eviction (drop cold accounts' storage trees)
