@@ -392,6 +392,28 @@ void state_overlay_destroy(state_overlay_t *so) {
     free(so);
 }
 
+void state_overlay_set_flat_state(state_overlay_t *so, flat_state_t *fs) {
+    if (!so) return;
+    so->flat_state = fs;
+
+    /* Destroy old tries */
+    if (so->storage_trie) { storage_trie_destroy(so->storage_trie); so->storage_trie = NULL; }
+    if (so->account_trie) { account_trie_destroy(so->account_trie); so->account_trie = NULL; }
+
+    /* Create new tries if flat_state available */
+    if (fs) {
+        compact_art_t *s_art = flat_state_storage_art(fs);
+        flat_store_t  *s_store = flat_state_storage_store(fs);
+        if (s_art && s_store)
+            so->storage_trie = storage_trie_create(s_art, s_store);
+
+        compact_art_t *a_art = flat_state_account_art(fs);
+        flat_store_t  *a_store = flat_state_account_store(fs);
+        if (a_art && a_store)
+            so->account_trie = account_trie_create(a_art, a_store);
+    }
+}
+
 /* =========================================================================
  * Account — read
  * ========================================================================= */

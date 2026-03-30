@@ -113,6 +113,13 @@ add_library(account_trie STATIC database/src/account_trie.c)
 target_include_directories(account_trie PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 target_link_libraries(account_trie art_mpt flat_store flat_state)
 
+add_library(state_overlay STATIC database/src/state_overlay.c)
+target_include_directories(state_overlay PUBLIC
+    ${CMAKE_SOURCE_DIR}/database/include
+    ${CMAKE_SOURCE_DIR}/evm/include
+)
+target_link_libraries(state_overlay art_database flat_state flat_store storage_trie account_trie code_store common)
+
 #==============================================================================
 # Libraries — EVM
 #==============================================================================
@@ -142,7 +149,7 @@ target_include_directories(evm PUBLIC
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/evm/vendor
 )
-set(EVM_LINK_LIBS art_database common ssl crypto secp256k1 blst code_store flat_state storage_trie account_trie)
+set(EVM_LINK_LIBS art_database common ssl crypto secp256k1 blst code_store flat_state storage_trie account_trie state_overlay)
 target_link_libraries(evm ${EVM_LINK_LIBS})
 if(ENABLE_EVM_TRACE)
     target_compile_definitions(evm PUBLIC ENABLE_EVM_TRACE=1)
