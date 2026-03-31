@@ -1412,13 +1412,19 @@ void state_overlay_evict(state_overlay_t *so) {
         flat_store_t *astore = flat_state_account_store(so->flat_state);
         flat_store_t *sstore = flat_state_storage_store(so->flat_state);
 
-        /* Flush dirty overlay entries to disk */
-        flat_store_flush_deferred(astore, NULL, NULL);
-        flat_store_flush_deferred(sstore, NULL, NULL);
+        /* Pass 1: flush dirty overlay entries to disk */
+        flat_store_stale_slot_t *acct_stale = NULL, *stor_stale = NULL;
+        size_t acct_sc = 0, stor_sc = 0;
+        flat_store_flush_deferred(astore, &acct_stale, &acct_sc);
+        flat_store_flush_deferred(sstore, &stor_stale, &stor_sc);
 
-        /* Evict clean overlay entries */
+        /* Pass 2: evict clean overlay entries */
         flat_store_evict_clean(astore);
         flat_store_evict_clean(sstore);
+
+        /* Pass 3: free stale disk slots */
+        flat_store_free_stale_slots(astore, acct_stale, acct_sc);
+        flat_store_free_stale_slots(sstore, stor_stale, stor_sc);
     }
 
     /* Free code pointers in used portion of meta */
