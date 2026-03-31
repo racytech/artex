@@ -847,15 +847,12 @@ void flat_store_flush_deferred(flat_store_t *s) {
         uint8_t class_idx; uint16_t data_len;
         slot_header_unpack(shdr, &class_idx, &data_len);
 
-        /* Free old file slot */
-        if (e->file_offset != UINT64_MAX) {
-            uint32_t old_hdr;
-            memcpy(&old_hdr, s->base + FLAT_STORE_HEADER_SIZE + e->file_offset,
-                   SLOT_HEADER_SIZE);
-            uint8_t oc; uint16_t ol;
-            slot_header_unpack(old_hdr, &oc, &ol);
-            free_slot(s, e->file_offset, oc);
-        }
+        /* NOTE: Do NOT free old file slots during flush.
+         * free_slot + alloc_slot in the same loop can reuse a just-freed
+         * slot for a different entry, overwriting data that other
+         * compact_art leaves still reference. Old slots become dead space
+         * (leaked) but correctness is preserved. They are reclaimed on
+         * the next flat_store_open scan. */
 
         /* Write to disk */
         uint64_t file_offset = alloc_slot(s, class_idx);

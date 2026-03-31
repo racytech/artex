@@ -5,7 +5,7 @@
 set(CMAKE_BUILD_TYPE Release)
 
 # Per-block state diff history
-set(ENABLE_HISTORY ON)
+set(ENABLE_HISTORY OFF)
 
 # Checkpoint interval (blocks between auto-saves)
 set(CHECKPOINT_INTERVAL 256)

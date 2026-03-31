@@ -1409,10 +1409,9 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
 void state_overlay_evict(state_overlay_t *so) {
     if (!so) return;
     if (so->flat_state) {
-        /* Overlay entries already have current data — just flush to disk */
+        /* Flush overlay to disk, then evict clean overlay entries */
         flat_store_flush_deferred(flat_state_account_store(so->flat_state));
         flat_store_flush_deferred(flat_state_storage_store(so->flat_state));
-        /* Evict clean overlay entries */
         flat_store_evict_clean(flat_state_account_store(so->flat_state));
         flat_store_evict_clean(flat_state_storage_store(so->flat_state));
     }
