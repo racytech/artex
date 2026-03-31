@@ -1,56 +1,66 @@
 /*
  * Storage Trie — per-account storage MPT roots from a shared compact_art.
  *
- * The compact_art has 64-byte keys (addr_hash[32] || slot_hash[32]).
- * The art_mpt subtree walk at prefix=addr_hash computes the per-account
- * storage root using slot_hash[32] as the MPT key.
- *
- * Leaf values in the compact_art are flat_store offsets (uint64_t).
- * The encode callback reads the actual compressed storage value from
- * the flat_store's mmap'd data file, then RLP-encodes it.
+ * Dual-path encode callback:
+ *   - OVERLAY_BIT set + meta_pool: read current value from slot meta
+ *   - Otherwise: read compressed value from flat_store (disk)
  */
 
 #include "storage_trie.h"
 #include "art_mpt.h"
 #include "flat_store.h"
+#include "state_meta.h"
 
 #include <stdlib.h>
 #include <string.h>
 
+#define OVERLAY_BIT (1ULL << 63)
+#define OVERLAY_IDX(v) ((uint32_t)((v) & 0x7FFFFFFF))
+
 struct storage_trie {
-    art_mpt_t    *mpt;
-    flat_store_t *store;   /* non-owning — for reading slot values */
+    art_mpt_t        *mpt;
+    flat_store_t     *store;
+    slot_meta_pool_t *meta_pool;
 };
 
-/*
- * Encode callback: read compressed storage value from flat_store,
- * then RLP-encode as big-endian integer (strip leading zeros).
- *
- * flat_store stores values with leading zeros stripped (encode_storage).
- * We need to produce the RLP encoding of the original 32-byte BE value.
- * The compressed bytes ARE the significant bytes of the value.
- *
- * RLP rules for a byte string:
- *   len=0          → 0x80 (empty string)
- *   len=1, v<0x80  → v (single byte, self-describing)
- *   len=1..55      → (0x80+len) || bytes
- */
 static uint32_t storage_value_encode(const uint8_t *key,
                                       const void *leaf_val,
                                       uint32_t val_size,
                                       uint8_t *rlp_out,
                                       void *user_ctx) {
-    (void)key;
-    (void)val_size;
+    (void)key; (void)val_size;
     storage_trie_t *st = user_ctx;
 
-    /* Read compressed value from flat_store */
-    uint8_t raw[32];
-    uint32_t raw_len = flat_store_read_leaf_record(st->store, leaf_val,
-                                                    raw, sizeof(raw));
+    uint64_t offset;
+    memcpy(&offset, leaf_val, sizeof(uint64_t));
 
-    /* raw contains the significant bytes (leading zeros already stripped).
-     * RLP-encode as a byte string. */
+    uint8_t be[32];
+    const uint8_t *raw;
+    uint32_t raw_len;
+
+    if ((offset & OVERLAY_BIT) && st->meta_pool) {
+        /* Meta path: read current value directly */
+        uint32_t idx = OVERLAY_IDX(offset);
+        if (idx < st->meta_pool->capacity) {
+            cached_slot_t *cs = &st->meta_pool->entries[idx];
+            uint256_to_bytes(&cs->current, be);
+            /* Strip leading zeros */
+            size_t i = 0;
+            while (i < 32 && be[i] == 0) i++;
+            raw = be + i;
+            raw_len = (uint32_t)(32 - i);
+        } else {
+            return 0;
+        }
+    } else {
+        /* Disk path: read compressed value from flat_store */
+        static __thread uint8_t disk_buf[32];
+        raw_len = flat_store_read_leaf_record(st->store, leaf_val,
+                                               disk_buf, sizeof(disk_buf));
+        raw = disk_buf;
+    }
+
+    /* RLP-encode as byte string */
     if (raw_len == 0) {
         rlp_out[0] = 0x80;
         return 1;
@@ -65,19 +75,15 @@ static uint32_t storage_value_encode(const uint8_t *key,
 }
 
 storage_trie_t *storage_trie_create(compact_art_t *storage_art,
-                                      flat_store_t *storage_store) {
+                                      flat_store_t *storage_store,
+                                      slot_meta_pool_t *meta_pool) {
     if (!storage_art || !storage_store) return NULL;
-
     storage_trie_t *st = calloc(1, sizeof(*st));
     if (!st) return NULL;
-
     st->store = storage_store;
+    st->meta_pool = meta_pool;
     st->mpt = art_mpt_create(storage_art, storage_value_encode, st);
-    if (!st->mpt) {
-        free(st);
-        return NULL;
-    }
-
+    if (!st->mpt) { free(st); return NULL; }
     return st;
 }
 

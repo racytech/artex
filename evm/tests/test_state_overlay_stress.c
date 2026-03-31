@@ -104,7 +104,7 @@ static hash_t compute_root_full(test_ctx_t *ctx, bool prune) {
     /* Now invalidate and recompute from disk */
     compact_art_t *a_art = flat_state_account_art(ctx->fs);
     flat_store_t  *a_store = flat_state_account_store(ctx->fs);
-    account_trie_t *at = account_trie_create(a_art, a_store);
+    account_trie_t *at = account_trie_create(a_art, a_store, NULL);
     hash_t full = {0};
     if (at) {
         account_trie_root(at, full.bytes);

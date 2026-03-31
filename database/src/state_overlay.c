@@ -9,6 +9,7 @@
  */
 
 #include "state_overlay.h"
+#include "state_meta.h"
 #include "flat_state.h"
 #include "flat_store.h"
 #include "code_store.h"
@@ -27,62 +28,12 @@
  * ========================================================================= */
 
 #define JOURNAL_INIT_CAP  256
-#define SLOT_KEY_SIZE     52    /* addr[20] + slot_be[32] */
+#define SLOT_KEY_SIZE     STATE_META_SLOT_KEY_SIZE
 #define ADDRESS_KEY_SIZE  20
 #define MAX_CODE_SIZE     (24 * 1024 + 1)
 
-/* =========================================================================
- * Cached Account
- * ========================================================================= */
-
-typedef struct {
-    /* Hot fields */
-    uint64_t   nonce;
-    uint256_t  balance;
-    bool dirty;
-    bool block_dirty;
-    bool existed;
-    bool mpt_dirty;
-    bool storage_dirty;
-    bool storage_cleared;
-    bool has_code;
-    bool created;
-    bool self_destructed;
-    bool code_dirty;
-    bool block_code_dirty;
-    uint8_t   *code;
-    uint32_t   code_size;
-    /* Cold fields */
-    address_t  addr;
-    hash_t     code_hash;
-    hash_t     storage_root;
-    hash_t     addr_hash;
-#ifdef ENABLE_HISTORY
-    uint64_t   original_nonce;
-    uint256_t  original_balance;
-    hash_t     original_code_hash;
-    bool       block_self_destructed;
-    bool       block_created;
-    bool       block_accessed;
-#endif
-} cached_account_t;
-
-/* =========================================================================
- * Cached Slot
- * ========================================================================= */
-
-typedef struct {
-    uint8_t   key[SLOT_KEY_SIZE];
-    uint256_t original;
-    uint256_t current;
-    bool dirty;
-    bool block_dirty;
-    bool mpt_dirty;
-    hash_t slot_hash;
-#ifdef ENABLE_HISTORY
-    uint256_t block_original;
-#endif
-} cached_slot_t;
+/* Types from state_meta.h: cached_account_t, cached_slot_t,
+ * account_meta_pool_t, slot_meta_pool_t */
 
 /* =========================================================================
  * Journal
@@ -153,16 +104,6 @@ static inline void dirty_free(dirty_vec_t *v) {
 /* =========================================================================
  * Meta arrays — indexed by flat_store overlay pool index
  * ========================================================================= */
-
-typedef struct {
-    cached_account_t *entries;
-    uint32_t          capacity;
-} account_meta_pool_t;
-
-typedef struct {
-    cached_slot_t    *entries;
-    uint32_t          capacity;
-} slot_meta_pool_t;
 
 static cached_account_t *acct_meta_ensure(account_meta_pool_t *p, uint32_t idx) {
     if (idx >= p->capacity) {
@@ -351,8 +292,10 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
     cached_account_t *existing = find_account_meta(so, addr->bytes);
     if (existing) return existing;
 
-    /* Allocate new meta entry */
+    /* Allocate new meta entry (sequential index) */
     uint32_t idx = so->next_acct_idx++;
+    hash_t addr_hash = hash_keccak256(addr->bytes, 20);
+
     cached_account_t *ca = acct_meta_ensure(&so->acct_meta, idx);
     if (!ca) return NULL;
 
@@ -363,7 +306,7 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
     /* Initialize meta */
     memset(ca, 0, sizeof(*ca));
     address_copy(&ca->addr, addr);
-    ca->addr_hash = hash_keccak256(addr->bytes, 20);
+    ca->addr_hash = addr_hash;
     ca->storage_root = HASH_EMPTY_STORAGE;
 
     /* Load from flat_state if available */
@@ -409,8 +352,10 @@ static cached_slot_t *ensure_slot(state_overlay_t *so, const address_t *addr,
     cached_slot_t *existing = find_slot_meta(so, skey);
     if (existing) return existing;
 
-    /* Allocate new meta entry */
+    /* Allocate new meta entry (sequential index) */
     uint32_t idx = so->next_slot_idx++;
+    hash_t slot_hash = hash_keccak256(skey + ADDRESS_SIZE, 32);
+
     cached_slot_t *cs = slot_meta_ensure(&so->slot_meta, idx);
     if (!cs) return NULL;
 
@@ -420,7 +365,7 @@ static cached_slot_t *ensure_slot(state_overlay_t *so, const address_t *addr,
     /* Initialize meta */
     memset(cs, 0, sizeof(*cs));
     memcpy(cs->key, skey, SLOT_KEY_SIZE);
-    cs->slot_hash = hash_keccak256(skey + ADDRESS_SIZE, 32);
+    cs->slot_hash = slot_hash;
 
     /* Load from flat_state */
     if (so->flat_state) {
@@ -451,11 +396,11 @@ static void init_tries(state_overlay_t *so) {
     compact_art_t *s_art = flat_state_storage_art(so->flat_state);
     flat_store_t  *s_store = flat_state_storage_store(so->flat_state);
     if (s_art && s_store)
-        so->storage_trie = storage_trie_create(s_art, s_store);
+        so->storage_trie = storage_trie_create(s_art, s_store, NULL);
     compact_art_t *a_art = flat_state_account_art(so->flat_state);
     flat_store_t  *a_store = flat_state_account_store(so->flat_state);
     if (a_art && a_store)
-        so->account_trie = account_trie_create(a_art, a_store);
+        so->account_trie = account_trie_create(a_art, a_store, NULL);
 }
 
 state_overlay_t *state_overlay_create(flat_state_t *fs, code_store_t *cs) {
@@ -1439,6 +1384,46 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
 
     /* Step 6. Compute account trie root from flat_state */
     account_trie_root(so->account_trie, root.bytes);
+
+    /* Verify: invalidate all caches and recompute from scratch */
+    {
+        hash_t full;
+        account_trie_invalidate_all(so->account_trie);
+        account_trie_root(so->account_trie, full.bytes);
+        if (memcmp(root.bytes, full.bytes, 32) != 0) {
+            fprintf(stderr, "ART_MPT INCREMENTAL MISMATCH (dirty_accts=%zu dirty_slots=%zu)\n",
+                    so->dirty_accounts.count, so->dirty_slots.count);
+            fprintf(stderr, "  inc:  0x");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", root.bytes[i]);
+            fprintf(stderr, "\n  full: 0x");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", full.bytes[i]);
+            fprintf(stderr, "\n");
+            /* Dump dirty accounts — meta vs flat_store */
+            for (size_t d = 0; d < so->dirty_accounts.count; d++) {
+                const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+                cached_account_t *ca = find_account_meta(so, akey);
+                if (!ca) continue;
+                fprintf(stderr, "  dirty[%zu]: addr=0x", d);
+                for (int i = 0; i < 20; i++) fprintf(stderr, "%02x", ca->addr.bytes[i]);
+                fprintf(stderr, " nonce=%lu existed=%d has_code=%d\n", ca->nonce, ca->existed, ca->has_code);
+                fprintf(stderr, "    meta bal=0x");
+                { uint8_t bb[32]; uint256_to_bytes(&ca->balance, bb);
+                  for (int j=0;j<32;j++) fprintf(stderr,"%02x",bb[j]); }
+                fprintf(stderr, "\n");
+                /* Read back from flat_store to compare */
+                flat_account_record_t frec;
+                if (flat_state_get_account(so->flat_state, ca->addr_hash.bytes, &frec)) {
+                    fprintf(stderr, "    flat nonce=%lu bal=0x", frec.nonce);
+                    for (int j=0;j<32;j++) fprintf(stderr,"%02x",frec.balance[j]);
+                    fprintf(stderr, "\n");
+                } else {
+                    fprintf(stderr, "    flat: NOT FOUND\n");
+                }
+            }
+        }
+        /* Always use the full root for correctness */
+        root = full;
+    }
     clock_gettime(CLOCK_MONOTONIC, &t2);
 
     /* Step 7. Clear dirty flags */
@@ -1476,45 +1461,21 @@ void state_overlay_evict(state_overlay_t *so) {
         flat_store_evict_clean(flat_state_storage_store(so->flat_state));
     }
 
-    /* Free code pointers */
-    for (uint32_t i = 0; i < so->next_acct_idx; i++)
-        free(so->acct_meta.entries[i].code);
-
-    /* Reset meta arrays — zero only the used portion */
-    if (so->next_acct_idx > 0)
-        memset(so->acct_meta.entries, 0,
-               so->next_acct_idx * sizeof(cached_account_t));
-    if (so->next_slot_idx > 0)
-        memset(so->slot_meta.entries, 0,
-               so->next_slot_idx * sizeof(cached_slot_t));
-
-    /* Shrink meta arrays if they grew large (keep at most 2x the typical
-     * working set, but never below 4096 initial capacity) */
-    const uint32_t MIN_META_CAP = 4096;
-    if (so->acct_meta.capacity > MIN_META_CAP &&
-        so->next_acct_idx < so->acct_meta.capacity / 4) {
-        uint32_t new_cap = so->acct_meta.capacity / 2;
-        if (new_cap < MIN_META_CAP) new_cap = MIN_META_CAP;
-        cached_account_t *na = realloc(so->acct_meta.entries,
-                                        new_cap * sizeof(cached_account_t));
-        if (na) {
-            so->acct_meta.entries = na;
-            so->acct_meta.capacity = new_cap;
-        }
-    }
-    if (so->slot_meta.capacity > MIN_META_CAP &&
-        so->next_slot_idx < so->slot_meta.capacity / 4) {
-        uint32_t new_cap = so->slot_meta.capacity / 2;
-        if (new_cap < MIN_META_CAP) new_cap = MIN_META_CAP;
-        cached_slot_t *ns = realloc(so->slot_meta.entries,
-                                     new_cap * sizeof(cached_slot_t));
-        if (ns) {
-            so->slot_meta.entries = ns;
-            so->slot_meta.capacity = new_cap;
+    /* Free code pointers in used portion of meta */
+    for (uint32_t i = 0; i < so->acct_meta.capacity; i++) {
+        if (so->acct_meta.entries[i].code) {
+            free(so->acct_meta.entries[i].code);
+            so->acct_meta.entries[i].code = NULL;
         }
     }
 
-    /* Reset sequential counters — next checkpoint starts from index 0 */
+    /* Reset meta arrays */
+    memset(so->acct_meta.entries, 0,
+           so->acct_meta.capacity * sizeof(cached_account_t));
+    memset(so->slot_meta.entries, 0,
+           so->slot_meta.capacity * sizeof(cached_slot_t));
+
+    /* Reset sequential counters (used when no flat_state) */
     so->next_acct_idx = 0;
     so->next_slot_idx = 0;
 

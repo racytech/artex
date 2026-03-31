@@ -1,26 +1,31 @@
 /*
  * Account Trie — MPT root hash from flat_state's account compact_art.
  *
- * The encode callback reads compressed account records from flat_store's
- * mmap'd data file, decodes to {nonce, balance, code_hash, storage_root},
- * then produces the Ethereum account RLP.
+ * Dual-path encode callback:
+ *   - OVERLAY_BIT set + meta_pool: read typed fields from meta pool
+ *   - Otherwise: read compressed record from flat_store (disk)
  */
 
 #include "account_trie.h"
 #include "art_mpt.h"
 #include "flat_store.h"
 #include "flat_state.h"
+#include "state_meta.h"
 
 #include <stdlib.h>
 #include <string.h>
 
+#define OVERLAY_BIT (1ULL << 63)
+#define OVERLAY_IDX(v) ((uint32_t)((v) & 0x7FFFFFFF))
+
 struct account_trie {
-    art_mpt_t    *mpt;
-    flat_store_t *store;   /* non-owning — for reading account records */
+    art_mpt_t            *mpt;
+    flat_store_t         *store;
+    account_meta_pool_t  *meta_pool;
 };
 
 /* =========================================================================
- * RLP helpers (same encoding as evm_state.c mpt_rlp_account)
+ * RLP helpers
  * ========================================================================= */
 
 static const uint8_t EMPTY_CODE_HASH[32] = {
@@ -37,11 +42,9 @@ static const uint8_t EMPTY_STORAGE_ROOT[32] = {
     0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
 };
 
-/* RLP-encode a uint64 as big-endian integer */
 static size_t rlp_u64(uint64_t v, uint8_t *out) {
     if (v == 0) { out[0] = 0x80; return 1; }
     if (v < 0x80) { out[0] = (uint8_t)v; return 1; }
-
     uint8_t be[8];
     int len = 0;
     uint64_t tmp = v;
@@ -51,12 +54,10 @@ static size_t rlp_u64(uint64_t v, uint8_t *out) {
     return 1 + len;
 }
 
-/* RLP-encode a big-endian byte string (strip leading zeros) */
 static size_t rlp_be(const uint8_t *be, size_t be_len, uint8_t *out) {
     size_t i = 0;
     while (i < be_len && be[i] == 0) i++;
     size_t len = be_len - i;
-
     if (len == 0)             { out[0] = 0x80;          return 1; }
     if (len == 1 && be[i] < 0x80) { out[0] = be[i];    return 1; }
     out[0] = 0x80 + (uint8_t)len;
@@ -65,7 +66,7 @@ static size_t rlp_be(const uint8_t *be, size_t be_len, uint8_t *out) {
 }
 
 /* =========================================================================
- * Decode flat_state compressed account
+ * Decode compressed account (disk path only)
  * ========================================================================= */
 
 #define ACCT_FLAG_HAS_NONCE      0x01
@@ -79,10 +80,8 @@ static void decode_account(const uint8_t *buf, uint32_t len,
                             flat_account_record_t *out) {
     memset(out, 0, sizeof(*out));
     if (len == 0) return;
-
     uint8_t flags = buf[0];
     uint32_t pos = 1;
-
     if (flags & ACCT_FLAG_HAS_NONCE) {
         if (flags & ACCT_FLAG_NONCE_BIG) {
             memcpy(&out->nonce, buf + pos, 8); pos += 8;
@@ -111,37 +110,19 @@ static void decode_account(const uint8_t *buf, uint32_t len,
 }
 
 /* =========================================================================
- * Encode callback: flat_store leaf → account RLP
+ * Encode: build account RLP [nonce, balance, storage_root, code_hash]
  * ========================================================================= */
 
-static uint32_t account_value_encode(const uint8_t *key,
-                                      const void *leaf_val,
-                                      uint32_t val_size,
-                                      uint8_t *rlp_out,
-                                      void *user_ctx) {
-    (void)key;
-    (void)val_size;
-    account_trie_t *at = user_ctx;
-
-    /* Read compressed account from flat_store */
-    uint8_t raw[128];
-    uint32_t raw_len = flat_store_read_leaf_record(at->store, leaf_val,
-                                                    raw, sizeof(raw));
-    if (raw_len == 0) return 0;
-
-    /* Decode compressed → flat_account_record_t */
-    flat_account_record_t rec;
-    decode_account(raw, raw_len, &rec);
-
-    /* Build account RLP: [nonce, balance, storage_root, code_hash] */
+static uint32_t build_account_rlp(uint64_t nonce, const uint8_t balance_be[32],
+                                    const uint8_t storage_root[32],
+                                    const uint8_t code_hash[32],
+                                    uint8_t *rlp_out) {
     uint8_t payload[120];
     size_t pos = 0;
-    pos += rlp_u64(rec.nonce, payload + pos);
-    pos += rlp_be(rec.balance, 32, payload + pos);
-    payload[pos++] = 0xa0; memcpy(payload + pos, rec.storage_root, 32); pos += 32;
-    payload[pos++] = 0xa0; memcpy(payload + pos, rec.code_hash, 32);   pos += 32;
-
-    /* List wrapper */
+    pos += rlp_u64(nonce, payload + pos);
+    pos += rlp_be(balance_be, 32, payload + pos);
+    payload[pos++] = 0xa0; memcpy(payload + pos, storage_root, 32); pos += 32;
+    payload[pos++] = 0xa0; memcpy(payload + pos, code_hash, 32);   pos += 32;
     if (pos <= 55) {
         rlp_out[0] = 0xc0 + (uint8_t)pos;
         memcpy(rlp_out + 1, payload, pos);
@@ -154,24 +135,57 @@ static uint32_t account_value_encode(const uint8_t *key,
     }
 }
 
+static uint32_t account_value_encode(const uint8_t *key,
+                                      const void *leaf_val,
+                                      uint32_t val_size,
+                                      uint8_t *rlp_out,
+                                      void *user_ctx) {
+    (void)key; (void)val_size;
+    account_trie_t *at = user_ctx;
+
+    uint64_t offset;
+    memcpy(&offset, leaf_val, sizeof(uint64_t));
+
+    if ((offset & OVERLAY_BIT) && at->meta_pool) {
+        /* Meta path: read typed fields directly */
+        uint32_t idx = OVERLAY_IDX(offset);
+        if (idx < at->meta_pool->capacity) {
+            cached_account_t *ca = &at->meta_pool->entries[idx];
+            uint8_t bal_be[32];
+            uint256_to_bytes(&ca->balance, bal_be);
+            return build_account_rlp(ca->nonce, bal_be,
+                                      ca->storage_root.bytes,
+                                      ca->has_code ? ca->code_hash.bytes
+                                                   : EMPTY_CODE_HASH,
+                                      rlp_out);
+        }
+    }
+
+    /* Disk path: read compressed record from flat_store */
+    uint8_t raw[128];
+    uint32_t raw_len = flat_store_read_leaf_record(at->store, leaf_val,
+                                                    raw, sizeof(raw));
+    if (raw_len == 0) return 0;
+    flat_account_record_t rec;
+    decode_account(raw, raw_len, &rec);
+    return build_account_rlp(rec.nonce, rec.balance,
+                              rec.storage_root, rec.code_hash, rlp_out);
+}
+
 /* =========================================================================
  * Public API
  * ========================================================================= */
 
 account_trie_t *account_trie_create(compact_art_t *account_art,
-                                      flat_store_t *account_store) {
+                                      flat_store_t *account_store,
+                                      account_meta_pool_t *meta_pool) {
     if (!account_art || !account_store) return NULL;
-
     account_trie_t *at = calloc(1, sizeof(*at));
     if (!at) return NULL;
-
     at->store = account_store;
+    at->meta_pool = meta_pool;
     at->mpt = art_mpt_create(account_art, account_value_encode, at);
-    if (!at->mpt) {
-        free(at);
-        return NULL;
-    }
-
+    if (!at->mpt) { free(at); return NULL; }
     return at;
 }
 
