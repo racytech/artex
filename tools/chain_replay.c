@@ -1231,9 +1231,12 @@ int main(int argc, char **argv) {
                            ss.root_dirty_count);
                     /* art_mpt: no per-commit stats — trie is computed from compact_art */
                 }
-                if (ss.evict_ms > 0.1 || ss.wait_flush_ms > 0.1) {
-                    printf("  └ checkpoint: wait=%.1f ms  evict=%.1f ms\n",
-                           ss.wait_flush_ms, ss.evict_ms);
+                {
+                    double other_ms = win_secs * 1000.0 - ss.exec_ms -
+                                      ss.wait_flush_ms - ss.evict_ms;
+                    printf("  └ exec=%.0fms  root=%.0fms  evict=%.0fms  other=%.0fms\n",
+                           ss.exec_ms, ss.wait_flush_ms, ss.evict_ms,
+                           other_ms > 0 ? other_ms : 0);
                 }
             }
             window_txs = 0;

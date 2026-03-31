@@ -70,8 +70,10 @@ struct sync {
     /* Stats snapshot taken before cache eviction (so callers see useful values) */
     evm_state_stats_t last_stats;
 
-    /* Checkpoint timing (ms) */
+    /* Timing (ms) */
     double last_evict_ms;
+    double exec_ms;        /* cumulative block_execute time per window */
+    double root_ms;        /* compute_mpt_root time this window */
 
 #ifdef ENABLE_HISTORY
     state_history_t *history;
@@ -374,13 +376,18 @@ bool sync_execute_block(sync_t *sync,
 
     uint64_t bn = header->number;
 
-    /* Execute block (block_hashes contains hashes up to block bn-1) */
+    /* Execute block */
+    struct timespec _exec0, _exec1;
+    clock_gettime(CLOCK_MONOTONIC, &_exec0);
     block_result_t br = block_execute(sync->evm, header, body,
                                       sync->block_hashes
 #ifdef ENABLE_HISTORY
                                       , sync->history
 #endif
                                       );
+    clock_gettime(CLOCK_MONOTONIC, &_exec1);
+    sync->exec_ms += (_exec1.tv_sec - _exec0.tv_sec) * 1000.0 +
+                     (_exec1.tv_nsec - _exec0.tv_nsec) / 1e6;
 
     /* Store current block's hash AFTER execution so it doesn't overwrite
      * the hash 256 blocks ago (same ring buffer slot) during execution. */
@@ -429,7 +436,8 @@ bool sync_execute_block(sync_t *sync,
         sync->blocks_fail == 0 &&
         bn % sync->config.checkpoint_interval == 0) {
 
-        /* Validate MPT root at interval boundary */
+        struct timespec _root0, _root1;
+        clock_gettime(CLOCK_MONOTONIC, &_root0);
         hash_t actual_root, expected_root;
         if (!sync_validate_batch_root(sync, &actual_root, &expected_root)) {
             result->ok    = false;
@@ -441,6 +449,9 @@ bool sync_execute_block(sync_t *sync,
             block_result_free(&br);
             return true;
         }
+        clock_gettime(CLOCK_MONOTONIC, &_root1);
+        sync->root_ms = (_root1.tv_sec - _root0.tv_sec) * 1000.0 +
+                         (_root1.tv_nsec - _root0.tv_nsec) / 1e6;
     }
 
     /* Periodic flush + evict (decoupled from validation) */
@@ -557,6 +568,7 @@ static void sync_flush_and_evict(sync_t *sync) {
 
     /* Snapshot stats before eviction clears the cache */
     sync->last_stats = evm_state_get_stats(sync->state);
+    sync->exec_ms = 0; /* reset for next window */
 
     /* Evict cache — root computation captured all dirty data into MPT
      * deferred buffer. Safe to drop cached entries now. */
@@ -603,7 +615,8 @@ evm_state_stats_t sync_get_state_stats(const sync_t *sync) {
     if (!sync) return (evm_state_stats_t){0};
     evm_state_stats_t st = sync->last_stats;
     st.evict_ms = sync->last_evict_ms;
-    st.wait_flush_ms = 0;
+    st.wait_flush_ms = sync->root_ms;  /* reuse field for root timing */
+    st.exec_ms = sync->exec_ms;
     return st;
 }
 

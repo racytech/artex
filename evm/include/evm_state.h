@@ -302,6 +302,7 @@ typedef struct {
     /* Checkpoint timing (filled by sync, not evm_state) */
     double   evict_ms;
     double   wait_flush_ms;
+    double   exec_ms;        /* block_execute time this window (ms) */
 } evm_state_stats_t;
 
 evm_state_stats_t evm_state_get_stats(const evm_state_t *es);

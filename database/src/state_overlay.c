@@ -1097,11 +1097,11 @@ void state_overlay_begin_block(state_overlay_t *so, uint64_t block_number) {
 void state_overlay_commit(state_overlay_t *so) {
     if (!so) return;
 
-    /* Reset slot originals */
-    for (uint32_t i = 0; i < so->slot_meta.capacity; i++) {
+    /* Reset slot originals — iterate only used entries */
+    for (uint32_t i = 0; i < so->next_slot_idx; i++) {
         cached_slot_t *cs = &so->slot_meta.entries[i];
         if (cs->slot_hash.bytes[0] == 0 && cs->slot_hash.bytes[1] == 0 &&
-            !cs->dirty && !cs->block_dirty && !cs->mpt_dirty) continue; /* uninitialized */
+            !cs->dirty && !cs->block_dirty && !cs->mpt_dirty) continue;
         cs->original = cs->current;
         cs->dirty = false;
 #ifdef ENABLE_HISTORY
@@ -1109,11 +1109,11 @@ void state_overlay_commit(state_overlay_t *so) {
 #endif
     }
 
-    /* Promote + reset account flags */
-    for (uint32_t i = 0; i < so->acct_meta.capacity; i++) {
+    /* Promote + reset account flags — iterate only used entries */
+    for (uint32_t i = 0; i < so->next_acct_idx; i++) {
         cached_account_t *ca = &so->acct_meta.entries[i];
         if (ca->addr.bytes[0] == 0 && ca->addr.bytes[1] == 0 &&
-            !ca->dirty && !ca->existed && !ca->created) continue; /* uninitialized */
+            !ca->dirty && !ca->existed && !ca->created) continue;
         bool is_empty = (ca->nonce == 0 && uint256_is_zero(&ca->balance) && !ca->has_code);
         if ((ca->existed || ca->created || ca->dirty || ca->code_dirty) && !is_empty)
             ca->existed = true;
@@ -1452,18 +1452,33 @@ void state_overlay_evict(state_overlay_t *so) {
     }
 
     /* Free code pointers in used portion of meta */
-    for (uint32_t i = 0; i < so->acct_meta.capacity; i++) {
+    for (uint32_t i = 0; i < so->next_acct_idx; i++) {
         if (so->acct_meta.entries[i].code) {
             free(so->acct_meta.entries[i].code);
             so->acct_meta.entries[i].code = NULL;
         }
     }
 
-    /* Reset meta arrays */
-    memset(so->acct_meta.entries, 0,
-           so->acct_meta.capacity * sizeof(cached_account_t));
-    memset(so->slot_meta.entries, 0,
-           so->slot_meta.capacity * sizeof(cached_slot_t));
+    /* Reset and shrink meta arrays back to minimum */
+    {
+        const uint32_t MIN_META_CAP = 4096;
+        if (so->acct_meta.capacity > MIN_META_CAP) {
+            free(so->acct_meta.entries);
+            so->acct_meta.entries = calloc(MIN_META_CAP, sizeof(cached_account_t));
+            so->acct_meta.capacity = MIN_META_CAP;
+        } else {
+            memset(so->acct_meta.entries, 0,
+                   so->acct_meta.capacity * sizeof(cached_account_t));
+        }
+        if (so->slot_meta.capacity > MIN_META_CAP) {
+            free(so->slot_meta.entries);
+            so->slot_meta.entries = calloc(MIN_META_CAP, sizeof(cached_slot_t));
+            so->slot_meta.capacity = MIN_META_CAP;
+        } else {
+            memset(so->slot_meta.entries, 0,
+                   so->slot_meta.capacity * sizeof(cached_slot_t));
+        }
+    }
 
     /* Reset sequential counters (used when no flat_state) */
     so->next_acct_idx = 0;
