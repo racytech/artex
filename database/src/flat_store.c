@@ -889,9 +889,15 @@ void flat_store_flush_deferred(flat_store_t *s,
         if (file_offset == UINT64_MAX) continue;
         memcpy(s->base + FLAT_STORE_HEADER_SIZE + file_offset, e->data, e->slot_size);
 
-        /* Update index to file offset */
+        /* Update leaf value to file offset WITHOUT marking path dirty.
+         * The trie was already hashed correctly before this flush —
+         * we're just persisting the same data to disk. */
         uint8_t *key_ptr = e->data + SLOT_HEADER_SIZE;
-        compact_art_insert(&s->index, key_ptr, &file_offset);
+        const void *leaf_val = compact_art_get(&s->index, key_ptr);
+        if (leaf_val)
+            memcpy((void *)leaf_val, &file_offset, sizeof(file_offset));
+        else
+            compact_art_insert(&s->index, key_ptr, &file_offset);
 
         e->file_offset = file_offset;
         e->dirty = false;
