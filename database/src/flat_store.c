@@ -525,7 +525,11 @@ flat_store_t *flat_store_open(const char *path) {
 
 void flat_store_destroy(flat_store_t *s) {
     if (!s) return;
-    flat_store_flush_deferred(s);
+    { /* Flush + free stale immediately (shutdown — nothing else reads) */
+        flat_store_stale_slot_t *st; size_t sc;
+        flat_store_flush_deferred(s, &st, &sc);
+        flat_store_free_stale_slots(s, st, sc);
+    }
     write_header(s);
     compact_art_destroy(&s->index);
     if (s->base && s->base != MAP_FAILED) {
@@ -696,7 +700,6 @@ bool flat_store_delete(flat_store_t *s, const uint8_t *key) {
     if (offset & OVERLAY_BIT) {
         uint32_t idx = OVERLAY_IDX(offset);
         overlay_entry_t *e = &s->overlay.entries[idx];
-        /* Free old file slot if entry was loaded from disk */
         if (e->file_offset != UINT64_MAX) {
             uint32_t fhdr;
             memcpy(&fhdr, s->base + FLAT_STORE_HEADER_SIZE + e->file_offset,
@@ -834,19 +837,17 @@ uint32_t flat_store_read_leaf_record(const flat_store_t *s,
  * Deferred Buffer — flush to data file
  * ========================================================================= */
 
-void flat_store_flush_deferred(flat_store_t *s) {
+void flat_store_flush_deferred(flat_store_t *s,
+                                flat_store_stale_slot_t **stale_out,
+                                size_t *stale_count_out) {
+    if (stale_out) *stale_out = NULL;
+    if (stale_count_out) *stale_count_out = 0;
     if (!s) return;
     overlay_pool_t *p = &s->overlay;
 
-    /* Collect old file offsets + class indices for deferred free.
-     * We can't free during pass 1 because alloc_slot might reuse a
-     * just-freed slot, overwriting data that another compact_art leaf
-     * still references until its own entry is flushed. */
-    typedef struct { uint64_t offset; uint8_t class_idx; } stale_slot_t;
-    stale_slot_t *stale = NULL;
+    flat_store_stale_slot_t *stale = NULL;
     size_t stale_count = 0, stale_cap = 0;
 
-    /* Pass 1: write all dirty entries to NEW disk slots */
     for (uint32_t i = 0; i < p->high_water; i++) {
         overlay_entry_t *e = &p->entries[i];
         if (!e->occupied || !e->dirty) continue;
@@ -856,11 +857,11 @@ void flat_store_flush_deferred(flat_store_t *s) {
         uint8_t class_idx; uint16_t data_len;
         slot_header_unpack(shdr, &class_idx, &data_len);
 
-        /* Remember old slot for deferred free */
+        /* Collect old slot for deferred free (caller frees after evict) */
         if (e->file_offset != UINT64_MAX) {
             if (stale_count >= stale_cap) {
                 size_t nc = stale_cap ? stale_cap * 2 : 64;
-                stale_slot_t *ns = realloc(stale, nc * sizeof(*ns));
+                flat_store_stale_slot_t *ns = realloc(stale, nc * sizeof(*ns));
                 if (ns) { stale = ns; stale_cap = nc; }
             }
             if (stale_count < stale_cap) {
@@ -869,7 +870,7 @@ void flat_store_flush_deferred(flat_store_t *s) {
                        SLOT_HEADER_SIZE);
                 uint8_t oc; uint16_t ol;
                 slot_header_unpack(old_hdr, &oc, &ol);
-                stale[stale_count++] = (stale_slot_t){ e->file_offset, oc };
+                stale[stale_count++] = (flat_store_stale_slot_t){ e->file_offset, oc };
             }
         }
 
@@ -886,11 +887,17 @@ void flat_store_flush_deferred(flat_store_t *s) {
         e->dirty = false;
     }
 
-    /* Don't free old slots during runtime — freed slots go into the free
-     * list and can be reused by alloc_slot in subsequent flat_store_put
-     * calls, potentially overwriting data that compact_art leaves still
-     * reference. Old slots become dead space and are reclaimed on the
-     * next flat_store_open (startup scan). */
+    if (stale_out) *stale_out = stale;
+    else free(stale);
+    if (stale_count_out) *stale_count_out = stale_count;
+}
+
+void flat_store_free_stale_slots(flat_store_t *s,
+                                  flat_store_stale_slot_t *stale,
+                                  size_t count) {
+    if (!s || !stale) return;
+    for (size_t i = 0; i < count; i++)
+        free_slot(s, stale[i].offset, stale[i].class_idx);
     free(stale);
 }
 
@@ -906,7 +913,9 @@ void flat_store_clear_deferred(flat_store_t *s) {
 
 void flat_store_sync(flat_store_t *s) {
     if (!s) return;
-    flat_store_flush_deferred(s);
+    { flat_store_stale_slot_t *st; size_t sc;
+      flat_store_flush_deferred(s, &st, &sc);
+      flat_store_free_stale_slots(s, st, sc); }
     write_header(s);
 }
 

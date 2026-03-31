@@ -1409,11 +1409,16 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
 void state_overlay_evict(state_overlay_t *so) {
     if (!so) return;
     if (so->flat_state) {
-        /* Flush overlay to disk, then evict clean overlay entries */
-        flat_store_flush_deferred(flat_state_account_store(so->flat_state));
-        flat_store_flush_deferred(flat_state_storage_store(so->flat_state));
-        flat_store_evict_clean(flat_state_account_store(so->flat_state));
-        flat_store_evict_clean(flat_state_storage_store(so->flat_state));
+        flat_store_t *astore = flat_state_account_store(so->flat_state);
+        flat_store_t *sstore = flat_state_storage_store(so->flat_state);
+
+        /* Flush dirty overlay entries to disk */
+        flat_store_flush_deferred(astore, NULL, NULL);
+        flat_store_flush_deferred(sstore, NULL, NULL);
+
+        /* Evict clean overlay entries */
+        flat_store_evict_clean(astore);
+        flat_store_evict_clean(sstore);
     }
 
     /* Free code pointers in used portion of meta */

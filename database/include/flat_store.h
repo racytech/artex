@@ -180,8 +180,21 @@ uint32_t flat_store_overlay_index(const flat_store_t *store, const uint8_t *key)
  * Overlay (in-memory cache)
  * ========================================================================= */
 
-/** Flush dirty overlay entries to disk. Entries stay cached (clean). */
-void flat_store_flush_deferred(flat_store_t *store);
+/** Stale slot collected during flush (old disk location to free later). */
+typedef struct { uint64_t offset; uint8_t class_idx; } flat_store_stale_slot_t;
+
+/** Flush dirty overlay entries to disk. Entries stay cached (clean).
+ *  Collects old disk slots in *stale_out (caller must free).
+ *  Call flat_store_free_stale_slots AFTER evict_clean to reclaim them. */
+void flat_store_flush_deferred(flat_store_t *store,
+                                flat_store_stale_slot_t **stale_out,
+                                size_t *stale_count_out);
+
+/** Free stale slots collected by flush_deferred.
+ *  Safe to call only after evict_clean (no compact_art leaf references them). */
+void flat_store_free_stale_slots(flat_store_t *store,
+                                  flat_store_stale_slot_t *stale,
+                                  size_t count);
 
 /** Drop all overlay entries without flushing. */
 void flat_store_clear_deferred(flat_store_t *store);
