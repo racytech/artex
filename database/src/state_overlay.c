@@ -1189,7 +1189,6 @@ void state_overlay_commit_tx(state_overlay_t *so) {
         if (so->prune_empty && is_empty && (ca->dirty || ca->code_dirty)) {
             ca->existed = false;
             mark_account_mpt_dirty(so, ca);
-
         }
 
         ca->created = false;
@@ -1349,8 +1348,7 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
     }
 
     /* Step 3. Sync dirty slots to flat_state */
-    struct timespec t3a, t3b, t4a, t4b, t5a, t5b;
-    size_t slot_sync_count = 0, stor_root_count = 0, acct_sync_count = 0;
+    struct timespec t3a, t4b, t5a;
     clock_gettime(CLOCK_MONOTONIC, &t3a);
     for (size_t d = 0; d < so->dirty_slots.count; d++) {
         const uint8_t *skey = so->dirty_slots.keys + d * SLOT_KEY_SIZE;
@@ -1361,20 +1359,16 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
         if (ca->storage_cleared && !cs->mpt_dirty) continue;
         sync_slot_to_overlay(so, ca, cs);
         cs->mpt_dirty = false;
-        slot_sync_count++;
     }
     dirty_clear(&so->dirty_slots);
-    clock_gettime(CLOCK_MONOTONIC, &t3b);
 
     /* Step 4. Compute storage roots for storage_dirty accounts */
-    clock_gettime(CLOCK_MONOTONIC, &t4a);
     for (size_t d = 0; d < so->dirty_accounts.count; d++) {
         const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
         cached_account_t *ca = find_account_meta(so, akey);
         if (!ca || !ca->storage_dirty || !ca->existed) continue;
         storage_trie_root(so->storage_trie, ca->addr_hash.bytes,
                            ca->storage_root.bytes);
-        stor_root_count++;
     }
     clock_gettime(CLOCK_MONOTONIC, &t4b);
 
@@ -1385,9 +1379,7 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
         cached_account_t *ca = find_account_meta(so, akey);
         if (!ca || !ca->mpt_dirty || !ca->existed) continue;
         sync_account_to_overlay(so, ca);
-        acct_sync_count++;
     }
-    clock_gettime(CLOCK_MONOTONIC, &t5b);
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
     /* Step 6. Compute account trie root from flat_state */
@@ -1407,21 +1399,10 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
     }
     dirty_clear(&so->dirty_accounts);
 
-    {
-        double slot_sync_ms = (t3b.tv_sec - t3a.tv_sec) * 1000.0 + (t3b.tv_nsec - t3a.tv_nsec) / 1e6;
-        double stor_hash_ms = (t4b.tv_sec - t4a.tv_sec) * 1000.0 + (t4b.tv_nsec - t4a.tv_nsec) / 1e6;
-        double acct_sync_ms = (t5b.tv_sec - t5a.tv_sec) * 1000.0 + (t5b.tv_nsec - t5a.tv_nsec) / 1e6;
-        double acct_hash_ms = (t2.tv_sec - t5b.tv_sec) * 1000.0 + (t2.tv_nsec - t5b.tv_nsec) / 1e6;
-        so->last_root_stor_ms = stor_hash_ms;
-        so->last_root_acct_ms = acct_hash_ms;
-        if (slot_sync_ms + stor_hash_ms + acct_sync_ms + acct_hash_ms > 10.0) {
-            fprintf(stderr, "  ROOT: slot_sync=%.1fms(%zu) stor_hash=%.1fms(%zu) "
-                    "acct_sync=%.1fms(%zu) acct_hash=%.1fms dirty_a=%zu dirty_s=%zu\n",
-                    slot_sync_ms, slot_sync_count, stor_hash_ms, stor_root_count,
-                    acct_sync_ms, acct_sync_count, acct_hash_ms,
-                    so->dirty_accounts.count, dirty_count);
-        }
-    }
+    so->last_root_stor_ms = (t4b.tv_sec - t3a.tv_sec) * 1000.0 +
+                            (t4b.tv_nsec - t3a.tv_nsec) / 1e6;
+    so->last_root_acct_ms = (t2.tv_sec - t5a.tv_sec) * 1000.0 +
+                            (t2.tv_nsec - t5a.tv_nsec) / 1e6;
     so->last_root_dirty_count = dirty_count;
     return root;
 }

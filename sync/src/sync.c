@@ -75,6 +75,8 @@ struct sync {
     double exec_ms;        /* cumulative block_execute time per window */
     double root_ms;        /* compute_mpt_root time this window */
 
+    evm_fork_t prev_fork;  /* fork of previous block (for boundary detection) */
+
 #ifdef ENABLE_HISTORY
     state_history_t *history;
 #endif
@@ -430,6 +432,20 @@ bool sync_execute_block(sync_t *sync,
     sync->total_gas += br.gas_used;
     sync->last_block = bn;
 
+    /* Force checkpoint at fork boundaries (e.g., Spurious Dragon) so that
+     * accounts touched pre-fork are committed with the correct prune_empty.
+     * Without this, the checkpoint-time prune_empty (from the last block)
+     * would be applied to ALL accounts in the window, including pre-fork ones. */
+    if (sync->prev_fork < FORK_SPURIOUS_DRAGON &&
+        sync->evm->fork >= FORK_SPURIOUS_DRAGON) {
+        /* SD boundary crossed mid-window — flush pre-SD state with
+         * prune_empty=false so empty accounts touched before this block
+         * are not incorrectly pruned at the next checkpoint. */
+        evm_state_compute_mpt_root(sync->state, false);
+        sync_flush_and_evict(sync);
+    }
+    sync->prev_fork = sync->evm->fork;
+
     /* Periodic root validation */
     if (result->ok &&
         sync->config.checkpoint_interval > 0 &&
@@ -568,6 +584,7 @@ static void sync_flush_and_evict(sync_t *sync) {
 
     /* Snapshot stats before eviction clears the cache */
     sync->last_stats = evm_state_get_stats(sync->state);
+    sync->last_stats.exec_ms = sync->exec_ms; /* save before reset */
     sync->exec_ms = 0; /* reset for next window */
 
     /* Evict cache — root computation captured all dirty data into MPT
@@ -615,8 +632,8 @@ evm_state_stats_t sync_get_state_stats(const sync_t *sync) {
     if (!sync) return (evm_state_stats_t){0};
     evm_state_stats_t st = sync->last_stats;
     st.evict_ms = sync->last_evict_ms;
-    st.wait_flush_ms = sync->root_ms;  /* reuse field for root timing */
-    st.exec_ms = sync->exec_ms;
+    st.wait_flush_ms = sync->root_ms;
+    /* exec_ms already saved in last_stats by sync_flush_and_evict */
     return st;
 }
 
