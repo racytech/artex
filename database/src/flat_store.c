@@ -700,28 +700,22 @@ bool flat_store_delete(flat_store_t *s, const uint8_t *key) {
     if (offset & OVERLAY_BIT) {
         uint32_t idx = OVERLAY_IDX(offset);
         overlay_entry_t *e = &s->overlay.entries[idx];
-        /* Mark old disk slot as free (header only, no free list) */
         if (e->file_offset != UINT64_MAX) {
             uint32_t fhdr;
             memcpy(&fhdr, s->base + FLAT_STORE_HEADER_SIZE + e->file_offset,
                    SLOT_HEADER_SIZE);
             uint8_t fc; uint16_t fl;
             slot_header_unpack(fhdr, &fc, &fl);
-            uint32_t free_hdr = slot_header_pack(fc, 0);
-            memcpy(s->base + FLAT_STORE_HEADER_SIZE + e->file_offset,
-                   &free_hdr, SLOT_HEADER_SIZE);
+            free_slot(s, e->file_offset, fc);
         }
         lru_remove(&s->overlay, idx);
         overlay_release(&s->overlay, idx);
     } else {
-        /* Mark disk slot as free (header only, no free list) */
         uint32_t shdr;
         memcpy(&shdr, s->base + FLAT_STORE_HEADER_SIZE + offset, SLOT_HEADER_SIZE);
         uint8_t class_idx; uint16_t data_len;
         slot_header_unpack(shdr, &class_idx, &data_len);
-        uint32_t free_hdr = slot_header_pack(class_idx, 0);
-        memcpy(s->base + FLAT_STORE_HEADER_SIZE + offset,
-               &free_hdr, SLOT_HEADER_SIZE);
+        free_slot(s, offset, class_idx);
     }
     return true;
 }
@@ -851,6 +845,16 @@ void flat_store_flush_deferred(flat_store_t *s,
     if (!s) return;
     overlay_pool_t *p = &s->overlay;
 
+    /* Save and clear free lists so alloc_slot only allocates from
+     * the end of the file. This prevents stale offsets (which are
+     * still valid data until we finish the flush) from being reused
+     * by alloc_slot for new entries within the same flush pass. */
+    uint32_t saved_counts[MAX_SIZE_CLASSES];
+    for (int c = 0; c < s->num_classes; c++) {
+        saved_counts[c] = s->free_lists[c].count;
+        s->free_lists[c].count = 0;
+    }
+
     flat_store_stale_slot_t *stale = NULL;
     size_t stale_count = 0, stale_cap = 0;
 
@@ -863,7 +867,7 @@ void flat_store_flush_deferred(flat_store_t *s,
         uint8_t class_idx; uint16_t data_len;
         slot_header_unpack(shdr, &class_idx, &data_len);
 
-        /* Collect old slot for deferred free (caller frees after evict) */
+        /* Collect old slot for deferred free */
         if (e->file_offset != UINT64_MAX) {
             if (stale_count >= stale_cap) {
                 size_t nc = stale_cap ? stale_cap * 2 : 64;
@@ -880,7 +884,7 @@ void flat_store_flush_deferred(flat_store_t *s,
             }
         }
 
-        /* Write to new disk slot */
+        /* Write to new disk slot (allocates from end of file only) */
         uint64_t file_offset = alloc_slot(s, class_idx);
         if (file_offset == UINT64_MAX) continue;
         memcpy(s->base + FLAT_STORE_HEADER_SIZE + file_offset, e->data, e->slot_size);
@@ -893,6 +897,10 @@ void flat_store_flush_deferred(flat_store_t *s,
         e->dirty = false;
     }
 
+    /* Restore free lists + add stale slots for future reuse */
+    for (int c = 0; c < s->num_classes; c++)
+        s->free_lists[c].count = saved_counts[c];
+
     if (stale_out) *stale_out = stale;
     else free(stale);
     if (stale_count_out) *stale_count_out = stale_count;
@@ -902,15 +910,8 @@ void flat_store_free_stale_slots(flat_store_t *s,
                                   flat_store_stale_slot_t *stale,
                                   size_t count) {
     if (!s || !stale) { free(stale); return; }
-    for (size_t i = 0; i < count; i++) {
-        /* Mark slot as free on disk (data_len=0) but do NOT add to the
-         * free list. This prevents alloc_slot from reusing the slot during
-         * this session. The slot is reclaimed on the next flat_store_open
-         * (startup scan rebuilds free lists from disk headers). */
-        uint32_t free_hdr = slot_header_pack(stale[i].class_idx, 0);
-        memcpy(s->base + FLAT_STORE_HEADER_SIZE + stale[i].offset,
-               &free_hdr, SLOT_HEADER_SIZE);
-    }
+    for (size_t i = 0; i < count; i++)
+        free_slot(s, stale[i].offset, stale[i].class_idx);
     free(stale);
 }
 
