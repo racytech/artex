@@ -838,6 +838,15 @@ void flat_store_flush_deferred(flat_store_t *s) {
     if (!s) return;
     overlay_pool_t *p = &s->overlay;
 
+    /* Collect old file offsets + class indices for deferred free.
+     * We can't free during pass 1 because alloc_slot might reuse a
+     * just-freed slot, overwriting data that another compact_art leaf
+     * still references until its own entry is flushed. */
+    typedef struct { uint64_t offset; uint8_t class_idx; } stale_slot_t;
+    stale_slot_t *stale = NULL;
+    size_t stale_count = 0, stale_cap = 0;
+
+    /* Pass 1: write all dirty entries to NEW disk slots */
     for (uint32_t i = 0; i < p->high_water; i++) {
         overlay_entry_t *e = &p->entries[i];
         if (!e->occupied || !e->dirty) continue;
@@ -847,14 +856,24 @@ void flat_store_flush_deferred(flat_store_t *s) {
         uint8_t class_idx; uint16_t data_len;
         slot_header_unpack(shdr, &class_idx, &data_len);
 
-        /* NOTE: Do NOT free old file slots during flush.
-         * free_slot + alloc_slot in the same loop can reuse a just-freed
-         * slot for a different entry, overwriting data that other
-         * compact_art leaves still reference. Old slots become dead space
-         * (leaked) but correctness is preserved. They are reclaimed on
-         * the next flat_store_open scan. */
+        /* Remember old slot for deferred free */
+        if (e->file_offset != UINT64_MAX) {
+            if (stale_count >= stale_cap) {
+                size_t nc = stale_cap ? stale_cap * 2 : 64;
+                stale_slot_t *ns = realloc(stale, nc * sizeof(*ns));
+                if (ns) { stale = ns; stale_cap = nc; }
+            }
+            if (stale_count < stale_cap) {
+                uint32_t old_hdr;
+                memcpy(&old_hdr, s->base + FLAT_STORE_HEADER_SIZE + e->file_offset,
+                       SLOT_HEADER_SIZE);
+                uint8_t oc; uint16_t ol;
+                slot_header_unpack(old_hdr, &oc, &ol);
+                stale[stale_count++] = (stale_slot_t){ e->file_offset, oc };
+            }
+        }
 
-        /* Write to disk */
+        /* Write to new disk slot */
         uint64_t file_offset = alloc_slot(s, class_idx);
         if (file_offset == UINT64_MAX) continue;
         memcpy(s->base + FLAT_STORE_HEADER_SIZE + file_offset, e->data, e->slot_size);
@@ -866,6 +885,13 @@ void flat_store_flush_deferred(flat_store_t *s) {
         e->file_offset = file_offset;
         e->dirty = false;
     }
+
+    /* Don't free old slots during runtime — freed slots go into the free
+     * list and can be reused by alloc_slot in subsequent flat_store_put
+     * calls, potentially overwriting data that compact_art leaves still
+     * reference. Old slots become dead space and are reclaimed on the
+     * next flat_store_open (startup scan). */
+    free(stale);
 }
 
 void flat_store_clear_deferred(flat_store_t *s) {
