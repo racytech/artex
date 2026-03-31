@@ -15,6 +15,9 @@
  */
 
 #include "evm_state.h"
+#include "evm.h"
+#include "transaction.h"
+#include "fork.h"
 #include "flat_state.h"
 #include "flat_store.h"
 #include "compact_art.h"
@@ -639,6 +642,243 @@ static void test_eip161_pruning(void) {
 }
 
 /* =========================================================================
+ * Test 11: Full transaction_execute path — simple ETH transfer
+ * Exercises the exact code path used by chain_replay / block_executor
+ * ========================================================================= */
+
+static void test_transaction_execute_transfer(void) {
+    printf("test_transaction_execute_transfer:\n");
+    test_ctx_t ctx = make_ctx();
+    CHECK(ctx.es && ctx.fs, "create state");
+
+    /* Create EVM instance with Frontier config (pre-EIP-155, pre-EIP-161) */
+    evm_t *evm = evm_create(ctx.es, chain_config_mainnet());
+    CHECK(evm != NULL, "create evm");
+
+    /* Genesis: sender with 100 ETH, some other accounts */
+    address_t sender = make_addr(0xAA, 0x01);
+    address_t recipient = make_addr(0xBB, 0x01);
+    address_t coinbase = make_addr(0xCC, 0x01);
+
+    uint256_t hundred_eth = uint256_from_uint64(100);
+    uint256_t one_eth_factor = uint256_from_uint64(1000000000000000000ULL);
+    hundred_eth = uint256_mul(&hundred_eth, &one_eth_factor);
+
+    evm_state_set_balance(ctx.es, &sender, &hundred_eth);
+    evm_state_mark_existed(ctx.es, &sender);
+
+    /* Add some other genesis accounts to make the trie non-trivial */
+    for (int i = 0; i < 50; i++) {
+        address_t a = make_addr(0x10, (uint8_t)i);
+        uint256_t bal = uint256_from_uint64(1000000000ULL + i);
+        evm_state_set_balance(ctx.es, &a, &bal);
+        evm_state_mark_existed(ctx.es, &a);
+    }
+
+    evm_state_commit(ctx.es);
+    hash_t genesis_root = compute_root(ctx.es, false);
+    evm_state_clear_prestate_dirty(ctx.es);
+
+    /* Set block environment (Frontier era — block 46242 equivalent) */
+    evm_block_env_t block_env = {
+        .number = 100,
+        .timestamp = 1438870000,
+        .gas_limit = 22000,
+        .difficulty = uint256_from_uint64(0x1545be7224dULL),
+        .coinbase = coinbase,
+        .base_fee = uint256_from_uint64(0),
+    };
+    evm_set_block_env(evm, &block_env);
+
+    /* Commit at block start (as block_executor does) */
+    evm_state_set_prune_empty(ctx.es, false); /* Frontier: no EIP-161 */
+    evm_state_commit(ctx.es);
+    evm_state_begin_block(ctx.es, 100);
+
+    /* Build a simple ETH transfer transaction */
+    transaction_t tx = {
+        .type = TX_TYPE_LEGACY,
+        .nonce = 0,
+        .sender = sender,
+        .to = recipient,
+        .value = one_eth_factor,  /* 1 ETH */
+        .gas_limit = 21000,
+        .gas_price = uint256_from_uint64(50000000000ULL), /* 50 Gwei */
+        .data = NULL,
+        .data_size = 0,
+        .is_create = false,
+        .access_list = NULL,
+        .access_list_count = 0,
+        .max_fee_per_blob_gas = {0},
+        .blob_versioned_hashes = NULL,
+        .blob_versioned_hashes_count = 0,
+        .authorization_list = NULL,
+        .authorization_list_count = 0,
+    };
+
+    block_env_t tx_block_env = {
+        .coinbase = coinbase,
+        .block_number = 100,
+        .timestamp = 1438870000,
+        .gas_limit = 22000,
+        .difficulty = uint256_from_uint64(0x1545be7224dULL),
+        .base_fee = uint256_from_uint64(0),
+        .skip_coinbase_payment = false,
+    };
+
+    /* Execute transaction */
+    transaction_result_t result;
+    bool ok = transaction_execute(evm, &tx, &tx_block_env, &result);
+    CHECK(ok, "transaction_execute succeeded");
+    CHECK(result.status == EVM_SUCCESS, "tx status is SUCCESS");
+    CHECK(result.gas_used == 21000, "gas used is 21000");
+    transaction_result_free(&result);
+
+    /* commit_tx (as block_executor does after each tx) */
+    evm_state_commit_tx(ctx.es);
+
+    /* Add block reward (5 ETH, Frontier era) */
+    uint256_t five_eth = uint256_from_uint64(5);
+    five_eth = uint256_mul(&five_eth, &one_eth_factor);
+    evm_state_add_balance(ctx.es, &coinbase, &five_eth);
+
+    /* Compute root — this is what chain_replay does */
+    hash_t root = compute_root(ctx.es, false);
+    hash_t full = compute_root_full(&ctx, false);
+
+    CHECK(!roots_match(root, genesis_root), "root changed after tx");
+    if (!roots_match(root, full)) {
+        fprintf(stderr, "  TRANSACTION EXECUTE: MISMATCH\n");
+        print_hash("incremental", root);
+        print_hash("full", full);
+    }
+    CHECK(roots_match(root, full), "incremental == full after transaction_execute");
+
+    /* Verify account states */
+    uint256_t sender_bal = evm_state_get_balance(ctx.es, &sender);
+    uint256_t recip_bal = evm_state_get_balance(ctx.es, &recipient);
+    uint64_t sender_nonce = evm_state_get_nonce(ctx.es, &sender);
+
+    CHECK(sender_nonce == 1, "sender nonce incremented");
+    CHECK(!uint256_is_zero(&recip_bal), "recipient received ETH");
+
+    /* Gas cost = 21000 * 50 Gwei = 1,050,000 Gwei = 0.00105 ETH */
+    /* Sender should have: 100 - 1 - 0.00105 = 98.99895 ETH */
+    /* Recipient should have: 1 ETH */
+    CHECK(uint256_eq(&recip_bal, &one_eth_factor), "recipient has 1 ETH");
+
+    evm_destroy(evm);
+    PASS("transaction_execute transfer");
+    free_ctx(&ctx);
+}
+
+/* =========================================================================
+ * Test 12: Multiple tx blocks with transaction_execute + evict
+ * Full chain_replay simulation
+ * ========================================================================= */
+
+static void test_multi_tx_blocks_with_evict(void) {
+    printf("test_multi_tx_blocks_with_evict:\n");
+    test_ctx_t ctx = make_ctx();
+    CHECK(ctx.es && ctx.fs, "create state");
+
+    evm_t *evm = evm_create(ctx.es, chain_config_mainnet());
+    CHECK(evm != NULL, "create evm");
+
+    /* Genesis: 100 funded accounts */
+    uint256_t one_eth = uint256_from_uint64(1000000000000000000ULL);
+    uint256_t init_bal = uint256_from_uint64(1000);
+    init_bal = uint256_mul(&init_bal, &one_eth); /* 1000 ETH each */
+
+    for (int i = 0; i < 100; i++) {
+        address_t a = make_addr(0x10, (uint8_t)i);
+        evm_state_set_balance(ctx.es, &a, &init_bal);
+        evm_state_mark_existed(ctx.es, &a);
+    }
+    evm_state_commit(ctx.es);
+    compute_root(ctx.es, false);
+    evm_state_clear_prestate_dirty(ctx.es);
+
+    /* Simulate 30 blocks: some empty, some with 1 tx */
+    for (int blk = 1; blk <= 30; blk++) {
+        address_t coinbase = make_addr(0xCC, (uint8_t)blk);
+
+        evm_block_env_t block_env = {
+            .number = blk,
+            .timestamp = 1438870000 + blk * 15,
+            .gas_limit = 5000000,
+            .difficulty = uint256_from_uint64(0x1545be7224dULL),
+            .coinbase = coinbase,
+            .base_fee = uint256_from_uint64(0),
+        };
+        evm_set_block_env(evm, &block_env);
+
+        evm_state_set_prune_empty(ctx.es, false);
+        evm_state_commit(ctx.es);
+        evm_state_begin_block(ctx.es, blk);
+
+        /* Every 3rd block has a transaction */
+        if (blk % 3 == 0) {
+            address_t sender = make_addr(0x10, (uint8_t)((blk / 3) % 100));
+            address_t recipient = make_addr(0xDD, (uint8_t)blk);
+            uint64_t sender_nonce = evm_state_get_nonce(ctx.es, &sender);
+
+            transaction_t tx = {
+                .type = TX_TYPE_LEGACY,
+                .nonce = sender_nonce,
+                .sender = sender,
+                .to = recipient,
+                .value = one_eth, /* 1 ETH */
+                .gas_limit = 21000,
+                .gas_price = uint256_from_uint64(20000000000ULL), /* 20 Gwei */
+                .data = NULL,
+                .data_size = 0,
+                .is_create = false,
+            };
+
+            block_env_t tx_env = {
+                .coinbase = coinbase,
+                .block_number = blk,
+                .timestamp = 1438870000 + blk * 15,
+                .gas_limit = 5000000,
+                .difficulty = uint256_from_uint64(0x1545be7224dULL),
+                .base_fee = uint256_from_uint64(0),
+                .skip_coinbase_payment = false,
+            };
+
+            transaction_result_t result;
+            bool ok = transaction_execute(evm, &tx, &tx_env, &result);
+            if (ok) transaction_result_free(&result);
+            evm_state_commit_tx(ctx.es);
+        }
+
+        /* Block reward */
+        uint256_t five_eth = uint256_from_uint64(5);
+        five_eth = uint256_mul(&five_eth, &one_eth);
+        evm_state_add_balance(ctx.es, &coinbase, &five_eth);
+
+        hash_t root = compute_root(ctx.es, false);
+        hash_t full = compute_root_full(&ctx, false);
+
+        if (!roots_match(root, full)) {
+            fprintf(stderr, "  Block %d: MISMATCH\n", blk);
+            print_hash("incremental", root);
+            print_hash("full", full);
+            evm_destroy(evm);
+            CHECK(false, "incremental == full in multi-tx simulation");
+        }
+
+        /* Evict every 10 blocks */
+        if (blk % 10 == 0)
+            evm_state_evict_cache(ctx.es);
+    }
+
+    evm_destroy(evm);
+    PASS("multi-tx blocks with evict (30 blocks)");
+    free_ctx(&ctx);
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -655,6 +895,8 @@ int main(void) {
     test_large_genesis_then_tx();
     test_self_destruct();
     test_eip161_pruning();
+    test_transaction_execute_transfer();
+    test_multi_tx_blocks_with_evict();
 
     printf("\n=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);
