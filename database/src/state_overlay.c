@@ -1115,7 +1115,8 @@ void state_overlay_commit(state_overlay_t *so) {
         if (ca->addr.bytes[0] == 0 && ca->addr.bytes[1] == 0 &&
             !ca->dirty && !ca->existed && !ca->created) continue;
         bool is_empty = (ca->nonce == 0 && uint256_is_zero(&ca->balance) && !ca->has_code);
-        if ((ca->existed || ca->created || ca->dirty || ca->code_dirty) && !is_empty)
+        bool touched = (ca->existed || ca->created || ca->dirty || ca->code_dirty);
+        if (touched && (!is_empty || !so->prune_empty))
             ca->existed = true;
         ca->created = false;
         ca->dirty = false;
@@ -1183,7 +1184,8 @@ void state_overlay_commit_tx(state_overlay_t *so) {
         }
 
         bool is_empty = (ca->nonce == 0 && uint256_is_zero(&ca->balance) && !ca->has_code);
-        if ((ca->existed || ca->created || ca->dirty || ca->code_dirty) && !is_empty)
+        bool touched = (ca->existed || ca->created || ca->dirty || ca->code_dirty);
+        if (touched && (!is_empty || !so->prune_empty))
             ca->existed = true;
 
         if (so->prune_empty && is_empty && (ca->dirty || ca->code_dirty)) {
@@ -1319,7 +1321,12 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
     size_t dirty_count = so->dirty_accounts.count;
 
-    /* Step 1. Promote existed on dirty accounts */
+    /* Step 1. Promote existed on dirty accounts.
+     * commit_tx handles per-block EIP-161 decisions (using the correct
+     * per-block prune_empty). Here we promote any remaining non-empty
+     * dirty accounts (e.g., block reward coinbase) and handle
+     * self-destructed accounts. We do NOT re-evaluate prune_empty here
+     * because commit_tx already made the per-block decision. */
     for (size_t d = 0; d < so->dirty_accounts.count; d++) {
         const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
         cached_account_t *ca = find_account_meta(so, akey);
@@ -1330,8 +1337,11 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
             } else {
                 bool is_empty = (ca->nonce == 0 &&
                                  uint256_is_zero(&ca->balance) && !ca->has_code);
-                if (!(!ca->existed && !ca->created && is_empty && prune_empty))
+                if (!is_empty)
                     ca->existed = true;
+                /* Empty accounts: trust commit_tx's decision.
+                 * If existed was set by commit_tx (pre-SD), keep it.
+                 * If existed was cleared by commit_tx (post-SD prune), keep it. */
             }
         }
     }

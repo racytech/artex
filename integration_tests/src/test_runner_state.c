@@ -353,12 +353,14 @@ bool test_runner_run_state_test(test_runner_t *runner,
 
             transaction_result_free(&tx_result);
 
+            // EIP-161 (Spurious Dragon+): prune empty accounts
+            bool prune_empty = (runner->evm->fork >= FORK_SPURIOUS_DRAGON);
+            evm_state_set_prune_empty(runner->state, prune_empty);
+
             // Commit transaction state (sets existed flags, processes self-destructs)
             evm_state_commit_tx(runner->state);
 
             // Verify state root
-            // EIP-161 (Spurious Dragon+): prune empty accounts from state trie
-            bool prune_empty = (runner->evm->fork >= FORK_SPURIOUS_DRAGON);
             hash_t actual_root = evm_state_compute_mpt_root(runner->state, prune_empty);
             if (!hash_equals(&actual_root, &post_cond->state_root)) {
                 result->status = TEST_FAIL;

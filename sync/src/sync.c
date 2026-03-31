@@ -74,8 +74,7 @@ struct sync {
     double last_evict_ms;
     double exec_ms;        /* cumulative block_execute time per window */
     double root_ms;        /* compute_mpt_root time this window */
-
-    evm_fork_t prev_fork;  /* fork of previous block (for boundary detection) */
+    evm_fork_t prev_fork;  /* for SD boundary detection */
 
 #ifdef ENABLE_HISTORY
     state_history_t *history;
@@ -378,6 +377,24 @@ bool sync_execute_block(sync_t *sync,
 
     uint64_t bn = header->number;
 
+    /* Detect fork transition BEFORE execution. If Spurious Dragon
+     * activates at this block, flush pre-SD state first so that
+     * accounts touched pre-fork are not re-evaluated with post-fork
+     * prune_empty by compute_mpt_root. */
+    {
+        evm_fork_t upcoming_fork = fork_get_active(header->number,
+            header->timestamp, sync->evm->chain_config);
+        if (sync->prev_fork < FORK_SPURIOUS_DRAGON &&
+            upcoming_fork >= FORK_SPURIOUS_DRAGON) {
+            fprintf(stderr, "SD BOUNDARY: block %lu prev_fork=%d upcoming=%d — flushing pre-SD state\n",
+                    bn, sync->prev_fork, upcoming_fork);
+            evm_state_compute_mpt_root(sync->state, false);
+            sync->batch_root_computed = true;
+            sync_flush_and_evict(sync);
+        }
+        sync->prev_fork = upcoming_fork;
+    }
+
     /* Execute block */
     struct timespec _exec0, _exec1;
     clock_gettime(CLOCK_MONOTONIC, &_exec0);
@@ -432,19 +449,7 @@ bool sync_execute_block(sync_t *sync,
     sync->total_gas += br.gas_used;
     sync->last_block = bn;
 
-    /* Force checkpoint at fork boundaries (e.g., Spurious Dragon) so that
-     * accounts touched pre-fork are committed with the correct prune_empty.
-     * Without this, the checkpoint-time prune_empty (from the last block)
-     * would be applied to ALL accounts in the window, including pre-fork ones. */
-    if (sync->prev_fork < FORK_SPURIOUS_DRAGON &&
-        sync->evm->fork >= FORK_SPURIOUS_DRAGON) {
-        /* SD boundary crossed mid-window — flush pre-SD state with
-         * prune_empty=false so empty accounts touched before this block
-         * are not incorrectly pruned at the next checkpoint. */
-        evm_state_compute_mpt_root(sync->state, false);
-        sync_flush_and_evict(sync);
-    }
-    sync->prev_fork = sync->evm->fork;
+    /* Fork boundary checkpoint handled pre-execution above */
 
     /* Periodic root validation */
     if (result->ok &&

@@ -887,12 +887,8 @@ void flat_store_flush_deferred(flat_store_t *s,
         /* Write to new disk slot (allocates from end of file only) */
         uint64_t file_offset = alloc_slot(s, class_idx);
         if (file_offset == UINT64_MAX) continue;
-        if (!e->data || FLAT_STORE_HEADER_SIZE + file_offset + e->slot_size > s->mapped_size) {
-            fprintf(stderr, "FLUSH: bad entry i=%u data=%p offset=%lu slot_size=%u mapped=%zu\n",
-                    i, (void*)e->data, file_offset, e->slot_size, s->mapped_size);
-            continue;
-        }
-        memcpy(s->base + FLAT_STORE_HEADER_SIZE + file_offset, e->data, e->slot_size);
+        uint32_t write_size = s->slot_sizes[class_idx];
+        memcpy(s->base + FLAT_STORE_HEADER_SIZE + file_offset, e->data, write_size);
 
         /* Update leaf value to file offset WITHOUT marking path dirty.
          * The trie was already hashed correctly before this flush —

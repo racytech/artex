@@ -364,6 +364,8 @@ static int run_statetest_file(const char *filepath, const statetest_args_t *args
                     gas_used = tx_result.gas_used;
                     tx_pass = true;
                     transaction_result_free(&tx_result);
+                    bool prune = (evm->fork >= FORK_SPURIOUS_DRAGON);
+                    evm_state_set_prune_empty(state, prune);
                     evm_state_commit_tx(state);
                 }
             }
