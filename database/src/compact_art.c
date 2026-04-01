@@ -49,14 +49,22 @@ static bool pool_init(compact_pool_t *pool, size_t reserve_bytes) {
     pool->base = mem;
     pool->reserved = reserve_bytes;
     pool->used = 0;
+    pool->arena_owned = false;
     return true;
 }
 
+static void pool_init_from_mem(compact_pool_t *pool, void *mem, size_t size) {
+    pool->base = mem;
+    pool->reserved = size;
+    pool->used = 0;
+    pool->arena_owned = true;
+}
+
 static void pool_destroy(compact_pool_t *pool) {
-    if (pool->base) {
+    if (pool->base && !pool->arena_owned) {
         munmap(pool->base, pool->reserved);
-        pool->base = NULL;
     }
+    pool->base = NULL;
     pool->reserved = 0;
     pool->used = 0;
 }
@@ -1207,6 +1215,32 @@ bool compact_art_init(compact_art_t *tree, uint32_t key_size,
     return compact_art_init_ex(tree, key_size, value_size, compact_leaves,
                                 key_fetch, key_fetch_ctx,
                                 COMPACT_NODE_POOL_RESERVE, leaf_reserve);
+}
+
+bool compact_art_init_arena(compact_art_t *tree, uint32_t key_size, uint32_t value_size,
+                             bool compact_leaves,
+                             compact_art_key_fetch_t key_fetch, void *key_fetch_ctx,
+                             void *node_mem, size_t node_size,
+                             void *leaf_mem, size_t leaf_size) {
+    if (!tree || key_size == 0 || !node_mem || !leaf_mem) return false;
+
+    memset(tree, 0, sizeof(*tree));
+    tree->root = COMPACT_REF_NULL;
+    tree->size = 0;
+    tree->key_size = key_size;
+    tree->value_size = value_size;
+    tree->leaf_key_size = compact_leaves ? 8 : key_size;
+    tree->leaf_size = tree->leaf_key_size + value_size;
+    tree->leaf_count = 0;
+    tree->key_fetch = key_fetch;
+    tree->key_fetch_ctx = key_fetch_ctx;
+
+    pool_init_from_mem(&tree->nodes, node_mem, node_size);
+    tree->nodes.used = 8; /* skip offset 0 so ref=0 means NULL */
+
+    pool_init_from_mem(&tree->leaves, leaf_mem, leaf_size);
+
+    return true;
 }
 
 void compact_art_destroy(compact_art_t *tree) {

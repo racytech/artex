@@ -30,6 +30,7 @@ typedef struct {
     uint8_t *base;
     size_t reserved;    // virtual bytes (MAP_NORESERVE)
     size_t used;        // committed bytes
+    bool   arena_owned; // if true, base is owned by an external arena — don't munmap
 } compact_pool_t;
 
 // ============================================================================
@@ -219,7 +220,20 @@ bool compact_art_init_ex(compact_art_t *tree, uint32_t key_size, uint32_t value_
                           size_t node_reserve, size_t leaf_reserve);
 
 /**
+ * Initialize with pools backed by an external arena.
+ * node_mem / leaf_mem: pre-allocated regions from arena_alloc().
+ * The tree does NOT own this memory — compact_art_destroy will not free it.
+ */
+struct arena;
+bool compact_art_init_arena(compact_art_t *tree, uint32_t key_size, uint32_t value_size,
+                             bool compact_leaves,
+                             compact_art_key_fetch_t key_fetch, void *key_fetch_ctx,
+                             void *node_mem, size_t node_size,
+                             void *leaf_mem, size_t leaf_size);
+
+/**
  * Destroy the tree and free all pool memory.
+ * If arena-backed, does NOT free the pool memory (arena owns it).
  */
 void compact_art_destroy(compact_art_t *tree);
 

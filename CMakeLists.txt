@@ -52,6 +52,10 @@ add_library(art_database STATIC
 # Disk Table (mmap-backed hash table optimized for pre-hashed keys)
 add_library(disk_table STATIC database/src/disk_table.c)
 
+# Arena (bump allocator for per-account storage)
+add_library(arena STATIC database/src/arena.c)
+target_include_directories(arena PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+
 # Compact ART (in-memory index for flat_store)
 add_library(compact_art STATIC database/src/compact_art.c)
 
@@ -321,7 +325,7 @@ target_link_libraries(test_state_overlay_stress evm)
 add_test(NAME test_state_overlay_stress COMMAND test_state_overlay_stress)
 
 add_executable(test_art_mpt_fuzz database/tests/test_art_mpt_fuzz.c)
-target_link_libraries(test_art_mpt_fuzz art_mpt compact_art common)
+target_link_libraries(test_art_mpt_fuzz art_mpt compact_art arena common)
 add_test(NAME test_art_mpt_fuzz COMMAND test_art_mpt_fuzz)
 
 add_executable(test_flat_state_roundtrip
@@ -329,6 +333,11 @@ add_executable(test_flat_state_roundtrip
 )
 target_link_libraries(test_flat_state_roundtrip evm)
 add_test(NAME test_flat_state_roundtrip COMMAND test_flat_state_roundtrip)
+
+# Test: Arena allocator
+add_executable(test_arena database/tests/test_arena.c)
+target_link_libraries(test_arena arena)
+add_test(NAME test_arena COMMAND test_arena)
 
 # Test: ART→MPT cross-validation against Python reference vectors
 add_executable(test_art_mpt_vectors database/tests/test_art_mpt_vectors.c)

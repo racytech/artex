@@ -20,7 +20,7 @@
 
 #include "art_mpt.h"
 #include "compact_art.h"
-/* No keccak needed — we generate random keys directly */
+#include "arena.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -732,6 +732,77 @@ static void test_small_pool(void) {
 }
 
 /* =========================================================================
+ * Test 10: Arena-backed compact_art — per-account storage simulation
+ *
+ * Creates compact_arts backed by a shared arena, verifies MPT hashes,
+ * then resets the arena and repeats (simulating checkpoint windows).
+ * ========================================================================= */
+
+static void test_arena_backed(void) {
+    printf("test_arena_backed:\n");
+    rng_seed(88888);
+
+    arena_t arena;
+    CHECK(arena_init(&arena, 64 * 1024 * 1024), "init arena 64MB");
+
+    #define NODE_SLICE (256 * 1024)  /* 256 KB per account nodes */
+    #define LEAF_SLICE (512 * 1024)  /* 512 KB per account leaves */
+    #define NUM_ACCTS  50
+
+    /* Simulate 10 checkpoint windows */
+    for (int window = 0; window < 10; window++) {
+        compact_art_t trees[NUM_ACCTS];
+        art_mpt_t *mpts[NUM_ACCTS];
+
+        /* Create per-account arts from arena */
+        for (int a = 0; a < NUM_ACCTS; a++) {
+            void *nmem = arena_alloc(&arena, NODE_SLICE);
+            void *lmem = arena_alloc(&arena, LEAF_SLICE);
+            CHECK(nmem && lmem, "arena alloc window=%d acct=%d", window, a);
+
+            bool ok = compact_art_init_arena(&trees[a], 32, sizeof(leaf_val_t) + 64,
+                                              false, NULL, NULL,
+                                              nmem, NODE_SLICE, lmem, LEAF_SLICE);
+            CHECK(ok, "init arena tree");
+            mpts[a] = art_mpt_create(&trees[a], fuzz_encode, NULL);
+            CHECK(mpts[a], "create mpt");
+        }
+
+        /* Insert random data per account (10-100 slots each) */
+        for (int a = 0; a < NUM_ACCTS; a++) {
+            int n = 10 + rng_range(91);
+            for (int i = 0; i < n; i++) {
+                uint8_t key[32];
+                rng_bytes(key, 32);
+                leaf_val_t *v = make_value(1 + rng_range(32));
+                compact_art_insert(&trees[a], key, v);
+                free(v);
+            }
+
+            if (!verify_roots(&trees[a], mpts[a], window * 100 + a, "arena tree")) {
+                tests_failed++;
+                for (int j = 0; j < NUM_ACCTS; j++) {
+                    art_mpt_destroy(mpts[j]);
+                    compact_art_destroy(&trees[j]);
+                }
+                arena_destroy(&arena);
+                return;
+            }
+        }
+
+        /* Destroy arts and reset arena (simulate eviction) */
+        for (int a = 0; a < NUM_ACCTS; a++) {
+            art_mpt_destroy(mpts[a]);
+            compact_art_destroy(&trees[a]); /* doesn't munmap — arena owned */
+        }
+        arena_reset(&arena);
+    }
+
+    arena_destroy(&arena);
+    PASS("arena-backed (50 accounts × 10 windows)");
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -753,6 +824,7 @@ int main(int argc, char **argv) {
     test_delete_reinsert();
     test_large_scale();
     test_small_pool();
+    test_arena_backed();
 
     printf("\n=== Results: %d passed, %d failed (seed=%lu) ===\n",
            tests_passed, tests_failed, seed);
