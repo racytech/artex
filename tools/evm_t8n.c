@@ -44,6 +44,8 @@ typedef struct {
     const char *state_fork;
     uint64_t    chain_id;
     bool        trace;
+    uint256_t   block_reward;
+    bool        has_block_reward;
 } t8n_args_t;
 
 static void print_usage(void) {
@@ -56,6 +58,7 @@ static void print_usage(void) {
         "  --output.alloc <file>    Post-state allocation (optional)\n"
         "  --state.fork <name>      Fork name (e.g. Cancun, Shanghai)\n"
         "  --state.chainid <N>      Chain ID (default: 1)\n"
+        "  --state.reward <N>       Block reward in wei (decimal, default: none)\n"
         "  --trace                  Enable EIP-3155 tracing to stderr\n"
     );
 }
@@ -81,6 +84,14 @@ static bool parse_args(int argc, char **argv, t8n_args_t *args) {
             args->state_fork = argv[++i];
         } else if (strcmp(argv[i], "--state.chainid") == 0 && i + 1 < argc) {
             args->chain_id = (uint64_t)atoll(argv[++i]);
+        } else if (strcmp(argv[i], "--state.reward") == 0 && i + 1 < argc) {
+            const char *rw = argv[++i];
+            /* Parse decimal or hex reward */
+            if (rw[0] == '0' && rw[1] == 'x')
+                parse_uint256(rw, &args->block_reward);
+            else
+                args->block_reward = uint256_from_uint64((uint64_t)strtoull(rw, NULL, 10));
+            args->has_block_reward = true;
         } else if (strcmp(argv[i], "--trace") == 0) {
             args->trace = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -542,9 +553,8 @@ int main(int argc, char **argv) {
     /* --- Populate pre-state --- */
     test_runner_setup_state(state, accounts, account_count);
     evm_state_commit(state);
-    evm_state_begin_block(state, env.number);
 
-    /* --- Set block environment --- */
+    /* --- Set block environment (must happen before prune_empty so fork is known) --- */
     evm_block_env_t evm_env;
     memset(&evm_env, 0, sizeof(evm_env));
     evm_env.number    = env.number;
@@ -568,6 +578,10 @@ int main(int argc, char **argv) {
         evm_env.blob_base_fee = calc_blob_gas_price(&evm_env.excess_blob_gas, evm->fork);
         evm_set_block_env(evm, &evm_env);
     }
+
+    /* EIP-161: enable empty account pruning after fork is determined */
+    evm_state_set_prune_empty(state, evm->fork >= FORK_SPURIOUS_DRAGON);
+    evm_state_begin_block(state, env.number);
 
     /* --- System calls --- */
     /* EIP-4788: beacon root storage (Cancun+) */
@@ -630,6 +644,16 @@ int main(int argc, char **argv) {
 
         if (!ok) {
             /* Transaction rejected at protocol level */
+            fprintf(stderr, "TX %zu REJECTED: sender=0x", i);
+            for (int j=0;j<20;j++) fprintf(stderr,"%02x",tx->sender.bytes[j]);
+            fprintf(stderr, " nonce=%lu gas=%lu value=", tx->nonce, tx->gas_limit);
+            uint8_t vb[32]; uint256_to_bytes(&tx->value, vb);
+            for (int j=0;j<4;j++) fprintf(stderr,"%02x",vb[j]);
+            fprintf(stderr, "... balance=");
+            uint256_t bal = evm_state_get_balance(state, &tx->sender);
+            uint8_t bb[32]; uint256_to_bytes(&bal, bb);
+            for (int j=0;j<8;j++) fprintf(stderr,"%02x",bb[j]);
+            fprintf(stderr, "\n");
             rejected[rejected_count].index = (int)i;
             rejected[rejected_count].error = "transaction rejected";
             rejected_count++;
@@ -646,6 +670,11 @@ int main(int argc, char **argv) {
 
         transaction_result_free(&tx_result);
         evm_state_commit_tx(state);
+    }
+
+    /* --- Apply block reward (PoW) --- */
+    if (args.has_block_reward && !uint256_is_zero(&args.block_reward)) {
+        evm_state_add_balance(state, &env.coinbase, &args.block_reward);
     }
 
     /* --- Process withdrawals (Shanghai+) --- */
@@ -706,6 +735,72 @@ int main(int argc, char **argv) {
             cJSON_AddItemToArray(rejected_arr, rj);
         }
         cJSON_AddItemToObject(result, "rejected", rejected_arr);
+    }
+
+    /* --- Output alloc (post-state) --- */
+    if (args.output_alloc) {
+        address_t addrs[8192];
+        size_t n = evm_state_collect_addresses(state, addrs, 8192);
+
+        cJSON *alloc_out = cJSON_CreateObject();
+        for (size_t i = 0; i < n; i++) {
+            address_t *a = &addrs[i];
+            bool exists = evm_state_exists(state, a);
+            /* Skip non-existent accounts (pruned empty accounts) */
+            uint64_t nonce = evm_state_get_nonce(state, a);
+            uint256_t bal = evm_state_get_balance(state, a);
+            bool is_empty = (nonce == 0 && uint256_is_zero(&bal) &&
+                             evm_state_get_code_size(state, a) == 0);
+            if (prune_empty && is_empty && !exists) continue;
+
+            char addr_hex[43];
+            addr_hex[0] = '0'; addr_hex[1] = 'x';
+            for (int j = 0; j < 20; j++)
+                sprintf(addr_hex + 2 + j*2, "%02x", a->bytes[j]);
+
+            cJSON *acct = cJSON_CreateObject();
+
+            /* Balance */
+            uint8_t bb[32]; uint256_to_bytes(&bal, bb);
+            char bal_hex[67] = "0x";
+            int s = 0; while (s < 31 && bb[s] == 0) s++;
+            for (int j = s; j < 32; j++)
+                sprintf(bal_hex + strlen(bal_hex), "%02x", bb[j]);
+            cJSON_AddStringToObject(acct, "balance", bal_hex);
+
+            /* Nonce (only if non-zero) */
+            if (nonce > 0) {
+                char nonce_hex[20];
+                sprintf(nonce_hex, "0x%lx", nonce);
+                cJSON_AddStringToObject(acct, "nonce", nonce_hex);
+            }
+
+            /* Code */
+            uint32_t csz = evm_state_get_code_size(state, a);
+            if (csz > 0) {
+                const uint8_t *code = evm_state_get_code_ptr(state, a, &csz);
+                if (code && csz > 0) {
+                    char *code_hex = malloc(csz * 2 + 3);
+                    code_hex[0] = '0'; code_hex[1] = 'x';
+                    for (uint32_t c = 0; c < csz; c++)
+                        sprintf(code_hex + 2 + c*2, "%02x", code[c]);
+                    cJSON_AddStringToObject(acct, "code", code_hex);
+                    free(code_hex);
+                }
+            }
+
+            cJSON_AddItemToObject(alloc_out, addr_hex, acct);
+        }
+
+        char *alloc_str = cJSON_Print(alloc_out);
+        if (strcmp(args.output_alloc, "stdout") == 0) {
+            printf("%s\n", alloc_str);
+        } else {
+            FILE *f = fopen(args.output_alloc, "w");
+            if (f) { fprintf(f, "%s\n", alloc_str); fclose(f); }
+        }
+        free(alloc_str);
+        cJSON_Delete(alloc_out);
     }
 
     /* --- Output result --- */

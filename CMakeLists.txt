@@ -119,6 +119,9 @@ target_include_directories(state_overlay PUBLIC
     ${CMAKE_SOURCE_DIR}/evm/include
 )
 target_link_libraries(state_overlay art_database flat_state flat_store storage_trie account_trie code_store common)
+if(ENABLE_HISTORY)
+    target_compile_definitions(state_overlay PUBLIC ENABLE_HISTORY=1)
+endif()
 
 #==============================================================================
 # Libraries — EVM

@@ -193,4 +193,8 @@ size_t state_overlay_collect_addresses(state_overlay_t *so, address_t *out, size
 size_t state_overlay_collect_storage_keys(state_overlay_t *so, const address_t *addr,
                                            uint256_t *out, size_t max);
 
+#ifdef ENABLE_HISTORY
+void state_overlay_dump_debug(state_overlay_t *so, const char *dir);
+#endif
+
 #endif /* STATE_OVERLAY_H */

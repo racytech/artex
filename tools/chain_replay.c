@@ -1306,8 +1306,8 @@ int main(int argc, char **argv) {
                 LOG_ERROR("got:      %s", got_hex);
                 LOG_ERROR("expected: %s", exp_hex);
                 LOG_WARN("hint: root is validated every %u blocks - bug is in range [%lu..%lu]",
-                        CHECKPOINT_INTERVAL,
-                        bn > CHECKPOINT_INTERVAL ? bn - CHECKPOINT_INTERVAL + 1 : 1, bn);
+                        validate_every,
+                        bn > validate_every ? bn - validate_every + 1 : 1, bn);
                 LOG_WARN("hint: if resumed from checkpoint, try --clean to replay fresh");
                 LOG_WARN("hint: use evm_statetest for per-block differential fuzzing against geth");
 #ifdef ENABLE_DEBUG
@@ -1344,94 +1344,21 @@ int main(int argc, char **argv) {
                 }
             }
 
-            /* Auto-dump prestate for the failing block */
+            /* Auto-dump pre/post state for the failing block */
             {
                 char auto_dir[512];
                 snprintf(auto_dir, sizeof(auto_dir), "known_issues/block_%lu", bn);
                 mkdir("known_issues", 0755);
                 mkdir(auto_dir, 0755);
-                LOG_INFO("auto-dumping prestate to %s/ ...", auto_dir);
+                LOG_INFO("auto-dumping pre/post state to %s/ ...", auto_dir);
 
                 evm_state_t *es = sync_get_state(sync);
 
-                /* Collect addresses and storage keys from dirty cache */
-                address_t *d_addrs = malloc(MAX_ADDRS * sizeof(address_t));
-                size_t d_n_addrs = evm_state_collect_addresses(es, d_addrs, MAX_ADDRS);
-
-                typedef struct { address_t addr; uint256_t *keys; size_t count; } dslot_t;
-                dslot_t *d_aslots = malloc(d_n_addrs * sizeof(dslot_t));
-                uint256_t *d_sbuf = malloc(MAX_SLOTS * sizeof(uint256_t));
-                size_t d_total_slots = 0;
-                for (size_t di = 0; di < d_n_addrs; di++) {
-                    d_aslots[di].addr = d_addrs[di];
-                    size_t n = evm_state_collect_storage_keys(es, &d_addrs[di],
-                        d_sbuf + d_total_slots, MAX_SLOTS - d_total_slots);
-                    d_aslots[di].keys = d_sbuf + d_total_slots;
-                    d_aslots[di].count = n;
-                    d_total_slots += n;
-                }
-
-                /* Write alloc.json from current state.
-                 * The evm_state cache still has accounts/storage from
-                 * this batch (evict hasn't happened yet). For accounts
-                 * not in cache, flat_state serves as fallback. */
-
-                /* Write alloc.json */
-                char alloc_p[512];
-                snprintf(alloc_p, sizeof(alloc_p), "%s/alloc.json", auto_dir);
-                FILE *af = fopen(alloc_p, "w");
-                if (af) {
-                    fprintf(af, "{\n");
-                    for (size_t di = 0; di < d_n_addrs; di++) {
-                        address_t *a = &d_addrs[di];
-                        evm_state_exists(es, a);
-                        uint64_t nn = evm_state_get_nonce(es, a);
-                        uint256_t bal = evm_state_get_balance(es, a);
-                        if (di > 0) fprintf(af, ",\n");
-                        fprintf(af, "  \"0x");
-                        for (int j = 0; j < 20; j++) fprintf(af, "%02x", a->bytes[j]);
-                        fprintf(af, "\": {\n");
-                        uint8_t bb[32]; uint256_to_bytes(&bal, bb);
-                        fprintf(af, "    \"balance\": \"0x");
-                        int s = 0; while (s < 31 && bb[s] == 0) s++;
-                        for (int j = s; j < 32; j++) fprintf(af, "%02x", bb[j]);
-                        fprintf(af, "\",\n");
-                        fprintf(af, "    \"nonce\": \"0x%lx\"", nn);
-                        uint32_t csz = evm_state_get_code_size(es, a);
-                        if (csz > 0) {
-                            const uint8_t *code = evm_state_get_code_ptr(es, a, &csz);
-                            if (code && csz > 0) {
-                                fprintf(af, ",\n    \"code\": \"0x");
-                                for (uint32_t c = 0; c < csz; c++) fprintf(af, "%02x", code[c]);
-                                fprintf(af, "\"");
-                            }
-                        }
-                        if (d_aslots[di].count > 0) {
-                            fprintf(af, ",\n    \"storage\": {");
-                            bool fs = true;
-                            for (size_t si = 0; si < d_aslots[di].count; si++) {
-                                uint256_t val = evm_state_get_storage(es, a, &d_aslots[di].keys[si]);
-                                if (uint256_is_zero(&val)) continue;
-                                if (!fs) fprintf(af, ",");
-                                fs = false;
-                                uint8_t kb[32], vb[32];
-                                uint256_to_bytes(&d_aslots[di].keys[si], kb);
-                                uint256_to_bytes(&val, vb);
-                                fprintf(af, "\n      \"0x");
-                                for (int j = 0; j < 32; j++) fprintf(af, "%02x", kb[j]);
-                                fprintf(af, "\": \"0x");
-                                for (int j = 0; j < 32; j++) fprintf(af, "%02x", vb[j]);
-                                fprintf(af, "\"");
-                            }
-                            fprintf(af, "\n    }");
-                        }
-                        fprintf(af, "\n  }");
-                    }
-                    fprintf(af, "\n}\n");
-                    fclose(af);
-                    LOG_INFO("dumped %zu accounts, %zu slots to %s",
-                            d_n_addrs, d_total_slots, alloc_p);
-                }
+#ifdef ENABLE_HISTORY
+                /* pre_alloc.json (original values) + post_alloc.json (current values)
+                 * with debug flags on each account */
+                evm_state_dump_debug(es, auto_dir);
+#endif
 
                 /* Write env.json */
                 char env_p[512];
@@ -1467,7 +1394,6 @@ int main(int argc, char **argv) {
                     fclose(ef);
                 }
 
-                free(d_addrs); free(d_aslots); free(d_sbuf);
             }
 
             /* Discard dirty state so destroy doesn't flush failing block to MPT.

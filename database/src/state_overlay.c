@@ -32,6 +32,15 @@
 #define ADDRESS_KEY_SIZE  20
 #define MAX_CODE_SIZE     (24 * 1024 + 1)
 
+/* EIP-161 RIPEMD special case: address 0x0000...0003.
+ * In geth, touching RIPEMD adds an extra dirty counter so that a journal
+ * revert does not remove it from the dirty set. This ensures that if
+ * RIPEMD is touched by a failing CALL (OOG), it still gets pruned as an
+ * empty account under EIP-161.  See go-ethereum journal.go:touchChange. */
+static const uint8_t RIPEMD_ADDR[20] = {
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3
+};
+
 /* Types from state_meta.h: cached_account_t, cached_slot_t,
  * account_meta_pool_t, slot_meta_pool_t */
 
@@ -55,8 +64,8 @@ typedef struct {
     journal_type_t type;
     address_t addr;
     union {
-        struct { uint64_t val; bool dirty; bool block_dirty; } nonce;
-        struct { uint256_t val; bool dirty; bool block_dirty; } balance;
+        struct { uint64_t val; bool dirty; bool block_dirty; bool mpt_dirty; } nonce;
+        struct { uint256_t val; bool dirty; bool block_dirty; bool mpt_dirty; } balance;
         struct { hash_t old_hash; bool old_has_code; uint8_t *old_code;
                  uint32_t old_code_size; } code;
         struct { uint256_t slot; uint256_t old_value; bool old_mpt_dirty; } storage;
@@ -522,7 +531,7 @@ void state_overlay_set_nonce(state_overlay_t *so, const address_t *addr, uint64_
     journal_entry_t je = {
         .type = JOURNAL_NONCE,
         .addr = *addr,
-        .data.nonce = { .val = ca->nonce, .dirty = ca->dirty, .block_dirty = ca->block_dirty }
+        .data.nonce = { .val = ca->nonce, .dirty = ca->dirty, .block_dirty = ca->block_dirty, .mpt_dirty = ca->mpt_dirty }
     };
     journal_push(so, &je);
 
@@ -546,7 +555,7 @@ void state_overlay_set_balance(state_overlay_t *so, const address_t *addr,
     journal_entry_t je = {
         .type = JOURNAL_BALANCE,
         .addr = *addr,
-        .data.balance = { .val = ca->balance, .dirty = ca->dirty, .block_dirty = ca->block_dirty }
+        .data.balance = { .val = ca->balance, .dirty = ca->dirty, .block_dirty = ca->block_dirty, .mpt_dirty = ca->mpt_dirty }
     };
     journal_push(so, &je);
 
@@ -650,7 +659,7 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
                 ca->nonce = je->data.nonce.val;
                 ca->dirty = je->data.nonce.dirty;
                 ca->block_dirty = je->data.nonce.block_dirty;
-            
+                ca->mpt_dirty = je->data.nonce.mpt_dirty;
             }
             break;
         }
@@ -658,9 +667,17 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
             cached_account_t *ca = find_account_meta(so, je->addr.bytes);
             if (ca) {
                 ca->balance = je->data.balance.val;
-                ca->dirty = je->data.balance.dirty;
-                ca->block_dirty = je->data.balance.block_dirty;
-            
+                /* RIPEMD special case: keep dirty after revert so EIP-161
+                 * can prune it even when the touching CALL fails (OOG).
+                 * Only applies post-Spurious Dragon (prune_empty=true). */
+                if (so->prune_empty &&
+                    memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0) {
+                    /* Don't restore dirty/block_dirty/mpt_dirty — leave them true */
+                } else {
+                    ca->dirty = je->data.balance.dirty;
+                    ca->block_dirty = je->data.balance.block_dirty;
+                    ca->mpt_dirty = je->data.balance.mpt_dirty;
+                }
             }
             break;
         }
@@ -1537,3 +1554,93 @@ size_t state_overlay_collect_storage_keys(state_overlay_t *so,
     }
     return n;
 }
+
+#ifdef ENABLE_HISTORY
+/* =========================================================================
+ * Debug dump: write pre_alloc.json and post_alloc.json for all cached accounts.
+ * pre_alloc uses original_* fields (start-of-block values).
+ * post_alloc uses current values.
+ * ========================================================================= */
+
+static void dump_alloc_file(state_overlay_t *so, const char *path, bool use_originals) {
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "{\n");
+    bool first = true;
+    for (uint32_t i = 0; i < so->next_acct_idx; i++) {
+        cached_account_t *ca = &so->acct_meta.entries[i];
+
+        uint64_t nonce = use_originals ? ca->original_nonce : ca->nonce;
+        uint256_t bal  = use_originals ? ca->original_balance : ca->balance;
+
+        if (!first) fprintf(f, ",\n");
+        first = false;
+        fprintf(f, "  \"0x");
+        for (int j = 0; j < 20; j++) fprintf(f, "%02x", ca->addr.bytes[j]);
+        fprintf(f, "\": {\n");
+
+        uint8_t bb[32]; uint256_to_bytes(&bal, bb);
+        fprintf(f, "    \"balance\": \"0x");
+        int s = 0; while (s < 31 && bb[s] == 0) s++;
+        for (int j = s; j < 32; j++) fprintf(f, "%02x", bb[j]);
+        fprintf(f, "\",\n");
+        fprintf(f, "    \"nonce\": \"0x%lx\"", nonce);
+
+        if (ca->has_code) {
+            if (ca->code && ca->code_size > 0) {
+                fprintf(f, ",\n    \"code\": \"0x");
+                for (uint32_t c = 0; c < ca->code_size; c++) fprintf(f, "%02x", ca->code[c]);
+                fprintf(f, "\"");
+            } else {
+                /* Code not loaded — indicate via code_hash */
+                fprintf(f, ",\n    \"_codeHash\": \"0x");
+                for (int j = 0; j < 32; j++) fprintf(f, "%02x", ca->code_hash.bytes[j]);
+                fprintf(f, "\"");
+            }
+        }
+
+        /* Storage */
+        bool has_slots = false;
+        for (uint32_t si = 0; si < so->next_slot_idx; si++) {
+            cached_slot_t *cs = &so->slot_meta.entries[si];
+            if (memcmp(cs->key, ca->addr.bytes, ADDRESS_SIZE) != 0) continue;
+            uint256_t val = use_originals ? cs->block_original : cs->current;
+            if (uint256_is_zero(&val)) continue;
+            if (!has_slots) { fprintf(f, ",\n    \"storage\": {"); has_slots = true; }
+            else fprintf(f, ",");
+            uint8_t kb[32], vb[32];
+            memcpy(kb, cs->key + ADDRESS_SIZE, 32);
+            uint256_to_bytes(&val, vb);
+            fprintf(f, "\n      \"0x");
+            for (int j = 0; j < 32; j++) fprintf(f, "%02x", kb[j]);
+            fprintf(f, "\": \"0x");
+            for (int j = 0; j < 32; j++) fprintf(f, "%02x", vb[j]);
+            fprintf(f, "\"");
+        }
+        if (has_slots) fprintf(f, "\n    }");
+
+        /* Debug flags (post_alloc only — pre_alloc must be clean for geth t8n) */
+        if (!use_originals) {
+            fprintf(f, ",\n    \"_flags\": \"existed=%d dirty=%d block_dirty=%d "
+                    "mpt_dirty=%d created=%d sd=%d empty=%d\"",
+                    ca->existed, ca->dirty, ca->block_dirty,
+                    ca->mpt_dirty, ca->created, ca->self_destructed,
+                    (ca->nonce == 0 && uint256_is_zero(&ca->balance) && !ca->has_code));
+        }
+
+        fprintf(f, "\n  }");
+    }
+    fprintf(f, "\n}\n");
+    fclose(f);
+}
+
+void state_overlay_dump_debug(state_overlay_t *so, const char *dir) {
+    if (!so || !dir) return;
+    char pre_path[512], post_path[512];
+    snprintf(pre_path, sizeof(pre_path), "%s/pre_alloc.json", dir);
+    snprintf(post_path, sizeof(post_path), "%s/post_alloc.json", dir);
+    dump_alloc_file(so, pre_path, true);
+    dump_alloc_file(so, post_path, false);
+    fprintf(stderr, "DEBUG: dumped pre/post alloc to %s/\n", dir);
+}
+#endif /* ENABLE_HISTORY */

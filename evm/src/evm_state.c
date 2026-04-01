@@ -383,4 +383,8 @@ void evm_state_apply_diff_bulk(evm_state_t *es, const struct block_diff_t *diff)
     /* TODO: delegate to state_overlay */
     (void)es; (void)diff;
 }
+
+void evm_state_dump_debug(evm_state_t *es, const char *dir) {
+    if (es && es->so) state_overlay_dump_debug(es->so, dir);
+}
 #endif

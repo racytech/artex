@@ -347,6 +347,12 @@ void evm_state_collect_block_diff(evm_state_t *es, struct block_diff_t *out);
  * Only marks mpt_dirty — caller computes root at the end.
  */
 void evm_state_apply_diff_bulk(evm_state_t *es, const struct block_diff_t *out);
+
+/**
+ * Debug dump: write pre_alloc.json and post_alloc.json to dir.
+ * pre_alloc uses original_* fields, post_alloc uses current values.
+ */
+void evm_state_dump_debug(evm_state_t *es, const char *dir);
 #endif
 
 #endif // EVM_STATE_H
