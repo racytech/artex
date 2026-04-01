@@ -17,6 +17,7 @@
 /* storage_trie.h no longer needed — per-account art computes storage roots */
 #include "account_trie.h"
 #include "art_mpt.h"
+#include "arena.h"
 #include "keccak256.h"
 #include "mem_art.h"
 #include <stdlib.h>
@@ -153,32 +154,11 @@ static uint32_t acct_stor_encode(const uint8_t *key, const void *leaf_val,
     return 1 + len;
 }
 
-static bool acct_stor_create(cached_account_t *ca) {
-    if (ca->storage_art) return true; /* already exists */
-    ca->storage_art = calloc(1, sizeof(compact_art_t));
-    if (!ca->storage_art) return false;
-    if (!compact_art_init_ex(ca->storage_art,
-                              ACCT_STOR_KEY_SIZE, ACCT_STOR_VAL_SIZE,
-                              false, NULL, NULL,
-                              ACCT_STOR_NODE_RESERVE, ACCT_STOR_LEAF_RESERVE)) {
-        free(ca->storage_art);
-        ca->storage_art = NULL;
-        return false;
-    }
-    ca->storage_mpt = art_mpt_create(ca->storage_art, acct_stor_encode, NULL);
-    if (!ca->storage_mpt) {
-        compact_art_destroy(ca->storage_art);
-        free(ca->storage_art);
-        ca->storage_art = NULL;
-        return false;
-    }
-    return true;
-}
-
+/* acct_stor_create/destroy defined after struct state_overlay */
 static void acct_stor_destroy(cached_account_t *ca) {
     if (ca->storage_mpt) { art_mpt_destroy(ca->storage_mpt); ca->storage_mpt = NULL; }
     if (ca->storage_art) {
-        compact_art_destroy(ca->storage_art);
+        compact_art_destroy(ca->storage_art); /* doesn't munmap — arena owned */
         free(ca->storage_art);
         ca->storage_art = NULL;
     }
@@ -218,11 +198,15 @@ static cached_slot_t *slot_meta_ensure(slot_meta_pool_t *p, uint32_t idx) {
  * Main struct
  * ========================================================================= */
 
+/* Storage arena: 8 GB virtual for all per-account compact_arts.
+ * Physical = demand-paged, proportional to actual storage loaded. */
+#define STORAGE_ARENA_RESERVE (8ULL * 1024 * 1024 * 1024)
+
 struct state_overlay {
     flat_state_t     *flat_state;
     code_store_t     *code_store;
     account_trie_t   *account_trie;
-    /* storage_trie removed — per-account art computes storage roots */
+    arena_t           storage_arena;  /* shared arena for per-account storage arts */
 
     /* Meta arrays — indexed by sequential meta index (NOT flat_store overlay index).
      * Meta holds typed access + flags. Persistent records in flat_store overlay
@@ -306,6 +290,38 @@ static inline void mark_account_tx_dirty(state_overlay_t *so, cached_account_t *
 static inline void mark_slot_tx_dirty(state_overlay_t *so, cached_slot_t *cs) {
     if (!cs->dirty)
         dirty_push(&so->tx_dirty_slots, cs->key, SLOT_KEY_SIZE);
+}
+
+/* Per-account storage art creation (needs full struct definition) */
+static bool acct_stor_create(state_overlay_t *so, cached_account_t *ca) {
+    if (ca->storage_art) return true; /* already exists */
+    ca->storage_art = calloc(1, sizeof(compact_art_t));
+    if (!ca->storage_art) return false;
+
+    void *nmem = arena_alloc(&so->storage_arena, ACCT_STOR_NODE_RESERVE);
+    void *lmem = arena_alloc(&so->storage_arena, ACCT_STOR_LEAF_RESERVE);
+    if (!nmem || !lmem) {
+        free(ca->storage_art);
+        ca->storage_art = NULL;
+        return false;
+    }
+    if (!compact_art_init_arena(ca->storage_art,
+                                 ACCT_STOR_KEY_SIZE, ACCT_STOR_VAL_SIZE,
+                                 false, NULL, NULL,
+                                 nmem, ACCT_STOR_NODE_RESERVE,
+                                 lmem, ACCT_STOR_LEAF_RESERVE)) {
+        free(ca->storage_art);
+        ca->storage_art = NULL;
+        return false;
+    }
+    ca->storage_mpt = art_mpt_create(ca->storage_art, acct_stor_encode, NULL);
+    if (!ca->storage_mpt) {
+        compact_art_destroy(ca->storage_art);
+        free(ca->storage_art);
+        ca->storage_art = NULL;
+        return false;
+    }
+    return true;
 }
 
 /* Lookup helpers: find meta by key via local index tables */
@@ -468,7 +484,7 @@ static cached_slot_t *ensure_slot(state_overlay_t *so, const address_t *addr,
             cs->original = uint256_from_bytes(val_be, 32);
             cs->current = cs->original;
             /* Populate per-account art with loaded value */
-            if (!ca->storage_art) acct_stor_create(ca);
+            if (!ca->storage_art) acct_stor_create(so, ca);
             if (ca->storage_art)
                 compact_art_insert(ca->storage_art, cs->slot_hash.bytes, val_be);
             so->flat_stor_hit++;
@@ -513,6 +529,10 @@ state_overlay_t *state_overlay_create(flat_state_t *fs, code_store_t *cs) {
     if (!so->journal) { free(so); return NULL; }
     so->journal_cap = JOURNAL_INIT_CAP;
 
+    if (!arena_init(&so->storage_arena, STORAGE_ARENA_RESERVE)) {
+        free(so->journal); free(so); return NULL;
+    }
+
     init_tries(so);
     return so;
 }
@@ -529,6 +549,7 @@ void state_overlay_destroy(state_overlay_t *so) {
     free(so->acct_meta.entries);
     free(so->slot_meta.entries);
 
+    arena_destroy(&so->storage_arena);
     if (so->account_trie) account_trie_destroy(so->account_trie);
 
     mem_art_destroy(&so->acct_index);
@@ -723,7 +744,7 @@ void state_overlay_set_storage(state_overlay_t *so, const address_t *addr,
         mark_account_mpt_dirty(so, ca);
 
         /* Write to per-account storage art */
-        if (!ca->storage_art) acct_stor_create(ca);
+        if (!ca->storage_art) acct_stor_create(so, ca);
         if (ca->storage_art) {
             uint8_t val_be[32];
             uint256_to_bytes(value, val_be);
@@ -1690,12 +1711,14 @@ void state_overlay_evict(state_overlay_t *so) {
         }
     }
 
-    /* Free code pointers and per-account storage arts in used portion of meta */
+    /* Free code pointers and per-account storage art structs */
     for (uint32_t i = 0; i < so->next_acct_idx; i++) {
         cached_account_t *ca = &so->acct_meta.entries[i];
         if (ca->code) { free(ca->code); ca->code = NULL; }
-        acct_stor_destroy(ca);
+        acct_stor_destroy(ca); /* frees art struct, doesn't free arena memory */
     }
+    /* Reset storage arena — releases all physical pages at once */
+    arena_reset(&so->storage_arena);
 
     /* Reset and shrink meta arrays back to minimum */
     {
