@@ -108,11 +108,12 @@ static uint32_t encode_account(const flat_account_record_t *rec, uint8_t *buf) {
         pos += 32;
     }
 
-    if (rec->stor_file_offset != UINT64_MAX && rec->stor_file_count > 0) {
+    /* stor_file refs: temporarily disabled to isolate root mismatch */
+    /* if (rec->stor_file_offset != UINT64_MAX && rec->stor_file_count > 0) {
         flags |= ACCT_FLAG_HAS_STOR_FILE;
         memcpy(buf + pos, &rec->stor_file_offset, 8); pos += 8;
         memcpy(buf + pos, &rec->stor_file_count, 4); pos += 4;
-    }
+    } */
 
     buf[0] = flags;
     return pos;
