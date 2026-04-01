@@ -1200,6 +1200,10 @@ void state_overlay_commit(state_overlay_t *so) {
     }
 
     so->journal_len = 0;
+
+    /* Clear originals — new block starts with current values as committed */
+    mem_art_destroy(&so->originals);
+    mem_art_init(&so->originals);
 }
 
 /* =========================================================================
@@ -1312,12 +1316,18 @@ void state_overlay_clear_prestate_dirty(state_overlay_t *so) {
         ca->block_dirty = false;
         ca->block_code_dirty = false;
         ca->mpt_dirty = false;
+        ca->storage_dirty = false;
 #ifdef ENABLE_HISTORY
         ca->block_self_destructed = false;
         ca->block_created = false;
 #endif
     }
     dirty_clear(&so->dirty_accounts);
+    /* Clear originals — pre-state setup set_storage calls populated it
+     * with pre-pre-state values (zeros). Must clear so execution sees
+     * the actual pre-state values as "committed". */
+    mem_art_destroy(&so->originals);
+    mem_art_init(&so->originals);
 }
 
 /* =========================================================================
