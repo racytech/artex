@@ -226,6 +226,7 @@ struct state_overlay {
     mem_art_t warm_addrs;   /* EIP-2929 */
     mem_art_t warm_slots;
     mem_art_t transient;    /* EIP-1153 */
+    mem_art_t originals;    /* EIP-2200: skey[52] → uint256_t (per-tx original values) */
 
     dirty_vec_t tx_dirty_accounts;
     dirty_vec_t tx_dirty_slots;
@@ -524,6 +525,7 @@ state_overlay_t *state_overlay_create(flat_state_t *fs, code_store_t *cs) {
     mem_art_init(&so->warm_addrs);
     mem_art_init(&so->warm_slots);
     mem_art_init(&so->transient);
+    mem_art_init(&so->originals);
 
     so->journal = malloc(JOURNAL_INIT_CAP * sizeof(journal_entry_t));
     if (!so->journal) { free(so); return NULL; }
@@ -557,6 +559,7 @@ void state_overlay_destroy(state_overlay_t *so) {
     mem_art_destroy(&so->warm_addrs);
     mem_art_destroy(&so->warm_slots);
     mem_art_destroy(&so->transient);
+    mem_art_destroy(&so->originals);
 
     for (uint32_t i = 0; i < so->journal_len; i++) {
         if (so->journal[i].type == JOURNAL_CODE)
@@ -706,6 +709,13 @@ uint256_t state_overlay_get_storage(state_overlay_t *so, const address_t *addr,
 uint256_t state_overlay_get_committed_storage(state_overlay_t *so, const address_t *addr,
                                                const uint256_t *key) {
     if (!so || !addr || !key) return UINT256_ZERO_INIT;
+    /* Check originals map first (has tx-start value if slot was modified this tx) */
+    uint8_t skey[SLOT_KEY_SIZE];
+    make_slot_key(addr, key, skey);
+    const uint256_t *orig = (const uint256_t *)mem_art_get(
+        &so->originals, skey, SLOT_KEY_SIZE, NULL);
+    if (orig) return *orig;
+    /* Not modified this tx — current value IS the original */
     cached_slot_t *cs = ensure_slot(so, addr, key);
     return cs ? cs->original : UINT256_ZERO_INIT;
 }
@@ -732,6 +742,16 @@ void state_overlay_set_storage(state_overlay_t *so, const address_t *addr,
         }
     };
     journal_push(so, &je);
+
+    /* Save original value for EIP-2200 (first write to this slot this tx) */
+    {
+        uint8_t skey[SLOT_KEY_SIZE];
+        make_slot_key(addr, key, skey);
+        if (!mem_art_contains(&so->originals, skey, SLOT_KEY_SIZE)) {
+            mem_art_insert(&so->originals, skey, SLOT_KEY_SIZE,
+                           &cs->current, sizeof(uint256_t));
+        }
+    }
 
     cs->current = *value;
     mark_slot_tx_dirty(so, cs);
@@ -1042,7 +1062,14 @@ void state_overlay_sstore_lookup(state_overlay_t *so, const address_t *addr,
         return;
     }
     if (current) *current = cs->current;
-    if (original) *original = cs->original;
+    if (original) {
+        /* Check originals map for tx-start value */
+        uint8_t skey[SLOT_KEY_SIZE];
+        make_slot_key(addr, key, skey);
+        const uint256_t *orig = (const uint256_t *)mem_art_get(
+            &so->originals, skey, SLOT_KEY_SIZE, NULL);
+        *original = orig ? *orig : cs->original;
+    }
     if (was_warm)
         *was_warm = mem_art_contains(&so->warm_slots, cs->key, SLOT_KEY_SIZE);
 }
@@ -1406,6 +1433,7 @@ void state_overlay_commit_tx(state_overlay_t *so) {
     mem_art_destroy(&so->warm_addrs);  mem_art_init(&so->warm_addrs);
     mem_art_destroy(&so->warm_slots);  mem_art_init(&so->warm_slots);
     mem_art_destroy(&so->transient);   mem_art_init(&so->transient);
+    mem_art_destroy(&so->originals);   mem_art_init(&so->originals);
 }
 
 /* =========================================================================
