@@ -23,7 +23,7 @@
 #include <string.h>
 
 #define ACCT_KEY_SIZE      32
-#define ACCT_MAX_REC_SIZE  116   /* max compressed account record (with stor_file ref) */
+#define ACCT_MAX_REC_SIZE  104   /* max compressed account record */
 #define STOR_KEY_SIZE      64   /* addr_hash[32] || slot_hash[32] */
 #define STOR_MAX_REC_SIZE  32
 
@@ -51,7 +51,6 @@
 #define ACCT_FLAG_HAS_CODE       0x08
 #define ACCT_FLAG_HAS_STORAGE    0x10
 #define ACCT_FLAG_NONCE_BIG      0x20
-#define ACCT_FLAG_HAS_STOR_FILE  0x40
 
 static inline bool is_zero_32(const uint8_t v[32]) {
     const uint64_t *p = (const uint64_t *)v;
@@ -108,12 +107,6 @@ static uint32_t encode_account(const flat_account_record_t *rec, uint8_t *buf) {
         pos += 32;
     }
 
-    /* stor_file refs: temporarily disabled to isolate root mismatch */
-    /* if (rec->stor_file_offset != UINT64_MAX && rec->stor_file_count > 0) {
-        flags |= ACCT_FLAG_HAS_STOR_FILE;
-        memcpy(buf + pos, &rec->stor_file_offset, 8); pos += 8;
-        memcpy(buf + pos, &rec->stor_file_count, 4); pos += 4;
-    } */
 
     buf[0] = flags;
     return pos;
@@ -162,14 +155,6 @@ static void decode_account(const uint8_t *buf, uint32_t len,
         pos += 32;
     } else {
         memcpy(out->storage_root, HASH_EMPTY_STORAGE.bytes, 32);
-    }
-
-    if (flags & ACCT_FLAG_HAS_STOR_FILE) {
-        memcpy(&out->stor_file_offset, buf + pos, 8); pos += 8;
-        memcpy(&out->stor_file_count, buf + pos, 4); pos += 4;
-    } else {
-        out->stor_file_offset = UINT64_MAX;
-        out->stor_file_count = 0;
     }
 
     (void)len; /* consumed by pos */

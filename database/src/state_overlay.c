@@ -50,6 +50,12 @@ static const uint8_t RIPEMD_ADDR[20] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3
 };
 
+/* Storage file index entry — stored in stor_index mem_art */
+typedef struct __attribute__((packed)) {
+    uint64_t offset;
+    uint32_t count;
+} stor_index_entry_t;
+
 /* Types from state_meta.h: cached_account_t, account_meta_pool_t */
 
 /* =========================================================================
@@ -193,6 +199,7 @@ struct state_overlay {
     account_trie_t   *account_trie;
     arena_t           storage_arena;  /* shared arena for per-account storage arts */
     storage_file_t   *storage_file;  /* packed per-account storage persistence */
+    mem_art_t         stor_index;    /* addr_hash[32] → {offset(8), count(4)} */
 
     /* Meta arrays — indexed by sequential meta index (NOT flat_store overlay index).
      * Meta holds typed access + flags. Persistent records in flat_store overlay
@@ -325,8 +332,6 @@ static void sync_account_to_overlay(state_overlay_t *so, cached_account_t *ca) {
         ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
     memcpy(frec.code_hash, ch, 32);
     memcpy(frec.storage_root, ca->storage_root.bytes, 32);
-    frec.stor_file_offset = ca->stor_file_offset;
-    frec.stor_file_count = ca->stor_file_count;
     flat_state_put_account(so->flat_state, ca->addr_hash.bytes, &frec);
 }
 
@@ -360,8 +365,6 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
     address_copy(&ca->addr, addr);
     ca->addr_hash = addr_hash;
     ca->storage_root = HASH_EMPTY_STORAGE;
-    ca->stor_file_offset = UINT64_MAX;
-    ca->stor_file_count = 0;
 
     /* Load from flat_state if available */
     if (so->flat_state) {
@@ -373,8 +376,6 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
             memcpy(ca->storage_root.bytes, frec.storage_root, 32);
             ca->has_code = (memcmp(frec.code_hash, ((hash_t){0}).bytes, 32) != 0 &&
                             memcmp(frec.code_hash, HASH_EMPTY_CODE.bytes, 32) != 0);
-            ca->stor_file_offset = frec.stor_file_offset;
-            ca->stor_file_count = frec.stor_file_count;
             ca->existed = true;
             so->flat_acct_hit++;
         } else {
@@ -399,14 +400,18 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
 /** Bulk-load all storage from packed storage_file into per-account art. */
 static void storage_bulk_load(state_overlay_t *so, cached_account_t *ca) {
     if (ca->storage_art) return; /* already loaded */
-    if (ca->stor_file_offset == UINT64_MAX || ca->stor_file_count == 0) return;
     if (!so->storage_file) return;
 
-    uint32_t count = ca->stor_file_count;
+    /* Look up storage_file refs from the separate index */
+    const stor_index_entry_t *entry = (const stor_index_entry_t *)
+        mem_art_get(&so->stor_index, ca->addr_hash.bytes, 32, NULL);
+    if (!entry || entry->count == 0) return;
+
+    uint32_t count = entry->count;
     uint8_t *buf = malloc((size_t)count * STORAGE_SLOT_SIZE);
     if (!buf) return;
 
-    if (!storage_file_read_section(so->storage_file, ca->stor_file_offset,
+    if (!storage_file_read_section(so->storage_file, entry->offset,
                                     count, buf)) {
         free(buf);
         return;
@@ -426,7 +431,7 @@ static void storage_bulk_load(state_overlay_t *so, cached_account_t *ca) {
 static uint256_t storage_read(state_overlay_t *so, cached_account_t *ca,
                                const uint8_t slot_hash[32]) {
     /* Ensure per-account art is populated (bulk-load from storage_file if needed) */
-    if (!ca->storage_art && ca->stor_file_count > 0)
+    if (!ca->storage_art)
         storage_bulk_load(so, ca);
 
     /* Check per-account art */
@@ -485,6 +490,7 @@ state_overlay_t *state_overlay_create(flat_state_t *fs, code_store_t *cs) {
     so->code_store = cs;
 
     mem_art_init(&so->acct_index);
+    mem_art_init(&so->stor_index);
     mem_art_init(&so->warm_addrs);
     mem_art_init(&so->warm_slots);
     mem_art_init(&so->transient);
@@ -523,6 +529,7 @@ void state_overlay_destroy(state_overlay_t *so) {
     if (so->account_trie) account_trie_destroy(so->account_trie);
 
     mem_art_destroy(&so->acct_index);
+    mem_art_destroy(&so->stor_index);
     mem_art_destroy(&so->warm_addrs);
     mem_art_destroy(&so->warm_slots);
     mem_art_destroy(&so->transient);
@@ -1446,8 +1453,8 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
     }
     clock_gettime(CLOCK_MONOTONIC, &t4b);
 
-    /* Step 4c. Write dirty accounts' storage to storage_file so that
-     * sync_account_to_overlay (Step 5) includes correct stor_file refs. */
+    /* Step 4c. Write dirty accounts' storage to storage_file and update
+     * the stor_index (separate from the account record). */
     if (so->storage_file) {
         for (size_t d = 0; d < so->dirty_accounts.count; d++) {
             const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
@@ -1455,8 +1462,7 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
             if (!ca || !ca->storage_dirty || !ca->storage_art) continue;
             uint32_t count = (uint32_t)compact_art_size(ca->storage_art);
             if (count == 0) {
-                ca->stor_file_offset = UINT64_MAX;
-                ca->stor_file_count = 0;
+                mem_art_delete(&so->stor_index, ca->addr_hash.bytes, 32);
                 continue;
             }
             uint8_t *buf = malloc((size_t)count * STORAGE_SLOT_SIZE);
@@ -1471,14 +1477,17 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
                 idx++;
             }
             compact_art_iterator_destroy(it);
-            ca->stor_file_offset = storage_file_write_section(so->storage_file, buf, idx);
-            ca->stor_file_count = idx;
+            stor_index_entry_t sie = {
+                .offset = storage_file_write_section(so->storage_file, buf, idx),
+                .count = idx,
+            };
+            mem_art_upsert(&so->stor_index, ca->addr_hash.bytes, 32,
+                           &sie, sizeof(sie));
             free(buf);
         }
     }
 
-    /* Step 5. Bulk flush dirty accounts to flat_state (with final storage_root
-     * and stor_file refs from Step 4c). */
+    /* Step 5. Bulk flush dirty accounts to flat_state (with final storage_root). */
     clock_gettime(CLOCK_MONOTONIC, &t5a);
     for (size_t d = 0; d < so->dirty_accounts.count; d++) {
         const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
