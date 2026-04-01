@@ -1334,26 +1334,9 @@ void state_overlay_clear_prestate_dirty(state_overlay_t *so) {
  *   6. Clear dirty flags
  * ========================================================================= */
 
-static uint64_t _debug_root_call = 0;
-/* Set via env DEBUG_VERIFY_FROM=N to enable full recompute verification
- * starting at the Nth root computation (roughly = block number). */
-static uint64_t _debug_verify_from = 0;
-static bool _debug_env_checked = false;
-
 hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
     hash_t root = hash_zero();
     if (!so) return root;
-
-    if (!_debug_env_checked) {
-        const char *env = getenv("DEBUG_VERIFY_FROM");
-        if (env) _debug_verify_from = (uint64_t)atoll(env);
-        _debug_env_checked = true;
-    }
-    _debug_root_call++;
-    bool debug_verify = (_debug_verify_from > 0 && _debug_root_call >= _debug_verify_from);
-    if (debug_verify && _debug_root_call == _debug_verify_from)
-        fprintf(stderr, "DEBUG_VERIFY: activated at call %lu (from=%lu)\n",
-                _debug_root_call, _debug_verify_from);
     if (!so->flat_state || !so->account_trie) {
         fprintf(stderr, "FATAL: compute_mpt_root without flat_state/account_trie\n");
         return root;
@@ -1428,70 +1411,11 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
         if (!ca || !ca->mpt_dirty || !ca->existed) continue;
         sync_account_to_overlay(so, ca);
 
-        /* DEBUG: read back from flat_state and verify roundtrip */
-        if (debug_verify) {
-            flat_account_record_t readback;
-            if (flat_state_get_account(so->flat_state, ca->addr_hash.bytes, &readback)) {
-                uint8_t meta_bal[32], zero32[32] = {0};
-                uint256_to_bytes(&ca->balance, meta_bal);
-                const uint8_t *meta_ch = ca->has_code
-                    ? ca->code_hash.bytes : (const uint8_t *)"\xc5\xd2\x46\x01\x86\xf7\x23\x3c"
-                      "\x92\x7e\x7d\xb2\xdc\xc7\x03\xc0\xe5\x00\xb6\x53\xca\x82\x27\x3b"
-                      "\x63\xb6\x8f\xb5\x43\x8d\xc8\x20";
-                bool bal_ok = memcmp(readback.balance, meta_bal, 32) == 0;
-                bool nonce_ok = readback.nonce == ca->nonce;
-                bool ch_ok = memcmp(readback.code_hash, meta_ch, 32) == 0;
-                bool sr_ok = memcmp(readback.storage_root, ca->storage_root.bytes, 32) == 0;
-                if (!bal_ok || !nonce_ok || !ch_ok || !sr_ok) {
-                    fprintf(stderr, "SYNC ROUNDTRIP MISMATCH (call %lu): addr=0x",
-                            _debug_root_call);
-                    for (int j = 0; j < 20; j++) fprintf(stderr, "%02x", ca->addr.bytes[j]);
-                    fprintf(stderr, " bal=%d nonce=%d code_hash=%d storage_root=%d\n",
-                            bal_ok, nonce_ok, ch_ok, sr_ok);
-                    if (!sr_ok) {
-                        fprintf(stderr, "  meta_sr: ");
-                        for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", ca->storage_root.bytes[j]);
-                        fprintf(stderr, "\n  disk_sr: ");
-                        for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", readback.storage_root[j]);
-                        fprintf(stderr, "\n");
-                    }
-                }
-            }
-        }
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
     /* Step 6. Compute account trie root from flat_state */
     account_trie_root(so->account_trie, root.bytes);
-
-    if (debug_verify) {
-        hash_t verify;
-        account_trie_invalidate_all(so->account_trie);
-        account_trie_root(so->account_trie, verify.bytes);
-        if (memcmp(root.bytes, verify.bytes, 32) != 0) {
-            fprintf(stderr, "ACCT HASH CACHE BUG (call %lu): incremental != full\n",
-                    _debug_root_call);
-            fprintf(stderr, "  incremental: ");
-            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", root.bytes[i]);
-            fprintf(stderr, "\n  full:        ");
-            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", verify.bytes[i]);
-            fprintf(stderr, "\n  dirty_accounts=%zu prune_empty=%d\n",
-                    dirty_count, prune_empty);
-            for (size_t d = 0; d < so->dirty_accounts.count; d++) {
-                const uint8_t *ak = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
-                cached_account_t *cx = find_account_meta(so, ak);
-                if (!cx) continue;
-                fprintf(stderr, "  dirty[%zu]: 0x", d);
-                for (int j = 0; j < 20; j++) fprintf(stderr, "%02x", cx->addr.bytes[j]);
-                fprintf(stderr, " existed=%d mpt_dirty=%d block_dirty=%d "
-                        "nonce=%lu empty=%d\n",
-                        cx->existed, cx->mpt_dirty, cx->block_dirty,
-                        cx->nonce,
-                        (cx->nonce == 0 && uint256_is_zero(&cx->balance) && !cx->has_code));
-            }
-            root = verify;
-        }
-    }
     clock_gettime(CLOCK_MONOTONIC, &t2);
 
     /* Step 7. Clear dirty flags and reset dirty vectors */
@@ -1523,13 +1447,6 @@ void state_overlay_evict(state_overlay_t *so) {
     if (!so) return;
 
     /* DEBUG: save pre-evict root for comparison */
-    bool debug_evict = (_debug_verify_from > 0 && _debug_root_call >= _debug_verify_from);
-    hash_t pre_evict_root = hash_zero();
-    if (debug_evict && so->account_trie) {
-        account_trie_invalidate_all(so->account_trie);
-        account_trie_root(so->account_trie, pre_evict_root.bytes);
-    }
-
     if (so->flat_state) {
         flat_store_t *astore = flat_state_account_store(so->flat_state);
         flat_store_t *sstore = flat_state_storage_store(so->flat_state);
@@ -1547,21 +1464,6 @@ void state_overlay_evict(state_overlay_t *so) {
         /* Pass 3: free stale disk slots */
         flat_store_free_stale_slots(astore, acct_stale, acct_sc);
         flat_store_free_stale_slots(sstore, stor_stale, stor_sc);
-    }
-
-    if (debug_evict && so->account_trie) {
-        hash_t post_flush_root;
-        account_trie_invalidate_all(so->account_trie);
-        account_trie_root(so->account_trie, post_flush_root.bytes);
-        if (memcmp(pre_evict_root.bytes, post_flush_root.bytes, 32) != 0) {
-            fprintf(stderr, "EVICT BUG (call %lu): root changed after flush+evict!\n",
-                    _debug_root_call);
-            fprintf(stderr, "  before: ");
-            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", pre_evict_root.bytes[i]);
-            fprintf(stderr, "\n  after:  ");
-            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", post_flush_root.bytes[i]);
-            fprintf(stderr, "\n");
-        }
     }
 
     /* Free code pointers and per-account storage art structs */
