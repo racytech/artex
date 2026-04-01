@@ -56,6 +56,10 @@ add_library(disk_table STATIC database/src/disk_table.c)
 add_library(arena STATIC database/src/arena.c)
 target_include_directories(arena PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 
+# Storage File (packed per-account storage persistence)
+add_library(storage_file STATIC database/src/storage_file.c)
+target_include_directories(storage_file PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+
 # Compact ART (in-memory index for flat_store)
 add_library(compact_art STATIC database/src/compact_art.c)
 
@@ -338,6 +342,11 @@ add_test(NAME test_flat_state_roundtrip COMMAND test_flat_state_roundtrip)
 add_executable(test_arena database/tests/test_arena.c)
 target_link_libraries(test_arena arena)
 add_test(NAME test_arena COMMAND test_arena)
+
+# Test: Storage file (packed per-account storage)
+add_executable(test_storage_file database/tests/test_storage_file.c)
+target_link_libraries(test_storage_file storage_file)
+add_test(NAME test_storage_file COMMAND test_storage_file)
 
 # Test: ART→MPT cross-validation against Python reference vectors
 add_executable(test_art_mpt_vectors database/tests/test_art_mpt_vectors.c)

@@ -132,9 +132,6 @@ static inline void dirty_free(dirty_vec_t *v) {
 static uint32_t acct_stor_encode(const uint8_t *key, const void *leaf_val,
                                   uint32_t val_size, uint8_t *rlp_out, void *ctx) {
     (void)key; (void)ctx;
-    /* The leaf stores the 32-byte BE value directly.
-     * For MPT, we need RLP-encoded value. For storage, the value is
-     * rlp_encode(trim_leading_zeros(value)). */
     const uint8_t *val = (const uint8_t *)leaf_val;
     /* Skip leading zeros */
     int start = 0;
@@ -398,12 +395,11 @@ static uint256_t storage_read(state_overlay_t *so, cached_account_t *ca,
         const void *leaf = compact_art_get(ca->storage_art, slot_hash);
         if (leaf) return uint256_from_bytes((const uint8_t *)leaf, 32);
     }
-    /* Fallback to flat_state (disk) */
+    /* Not in art (or art doesn't exist yet) — check flat_state (disk). */
     if (so->flat_state) {
         uint8_t val_be[32];
         if (flat_state_get_storage(so->flat_state, ca->addr_hash.bytes,
                                    slot_hash, val_be)) {
-            /* Populate per-account art with loaded value */
             if (!ca->storage_art) acct_stor_create(so, ca);
             if (ca->storage_art)
                 compact_art_insert(ca->storage_art, slot_hash, val_be);
@@ -411,6 +407,22 @@ static uint256_t storage_read(state_overlay_t *so, cached_account_t *ca,
         }
     }
     return UINT256_ZERO;
+}
+
+/* Sync per-account art storage to flat_state for a single account.
+ * Called from set_storage so flat_state stays in sync within a window. */
+static void sync_storage_to_flat(state_overlay_t *so, cached_account_t *ca,
+                                  const uint8_t slot_hash[32],
+                                  const uint256_t *value) {
+    if (!so->flat_state) return;
+    if (uint256_is_zero(value)) {
+        flat_state_delete_storage(so->flat_state, ca->addr_hash.bytes, slot_hash);
+    } else {
+        uint8_t val_be[32];
+        uint256_to_bytes(value, val_be);
+        flat_state_put_storage(so->flat_state, ca->addr_hash.bytes,
+                               slot_hash, val_be);
+    }
 }
 
 /* =========================================================================
@@ -1450,6 +1462,28 @@ void state_overlay_evict(state_overlay_t *so) {
         /* Pass 3: free stale disk slots */
         flat_store_free_stale_slots(astore, acct_stale, acct_sc);
         flat_store_free_stale_slots(sstore, stor_stale, stor_sc);
+    }
+
+    /* Flush per-account storage arts to flat_state before destroying them.
+     * The per-account art is the single source of truth — flat_state needs
+     * the latest values for next block's SLOAD after eviction. */
+    if (so->flat_state) {
+        for (uint32_t i = 0; i < so->next_acct_idx; i++) {
+            cached_account_t *ca = &so->acct_meta.entries[i];
+            if (!ca->storage_art || !ca->storage_dirty || !ca->existed) continue;
+            /* Clear old storage in flat_state, then write current art contents.
+             * This handles both modifications and deletions correctly —
+             * slots deleted from the art (zero writes) won't be re-written. */
+            flat_state_delete_all_storage(so->flat_state, ca->addr_hash.bytes);
+            compact_art_iterator_t *it = compact_art_iterator_create(ca->storage_art);
+            while (compact_art_iterator_next(it)) {
+                const uint8_t *slot_hash = compact_art_iterator_key(it);
+                const uint8_t *val_ptr = (const uint8_t *)compact_art_iterator_value(it);
+                flat_state_put_storage(so->flat_state, ca->addr_hash.bytes,
+                                       slot_hash, val_ptr);
+            }
+            compact_art_iterator_destroy(it);
+        }
     }
 
     /* Free code pointers and per-account storage art structs */
