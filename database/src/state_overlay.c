@@ -1511,35 +1511,17 @@ void state_overlay_evict(state_overlay_t *so) {
         flat_store_free_stale_slots(astore, acct_stale, acct_sc);
     }
 
-    /* Free code pointers and per-account storage art structs */
+    /* Free code pointers (storage arts kept alive for hash cache) */
     for (uint32_t i = 0; i < so->next_acct_idx; i++) {
         cached_account_t *ca = &so->acct_meta.entries[i];
         if (ca->code) { free(ca->code); ca->code = NULL; }
-        acct_stor_destroy(ca); /* frees art struct, doesn't free arena memory */
+        /* Don't destroy storage arts — keep hash cache warm */
     }
-    /* Reset storage arena — releases all physical pages at once */
-    arena_reset(&so->storage_arena);
+    /* Don't reset arena — storage arts still point into it */
 
-    /* Reset and shrink meta arrays back to minimum */
-    {
-        const uint32_t MIN_META_CAP = 4096;
-        if (so->acct_meta.capacity > MIN_META_CAP) {
-            free(so->acct_meta.entries);
-            so->acct_meta.entries = calloc(MIN_META_CAP, sizeof(cached_account_t));
-            so->acct_meta.capacity = MIN_META_CAP;
-        } else {
-            memset(so->acct_meta.entries, 0,
-                   so->acct_meta.capacity * sizeof(cached_account_t));
-        }
-    }
-
-    so->next_acct_idx = 0;
-
-    mem_art_destroy(&so->acct_index);
-    mem_art_init(&so->acct_index);
-
+    /* Don't reset acct_meta or acct_index — accounts persist across windows.
+     * Only clear dirty flags and journal. */
     dirty_clear(&so->dirty_accounts);
-
     so->journal_len = 0;
 }
 
