@@ -49,8 +49,7 @@ static const uint8_t RIPEMD_ADDR[20] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3
 };
 
-/* Types from state_meta.h: cached_account_t, cached_slot_t,
- * account_meta_pool_t, slot_meta_pool_t */
+/* Types from state_meta.h: cached_account_t, account_meta_pool_t */
 
 /* =========================================================================
  * Journal
@@ -180,7 +179,7 @@ static cached_account_t *acct_meta_ensure(account_meta_pool_t *p, uint32_t idx) 
     return &p->entries[idx];
 }
 
-/* slot_meta_pool removed — per-account storage_art is the single store */
+/* slot_meta_pool_t no longer used — per-account storage_art is the single store */
 
 /* =========================================================================
  * Main struct
@@ -1285,29 +1284,6 @@ void state_overlay_commit_tx(state_overlay_t *so) {
 /* =========================================================================
  * Clear prestate dirty (for test_runner pre-state setup)
  * ========================================================================= */
-
-static bool clear_prestate_acct_cb(const uint8_t *k, size_t kl,
-                                    const void *v, size_t vl, void *u) {
-    (void)k; (void)kl; (void)vl; (void)u;
-    cached_account_t *ca = (cached_account_t *)(uintptr_t)v;
-    ca->block_dirty = false;
-    ca->block_code_dirty = false;
-    ca->mpt_dirty = false;
-#ifdef ENABLE_HISTORY
-    ca->block_self_destructed = false;
-    ca->block_created = false;
-#endif
-    return true;
-}
-
-static bool clear_prestate_slot_cb(const uint8_t *k, size_t kl,
-                                    const void *v, size_t vl, void *u) {
-    (void)k; (void)kl; (void)vl; (void)u;
-    cached_slot_t *cs = (cached_slot_t *)(uintptr_t)v;
-    cs->block_dirty = false;
-    cs->mpt_dirty = false;
-    return true;
-}
 
 void state_overlay_clear_prestate_dirty(state_overlay_t *so) {
     if (!so) return;
