@@ -1469,6 +1469,32 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
     }
     clock_gettime(CLOCK_MONOTONIC, &t4b);
 
+    /* Step 4b. DEBUG: verify storage_root of ALL dirty accounts (not just
+     * storage_dirty). Catches stale storage_root loaded from flat_state. */
+    if (debug_verify) {
+        storage_trie_invalidate_all(so->storage_trie);
+        for (size_t d = 0; d < so->dirty_accounts.count; d++) {
+            const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+            cached_account_t *ca = find_account_meta(so, akey);
+            if (!ca || !ca->mpt_dirty || !ca->existed) continue;
+            uint8_t verify_sr[32];
+            storage_trie_root(so->storage_trie, ca->addr_hash.bytes, verify_sr);
+            if (memcmp(ca->storage_root.bytes, verify_sr, 32) != 0) {
+                fprintf(stderr, "STALE STORAGE ROOT (call %lu): addr=0x",
+                        _debug_root_call);
+                for (int j = 0; j < 20; j++) fprintf(stderr, "%02x", ca->addr.bytes[j]);
+                fprintf(stderr, " storage_dirty=%d\n  cached_sr: ",
+                        ca->storage_dirty);
+                for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", ca->storage_root.bytes[j]);
+                fprintf(stderr, "\n  actual_sr: ");
+                for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", verify_sr[j]);
+                fprintf(stderr, "\n");
+                /* Fix it so the root computation proceeds correctly */
+                memcpy(ca->storage_root.bytes, verify_sr, 32);
+            }
+        }
+    }
+
     /* Step 5. Bulk flush dirty accounts to flat_state (with final storage_root). */
     clock_gettime(CLOCK_MONOTONIC, &t5a);
     for (size_t d = 0; d < so->dirty_accounts.count; d++) {
@@ -1476,6 +1502,37 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
         cached_account_t *ca = find_account_meta(so, akey);
         if (!ca || !ca->mpt_dirty || !ca->existed) continue;
         sync_account_to_overlay(so, ca);
+
+        /* DEBUG: read back from flat_state and verify roundtrip */
+        if (debug_verify) {
+            flat_account_record_t readback;
+            if (flat_state_get_account(so->flat_state, ca->addr_hash.bytes, &readback)) {
+                uint8_t meta_bal[32], zero32[32] = {0};
+                uint256_to_bytes(&ca->balance, meta_bal);
+                const uint8_t *meta_ch = ca->has_code
+                    ? ca->code_hash.bytes : (const uint8_t *)"\xc5\xd2\x46\x01\x86\xf7\x23\x3c"
+                      "\x92\x7e\x7d\xb2\xdc\xc7\x03\xc0\xe5\x00\xb6\x53\xca\x82\x27\x3b"
+                      "\x63\xb6\x8f\xb5\x43\x8d\xc8\x20";
+                bool bal_ok = memcmp(readback.balance, meta_bal, 32) == 0;
+                bool nonce_ok = readback.nonce == ca->nonce;
+                bool ch_ok = memcmp(readback.code_hash, meta_ch, 32) == 0;
+                bool sr_ok = memcmp(readback.storage_root, ca->storage_root.bytes, 32) == 0;
+                if (!bal_ok || !nonce_ok || !ch_ok || !sr_ok) {
+                    fprintf(stderr, "SYNC ROUNDTRIP MISMATCH (call %lu): addr=0x",
+                            _debug_root_call);
+                    for (int j = 0; j < 20; j++) fprintf(stderr, "%02x", ca->addr.bytes[j]);
+                    fprintf(stderr, " bal=%d nonce=%d code_hash=%d storage_root=%d\n",
+                            bal_ok, nonce_ok, ch_ok, sr_ok);
+                    if (!sr_ok) {
+                        fprintf(stderr, "  meta_sr: ");
+                        for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", ca->storage_root.bytes[j]);
+                        fprintf(stderr, "\n  disk_sr: ");
+                        for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", readback.storage_root[j]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+        }
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
 

@@ -665,6 +665,10 @@ if(CJSON_FOUND)
         target_compile_definitions(chain_replay PRIVATE ENABLE_TUI=1)
     endif()
 
+    # History query tool
+    add_executable(history_query tools/history_query.c)
+    target_link_libraries(history_query block_executor evm common)
+
     # Full-stack stress test (evm_state → flat_state → account_trie + storage_trie)
     add_executable(stress_fullstack tools/stress_fullstack.c)
     target_link_libraries(stress_fullstack evm)
