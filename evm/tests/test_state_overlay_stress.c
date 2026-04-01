@@ -879,6 +879,465 @@ static void test_multi_tx_blocks_with_evict(void) {
 }
 
 /* =========================================================================
+ * Test 13: Evict per-block — root stability with evict every block
+ *
+ * Simulates --validate-every 1: compute root, evict, next block.
+ * Catches hash cache corruption from flush+evict cycle.
+ * ========================================================================= */
+
+static void test_evict_per_block(void) {
+    printf("test_evict_per_block:\n");
+    test_ctx_t ctx = make_ctx();
+    CHECK(ctx.es && ctx.fs, "create state");
+
+    /* Genesis: 200 accounts with balances + some with storage */
+    for (int i = 0; i < 200; i++) {
+        address_t a = make_addr((uint8_t)(i >> 8), (uint8_t)(i & 0xff));
+        uint256_t bal = uint256_from_uint64(1000000 + i * 100);
+        evm_state_set_balance(ctx.es, &a, &bal);
+        evm_state_mark_existed(ctx.es, &a);
+        if (i % 10 == 0) {
+            uint256_t key = uint256_from_uint64(i);
+            uint256_t val = uint256_from_uint64(i * 42);
+            evm_state_set_storage(ctx.es, &a, &key, &val);
+        }
+    }
+    evm_state_commit(ctx.es);
+    hash_t genesis = compute_root(ctx.es, false);
+    evm_state_clear_prestate_dirty(ctx.es);
+    evm_state_evict_cache(ctx.es);
+
+    /* Simulate 50 blocks with evict after every block */
+    hash_t prev_root = genesis;
+    for (int blk = 1; blk <= 50; blk++) {
+        evm_state_begin_block(ctx.es, blk);
+
+        /* Each block: modify 2-3 accounts (balance, storage) */
+        address_t coinbase = make_addr(0, (uint8_t)(blk % 20));
+        uint256_t reward = uint256_from_uint64(5000000);
+        evm_state_add_balance(ctx.es, &coinbase, &reward);
+
+        address_t sender = make_addr(0, (uint8_t)((blk + 50) % 200));
+        address_t recip = make_addr(0, (uint8_t)((blk + 100) % 200));
+        uint256_t amount = uint256_from_uint64(100);
+        evm_state_sub_balance(ctx.es, &sender, &amount);
+        evm_state_add_balance(ctx.es, &recip, &amount);
+
+        /* Occasionally write storage */
+        if (blk % 5 == 0) {
+            address_t stor_acct = make_addr(0, (uint8_t)((blk * 10) % 200));
+            uint256_t skey = uint256_from_uint64(blk);
+            uint256_t sval = uint256_from_uint64(blk * 1000);
+            evm_state_set_storage(ctx.es, &stor_acct, &skey, &sval);
+        }
+
+        evm_state_commit_tx(ctx.es);
+        evm_state_commit(ctx.es);
+
+        /* Compute root + verify incremental == full */
+        hash_t inc = compute_root(ctx.es, false);
+        hash_t full = compute_root_full(&ctx, false);
+
+        CHECK(!roots_match(prev_root, inc), "root changed");
+        if (!roots_match(inc, full)) {
+            fprintf(stderr, "  block %d: incremental != full\n", blk);
+            print_hash("incremental", inc);
+            print_hash("full", full);
+        }
+        CHECK(roots_match(inc, full), "incremental == full");
+
+        prev_root = inc;
+
+        /* Evict after every block (like --validate-every 1) */
+        evm_state_evict_cache(ctx.es);
+    }
+
+    PASS("evict per-block (50 blocks)");
+    free_ctx(&ctx);
+}
+
+/* =========================================================================
+ * Test 14: Reverted CREATE doesn't leak dirty flags
+ *
+ * CREATE + revert should leave state unchanged. Catches the mpt_dirty
+ * leak we fixed in JOURNAL_CODE and JOURNAL_ACCOUNT_CREATE.
+ * ========================================================================= */
+
+static void test_reverted_create_no_leak(void) {
+    printf("test_reverted_create_no_leak:\n");
+    test_ctx_t ctx = make_ctx();
+    CHECK(ctx.es && ctx.fs, "create state");
+
+    /* Setup: 10 accounts */
+    for (int i = 0; i < 10; i++) {
+        address_t a = make_addr(0, (uint8_t)i);
+        uint256_t bal = uint256_from_uint64(1000000);
+        evm_state_set_balance(ctx.es, &a, &bal);
+        evm_state_mark_existed(ctx.es, &a);
+    }
+    evm_state_commit(ctx.es);
+    hash_t root_before = compute_root(ctx.es, false);
+    evm_state_clear_prestate_dirty(ctx.es);
+
+    /* Block 1: snapshot, create account, set code, revert */
+    evm_state_begin_block(ctx.es, 1);
+    uint32_t snap = evm_state_snapshot(ctx.es);
+
+    address_t new_acct = make_addr(0, 99);
+    evm_state_create_account(ctx.es, &new_acct);
+    uint8_t code[] = {0x60, 0x00, 0x60, 0x00, 0xf3}; /* PUSH 0, PUSH 0, RETURN */
+    evm_state_set_code(ctx.es, &new_acct, code, sizeof(code));
+    uint256_t stor_key = uint256_from_uint64(1);
+    uint256_t stor_val = uint256_from_uint64(42);
+    evm_state_set_storage(ctx.es, &new_acct, &stor_key, &stor_val);
+
+    /* Revert everything */
+    evm_state_revert(ctx.es, snap);
+    evm_state_commit_tx(ctx.es);
+    evm_state_commit(ctx.es);
+
+    /* Root should be unchanged */
+    hash_t root_after = compute_root(ctx.es, false);
+    hash_t root_full = compute_root_full(&ctx, false);
+
+    if (!roots_match(root_before, root_after)) {
+        print_hash("before", root_before);
+        print_hash("after", root_after);
+        print_hash("full", root_full);
+    }
+    CHECK(roots_match(root_before, root_after), "root unchanged after reverted CREATE");
+    CHECK(roots_match(root_after, root_full), "incremental == full after revert");
+
+    PASS("reverted CREATE no dirty leak");
+    free_ctx(&ctx);
+}
+
+/* =========================================================================
+ * Test 15: Reverted CALL touch doesn't leak dirty flags
+ *
+ * Simulates add_balance(0) + revert (CALL to empty account that fails).
+ * ========================================================================= */
+
+static void test_reverted_touch_no_leak(void) {
+    printf("test_reverted_touch_no_leak:\n");
+    test_ctx_t ctx = make_ctx();
+    CHECK(ctx.es && ctx.fs, "create state");
+
+    /* Setup: 10 accounts, one empty */
+    for (int i = 0; i < 10; i++) {
+        address_t a = make_addr(0, (uint8_t)i);
+        uint256_t bal = uint256_from_uint64(i == 5 ? 0 : 1000000);
+        evm_state_set_balance(ctx.es, &a, &bal);
+        evm_state_mark_existed(ctx.es, &a);
+    }
+    evm_state_commit(ctx.es);
+    hash_t root_before = compute_root(ctx.es, false);
+    evm_state_clear_prestate_dirty(ctx.es);
+
+    /* Block 1: snapshot, touch empty account (add_balance(0)), revert */
+    evm_state_begin_block(ctx.es, 1);
+    uint32_t snap = evm_state_snapshot(ctx.es);
+
+    address_t empty = make_addr(0, 5);
+    uint256_t zero = UINT256_ZERO;
+    evm_state_add_balance(ctx.es, &empty, &zero);
+
+    /* Revert */
+    evm_state_revert(ctx.es, snap);
+    evm_state_commit_tx(ctx.es);
+    evm_state_commit(ctx.es);
+
+    hash_t root_after = compute_root(ctx.es, false);
+    hash_t root_full = compute_root_full(&ctx, false);
+
+    if (!roots_match(root_before, root_after)) {
+        print_hash("before", root_before);
+        print_hash("after", root_after);
+        print_hash("full", root_full);
+    }
+    CHECK(roots_match(root_before, root_after), "root unchanged after reverted touch");
+    CHECK(roots_match(root_after, root_full), "incremental == full after revert");
+
+    PASS("reverted touch no dirty leak");
+    free_ctx(&ctx);
+}
+
+/* =========================================================================
+ * Test 16: Reverted storage write doesn't leak dirty flags
+ * ========================================================================= */
+
+static void test_reverted_sstore_no_leak(void) {
+    printf("test_reverted_sstore_no_leak:\n");
+    test_ctx_t ctx = make_ctx();
+    CHECK(ctx.es && ctx.fs, "create state");
+
+    /* Setup: 5 accounts, account 3 has storage */
+    for (int i = 0; i < 5; i++) {
+        address_t a = make_addr(0, (uint8_t)i);
+        uint256_t bal = uint256_from_uint64(1000000);
+        evm_state_set_balance(ctx.es, &a, &bal);
+        evm_state_mark_existed(ctx.es, &a);
+    }
+    address_t stor_acct = make_addr(0, 3);
+    uint256_t skey = uint256_from_uint64(1);
+    uint256_t sval = uint256_from_uint64(100);
+    evm_state_set_storage(ctx.es, &stor_acct, &skey, &sval);
+    evm_state_commit(ctx.es);
+    hash_t root_before = compute_root(ctx.es, false);
+    evm_state_clear_prestate_dirty(ctx.es);
+
+    /* Block 1: snapshot, write storage, revert */
+    evm_state_begin_block(ctx.es, 1);
+    uint32_t snap = evm_state_snapshot(ctx.es);
+
+    uint256_t new_sval = uint256_from_uint64(999);
+    evm_state_set_storage(ctx.es, &stor_acct, &skey, &new_sval);
+    /* Also write a new slot */
+    uint256_t skey2 = uint256_from_uint64(2);
+    uint256_t sval2 = uint256_from_uint64(777);
+    evm_state_set_storage(ctx.es, &stor_acct, &skey2, &sval2);
+
+    /* Revert */
+    evm_state_revert(ctx.es, snap);
+    evm_state_commit_tx(ctx.es);
+    evm_state_commit(ctx.es);
+
+    hash_t root_after = compute_root(ctx.es, false);
+    hash_t root_full = compute_root_full(&ctx, false);
+
+    if (!roots_match(root_before, root_after)) {
+        print_hash("before", root_before);
+        print_hash("after", root_after);
+        print_hash("full", root_full);
+    }
+    CHECK(roots_match(root_before, root_after), "root unchanged after reverted SSTORE");
+    CHECK(roots_match(root_after, root_full), "incremental == full after revert");
+
+    PASS("reverted SSTORE no dirty leak");
+    free_ctx(&ctx);
+}
+
+/* =========================================================================
+ * Test 17: EIP-161 RIPEMD special case
+ *
+ * Touch RIPEMD (0x3) with prune_empty=true, revert.
+ * RIPEMD should still get pruned (dirty persists through revert).
+ * ========================================================================= */
+
+static void test_ripemd_pruning(void) {
+    printf("test_ripemd_pruning:\n");
+    test_ctx_t ctx = make_ctx();
+    CHECK(ctx.es && ctx.fs, "create state");
+    evm_state_set_prune_empty(ctx.es, true);
+
+    /* Setup: 5 accounts + RIPEMD (0x3) as empty */
+    for (int i = 0; i < 5; i++) {
+        address_t a = make_addr(0, (uint8_t)(i + 1));
+        uint256_t bal = uint256_from_uint64(1000000);
+        evm_state_set_balance(ctx.es, &a, &bal);
+        evm_state_mark_existed(ctx.es, &a);
+    }
+    /* RIPEMD — empty account that exists in trie */
+    address_t ripemd = {{0}};
+    ripemd.bytes[19] = 3;
+    uint256_t zero_bal = UINT256_ZERO;
+    evm_state_set_balance(ctx.es, &ripemd, &zero_bal);
+    evm_state_mark_existed(ctx.es, &ripemd);
+
+    evm_state_commit(ctx.es);
+    hash_t root_with_ripemd = compute_root(ctx.es, true);
+    evm_state_clear_prestate_dirty(ctx.es);
+
+    /* Block: snapshot, touch RIPEMD (add_balance(0)), revert */
+    evm_state_begin_block(ctx.es, 1);
+    uint32_t snap = evm_state_snapshot(ctx.es);
+    evm_state_add_balance(ctx.es, &ripemd, &zero_bal);
+    evm_state_revert(ctx.es, snap);
+    evm_state_commit_tx(ctx.es);
+    evm_state_commit(ctx.es);
+
+    hash_t root_after = compute_root(ctx.es, true);
+
+    /* RIPEMD should be pruned — root must differ from root_with_ripemd */
+    CHECK(!roots_match(root_with_ripemd, root_after),
+          "RIPEMD pruned after reverted touch (root changed)");
+
+    /* Verify the empty RIPEMD no longer exists */
+    CHECK(!evm_state_exists(ctx.es, &ripemd), "RIPEMD not in state after prune");
+
+    hash_t root_full = compute_root_full(&ctx, true);
+    CHECK(roots_match(root_after, root_full), "incremental == full after RIPEMD prune");
+
+    PASS("RIPEMD EIP-161 pruning");
+    free_ctx(&ctx);
+}
+
+/* =========================================================================
+ * Test 18: RIPEMD NOT pruned on pre-SD (prune_empty=false)
+ * ========================================================================= */
+
+static void test_ripemd_no_prune_frontier(void) {
+    printf("test_ripemd_no_prune_frontier:\n");
+    test_ctx_t ctx = make_ctx();
+    CHECK(ctx.es && ctx.fs, "create state");
+    evm_state_set_prune_empty(ctx.es, false);
+
+    /* Setup: RIPEMD as empty existed account */
+    address_t ripemd = {{0}};
+    ripemd.bytes[19] = 3;
+    uint256_t zero_bal = UINT256_ZERO;
+    evm_state_set_balance(ctx.es, &ripemd, &zero_bal);
+    evm_state_mark_existed(ctx.es, &ripemd);
+
+    address_t other = make_addr(0, 1);
+    uint256_t bal = uint256_from_uint64(1000000);
+    evm_state_set_balance(ctx.es, &other, &bal);
+    evm_state_mark_existed(ctx.es, &other);
+
+    evm_state_commit(ctx.es);
+    hash_t root_before = compute_root(ctx.es, false);
+    evm_state_clear_prestate_dirty(ctx.es);
+
+    /* Block: snapshot, touch RIPEMD, revert */
+    evm_state_begin_block(ctx.es, 1);
+    uint32_t snap = evm_state_snapshot(ctx.es);
+    evm_state_add_balance(ctx.es, &ripemd, &zero_bal);
+    evm_state_revert(ctx.es, snap);
+    evm_state_commit_tx(ctx.es);
+    evm_state_commit(ctx.es);
+
+    hash_t root_after = compute_root(ctx.es, false);
+
+    /* Pre-SD: RIPEMD should NOT be pruned, root unchanged */
+    if (!roots_match(root_before, root_after)) {
+        print_hash("before", root_before);
+        print_hash("after", root_after);
+    }
+    CHECK(roots_match(root_before, root_after),
+          "RIPEMD NOT pruned on Frontier (root unchanged)");
+
+    PASS("RIPEMD no prune on Frontier");
+    free_ctx(&ctx);
+}
+
+/* =========================================================================
+ * Test 19: Evict stability with storage — per-block evict with storage mods
+ *
+ * Exercises the storage trie hash cache across eviction boundaries.
+ * ========================================================================= */
+
+static void test_evict_storage_stability(void) {
+    printf("test_evict_storage_stability:\n");
+    test_ctx_t ctx = make_ctx();
+    CHECK(ctx.es && ctx.fs, "create state");
+
+    /* Genesis: 20 accounts, 5 with storage */
+    for (int i = 0; i < 20; i++) {
+        address_t a = make_addr(0, (uint8_t)i);
+        uint256_t bal = uint256_from_uint64(1000000 + i);
+        evm_state_set_balance(ctx.es, &a, &bal);
+        evm_state_mark_existed(ctx.es, &a);
+        if (i < 5) {
+            for (int s = 0; s < 10; s++) {
+                uint256_t sk = uint256_from_uint64(s);
+                uint256_t sv = uint256_from_uint64(i * 1000 + s);
+                evm_state_set_storage(ctx.es, &a, &sk, &sv);
+            }
+        }
+    }
+    evm_state_commit(ctx.es);
+    compute_root(ctx.es, false);
+    evm_state_clear_prestate_dirty(ctx.es);
+    evm_state_evict_cache(ctx.es);
+
+    /* 30 blocks: each modifies 1 storage slot, evict after each */
+    for (int blk = 1; blk <= 30; blk++) {
+        evm_state_begin_block(ctx.es, blk);
+
+        address_t acct = make_addr(0, (uint8_t)(blk % 5));
+        uint256_t sk = uint256_from_uint64(blk % 10);
+        uint256_t sv = uint256_from_uint64(blk * 9999);
+        evm_state_set_storage(ctx.es, &acct, &sk, &sv);
+
+        /* Also do a balance change (coinbase reward) */
+        address_t cb = make_addr(0, (uint8_t)((blk + 10) % 20));
+        uint256_t rw = uint256_from_uint64(5000);
+        evm_state_add_balance(ctx.es, &cb, &rw);
+
+        evm_state_commit_tx(ctx.es);
+        evm_state_commit(ctx.es);
+
+        hash_t inc = compute_root(ctx.es, false);
+        hash_t full = compute_root_full(&ctx, false);
+
+        if (!roots_match(inc, full)) {
+            fprintf(stderr, "  block %d: incremental != full\n", blk);
+            print_hash("incremental", inc);
+            print_hash("full", full);
+        }
+        CHECK(roots_match(inc, full), "incremental == full with storage");
+
+        evm_state_evict_cache(ctx.es);
+    }
+
+    PASS("evict stability with storage (30 blocks)");
+    free_ctx(&ctx);
+}
+
+/* =========================================================================
+ * Test 20: Reverted self-destruct doesn't leak dirty
+ * ========================================================================= */
+
+static void test_reverted_selfdestruct_no_leak(void) {
+    printf("test_reverted_selfdestruct_no_leak:\n");
+    test_ctx_t ctx = make_ctx();
+    CHECK(ctx.es && ctx.fs, "create state");
+
+    /* Setup: 5 accounts, one with code and storage */
+    for (int i = 0; i < 5; i++) {
+        address_t a = make_addr(0, (uint8_t)i);
+        uint256_t bal = uint256_from_uint64(1000000);
+        evm_state_set_balance(ctx.es, &a, &bal);
+        evm_state_mark_existed(ctx.es, &a);
+    }
+    address_t contract = make_addr(0, 3);
+    uint8_t code[] = {0x60, 0x00, 0xff}; /* PUSH 0, SELFDESTRUCT */
+    evm_state_set_code(ctx.es, &contract, code, sizeof(code));
+    uint256_t sk = uint256_from_uint64(1);
+    uint256_t sv = uint256_from_uint64(42);
+    evm_state_set_storage(ctx.es, &contract, &sk, &sv);
+
+    evm_state_commit(ctx.es);
+    hash_t root_before = compute_root(ctx.es, false);
+    evm_state_clear_prestate_dirty(ctx.es);
+
+    /* Block 1: snapshot, self-destruct, revert */
+    evm_state_begin_block(ctx.es, 1);
+    uint32_t snap = evm_state_snapshot(ctx.es);
+
+    evm_state_self_destruct(ctx.es, &contract);
+
+    evm_state_revert(ctx.es, snap);
+    evm_state_commit_tx(ctx.es);
+    evm_state_commit(ctx.es);
+
+    hash_t root_after = compute_root(ctx.es, false);
+    hash_t root_full = compute_root_full(&ctx, false);
+
+    if (!roots_match(root_before, root_after)) {
+        print_hash("before", root_before);
+        print_hash("after", root_after);
+        print_hash("full", root_full);
+    }
+    CHECK(roots_match(root_before, root_after),
+          "root unchanged after reverted SELFDESTRUCT");
+    CHECK(roots_match(root_after, root_full), "incremental == full");
+
+    PASS("reverted SELFDESTRUCT no dirty leak");
+    free_ctx(&ctx);
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -897,6 +1356,14 @@ int main(void) {
     test_eip161_pruning();
     test_transaction_execute_transfer();
     test_multi_tx_blocks_with_evict();
+    test_evict_per_block();
+    test_reverted_create_no_leak();
+    test_reverted_touch_no_leak();
+    test_reverted_sstore_no_leak();
+    test_ripemd_pruning();
+    test_ripemd_no_prune_frontier();
+    test_evict_storage_stability();
+    test_reverted_selfdestruct_no_leak();
 
     printf("\n=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);

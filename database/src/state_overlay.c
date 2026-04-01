@@ -67,16 +67,22 @@ typedef struct {
         struct { uint64_t val; bool dirty; bool block_dirty; bool mpt_dirty; } nonce;
         struct { uint256_t val; bool dirty; bool block_dirty; bool mpt_dirty; } balance;
         struct { hash_t old_hash; bool old_has_code; uint8_t *old_code;
-                 uint32_t old_code_size; } code;
-        struct { uint256_t slot; uint256_t old_value; bool old_mpt_dirty; } storage;
+                 uint32_t old_code_size;
+                 bool old_dirty; bool old_code_dirty;
+                 bool old_block_dirty; bool old_block_code_dirty;
+                 bool old_mpt_dirty; } code;
+        struct { uint256_t slot; uint256_t old_value;
+                 bool old_dirty; bool old_block_dirty; bool old_mpt_dirty;
+                 bool old_acct_storage_dirty; bool old_acct_mpt_dirty; } storage;
         uint256_t slot;
-        bool old_self_destructed;
+        struct { bool old_self_destructed; bool old_dirty; bool old_block_dirty; bool old_mpt_dirty; } sd;
         struct {
             uint64_t old_nonce; uint256_t old_balance;
             hash_t old_code_hash; bool old_has_code;
             uint8_t *old_code; uint32_t old_code_size;
             bool old_dirty; bool old_code_dirty;
             bool old_block_dirty; bool old_block_code_dirty;
+            bool old_mpt_dirty;
             bool old_created; bool old_existed; bool old_self_destructed;
             hash_t old_storage_root;
             bool old_storage_dirty; bool old_storage_cleared;
@@ -612,13 +618,19 @@ void state_overlay_set_storage(state_overlay_t *so, const address_t *addr,
     cached_slot_t *cs = ensure_slot(so, addr, key);
     if (!cs) return;
 
+    cached_account_t *ca = ensure_account(so, addr);
+
     journal_entry_t je = {
         .type = JOURNAL_STORAGE,
         .addr = *addr,
         .data.storage = {
             .slot = *key,
             .old_value = cs->current,
-            .old_mpt_dirty = cs->mpt_dirty
+            .old_dirty = cs->dirty,
+            .old_block_dirty = cs->block_dirty,
+            .old_mpt_dirty = cs->mpt_dirty,
+            .old_acct_storage_dirty = ca ? ca->storage_dirty : false,
+            .old_acct_mpt_dirty = ca ? ca->mpt_dirty : false,
         }
     };
     journal_push(so, &je);
@@ -629,7 +641,6 @@ void state_overlay_set_storage(state_overlay_t *so, const address_t *addr,
     cs->block_dirty = true;
     mark_slot_mpt_dirty(so, cs);
 
-    cached_account_t *ca = ensure_account(so, addr);
     if (ca) {
         ca->storage_dirty = true;
         mark_account_mpt_dirty(so, ca);
@@ -689,7 +700,11 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
                 ca->code_size = je->data.code.old_code_size;
                 ca->code_hash = je->data.code.old_hash;
                 ca->has_code = je->data.code.old_has_code;
-            
+                ca->dirty = je->data.code.old_dirty;
+                ca->code_dirty = je->data.code.old_code_dirty;
+                ca->block_dirty = je->data.code.old_block_dirty;
+                ca->block_code_dirty = je->data.code.old_block_code_dirty;
+                ca->mpt_dirty = je->data.code.old_mpt_dirty;
             }
             je->data.code.old_code = NULL;
             break;
@@ -700,7 +715,14 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
             cached_slot_t *cs = find_slot_meta(so, skey);
             if (cs) {
                 cs->current = je->data.storage.old_value;
+                cs->dirty = je->data.storage.old_dirty;
+                cs->block_dirty = je->data.storage.old_block_dirty;
                 cs->mpt_dirty = je->data.storage.old_mpt_dirty;
+            }
+            cached_account_t *ca = find_account_meta(so, je->addr.bytes);
+            if (ca) {
+                ca->storage_dirty = je->data.storage.old_acct_storage_dirty;
+                ca->mpt_dirty = je->data.storage.old_acct_mpt_dirty;
             }
             break;
         }
@@ -718,6 +740,7 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
                 ca->code_dirty      = je->data.create.old_code_dirty;
                 ca->block_dirty     = je->data.create.old_block_dirty;
                 ca->block_code_dirty = je->data.create.old_block_code_dirty;
+                ca->mpt_dirty       = je->data.create.old_mpt_dirty;
                 ca->created         = je->data.create.old_created;
                 ca->existed         = je->data.create.old_existed;
                 ca->self_destructed = je->data.create.old_self_destructed;
@@ -734,8 +757,12 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
         }
         case JOURNAL_SELF_DESTRUCT: {
             cached_account_t *ca = find_account_meta(so, je->addr.bytes);
-            if (ca)
-                ca->self_destructed = je->data.old_self_destructed;
+            if (ca) {
+                ca->self_destructed = je->data.sd.old_self_destructed;
+                ca->dirty = je->data.sd.old_dirty;
+                ca->block_dirty = je->data.sd.old_block_dirty;
+                ca->mpt_dirty = je->data.sd.old_mpt_dirty;
+            }
             break;
         }
         case JOURNAL_WARM_ADDR:
@@ -824,7 +851,10 @@ void state_overlay_set_code(state_overlay_t *so, const address_t *addr,
     journal_entry_t je = {
         .type = JOURNAL_CODE, .addr = *addr,
         .data.code = { .old_hash = ca->code_hash, .old_has_code = ca->has_code,
-                        .old_code = ca->code, .old_code_size = ca->code_size }
+                        .old_code = ca->code, .old_code_size = ca->code_size,
+                        .old_dirty = ca->dirty, .old_code_dirty = ca->code_dirty,
+                        .old_block_dirty = ca->block_dirty, .old_block_code_dirty = ca->block_code_dirty,
+                        .old_mpt_dirty = ca->mpt_dirty }
     };
     if (!journal_push(so, &je))
         free(ca->code);
@@ -925,6 +955,7 @@ void state_overlay_create_account(state_overlay_t *so, const address_t *addr) {
             .old_code = ca->code, .old_code_size = ca->code_size,
             .old_dirty = ca->dirty, .old_code_dirty = ca->code_dirty,
             .old_block_dirty = ca->block_dirty, .old_block_code_dirty = ca->block_code_dirty,
+            .old_mpt_dirty = ca->mpt_dirty,
             .old_created = ca->created, .old_existed = ca->existed,
             .old_self_destructed = ca->self_destructed,
             .old_storage_root = ca->storage_root,
@@ -968,7 +999,9 @@ void state_overlay_self_destruct(state_overlay_t *so, const address_t *addr) {
 
     journal_entry_t je = {
         .type = JOURNAL_SELF_DESTRUCT, .addr = *addr,
-        .data.old_self_destructed = ca->self_destructed,
+        .data.sd = { .old_self_destructed = ca->self_destructed,
+                     .old_dirty = ca->dirty, .old_block_dirty = ca->block_dirty,
+                     .old_mpt_dirty = ca->mpt_dirty },
     };
     journal_push(so, &je);
 
@@ -1326,9 +1359,26 @@ void state_overlay_clear_prestate_dirty(state_overlay_t *so) {
  *   6. Clear dirty flags
  * ========================================================================= */
 
+static uint64_t _debug_root_call = 0;
+/* Set via env DEBUG_VERIFY_FROM=N to enable full recompute verification
+ * starting at the Nth root computation (roughly = block number). */
+static uint64_t _debug_verify_from = 0;
+static bool _debug_env_checked = false;
+
 hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
     hash_t root = hash_zero();
     if (!so) return root;
+
+    if (!_debug_env_checked) {
+        const char *env = getenv("DEBUG_VERIFY_FROM");
+        if (env) _debug_verify_from = (uint64_t)atoll(env);
+        _debug_env_checked = true;
+    }
+    _debug_root_call++;
+    bool debug_verify = (_debug_verify_from > 0 && _debug_root_call >= _debug_verify_from);
+    if (debug_verify && _debug_root_call == _debug_verify_from)
+        fprintf(stderr, "DEBUG_VERIFY: activated at call %lu (from=%lu)\n",
+                _debug_root_call, _debug_verify_from);
     if (!so->flat_state || !so->account_trie) {
         fprintf(stderr, "FATAL: compute_mpt_root without flat_state/account_trie\n");
         return root;
@@ -1394,8 +1444,28 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
         const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
         cached_account_t *ca = find_account_meta(so, akey);
         if (!ca || !ca->storage_dirty || !ca->existed) continue;
+
+        hash_t old_sr = ca->storage_root;
         storage_trie_root(so->storage_trie, ca->addr_hash.bytes,
                            ca->storage_root.bytes);
+        if (debug_verify) {
+            uint8_t verify_sr[32];
+            storage_trie_invalidate_all(so->storage_trie);
+            storage_trie_root(so->storage_trie, ca->addr_hash.bytes, verify_sr);
+            if (memcmp(ca->storage_root.bytes, verify_sr, 32) != 0) {
+                fprintf(stderr, "STORAGE HASH CACHE BUG (call %lu): addr=0x",
+                        _debug_root_call);
+                for (int j = 0; j < 20; j++) fprintf(stderr, "%02x", ca->addr.bytes[j]);
+                fprintf(stderr, "\n  incremental: ");
+                for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", ca->storage_root.bytes[j]);
+                fprintf(stderr, "\n  full:        ");
+                for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", verify_sr[j]);
+                fprintf(stderr, "\n  old_sr:      ");
+                for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", old_sr.bytes[j]);
+                fprintf(stderr, "\n");
+                memcpy(ca->storage_root.bytes, verify_sr, 32);
+            }
+        }
     }
     clock_gettime(CLOCK_MONOTONIC, &t4b);
 
@@ -1411,6 +1481,35 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
 
     /* Step 6. Compute account trie root from flat_state */
     account_trie_root(so->account_trie, root.bytes);
+
+    if (debug_verify) {
+        hash_t verify;
+        account_trie_invalidate_all(so->account_trie);
+        account_trie_root(so->account_trie, verify.bytes);
+        if (memcmp(root.bytes, verify.bytes, 32) != 0) {
+            fprintf(stderr, "ACCT HASH CACHE BUG (call %lu): incremental != full\n",
+                    _debug_root_call);
+            fprintf(stderr, "  incremental: ");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", root.bytes[i]);
+            fprintf(stderr, "\n  full:        ");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", verify.bytes[i]);
+            fprintf(stderr, "\n  dirty_accounts=%zu dirty_slots=%zu prune_empty=%d\n",
+                    dirty_count, so->dirty_slots.count, prune_empty);
+            for (size_t d = 0; d < so->dirty_accounts.count; d++) {
+                const uint8_t *ak = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+                cached_account_t *cx = find_account_meta(so, ak);
+                if (!cx) continue;
+                fprintf(stderr, "  dirty[%zu]: 0x", d);
+                for (int j = 0; j < 20; j++) fprintf(stderr, "%02x", cx->addr.bytes[j]);
+                fprintf(stderr, " existed=%d mpt_dirty=%d block_dirty=%d "
+                        "nonce=%lu empty=%d\n",
+                        cx->existed, cx->mpt_dirty, cx->block_dirty,
+                        cx->nonce,
+                        (cx->nonce == 0 && uint256_is_zero(&cx->balance) && !cx->has_code));
+            }
+            root = verify;
+        }
+    }
     clock_gettime(CLOCK_MONOTONIC, &t2);
 
     /* Step 7. Clear dirty flags and reset dirty vectors */
@@ -1440,6 +1539,15 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
 
 void state_overlay_evict(state_overlay_t *so) {
     if (!so) return;
+
+    /* DEBUG: save pre-evict root for comparison */
+    bool debug_evict = (_debug_verify_from > 0 && _debug_root_call >= _debug_verify_from);
+    hash_t pre_evict_root = hash_zero();
+    if (debug_evict && so->account_trie) {
+        account_trie_invalidate_all(so->account_trie);
+        account_trie_root(so->account_trie, pre_evict_root.bytes);
+    }
+
     if (so->flat_state) {
         flat_store_t *astore = flat_state_account_store(so->flat_state);
         flat_store_t *sstore = flat_state_storage_store(so->flat_state);
@@ -1457,6 +1565,21 @@ void state_overlay_evict(state_overlay_t *so) {
         /* Pass 3: free stale disk slots */
         flat_store_free_stale_slots(astore, acct_stale, acct_sc);
         flat_store_free_stale_slots(sstore, stor_stale, stor_sc);
+    }
+
+    if (debug_evict && so->account_trie) {
+        hash_t post_flush_root;
+        account_trie_invalidate_all(so->account_trie);
+        account_trie_root(so->account_trie, post_flush_root.bytes);
+        if (memcmp(pre_evict_root.bytes, post_flush_root.bytes, 32) != 0) {
+            fprintf(stderr, "EVICT BUG (call %lu): root changed after flush+evict!\n",
+                    _debug_root_call);
+            fprintf(stderr, "  before: ");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", pre_evict_root.bytes[i]);
+            fprintf(stderr, "\n  after:  ");
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", post_flush_root.bytes[i]);
+            fprintf(stderr, "\n");
+        }
     }
 
     /* Free code pointers in used portion of meta */

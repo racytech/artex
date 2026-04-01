@@ -320,6 +320,10 @@ add_executable(test_state_overlay_stress
 target_link_libraries(test_state_overlay_stress evm)
 add_test(NAME test_state_overlay_stress COMMAND test_state_overlay_stress)
 
+add_executable(test_art_mpt_fuzz database/tests/test_art_mpt_fuzz.c)
+target_link_libraries(test_art_mpt_fuzz art_mpt compact_art common)
+add_test(NAME test_art_mpt_fuzz COMMAND test_art_mpt_fuzz)
+
 add_executable(test_flat_state_roundtrip
     evm/tests/test_flat_state_roundtrip.c
 )
