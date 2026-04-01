@@ -651,6 +651,87 @@ static void test_large_scale(void) {
 }
 
 /* =========================================================================
+ * Test 9: Small-pool mode — per-account sized compact_art
+ *
+ * Tests compact_art_init_ex with small reserves (4MB/8MB) to verify
+ * it works correctly for per-account storage use case.
+ * ========================================================================= */
+
+#define SMALL_NODE_RESERVE  (4ULL * 1024 * 1024)   /* 4 MB */
+#define SMALL_LEAF_RESERVE  (8ULL * 1024 * 1024)   /* 8 MB */
+
+static void test_small_pool(void) {
+    printf("test_small_pool:\n");
+    rng_seed(44444);
+    reset_keys();
+
+    /* Create many small trees (simulates many accounts with storage) */
+    #define NUM_SMALL_TREES 100
+    compact_art_t trees[NUM_SMALL_TREES];
+    art_mpt_t *mpts[NUM_SMALL_TREES];
+
+    for (int t = 0; t < NUM_SMALL_TREES; t++) {
+        bool ok = compact_art_init_ex(&trees[t], 32, sizeof(leaf_val_t) + 64,
+                                       false, NULL, NULL,
+                                       SMALL_NODE_RESERVE, SMALL_LEAF_RESERVE);
+        CHECK(ok, "init small tree %d", t);
+        mpts[t] = art_mpt_create(&trees[t], fuzz_encode, NULL);
+        CHECK(mpts[t], "create mpt %d", t);
+    }
+
+    /* Insert varying amounts of data per tree (1-200 keys) */
+    for (int t = 0; t < NUM_SMALL_TREES; t++) {
+        int n = 1 + rng_range(200);
+        for (int i = 0; i < n; i++) {
+            uint8_t key[32];
+            rng_bytes(key, 32);
+            leaf_val_t *v = make_value(1 + rng_range(32));
+            compact_art_insert(&trees[t], key, v);
+            free(v);
+        }
+
+        /* Verify each tree */
+        if (!verify_roots(&trees[t], mpts[t], t, "small tree insert")) {
+            tests_failed++;
+            for (int j = 0; j < NUM_SMALL_TREES; j++) {
+                art_mpt_destroy(mpts[j]);
+                compact_art_destroy(&trees[j]);
+            }
+            return;
+        }
+    }
+
+    /* Update some entries in each tree */
+    for (int t = 0; t < NUM_SMALL_TREES; t++) {
+        /* Can't easily pick existing keys without tracking them per-tree,
+         * so just insert more (some will be new, some overwrites) */
+        for (int i = 0; i < 20; i++) {
+            uint8_t key[32];
+            rng_bytes(key, 32);
+            leaf_val_t *v = make_value(1 + rng_range(32));
+            compact_art_insert(&trees[t], key, v);
+            free(v);
+        }
+        if (!verify_roots(&trees[t], mpts[t], t, "small tree update")) {
+            tests_failed++;
+            for (int j = 0; j < NUM_SMALL_TREES; j++) {
+                art_mpt_destroy(mpts[j]);
+                compact_art_destroy(&trees[j]);
+            }
+            return;
+        }
+    }
+
+    /* Clean up all trees */
+    for (int t = 0; t < NUM_SMALL_TREES; t++) {
+        art_mpt_destroy(mpts[t]);
+        compact_art_destroy(&trees[t]);
+    }
+
+    PASS("small-pool mode (100 trees, 1-200 keys each)");
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -671,6 +752,7 @@ int main(int argc, char **argv) {
     test_value_rewrite();
     test_delete_reinsert();
     test_large_scale();
+    test_small_pool();
 
     printf("\n=== Results: %d passed, %d failed (seed=%lu) ===\n",
            tests_passed, tests_failed, seed);

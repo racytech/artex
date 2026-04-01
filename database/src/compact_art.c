@@ -1167,9 +1167,10 @@ static compact_ref_t delete_recursive(compact_art_t *tree, compact_ref_t ref,
 // Public API
 // ============================================================================
 
-bool compact_art_init(compact_art_t *tree, uint32_t key_size,
-                      uint32_t value_size, bool compact_leaves,
-                      compact_art_key_fetch_t key_fetch, void *key_fetch_ctx) {
+bool compact_art_init_ex(compact_art_t *tree, uint32_t key_size,
+                         uint32_t value_size, bool compact_leaves,
+                         compact_art_key_fetch_t key_fetch, void *key_fetch_ctx,
+                         size_t node_reserve, size_t leaf_reserve) {
     if (!tree || key_size == 0) return false;
 
     memset(tree, 0, sizeof(*tree));
@@ -1183,14 +1184,9 @@ bool compact_art_init(compact_art_t *tree, uint32_t key_size,
     tree->key_fetch = key_fetch;
     tree->key_fetch_ctx = key_fetch_ctx;
 
-    if (!pool_init(&tree->nodes, COMPACT_NODE_POOL_RESERVE)) return false;
+    if (!pool_init(&tree->nodes, node_reserve)) return false;
     // Skip offset 0 so ref=0 means NULL
     tree->nodes.used = 8;
-
-    // Leaf pool: reserve enough for ~1.8B leaves
-    size_t leaf_reserve = (size_t)tree->leaf_size * (1UL << 31);
-    if (leaf_reserve > COMPACT_LEAF_POOL_RESERVE)
-        leaf_reserve = COMPACT_LEAF_POOL_RESERVE;
 
     if (!pool_init(&tree->leaves, leaf_reserve)) {
         pool_destroy(&tree->nodes);
@@ -1198,6 +1194,19 @@ bool compact_art_init(compact_art_t *tree, uint32_t key_size,
     }
 
     return true;
+}
+
+bool compact_art_init(compact_art_t *tree, uint32_t key_size,
+                      uint32_t value_size, bool compact_leaves,
+                      compact_art_key_fetch_t key_fetch, void *key_fetch_ctx) {
+    // Default large reserves for global flat_store indexes
+    size_t leaf_reserve = (size_t)(compact_leaves ? 8 + value_size : key_size + value_size)
+                          * (1UL << 31);
+    if (leaf_reserve > COMPACT_LEAF_POOL_RESERVE)
+        leaf_reserve = COMPACT_LEAF_POOL_RESERVE;
+    return compact_art_init_ex(tree, key_size, value_size, compact_leaves,
+                                key_fetch, key_fetch_ctx,
+                                COMPACT_NODE_POOL_RESERVE, leaf_reserve);
 }
 
 void compact_art_destroy(compact_art_t *tree) {

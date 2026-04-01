@@ -16,6 +16,7 @@
 #include "compact_art.h"
 #include "storage_trie.h"
 #include "account_trie.h"
+#include "art_mpt.h"
 #include "keccak256.h"
 #include "mem_art.h"
 #include <stdlib.h>
@@ -31,6 +32,12 @@
 #define SLOT_KEY_SIZE     STATE_META_SLOT_KEY_SIZE
 #define ADDRESS_KEY_SIZE  20
 #define MAX_CODE_SIZE     (24 * 1024 + 1)
+
+/* Per-account storage art pool sizes (virtual only, demand-paged) */
+#define ACCT_STOR_NODE_RESERVE  (4ULL * 1024 * 1024)   /* 4 MB */
+#define ACCT_STOR_LEAF_RESERVE  (8ULL * 1024 * 1024)   /* 8 MB */
+#define ACCT_STOR_KEY_SIZE      32                       /* slot_hash */
+#define ACCT_STOR_VAL_SIZE      32                       /* slot value BE */
 
 /* EIP-161 RIPEMD special case: address 0x0000...0003.
  * In geth, touching RIPEMD adds an extra dirty counter so that a journal
@@ -114,6 +121,67 @@ static inline void dirty_push(dirty_vec_t *v, const uint8_t *key, size_t key_siz
 static inline void dirty_clear(dirty_vec_t *v) { v->count = 0; }
 static inline void dirty_free(dirty_vec_t *v) {
     free(v->keys); v->keys = NULL; v->count = v->cap = 0;
+}
+
+/* =========================================================================
+ * Per-account storage art — lifecycle helpers
+ * ========================================================================= */
+
+/** Encode callback for per-account storage art_mpt.
+ *  Leaf value = raw 32-byte slot value (big-endian).
+ *  Returns value bytes as RLP (raw, same as test vectors). */
+static uint32_t acct_stor_encode(const uint8_t *key, const void *leaf_val,
+                                  uint32_t val_size, uint8_t *rlp_out, void *ctx) {
+    (void)key; (void)ctx;
+    /* The leaf stores the 32-byte BE value directly.
+     * For MPT, we need RLP-encoded value. For storage, the value is
+     * rlp_encode(trim_leading_zeros(value)). */
+    const uint8_t *val = (const uint8_t *)leaf_val;
+    /* Skip leading zeros */
+    int start = 0;
+    while (start < 31 && val[start] == 0) start++;
+    int len = 32 - start;
+
+    if (len == 1 && val[start] < 0x80) {
+        /* Single byte < 0x80: RLP is the byte itself */
+        rlp_out[0] = val[start];
+        return 1;
+    }
+    /* Short string: 0x80+len, then bytes */
+    rlp_out[0] = (uint8_t)(0x80 + len);
+    memcpy(rlp_out + 1, val + start, len);
+    return 1 + len;
+}
+
+static bool acct_stor_create(cached_account_t *ca) {
+    if (ca->storage_art) return true; /* already exists */
+    ca->storage_art = calloc(1, sizeof(compact_art_t));
+    if (!ca->storage_art) return false;
+    if (!compact_art_init_ex(ca->storage_art,
+                              ACCT_STOR_KEY_SIZE, ACCT_STOR_VAL_SIZE,
+                              false, NULL, NULL,
+                              ACCT_STOR_NODE_RESERVE, ACCT_STOR_LEAF_RESERVE)) {
+        free(ca->storage_art);
+        ca->storage_art = NULL;
+        return false;
+    }
+    ca->storage_mpt = art_mpt_create(ca->storage_art, acct_stor_encode, NULL);
+    if (!ca->storage_mpt) {
+        compact_art_destroy(ca->storage_art);
+        free(ca->storage_art);
+        ca->storage_art = NULL;
+        return false;
+    }
+    return true;
+}
+
+static void acct_stor_destroy(cached_account_t *ca) {
+    if (ca->storage_mpt) { art_mpt_destroy(ca->storage_mpt); ca->storage_mpt = NULL; }
+    if (ca->storage_art) {
+        compact_art_destroy(ca->storage_art);
+        free(ca->storage_art);
+        ca->storage_art = NULL;
+    }
 }
 
 /* =========================================================================
@@ -382,13 +450,27 @@ static cached_slot_t *ensure_slot(state_overlay_t *so, const address_t *addr,
     memcpy(cs->key, skey, SLOT_KEY_SIZE);
     cs->slot_hash = slot_hash;
 
-    /* Load from flat_state */
-    if (so->flat_state) {
+    /* Load from per-account storage art first, fallback to flat_state */
+    bool loaded = false;
+    if (ca->storage_art) {
+        const void *leaf = compact_art_get(ca->storage_art, cs->slot_hash.bytes);
+        if (leaf) {
+            cs->original = uint256_from_bytes((const uint8_t *)leaf, 32);
+            cs->current = cs->original;
+            loaded = true;
+            so->flat_stor_hit++;
+        }
+    }
+    if (!loaded && so->flat_state) {
         uint8_t val_be[32];
         if (flat_state_get_storage(so->flat_state, ca->addr_hash.bytes,
                                    cs->slot_hash.bytes, val_be)) {
             cs->original = uint256_from_bytes(val_be, 32);
             cs->current = cs->original;
+            /* Populate per-account art with loaded value */
+            if (!ca->storage_art) acct_stor_create(ca);
+            if (ca->storage_art)
+                compact_art_insert(ca->storage_art, cs->slot_hash.bytes, val_be);
             so->flat_stor_hit++;
         } else {
             so->flat_stor_miss++;
@@ -442,10 +524,11 @@ state_overlay_t *state_overlay_create(flat_state_t *fs, code_store_t *cs) {
 void state_overlay_destroy(state_overlay_t *so) {
     if (!so) return;
 
-    /* Free code pointers in account meta */
+    /* Free code pointers and per-account storage arts in account meta */
     for (uint32_t i = 0; i < so->acct_meta.capacity; i++) {
         cached_account_t *ca = &so->acct_meta.entries[i];
         free(ca->code);
+        acct_stor_destroy(ca);
     }
     free(so->acct_meta.entries);
     free(so->slot_meta.entries);
@@ -644,6 +727,17 @@ void state_overlay_set_storage(state_overlay_t *so, const address_t *addr,
     if (ca) {
         ca->storage_dirty = true;
         mark_account_mpt_dirty(so, ca);
+
+        /* Write to per-account storage art */
+        if (!ca->storage_art) acct_stor_create(ca);
+        if (ca->storage_art) {
+            uint8_t val_be[32];
+            uint256_to_bytes(value, val_be);
+            if (uint256_is_zero(value))
+                compact_art_delete(ca->storage_art, cs->slot_hash.bytes);
+            else
+                compact_art_insert(ca->storage_art, cs->slot_hash.bytes, val_be);
+        }
     }
 }
 
@@ -990,6 +1084,7 @@ void state_overlay_create_account(state_overlay_t *so, const address_t *addr) {
     ca->storage_root = HASH_EMPTY_STORAGE;
     ca->storage_dirty = true;
     ca->storage_cleared = true;
+    acct_stor_destroy(ca);  /* destroy old storage, will be recreated if needed */
 }
 
 void state_overlay_self_destruct(state_overlay_t *so, const address_t *addr) {
@@ -1230,6 +1325,7 @@ void state_overlay_commit_tx(state_overlay_t *so) {
             ca->storage_root = HASH_EMPTY_STORAGE;
             ca->storage_cleared = true;
             ca->storage_dirty = true;
+            acct_stor_destroy(ca);
             continue;
         }
 
@@ -1439,32 +1535,21 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
     }
     dirty_clear(&so->dirty_slots);
 
-    /* Step 4. Compute storage roots for storage_dirty accounts */
+    /* Step 4. Compute storage roots for storage_dirty accounts.
+     * Uses per-account storage art when available (Phase 5),
+     * falls back to shared storage trie for accounts without one. */
     for (size_t d = 0; d < so->dirty_accounts.count; d++) {
         const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
         cached_account_t *ca = find_account_meta(so, akey);
         if (!ca || !ca->storage_dirty || !ca->existed) continue;
 
-        hash_t old_sr = ca->storage_root;
-        storage_trie_root(so->storage_trie, ca->addr_hash.bytes,
-                           ca->storage_root.bytes);
-        if (debug_verify) {
-            uint8_t verify_sr[32];
-            storage_trie_invalidate_all(so->storage_trie);
-            storage_trie_root(so->storage_trie, ca->addr_hash.bytes, verify_sr);
-            if (memcmp(ca->storage_root.bytes, verify_sr, 32) != 0) {
-                fprintf(stderr, "STORAGE HASH CACHE BUG (call %lu): addr=0x",
-                        _debug_root_call);
-                for (int j = 0; j < 20; j++) fprintf(stderr, "%02x", ca->addr.bytes[j]);
-                fprintf(stderr, "\n  incremental: ");
-                for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", ca->storage_root.bytes[j]);
-                fprintf(stderr, "\n  full:        ");
-                for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", verify_sr[j]);
-                fprintf(stderr, "\n  old_sr:      ");
-                for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", old_sr.bytes[j]);
-                fprintf(stderr, "\n");
-                memcpy(ca->storage_root.bytes, verify_sr, 32);
-            }
+        if (ca->storage_mpt) {
+            /* Per-account art: compute root directly */
+            art_mpt_root_hash(ca->storage_mpt, ca->storage_root.bytes);
+        } else if (so->storage_trie) {
+            /* Fallback: shared storage trie subtree walk */
+            storage_trie_root(so->storage_trie, ca->addr_hash.bytes,
+                               ca->storage_root.bytes);
         }
     }
     clock_gettime(CLOCK_MONOTONIC, &t4b);
@@ -1639,12 +1724,11 @@ void state_overlay_evict(state_overlay_t *so) {
         }
     }
 
-    /* Free code pointers in used portion of meta */
+    /* Free code pointers and per-account storage arts in used portion of meta */
     for (uint32_t i = 0; i < so->next_acct_idx; i++) {
-        if (so->acct_meta.entries[i].code) {
-            free(so->acct_meta.entries[i].code);
-            so->acct_meta.entries[i].code = NULL;
-        }
+        cached_account_t *ca = &so->acct_meta.entries[i];
+        if (ca->code) { free(ca->code); ca->code = NULL; }
+        acct_stor_destroy(ca);
     }
 
     /* Reset and shrink meta arrays back to minimum */

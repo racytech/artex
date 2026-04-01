@@ -201,10 +201,22 @@ struct compact_art {
  * Initialize a compact ART tree with fixed key and value sizes.
  * If compact_leaves is true, leaves store only an 8-byte verification
  * hash instead of the full key (saves memory at negligible collision risk).
+ * Uses default large VA reservations (16GB nodes, up to 64GB leaves).
  */
 bool compact_art_init(compact_art_t *tree, uint32_t key_size, uint32_t value_size,
                        bool compact_leaves,
                        compact_art_key_fetch_t key_fetch, void *key_fetch_ctx);
+
+/**
+ * Initialize with explicit pool reserve sizes (for per-account storage).
+ * node_reserve / leaf_reserve: virtual address space to reserve (bytes).
+ * Physical memory is demand-paged — only committed on first write.
+ * Typical: node_reserve=4MB, leaf_reserve=8MB for per-account use.
+ */
+bool compact_art_init_ex(compact_art_t *tree, uint32_t key_size, uint32_t value_size,
+                          bool compact_leaves,
+                          compact_art_key_fetch_t key_fetch, void *key_fetch_ctx,
+                          size_t node_reserve, size_t leaf_reserve);
 
 /**
  * Destroy the tree and free all pool memory.
