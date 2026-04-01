@@ -232,7 +232,6 @@ struct state_overlay {
     size_t last_root_dirty_count;
 
     uint64_t flat_acct_hit, flat_acct_miss;
-    uint64_t flat_stor_hit, flat_stor_miss;
 };
 
 /* =========================================================================
@@ -440,34 +439,8 @@ static uint256_t storage_read(state_overlay_t *so, cached_account_t *ca,
         if (leaf) return uint256_from_bytes((const uint8_t *)leaf, 32);
     }
 
-    /* Not in art — check flat_state (legacy data from genesis/old checkpoints) */
-    if (so->flat_state) {
-        uint8_t val_be[32];
-        if (flat_state_get_storage(so->flat_state, ca->addr_hash.bytes,
-                                   slot_hash, val_be)) {
-            if (!ca->storage_art) acct_stor_create(so, ca);
-            if (ca->storage_art)
-                compact_art_insert(ca->storage_art, slot_hash, val_be);
-            return uint256_from_bytes(val_be, 32);
-        }
-    }
+    /* Not in per-account art or storage_file — slot is zero */
     return UINT256_ZERO;
-}
-
-/* Sync per-account art storage to flat_state for a single account.
- * Called from set_storage so flat_state stays in sync within a window. */
-static void sync_storage_to_flat(state_overlay_t *so, cached_account_t *ca,
-                                  const uint8_t slot_hash[32],
-                                  const uint256_t *value) {
-    if (!so->flat_state) return;
-    if (uint256_is_zero(value)) {
-        flat_state_delete_storage(so->flat_state, ca->addr_hash.bytes, slot_hash);
-    } else {
-        uint8_t val_be[32];
-        uint256_to_bytes(value, val_be);
-        flat_state_put_storage(so->flat_state, ca->addr_hash.bytes,
-                               slot_hash, val_be);
-    }
 }
 
 /* =========================================================================
@@ -1423,13 +1396,11 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
         }
     }
 
-    /* Step 2. Delete orphaned storage + dead accounts from flat_state */
+    /* Step 2. Delete dead accounts from flat_state (storage handled by per-account art) */
     for (size_t d = 0; d < so->dirty_accounts.count; d++) {
         const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
         cached_account_t *ca = find_account_meta(so, akey);
         if (!ca || !ca->mpt_dirty) continue;
-        if (!ca->existed || ca->storage_cleared)
-            flat_state_delete_all_storage(so->flat_state, ca->addr_hash.bytes);
         if (!ca->existed)
             flat_state_delete_account(so->flat_state, ca->addr_hash.bytes);
     }
@@ -1531,28 +1502,14 @@ void state_overlay_evict(state_overlay_t *so) {
 
     if (so->flat_state) {
         flat_store_t *astore = flat_state_account_store(so->flat_state);
-        flat_store_t *sstore = flat_state_storage_store(so->flat_state);
 
-        /* Pass 1: flush dirty overlay entries to disk */
-        flat_store_stale_slot_t *acct_stale = NULL, *stor_stale = NULL;
-        size_t acct_sc = 0, stor_sc = 0;
+        /* Flush account overlay to disk (storage handled by storage_file) */
+        flat_store_stale_slot_t *acct_stale = NULL;
+        size_t acct_sc = 0;
         flat_store_flush_deferred(astore, &acct_stale, &acct_sc);
-        flat_store_flush_deferred(sstore, &stor_stale, &stor_sc);
-
-        /* Pass 2: evict clean overlay entries */
         flat_store_evict_clean(astore);
-        flat_store_evict_clean(sstore);
-
-        /* Pass 3: free stale disk slots */
         flat_store_free_stale_slots(astore, acct_stale, acct_sc);
-        flat_store_free_stale_slots(sstore, stor_stale, stor_sc);
     }
-
-    /* Storage file was already written in compute_mpt_root Step 4c.
-     * Account records in flat_state already have correct stor_file refs
-     * from Step 5. Just need to persist flat_state overlay to disk above. */
-
-    /* Storage file + account records written in compute_mpt_root Steps 4c-5. */
 
     /* Free code pointers and per-account storage art structs */
     for (uint32_t i = 0; i < so->next_acct_idx; i++) {
@@ -1597,9 +1554,9 @@ state_overlay_stats_t state_overlay_get_stats(const state_overlay_t *so) {
     s.overlay_slots = 0; /* slot_meta removed — per-account art */
     if (so->flat_state) {
         s.flat_acct_count = flat_state_account_count(so->flat_state);
-        s.flat_stor_count = flat_state_storage_count(so->flat_state);
+        s.flat_stor_count = 0; /* storage managed by per-account art + storage_file */
         s.flat_acct_mem = compact_art_memory_usage(flat_state_account_art(so->flat_state));
-        s.flat_stor_mem = compact_art_memory_usage(flat_state_storage_art(so->flat_state));
+        s.flat_stor_mem = 0;
     }
     s.root_stor_ms = so->last_root_stor_ms;
     s.root_acct_ms = so->last_root_acct_ms;
