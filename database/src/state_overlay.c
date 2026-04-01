@@ -14,7 +14,7 @@
 #include "flat_store.h"
 #include "code_store.h"
 #include "compact_art.h"
-#include "storage_trie.h"
+/* storage_trie.h no longer needed — per-account art computes storage roots */
 #include "account_trie.h"
 #include "art_mpt.h"
 #include "keccak256.h"
@@ -222,7 +222,7 @@ struct state_overlay {
     flat_state_t     *flat_state;
     code_store_t     *code_store;
     account_trie_t   *account_trie;
-    storage_trie_t   *storage_trie;
+    /* storage_trie removed — per-account art computes storage roots */
 
     /* Meta arrays — indexed by sequential meta index (NOT flat_store overlay index).
      * Meta holds typed access + flags. Persistent records in flat_store overlay
@@ -490,10 +490,6 @@ static cached_slot_t *ensure_slot(state_overlay_t *so, const address_t *addr,
 
 static void init_tries(state_overlay_t *so) {
     if (!so->flat_state) return;
-    compact_art_t *s_art = flat_state_storage_art(so->flat_state);
-    flat_store_t  *s_store = flat_state_storage_store(so->flat_state);
-    if (s_art && s_store)
-        so->storage_trie = storage_trie_create(s_art, s_store, NULL);
     compact_art_t *a_art = flat_state_account_art(so->flat_state);
     flat_store_t  *a_store = flat_state_account_store(so->flat_state);
     if (a_art && a_store)
@@ -533,7 +529,6 @@ void state_overlay_destroy(state_overlay_t *so) {
     free(so->acct_meta.entries);
     free(so->slot_meta.entries);
 
-    if (so->storage_trie) storage_trie_destroy(so->storage_trie);
     if (so->account_trie) account_trie_destroy(so->account_trie);
 
     mem_art_destroy(&so->acct_index);
@@ -561,7 +556,6 @@ void state_overlay_destroy(state_overlay_t *so) {
 void state_overlay_set_flat_state(state_overlay_t *so, flat_state_t *fs) {
     if (!so) return;
     so->flat_state = fs;
-    if (so->storage_trie) { storage_trie_destroy(so->storage_trie); so->storage_trie = NULL; }
     if (so->account_trie) { account_trie_destroy(so->account_trie); so->account_trie = NULL; }
     init_tries(so);
 }
@@ -1544,42 +1538,14 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
         if (!ca || !ca->storage_dirty || !ca->existed) continue;
 
         if (ca->storage_mpt) {
-            /* Per-account art: compute root directly */
             art_mpt_root_hash(ca->storage_mpt, ca->storage_root.bytes);
-        } else if (so->storage_trie) {
-            /* Fallback: shared storage trie subtree walk */
-            storage_trie_root(so->storage_trie, ca->addr_hash.bytes,
-                               ca->storage_root.bytes);
         }
+        /* No fallback needed: set_storage always creates storage_mpt */
     }
     clock_gettime(CLOCK_MONOTONIC, &t4b);
 
     /* Step 4b. DEBUG: verify storage_root of ALL dirty accounts (not just
      * storage_dirty). Catches stale storage_root loaded from flat_state. */
-    if (debug_verify) {
-        storage_trie_invalidate_all(so->storage_trie);
-        for (size_t d = 0; d < so->dirty_accounts.count; d++) {
-            const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
-            cached_account_t *ca = find_account_meta(so, akey);
-            if (!ca || !ca->mpt_dirty || !ca->existed) continue;
-            uint8_t verify_sr[32];
-            storage_trie_root(so->storage_trie, ca->addr_hash.bytes, verify_sr);
-            if (memcmp(ca->storage_root.bytes, verify_sr, 32) != 0) {
-                fprintf(stderr, "STALE STORAGE ROOT (call %lu): addr=0x",
-                        _debug_root_call);
-                for (int j = 0; j < 20; j++) fprintf(stderr, "%02x", ca->addr.bytes[j]);
-                fprintf(stderr, " storage_dirty=%d\n  cached_sr: ",
-                        ca->storage_dirty);
-                for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", ca->storage_root.bytes[j]);
-                fprintf(stderr, "\n  actual_sr: ");
-                for (int j = 0; j < 32; j++) fprintf(stderr, "%02x", verify_sr[j]);
-                fprintf(stderr, "\n");
-                /* Fix it so the root computation proceeds correctly */
-                memcpy(ca->storage_root.bytes, verify_sr, 32);
-            }
-        }
-    }
-
     /* Step 5. Bulk flush dirty accounts to flat_state (with final storage_root). */
     clock_gettime(CLOCK_MONOTONIC, &t5a);
     for (size_t d = 0; d < so->dirty_accounts.count; d++) {
