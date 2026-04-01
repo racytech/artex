@@ -18,6 +18,7 @@
 #include "account_trie.h"
 #include "art_mpt.h"
 #include "arena.h"
+#include "storage_file.h"
 #include "keccak256.h"
 #include "mem_art.h"
 #include <stdlib.h>
@@ -191,6 +192,7 @@ struct state_overlay {
     code_store_t     *code_store;
     account_trie_t   *account_trie;
     arena_t           storage_arena;  /* shared arena for per-account storage arts */
+    storage_file_t   *storage_file;  /* packed per-account storage persistence */
 
     /* Meta arrays — indexed by sequential meta index (NOT flat_store overlay index).
      * Meta holds typed access + flags. Persistent records in flat_store overlay
@@ -323,6 +325,8 @@ static void sync_account_to_overlay(state_overlay_t *so, cached_account_t *ca) {
         ? ca->code_hash.bytes : HASH_EMPTY_CODE.bytes;
     memcpy(frec.code_hash, ch, 32);
     memcpy(frec.storage_root, ca->storage_root.bytes, 32);
+    frec.stor_file_offset = ca->stor_file_offset;
+    frec.stor_file_count = ca->stor_file_count;
     flat_state_put_account(so->flat_state, ca->addr_hash.bytes, &frec);
 }
 
@@ -356,6 +360,8 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
     address_copy(&ca->addr, addr);
     ca->addr_hash = addr_hash;
     ca->storage_root = HASH_EMPTY_STORAGE;
+    ca->stor_file_offset = UINT64_MAX;
+    ca->stor_file_count = 0;
 
     /* Load from flat_state if available */
     if (so->flat_state) {
@@ -367,6 +373,8 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
             memcpy(ca->storage_root.bytes, frec.storage_root, 32);
             ca->has_code = (memcmp(frec.code_hash, ((hash_t){0}).bytes, 32) != 0 &&
                             memcmp(frec.code_hash, HASH_EMPTY_CODE.bytes, 32) != 0);
+            ca->stor_file_offset = frec.stor_file_offset;
+            ca->stor_file_count = frec.stor_file_count;
             ca->existed = true;
             so->flat_acct_hit++;
         } else {
@@ -388,14 +396,46 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
  * Creates per-account art and populates from flat_state on first access.
  * ========================================================================= */
 
+/** Bulk-load all storage from packed storage_file into per-account art. */
+static void storage_bulk_load(state_overlay_t *so, cached_account_t *ca) {
+    if (ca->storage_art) return; /* already loaded */
+    if (ca->stor_file_offset == UINT64_MAX || ca->stor_file_count == 0) return;
+    if (!so->storage_file) return;
+
+    uint32_t count = ca->stor_file_count;
+    uint8_t *buf = malloc((size_t)count * STORAGE_SLOT_SIZE);
+    if (!buf) return;
+
+    if (!storage_file_read_section(so->storage_file, ca->stor_file_offset,
+                                    count, buf)) {
+        free(buf);
+        return;
+    }
+
+    acct_stor_create(so, ca);
+    if (!ca->storage_art) { free(buf); return; }
+
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *slot_hash = buf + i * STORAGE_SLOT_SIZE;
+        const uint8_t *val_be    = buf + i * STORAGE_SLOT_SIZE + 32;
+        compact_art_insert(ca->storage_art, slot_hash, val_be);
+    }
+    free(buf);
+}
+
 static uint256_t storage_read(state_overlay_t *so, cached_account_t *ca,
                                const uint8_t slot_hash[32]) {
-    /* Check per-account art first */
+    /* Ensure per-account art is populated (bulk-load from storage_file if needed) */
+    if (!ca->storage_art && ca->stor_file_count > 0)
+        storage_bulk_load(so, ca);
+
+    /* Check per-account art */
     if (ca->storage_art) {
         const void *leaf = compact_art_get(ca->storage_art, slot_hash);
         if (leaf) return uint256_from_bytes((const uint8_t *)leaf, 32);
     }
-    /* Not in art (or art doesn't exist yet) — check flat_state (disk). */
+
+    /* Not in art — check flat_state (legacy data from genesis/old checkpoints) */
     if (so->flat_state) {
         uint8_t val_be[32];
         if (flat_state_get_storage(so->flat_state, ca->addr_hash.bytes,
@@ -462,6 +502,12 @@ state_overlay_t *state_overlay_create(flat_state_t *fs, code_store_t *cs) {
     return so;
 }
 
+void state_overlay_set_storage_path(state_overlay_t *so, const char *path) {
+    if (!so || !path) return;
+    if (so->storage_file) storage_file_destroy(so->storage_file);
+    so->storage_file = storage_file_create(path);
+}
+
 void state_overlay_destroy(state_overlay_t *so) {
     if (!so) return;
 
@@ -473,6 +519,7 @@ void state_overlay_destroy(state_overlay_t *so) {
     }
     free(so->acct_meta.entries);
     arena_destroy(&so->storage_arena);
+    if (so->storage_file) storage_file_destroy(so->storage_file);
     if (so->account_trie) account_trie_destroy(so->account_trie);
 
     mem_art_destroy(&so->acct_index);
@@ -1444,7 +1491,14 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
 void state_overlay_evict(state_overlay_t *so) {
     if (!so) return;
 
-    /* DEBUG: save pre-evict root for comparison */
+    /* DEBUG: count arts */
+    { uint32_t nart = 0;
+      for (uint32_t i = 0; i < so->next_acct_idx; i++)
+        if (so->acct_meta.entries[i].storage_art) nart++;
+      if (nart > 0) fprintf(stderr, "EVICT: %u accounts with storage_art (of %u total)\n",
+                             nart, so->next_acct_idx);
+    }
+
     if (so->flat_state) {
         flat_store_t *astore = flat_state_account_store(so->flat_state);
         flat_store_t *sstore = flat_state_storage_store(so->flat_state);
@@ -1464,26 +1518,59 @@ void state_overlay_evict(state_overlay_t *so) {
         flat_store_free_stale_slots(sstore, stor_stale, stor_sc);
     }
 
-    /* Flush per-account storage arts to flat_state before destroying them.
-     * The per-account art is the single source of truth — flat_state needs
-     * the latest values for next block's SLOAD after eviction. */
-    if (so->flat_state) {
+    /* Flush per-account storage arts to storage_file before destroying them.
+     * Each account's storage is written as a packed section. The offset+count
+     * are saved in the account meta for reload after eviction. */
+    if (so->storage_file) {
+        storage_file_reset(so->storage_file);
+        uint32_t _sf_written = 0;
         for (uint32_t i = 0; i < so->next_acct_idx; i++) {
             cached_account_t *ca = &so->acct_meta.entries[i];
-            if (!ca->storage_art || !ca->storage_dirty || !ca->existed) continue;
-            /* Clear old storage in flat_state, then write current art contents.
-             * This handles both modifications and deletions correctly —
-             * slots deleted from the art (zero writes) won't be re-written. */
-            flat_state_delete_all_storage(so->flat_state, ca->addr_hash.bytes);
+            if (!ca->storage_art || compact_art_size(ca->storage_art) == 0) {
+                ca->stor_file_offset = UINT64_MAX;
+                ca->stor_file_count = 0;
+                continue;
+            }
+            /* Build packed buffer from per-account art */
+            uint32_t count = (uint32_t)compact_art_size(ca->storage_art);
+            uint8_t *buf = malloc((size_t)count * STORAGE_SLOT_SIZE);
+            if (!buf) continue;
+            uint32_t idx = 0;
             compact_art_iterator_t *it = compact_art_iterator_create(ca->storage_art);
-            while (compact_art_iterator_next(it)) {
+            while (compact_art_iterator_next(it) && idx < count) {
                 const uint8_t *slot_hash = compact_art_iterator_key(it);
                 const uint8_t *val_ptr = (const uint8_t *)compact_art_iterator_value(it);
-                flat_state_put_storage(so->flat_state, ca->addr_hash.bytes,
-                                       slot_hash, val_ptr);
+                memcpy(buf + idx * STORAGE_SLOT_SIZE, slot_hash, 32);
+                memcpy(buf + idx * STORAGE_SLOT_SIZE + 32, val_ptr, 32);
+                idx++;
             }
             compact_art_iterator_destroy(it);
+            ca->stor_file_offset = storage_file_write_section(so->storage_file, buf, idx);
+            ca->stor_file_count = idx;
+            _sf_written++;
+            free(buf);
         }
+        if (_sf_written > 0)
+            fprintf(stderr, "STOR_FILE: wrote %u accounts, file=%lu bytes\n",
+                    _sf_written, storage_file_size(so->storage_file));
+    }
+
+    /* Re-sync account records with updated storage_file references.
+     * compute_mpt_root (Step 5) wrote account records BEFORE the storage_file
+     * flush above, so stor_file_offset was stale. Update them now. */
+    if (so->flat_state && so->storage_file) {
+        for (uint32_t i = 0; i < so->next_acct_idx; i++) {
+            cached_account_t *ca = &so->acct_meta.entries[i];
+            if (!ca->existed) continue;
+            if (ca->stor_file_offset != UINT64_MAX || ca->storage_dirty)
+                sync_account_to_overlay(so, ca);
+        }
+        /* Flush the updated records to disk */
+        flat_store_t *astore = flat_state_account_store(so->flat_state);
+        flat_store_stale_slot_t *stale = NULL; size_t sc = 0;
+        flat_store_flush_deferred(astore, &stale, &sc);
+        flat_store_evict_clean(astore);
+        flat_store_free_stale_slots(astore, stale, sc);
     }
 
     /* Free code pointers and per-account storage art structs */

@@ -46,6 +46,10 @@ typedef struct {
      * Key = slot_hash[32], value = slot_value_be[32]. */
     compact_art_t *storage_art;   /* NULL if no storage */
     art_mpt_t     *storage_mpt;   /* MPT context for storage_art */
+
+    /* Packed storage file reference — set on eviction, used on reload */
+    uint64_t  stor_file_offset;   /* offset into storage_file, UINT64_MAX = none */
+    uint32_t  stor_file_count;    /* number of slots at that offset */
 #ifdef ENABLE_HISTORY
     uint64_t   original_nonce;
     uint256_t  original_balance;

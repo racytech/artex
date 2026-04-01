@@ -17,16 +17,18 @@
 
 typedef struct flat_state flat_state_t;
 
-/* Account record: 104 bytes */
+/* Account record: 116 bytes */
 typedef struct __attribute__((packed)) {
     uint64_t nonce;              /*   8 bytes */
     uint8_t  balance[32];        /*  32 bytes (big-endian uint256) */
     uint8_t  code_hash[32];      /*  32 bytes */
     uint8_t  storage_root[32];   /*  32 bytes */
+    uint64_t stor_file_offset;   /*   8 bytes (packed storage file offset) */
+    uint32_t stor_file_count;    /*   4 bytes (number of slots) */
 } flat_account_record_t;
 
-_Static_assert(sizeof(flat_account_record_t) == 104,
-               "flat_account_record_t must be 104 bytes");
+_Static_assert(sizeof(flat_account_record_t) == 116,
+               "flat_account_record_t must be 116 bytes");
 
 /* =========================================================================
  * Lifecycle

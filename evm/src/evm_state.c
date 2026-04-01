@@ -64,6 +64,10 @@ void evm_state_set_prune_empty(evm_state_t *es, bool enabled) {
     if (es && es->so) state_overlay_set_prune_empty(es->so, enabled);
 }
 
+void evm_state_set_storage_path(evm_state_t *es, const char *path) {
+    if (es && es->so) state_overlay_set_storage_path(es->so, path);
+}
+
 void evm_state_set_flat_state(evm_state_t *es, flat_state_t *fs) {
     if (!es) return;
     es->flat_state = fs;

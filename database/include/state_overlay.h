@@ -31,6 +31,9 @@ typedef struct code_store code_store_t;
 state_overlay_t *state_overlay_create(flat_state_t *fs, code_store_t *cs);
 void             state_overlay_destroy(state_overlay_t *so);
 
+/** Set the path for the packed storage file. Must be called before first use. */
+void state_overlay_set_storage_path(state_overlay_t *so, const char *path);
+
 /** Set or change the flat_state backend. Creates/destroys tries as needed. */
 void             state_overlay_set_flat_state(state_overlay_t *so, flat_state_t *fs);
 

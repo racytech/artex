@@ -70,6 +70,9 @@ typedef struct flat_state flat_state_t;
 void evm_state_set_flat_state(evm_state_t *es, flat_state_t *fs);
 flat_state_t *evm_state_get_flat_state(const evm_state_t *es);
 
+/** Set path for packed storage file (per-account storage persistence). */
+void evm_state_set_storage_path(evm_state_t *es, const char *path);
+
 /**
  * Flush accumulated block-dirty state to verkle backing store.
  * Call at checkpoint boundaries when in batch mode.
