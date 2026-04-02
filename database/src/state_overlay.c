@@ -36,8 +36,8 @@
 #define ADDRESS_KEY_SIZE  20
 #define MAX_CODE_SIZE     (24 * 1024 + 1)
 
-/* Per-account storage: mem_art with 12 KB initial arena (~100 slots) */
-#define ACCT_STOR_INIT_CAP  (12 * 1024)
+/* Per-account storage: mem_art with 1 KB initial arena, grows via realloc */
+#define ACCT_STOR_INIT_CAP  1024
 #define ACCT_STOR_KEY_SIZE  32   /* slot_hash */
 #define ACCT_STOR_VAL_SIZE  32   /* slot value BE */
 
