@@ -86,6 +86,11 @@ void *mem_art_upsert(mem_art_t *tree, const uint8_t *key, size_t key_len,
                      const void *value, size_t value_len);
 
 bool mem_art_delete(mem_art_t *tree, const uint8_t *key, size_t key_len);
+
+/** Walk from root to the leaf matching key, set dirty flags on all inner nodes.
+ *  No allocation, no value change, no structural modification.
+ *  Returns true if the key was found. */
+bool mem_art_mark_path_dirty(mem_art_t *tree, const uint8_t *key, size_t key_len);
 bool mem_art_contains(const mem_art_t *tree, const uint8_t *key, size_t key_len);
 
 /** Prefetch ART tree path for key into CPU cache (non-blocking). */

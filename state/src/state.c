@@ -10,7 +10,6 @@
 #include "code_store.h"
 #include "compact_art.h"
 #include "art_mpt.h"
-#include "mem_mpt.h"
 #include "keccak256.h"
 #include "logger.h"
 
@@ -316,12 +315,9 @@ static void mark_blk_dirty(state_t *s, account_t *a) {
         acct_set_flag(a, ACCT_MPT_DIRTY);
         dirty_push(&s->blk_dirty, a->addr.bytes, 20);
 
-        /* Mark acct_index trie path dirty so art_mpt rehashes.
-         * TODO: replace with mem_art_mark_path_dirty() — a dedicated
-         * walk that only sets dirty flags without insert/update work. */
+        /* Mark acct_index trie path dirty so art_mpt rehashes. */
         hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
-        uint32_t idx = (uint32_t)(a - s->accounts);
-        mem_art_insert(&s->acct_index, addr_hash.bytes, 32, &idx, sizeof(idx));
+        mem_art_mark_path_dirty(&s->acct_index, addr_hash.bytes, 32);
     }
 }
 
@@ -1148,33 +1144,8 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
         /* Compute storage root if dirty */
         if (acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
             resource_t *r = get_resource(s, a);
-            if (r && r->storage && mem_art_size(r->storage) > 0) {
-                /* Batch rebuild storage root from storage mem_art */
-                size_t stor_n = mem_art_size(r->storage);
-                mpt_batch_entry_t *stor_entries = calloc(stor_n, sizeof(mpt_batch_entry_t));
-                uint8_t *stor_rlp_buf = malloc(stor_n * 33);
-                size_t si = 0;
-
-                mem_art_iterator_t *it = mem_art_iterator_create(r->storage);
-                while (mem_art_iterator_next(it)) {
-                    size_t klen, vlen;
-                    const uint8_t *ik = mem_art_iterator_key(it, &klen);
-                    const uint8_t *iv = mem_art_iterator_value(it, &vlen);
-                    memcpy(stor_entries[si].key, ik, 32);
-                    size_t rlen = rlp_be(iv, vlen, stor_rlp_buf + si * 33);
-                    stor_entries[si].value = stor_rlp_buf + si * 33;
-                    stor_entries[si].value_len = rlen;
-                    si++;
-                }
-                free(it);
-
-                hash_t stor_root;
-                mpt_compute_root_batch(stor_entries, si, &stor_root);
-                r->storage_root = stor_root;
-                free(stor_entries);
-                free(stor_rlp_buf);
-            } else if (r) {
-                r->storage_root = EMPTY_STORAGE_ROOT;
+            if (r && r->storage_mpt) {
+                art_mpt_root_hash(r->storage_mpt, r->storage_root.bytes);
             }
         }
 
@@ -1199,33 +1170,8 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
          * The mem_art dirty flags propagate from insert/delete. */
     }
 
-    /* Step 3: Compute account trie root via batch rebuild */
-    {
-        mpt_batch_entry_t *entries = malloc(s->count * sizeof(mpt_batch_entry_t));
-        uint8_t (*rlp_store)[128] = malloc(s->count * 128);
-        size_t n = 0;
-        for (uint32_t i = 0; i < s->count; i++) {
-            account_t *a = &s->accounts[i];
-            if (!acct_has_flag(a, ACCT_EXISTED)) continue;
-            if (acct_is_empty(a) && prune_empty) continue;
-            hash_t ah = hash_keccak256(a->addr.bytes, 20);
-            memcpy(entries[n].key, ah.bytes, 32);
-            uint8_t bal_be[32]; uint256_to_bytes(&a->balance, bal_be);
-            resource_t *r = get_resource(s, a);
-            (void)0; /* storage root computed above */
-            uint32_t rlen = build_account_rlp(
-                a->nonce, bal_be,
-                r ? r->storage_root.bytes : EMPTY_STORAGE_ROOT.bytes,
-                r && acct_has_flag(a, ACCT_HAS_CODE) ? r->code_hash.bytes : EMPTY_CODE_HASH.bytes,
-                rlp_store[n]);
-            entries[n].value = rlp_store[n];
-            entries[n].value_len = rlen;
-            n++;
-        }
-        mpt_compute_root_batch(entries, n, &root);
-        free(entries);
-        free(rlp_store);
-    }
+    /* Step 3: Compute account trie root */
+    art_mpt_root_hash(s->acct_trie_mpt, root.bytes);
 
     /* Step 4: Clear dirty flags */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
