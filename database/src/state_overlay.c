@@ -1457,42 +1457,8 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
     }
     clock_gettime(CLOCK_MONOTONIC, &t4b);
 
-    /* Step 4c. Write dirty accounts' storage to storage_file and update
-     * the stor_index (separate from the account record). */
-    if (so->storage_file) {
-        for (size_t d = 0; d < so->dirty_accounts.count; d++) {
-            const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
-            cached_account_t *ca = find_account_meta(so, akey);
-            if (!ca || !ca->storage_dirty || !ca->storage_mem) continue;
-            uint32_t count = (uint32_t)mem_art_size(ca->storage_mem);
-            if (count == 0) {
-                mem_art_delete(&so->stor_index, ca->addr_hash.bytes, 32);
-                continue;
-            }
-            uint8_t *buf = malloc((size_t)count * STORAGE_SLOT_SIZE);
-            if (!buf) continue;
-            uint32_t idx = 0;
-            mem_art_iterator_t *it = mem_art_iterator_create(ca->storage_mem);
-            while (mem_art_iterator_next(it) && idx < count) {
-                size_t klen, vlen;
-                const uint8_t *k = mem_art_iterator_key(it, &klen);
-                const void *v = mem_art_iterator_value(it, &vlen);
-                if (k && v && klen == 32 && vlen == 32) {
-                    memcpy(buf + idx * STORAGE_SLOT_SIZE, k, 32);
-                    memcpy(buf + idx * STORAGE_SLOT_SIZE + 32, v, 32);
-                    idx++;
-                }
-            }
-            mem_art_iterator_destroy(it);
-            stor_index_entry_t sie = {
-                .offset = storage_file_write_section(so->storage_file, buf, idx),
-                .count = idx,
-            };
-            mem_art_upsert(&so->stor_index, ca->addr_hash.bytes, 32,
-                           &sie, sizeof(sie));
-            free(buf);
-        }
-    }
+    /* Storage file writes removed from hot path — eviction-only.
+     * mem_art is the live storage; storage_file written only on LRU evict. */
 
     /* Step 5. Bulk flush dirty accounts to flat_state (with final storage_root). */
     clock_gettime(CLOCK_MONOTONIC, &t5a);

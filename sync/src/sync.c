@@ -217,11 +217,8 @@ sync_t *sync_create(const sync_config_t *config) {
             fprintf(stderr, "warning: failed to open/create flat state at %s\n",
                     config->flat_state_path);
 
-        /* Packed storage file alongside flat_state */
-        char stor_path[512];
-        snprintf(stor_path, sizeof(stor_path), "%s_stor_packed.dat",
-                 config->flat_state_path);
-        evm_state_set_storage_path(s->state, stor_path);
+        /* Storage file removed — per-account mem_art is the live store.
+         * storage_file will be used only for LRU eviction (future). */
     }
     /* No background flush thread — flat_state is mmap'd */
 
