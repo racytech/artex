@@ -107,6 +107,9 @@ void state_begin_block(state_t *s, uint64_t block_number);
 /* EIP-161: enable empty account pruning post-Spurious Dragon */
 void state_set_prune_empty(state_t *s, bool enabled);
 
+/* Clear all dirty flags from prestate setup (for test runner) */
+void state_clear_prestate_dirty(state_t *s);
+
 /* =========================================================================
  * EIP-2929 warm/cold access
  * ========================================================================= */

@@ -797,6 +797,9 @@ if(CJSON_FOUND)
         add_executable(test_runner_batch_v2 integration_tests/test_runner_batch_main.c)
         target_link_libraries(test_runner_batch_v2 integration_tests_v2)
 
+        add_executable(test_runner_failfast_v2 integration_tests/test_runner_failfast_main.c)
+        target_link_libraries(test_runner_failfast_v2 integration_tests_v2)
+
         add_executable(test_runner_failfast integration_tests/test_runner_failfast_main.c)
         target_link_libraries(test_runner_failfast integration_tests)
 

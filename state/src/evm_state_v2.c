@@ -337,7 +337,7 @@ void evm_state_mark_existed(evm_state_t *es, const address_t *addr) {
 }
 
 void evm_state_clear_prestate_dirty(evm_state_t *es) {
-    (void)es; /* TODO: implement for test_runner prestate setup */
+    if (es) state_clear_prestate_dirty(es->st);
 }
 
 bool evm_state_is_self_destructed(evm_state_t *es, const address_t *addr) {
