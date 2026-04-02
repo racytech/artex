@@ -1168,13 +1168,21 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
     /* Step 2b: Remove phantom accounts from acct_index.
      * ensure_account inserts every written-to address into acct_index,
      * including accounts touched by add_balance(0) that never got EXISTED.
-     * These must not appear in the trie. */
+     * These must not appear in the trie.
+     *
+     * IMPORTANT: only delete if this account's index actually matches the
+     * acct_index entry. Duplicate addresses (from pruned + re-created
+     * accounts) can share the same hash key — don't delete the live entry. */
     for (uint32_t i = 0; i < s->count; i++) {
         account_t *a = &s->accounts[i];
         if (acct_has_flag(a, ACCT_EXISTED) && !(acct_is_empty(a) && prune_empty))
             continue; /* keep */
         hash_t h = hash_keccak256(a->addr.bytes, 20);
-        mem_art_delete(&s->acct_index, h.bytes, 32);
+        /* Check that acct_index points to THIS entry, not a newer duplicate */
+        const uint32_t *pidx = (const uint32_t *)
+            mem_art_get(&s->acct_index, h.bytes, 32, NULL);
+        if (pidx && *pidx == i)
+            mem_art_delete(&s->acct_index, h.bytes, 32);
     }
 
     /* Step 3: Compute account trie root */
