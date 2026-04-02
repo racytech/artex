@@ -18,7 +18,7 @@
 #include "account_trie.h"
 #include "art_mpt.h"
 #include "art_iface.h"
-#include "storage_file.h"
+/* storage_file.h removed — storage is purely in-memory (per-account mem_art) */
 #include "keccak256.h"
 #include "mem_art.h"
 #include "logger.h"
@@ -50,11 +50,7 @@ static const uint8_t RIPEMD_ADDR[20] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3
 };
 
-/* Storage file index entry — stored in stor_index mem_art */
-typedef struct __attribute__((packed)) {
-    uint64_t offset;
-    uint32_t count;
-} stor_index_entry_t;
+/* stor_index_entry_t / storage_file removed — storage is in-memory only */
 
 /* Types from state_meta.h: cached_account_t, account_meta_pool_t */
 
@@ -194,8 +190,7 @@ struct state_overlay {
     flat_state_t     *flat_state;
     code_store_t     *code_store;
     account_trie_t   *account_trie;
-    storage_file_t   *storage_file;  /* packed per-account storage persistence */
-    mem_art_t         stor_index;    /* addr_hash[32] → {offset(8), count(4)} */
+    /* storage_file / stor_index removed — storage is in-memory only */
 
     /* Meta arrays — indexed by sequential meta index (NOT flat_store overlay index).
      * Meta holds typed access + flags. Persistent records in flat_store overlay
@@ -405,58 +400,12 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
 }
 
 /* =========================================================================
- * Storage read helper — reads slot value from per-account art or flat_state.
- * Creates per-account art and populates from flat_state on first access.
+ * Storage read — reads slot value from per-account mem_art.
  * ========================================================================= */
-
-/** Bulk-load all storage from packed storage_file into per-account mem_art. */
-static void storage_bulk_load(state_overlay_t *so, cached_account_t *ca) {
-    if (ca->storage_mem) return; /* already loaded */
-    if (!so->storage_file) return;
-
-    /* Look up storage_file refs from the separate index */
-    const stor_index_entry_t *entry = (const stor_index_entry_t *)
-        mem_art_get(&so->stor_index, ca->addr_hash.bytes, 32, NULL);
-    if (!entry || entry->count == 0) return;
-
-    uint32_t count = entry->count;
-    uint8_t *buf = malloc((size_t)count * STORAGE_SLOT_SIZE);
-    if (!buf) return;
-
-    if (!storage_file_read_section(so->storage_file, entry->offset,
-                                    count, buf)) {
-        free(buf);
-        return;
-    }
-
-    if (!acct_stor_create(so, ca)) {
-        LOG_ERROR("bulk_load: cannot create storage art for %02x%02x..%02x%02x (%u slots lost)",
-                  ca->addr.bytes[0], ca->addr.bytes[1],
-                  ca->addr.bytes[18], ca->addr.bytes[19], count);
-        free(buf);
-        return;
-    }
-
-    for (uint32_t i = 0; i < count; i++) {
-        const uint8_t *slot_hash = buf + i * STORAGE_SLOT_SIZE;
-        const uint8_t *val_be    = buf + i * STORAGE_SLOT_SIZE + 32;
-        if (!mem_art_insert(ca->storage_mem, slot_hash, ACCT_STOR_KEY_SIZE,
-                            val_be, ACCT_STOR_VAL_SIZE)) {
-            LOG_ERROR("bulk_load: mem_art_insert failed for %02x%02x..%02x%02x "
-                      "(inserted %u/%u slots)",
-                      ca->addr.bytes[0], ca->addr.bytes[1],
-                      ca->addr.bytes[18], ca->addr.bytes[19], i, count);
-            break;
-        }
-    }
-    free(buf);
-}
 
 static uint256_t storage_read(state_overlay_t *so, cached_account_t *ca,
                                const uint8_t slot_hash[32]) {
-    /* Ensure per-account storage is populated (bulk-load from storage_file if needed) */
-    if (!ca->storage_mem)
-        storage_bulk_load(so, ca);
+    (void)so;
 
     /* Check per-account mem_art */
     if (ca->storage_mem) {
@@ -491,7 +440,7 @@ state_overlay_t *state_overlay_create(flat_state_t *fs, code_store_t *cs) {
     so->code_store = cs;
 
     mem_art_init(&so->acct_index);
-    mem_art_init(&so->stor_index);
+    /* stor_index removed — no storage_file */
     mem_art_init(&so->warm_addrs);
     mem_art_init(&so->warm_slots);
     mem_art_init(&so->transient);
@@ -506,9 +455,8 @@ state_overlay_t *state_overlay_create(flat_state_t *fs, code_store_t *cs) {
 }
 
 void state_overlay_set_storage_path(state_overlay_t *so, const char *path) {
-    if (!so || !path) return;
-    if (so->storage_file) storage_file_destroy(so->storage_file);
-    so->storage_file = storage_file_create(path);
+    (void)so; (void)path;
+    /* no-op — storage_file removed, storage is in-memory only */
 }
 
 void state_overlay_destroy(state_overlay_t *so) {
@@ -521,11 +469,9 @@ void state_overlay_destroy(state_overlay_t *so) {
         acct_stor_destroy(ca);
     }
     free(so->acct_meta.entries);
-    if (so->storage_file) storage_file_destroy(so->storage_file);
     if (so->account_trie) account_trie_destroy(so->account_trie);
 
     mem_art_destroy(&so->acct_index);
-    mem_art_destroy(&so->stor_index);
     mem_art_destroy(&so->warm_addrs);
     mem_art_destroy(&so->warm_slots);
     mem_art_destroy(&so->transient);
@@ -1457,8 +1403,7 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
     }
     clock_gettime(CLOCK_MONOTONIC, &t4b);
 
-    /* Storage file writes removed from hot path — eviction-only.
-     * mem_art is the live storage; storage_file written only on LRU evict. */
+    /* Storage persistence removed — mem_art is the sole live store. */
 
     /* Step 5. Bulk flush dirty accounts to flat_state (with final storage_root). */
     clock_gettime(CLOCK_MONOTONIC, &t5a);
@@ -1505,7 +1450,7 @@ void state_overlay_evict(state_overlay_t *so) {
     if (so->flat_state) {
         flat_store_t *astore = flat_state_account_store(so->flat_state);
 
-        /* Flush account overlay to disk (storage handled by storage_file) */
+        /* Flush account overlay to disk */
         flat_store_stale_slot_t *acct_stale = NULL;
         size_t acct_sc = 0;
         flat_store_flush_deferred(astore, &acct_stale, &acct_sc);
@@ -1537,7 +1482,7 @@ state_overlay_stats_t state_overlay_get_stats(const state_overlay_t *so) {
     s.overlay_slots = 0; /* slot_meta removed — per-account art */
     if (so->flat_state) {
         s.flat_acct_count = flat_state_account_count(so->flat_state);
-        s.flat_stor_count = 0; /* storage managed by per-account art + storage_file */
+        s.flat_stor_count = 0; /* storage managed by per-account mem_art */
         s.flat_acct_mem = compact_art_memory_usage(flat_state_account_art(so->flat_state));
         s.flat_stor_mem = 0;
     }
