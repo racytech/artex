@@ -213,6 +213,13 @@ struct state {
     uint32_t  resource_count;
     uint32_t  resource_cap;
 
+    /* Phantom tracking: indices of accounts created by ensure_account
+     * that may not get EXISTED (e.g. add_balance(0) touch targets).
+     * Checked at compute_root time — O(phantoms) instead of O(all_accounts). */
+    uint32_t *phantoms;
+    uint32_t  phantom_count;
+    uint32_t  phantom_cap;
+
     /* Block state */
     uint64_t current_block;
     bool     prune_empty;
@@ -288,7 +295,14 @@ static account_t *ensure_account(state_t *s, const address_t *addr) {
     hash_t addr_hash = hash_keccak256(addr->bytes, 20);
     mem_art_insert(&s->acct_index, addr_hash.bytes, 32, &idx, sizeof(idx));
 
-    (void)0;
+    /* Track as potential phantom — will be checked at compute_root */
+    if (s->phantom_count >= s->phantom_cap) {
+        uint32_t nc = s->phantom_cap ? s->phantom_cap * 2 : 64;
+        uint32_t *np = realloc(s->phantoms, nc * sizeof(uint32_t));
+        if (np) { s->phantoms = np; s->phantom_cap = nc; }
+    }
+    if (s->phantom_count < s->phantom_cap)
+        s->phantoms[s->phantom_count++] = idx;
 
     return a;
 }
@@ -465,6 +479,7 @@ void state_destroy(state_t *s) {
     free(s->resources);
     free(s->accounts);
     free(s->resource_list);
+    free(s->phantoms);
 
     if (s->acct_trie_mpt) art_mpt_destroy(s->acct_trie_mpt);
     mem_art_destroy(&s->acct_index);
@@ -1166,24 +1181,22 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
     }
 
     /* Step 2b: Remove phantom accounts from acct_index.
-     * ensure_account inserts every written-to address into acct_index,
-     * including accounts touched by add_balance(0) that never got EXISTED.
-     * These must not appear in the trie.
-     *
-     * IMPORTANT: only delete if this account's index actually matches the
-     * acct_index entry. Duplicate addresses (from pruned + re-created
-     * accounts) can share the same hash key — don't delete the live entry. */
-    for (uint32_t i = 0; i < s->count; i++) {
+     * Only iterates accounts tracked as potential phantoms — O(phantoms)
+     * instead of O(all_accounts). */
+    for (uint32_t pi = 0; pi < s->phantom_count; pi++) {
+        uint32_t i = s->phantoms[pi];
+        if (i >= s->count) continue;
         account_t *a = &s->accounts[i];
         if (acct_has_flag(a, ACCT_EXISTED) && !(acct_is_empty(a) && prune_empty))
-            continue; /* keep */
+            continue; /* became real — keep */
         hash_t h = hash_keccak256(a->addr.bytes, 20);
-        /* Check that acct_index points to THIS entry, not a newer duplicate */
+        /* Only delete if acct_index points to THIS entry (not a newer duplicate) */
         const uint32_t *pidx = (const uint32_t *)
             mem_art_get(&s->acct_index, h.bytes, 32, NULL);
         if (pidx && *pidx == i)
             mem_art_delete(&s->acct_index, h.bytes, 32);
     }
+    s->phantom_count = 0;
 
     /* Step 3: Compute account trie root */
     art_mpt_root_hash(s->acct_trie_mpt, root.bytes);
