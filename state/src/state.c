@@ -502,12 +502,12 @@ void state_set_prune_empty(state_t *s, bool enabled) {
 
 account_t *state_get_account(state_t *s, const address_t *addr) {
     if (!s || !addr) return NULL;
-    return ensure_account(s, addr);
+    return find_account(s, addr->bytes);
 }
 
 bool state_exists(state_t *s, const address_t *addr) {
     if (!s || !addr) return false;
-    account_t *a = ensure_account(s, addr);
+    account_t *a = find_account(s, addr->bytes);
     if (!a) return false;
     return acct_has_flag(a, ACCT_EXISTED) ||
            acct_has_flag(a, ACCT_CREATED) ||
@@ -517,19 +517,19 @@ bool state_exists(state_t *s, const address_t *addr) {
 
 bool state_is_empty(state_t *s, const address_t *addr) {
     if (!s || !addr) return true;
-    account_t *a = ensure_account(s, addr);
+    account_t *a = find_account(s, addr->bytes);
     return !a || acct_is_empty(a);
 }
 
 uint64_t state_get_nonce(state_t *s, const address_t *addr) {
     if (!s || !addr) return 0;
-    account_t *a = ensure_account(s, addr);
+    account_t *a = find_account(s, addr->bytes);
     return a ? a->nonce : 0;
 }
 
 uint256_t state_get_balance(state_t *s, const address_t *addr) {
     if (!s || !addr) return UINT256_ZERO;
-    account_t *a = ensure_account(s, addr);
+    account_t *a = find_account(s, addr->bytes);
     return a ? a->balance : UINT256_ZERO;
 }
 
@@ -620,7 +620,7 @@ void state_set_code(state_t *s, const address_t *addr,
 
 const uint8_t *state_get_code(state_t *s, const address_t *addr, uint32_t *out_len) {
     if (!s || !addr) { if (out_len) *out_len = 0; return NULL; }
-    account_t *a = ensure_account(s, addr);
+    account_t *a = find_account(s, addr->bytes);
     if (!a || !acct_has_flag(a, ACCT_HAS_CODE)) { if (out_len) *out_len = 0; return NULL; }
 
     resource_t *r = get_resource(s, a);
@@ -643,7 +643,7 @@ const uint8_t *state_get_code(state_t *s, const address_t *addr, uint32_t *out_l
 
 uint32_t state_get_code_size(state_t *s, const address_t *addr) {
     if (!s || !addr) return 0;
-    account_t *a = ensure_account(s, addr);
+    account_t *a = find_account(s, addr->bytes);
     if (!a || !acct_has_flag(a, ACCT_HAS_CODE)) return 0;
     resource_t *r = get_resource(s, a);
     if (!r) return 0;
@@ -654,7 +654,7 @@ uint32_t state_get_code_size(state_t *s, const address_t *addr) {
 
 hash_t state_get_code_hash(state_t *s, const address_t *addr) {
     if (!s || !addr) return EMPTY_CODE_HASH;
-    account_t *a = ensure_account(s, addr);
+    account_t *a = find_account(s, addr->bytes);
     if (!a || !acct_has_flag(a, ACCT_HAS_CODE)) return EMPTY_CODE_HASH;
     resource_t *r = get_resource(s, a);
     return r ? r->code_hash : EMPTY_CODE_HASH;
@@ -666,7 +666,7 @@ hash_t state_get_code_hash(state_t *s, const address_t *addr) {
 
 uint256_t state_get_storage(state_t *s, const address_t *addr, const uint256_t *key) {
     if (!s || !addr || !key) return UINT256_ZERO;
-    account_t *a = ensure_account(s, addr);
+    account_t *a = find_account(s, addr->bytes);
     if (!a) return UINT256_ZERO;
     uint8_t slot_be[32]; uint256_to_bytes(key, slot_be);
     hash_t slot_hash = hash_keccak256(slot_be, 32);
@@ -718,7 +718,7 @@ void state_set_storage(state_t *s, const address_t *addr,
 
 bool state_has_storage(state_t *s, const address_t *addr) {
     if (!s || !addr) return false;
-    account_t *a = ensure_account(s, addr);
+    account_t *a = find_account(s, addr->bytes);
     if (!a) return false;
     resource_t *r = get_resource(s, a);
     if (r && memcmp(r->storage_root.bytes, EMPTY_STORAGE_ROOT.bytes, 32) != 0)
@@ -1086,18 +1086,6 @@ state_stats_t state_get_stats(const state_t *s) {
 hash_t state_compute_root(state_t *s, bool prune_empty) {
     hash_t root = {0};
     if (!s || !s->acct_trie_mpt) return root;
-
-    /* Step 0: Remove phantom accounts from acct_index.
-     * ensure_account inserts every accessed address into acct_index for lookup.
-     * Accounts that were only read (never modified) have no EXISTED flag and
-     * are empty — they must not appear in the trie. */
-    for (uint32_t i = 0; i < s->count; i++) {
-        account_t *a = &s->accounts[i];
-        if (!acct_has_flag(a, ACCT_EXISTED) && acct_is_empty(a)) {
-            hash_t h = hash_keccak256(a->addr.bytes, 20);
-            mem_art_delete(&s->acct_index, h.bytes, 32);
-        }
-    }
 
     /* Step 1: For each dirty account, decide existence + compute storage root */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
