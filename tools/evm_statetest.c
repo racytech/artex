@@ -17,7 +17,6 @@
 #include "transaction.h"
 #include "evm.h"
 #include "evm_state.h"
-#include "flat_state.h"
 #include "fork.h"
 #include "hash.h"
 #include "uint256.h"
@@ -174,10 +173,6 @@ static int run_statetest_file(const char *filepath, const statetest_args_t *args
                 results[ri].error = "failed to create state";
                 ri++;
                 continue;
-            }
-            {
-                flat_state_t *fs = flat_state_create("/dev/shm/evm_statetest_flat");
-                if (fs) evm_state_set_flat_state(state, fs);
             }
             evm_t *evm = evm_create(state, fork_config);
             if (!evm) {

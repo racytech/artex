@@ -367,3 +367,14 @@ void evm_state_print_mpt_stats(evm_state_t *es) { (void)es; }
 state_t *evm_state_get_state(evm_state_t *es) {
     return es ? es->st : NULL;
 }
+
+size_t evm_state_collect_addresses(evm_state_t *es, address_t *out, size_t max_count) {
+    (void)es; (void)out; (void)max_count;
+    /* TODO: iterate accounts vector */
+    return 0;
+}
+
+void evm_state_dump_debug(evm_state_t *es, const char *dir) {
+    (void)es; (void)dir;
+    /* TODO: implement for state_v2 */
+}

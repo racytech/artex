@@ -16,7 +16,6 @@
 #include "evm_state.h"
 #include "block_executor.h"
 #include "code_store.h"
-#include "flat_state.h"
 #ifdef ENABLE_HISTORY
 #include "state_history.h"
 #endif
@@ -50,7 +49,6 @@ struct sync {
     sync_config_t config;
 
     code_store_t  *cs;
-    flat_state_t  *flat_state;
 
     evm_state_t *state;
     evm_t       *evm;
@@ -167,8 +165,6 @@ sync_t *sync_create(const sync_config_t *config) {
         s->config.mpt_path = strdup(config->mpt_path);
     if (config->code_store_path)
         s->config.code_store_path = strdup(config->code_store_path);
-    if (config->flat_state_path)
-        s->config.flat_state_path = strdup(config->flat_state_path);
     if (config->history_dir)
         s->config.history_dir = strdup(config->history_dir);
     if (config->verkle_builder_value_dir)
@@ -201,26 +197,6 @@ sync_t *sync_create(const sync_config_t *config) {
                 "  hint: delete state files and replay fresh\n");
         goto fail;
     }
-
-    /* Batch mode: defer per-block verkle/MPT flush to checkpoint boundaries */
-    evm_state_set_batch_mode(s->state, true);
-
-    /* Flat state: O(1) disk-backed lookups for cache misses */
-    if (config->flat_state_path) {
-        s->flat_state = flat_state_open(config->flat_state_path);
-        if (!s->flat_state) {
-            s->flat_state = flat_state_create(config->flat_state_path);
-        }
-        if (s->flat_state)
-            evm_state_set_flat_state(s->state, s->flat_state);
-        else
-            fprintf(stderr, "warning: failed to open/create flat state at %s\n",
-                    config->flat_state_path);
-
-        /* Open storage cache file for LRU eviction persistence */
-        evm_state_set_storage_path(s->state, config->flat_state_path);
-    }
-    /* No background flush thread — flat_state is mmap'd */
 
     /* Create EVM */
     s->evm = evm_create(s->state, config->chain_config);
@@ -265,14 +241,12 @@ void sync_destroy(sync_t *sync) {
     sync_flush_code(sync);
     if (sync->state) evm_state_destroy(sync->state);
     if (sync->cs) code_store_destroy(sync->cs);
-    if (sync->flat_state) flat_state_destroy(sync->flat_state);
 #ifdef ENABLE_HISTORY
     if (sync->history) state_history_destroy(sync->history);
 #endif
     free((char *)sync->config.verkle_value_dir);
     free((char *)sync->config.verkle_commit_dir);
     free((char *)sync->config.mpt_path);
-    free((char *)sync->config.flat_state_path);
     free((char *)sync->config.code_store_path);
     free((char *)sync->config.history_dir);
     free((char *)sync->config.verkle_builder_value_dir);

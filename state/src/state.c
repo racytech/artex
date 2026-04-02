@@ -1106,6 +1106,7 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
                 art_mpt_root_hash(r->storage_mpt, r->storage_root.bytes);
             }
         }
+
     }
 
     /* Step 2: Update account trie — insert/delete for dirty accounts */

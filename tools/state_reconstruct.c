@@ -15,7 +15,6 @@
 
 #include "state_history.h"
 #include "evm_state.h"
-#include "flat_state.h"
 #include "era1.h"
 #include "block.h"
 #include "hash.h"

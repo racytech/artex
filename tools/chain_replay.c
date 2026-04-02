@@ -653,7 +653,6 @@ int main(int argc, char **argv) {
         cfg.history_dir = history_path;
 #endif
     cfg.mpt_path = mpt_path;
-    cfg.flat_state_path = flat_path;
     cfg.code_store_path = code_path;
 
     LOG_INFO("Loading state...");
@@ -672,9 +671,9 @@ int main(int argc, char **argv) {
     LOG_INFO("State loaded successfully");
     {
         evm_state_stats_t dbg_ss = sync_get_state_stats(sync);
-        LOG_INFO("flat_state: %lu accts, %lu slots",
-                 (unsigned long)dbg_ss.flat_acct_count,
-                 (unsigned long)dbg_ss.flat_stor_count);
+        LOG_INFO("state: %lu accts, %lu storage_accts",
+                 (unsigned long)dbg_ss.cache_accounts,
+                 (unsigned long)dbg_ss.cache_slots);
     }
 
     uint64_t start_block = (user_start > 0) ? user_start : 1;

@@ -4,7 +4,6 @@
 
 #include "test_runner.h"
 #include "fork.h"
-#include "flat_state.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -397,26 +396,11 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
         runner->config.timeout_ms = 30000; // 30 second default timeout
     }
 
-    // Initialize state backends + EVM State
-    runner->state = evm_state_create(NULL   /* no code_store for tests */);
-    if (!runner->state) {
-        return false;
-    }
+    // Initialize state + EVM
+    runner->state = evm_state_create(NULL);
+    if (!runner->state) return false;
 
-    // Initialize flat_state for MPT root computation (owns the compact_arts)
-    {
-        runner->flat_state = flat_state_create("/dev/shm/test_runner_flat");
-        if (!runner->flat_state) {
-            fprintf(stderr, "ERROR: Failed to create flat_state\n");
-            evm_state_destroy(runner->state);
-            runner->state = NULL;
-            return false;
-        }
-        evm_state_set_flat_state(runner->state, (flat_state_t *)runner->flat_state);
-    }
-
-    // Initialize EVM
-    runner->evm = evm_create(runner->state, NULL); // NULL = use default mainnet config
+    runner->evm = evm_create(runner->state, NULL);
     if (!runner->evm) {
         evm_state_destroy(runner->state);
         runner->state = NULL;
@@ -428,49 +412,20 @@ bool test_runner_init(test_runner_t *runner, const test_runner_config_t *config)
 
 void test_runner_destroy(test_runner_t *runner) {
     if (!runner) return;
-
-    if (runner->evm) {
-        evm_destroy(runner->evm);
-    }
-
-    if (runner->state) {
-        evm_state_set_flat_state(runner->state, NULL); /* detach before destroy */
-        evm_state_destroy(runner->state);
-    }
-
-    if (runner->flat_state)
-        flat_state_destroy((flat_state_t *)runner->flat_state);
-
+    if (runner->evm) evm_destroy(runner->evm);
+    if (runner->state) evm_state_destroy(runner->state);
     memset(runner, 0, sizeof(*runner));
 }
 
 void test_runner_reset(test_runner_t *runner) {
     if (!runner) return;
 
-    // Destroy old state and flat_state (stale data from previous test)
-    if (runner->evm) {
-        evm_destroy(runner->evm);
-        runner->evm = NULL;
-    }
-    if (runner->state) {
-        evm_state_set_flat_state(runner->state, NULL);
-        evm_state_destroy(runner->state);
-        runner->state = NULL;
-    }
-    if (runner->flat_state) {
-        flat_state_destroy((flat_state_t *)runner->flat_state);
-        runner->flat_state = NULL;
-    }
+    if (runner->evm) { evm_destroy(runner->evm); runner->evm = NULL; }
+    if (runner->state) { evm_state_destroy(runner->state); runner->state = NULL; }
 
-    // Recreate fresh
-    runner->state = evm_state_create(NULL   /* no code_store for tests */);
-    if (runner->state) {
-        /* Fresh flat_state for this test case */
-        runner->flat_state = flat_state_create("/dev/shm/test_runner_flat");
-        if (runner->flat_state)
-            evm_state_set_flat_state(runner->state, (flat_state_t *)runner->flat_state);
+    runner->state = evm_state_create(NULL);
+    if (runner->state)
         runner->evm = evm_create(runner->state, NULL);
-    }
 
     runner->total_gas_used = 0;
     runner->total_transactions = 0;

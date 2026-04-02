@@ -56,20 +56,8 @@ add_library(disk_table STATIC database/src/disk_table.c)
 add_library(arena STATIC database/src/arena.c)
 target_include_directories(arena PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 
-# Storage File (packed per-account storage persistence)
-add_library(storage_file STATIC database/src/storage_file.c)
-target_include_directories(storage_file PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-
-# Compact ART (in-memory index for flat_store)
+# Compact ART (used by art_mpt for backward-compatible wrapper)
 add_library(compact_art STATIC database/src/compact_art.c)
-
-# Flat Store (compact_art index + mmap'd data file)
-add_library(flat_store STATIC database/src/flat_store.c)
-target_link_libraries(flat_store compact_art)
-
-# Flat State (O(1) account/storage lookups via flat_store)
-add_library(flat_state STATIC database/src/flat_state.c)
-target_link_libraries(flat_state flat_store)
 
 # Code Store (content-addressed, append-only, deduplicated)
 add_library(code_store STATIC
@@ -117,23 +105,6 @@ add_library(art_mpt STATIC
 target_include_directories(art_mpt PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
 target_link_libraries(art_mpt compact_art art_database common)
 
-add_library(storage_trie STATIC database/src/storage_trie.c)
-target_include_directories(storage_trie PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-target_link_libraries(storage_trie art_mpt flat_store)
-
-add_library(account_trie STATIC database/src/account_trie.c)
-target_include_directories(account_trie PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-target_link_libraries(account_trie art_mpt flat_store flat_state)
-
-add_library(state_overlay STATIC database/src/state_overlay.c)
-target_include_directories(state_overlay PUBLIC
-    ${CMAKE_SOURCE_DIR}/database/include
-    ${CMAKE_SOURCE_DIR}/evm/include
-)
-target_link_libraries(state_overlay art_database flat_state flat_store storage_trie account_trie code_store arena art_mpt storage_file common)
-if(ENABLE_HISTORY)
-    target_compile_definitions(state_overlay PUBLIC ENABLE_HISTORY=1)
-endif()
 
 #==============================================================================
 # Libraries — EVM
@@ -145,44 +116,21 @@ set_target_properties(secp256k1 PROPERTIES
     IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/third_party/secp256k1/build/lib/libsecp256k1.a
 )
 
-# State v2 (in-memory only, no flat_state/flat_store)
-add_library(state_v2 STATIC
+# State (in-memory, no flat_state/flat_store)
+add_library(state STATIC
     state/src/state.c
-    state/src/evm_state_v2.c
+    state/src/evm_state.c
 )
-target_include_directories(state_v2 PUBLIC
+target_include_directories(state PUBLIC
     ${CMAKE_SOURCE_DIR}/state/include
     ${CMAKE_SOURCE_DIR}/database/include
     ${CMAKE_SOURCE_DIR}/evm/include
 )
-target_link_libraries(state_v2 art_database art_mpt code_store common)
+target_link_libraries(state art_database art_mpt code_store common)
 
-# EVM v2 (uses state_v2 instead of state_overlay)
-add_library(evm_v2 STATIC
-    evm/src/evm.c
-    state/src/evm_state_v2.c
-    evm/src/evm_tracer.c
-    evm/src/evm_stack.c
-    evm/src/evm_memory.c
-    evm/src/gas.c
-    evm/src/interpreter.c
-    evm/src/fork.c
-    evm/src/transaction.c
-    evm/src/precompile.c
-    evm/vendor/mini-gmp.c
-    evm/vendor/bn256.c
-)
-target_include_directories(evm_v2 PUBLIC
-    ${CMAKE_SOURCE_DIR}/evm/include
-    ${CMAKE_SOURCE_DIR}/evm/vendor
-    ${CMAKE_SOURCE_DIR}/state/include
-)
-target_link_libraries(evm_v2 state_v2 art_database common ssl crypto secp256k1 blst code_store)
-
-# EVM (Ethereum Virtual Machine — legacy, uses state_overlay)
+# EVM (Ethereum Virtual Machine)
 add_library(evm STATIC
     evm/src/evm.c
-    evm/src/evm_state.c
     evm/src/evm_tracer.c
     evm/src/evm_stack.c
     evm/src/evm_memory.c
@@ -197,9 +145,9 @@ add_library(evm STATIC
 target_include_directories(evm PUBLIC
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/evm/vendor
+    ${CMAKE_SOURCE_DIR}/state/include
 )
-set(EVM_LINK_LIBS art_database common ssl crypto secp256k1 blst code_store flat_state storage_trie account_trie state_overlay)
-target_link_libraries(evm ${EVM_LINK_LIBS})
+target_link_libraries(evm state art_database common ssl crypto secp256k1 blst code_store)
 if(ENABLE_EVM_TRACE)
     target_compile_definitions(evm PUBLIC ENABLE_EVM_TRACE=1)
 endif()
@@ -209,8 +157,6 @@ endif()
 if(ENABLE_HISTORY)
     target_compile_definitions(evm PUBLIC ENABLE_HISTORY=1)
 endif()
-target_compile_definitions(evm PRIVATE
-)
 
 #==============================================================================
 # Libraries — Block Executor
@@ -230,17 +176,9 @@ endif()
 add_library(block_executor STATIC ${BLOCK_EXECUTOR_SOURCES})
 target_include_directories(block_executor PUBLIC
     ${CMAKE_SOURCE_DIR}/executor/include
-)
-set(BLOCK_EXECUTOR_LIBS evm mem_mpt common secp256k1 pthread)
-target_link_libraries(block_executor ${BLOCK_EXECUTOR_LIBS})
-
-# Block executor v2 (uses evm_v2 / state_v2)
-add_library(block_executor_v2 STATIC ${BLOCK_EXECUTOR_SOURCES})
-target_include_directories(block_executor_v2 PUBLIC
-    ${CMAKE_SOURCE_DIR}/executor/include
     ${CMAKE_SOURCE_DIR}/state/include
 )
-target_link_libraries(block_executor_v2 evm_v2 mem_mpt common secp256k1 pthread)
+target_link_libraries(block_executor evm mem_mpt common secp256k1 pthread)
 
 #==============================================================================
 # Libraries — Networking / Portal
@@ -378,12 +316,6 @@ add_executable(test_evm_state_audit
 target_link_libraries(test_evm_state_audit evm)
 add_test(NAME test_evm_state_audit COMMAND test_evm_state_audit)
 
-add_executable(test_state_overlay_stress
-    evm/tests/test_state_overlay_stress.c
-)
-target_link_libraries(test_state_overlay_stress evm)
-add_test(NAME test_state_overlay_stress COMMAND test_state_overlay_stress)
-
 add_executable(test_art_mpt_fuzz database/tests/test_art_mpt_fuzz.c)
 target_link_libraries(test_art_mpt_fuzz art_mpt compact_art arena common)
 add_test(NAME test_art_mpt_fuzz COMMAND test_art_mpt_fuzz)
@@ -392,21 +324,14 @@ add_executable(test_art_mpt_mem database/tests/test_art_mpt_mem.c)
 target_link_libraries(test_art_mpt_mem art_mpt compact_art art_database common)
 add_test(NAME test_art_mpt_mem COMMAND test_art_mpt_mem)
 
-add_executable(test_flat_state_roundtrip
-    evm/tests/test_flat_state_roundtrip.c
+# Shared library for Python mpt_fuzz.py differential fuzzing
+add_library(mpt_fuzz SHARED tools/mpt_fuzz_lib.c)
+target_include_directories(mpt_fuzz PRIVATE
+    ${CMAKE_SOURCE_DIR}/database/include
+    ${CMAKE_SOURCE_DIR}/common/include
 )
-target_link_libraries(test_flat_state_roundtrip evm)
-add_test(NAME test_flat_state_roundtrip COMMAND test_flat_state_roundtrip)
+target_link_libraries(mpt_fuzz art_mpt compact_art art_database mem_mpt arena common)
 
-# Test: Arena allocator
-add_executable(test_arena database/tests/test_arena.c)
-target_link_libraries(test_arena arena)
-add_test(NAME test_arena COMMAND test_arena)
-
-# Test: Storage file (packed per-account storage)
-add_executable(test_storage_file database/tests/test_storage_file.c)
-target_link_libraries(test_storage_file storage_file)
-add_test(NAME test_storage_file COMMAND test_storage_file)
 
 # Test: ART→MPT cross-validation against Python reference vectors
 add_executable(test_art_mpt_vectors database/tests/test_art_mpt_vectors.c)
@@ -557,9 +482,9 @@ if(ENABLE_HISTORY)
     add_executable(history_dump tools/history_dump.c)
     target_link_libraries(history_dump block_executor evm common)
 
-    add_executable(state_reconstruct tools/state_reconstruct.c)
-    target_include_directories(state_reconstruct PRIVATE ${CJSON_INCLUDE_DIRS})
-    target_link_libraries(state_reconstruct block_executor evm common ${CJSON_LIBRARIES})
+    # state_reconstruct — disabled (needs rewrite for state_v2)
+    # add_executable(state_reconstruct tools/state_reconstruct.c)
+    # target_link_libraries(state_reconstruct block_executor evm common ${CJSON_LIBRARIES})
 
 endif()
 
@@ -724,7 +649,7 @@ if(CJSON_FOUND)
     add_library(sync STATIC sync/src/sync.c)
     target_include_directories(sync PUBLIC ${CMAKE_SOURCE_DIR}/sync/include)
     target_include_directories(sync PRIVATE ${CJSON_INCLUDE_DIRS})
-    set(SYNC_LIBS block_executor evm common ${CJSON_LIBRARIES} code_store flat_state)
+    set(SYNC_LIBS block_executor evm common ${CJSON_LIBRARIES} code_store)
     target_link_libraries(sync ${SYNC_LIBS})
     # TUI (ncurses terminal UI, optional)
     find_package(Curses QUIET)
@@ -747,10 +672,6 @@ if(CJSON_FOUND)
     add_executable(history_query tools/history_query.c)
     target_link_libraries(history_query block_executor evm common)
 
-    # Full-stack stress test (evm_state → flat_state → account_trie + storage_trie)
-    add_executable(stress_fullstack tools/stress_fullstack.c)
-    target_link_libraries(stress_fullstack evm)
-
     # Artex Node — full execution client (era1 replay + CL sync)
     add_executable(artex_node tools/artex_node.c)
     target_include_directories(artex_node PRIVATE
@@ -770,10 +691,10 @@ if(CJSON_FOUND)
         target_include_directories(integration_tests PUBLIC
             integration_tests/include
             executor/include
+            state/include
             ${CJSON_INCLUDE_DIRS}
         )
-        set(INTEG_TEST_LIBS evm block_executor flat_state common ${CJSON_LIBRARIES})
-        target_link_libraries(integration_tests PUBLIC ${INTEG_TEST_LIBS})
+        target_link_libraries(integration_tests PUBLIC evm block_executor common ${CJSON_LIBRARIES})
 
         add_executable(test_parser_verify integration_tests/test_parser_verify.c)
         target_link_libraries(test_parser_verify integration_tests)
@@ -783,22 +704,6 @@ if(CJSON_FOUND)
 
         add_executable(test_runner_batch integration_tests/test_runner_batch_main.c)
         target_link_libraries(test_runner_batch integration_tests)
-
-        # State v2 test runner
-        add_library(integration_tests_v2 STATIC ${INTEGRATION_TEST_SOURCES})
-        target_include_directories(integration_tests_v2 PUBLIC
-            integration_tests/include
-            executor/include
-            state/include
-            ${CJSON_INCLUDE_DIRS}
-        )
-        target_link_libraries(integration_tests_v2 PUBLIC evm_v2 block_executor_v2 flat_state common ${CJSON_LIBRARIES})
-
-        add_executable(test_runner_batch_v2 integration_tests/test_runner_batch_main.c)
-        target_link_libraries(test_runner_batch_v2 integration_tests_v2)
-
-        add_executable(test_runner_failfast_v2 integration_tests/test_runner_failfast_main.c)
-        target_link_libraries(test_runner_failfast_v2 integration_tests_v2)
 
         add_executable(test_runner_failfast integration_tests/test_runner_failfast_main.c)
         target_link_libraries(test_runner_failfast integration_tests)

@@ -96,12 +96,9 @@ typedef struct {
  * Test execution environment
  */
 typedef struct {
-    evm_state_t *state;         // Typed EVM state interface
-    evm_t *evm;                 // EVM instance
+    evm_state_t *state;
+    evm_t *evm;
     test_runner_config_t config;
-
-    // Persistent flat_state (reused across resets — owns compact_arts for tries)
-    void *flat_state;           // flat_state_t* (opaque, owned by runner)
 
     // Statistics
     uint64_t total_gas_used;
