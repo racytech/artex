@@ -174,10 +174,7 @@ struct state {
     account_t *accounts;
     uint32_t   count;       /* number of accounts in use */
     uint32_t   capacity;    /* allocated slots */
-    mem_art_t  acct_index;  /* addr_hash[32] → uint32_t idx */
-
-    /* Reverse lookup: addr[20] → uint32_t idx (for find_account by address) */
-    mem_art_t  addr_lookup;
+    mem_art_t  acct_index;  /* addr_hash[32] → uint32_t idx (lookup + trie) */
 
     /* Resource vector (only accounts with code/storage) */
     resource_t *resources;
@@ -221,8 +218,9 @@ struct state {
  * ========================================================================= */
 
 static account_t *find_account(const state_t *s, const uint8_t addr[20]) {
+    hash_t h = hash_keccak256(addr, 20);
     const uint32_t *pidx = (const uint32_t *)
-        mem_art_get(&((state_t *)s)->addr_lookup, addr, 20, NULL);
+        mem_art_get(&((state_t *)s)->acct_index, h.bytes, 32, NULL);
     if (!pidx) return NULL;
     uint32_t idx = *pidx;
     if (idx >= s->count) return NULL;
@@ -256,8 +254,7 @@ static resource_t *ensure_resource(state_t *s, account_t *a) {
     return r;
 }
 
-/* Create account in vector + addr_lookup only (no trie insertion).
- * Used by read-only paths — avoids polluting acct_index with phantom entries. */
+/* Get or create account. Inserts into acct_index (trie) on creation. */
 static account_t *ensure_account(state_t *s, const address_t *addr) {
     account_t *existing = find_account(s, addr->bytes);
     if (existing) {
@@ -282,10 +279,12 @@ static account_t *ensure_account(state_t *s, const address_t *addr) {
     address_copy(&a->addr, addr);
     a->last_access_block = s->current_block;
 
-    /* Insert into addr_lookup only — NOT acct_index (trie).
-     * acct_index insertion happens in ensure_in_trie when the account
-     * is actually modified (write path). */
-    mem_art_insert(&s->addr_lookup, addr->bytes, 20, &idx, sizeof(idx));
+    /* Single index: addr_hash[32] → idx (serves both lookup and trie) */
+    hash_t addr_hash = hash_keccak256(addr->bytes, 20);
+    mem_art_insert(&s->acct_index, addr_hash.bytes, 32, &idx, sizeof(idx));
+
+    (void)0;
+
     return a;
 }
 
@@ -398,7 +397,6 @@ static uint32_t acct_trie_encode(const uint8_t *key, const void *leaf_val,
     state_t *s = user_ctx;
     uint32_t idx;
     memcpy(&idx, leaf_val, sizeof(idx));
-    /* encode callback continues below */
     if (idx >= s->count) return 0;
 
     account_t *a = &s->accounts[idx];
@@ -407,12 +405,16 @@ static uint32_t acct_trie_encode(const uint8_t *key, const void *leaf_val,
     uint8_t bal_be[32];
     uint256_to_bytes(&a->balance, bal_be);
 
-    return build_account_rlp(
+    uint32_t len = build_account_rlp(
         a->nonce, bal_be,
         r ? r->storage_root.bytes : EMPTY_STORAGE_ROOT.bytes,
         r && acct_has_flag(a, ACCT_HAS_CODE) ? r->code_hash.bytes
                                               : EMPTY_CODE_HASH.bytes,
         rlp_out);
+
+    (void)key;
+
+    return len;
 }
 
 state_t *state_create(code_store_t *cs) {
@@ -425,7 +427,6 @@ state_t *state_create(code_store_t *cs) {
     s->capacity = ACCT_INIT_CAP;
 
     mem_art_init(&s->acct_index);
-    mem_art_init(&s->addr_lookup);
     mem_art_init(&s->warm_addrs);
     mem_art_init(&s->warm_slots);
     mem_art_init(&s->transient);
@@ -465,7 +466,6 @@ void state_destroy(state_t *s) {
 
     if (s->acct_trie_mpt) art_mpt_destroy(s->acct_trie_mpt);
     mem_art_destroy(&s->acct_index);
-    mem_art_destroy(&s->addr_lookup);
     mem_art_destroy(&s->warm_addrs);
     mem_art_destroy(&s->warm_slots);
     mem_art_destroy(&s->transient);
@@ -1086,6 +1086,18 @@ state_stats_t state_get_stats(const state_t *s) {
 hash_t state_compute_root(state_t *s, bool prune_empty) {
     hash_t root = {0};
     if (!s || !s->acct_trie_mpt) return root;
+
+    /* Step 0: Remove phantom accounts from acct_index.
+     * ensure_account inserts every accessed address into acct_index for lookup.
+     * Accounts that were only read (never modified) have no EXISTED flag and
+     * are empty — they must not appear in the trie. */
+    for (uint32_t i = 0; i < s->count; i++) {
+        account_t *a = &s->accounts[i];
+        if (!acct_has_flag(a, ACCT_EXISTED) && acct_is_empty(a)) {
+            hash_t h = hash_keccak256(a->addr.bytes, 20);
+            mem_art_delete(&s->acct_index, h.bytes, 32);
+        }
+    }
 
     /* Step 1: For each dirty account, decide existence + compute storage root */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
