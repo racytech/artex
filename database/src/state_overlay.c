@@ -1193,11 +1193,12 @@ void state_overlay_begin_block(state_overlay_t *so, uint64_t block_number) {
 void state_overlay_commit(state_overlay_t *so) {
     if (!so) return;
 
-    /* Promote + reset account flags — iterate only used entries */
-    for (uint32_t i = 0; i < so->next_acct_idx; i++) {
-        cached_account_t *ca = &so->acct_meta.entries[i];
-        if (ca->addr.bytes[0] == 0 && ca->addr.bytes[1] == 0 &&
-            !ca->dirty && !ca->existed && !ca->created) continue;
+    /* Promote + reset flags — only for accounts touched this block */
+    for (size_t d = 0; d < so->dirty_accounts.count; d++) {
+        const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
+        cached_account_t *ca = find_account_meta(so, akey);
+        if (!ca) continue;
+
         bool is_empty = (ca->nonce == 0 && uint256_is_zero(&ca->balance) && !ca->has_code);
         bool touched = (ca->existed || ca->created || ca->dirty || ca->code_dirty);
         if (touched && (!is_empty || !so->prune_empty))
