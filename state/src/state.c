@@ -429,6 +429,12 @@ state_t *state_create(code_store_t *cs) {
     if (!s->journal) { free(s->accounts); free(s); return NULL; }
     s->journal_cap = JOURNAL_INIT_CAP;
 
+    /* Reserve resource index 0 as "none" (resource_idx=0 means no resource) */
+    s->resources = calloc(1024, sizeof(resource_t));
+    if (!s->resources) { free(s->journal); free(s->accounts); free(s); return NULL; }
+    s->res_capacity = 1024;
+    s->res_count = 1;
+
     /* Account trie MPT — wraps acct_index mem_art */
     s->acct_trie_ctx.tree = &s->acct_index;
     s->acct_trie_ctx.key_size = 32;   /* addr_hash */
@@ -777,6 +783,13 @@ void state_mark_storage_warm(state_t *s, const address_t *addr, const uint256_t 
     make_slot_key(addr, key, skey);
     uint8_t one = 1;
     mem_art_insert(&s->warm_slots, skey, SLOT_KEY_SIZE, &one, 1);
+}
+
+bool state_is_storage_warm(const state_t *s, const address_t *addr, const uint256_t *key) {
+    if (!s || !addr || !key) return false;
+    uint8_t skey[SLOT_KEY_SIZE];
+    make_slot_key(addr, key, skey);
+    return mem_art_contains(&((state_t *)s)->warm_slots, skey, SLOT_KEY_SIZE);
 }
 
 /* =========================================================================

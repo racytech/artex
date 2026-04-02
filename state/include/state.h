@@ -114,6 +114,7 @@ void state_set_prune_empty(state_t *s, bool enabled);
 void state_mark_addr_warm(state_t *s, const address_t *addr);
 bool state_is_addr_warm(const state_t *s, const address_t *addr);
 void state_mark_storage_warm(state_t *s, const address_t *addr, const uint256_t *key);
+bool state_is_storage_warm(const state_t *s, const address_t *addr, const uint256_t *key);
 
 /* =========================================================================
  * EIP-1153 transient storage

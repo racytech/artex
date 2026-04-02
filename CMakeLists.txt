@@ -145,7 +145,41 @@ set_target_properties(secp256k1 PROPERTIES
     IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/third_party/secp256k1/build/lib/libsecp256k1.a
 )
 
-# EVM (Ethereum Virtual Machine)
+# State v2 (in-memory only, no flat_state/flat_store)
+add_library(state_v2 STATIC
+    state/src/state.c
+    state/src/evm_state_v2.c
+)
+target_include_directories(state_v2 PUBLIC
+    ${CMAKE_SOURCE_DIR}/state/include
+    ${CMAKE_SOURCE_DIR}/database/include
+    ${CMAKE_SOURCE_DIR}/evm/include
+)
+target_link_libraries(state_v2 art_database art_mpt code_store common)
+
+# EVM v2 (uses state_v2 instead of state_overlay)
+add_library(evm_v2 STATIC
+    evm/src/evm.c
+    state/src/evm_state_v2.c
+    evm/src/evm_tracer.c
+    evm/src/evm_stack.c
+    evm/src/evm_memory.c
+    evm/src/gas.c
+    evm/src/interpreter.c
+    evm/src/fork.c
+    evm/src/transaction.c
+    evm/src/precompile.c
+    evm/vendor/mini-gmp.c
+    evm/vendor/bn256.c
+)
+target_include_directories(evm_v2 PUBLIC
+    ${CMAKE_SOURCE_DIR}/evm/include
+    ${CMAKE_SOURCE_DIR}/evm/vendor
+    ${CMAKE_SOURCE_DIR}/state/include
+)
+target_link_libraries(evm_v2 state_v2 art_database common ssl crypto secp256k1 blst code_store)
+
+# EVM (Ethereum Virtual Machine — legacy, uses state_overlay)
 add_library(evm STATIC
     evm/src/evm.c
     evm/src/evm_state.c
@@ -199,6 +233,14 @@ target_include_directories(block_executor PUBLIC
 )
 set(BLOCK_EXECUTOR_LIBS evm mem_mpt common secp256k1 pthread)
 target_link_libraries(block_executor ${BLOCK_EXECUTOR_LIBS})
+
+# Block executor v2 (uses evm_v2 / state_v2)
+add_library(block_executor_v2 STATIC ${BLOCK_EXECUTOR_SOURCES})
+target_include_directories(block_executor_v2 PUBLIC
+    ${CMAKE_SOURCE_DIR}/executor/include
+    ${CMAKE_SOURCE_DIR}/state/include
+)
+target_link_libraries(block_executor_v2 evm_v2 mem_mpt common secp256k1 pthread)
 
 #==============================================================================
 # Libraries — Networking / Portal
@@ -741,6 +783,19 @@ if(CJSON_FOUND)
 
         add_executable(test_runner_batch integration_tests/test_runner_batch_main.c)
         target_link_libraries(test_runner_batch integration_tests)
+
+        # State v2 test runner
+        add_library(integration_tests_v2 STATIC ${INTEGRATION_TEST_SOURCES})
+        target_include_directories(integration_tests_v2 PUBLIC
+            integration_tests/include
+            executor/include
+            state/include
+            ${CJSON_INCLUDE_DIRS}
+        )
+        target_link_libraries(integration_tests_v2 PUBLIC evm_v2 block_executor_v2 flat_state common ${CJSON_LIBRARIES})
+
+        add_executable(test_runner_batch_v2 integration_tests/test_runner_batch_main.c)
+        target_link_libraries(test_runner_batch_v2 integration_tests_v2)
 
         add_executable(test_runner_failfast integration_tests/test_runner_failfast_main.c)
         target_link_libraries(test_runner_failfast integration_tests)
