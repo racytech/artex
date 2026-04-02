@@ -289,13 +289,6 @@ static account_t *ensure_account(state_t *s, const address_t *addr) {
     return a;
 }
 
-/* Insert account into acct_index (trie) if not already present.
- * Called by write paths before marking dirty. */
-static void ensure_in_trie(state_t *s, account_t *a) {
-    uint32_t idx = (uint32_t)(a - s->accounts);
-    hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
-    mem_art_insert(&s->acct_index, addr_hash.bytes, 32, &idx, sizeof(idx));
-}
 
 static bool journal_push(state_t *s, const journal_entry_t *entry) {
     if (s->journal_len >= s->journal_cap) {
