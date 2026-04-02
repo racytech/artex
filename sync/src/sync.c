@@ -343,29 +343,7 @@ bool sync_resume(sync_t *sync, uint64_t last_block,
 // Batch MPT root validation (internal)
 // ============================================================================
 
-/**
- * Compute MPT state root and validate against the pending expected root
- * (saved from the last block's header). Called at checkpoint boundaries.
- *
- * Sets sync->batch_root_computed = true on success.
- * Returns true if root matches (or validation is disabled).
- * On mismatch, populates actual/expected in sync for the caller to report.
- */
-static bool sync_validate_batch_root(sync_t *sync,
-                                     hash_t *actual_out,
-                                     hash_t *expected_out) {
-    bool prune_empty = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
-    hash_t actual = evm_state_compute_mpt_root(sync->state, prune_empty);
-    sync->batch_root_computed = true;
-
-    if (actual_out)   *actual_out   = actual;
-    if (expected_out)  *expected_out = sync->pending_expected_root;
-
-    if (!sync->config.validate_state_root)
-        return true;
-
-    return memcmp(actual.bytes, sync->pending_expected_root.bytes, 32) == 0;
-}
+/* sync_validate_batch_root removed — per-block validation in sync_execute_block */
 
 // ============================================================================
 // Block Execution
@@ -542,41 +520,7 @@ void sync_set_live_mode(sync_t *sync, bool live) {
 // Flush + Evict (periodic, after root validation)
 // ============================================================================
 
-static void sync_flush_and_evict(sync_t *sync) {
-    if (!sync) return;
-
-    /* Compute MPT root before eviction if not already done.
-     * This ensures dirty data is captured into deferred buffer
-     * before cache entries are dropped. */
-    if (!sync->batch_root_computed) {
-        bool prune_empty = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
-        evm_state_compute_mpt_root(sync->state, prune_empty);
-        sync->batch_root_computed = true;
-    }
-
-    /* Snapshot stats before eviction clears the cache */
-    sync->last_stats = evm_state_get_stats(sync->state);
-    sync->last_stats.exec_ms = sync->exec_ms; /* save before reset */
-    sync->exec_ms = 0; /* reset for next window */
-
-    /* Evict cache — root computation captured all dirty data into MPT
-     * deferred buffer. Safe to drop cached entries now. */
-    struct timespec _ev0, _ev1;
-    clock_gettime(CLOCK_MONOTONIC, &_ev0);
-#ifdef ENABLE_DEBUG
-    if (!sync->config.no_evict)
-#endif
-        evm_state_evict_cache(sync->state);
-    clock_gettime(CLOCK_MONOTONIC, &_ev1);
-
-    sync->last_evict_ms = (_ev1.tv_sec - _ev0.tv_sec) * 1000.0 +
-                           (_ev1.tv_nsec - _ev0.tv_nsec) / 1e6;
-
-    /* Kick off background flush — execution continues immediately */
-    sync_flush_code(sync);
-
-    sync->batch_root_computed = false;
-}
+/* sync_flush_and_evict removed — no batched eviction with mem_art */
 
 bool sync_get_block_hash(const sync_t *sync, uint64_t block_number, hash_t *out) {
     if (!sync || !out || block_number == 0) return false;
@@ -605,7 +549,7 @@ evm_state_stats_t sync_get_state_stats(const sync_t *sync) {
     evm_state_stats_t st = sync->last_stats;
     st.evict_ms = sync->last_evict_ms;
     st.wait_flush_ms = sync->root_ms;
-    /* exec_ms already saved in last_stats by sync_flush_and_evict */
+    /* exec_ms saved in last_stats by periodic stats snapshot */
     return st;
 }
 

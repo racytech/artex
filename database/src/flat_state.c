@@ -211,39 +211,26 @@ flat_state_t *flat_state_create(const char *path) {
     if (!path) return NULL;
 
     char *acct_path = make_path(path, "_acct.art");
-    char *stor_path = make_path(path, "_stor.art");
-    if (!acct_path || !stor_path) {
-        free(acct_path); free(stor_path);
-        return NULL;
-    }
+    if (!acct_path) return NULL;
 
     flat_store_t *accounts = flat_store_create(acct_path, ACCT_KEY_SIZE, ACCT_MAX_REC_SIZE);
     if (!accounts) {
         fprintf(stderr, "flat_state: failed to create account store at %s\n", acct_path);
-        free(acct_path); free(stor_path);
-        return NULL;
-    }
-
-    flat_store_t *storage = flat_store_create(stor_path, STOR_KEY_SIZE, STOR_MAX_REC_SIZE);
-    if (!storage) {
-        fprintf(stderr, "flat_state: failed to create storage store at %s\n", stor_path);
-        flat_store_destroy(accounts);
-        free(acct_path); free(stor_path);
+        free(acct_path);
         return NULL;
     }
 
     flat_state_t *fs = calloc(1, sizeof(*fs));
     if (!fs) {
         flat_store_destroy(accounts);
-        flat_store_destroy(storage);
-        free(acct_path); free(stor_path);
+        free(acct_path);
         return NULL;
     }
 
     fs->accounts  = accounts;
-    fs->storage   = storage;
+    fs->storage   = NULL;  /* storage handled by per-account mem_art, not flat_state */
     fs->acct_path = acct_path;
-    fs->stor_path = stor_path;
+    fs->stor_path = NULL;
     return fs;
 }
 
@@ -251,37 +238,25 @@ flat_state_t *flat_state_open(const char *path) {
     if (!path) return NULL;
 
     char *acct_path = make_path(path, "_acct.art");
-    char *stor_path = make_path(path, "_stor.art");
-    if (!acct_path || !stor_path) {
-        free(acct_path); free(stor_path);
-        return NULL;
-    }
+    if (!acct_path) return NULL;
 
     flat_store_t *accounts = flat_store_open(acct_path);
     if (!accounts) {
-        free(acct_path); free(stor_path);
-        return NULL;
-    }
-
-    flat_store_t *storage = flat_store_open(stor_path);
-    if (!storage) {
-        flat_store_destroy(accounts);
-        free(acct_path); free(stor_path);
+        free(acct_path);
         return NULL;
     }
 
     flat_state_t *fs = calloc(1, sizeof(*fs));
     if (!fs) {
         flat_store_destroy(accounts);
-        flat_store_destroy(storage);
-        free(acct_path); free(stor_path);
+        free(acct_path);
         return NULL;
     }
 
     fs->accounts  = accounts;
-    fs->storage   = storage;
+    fs->storage   = NULL;
     fs->acct_path = acct_path;
-    fs->stor_path = stor_path;
+    fs->stor_path = NULL;
     return fs;
 }
 
