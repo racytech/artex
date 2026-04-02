@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "compact_art.h"
+#include "art_iface.h"
 
 /**
  * ART→MPT — Incremental Ethereum MPT root hash from compact_art.
@@ -39,10 +40,14 @@ typedef uint32_t (*art_mpt_value_encode_t)(const uint8_t *key,
                                             void *user_ctx);
 
 /**
- * Create an art_mpt context over an existing compact_art tree.
+ * Create an art_mpt context over any ART tree via the abstract interface.
  * The tree is NOT owned — caller manages its lifetime.
- * encode: callback for leaf value → RLP conversion.
- * ctx: user context passed to encode.
+ */
+art_mpt_t *art_mpt_create_iface(art_iface_t iface,
+                                  art_mpt_value_encode_t encode, void *ctx);
+
+/**
+ * Convenience: create over a compact_art tree (backward compatible).
  */
 art_mpt_t *art_mpt_create(compact_art_t *tree,
                             art_mpt_value_encode_t encode, void *ctx);

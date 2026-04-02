@@ -61,6 +61,7 @@ struct mem_art_iterator {
 // ============================================================================
 
 bool mem_art_init(mem_art_t *tree);
+bool mem_art_init_cap(mem_art_t *tree, size_t initial_cap);
 void mem_art_destroy(mem_art_t *tree);
 
 bool mem_art_insert(mem_art_t *tree, const uint8_t *key, size_t key_len,

@@ -1,15 +1,17 @@
 /*
- * ART→MPT — Incremental Ethereum MPT root hash from compact_art.
+ * ART→MPT — Incremental Ethereum MPT root hash from any ART tree.
  *
+ * Uses art_iface_t vtable to abstract over compact_art and mem_art.
  * Side hash cache on ART inner nodes enables incremental computation:
  * only dirty paths (from mutated leaves to root) are rehashed.
  * Clean subtrees return cached hashes in O(1).
  *
- * Cache is indexed by compact_ref_t (inner node pool offset / 8).
- * Leaf hashes are NOT cached — recomputed on demand from flat_state.
+ * Cache is indexed by art_ref_t (inner node offset).
+ * Leaf hashes are NOT cached — recomputed on demand.
  */
 
 #include "art_mpt.h"
+#include "art_iface.h"
 #include "keccak256.h"
 
 #include <stdio.h>
@@ -45,17 +47,15 @@ typedef struct {
  * ========================================================================= */
 
 struct art_mpt {
-    compact_art_t          *tree;
+    art_iface_t             iface;
     art_mpt_value_encode_t  encode;
     void                   *encode_ctx;
 
-    /* Hash cache: indexed by compact_ref_t / 8 for inner nodes.
-     * Stores either inline RLP (< 32 bytes) or keccak hash (32 bytes). */
     hash_entry_t *cache;
     size_t        cache_cap;
 
-    bool             no_cache;   /* disable caching (for stateless full recompute) */
-    uint32_t         mpt_key_offset; /* for subtree mode: MPT key starts at this byte offset */
+    bool             no_cache;
+    uint32_t         mpt_key_offset;
     art_mpt_stats_t stats;
 };
 
@@ -138,198 +138,47 @@ static size_t hex_prefix_encode(const uint8_t *nibbles, size_t nibble_len,
     }
 }
 
-/* Convert full RLP to hash_ref return convention:
- * < 32 bytes: return as-is (inline)
- * >= 32 bytes: return keccak hash (32 bytes) */
-static size_t rlp_to_hashref(const uint8_t *rlp, size_t rlp_len,
-                               uint8_t *out) {
-    if (rlp_len < 32) {
-        memcpy(out, rlp, rlp_len);
-        return rlp_len;
-    }
+static size_t rlp_to_hashref(const uint8_t *rlp, size_t rlp_len, uint8_t *out) {
+    if (rlp_len < 32) { memcpy(out, rlp, rlp_len); return rlp_len; }
     keccak(rlp, rlp_len, out);
     return 32;
 }
 
-/* Encode a child reference for embedding in a parent node's RLP.
- * New convention: child_rlp_len < 32 = inline RLP, embed as-is.
- *                 child_rlp_len == 32 = already a keccak hash, encode as 0xa0+hash.
- *                 child_rlp_len > 32  = full RLP, hash it then encode as 0xa0+hash. */
 static size_t encode_child_ref(const uint8_t *child_rlp, size_t child_rlp_len,
                                 uint8_t *ref_out) {
     if (child_rlp_len == 0) { ref_out[0] = 0x80; return 1; }
-    if (child_rlp_len < 32) {
-        /* Inline: embed raw RLP bytes */
-        memcpy(ref_out, child_rlp, child_rlp_len);
-        return child_rlp_len;
-    }
-    if (child_rlp_len == 32) {
-        /* Already a hash — just wrap with 0xa0 prefix */
-        ref_out[0] = 0xa0;
-        memcpy(ref_out + 1, child_rlp, 32);
-        return 33;
-    }
-    /* Full RLP >= 33 bytes — hash it */
+    if (child_rlp_len < 32) { memcpy(ref_out, child_rlp, child_rlp_len); return child_rlp_len; }
+    if (child_rlp_len == 32) { ref_out[0] = 0xa0; memcpy(ref_out + 1, child_rlp, 32); return 33; }
     ref_out[0] = 0xa0;
     keccak(child_rlp, child_rlp_len, ref_out + 1);
     return 33;
 }
 
 /* =========================================================================
- * ART node access helpers
+ * Hash cache — indexed by ref offset
  * ========================================================================= */
 
-static inline void *node_ptr(const compact_art_t *tree, compact_ref_t ref) {
-    return tree->nodes.base + ((size_t)(ref & 0x7FFFFFFFU) * 8);
+static inline size_t ref_to_idx(art_ref_t ref) {
+    return (size_t)(ref & 0x7FFFFFFFu);
 }
 
-static inline void *leaf_ptr(const compact_art_t *tree, compact_ref_t ref) {
-    return tree->leaves.base + (size_t)COMPACT_LEAF_INDEX(ref) * tree->leaf_size;
-}
-
-static bool get_leaf_key(const compact_art_t *tree, compact_ref_t ref,
-                          uint8_t *key_out) {
-    const uint8_t *leaf = leaf_ptr(tree, ref);
-    if (tree->leaf_key_size == tree->key_size) {
-        memcpy(key_out, leaf, tree->key_size);
-        return true;
-    }
-    if (tree->key_fetch) {
-        const void *val = leaf + tree->leaf_key_size;
-        return tree->key_fetch(val, key_out, tree->key_fetch_ctx);
-    }
-    return false;
-}
-
-static const void *get_leaf_value(const compact_art_t *tree, compact_ref_t ref) {
-    return (const uint8_t *)leaf_ptr(tree, ref) + tree->leaf_key_size;
-}
-
-static int get_art_children(const compact_art_t *tree, const void *node,
-                             uint8_t *keys, compact_ref_t *refs) {
-    uint8_t type = *(const uint8_t *)node;
-    switch (type) {
-    case COMPACT_NODE_4: {
-        const compact_node4_t *n = node;
-        for (int i = 0; i < n->num_children; i++) { keys[i] = n->keys[i]; refs[i] = n->children[i]; }
-        return n->num_children;
-    }
-    case COMPACT_NODE_16: {
-        const compact_node16_t *n = node;
-        for (int i = 0; i < n->num_children; i++) { keys[i] = n->keys[i]; refs[i] = n->children[i]; }
-        return n->num_children;
-    }
-    case COMPACT_NODE_32: {
-        const compact_node32_t *n = node;
-        for (int i = 0; i < n->num_children; i++) { keys[i] = n->keys[i]; refs[i] = n->children[i]; }
-        return n->num_children;
-    }
-    case COMPACT_NODE_48: {
-        const compact_node48_t *n = node;
-        int count = 0;
-        for (int i = 0; i < 256; i++) {
-            if (n->index[i] != COMPACT_NODE48_EMPTY) {
-                keys[count] = (uint8_t)i; refs[count] = n->children[n->index[i]]; count++;
-            }
-        }
-        return count;
-    }
-    case COMPACT_NODE_256: {
-        const compact_node256_t *n = node;
-        int count = 0;
-        for (int i = 0; i < 256; i++) {
-            if (n->children[i] != COMPACT_REF_NULL) {
-                keys[count] = (uint8_t)i; refs[count] = n->children[i]; count++;
-            }
-        }
-        return count;
-    }
-    }
-    return 0;
-}
-
-static const uint8_t *get_partial(const void *node, uint8_t *partial_len) {
-    uint8_t type = *(const uint8_t *)node;
-    switch (type) {
-    case COMPACT_NODE_4:   *partial_len = ((const compact_node4_t *)node)->partial_len; return ((const compact_node4_t *)node)->partial;
-    case COMPACT_NODE_16:  *partial_len = ((const compact_node16_t *)node)->partial_len; return ((const compact_node16_t *)node)->partial;
-    case COMPACT_NODE_32:  *partial_len = ((const compact_node32_t *)node)->partial_len; return ((const compact_node32_t *)node)->partial;
-    case COMPACT_NODE_48:  *partial_len = ((const compact_node48_t *)node)->partial_len; return ((const compact_node48_t *)node)->partial;
-    case COMPACT_NODE_256: *partial_len = ((const compact_node256_t *)node)->partial_len; return ((const compact_node256_t *)node)->partial;
-    }
-    *partial_len = 0;
-    return NULL;
-}
-
-/* =========================================================================
- * Hash cache access
- * ========================================================================= */
-
-/* =========================================================================
- * Node dirty flag access
- * ========================================================================= */
-
-static inline bool node_is_dirty(const compact_art_t *tree, compact_ref_t ref) {
-    if (COMPACT_IS_LEAF_REF(ref) || ref == COMPACT_REF_NULL) return true;
-    const void *node = (const uint8_t *)tree->nodes.base + ((size_t)(ref & 0x7FFFFFFFU) * 8);
-    uint8_t type = *(const uint8_t *)node;
-    const uint8_t *flags;
-    switch (type) {
-    case COMPACT_NODE_4:   flags = &((const compact_node4_t *)node)->flags; break;
-    case COMPACT_NODE_16:  flags = &((const compact_node16_t *)node)->flags; break;
-    case COMPACT_NODE_32:  flags = &((const compact_node32_t *)node)->flags; break;
-    case COMPACT_NODE_48:  flags = &((const compact_node48_t *)node)->flags; break;
-    case COMPACT_NODE_256: flags = &((const compact_node256_t *)node)->flags; break;
-    default: return true;
-    }
-    return (*flags & COMPACT_NODE_FLAG_DIRTY) != 0;
-}
-
-static inline void node_clear_dirty(const compact_art_t *tree, compact_ref_t ref) {
-    if (COMPACT_IS_LEAF_REF(ref) || ref == COMPACT_REF_NULL) return;
-    void *node = (uint8_t *)tree->nodes.base + ((size_t)(ref & 0x7FFFFFFFU) * 8);
-    uint8_t type = *(const uint8_t *)node;
-    uint8_t *flags;
-    switch (type) {
-    case COMPACT_NODE_4:   flags = &((compact_node4_t *)node)->flags; break;
-    case COMPACT_NODE_16:  flags = &((compact_node16_t *)node)->flags; break;
-    case COMPACT_NODE_32:  flags = &((compact_node32_t *)node)->flags; break;
-    case COMPACT_NODE_48:  flags = &((compact_node48_t *)node)->flags; break;
-    case COMPACT_NODE_256: flags = &((compact_node256_t *)node)->flags; break;
-    default: return;
-    }
-    *flags &= ~COMPACT_NODE_FLAG_DIRTY;
-}
-
-/* =========================================================================
- * Hash cache — indexed by compact_ref / 8
- * Only stores computed hash/inline RLP. Validity is determined by
- * the ART node's dirty flag, not by the cache entry itself.
- * ========================================================================= */
-
-static inline size_t ref_to_idx(compact_ref_t ref) {
-    return (size_t)(ref & 0x7FFFFFFFU);
-}
-
-static bool cache_get(art_mpt_t *am, compact_ref_t ref,
+static bool cache_get(art_mpt_t *am, art_ref_t ref,
                        size_t byte_depth, uint8_t *out, size_t *out_len) {
-    if (COMPACT_IS_LEAF_REF(ref)) return false;
-    if (node_is_dirty(am->tree, ref)) return false;
+    if (ART_IS_LEAF(ref)) return false;
+    if (am->iface.is_dirty(am->iface.ctx, ref)) return false;
     size_t idx = ref_to_idx(ref);
     if (idx >= am->cache_cap) return false;
     const hash_entry_t *e = &am->cache[idx];
     if (e->len == 0) return false;
     if (e->depth != (uint8_t)byte_depth) return false;
-
-    /* Return in hash_ref convention: < 32 = inline RLP, 32 = keccak hash */
     memcpy(out, e->data, e->len);
     *out_len = e->len;
     return true;
 }
 
-static void cache_put(art_mpt_t *am, compact_ref_t ref,
+static void cache_put(art_mpt_t *am, art_ref_t ref,
                        size_t byte_depth, const uint8_t *data, size_t data_len) {
-    if (COMPACT_IS_LEAF_REF(ref)) return;
+    if (ART_IS_LEAF(ref)) return;
     if (am->no_cache) return;
     if (data_len == 0 || data_len > 32) return;
 
@@ -349,34 +198,53 @@ static void cache_put(art_mpt_t *am, compact_ref_t ref,
     e->len = (uint8_t)data_len;
     e->depth = (uint8_t)byte_depth;
 
-    node_clear_dirty(am->tree, ref);
+    am->iface.clear_dirty(am->iface.ctx, ref);
 }
 
-/* Dirty marking is handled by compact_art itself (in insert_recursive /
- * delete_recursive). No separate invalidation walk needed. */
-
 /* =========================================================================
- * MPT hash computation (same algorithm as before, with cache)
+ * Long partial reconstruction — when partial_len > max_prefix,
+ * walk down to a descendant leaf and read the full key.
  * ========================================================================= */
 
-static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
+static void reconstruct_partial(art_mpt_t *am, art_ref_t ref,
+                                 size_t byte_depth, uint8_t partial_len,
+                                 uint8_t *out) {
+    /* Walk to leftmost leaf descendant */
+    art_ref_t probe = ref;
+    while (!ART_IS_LEAF(probe) && probe != ART_REF_NULL) {
+        void *pn = am->iface.node_ptr(am->iface.ctx, probe);
+        uint8_t pk[256]; art_ref_t pr[256];
+        int pc = am->iface.node_children(am->iface.ctx, pn, pk, pr);
+        if (pc == 0) break;
+        probe = pr[0];
+    }
+    if (ART_IS_LEAF(probe)) {
+        uint8_t lk[64];
+        if (am->iface.leaf_key(am->iface.ctx, probe, lk))
+            memcpy(out, lk + byte_depth, partial_len);
+    }
+}
+
+/* =========================================================================
+ * MPT hash computation
+ * ========================================================================= */
+
+static size_t hash_ref(art_mpt_t *am, art_ref_t ref, size_t byte_depth,
                         const uint8_t *nib_prefix, size_t nib_prefix_len,
                         uint8_t *rlp_out);
 
-static size_t encode_leaf(art_mpt_t *am, compact_ref_t leaf_ref,
+static size_t encode_leaf(art_mpt_t *am, art_ref_t leaf_ref,
                            size_t byte_depth,
                            const uint8_t *nib_prefix, size_t nib_prefix_len,
                            uint8_t *rlp_out) {
     uint8_t key[64];
-    if (!get_leaf_key(am->tree, leaf_ref, key)) return 0;
+    if (!am->iface.leaf_key(am->iface.ctx, leaf_ref, key)) return 0;
 
     uint8_t path[MAX_NIBBLES * 2];
     size_t path_len = 0;
     if (nib_prefix_len > 0) { memcpy(path, nib_prefix, nib_prefix_len); path_len = nib_prefix_len; }
-    /* In subtree mode, MPT key starts at mpt_key_offset (e.g., 32 for storage).
-     * Skip prefix bytes that are part of the subtree address, not the MPT key. */
     size_t path_start = byte_depth > am->mpt_key_offset ? byte_depth : am->mpt_key_offset;
-    for (size_t i = path_start; i < am->tree->key_size; i++) {
+    for (size_t i = path_start; i < am->iface.key_size; i++) {
         path[path_len++] = (key[i] >> 4) & 0x0F;
         path[path_len++] =  key[i]       & 0x0F;
     }
@@ -384,9 +252,9 @@ static size_t encode_leaf(art_mpt_t *am, compact_ref_t leaf_ref,
     uint8_t hp[33];
     size_t hp_len = hex_prefix_encode(path, path_len, true, hp);
 
-    const void *leaf_val = get_leaf_value(am->tree, leaf_ref);
+    const void *leaf_val = am->iface.leaf_value(am->iface.ctx, leaf_ref);
     uint8_t value_rlp[MAX_NODE_RLP];
-    uint32_t value_len = am->encode(key, leaf_val, am->tree->value_size,
+    uint32_t value_len = am->encode(key, leaf_val, am->iface.value_size,
                                      value_rlp, am->encode_ctx);
     if (value_len == 0) return 0;
 
@@ -433,7 +301,7 @@ static size_t encode_branch(uint8_t child_rlps[16][MAX_NODE_RLP],
 }
 
 static size_t hash_lo_group(art_mpt_t *am, uint8_t *lo_nibs,
-                              compact_ref_t *lo_refs, int lo_count,
+                              art_ref_t *lo_refs, int lo_count,
                               size_t next_byte_depth,
                               const uint8_t *nib_prefix, size_t nib_prefix_len,
                               uint8_t *rlp_out) {
@@ -456,51 +324,32 @@ static size_t hash_lo_group(art_mpt_t *am, uint8_t *lo_nibs,
     return encode_extension(nib_prefix, nib_prefix_len, branch_rlp, branch_len, rlp_out);
 }
 
-static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
+static size_t hash_ref(art_mpt_t *am, art_ref_t ref, size_t byte_depth,
                         const uint8_t *nib_prefix, size_t nib_prefix_len,
                         uint8_t *rlp_out) {
-    if (ref == COMPACT_REF_NULL) return 0;
+    if (ref == ART_REF_NULL) return 0;
 
-    if (COMPACT_IS_LEAF_REF(ref)) {
+    if (ART_IS_LEAF(ref)) {
         return encode_leaf(am, ref, byte_depth, nib_prefix, nib_prefix_len, rlp_out);
     }
 
-    /* --- Cache check ---
-     * Cache stores the BRANCH RLP (without any prefix — neither the
-     * incoming nib_prefix nor the node's own partial).
-     * On cache hit, we re-read the partial from the ART node and
-     * build the full prefix (incoming + partial) before wrapping. */
+    /* --- Cache check --- */
     {
         uint8_t cached_rlp[MAX_NODE_RLP];
         size_t cached_len;
         if (cache_get(am, ref, byte_depth, cached_rlp, &cached_len)) {
             am->stats.cache_hits++;
 
-            /* Re-read partial from the ART node */
-            const void *cnode = node_ptr(am->tree, ref);
+            const void *cnode = am->iface.node_ptr(am->iface.ctx, ref);
             uint8_t cpartial_len;
-            const uint8_t *cpartial = get_partial(cnode, &cpartial_len);
+            const uint8_t *cpartial = am->iface.node_partial(am->iface.ctx, cnode, &cpartial_len);
 
             uint8_t cfull_partial[64];
-            if (cpartial_len > COMPACT_MAX_PREFIX) {
-                compact_ref_t probe = ref;
-                while (!COMPACT_IS_LEAF_REF(probe) && probe != COMPACT_REF_NULL) {
-                    const void *pn = node_ptr(am->tree, probe);
-                    uint8_t pk[256]; compact_ref_t pr[256];
-                    int pc = get_art_children(am->tree, pn, pk, pr);
-                    if (pc == 0) break;
-                    probe = pr[0];
-                }
-                if (COMPACT_IS_LEAF_REF(probe)) {
-                    uint8_t lk[64];
-                    if (get_leaf_key(am->tree, probe, lk))
-                        memcpy(cfull_partial, lk + byte_depth, cpartial_len);
-                    cpartial = cfull_partial;
-                }
+            if (cpartial_len > am->iface.max_prefix) {
+                reconstruct_partial(am, ref, byte_depth, cpartial_len, cfull_partial);
+                cpartial = cfull_partial;
             }
 
-            /* Build full prefix: incoming nib_prefix + partial nibbles.
-             * In subtree mode, skip partial bytes before mpt_key_offset. */
             uint8_t full_pfx[MAX_NIBBLES * 2];
             size_t full_pfx_len = 0;
             if (nib_prefix_len > 0) {
@@ -521,35 +370,20 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
     am->stats.cache_misses++;
 
     /* Inner node — compute hash */
-    const void *node = node_ptr(am->tree, ref);
+    const void *node = am->iface.node_ptr(am->iface.ctx, ref);
 
-    /* ART partial → add to nibble prefix */
     uint8_t partial_len;
-    const uint8_t *partial = get_partial(node, &partial_len);
+    const uint8_t *partial = am->iface.node_partial(am->iface.ctx, node, &partial_len);
 
-    /* Reconstruct long partials from a leaf key */
     uint8_t full_partial[64];
-    if (partial_len > COMPACT_MAX_PREFIX) {
-        compact_ref_t probe = ref;
-        while (!COMPACT_IS_LEAF_REF(probe) && probe != COMPACT_REF_NULL) {
-            const void *pn = node_ptr(am->tree, probe);
-            uint8_t pk[256]; compact_ref_t pr[256];
-            int pc = get_art_children(am->tree, pn, pk, pr);
-            if (pc == 0) break;
-            probe = pr[0];
-        }
-        if (COMPACT_IS_LEAF_REF(probe)) {
-            uint8_t leaf_key[64];
-            if (get_leaf_key(am->tree, probe, leaf_key))
-                memcpy(full_partial, leaf_key + byte_depth, partial_len);
-            partial = full_partial;
-        }
+    if (partial_len > am->iface.max_prefix) {
+        reconstruct_partial(am, ref, byte_depth, partial_len, full_partial);
+        partial = full_partial;
     }
 
     uint8_t prefix[MAX_NIBBLES * 2];
     size_t prefix_len = 0;
     if (nib_prefix_len > 0) { memcpy(prefix, nib_prefix, nib_prefix_len); prefix_len = nib_prefix_len; }
-    /* In subtree mode, skip partial bytes before mpt_key_offset */
     for (size_t i = 0; i < partial_len; i++) {
         if (byte_depth + i >= am->mpt_key_offset) {
             prefix[prefix_len++] = (partial[i] >> 4) & 0x0F;
@@ -558,32 +392,23 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
     }
 
     size_t next_byte_depth = byte_depth + partial_len + 1;
-    /* The child byte position in the key */
     size_t child_byte_pos = byte_depth + partial_len;
 
     uint8_t child_keys[256];
-    compact_ref_t child_refs[256];
-    int nchildren = get_art_children(am->tree, node, child_keys, child_refs);
-
-    /* Result RLP for this node (without prefix — prefix added by caller or here) */
-    uint8_t node_rlp[MAX_NODE_RLP];
-    size_t node_rlp_len;
+    art_ref_t child_refs[256];
+    int nchildren = am->iface.node_children(am->iface.ctx, node, child_keys, child_refs);
 
     if (nchildren == 1) {
         if (child_byte_pos >= am->mpt_key_offset) {
             prefix[prefix_len++] = child_keys[0] >> 4;
             prefix[prefix_len++] = child_keys[0] & 0x0F;
         }
-        size_t result = hash_ref(am, child_refs[0], next_byte_depth,
-                                  prefix, prefix_len, rlp_out);
-        /* Cache: we cache the node's contribution without the incoming prefix.
-         * For single-child nodes, the contribution is extension(partial+byte) → child.
-         * It's complex to separate, so skip caching for single-child. */
-        return result;
+        return hash_ref(am, child_refs[0], next_byte_depth,
+                          prefix, prefix_len, rlp_out);
     }
 
     /* Multiple children — group by high nibble */
-    typedef struct { uint8_t lo; compact_ref_t ref; } lo_entry_t;
+    typedef struct { uint8_t lo; art_ref_t ref; } lo_entry_t;
     lo_entry_t groups[16][16];
     int gcounts[16] = {0};
     for (int i = 0; i < nchildren; i++) {
@@ -601,15 +426,13 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
     if (hi_occupied == 1) {
         if (child_byte_pos >= am->mpt_key_offset)
             prefix[prefix_len++] = (uint8_t)single_hi;
-        uint8_t lo_nibs[16]; compact_ref_t lo_refs[16];
+        uint8_t lo_nibs[16]; art_ref_t lo_refs[16];
         for (int j = 0; j < gcounts[single_hi]; j++) {
             lo_nibs[j] = groups[single_hi][j].lo;
             lo_refs[j] = groups[single_hi][j].ref;
         }
-        size_t result = hash_lo_group(am, lo_nibs, lo_refs, gcounts[single_hi],
-                                       next_byte_depth, prefix, prefix_len, rlp_out);
-        /* Skip caching single-hi (same reason as single-child) */
-        return result;
+        return hash_lo_group(am, lo_nibs, lo_refs, gcounts[single_hi],
+                              next_byte_depth, prefix, prefix_len, rlp_out);
     }
 
     /* Multiple high nibbles → branch */
@@ -617,7 +440,7 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
     size_t hi_child_lens[16] = {0};
     for (int hi = 0; hi < 16; hi++) {
         if (gcounts[hi] == 0) continue;
-        uint8_t lo_nibs[16]; compact_ref_t lo_refs[16];
+        uint8_t lo_nibs[16]; art_ref_t lo_refs[16];
         for (int j = 0; j < gcounts[hi]; j++) {
             lo_nibs[j] = groups[hi][j].lo;
             lo_refs[j] = groups[hi][j].ref;
@@ -626,13 +449,11 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
                                             next_byte_depth, NULL, 0, hi_children[hi]);
     }
 
-    node_rlp_len = encode_branch(hi_children, hi_child_lens, node_rlp);
+    uint8_t node_rlp[MAX_NODE_RLP];
+    size_t node_rlp_len = encode_branch(hi_children, hi_child_lens, node_rlp);
 
-    /* Cache the branch RLP (without any prefix).
-     * On cache hit, the partial will be re-read from the ART node. */
     cache_put(am, ref, byte_depth, node_rlp, node_rlp_len);
 
-    /* Wrap with accumulated prefix (incoming + partial) */
     return encode_extension(prefix, prefix_len, node_rlp, node_rlp_len, rlp_out);
 }
 
@@ -640,15 +461,21 @@ static size_t hash_ref(art_mpt_t *am, compact_ref_t ref, size_t byte_depth,
  * Public API
  * ========================================================================= */
 
-art_mpt_t *art_mpt_create(compact_art_t *tree,
-                            art_mpt_value_encode_t encode, void *ctx) {
-    if (!tree) return NULL;
+art_mpt_t *art_mpt_create_iface(art_iface_t iface,
+                                  art_mpt_value_encode_t encode, void *ctx) {
+    if (!iface.ctx) return NULL;
     art_mpt_t *am = calloc(1, sizeof(*am));
     if (!am) return NULL;
-    am->tree = tree;
+    am->iface = iface;
     am->encode = encode;
     am->encode_ctx = ctx;
     return am;
+}
+
+art_mpt_t *art_mpt_create(compact_art_t *tree,
+                            art_mpt_value_encode_t encode, void *ctx) {
+    if (!tree) return NULL;
+    return art_mpt_create_iface(art_iface_compact(tree), encode, ctx);
 }
 
 void art_mpt_destroy(art_mpt_t *am) {
@@ -661,50 +488,31 @@ bool art_mpt_insert(art_mpt_t *am, const uint8_t key[32],
                      const void *value, uint32_t value_size) {
     if (!am) return false;
     (void)value_size;
-    /* compact_art_insert marks all visited nodes dirty internally */
-    return compact_art_insert(am->tree, key, value);
+    return am->iface.insert(am->iface.ctx, key, value);
 }
 
 bool art_mpt_delete(art_mpt_t *am, const uint8_t key[32]) {
     if (!am) return false;
-    /* compact_art_delete marks all visited nodes dirty internally */
-    return compact_art_delete(am->tree, key);
-}
-
-/* Clear dirty flags on all inner nodes (after hash walk cached everything) */
-static void clear_dirty_recursive(art_mpt_t *am, compact_ref_t ref) {
-    if (ref == COMPACT_REF_NULL || COMPACT_IS_LEAF_REF(ref)) return;
-    node_clear_dirty(am->tree, ref);
-
-    uint8_t keys[256];
-    compact_ref_t refs[256];
-    const void *node = node_ptr(am->tree, ref);
-    int n = get_art_children(am->tree, node, keys, refs);
-    for (int i = 0; i < n; i++)
-        clear_dirty_recursive(am, refs[i]);
+    return am->iface.del(am->iface.ctx, key);
 }
 
 void art_mpt_root_hash(art_mpt_t *am, uint8_t out[32]) {
-    if (!am || !am->tree || compact_art_size(am->tree) == 0) {
+    if (!am || am->iface.size(am->iface.ctx) == 0) {
         memcpy(out, EMPTY_ROOT, 32);
         return;
     }
 
+    art_ref_t root = am->iface.root(am->iface.ctx);
     uint8_t rlp[MAX_NODE_RLP];
-    size_t rlp_len = hash_ref(am, am->tree->root, 0, NULL, 0, rlp);
+    size_t rlp_len = hash_ref(am, root, 0, NULL, 0, rlp);
 
     if (rlp_len == 0) {
         memcpy(out, EMPTY_ROOT, 32);
     } else if (rlp_len == 32) {
-        /* Root returned its hash directly */
         memcpy(out, rlp, 32);
     } else {
-        /* Root is inline (< 32 bytes) — hash it */
         keccak(rlp, rlp_len, out);
     }
-
-    /* Dirty flags are cleared by cache_put during the hash walk.
-     * Nodes not visited (clean subtrees) keep their clean state. */
 }
 
 void art_mpt_invalidate_all(art_mpt_t *am) {
@@ -729,15 +537,15 @@ void art_mpt_reset_stats(art_mpt_t *am) {
 void art_mpt_subtree_hash(art_mpt_t *am,
                             const uint8_t *prefix, uint32_t prefix_len,
                             uint8_t out[32]) {
-    if (!am || !am->tree || !prefix) {
+    if (!am || !prefix || !am->iface.find_subtree) {
         memcpy(out, EMPTY_ROOT, 32);
         return;
     }
 
     uint32_t depth_out;
-    compact_ref_t subtree = compact_art_find_subtree(am->tree, prefix,
-                                                      prefix_len, &depth_out);
-    if (subtree == COMPACT_REF_NULL) {
+    art_ref_t subtree = am->iface.find_subtree(am->iface.ctx, prefix,
+                                                 prefix_len, &depth_out);
+    if (subtree == ART_REF_NULL) {
         memcpy(out, EMPTY_ROOT, 32);
         return;
     }
@@ -760,18 +568,15 @@ void art_mpt_subtree_hash(art_mpt_t *am,
 }
 
 /* =========================================================================
- * Legacy non-incremental API (for tests that don't use art_mpt_t)
+ * Legacy non-incremental API
  * ========================================================================= */
 
 void art_mpt_root_hash_full(const compact_art_t *tree,
                               art_mpt_value_encode_t encode, void *ctx,
                               uint8_t out[32]) {
-    /* Stateless: create temp context with caching disabled.
-     * Does NOT modify dirty flags on the tree — safe to call
-     * alongside an incremental art_mpt_t on the same tree. */
     art_mpt_t *am = art_mpt_create((compact_art_t *)tree, encode, ctx);
     if (!am) { memcpy(out, EMPTY_ROOT, 32); return; }
-    am->no_cache = true;  /* disable cache_put (and node_clear_dirty) */
+    am->no_cache = true;
     art_mpt_root_hash(am, out);
     art_mpt_destroy(am);
 }

@@ -31,6 +31,7 @@
 
 #define MEM_MAX_PREFIX  20
 #define MEM_NODE48_EMPTY 255
+#define MEM_NODE_FLAG_DIRTY 0x01
 
 // ============================================================================
 // Node Types
@@ -53,7 +54,7 @@ typedef struct {
     uint8_t num_children;
     uint8_t partial_len;
     uint8_t keys[4];
-    uint8_t _pad[1];
+    uint8_t flags;
     mem_ref_t children[4];
     uint8_t partial[MEM_MAX_PREFIX];
 } mem_node4_t;  // 32 bytes
@@ -63,7 +64,7 @@ typedef struct {
     uint8_t num_children;
     uint8_t partial_len;
     uint8_t keys[16];
-    uint8_t _pad[1];
+    uint8_t flags;
     mem_ref_t children[16];
     uint8_t partial[MEM_MAX_PREFIX];
 } mem_node16_t;  // 92 bytes
@@ -73,7 +74,7 @@ typedef struct {
     uint8_t num_children;
     uint8_t partial_len;
     uint8_t keys[32];
-    uint8_t _pad[1];
+    uint8_t flags;
     mem_ref_t children[32];
     uint8_t partial[MEM_MAX_PREFIX];
 } mem_node32_t;  // 172 bytes
@@ -83,7 +84,7 @@ typedef struct {
     uint8_t num_children;
     uint8_t partial_len;
     uint8_t index[256];
-    uint8_t _pad[1];
+    uint8_t flags;
     mem_ref_t children[48];
     uint8_t partial[MEM_MAX_PREFIX];
 } mem_node48_t;  // 460 bytes
@@ -92,7 +93,7 @@ typedef struct {
     uint8_t type;
     uint8_t num_children;
     uint8_t partial_len;
-    uint8_t _pad[1];
+    uint8_t flags;
     mem_ref_t children[256];
     uint8_t partial[MEM_MAX_PREFIX];
 } mem_node256_t;  // 1036 bytes
@@ -225,6 +226,26 @@ static inline bool leaf_matches(const mem_art_t *tree, mem_ref_t ref,
 }
 
 // ============================================================================
+// Dirty Flag Helpers
+// ============================================================================
+
+static inline void mark_dirty(mem_art_t *tree, mem_ref_t ref) {
+    if (MEM_IS_LEAF(ref) || ref == MEM_REF_NULL) return;
+    void *node = ref_ptr(tree, ref);
+    uint8_t type = *(const uint8_t *)node;
+    uint8_t *flags;
+    switch (type) {
+    case MEM_NODE_4:   flags = &((mem_node4_t *)node)->flags; break;
+    case MEM_NODE_16:  flags = &((mem_node16_t *)node)->flags; break;
+    case MEM_NODE_32:  flags = &((mem_node32_t *)node)->flags; break;
+    case MEM_NODE_48:  flags = &((mem_node48_t *)node)->flags; break;
+    case MEM_NODE_256: flags = &((mem_node256_t *)node)->flags; break;
+    default: return;
+    }
+    *flags |= MEM_NODE_FLAG_DIRTY;
+}
+
+// ============================================================================
 // Node Allocation
 // ============================================================================
 
@@ -244,6 +265,16 @@ static mem_ref_t alloc_node(mem_art_t *tree, mem_node_type_t type) {
 
     void *node = ref_ptr(tree, ref);
     ((uint8_t *)node)[0] = (uint8_t)type;
+
+    /* New nodes are born dirty */
+    switch (type) {
+    case MEM_NODE_4:   ((mem_node4_t *)node)->flags = MEM_NODE_FLAG_DIRTY; break;
+    case MEM_NODE_16:  ((mem_node16_t *)node)->flags = MEM_NODE_FLAG_DIRTY; break;
+    case MEM_NODE_32:  ((mem_node32_t *)node)->flags = MEM_NODE_FLAG_DIRTY; break;
+    case MEM_NODE_48:  ((mem_node48_t *)node)->flags = MEM_NODE_FLAG_DIRTY; break;
+    case MEM_NODE_256: ((mem_node256_t *)node)->flags = MEM_NODE_FLAG_DIRTY; break;
+    default: break;
+    }
 
     if (type == MEM_NODE_48) {
         mem_node48_t *n48 = node;
@@ -871,6 +902,9 @@ static mem_ref_t insert_recursive(mem_art_t *tree, mem_ref_t ref,
     uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
     mem_ref_t *child_ptr = find_child_ptr(tree, ref, byte);
 
+    /* Mark this inner node dirty — we're modifying its subtree */
+    mark_dirty(tree, ref);
+
     if (child_ptr) {
         // Child exists — recurse or update in-place
         if (depth >= key_len) {
@@ -938,6 +972,9 @@ static mem_ref_t delete_recursive(mem_art_t *tree, mem_ref_t ref,
     uint8_t byte = (depth < key_len) ? key[depth] : 0x00;
     mem_ref_t *child_ptr = find_child_ptr(tree, ref, byte);
     if (!child_ptr) return ref;
+
+    /* Mark this inner node dirty — we're modifying its subtree */
+    mark_dirty(tree, ref);
 
     // If key is consumed, child should be the leaf to delete
     if (depth >= key_len) {
@@ -1022,6 +1059,9 @@ check_collapse:
             memcpy(node_partial(child_node), new_partial,
                    pos < MEM_MAX_PREFIX ? pos : MEM_MAX_PREFIX);
 
+            /* Child's partial changed — mark dirty so cached hash is invalidated */
+            mark_dirty(tree, only_child);
+
             return only_child;
         }
     }
@@ -1034,12 +1074,17 @@ check_collapse:
 // ============================================================================
 
 bool mem_art_init(mem_art_t *tree) {
+    return mem_art_init_cap(tree, MEM_ARENA_INITIAL_CAP);
+}
+
+bool mem_art_init_cap(mem_art_t *tree, size_t initial_cap) {
     if (!tree) return false;
+    if (initial_cap < 256) initial_cap = 256; /* sane minimum */
     tree->root = MEM_REF_NULL;
     tree->size = 0;
-    tree->arena = malloc(MEM_ARENA_INITIAL_CAP);
+    tree->arena = malloc(initial_cap);
     if (!tree->arena) return false;
-    tree->arena_cap = MEM_ARENA_INITIAL_CAP;
+    tree->arena_cap = initial_cap;
     tree->arena_used = 4;  // Reserve offset 0 as MEM_REF_NULL
     return true;
 }

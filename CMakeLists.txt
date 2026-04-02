@@ -109,9 +109,13 @@ set_target_properties(blst PROPERTIES
 add_library(mem_mpt STATIC database/src/mem_mpt.c)
 target_link_libraries(mem_mpt common)
 
-add_library(art_mpt STATIC database/src/art_mpt.c)
+add_library(art_mpt STATIC
+    database/src/art_mpt.c
+    database/src/art_iface_compact.c
+    database/src/art_iface_mem.c
+)
 target_include_directories(art_mpt PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-target_link_libraries(art_mpt compact_art common)
+target_link_libraries(art_mpt compact_art art_database common)
 
 add_library(storage_trie STATIC database/src/storage_trie.c)
 target_include_directories(storage_trie PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
@@ -308,6 +312,16 @@ add_executable(bench_mem_art_index
 )
 target_link_libraries(bench_mem_art_index art_database)
 
+add_executable(bench_mem_art_storage
+    database/tests/bench_mem_art_storage.c
+)
+target_link_libraries(bench_mem_art_storage art_database common)
+
+add_executable(bench_mem_art_cache
+    database/tests/bench_mem_art_cache.c
+)
+target_link_libraries(bench_mem_art_cache art_database common)
+
 # Test: Code Store (content-addressed bytecode storage)
 add_executable(test_code_store
     database/tests/test_code_store.c
@@ -331,6 +345,10 @@ add_test(NAME test_state_overlay_stress COMMAND test_state_overlay_stress)
 add_executable(test_art_mpt_fuzz database/tests/test_art_mpt_fuzz.c)
 target_link_libraries(test_art_mpt_fuzz art_mpt compact_art arena common)
 add_test(NAME test_art_mpt_fuzz COMMAND test_art_mpt_fuzz)
+
+add_executable(test_art_mpt_mem database/tests/test_art_mpt_mem.c)
+target_link_libraries(test_art_mpt_mem art_mpt compact_art art_database common)
+add_test(NAME test_art_mpt_mem COMMAND test_art_mpt_mem)
 
 add_executable(test_flat_state_roundtrip
     evm/tests/test_flat_state_roundtrip.c
