@@ -281,60 +281,86 @@ One root computation per block instead of one per 256. But each is ~256x cheaper
 (256x fewer dirty accounts). Net: roughly the same total work, spread evenly
 instead of in bursts. Better latency, same throughput.
 
-## Storage Persistence — Eviction-Only
+## LRU Eviction and Storage Persistence
 
-### Problem with current storage_file
+### Problem
 
-Current design: at every checkpoint, for each dirty account, serialize ALL slots
-to storage_file (append-only bump file). Old sections become dead space.
+Without eviction, every account stays in memory forever. At 2.3M blocks
+(DoS era), 8M+ cached accounts consume 23 GB RSS. Most are empty or
+cold — touched once and never again.
 
-With per-block checkpoint this is disastrous:
-- Uniswap touched every block, 10K+ slots → 640 KB appended per block
-- At 7K blocks/s sync speed → 4.5 GB/s dead space growth
-- File grows without bound, no compaction
+### Budget-based eviction
 
-### Design: no writes on hot path
+Not timer-based (evict every N blocks) — budget-based:
+- Set max cached accounts target (e.g. 500K)
+- After each block, if cached > target, evict coldest accounts to 80% of target
+- `last_access_block` on `cached_account_t` identifies coldest
+- Avoids thrashing: only evict accounts cold for 1000+ blocks
 
-The mem_art IS the live state. Checkpoint only computes the MPT root — it does
-NOT persist storage to disk. No per-block I/O for storage.
+### What eviction does
 
-Storage_file is used ONLY for eviction:
-- **On evict** (LRU cold account): serialize mem_art to storage_file, update stor_index, destroy mem_art
-- **On reload** (cold account accessed): read from storage_file into fresh mem_art
+For each evicted account:
+1. If storage_mem has slots → write to storage cache file
+2. Destroy mem_art + art_mpt (memory returned to OS)
+3. Account record already in flat_state (synced at checkpoint)
+4. Remove from acct_index + acct_meta (or keep shell for fast relookup)
 
-Hot accounts never touch storage_file. The file only grows when cold accounts
-are evicted, and only read when cold accounts are reactivated.
+### Storage cache file
 
-### Crash recovery
-
-If we crash, in-memory state (mem_arts, cached_account_t) is lost. Recovery:
-- Replay from last era1 checkpoint (or last persisted state snapshot)
-- This is acceptable during sync (era1 files are the source of truth)
-- For chain-tip operation, periodic state snapshots provide recovery points
-
-### Storage_file lifecycle
+Single append-only file. Deleted on startup (it's a cache, not a database).
+In-memory index (mem_art: addr_hash → offset+count). No fsync needed.
 
 ```
-Account created/loaded → mem_art (in memory, no disk)
-        │
-        ├─ hot (accessed recently) → stays in mem_art
-        │    checkpoint: compute root via art_mpt, no disk write
-        │
-        └─ cold (not touched in N blocks) → LRU eviction
-             1. serialize mem_art → storage_file (append section)
-             2. update stor_index (addr_hash → {offset, count})
-             3. mem_art_destroy() → memory freed
-             │
-             └─ accessed again → reload from storage_file → new mem_art
+File format:
+  [addr_hash(32)] [slot_count(4)] [slot_hash(32)+value(32)] × slot_count
+  [addr_hash(32)] [slot_count(4)] [slot_hash(32)+value(32)] × slot_count
+  ...
+
+On evict:
+  1. append section to file
+  2. index[addr_hash] = {file_offset, slot_count}
+  3. mem_art_destroy(storage_mem)
+
+On reload (cold account accessed):
+  1. pread at index[addr_hash].offset
+  2. populate fresh mem_art from section data
+  3. remove index entry (data now in mem_art)
+
+On re-evict (same account evicted again after modification):
+  1. append NEW section (old section becomes dead space)
+  2. update index to new offset
 ```
 
-### Future: compaction
+### Why no crash recovery needed
 
-Storage_file grows with dead sections (from re-evicted accounts that were
-modified between eviction cycles). Compaction rewrites live sections
-contiguously. Can be done offline or lazily during idle periods.
-Not needed for initial implementation — file growth is bounded by
-eviction rate, not by block rate.
+The storage cache file is ephemeral — a session-local optimization.
+- On crash: replay from last era1 checkpoint (source of truth)
+- On restart: delete file, start fresh, populate mem_arts from execution
+- No fsync, no write-ahead log, no durability guarantees
+
+### Compaction
+
+Dead space accumulates when accounts are evicted, reloaded, modified,
+then evicted again (old section orphaned, new section appended).
+
+Compaction: rewrite file with only live sections (those in the index).
+Trigger when dead_space > 50% of file_size. Run during idle time.
+Not needed for initial implementation — dead space is bounded by
+eviction churn rate which is low (most evicted accounts stay cold).
+
+### Integration with existing flat_store LRU
+
+The account flat_store already has a doubly-linked LRU overlay with
+flush_deferred + evict_clean. Account records (nonce, balance, code_hash,
+storage_root) are handled by this existing mechanism.
+
+The storage cache file extends this: when flat_store evicts an account's
+overlay entry, state_overlay also destroys the account's mem_art and
+writes its storage to the cache file.
+
+Single eviction decision per account — both account record and storage
+are evicted together. Reload brings both back: account from flat_store
+disk, storage from cache file.
 
 ## Target Architecture (post-refactor)
 
