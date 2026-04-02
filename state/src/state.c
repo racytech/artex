@@ -1120,8 +1120,9 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
 
         hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
 
-        if (!acct_has_flag(a, ACCT_EXISTED)) {
-            /* Delete from trie */
+        if (!acct_has_flag(a, ACCT_EXISTED) ||
+            (acct_is_empty(a) && prune_empty)) {
+            /* Delete non-existed or empty+pruned accounts from trie */
             mem_art_delete(&s->acct_index, addr_hash.bytes, 32);
         }
         /* Existed accounts: already in acct_index from ensure_account.
