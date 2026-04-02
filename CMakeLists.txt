@@ -320,6 +320,9 @@ add_executable(test_state_root state/tests/test_state_root.c)
 target_link_libraries(test_state_root state evm)
 add_test(NAME test_state_root COMMAND test_state_root)
 
+add_executable(test_art_mpt_incremental state/tests/test_art_mpt_incremental.c)
+target_link_libraries(test_art_mpt_incremental art_mpt art_database mem_mpt common)
+
 add_executable(test_state_dup1 state/tests/test_state_dup1.c)
 target_link_libraries(test_state_dup1 evm)
 target_include_directories(test_state_dup1 PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
