@@ -77,7 +77,7 @@ typedef struct {
  * ========================================================================= */
 
 static inline void *mi_ref_ptr(const mem_art_t *tree, mi_ref_t ref) {
-    return tree->arena + (ref & 0x7FFFFFFFu);
+    return tree->arena + ((size_t)(ref & 0x7FFFFFFFu) << 4);  /* ref * 16 */
 }
 
 static inline art_iface_mem_ctx_t *get_ctx(const void *ctx) {

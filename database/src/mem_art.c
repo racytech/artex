@@ -113,7 +113,7 @@ typedef struct {
 // ============================================================================
 
 static mem_ref_t arena_alloc(mem_art_t *tree, size_t bytes, bool is_leaf) {
-    // 16-byte alignment (required for struct values with __uint128_t fields)
+    // 16-byte alignment — also allows ref = offset/16, giving 32 GB addressable
     size_t aligned = (tree->arena_used + 15) & ~(size_t)15;
     if (aligned + bytes > tree->arena_cap) {
         size_t new_cap = tree->arena_cap * 2;
@@ -125,7 +125,7 @@ static mem_ref_t arena_alloc(mem_art_t *tree, size_t bytes, bool is_leaf) {
     }
     tree->arena_used = aligned + bytes;
     memset(tree->arena + aligned, 0, bytes);
-    mem_ref_t ref = (mem_ref_t)aligned;
+    mem_ref_t ref = (mem_ref_t)(aligned >> 4);  /* offset / 16 */
     if (is_leaf) ref |= MEM_REF_LEAF_BIT;
     return ref;
 }
@@ -135,7 +135,7 @@ static mem_ref_t arena_alloc(mem_art_t *tree, size_t bytes, bool is_leaf) {
 // ============================================================================
 
 static inline void *ref_ptr(const mem_art_t *tree, mem_ref_t ref) {
-    return tree->arena + (ref & 0x7FFFFFFFu);
+    return tree->arena + ((size_t)(ref & 0x7FFFFFFFu) << 4);  /* ref * 16 */
 }
 
 // ============================================================================
@@ -1102,7 +1102,7 @@ bool mem_art_init_cap(mem_art_t *tree, size_t initial_cap) {
     tree->arena = malloc(initial_cap);
     if (!tree->arena) return false;
     tree->arena_cap = initial_cap;
-    tree->arena_used = 4;  // Reserve offset 0 as MEM_REF_NULL
+    tree->arena_used = 16;  // Reserve offset 0 (ref=0 is MEM_REF_NULL)
     return true;
 }
 
