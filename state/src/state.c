@@ -393,6 +393,7 @@ static uint32_t acct_trie_encode(const uint8_t *key, const void *leaf_val,
     state_t *s = user_ctx;
     uint32_t idx;
     memcpy(&idx, leaf_val, sizeof(idx));
+    /* encode callback continues below */
     if (idx >= s->count) return 0;
 
     account_t *a = &s->accounts[idx];
@@ -1109,11 +1110,7 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
     }
 
     /* Step 3: Compute account trie root */
-    fprintf(stderr, "DEBUG compute_root: acct_index size=%zu, blk_dirty=%zu\n",
-            mem_art_size(&s->acct_index), s->blk_dirty.count);
     art_mpt_root_hash(s->acct_trie_mpt, root.bytes);
-    fprintf(stderr, "DEBUG compute_root: root=%02x%02x%02x%02x...\n",
-            root.bytes[0], root.bytes[1], root.bytes[2], root.bytes[3]);
 
     /* Step 4: Clear dirty flags */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
