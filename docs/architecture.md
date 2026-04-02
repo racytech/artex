@@ -280,3 +280,184 @@ then add dirty flags later as an optimization — not a correctness requirement.
 One root computation per block instead of one per 256. But each is ~256x cheaper
 (256x fewer dirty accounts). Net: roughly the same total work, spread evenly
 instead of in bursts. Better latency, same throughput.
+
+## Storage Persistence — Eviction-Only
+
+### Problem with current storage_file
+
+Current design: at every checkpoint, for each dirty account, serialize ALL slots
+to storage_file (append-only bump file). Old sections become dead space.
+
+With per-block checkpoint this is disastrous:
+- Uniswap touched every block, 10K+ slots → 640 KB appended per block
+- At 7K blocks/s sync speed → 4.5 GB/s dead space growth
+- File grows without bound, no compaction
+
+### Design: no writes on hot path
+
+The mem_art IS the live state. Checkpoint only computes the MPT root — it does
+NOT persist storage to disk. No per-block I/O for storage.
+
+Storage_file is used ONLY for eviction:
+- **On evict** (LRU cold account): serialize mem_art to storage_file, update stor_index, destroy mem_art
+- **On reload** (cold account accessed): read from storage_file into fresh mem_art
+
+Hot accounts never touch storage_file. The file only grows when cold accounts
+are evicted, and only read when cold accounts are reactivated.
+
+### Crash recovery
+
+If we crash, in-memory state (mem_arts, cached_account_t) is lost. Recovery:
+- Replay from last era1 checkpoint (or last persisted state snapshot)
+- This is acceptable during sync (era1 files are the source of truth)
+- For chain-tip operation, periodic state snapshots provide recovery points
+
+### Storage_file lifecycle
+
+```
+Account created/loaded → mem_art (in memory, no disk)
+        │
+        ├─ hot (accessed recently) → stays in mem_art
+        │    checkpoint: compute root via art_mpt, no disk write
+        │
+        └─ cold (not touched in N blocks) → LRU eviction
+             1. serialize mem_art → storage_file (append section)
+             2. update stor_index (addr_hash → {offset, count})
+             3. mem_art_destroy() → memory freed
+             │
+             └─ accessed again → reload from storage_file → new mem_art
+```
+
+### Future: compaction
+
+Storage_file grows with dead sections (from re-evicted accounts that were
+modified between eviction cycles). Compaction rewrites live sections
+contiguously. Can be done offline or lazily during idle periods.
+Not needed for initial implementation — file growth is bounded by
+eviction rate, not by block rate.
+
+## Target Architecture (post-refactor)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          EVM (interpreter)                              │
+│  SLOAD/SSTORE ──► evm_state_get/set_storage()                         │
+│  CREATE/CALL  ──► evm_state_create_account(), snapshot(), revert()     │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                    evm_state_t  │  thin wrapper
+                                 │
+┌────────────────────────────────▼────────────────────────────────────────┐
+│                        state_overlay_t                                  │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Account Cache (in memory, LRU-managed)                           │  │
+│  │                                                                   │  │
+│  │  acct_index ─── mem_art: addr[20] ──► uint32_t idx               │  │
+│  │       │                                                           │  │
+│  │       ▼                                                           │  │
+│  │  acct_meta ─── array of cached_account_t (by idx)                │  │
+│  │       │          ├ nonce, balance, code_hash, storage_root        │  │
+│  │       │          ├ storage ──► mem_art_t * (NULL if evicted)      │  │
+│  │       │          ├ storage_ctx ──► art_iface_mem_ctx_t            │  │
+│  │       │          ├ storage_mpt ──► art_mpt_t * (NULL if evicted) │  │
+│  │       │          ├ last_access_block (for LRU eviction)          │  │
+│  │       │          ├ flags: dirty, existed, created, etc            │  │
+│  │       │          └ addr, addr_hash                                │  │
+│  │       │                                                           │  │
+│  │  Per-account storage: mem_art (malloc-backed, growable)           │  │
+│  │       key: slot_hash[32] = keccak(slot_be)                       │  │
+│  │       val: slot_value_be[32]                                      │  │
+│  │       init_cap: 12 KB, grows via realloc, ~100 B/slot            │  │
+│  │       eviction: mem_art_destroy() → memory returned to OS        │  │
+│  │                                                                   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Cold Storage (disk, eviction-only)                               │  │
+│  │                                                                   │  │
+│  │  storage_file ── append-only packed sections                     │  │
+│  │       written ONLY on LRU eviction (not on checkpoint)           │  │
+│  │       read ONLY on cold account reload                           │  │
+│  │                                                                   │  │
+│  │  stor_index ─── mem_art: addr_hash[32] ──► {offset, count}      │  │
+│  │                                                                   │  │
+│  │  flat_state ── disk-backed account records                       │  │
+│  │       nonce, balance, code_hash, storage_root                    │  │
+│  │       class-based record sizes (12B/44B/104B)                    │  │
+│  │       synced on eviction, loaded on ensure_account()             │  │
+│  │                                                                   │  │
+│  │  code_store ── code_hash[32] ──► bytecode (LRU cached)          │  │
+│  │                                                                   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Transaction State (per-tx, cleared on commit_tx)                 │  │
+│  │                                                                   │  │
+│  │  journal[] ─── undo log (snapshot/revert)                        │  │
+│  │  originals ─── mem_art (EIP-2200 committed values)               │  │
+│  │  warm_addrs ── mem_art (EIP-2929)                                │  │
+│  │  warm_slots ── mem_art (EIP-2929)                                │  │
+│  │  transient ─── mem_art (EIP-1153)                                │  │
+│  │                                                                   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  MPT Root (per-block, incremental)                                │  │
+│  │                                                                   │  │
+│  │  For each dirty account:                                          │  │
+│  │    1. art_mpt_root_hash(storage_mpt) ──► storage_root            │  │
+│  │       via art_iface_mem vtable, dirty flags on mem_art nodes     │  │
+│  │    2. NO disk write (storage_file only on eviction)              │  │
+│  │    3. Sync account record to flat_state                          │  │
+│  │                                                                   │  │
+│  │  account_trie root ──► block state root                          │  │
+│  │                                                                   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  LRU Eviction (after each block)                                  │  │
+│  │                                                                   │  │
+│  │  For accounts with last_access_block < current_block - N:        │  │
+│  │    1. Serialize mem_art ──► storage_file (append)                │  │
+│  │    2. Update stor_index                                           │  │
+│  │    3. Sync account to flat_state                                  │  │
+│  │    4. mem_art_destroy() + art_mpt_destroy()                      │  │
+│  │    5. Free code pointer                                           │  │
+│  │    6. Remove from acct_index + acct_meta                         │  │
+│  │       (or keep acct_meta shell — 200 bytes — for fast relookup)  │  │
+│  │                                                                   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Data flow: SSTORE(addr, slot, value)
+─────────────────────────────────────
+  1. ensure_account(addr)
+     ├ acct_index lookup → cached_account_t
+     └ if not found: load from flat_state, reload storage from storage_file
+  2. touch last_access_block = current_block
+  3. sstore_lookup → mem_art_get for current value
+  4. journal_push(JOURNAL_STORAGE, old_value)
+  5. save to originals if first write this tx
+  6. mem_art_insert(storage, slot_hash, value_be)
+
+Data flow: per-block checkpoint
+────────────────────────────────
+  for each dirty account:
+    1. storage_root = art_mpt_root_hash(storage_mpt)  [incremental, via iface]
+    2. sync account record to flat_state
+    3. account_trie_update(addr_hash, rlp(account))
+  state_root = art_mpt_root_hash(account_trie)
+  clear dirty flags
+  (no storage_file writes — that's eviction only)
+
+Data flow: LRU eviction (after checkpoint)
+──────────────────────────────────────────
+  scan acct_meta for last_access_block < threshold:
+    1. iterate mem_art → write slots to storage_file
+    2. stor_index[addr_hash] = {offset, count}
+    3. mem_art_destroy(storage), art_mpt_destroy(storage_mpt)
+    4. free(code), remove from acct_index
+    5. (optionally keep acct_meta entry for fast re-lookup)
+```

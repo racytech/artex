@@ -17,7 +17,7 @@
 /* storage_trie.h no longer needed — per-account art computes storage roots */
 #include "account_trie.h"
 #include "art_mpt.h"
-#include "arena.h"
+#include "art_iface.h"
 #include "storage_file.h"
 #include "keccak256.h"
 #include "mem_art.h"
@@ -36,11 +36,10 @@
 #define ADDRESS_KEY_SIZE  20
 #define MAX_CODE_SIZE     (24 * 1024 + 1)
 
-/* Per-account storage art pool sizes (virtual only, demand-paged) */
-#define ACCT_STOR_NODE_RESERVE  (256ULL * 1024)   /* 256 KB per account */
-#define ACCT_STOR_LEAF_RESERVE  (512ULL * 1024)   /* 512 KB per account — fits ~8K slots */
-#define ACCT_STOR_KEY_SIZE      32                       /* slot_hash */
-#define ACCT_STOR_VAL_SIZE      32                       /* slot value BE */
+/* Per-account storage: mem_art with 12 KB initial arena (~100 slots) */
+#define ACCT_STOR_INIT_CAP  (12 * 1024)
+#define ACCT_STOR_KEY_SIZE  32   /* slot_hash */
+#define ACCT_STOR_VAL_SIZE  32   /* slot value BE */
 
 /* EIP-161 RIPEMD special case: address 0x0000...0003.
  * In geth, touching RIPEMD adds an extra dirty counter so that a journal
@@ -160,11 +159,12 @@ static uint32_t acct_stor_encode(const uint8_t *key, const void *leaf_val,
 /* acct_stor_create/destroy defined after struct state_overlay */
 static void acct_stor_destroy(cached_account_t *ca) {
     if (ca->storage_mpt) { art_mpt_destroy(ca->storage_mpt); ca->storage_mpt = NULL; }
-    if (ca->storage_art) {
-        compact_art_destroy(ca->storage_art); /* doesn't munmap — arena owned */
-        free(ca->storage_art);
-        ca->storage_art = NULL;
+    if (ca->storage_mem) {
+        mem_art_destroy(ca->storage_mem);
+        free(ca->storage_mem);
+        ca->storage_mem = NULL;
     }
+    if (ca->storage_ctx) { free(ca->storage_ctx); ca->storage_ctx = NULL; }
 }
 
 /* =========================================================================
@@ -184,21 +184,16 @@ static cached_account_t *acct_meta_ensure(account_meta_pool_t *p, uint32_t idx) 
     return &p->entries[idx];
 }
 
-/* slot_meta_pool_t no longer used — per-account storage_art is the single store */
+/* slot_meta_pool_t no longer used — per-account mem_art is the single store */
 
 /* =========================================================================
  * Main struct
  * ========================================================================= */
 
-/* Storage arena: 8 GB virtual for all per-account compact_arts.
- * Physical = demand-paged, proportional to actual storage loaded. */
-#define STORAGE_ARENA_RESERVE (128ULL * 1024 * 1024 * 1024) /* 128 GB virtual — ~170K accounts */
-
 struct state_overlay {
     flat_state_t     *flat_state;
     code_store_t     *code_store;
     account_trie_t   *account_trie;
-    arena_t           storage_arena;  /* shared arena for per-account storage arts */
     storage_file_t   *storage_file;  /* packed per-account storage persistence */
     mem_art_t         stor_index;    /* addr_hash[32] → {offset(8), count(4)} */
 
@@ -269,51 +264,50 @@ static inline void mark_account_tx_dirty(state_overlay_t *so, cached_account_t *
         dirty_push(&so->tx_dirty_accounts, ca->addr.bytes, ADDRESS_KEY_SIZE);
 }
 
-/* Per-account storage art creation (needs full struct definition) */
+/* Per-account storage creation — mem_art backed */
 static bool acct_stor_create(state_overlay_t *so, cached_account_t *ca) {
-    if (ca->storage_art) return true; /* already exists */
-    ca->storage_art = calloc(1, sizeof(compact_art_t));
-    if (!ca->storage_art) {
-        LOG_ERROR("storage art calloc failed for %02x%02x..%02x%02x (OOM)",
+    (void)so;
+    if (ca->storage_mem) return true; /* already exists */
+
+    ca->storage_mem = calloc(1, sizeof(mem_art_t));
+    if (!ca->storage_mem) {
+        LOG_ERROR("storage mem_art calloc failed for %02x%02x..%02x%02x (OOM)",
                   ca->addr.bytes[0], ca->addr.bytes[1],
                   ca->addr.bytes[18], ca->addr.bytes[19]);
+        return false;
+    }
+    if (!mem_art_init_cap(ca->storage_mem, ACCT_STOR_INIT_CAP)) {
+        LOG_ERROR("mem_art_init_cap failed for %02x%02x..%02x%02x",
+                  ca->addr.bytes[0], ca->addr.bytes[1],
+                  ca->addr.bytes[18], ca->addr.bytes[19]);
+        free(ca->storage_mem);
+        ca->storage_mem = NULL;
         return false;
     }
 
-    void *nmem = arena_alloc(&so->storage_arena, ACCT_STOR_NODE_RESERVE);
-    void *lmem = arena_alloc(&so->storage_arena, ACCT_STOR_LEAF_RESERVE);
-    if (!nmem || !lmem) {
-        LOG_ERROR("storage arena exhausted for %02x%02x..%02x%02x "
-                  "(used=%zu, reserve=%zu, per_acct=%zu)",
-                  ca->addr.bytes[0], ca->addr.bytes[1],
-                  ca->addr.bytes[18], ca->addr.bytes[19],
-                  arena_used(&so->storage_arena),
-                  (size_t)STORAGE_ARENA_RESERVE,
-                  (size_t)(ACCT_STOR_NODE_RESERVE + ACCT_STOR_LEAF_RESERVE));
-        free(ca->storage_art);
-        ca->storage_art = NULL;
+    /* Set up iface context (heap-allocated — survives acct_meta realloc) */
+    ca->storage_ctx = calloc(1, sizeof(art_iface_mem_ctx_t));
+    if (!ca->storage_ctx) {
+        mem_art_destroy(ca->storage_mem);
+        free(ca->storage_mem);
+        ca->storage_mem = NULL;
         return false;
     }
-    if (!compact_art_init_arena(ca->storage_art,
-                                 ACCT_STOR_KEY_SIZE, ACCT_STOR_VAL_SIZE,
-                                 false, NULL, NULL,
-                                 nmem, ACCT_STOR_NODE_RESERVE,
-                                 lmem, ACCT_STOR_LEAF_RESERVE)) {
-        LOG_ERROR("compact_art_init_arena failed for %02x%02x..%02x%02x",
-                  ca->addr.bytes[0], ca->addr.bytes[1],
-                  ca->addr.bytes[18], ca->addr.bytes[19]);
-        free(ca->storage_art);
-        ca->storage_art = NULL;
-        return false;
-    }
-    ca->storage_mpt = art_mpt_create(ca->storage_art, acct_stor_encode, NULL);
+    ca->storage_ctx->tree = ca->storage_mem;
+    ca->storage_ctx->key_size = ACCT_STOR_KEY_SIZE;
+    ca->storage_ctx->value_size = ACCT_STOR_VAL_SIZE;
+
+    ca->storage_mpt = art_mpt_create_iface(
+        art_iface_mem(ca->storage_ctx), acct_stor_encode, NULL);
     if (!ca->storage_mpt) {
-        LOG_ERROR("art_mpt_create failed for %02x%02x..%02x%02x",
+        LOG_ERROR("art_mpt_create_iface failed for %02x%02x..%02x%02x",
                   ca->addr.bytes[0], ca->addr.bytes[1],
                   ca->addr.bytes[18], ca->addr.bytes[19]);
-        compact_art_destroy(ca->storage_art);
-        free(ca->storage_art);
-        ca->storage_art = NULL;
+        mem_art_destroy(ca->storage_mem);
+        free(ca->storage_mem);
+        ca->storage_mem = NULL;
+        free(ca->storage_ctx);
+        ca->storage_ctx = NULL;
         return false;
     }
     return true;
@@ -415,9 +409,9 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
  * Creates per-account art and populates from flat_state on first access.
  * ========================================================================= */
 
-/** Bulk-load all storage from packed storage_file into per-account art. */
+/** Bulk-load all storage from packed storage_file into per-account mem_art. */
 static void storage_bulk_load(state_overlay_t *so, cached_account_t *ca) {
-    if (ca->storage_art) return; /* already loaded */
+    if (ca->storage_mem) return; /* already loaded */
     if (!so->storage_file) return;
 
     /* Look up storage_file refs from the separate index */
@@ -446,8 +440,9 @@ static void storage_bulk_load(state_overlay_t *so, cached_account_t *ca) {
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *slot_hash = buf + i * STORAGE_SLOT_SIZE;
         const uint8_t *val_be    = buf + i * STORAGE_SLOT_SIZE + 32;
-        if (!compact_art_insert(ca->storage_art, slot_hash, val_be)) {
-            LOG_ERROR("bulk_load: storage art pool full for %02x%02x..%02x%02x "
+        if (!mem_art_insert(ca->storage_mem, slot_hash, ACCT_STOR_KEY_SIZE,
+                            val_be, ACCT_STOR_VAL_SIZE)) {
+            LOG_ERROR("bulk_load: mem_art_insert failed for %02x%02x..%02x%02x "
                       "(inserted %u/%u slots)",
                       ca->addr.bytes[0], ca->addr.bytes[1],
                       ca->addr.bytes[18], ca->addr.bytes[19], i, count);
@@ -459,17 +454,20 @@ static void storage_bulk_load(state_overlay_t *so, cached_account_t *ca) {
 
 static uint256_t storage_read(state_overlay_t *so, cached_account_t *ca,
                                const uint8_t slot_hash[32]) {
-    /* Ensure per-account art is populated (bulk-load from storage_file if needed) */
-    if (!ca->storage_art)
+    /* Ensure per-account storage is populated (bulk-load from storage_file if needed) */
+    if (!ca->storage_mem)
         storage_bulk_load(so, ca);
 
-    /* Check per-account art */
-    if (ca->storage_art) {
-        const void *leaf = compact_art_get(ca->storage_art, slot_hash);
-        if (leaf) return uint256_from_bytes((const uint8_t *)leaf, 32);
+    /* Check per-account mem_art */
+    if (ca->storage_mem) {
+        size_t vlen;
+        const void *val = mem_art_get(ca->storage_mem, slot_hash,
+                                       ACCT_STOR_KEY_SIZE, &vlen);
+        if (val && vlen == ACCT_STOR_VAL_SIZE)
+            return uint256_from_bytes((const uint8_t *)val, 32);
     }
 
-    /* Not in per-account art or storage_file — slot is zero */
+    /* Not found — slot is zero */
     return UINT256_ZERO;
 }
 
@@ -503,10 +501,6 @@ state_overlay_t *state_overlay_create(flat_state_t *fs, code_store_t *cs) {
     if (!so->journal) { free(so); return NULL; }
     so->journal_cap = JOURNAL_INIT_CAP;
 
-    if (!arena_init(&so->storage_arena, STORAGE_ARENA_RESERVE)) {
-        free(so->journal); free(so); return NULL;
-    }
-
     init_tries(so);
     return so;
 }
@@ -527,7 +521,6 @@ void state_overlay_destroy(state_overlay_t *so) {
         acct_stor_destroy(ca);
     }
     free(so->acct_meta.entries);
-    arena_destroy(&so->storage_arena);
     if (so->storage_file) storage_file_destroy(so->storage_file);
     if (so->account_trie) account_trie_destroy(so->account_trie);
 
@@ -732,21 +725,21 @@ void state_overlay_set_storage(state_overlay_t *so, const address_t *addr,
         mem_art_insert(&so->originals, skey, SLOT_KEY_SIZE,
                        &old_value, sizeof(uint256_t));
 
-    /* Write to per-account storage art */
-    if (!ca->storage_art && !acct_stor_create(so, ca)) {
-        LOG_ERROR("SSTORE lost: cannot create storage art for %02x%02x..%02x%02x",
+    /* Write to per-account storage mem_art */
+    if (!ca->storage_mem && !acct_stor_create(so, ca)) {
+        LOG_ERROR("SSTORE lost: cannot create storage for %02x%02x..%02x%02x",
                   addr->bytes[0], addr->bytes[1], addr->bytes[18], addr->bytes[19]);
     }
-    if (ca->storage_art) {
+    if (ca->storage_mem) {
         uint8_t val_be[32];
         uint256_to_bytes(value, val_be);
         if (uint256_is_zero(value))
-            compact_art_delete(ca->storage_art, slot_hash.bytes);
-        else if (!compact_art_insert(ca->storage_art, slot_hash.bytes, val_be))
-            LOG_ERROR("SSTORE pool full for %02x%02x..%02x%02x (size=%zu)",
+            mem_art_delete(ca->storage_mem, slot_hash.bytes, ACCT_STOR_KEY_SIZE);
+        else if (!mem_art_insert(ca->storage_mem, slot_hash.bytes, ACCT_STOR_KEY_SIZE,
+                                  val_be, ACCT_STOR_VAL_SIZE))
+            LOG_ERROR("SSTORE mem_art_insert failed for %02x%02x..%02x%02x (OOM)",
                       addr->bytes[0], addr->bytes[1],
-                      addr->bytes[18], addr->bytes[19],
-                      ca->storage_art->size);
+                      addr->bytes[18], addr->bytes[19]);
     }
 
     ca->storage_dirty = true;
@@ -817,17 +810,18 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
         }
         case JOURNAL_STORAGE: {
             cached_account_t *ca = find_account_meta(so, je->addr.bytes);
-            if (ca && ca->storage_art) {
+            if (ca && ca->storage_mem) {
                 uint8_t slot_be[32];
                 uint256_to_bytes(&je->data.storage.slot, slot_be);
                 hash_t slot_hash = hash_keccak256(slot_be, 32);
                 if (uint256_is_zero(&je->data.storage.old_value))
-                    compact_art_delete(ca->storage_art, slot_hash.bytes);
+                    mem_art_delete(ca->storage_mem, slot_hash.bytes, ACCT_STOR_KEY_SIZE);
                 else {
                     uint8_t val_be[32];
                     uint256_to_bytes(&je->data.storage.old_value, val_be);
-                    if (!compact_art_insert(ca->storage_art, slot_hash.bytes, val_be))
-                        LOG_ERROR("journal revert: storage art pool full for %02x%02x..%02x%02x",
+                    if (!mem_art_insert(ca->storage_mem, slot_hash.bytes, ACCT_STOR_KEY_SIZE,
+                                        val_be, ACCT_STOR_VAL_SIZE))
+                        LOG_ERROR("journal revert: mem_art_insert failed for %02x%02x..%02x%02x",
                                   je->addr.bytes[0], je->addr.bytes[1],
                                   je->addr.bytes[18], je->addr.bytes[19]);
                 }
@@ -1150,7 +1144,7 @@ bool state_overlay_has_storage(state_overlay_t *so, const address_t *addr) {
     if (!ca) return false;
     if (memcmp(ca->storage_root.bytes, HASH_EMPTY_STORAGE.bytes, 32) != 0)
         return true;
-    if (ca->storage_art && compact_art_size(ca->storage_art) > 0)
+    if (ca->storage_mem && mem_art_size(ca->storage_mem) > 0)
         return true;
     return false;
 }
@@ -1469,8 +1463,8 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
         for (size_t d = 0; d < so->dirty_accounts.count; d++) {
             const uint8_t *akey = so->dirty_accounts.keys + d * ADDRESS_KEY_SIZE;
             cached_account_t *ca = find_account_meta(so, akey);
-            if (!ca || !ca->storage_dirty || !ca->storage_art) continue;
-            uint32_t count = (uint32_t)compact_art_size(ca->storage_art);
+            if (!ca || !ca->storage_dirty || !ca->storage_mem) continue;
+            uint32_t count = (uint32_t)mem_art_size(ca->storage_mem);
             if (count == 0) {
                 mem_art_delete(&so->stor_index, ca->addr_hash.bytes, 32);
                 continue;
@@ -1478,15 +1472,18 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
             uint8_t *buf = malloc((size_t)count * STORAGE_SLOT_SIZE);
             if (!buf) continue;
             uint32_t idx = 0;
-            compact_art_iterator_t *it = compact_art_iterator_create(ca->storage_art);
-            while (compact_art_iterator_next(it) && idx < count) {
-                memcpy(buf + idx * STORAGE_SLOT_SIZE,
-                       compact_art_iterator_key(it), 32);
-                memcpy(buf + idx * STORAGE_SLOT_SIZE + 32,
-                       (const uint8_t *)compact_art_iterator_value(it), 32);
-                idx++;
+            mem_art_iterator_t *it = mem_art_iterator_create(ca->storage_mem);
+            while (mem_art_iterator_next(it) && idx < count) {
+                size_t klen, vlen;
+                const uint8_t *k = mem_art_iterator_key(it, &klen);
+                const void *v = mem_art_iterator_value(it, &vlen);
+                if (k && v && klen == 32 && vlen == 32) {
+                    memcpy(buf + idx * STORAGE_SLOT_SIZE, k, 32);
+                    memcpy(buf + idx * STORAGE_SLOT_SIZE + 32, v, 32);
+                    idx++;
+                }
             }
-            compact_art_iterator_destroy(it);
+            mem_art_iterator_destroy(it);
             stor_index_entry_t sie = {
                 .offset = storage_file_write_section(so->storage_file, buf, idx),
                 .count = idx,
@@ -1550,13 +1547,12 @@ void state_overlay_evict(state_overlay_t *so) {
         flat_store_free_stale_slots(astore, acct_stale, acct_sc);
     }
 
-    /* Free code pointers (storage arts kept alive for hash cache) */
+    /* Free code pointers (storage mem_arts kept alive for hash cache) */
     for (uint32_t i = 0; i < so->next_acct_idx; i++) {
         cached_account_t *ca = &so->acct_meta.entries[i];
         if (ca->code) { free(ca->code); ca->code = NULL; }
-        /* Don't destroy storage arts — keep hash cache warm */
+        /* Don't destroy storage mem_arts — keep hash cache warm */
     }
-    /* Don't reset arena — storage arts still point into it */
 
     /* Don't reset acct_meta or acct_index — accounts persist across windows.
      * Only clear dirty flags and journal. */
@@ -1655,10 +1651,10 @@ static void dump_alloc_file(state_overlay_t *so, const char *path, bool use_orig
             }
         }
 
-        /* Storage: per-account art stores slot_hash, can't dump raw slot keys */
-        if (ca->storage_art && compact_art_size(ca->storage_art) > 0 && !use_originals)
+        /* Storage: per-account mem_art stores slot_hash, can't dump raw slot keys */
+        if (ca->storage_mem && mem_art_size(ca->storage_mem) > 0 && !use_originals)
             fprintf(f, ",\n    \"_storage_slots\": %zu",
-                    compact_art_size(ca->storage_art));
+                    mem_art_size(ca->storage_mem));
 
         /* Debug flags (post_alloc only — pre_alloc must be clean for geth t8n) */
         if (!use_originals) {

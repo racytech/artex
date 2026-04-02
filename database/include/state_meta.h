@@ -13,6 +13,8 @@
 #include "hash.h"
 #include "address.h"
 #include "compact_art.h"
+#include "mem_art.h"
+#include "art_iface.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -41,11 +43,13 @@ typedef struct {
     hash_t     storage_root;
     hash_t     addr_hash;
 
-    /* Per-account storage (Phase 5): lazily created on first SSTORE
-     * or when loading account with non-empty storage_root from disk.
-     * Key = slot_hash[32], value = slot_value_be[32]. */
-    compact_art_t *storage_art;   /* NULL if no storage */
-    art_mpt_t     *storage_mpt;   /* MPT context for storage_art */
+    /* Per-account storage: lazily created on first SSTORE or bulk_load.
+     * mem_art with key = slot_hash[32], value = slot_value_be[32].
+     * storage_ctx is heap-allocated because acct_meta realloc can move
+     * cached_account_t, but art_mpt holds a pointer to ctx. */
+    mem_art_t            *storage_mem;   /* NULL if no storage / evicted */
+    art_iface_mem_ctx_t  *storage_ctx;   /* heap-alloc'd iface context */
+    art_mpt_t            *storage_mpt;   /* MPT context via art_iface_mem */
 #ifdef ENABLE_HISTORY
     uint64_t   original_nonce;
     uint256_t  original_balance;
