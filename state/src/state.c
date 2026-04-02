@@ -10,6 +10,7 @@
 #include "code_store.h"
 #include "compact_art.h"
 #include "art_mpt.h"
+#include "mem_mpt.h"
 #include "keccak256.h"
 #include "logger.h"
 
@@ -1131,8 +1132,32 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
          * The mem_art dirty flags propagate from insert/delete. */
     }
 
-    /* Step 3: Compute account trie root */
-    art_mpt_root_hash(s->acct_trie_mpt, root.bytes);
+    /* Step 3: Compute account trie root via batch rebuild */
+    {
+        mpt_batch_entry_t *entries = malloc(s->count * sizeof(mpt_batch_entry_t));
+        uint8_t (*rlp_store)[128] = malloc(s->count * 128);
+        size_t n = 0;
+        for (uint32_t i = 0; i < s->count; i++) {
+            account_t *a = &s->accounts[i];
+            if (!acct_has_flag(a, ACCT_EXISTED)) continue;
+            if (acct_is_empty(a) && prune_empty) continue;
+            hash_t ah = hash_keccak256(a->addr.bytes, 20);
+            memcpy(entries[n].key, ah.bytes, 32);
+            uint8_t bal_be[32]; uint256_to_bytes(&a->balance, bal_be);
+            resource_t *r = get_resource(s, a);
+            uint32_t rlen = build_account_rlp(
+                a->nonce, bal_be,
+                r ? r->storage_root.bytes : EMPTY_STORAGE_ROOT.bytes,
+                r && acct_has_flag(a, ACCT_HAS_CODE) ? r->code_hash.bytes : EMPTY_CODE_HASH.bytes,
+                rlp_store[n]);
+            entries[n].value = rlp_store[n];
+            entries[n].value_len = rlen;
+            n++;
+        }
+        mpt_compute_root_batch(entries, n, &root);
+        free(entries);
+        free(rlp_store);
+    }
 
     /* Step 4: Clear dirty flags */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {

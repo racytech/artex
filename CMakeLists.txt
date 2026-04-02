@@ -126,7 +126,7 @@ target_include_directories(state PUBLIC
     ${CMAKE_SOURCE_DIR}/database/include
     ${CMAKE_SOURCE_DIR}/evm/include
 )
-target_link_libraries(state art_database art_mpt code_store common)
+target_link_libraries(state art_database art_mpt mem_mpt code_store common)
 
 # EVM (Ethereum Virtual Machine)
 add_library(evm STATIC
