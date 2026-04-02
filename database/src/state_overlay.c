@@ -25,6 +25,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <time.h>
 
 /* =========================================================================
@@ -40,6 +42,17 @@
 #define ACCT_STOR_INIT_CAP  1024
 #define ACCT_STOR_KEY_SIZE  32   /* slot_hash */
 #define ACCT_STOR_VAL_SIZE  32   /* slot value BE */
+#define STOR_SLOT_SIZE      64   /* slot_hash[32] + value_be[32] */
+
+/* LRU eviction: scan every 256 blocks, evict if not touched in 1024 blocks */
+#define EVICT_SCAN_INTERVAL 256
+#define EVICT_AGE_THRESHOLD 1024
+
+/* Storage cache file entry — stored in stor_cache_index */
+typedef struct __attribute__((packed)) {
+    uint64_t offset;
+    uint32_t count;
+} stor_cache_entry_t;
 
 /* EIP-161 RIPEMD special case: address 0x0000...0003.
  * In geth, touching RIPEMD adds an extra dirty counter so that a journal
@@ -190,7 +203,11 @@ struct state_overlay {
     flat_state_t     *flat_state;
     code_store_t     *code_store;
     account_trie_t   *account_trie;
-    /* storage_file / stor_index removed — storage is in-memory only */
+
+    /* LRU eviction */
+    uint64_t current_block;
+    int      storage_cache_fd;   /* append-only cache file, -1 if not open */
+    mem_art_t stor_cache_index;  /* addr_hash[32] → {offset, count} for cache file */
 
     /* Meta arrays — indexed by sequential meta index (NOT flat_store overlay index).
      * Meta holds typed access + flags. Persistent records in flat_store overlay
@@ -354,7 +371,10 @@ static void sync_account_to_overlay(state_overlay_t *so, cached_account_t *ca) {
 static cached_account_t *ensure_account(state_overlay_t *so, const address_t *addr) {
     /* Check local index first */
     cached_account_t *existing = find_account_meta(so, addr->bytes);
-    if (existing) return existing;
+    if (existing) {
+        existing->last_access_block = so->current_block;
+        return existing;
+    }
 
     /* Allocate new meta entry (sequential index) */
     uint32_t idx = so->next_acct_idx++;
@@ -372,6 +392,7 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
     address_copy(&ca->addr, addr);
     ca->addr_hash = addr_hash;
     ca->storage_root = HASH_EMPTY_STORAGE;
+    ca->last_access_block = so->current_block;
 
     /* Load from flat_state if available */
     if (so->flat_state) {
@@ -399,13 +420,18 @@ static cached_account_t *ensure_account(state_overlay_t *so, const address_t *ad
     return ca;
 }
 
+/* Forward declaration — defined after struct state_overlay */
+static bool stor_cache_load_account(state_overlay_t *so, cached_account_t *ca);
+
 /* =========================================================================
  * Storage read — reads slot value from per-account mem_art.
  * ========================================================================= */
 
 static uint256_t storage_read(state_overlay_t *so, cached_account_t *ca,
                                const uint8_t slot_hash[32]) {
-    (void)so;
+    /* If storage was evicted, try reloading from cache file */
+    if (!ca->storage_mem)
+        stor_cache_load_account(so, ca);
 
     /* Check per-account mem_art */
     if (ca->storage_mem) {
@@ -440,7 +466,8 @@ state_overlay_t *state_overlay_create(flat_state_t *fs, code_store_t *cs) {
     so->code_store = cs;
 
     mem_art_init(&so->acct_index);
-    /* stor_index removed — no storage_file */
+    mem_art_init(&so->stor_cache_index);
+    so->storage_cache_fd = -1;
     mem_art_init(&so->warm_addrs);
     mem_art_init(&so->warm_slots);
     mem_art_init(&so->transient);
@@ -455,8 +482,12 @@ state_overlay_t *state_overlay_create(flat_state_t *fs, code_store_t *cs) {
 }
 
 void state_overlay_set_storage_path(state_overlay_t *so, const char *path) {
-    (void)so; (void)path;
-    /* no-op — storage_file removed, storage is in-memory only */
+    if (!so || !path) return;
+    /* Open storage cache file for LRU eviction persistence */
+    char cache_path[512];
+    snprintf(cache_path, sizeof(cache_path), "%s_storage_cache.bin", path);
+    if (so->storage_cache_fd >= 0) close(so->storage_cache_fd);
+    so->storage_cache_fd = open(cache_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
 }
 
 void state_overlay_destroy(state_overlay_t *so) {
@@ -472,6 +503,8 @@ void state_overlay_destroy(state_overlay_t *so) {
     if (so->account_trie) account_trie_destroy(so->account_trie);
 
     mem_art_destroy(&so->acct_index);
+    mem_art_destroy(&so->stor_cache_index);
+    if (so->storage_cache_fd >= 0) close(so->storage_cache_fd);
     mem_art_destroy(&so->warm_addrs);
     mem_art_destroy(&so->warm_slots);
     mem_art_destroy(&so->transient);
@@ -1183,7 +1216,8 @@ void state_overlay_set_prune_empty(state_overlay_t *so, bool enabled) {
  * ========================================================================= */
 
 void state_overlay_begin_block(state_overlay_t *so, uint64_t block_number) {
-    (void)so; (void)block_number;
+    if (!so) return;
+    so->current_block = block_number;
 }
 
 /* =========================================================================
@@ -1442,34 +1476,131 @@ hash_t state_overlay_compute_mpt_root(state_overlay_t *so, bool prune_empty) {
 }
 
 /* =========================================================================
- * Evict — flush overlay to disk, free meta arrays
+ * Storage cache file — append-only, ephemeral (deleted on restart)
+ * ========================================================================= */
+
+static bool stor_cache_open(state_overlay_t *so, const char *dir) {
+    if (so->storage_cache_fd >= 0) return true;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/storage_cache.bin", dir);
+    so->storage_cache_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    return so->storage_cache_fd >= 0;
+}
+
+static void stor_cache_write_account(state_overlay_t *so, cached_account_t *ca) {
+    if (so->storage_cache_fd < 0 || !ca->storage_mem) return;
+    size_t count = mem_art_size(ca->storage_mem);
+    if (count == 0) return;
+
+    /* Build packed buffer: [slot_hash(32) + value(32)] × count */
+    size_t buf_size = count * STOR_SLOT_SIZE;
+    uint8_t *buf = malloc(buf_size);
+    if (!buf) return;
+
+    uint32_t idx = 0;
+    mem_art_iterator_t *it = mem_art_iterator_create(ca->storage_mem);
+    while (mem_art_iterator_next(it) && idx < count) {
+        size_t klen, vlen;
+        const uint8_t *k = mem_art_iterator_key(it, &klen);
+        const void *v = mem_art_iterator_value(it, &vlen);
+        if (k && v && klen == ACCT_STOR_KEY_SIZE && vlen == ACCT_STOR_VAL_SIZE) {
+            memcpy(buf + idx * STOR_SLOT_SIZE, k, 32);
+            memcpy(buf + idx * STOR_SLOT_SIZE + 32, v, 32);
+            idx++;
+        }
+    }
+    mem_art_iterator_destroy(it);
+
+    /* Append: [addr_hash(32)][count(4)][slots...] */
+    off_t offset = lseek(so->storage_cache_fd, 0, SEEK_END);
+    if (offset < 0) { free(buf); return; }
+
+    uint32_t slot_count = idx;
+    write(so->storage_cache_fd, ca->addr_hash.bytes, 32);
+    write(so->storage_cache_fd, &slot_count, 4);
+    write(so->storage_cache_fd, buf, (size_t)slot_count * STOR_SLOT_SIZE);
+    free(buf);
+
+    /* Index: addr_hash → {offset, count} */
+    stor_cache_entry_t entry = { .offset = (uint64_t)offset, .count = slot_count };
+    mem_art_insert(&so->stor_cache_index, ca->addr_hash.bytes, 32,
+                   &entry, sizeof(entry));
+}
+
+static bool stor_cache_load_account(state_overlay_t *so, cached_account_t *ca) {
+    if (so->storage_cache_fd < 0) return false;
+
+    size_t vlen;
+    const stor_cache_entry_t *entry = (const stor_cache_entry_t *)
+        mem_art_get(&so->stor_cache_index, ca->addr_hash.bytes, 32, &vlen);
+    if (!entry || entry->count == 0) return false;
+
+    /* Read section: skip addr_hash(32) + count(4), then slots */
+    uint64_t data_offset = entry->offset + 32 + 4;
+    size_t buf_size = (size_t)entry->count * STOR_SLOT_SIZE;
+    uint8_t *buf = malloc(buf_size);
+    if (!buf) return false;
+
+    ssize_t rd = pread(so->storage_cache_fd, buf, buf_size, (off_t)data_offset);
+    if (rd != (ssize_t)buf_size) { free(buf); return false; }
+
+    /* Create mem_art and populate */
+    if (!acct_stor_create(so, ca)) { free(buf); return false; }
+
+    for (uint32_t i = 0; i < entry->count; i++) {
+        const uint8_t *slot_hash = buf + i * STOR_SLOT_SIZE;
+        const uint8_t *val_be    = buf + i * STOR_SLOT_SIZE + 32;
+        mem_art_insert(ca->storage_mem, slot_hash, ACCT_STOR_KEY_SIZE,
+                       val_be, ACCT_STOR_VAL_SIZE);
+    }
+    free(buf);
+
+    /* Remove from cache index — data is now in mem_art */
+    mem_art_delete(&so->stor_cache_index, ca->addr_hash.bytes, 32);
+    return true;
+}
+
+/* =========================================================================
+ * LRU Eviction — age-based, periodic scan
  * ========================================================================= */
 
 void state_overlay_evict(state_overlay_t *so) {
     if (!so) return;
 
-    if (so->flat_state) {
-        flat_store_t *astore = flat_state_account_store(so->flat_state);
+    uint64_t threshold = so->current_block > EVICT_AGE_THRESHOLD
+                       ? so->current_block - EVICT_AGE_THRESHOLD : 0;
 
-        /* Flush account overlay to disk */
-        flat_store_stale_slot_t *acct_stale = NULL;
-        size_t acct_sc = 0;
-        flat_store_flush_deferred(astore, &acct_stale, &acct_sc);
-        flat_store_evict_clean(astore);
-        flat_store_free_stale_slots(astore, acct_stale, acct_sc);
-    }
-
-    /* Free code pointers (storage mem_arts kept alive for hash cache) */
+    size_t evicted = 0;
     for (uint32_t i = 0; i < so->next_acct_idx; i++) {
         cached_account_t *ca = &so->acct_meta.entries[i];
-        if (ca->code) { free(ca->code); ca->code = NULL; }
-        /* Don't destroy storage mem_arts — keep hash cache warm */
+
+        /* Skip accounts without storage — nothing to evict */
+        if (!ca->storage_mem) continue;
+
+        /* Skip recently accessed accounts */
+        if (ca->last_access_block >= threshold) continue;
+
+        /* Skip dirty accounts — they haven't been checkpointed yet */
+        if (ca->storage_dirty || ca->mpt_dirty) continue;
+
+        /* Write storage to cache file before destroying */
+        stor_cache_write_account(so, ca);
+
+        /* Destroy storage */
+        acct_stor_destroy(ca);
+        evicted++;
     }
 
-    /* Don't reset acct_meta or acct_index — accounts persist across windows.
-     * Only clear dirty flags and journal. */
-    dirty_clear(&so->dirty_accounts);
-    so->journal_len = 0;
+    /* Also free code for cold accounts */
+    for (uint32_t i = 0; i < so->next_acct_idx; i++) {
+        cached_account_t *ca = &so->acct_meta.entries[i];
+        if (ca->code && ca->last_access_block < threshold) {
+            free(ca->code);
+            ca->code = NULL;
+        }
+    }
+
+    (void)evicted; /* for future stats */
 }
 
 /* =========================================================================

@@ -217,8 +217,8 @@ sync_t *sync_create(const sync_config_t *config) {
             fprintf(stderr, "warning: failed to open/create flat state at %s\n",
                     config->flat_state_path);
 
-        /* Storage file removed — per-account mem_art is the live store.
-         * storage_file will be used only for LRU eviction (future). */
+        /* Open storage cache file for LRU eviction persistence */
+        evm_state_set_storage_path(s->state, config->flat_state_path);
     }
     /* No background flush thread — flat_state is mmap'd */
 
@@ -416,7 +416,7 @@ bool sync_execute_block(sync_t *sync,
     sync->total_gas += br.gas_used;
     sync->last_block = bn;
 
-    /* Periodic stats snapshot (no eviction — mem_art frees on demand) */
+    /* Periodic stats snapshot + LRU eviction */
     {
         uint32_t si = sync->config.checkpoint_interval > 0
                     ? sync->config.checkpoint_interval : 256;
@@ -424,6 +424,9 @@ bool sync_execute_block(sync_t *sync,
             sync->last_stats = evm_state_get_stats(sync->state);
             sync->last_stats.exec_ms = sync->exec_ms;
             sync->exec_ms = 0;
+
+            /* Evict cold account storage */
+            evm_state_evict_cache(sync->state);
         }
     }
 

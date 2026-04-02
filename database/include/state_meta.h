@@ -50,6 +50,7 @@ typedef struct {
     mem_art_t            *storage_mem;   /* NULL if no storage / evicted */
     art_iface_mem_ctx_t  *storage_ctx;   /* heap-alloc'd iface context */
     art_mpt_t            *storage_mpt;   /* MPT context via art_iface_mem */
+    uint64_t              last_access_block; /* for LRU eviction */
 #ifdef ENABLE_HISTORY
     uint64_t   original_nonce;
     uint256_t  original_balance;
