@@ -111,6 +111,8 @@ typedef enum {
     JE_CREATE,
     JE_SELF_DESTRUCT,
     JE_TRANSIENT,
+    JE_WARM_ADDR,
+    JE_WARM_SLOT,
 } journal_type_t;
 
 typedef struct {
@@ -128,6 +130,7 @@ typedef struct {
                  uint16_t flags; } create;
         struct { uint16_t flags; } sd;
         struct { uint256_t key; uint256_t val; } transient;
+        uint256_t warm_slot_key;    /* JE_WARM_SLOT */
     } data;
 } journal_entry_t;
 
@@ -777,8 +780,11 @@ void state_sstore_lookup(state_t *s, const address_t *addr,
 
 void state_mark_addr_warm(state_t *s, const address_t *addr) {
     if (!s || !addr) return;
+    if (mem_art_contains(&s->warm_addrs, addr->bytes, 20)) return; /* already warm */
     uint8_t one = 1;
     mem_art_insert(&s->warm_addrs, addr->bytes, 20, &one, 1);
+    journal_entry_t je = { .type = JE_WARM_ADDR, .addr = *addr };
+    journal_push(s, &je);
 }
 
 bool state_is_addr_warm(const state_t *s, const address_t *addr) {
@@ -790,8 +796,12 @@ void state_mark_storage_warm(state_t *s, const address_t *addr, const uint256_t 
     if (!s || !addr || !key) return;
     uint8_t skey[SLOT_KEY_SIZE];
     make_slot_key(addr, key, skey);
+    if (mem_art_contains(&s->warm_slots, skey, SLOT_KEY_SIZE)) return; /* already warm */
     uint8_t one = 1;
     mem_art_insert(&s->warm_slots, skey, SLOT_KEY_SIZE, &one, 1);
+    journal_entry_t je = { .type = JE_WARM_SLOT, .addr = *addr,
+        .data.warm_slot_key = *key };
+    journal_push(s, &je);
 }
 
 bool state_is_storage_warm(const state_t *s, const address_t *addr, const uint256_t *key) {
@@ -912,6 +922,15 @@ void state_revert(state_t *s, uint32_t snap) {
             else
                 mem_art_insert(&s->transient, skey, SLOT_KEY_SIZE,
                                &je->data.transient.val, sizeof(uint256_t));
+            break;
+        }
+        case JE_WARM_ADDR:
+            mem_art_delete(&s->warm_addrs, je->addr.bytes, 20);
+            break;
+        case JE_WARM_SLOT: {
+            uint8_t skey[SLOT_KEY_SIZE];
+            make_slot_key(&je->addr, &je->data.warm_slot_key, skey);
+            mem_art_delete(&s->warm_slots, skey, SLOT_KEY_SIZE);
             break;
         }
         }
