@@ -21,6 +21,7 @@
 #include "storage_file.h"
 #include "keccak256.h"
 #include "mem_art.h"
+#include "logger.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -36,8 +37,8 @@
 #define MAX_CODE_SIZE     (24 * 1024 + 1)
 
 /* Per-account storage art pool sizes (virtual only, demand-paged) */
-#define ACCT_STOR_NODE_RESERVE  (4ULL * 1024 * 1024)   /* 4 MB */
-#define ACCT_STOR_LEAF_RESERVE  (8ULL * 1024 * 1024)   /* 8 MB */
+#define ACCT_STOR_NODE_RESERVE  (256ULL * 1024)   /* 256 KB per account */
+#define ACCT_STOR_LEAF_RESERVE  (512ULL * 1024)   /* 512 KB per account — fits ~8K slots */
 #define ACCT_STOR_KEY_SIZE      32                       /* slot_hash */
 #define ACCT_STOR_VAL_SIZE      32                       /* slot value BE */
 
@@ -191,7 +192,7 @@ static cached_account_t *acct_meta_ensure(account_meta_pool_t *p, uint32_t idx) 
 
 /* Storage arena: 8 GB virtual for all per-account compact_arts.
  * Physical = demand-paged, proportional to actual storage loaded. */
-#define STORAGE_ARENA_RESERVE (8ULL * 1024 * 1024 * 1024)
+#define STORAGE_ARENA_RESERVE (128ULL * 1024 * 1024 * 1024) /* 128 GB virtual — ~170K accounts */
 
 struct state_overlay {
     flat_state_t     *flat_state;
@@ -272,11 +273,23 @@ static inline void mark_account_tx_dirty(state_overlay_t *so, cached_account_t *
 static bool acct_stor_create(state_overlay_t *so, cached_account_t *ca) {
     if (ca->storage_art) return true; /* already exists */
     ca->storage_art = calloc(1, sizeof(compact_art_t));
-    if (!ca->storage_art) return false;
+    if (!ca->storage_art) {
+        LOG_ERROR("storage art calloc failed for %02x%02x..%02x%02x (OOM)",
+                  ca->addr.bytes[0], ca->addr.bytes[1],
+                  ca->addr.bytes[18], ca->addr.bytes[19]);
+        return false;
+    }
 
     void *nmem = arena_alloc(&so->storage_arena, ACCT_STOR_NODE_RESERVE);
     void *lmem = arena_alloc(&so->storage_arena, ACCT_STOR_LEAF_RESERVE);
     if (!nmem || !lmem) {
+        LOG_ERROR("storage arena exhausted for %02x%02x..%02x%02x "
+                  "(used=%zu, reserve=%zu, per_acct=%zu)",
+                  ca->addr.bytes[0], ca->addr.bytes[1],
+                  ca->addr.bytes[18], ca->addr.bytes[19],
+                  arena_used(&so->storage_arena),
+                  (size_t)STORAGE_ARENA_RESERVE,
+                  (size_t)(ACCT_STOR_NODE_RESERVE + ACCT_STOR_LEAF_RESERVE));
         free(ca->storage_art);
         ca->storage_art = NULL;
         return false;
@@ -286,12 +299,18 @@ static bool acct_stor_create(state_overlay_t *so, cached_account_t *ca) {
                                  false, NULL, NULL,
                                  nmem, ACCT_STOR_NODE_RESERVE,
                                  lmem, ACCT_STOR_LEAF_RESERVE)) {
+        LOG_ERROR("compact_art_init_arena failed for %02x%02x..%02x%02x",
+                  ca->addr.bytes[0], ca->addr.bytes[1],
+                  ca->addr.bytes[18], ca->addr.bytes[19]);
         free(ca->storage_art);
         ca->storage_art = NULL;
         return false;
     }
     ca->storage_mpt = art_mpt_create(ca->storage_art, acct_stor_encode, NULL);
     if (!ca->storage_mpt) {
+        LOG_ERROR("art_mpt_create failed for %02x%02x..%02x%02x",
+                  ca->addr.bytes[0], ca->addr.bytes[1],
+                  ca->addr.bytes[18], ca->addr.bytes[19]);
         compact_art_destroy(ca->storage_art);
         free(ca->storage_art);
         ca->storage_art = NULL;
@@ -416,8 +435,13 @@ static void storage_bulk_load(state_overlay_t *so, cached_account_t *ca) {
         return;
     }
 
-    acct_stor_create(so, ca);
-    if (!ca->storage_art) { free(buf); return; }
+    if (!acct_stor_create(so, ca)) {
+        LOG_ERROR("bulk_load: cannot create storage art for %02x%02x..%02x%02x (%u slots lost)",
+                  ca->addr.bytes[0], ca->addr.bytes[1],
+                  ca->addr.bytes[18], ca->addr.bytes[19], count);
+        free(buf);
+        return;
+    }
 
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *slot_hash = buf + i * STORAGE_SLOT_SIZE;
@@ -703,7 +727,10 @@ void state_overlay_set_storage(state_overlay_t *so, const address_t *addr,
                        &old_value, sizeof(uint256_t));
 
     /* Write to per-account storage art */
-    if (!ca->storage_art) acct_stor_create(so, ca);
+    if (!ca->storage_art && !acct_stor_create(so, ca)) {
+        LOG_ERROR("SSTORE lost: cannot create storage art for %02x%02x..%02x%02x",
+                  addr->bytes[0], addr->bytes[1], addr->bytes[18], addr->bytes[19]);
+    }
     if (ca->storage_art) {
         uint8_t val_be[32];
         uint256_to_bytes(value, val_be);
