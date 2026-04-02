@@ -110,6 +110,7 @@ typedef enum {
     JE_STORAGE,
     JE_CREATE,
     JE_SELF_DESTRUCT,
+    JE_TRANSIENT,
 } journal_type_t;
 
 typedef struct {
@@ -126,6 +127,7 @@ typedef struct {
                  hash_t storage_root; uint8_t *code; uint32_t code_size;
                  uint16_t flags; } create;
         struct { uint16_t flags; } sd;
+        struct { uint256_t key; uint256_t val; } transient;
     } data;
 } journal_entry_t;
 
@@ -817,6 +819,17 @@ void state_tstore(state_t *s, const address_t *addr,
     if (!s || !addr || !key || !value) return;
     uint8_t skey[SLOT_KEY_SIZE];
     make_slot_key(addr, key, skey);
+
+    /* Journal old value for revert */
+    uint256_t old_val = UINT256_ZERO;
+    const uint256_t *existing = (const uint256_t *)
+        mem_art_get(&s->transient, skey, SLOT_KEY_SIZE, NULL);
+    if (existing) old_val = *existing;
+
+    journal_entry_t je = { .type = JE_TRANSIENT, .addr = *addr,
+        .data.transient = { .key = *key, .val = old_val } };
+    journal_push(s, &je);
+
     mem_art_insert(&s->transient, skey, SLOT_KEY_SIZE, value, sizeof(uint256_t));
 }
 
@@ -891,6 +904,16 @@ void state_revert(state_t *s, uint32_t snap) {
         case JE_SELF_DESTRUCT:
             if (a) a->flags = je->data.sd.flags;
             break;
+        case JE_TRANSIENT: {
+            uint8_t skey[SLOT_KEY_SIZE];
+            make_slot_key(&je->addr, &je->data.transient.key, skey);
+            if (uint256_is_zero(&je->data.transient.val))
+                mem_art_delete(&s->transient, skey, SLOT_KEY_SIZE);
+            else
+                mem_art_insert(&s->transient, skey, SLOT_KEY_SIZE,
+                               &je->data.transient.val, sizeof(uint256_t));
+            break;
+        }
         }
     }
     s->journal_len = snap;
