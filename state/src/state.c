@@ -577,25 +577,28 @@ void state_set_code(state_t *s, const address_t *addr,
     account_t *a = ensure_account(s, addr);
     if (!a) return;
 
-    journal_entry_t je = { .type = JE_CODE, .addr = *addr,
-        .data.code = { .hash = a->code_hash, .code = a->code,
-                       .size = a->code_size, .flags = a->flags } };
-    if (!journal_push(s, &je))
-        free(a->code); /* can't journal — leak old code */
+    resource_t *r = ensure_resource(s, a);
+    if (!r) return;
 
-    a->code = NULL;
-    a->code_size = 0;
+    journal_entry_t je = { .type = JE_CODE, .addr = *addr,
+        .data.code = { .hash = r->code_hash, .code = r->code,
+                       .size = r->code_size, .flags = a->flags } };
+    if (!journal_push(s, &je))
+        free(r->code);
+
+    r->code = NULL;
+    r->code_size = 0;
 
     if (code && len > 0) {
-        a->code = malloc(len);
-        if (a->code) { memcpy(a->code, code, len); a->code_size = len; }
+        r->code = malloc(len);
+        if (r->code) { memcpy(r->code, code, len); r->code_size = len; }
         acct_set_flag(a, ACCT_HAS_CODE);
-        a->code_hash = hash_keccak256(code, len);
+        r->code_hash = hash_keccak256(code, len);
         if (s->code_store)
-            code_store_put(s->code_store, a->code_hash.bytes, code, len);
+            code_store_put(s->code_store, r->code_hash.bytes, code, len);
     } else {
         acct_clear_flag(a, ACCT_HAS_CODE);
-        a->code_hash = EMPTY_CODE_HASH;
+        r->code_hash = EMPTY_CODE_HASH;
     }
 
     acct_set_flag(a, ACCT_CODE_DIRTY | ACCT_BLOCK_DIRTY);
@@ -608,34 +611,41 @@ const uint8_t *state_get_code(state_t *s, const address_t *addr, uint32_t *out_l
     account_t *a = ensure_account(s, addr);
     if (!a || !acct_has_flag(a, ACCT_HAS_CODE)) { if (out_len) *out_len = 0; return NULL; }
 
+    resource_t *r = get_resource(s, a);
+    if (!r) { if (out_len) *out_len = 0; return NULL; }
+
     /* Load from code_store if not cached */
-    if (!a->code && s->code_store) {
-        uint32_t size;
-        const uint8_t *ptr = code_store_get(s->code_store, a->code_hash.bytes, &size);
-        if (ptr && size > 0) {
-            a->code = malloc(size);
-            if (a->code) { memcpy(a->code, ptr, size); a->code_size = size; }
+    if (!r->code && s->code_store) {
+        uint32_t size = code_store_get_size(s->code_store, r->code_hash.bytes);
+        if (size > 0) {
+            r->code = malloc(size);
+            if (r->code) {
+                r->code_size = code_store_get(s->code_store, r->code_hash.bytes,
+                                               r->code, size);
+            }
         }
     }
-    if (out_len) *out_len = a->code_size;
-    return a->code;
+    if (out_len) *out_len = r->code_size;
+    return r->code;
 }
 
 uint32_t state_get_code_size(state_t *s, const address_t *addr) {
     if (!s || !addr) return 0;
     account_t *a = ensure_account(s, addr);
     if (!a || !acct_has_flag(a, ACCT_HAS_CODE)) return 0;
-    if (a->code_size > 0) return a->code_size;
-    /* Load from code_store to get size */
+    resource_t *r = get_resource(s, a);
+    if (!r) return 0;
+    if (r->code_size > 0) return r->code_size;
     state_get_code(s, addr, NULL);
-    return a->code_size;
+    return r ? r->code_size : 0;
 }
 
 hash_t state_get_code_hash(state_t *s, const address_t *addr) {
     if (!s || !addr) return EMPTY_CODE_HASH;
     account_t *a = ensure_account(s, addr);
-    if (!a) return EMPTY_CODE_HASH;
-    return acct_has_flag(a, ACCT_HAS_CODE) ? a->code_hash : EMPTY_CODE_HASH;
+    if (!a || !acct_has_flag(a, ACCT_HAS_CODE)) return EMPTY_CODE_HASH;
+    resource_t *r = get_resource(s, a);
+    return r ? r->code_hash : EMPTY_CODE_HASH;
 }
 
 /* =========================================================================
@@ -648,7 +658,7 @@ uint256_t state_get_storage(state_t *s, const address_t *addr, const uint256_t *
     if (!a) return UINT256_ZERO;
     uint8_t slot_be[32]; uint256_to_bytes(key, slot_be);
     hash_t slot_hash = hash_keccak256(slot_be, 32);
-    return storage_read(a, slot_hash.bytes);
+    return storage_read(s, a, slot_hash.bytes);
 }
 
 void state_set_storage(state_t *s, const address_t *addr,
@@ -660,7 +670,7 @@ void state_set_storage(state_t *s, const address_t *addr,
     uint8_t slot_be[32]; uint256_to_bytes(key, slot_be);
     hash_t slot_hash = hash_keccak256(slot_be, 32);
 
-    uint256_t old_value = storage_read(a, slot_hash.bytes);
+    uint256_t old_value = storage_read(s, a, slot_hash.bytes);
 
     journal_entry_t je = { .type = JE_STORAGE, .addr = *addr,
         .data.storage = { .key = *key, .val = old_value, .flags = a->flags } };
@@ -674,18 +684,19 @@ void state_set_storage(state_t *s, const address_t *addr,
                        &old_value, sizeof(uint256_t));
 
     /* Write to storage */
-    if (!a->storage && !ensure_storage(s, a)) {
+    if (!ensure_storage(s, a)) {
         LOG_ERROR("storage create failed for %02x%02x..%02x%02x",
                   addr->bytes[0], addr->bytes[1], addr->bytes[18], addr->bytes[19]);
         return;
     }
+    resource_t *r = get_resource(s, a);
 
     uint8_t val_be[32];
     uint256_to_bytes(value, val_be);
     if (uint256_is_zero(value))
-        mem_art_delete(a->storage, slot_hash.bytes, STOR_KEY_SIZE);
+        mem_art_delete(r->storage, slot_hash.bytes, STOR_KEY_SIZE);
     else
-        mem_art_insert(a->storage, slot_hash.bytes, STOR_KEY_SIZE,
+        mem_art_insert(r->storage, slot_hash.bytes, STOR_KEY_SIZE,
                        val_be, STOR_VAL_SIZE);
 
     acct_set_flag(a, ACCT_STORAGE_DIRTY);
@@ -697,9 +708,10 @@ bool state_has_storage(state_t *s, const address_t *addr) {
     if (!s || !addr) return false;
     account_t *a = ensure_account(s, addr);
     if (!a) return false;
-    if (memcmp(a->storage_root.bytes, EMPTY_STORAGE_ROOT.bytes, 32) != 0)
+    resource_t *r = get_resource(s, a);
+    if (r && memcmp(r->storage_root.bytes, EMPTY_STORAGE_ROOT.bytes, 32) != 0)
         return true;
-    if (a->storage && mem_art_size(a->storage) > 0)
+    if (r && r->storage && mem_art_size(r->storage) > 0)
         return true;
     return false;
 }
@@ -812,39 +824,47 @@ void state_revert(state_t *s, uint32_t snap) {
             break;
         case JE_CODE:
             if (a) {
-                free(a->code);
-                a->code = je->data.code.code;
-                a->code_size = je->data.code.size;
-                a->code_hash = je->data.code.hash;
+                resource_t *r = get_resource(s, a);
+                if (r) {
+                    free(r->code);
+                    r->code = je->data.code.code;
+                    r->code_size = je->data.code.size;
+                    r->code_hash = je->data.code.hash;
+                }
                 a->flags = je->data.code.flags;
             }
-            je->data.code.code = NULL; /* ownership transferred */
+            je->data.code.code = NULL;
             break;
-        case JE_STORAGE:
-            if (a && a->storage) {
+        case JE_STORAGE: {
+            resource_t *r = a ? get_resource(s, a) : NULL;
+            if (r && r->storage) {
                 uint8_t slot_be[32]; uint256_to_bytes(&je->data.storage.key, slot_be);
                 hash_t slot_hash = hash_keccak256(slot_be, 32);
                 if (uint256_is_zero(&je->data.storage.val))
-                    mem_art_delete(a->storage, slot_hash.bytes, STOR_KEY_SIZE);
+                    mem_art_delete(r->storage, slot_hash.bytes, STOR_KEY_SIZE);
                 else {
                     uint8_t val_be[32];
                     uint256_to_bytes(&je->data.storage.val, val_be);
-                    mem_art_insert(a->storage, slot_hash.bytes, STOR_KEY_SIZE,
+                    mem_art_insert(r->storage, slot_hash.bytes, STOR_KEY_SIZE,
                                    val_be, STOR_VAL_SIZE);
                 }
-                a->flags = je->data.storage.flags;
             }
+            if (a) a->flags = je->data.storage.flags;
             break;
+        }
         case JE_CREATE:
             if (a) {
+                resource_t *r = get_resource(s, a);
                 a->nonce = je->data.create.nonce;
                 a->balance = je->data.create.balance;
-                a->code_hash = je->data.create.code_hash;
-                a->storage_root = je->data.create.storage_root;
-                free(a->code);
-                a->code = je->data.create.code;
-                a->code_size = je->data.create.code_size;
                 a->flags = je->data.create.flags;
+                if (r) {
+                    r->code_hash = je->data.create.code_hash;
+                    r->storage_root = je->data.create.storage_root;
+                    free(r->code);
+                    r->code = je->data.create.code;
+                    r->code_size = je->data.create.code_size;
+                }
             }
             je->data.create.code = NULL;
             break;
@@ -865,26 +885,32 @@ void state_create_account(state_t *s, const address_t *addr) {
     account_t *a = ensure_account(s, addr);
     if (!a) return;
 
+    resource_t *r = get_resource(s, a);
     journal_entry_t je = { .type = JE_CREATE, .addr = *addr,
         .data.create = {
             .nonce = a->nonce, .balance = a->balance,
-            .code_hash = a->code_hash, .storage_root = a->storage_root,
-            .code = a->code, .code_size = a->code_size,
+            .code_hash = r ? r->code_hash : EMPTY_CODE_HASH,
+            .storage_root = r ? r->storage_root : EMPTY_STORAGE_ROOT,
+            .code = r ? r->code : NULL,
+            .code_size = r ? r->code_size : 0,
             .flags = a->flags
         } };
-    if (!journal_push(s, &je))
-        free(a->code);
+    if (!journal_push(s, &je) && r)
+        free(r->code);
 
     uint256_t bal = a->balance; /* preserve balance */
     a->nonce = 0;
     a->balance = bal;
-    a->code = NULL;
-    a->code_size = 0;
-    a->code_hash = EMPTY_CODE_HASH;
-    a->storage_root = EMPTY_STORAGE_ROOT;
     a->flags = ACCT_CREATED | ACCT_DIRTY | ACCT_BLOCK_DIRTY |
                ACCT_MPT_DIRTY | ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED;
-    destroy_storage(a);
+
+    if (r) {
+        r->code = NULL;
+        r->code_size = 0;
+        r->code_hash = EMPTY_CODE_HASH;
+        r->storage_root = EMPTY_STORAGE_ROOT;
+        destroy_resource_storage(r);
+    }
 
     mark_tx_dirty(s, addr);
     mark_blk_dirty(s, a);
@@ -918,14 +944,18 @@ void state_commit_tx(state_t *s) {
             a->balance = UINT256_ZERO;
             a->nonce = 0;
             acct_clear_flag(a, ACCT_HAS_CODE);
-            a->code_hash = EMPTY_CODE_HASH;
-            if (a->code) { free(a->code); a->code = NULL; }
-            a->code_size = 0;
             acct_clear_flag(a, ACCT_EXISTED | ACCT_CREATED | ACCT_DIRTY |
                            ACCT_CODE_DIRTY | ACCT_BLOCK_DIRTY | ACCT_SELF_DESTRUCTED);
             acct_set_flag(a, ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
-            a->storage_root = EMPTY_STORAGE_ROOT;
-            destroy_storage(a);
+
+            resource_t *r = get_resource(s, a);
+            if (r) {
+                r->code_hash = EMPTY_CODE_HASH;
+                if (r->code) { free(r->code); r->code = NULL; }
+                r->code_size = 0;
+                r->storage_root = EMPTY_STORAGE_ROOT;
+                destroy_resource_storage(r);
+            }
             mark_blk_dirty(s, a);
             continue;
         }
