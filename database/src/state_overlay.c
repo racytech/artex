@@ -446,7 +446,13 @@ static void storage_bulk_load(state_overlay_t *so, cached_account_t *ca) {
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *slot_hash = buf + i * STORAGE_SLOT_SIZE;
         const uint8_t *val_be    = buf + i * STORAGE_SLOT_SIZE + 32;
-        compact_art_insert(ca->storage_art, slot_hash, val_be);
+        if (!compact_art_insert(ca->storage_art, slot_hash, val_be)) {
+            LOG_ERROR("bulk_load: storage art pool full for %02x%02x..%02x%02x "
+                      "(inserted %u/%u slots)",
+                      ca->addr.bytes[0], ca->addr.bytes[1],
+                      ca->addr.bytes[18], ca->addr.bytes[19], i, count);
+            break;
+        }
     }
     free(buf);
 }
@@ -736,8 +742,11 @@ void state_overlay_set_storage(state_overlay_t *so, const address_t *addr,
         uint256_to_bytes(value, val_be);
         if (uint256_is_zero(value))
             compact_art_delete(ca->storage_art, slot_hash.bytes);
-        else
-            compact_art_insert(ca->storage_art, slot_hash.bytes, val_be);
+        else if (!compact_art_insert(ca->storage_art, slot_hash.bytes, val_be))
+            LOG_ERROR("SSTORE pool full for %02x%02x..%02x%02x (size=%zu)",
+                      addr->bytes[0], addr->bytes[1],
+                      addr->bytes[18], addr->bytes[19],
+                      ca->storage_art->size);
     }
 
     ca->storage_dirty = true;
@@ -817,7 +826,10 @@ void state_overlay_revert(state_overlay_t *so, uint32_t snap_id) {
                 else {
                     uint8_t val_be[32];
                     uint256_to_bytes(&je->data.storage.old_value, val_be);
-                    compact_art_insert(ca->storage_art, slot_hash.bytes, val_be);
+                    if (!compact_art_insert(ca->storage_art, slot_hash.bytes, val_be))
+                        LOG_ERROR("journal revert: storage art pool full for %02x%02x..%02x%02x",
+                                  je->addr.bytes[0], je->addr.bytes[1],
+                                  je->addr.bytes[18], je->addr.bytes[19]);
                 }
             }
             if (ca) {
