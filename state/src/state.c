@@ -67,6 +67,8 @@ static size_t rlp_be(const uint8_t *be, size_t be_len, uint8_t *out) {
     return 1 + len;
 }
 
+/* Build full account RLP: list(nonce, balance, storage_root, code_hash).
+ * art_mpt's encode_leaf wraps the entire output with rbuf_encode_bytes. */
 static uint32_t build_account_rlp(uint64_t nonce, const uint8_t balance_be[32],
                                     const uint8_t storage_root[32],
                                     const uint8_t code_hash[32],
