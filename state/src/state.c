@@ -1034,11 +1034,26 @@ void state_commit_block(state_t *s) {
 
 void state_clear_prestate_dirty(state_t *s) {
     if (!s) return;
+
     for (uint32_t i = 0; i < s->count; i++) {
         account_t *a = &s->accounts[i];
+
+        /* Compute storage roots for prestate accounts that have storage.
+         * Without this, acct_trie_encode would see EMPTY_STORAGE_ROOT
+         * for prestate accounts whose storage isn't modified by the tx. */
+        resource_t *r = get_resource(s, a);
+        if (r && r->storage_mpt) {
+            art_mpt_root_hash(r->storage_mpt, r->storage_root.bytes);
+        }
+
+        /* Mark prestate accounts as existing — they're in the state trie.
+         * Required for correct EIP-161 pruning decisions in commit_tx. */
+        acct_set_flag(a, ACCT_EXISTED);
+
         acct_clear_flag(a, ACCT_DIRTY | ACCT_CODE_DIRTY | ACCT_MPT_DIRTY |
                         ACCT_BLOCK_DIRTY | ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
     }
+
     dirty_clear(&s->blk_dirty);
     dirty_clear(&s->tx_dirty);
     s->journal_len = 0;
