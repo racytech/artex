@@ -316,6 +316,10 @@ add_executable(test_evm_state_audit
 target_link_libraries(test_evm_state_audit evm)
 add_test(NAME test_evm_state_audit COMMAND test_evm_state_audit)
 
+add_executable(test_state_root state/tests/test_state_root.c)
+target_link_libraries(test_state_root state evm)
+add_test(NAME test_state_root COMMAND test_state_root)
+
 add_executable(test_art_mpt_fuzz database/tests/test_art_mpt_fuzz.c)
 target_link_libraries(test_art_mpt_fuzz art_mpt compact_art arena common)
 add_test(NAME test_art_mpt_fuzz COMMAND test_art_mpt_fuzz)

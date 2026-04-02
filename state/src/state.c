@@ -256,6 +256,8 @@ static resource_t *ensure_resource(state_t *s, account_t *a) {
     return r;
 }
 
+/* Create account in vector + addr_lookup only (no trie insertion).
+ * Used by read-only paths — avoids polluting acct_index with phantom entries. */
 static account_t *ensure_account(state_t *s, const address_t *addr) {
     account_t *existing = find_account(s, addr->bytes);
     if (existing) {
@@ -280,11 +282,19 @@ static account_t *ensure_account(state_t *s, const address_t *addr) {
     address_copy(&a->addr, addr);
     a->last_access_block = s->current_block;
 
-    /* Insert into both indices */
-    hash_t addr_hash = hash_keccak256(addr->bytes, 20);
+    /* Insert into addr_lookup only — NOT acct_index (trie).
+     * acct_index insertion happens in ensure_in_trie when the account
+     * is actually modified (write path). */
     mem_art_insert(&s->addr_lookup, addr->bytes, 20, &idx, sizeof(idx));
-    mem_art_insert(&s->acct_index, addr_hash.bytes, 32, &idx, sizeof(idx));
     return a;
+}
+
+/* Insert account into acct_index (trie) if not already present.
+ * Called by write paths before marking dirty. */
+static void ensure_in_trie(state_t *s, account_t *a) {
+    uint32_t idx = (uint32_t)(a - s->accounts);
+    hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
+    mem_art_insert(&s->acct_index, addr_hash.bytes, 32, &idx, sizeof(idx));
 }
 
 static bool journal_push(state_t *s, const journal_entry_t *entry) {

@@ -123,8 +123,7 @@ bool test_runner_run_state_test(test_runner_t *runner,
             // Commit pre-state as "original" for EIP-2200 storage tracking
             evm_state_commit(runner->state);
 
-            // Flush pre-state to flat_state (so unmodified accounts
-            // are in the trie before we clear dirty flags)
+            // Compute genesis root then clear dirty flags
             evm_state_compute_mpt_root(runner->state, false);
             evm_state_clear_prestate_dirty(runner->state);
 
@@ -295,7 +294,7 @@ bool test_runner_run_state_test(test_runner_t *runner,
             // Execute transaction using transaction execution layer
             transaction_result_t tx_result;
             bool tx_executed = transaction_execute(runner->evm, &tx, &block_env, &tx_result);
-            
+
             // Check if test expects an exception
             if (post_cond->expect_exception != NULL) {
                 // Test expects transaction to fail
@@ -362,6 +361,7 @@ bool test_runner_run_state_test(test_runner_t *runner,
 
             // Verify state root
             hash_t actual_root = evm_state_compute_mpt_root(runner->state, prune_empty);
+
             if (!hash_equals(&actual_root, &post_cond->state_root)) {
                 result->status = TEST_FAIL;
 
