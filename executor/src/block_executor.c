@@ -714,10 +714,7 @@ block_result_t block_execute(evm_t *evm,
     }
 #endif
 
-    /* Compute state root — prune empty accounts post-Spurious Dragon (EIP-161).
-     * For Verkle: flushes block-dirty state to backing store, clears dirty flags.
-     * For MPT: no-op here — root computation is batched at checkpoint boundaries
-     * by the sync layer (sync_validate_batch_root). */
+    /* Compute state root — prune empty accounts post-Spurious Dragon (EIP-161). */
     bool prune_empty = (evm->fork >= FORK_SPURIOUS_DRAGON);
     result.state_root = evm_state_compute_state_root_ex(evm->state, prune_empty);
     result.gas_used = cumulative_gas;

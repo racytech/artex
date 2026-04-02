@@ -40,7 +40,7 @@
 #define BLOCK_HASH_WINDOW 256
 
 /* Forward declarations */
-static void sync_flush_and_evict(sync_t *sync);
+/* sync_flush_and_evict removed — no batched eviction with mem_art */
 
 // ============================================================================
 // Internal struct
@@ -64,8 +64,7 @@ struct sync {
 
     /* Batched MPT root validation: root is computed at interval boundaries,
      * not per-block. We remember the last block's expected root for validation. */
-    hash_t   pending_expected_root;
-    bool     batch_root_computed;
+    /* pending_expected_root / batch_root_computed removed — per-block validation */
 
     /* Stats snapshot taken before cache eviction (so callers see useful values) */
     evm_state_stats_t last_stats;
@@ -383,21 +382,10 @@ bool sync_execute_block(sync_t *sync,
 
     uint64_t bn = header->number;
 
-    /* Detect fork transition BEFORE execution. If Spurious Dragon
-     * activates at this block, flush pre-SD state first so that
-     * accounts touched pre-fork are not re-evaluated with post-fork
-     * prune_empty by compute_mpt_root. */
+    /* Track fork transitions (per-block root handles SD boundary naturally) */
     {
         evm_fork_t upcoming_fork = fork_get_active(header->number,
             header->timestamp, sync->evm->chain_config);
-        if (sync->prev_fork < FORK_SPURIOUS_DRAGON &&
-            upcoming_fork >= FORK_SPURIOUS_DRAGON) {
-            fprintf(stderr, "SD BOUNDARY: block %lu prev_fork=%d upcoming=%d — flushing pre-SD state\n",
-                    bn, sync->prev_fork, upcoming_fork);
-            evm_state_compute_mpt_root(sync->state, false);
-            sync->batch_root_computed = true;
-            sync_flush_and_evict(sync);
-        }
         sync->prev_fork = upcoming_fork;
     }
 
@@ -428,23 +416,21 @@ bool sync_execute_block(sync_t *sync,
     result->expected_gas = header->gas_used;
     result->actual_gas   = br.gas_used;
 
-    /* MPT root: deferred to checkpoint boundaries (not per-block).
-     * Save the expected root from each block header — at checkpoint time
-     * we validate against the last block's root. */
-    if (sync->config.validate_state_root) {
-        sync->pending_expected_root = header->state_root;
-    }
-
-
-    /* Determine outcome (gas only — root validated at checkpoint) */
+    /* Determine outcome — gas + state root validated per block */
     if (!gas_match) {
         result->ok    = false;
         result->error = SYNC_GAS_MISMATCH;
-        /* Transfer receipt ownership to caller for debugging */
         result->receipts = br.receipts;
         result->receipt_count = br.receipt_count;
         br.receipts = NULL;
         br.receipt_count = 0;
+        sync->blocks_fail++;
+    } else if (sync->config.validate_state_root &&
+               memcmp(br.state_root.bytes, header->state_root.bytes, 32) != 0) {
+        result->ok    = false;
+        result->error = SYNC_ROOT_MISMATCH;
+        result->actual_root   = br.state_root;
+        result->expected_root = header->state_root;
         sync->blocks_fail++;
     } else {
         result->ok    = true;
@@ -455,40 +441,15 @@ bool sync_execute_block(sync_t *sync,
     sync->total_gas += br.gas_used;
     sync->last_block = bn;
 
-    /* Fork boundary checkpoint handled pre-execution above */
-
-    /* Periodic root validation */
-    if (result->ok &&
-        sync->config.checkpoint_interval > 0 &&
-        sync->blocks_fail == 0 &&
-        bn % sync->config.checkpoint_interval == 0) {
-
-        struct timespec _root0, _root1;
-        clock_gettime(CLOCK_MONOTONIC, &_root0);
-        hash_t actual_root, expected_root;
-        if (!sync_validate_batch_root(sync, &actual_root, &expected_root)) {
-            result->ok    = false;
-            result->error = SYNC_ROOT_MISMATCH;
-            result->actual_root   = actual_root;
-            result->expected_root = expected_root;
-            sync->blocks_ok--;
-            sync->blocks_fail++;
-            block_result_free(&br);
-            return true;
-        }
-        clock_gettime(CLOCK_MONOTONIC, &_root1);
-        sync->root_ms = (_root1.tv_sec - _root0.tv_sec) * 1000.0 +
-                         (_root1.tv_nsec - _root0.tv_nsec) / 1e6;
-    }
-
-    /* Periodic flush + evict (decoupled from validation) */
+    /* Periodic stats snapshot (no eviction — mem_art frees on demand) */
     {
-        uint32_t ei = sync->config.evict_interval > 0
-                    ? sync->config.evict_interval
-                    : (sync->config.checkpoint_interval > 0
-                       ? sync->config.checkpoint_interval : 256);
-        if (bn % ei == 0)
-            sync_flush_and_evict(sync);
+        uint32_t si = sync->config.checkpoint_interval > 0
+                    ? sync->config.checkpoint_interval : 256;
+        if (bn % si == 0) {
+            sync->last_stats = evm_state_get_stats(sync->state);
+            sync->last_stats.exec_ms = sync->exec_ms;
+            sync->exec_ms = 0;
+        }
     }
 
     block_result_free(&br);
