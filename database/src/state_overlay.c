@@ -209,6 +209,12 @@ struct state_overlay {
     int      storage_cache_fd;   /* append-only cache file, -1 if not open */
     mem_art_t stor_cache_index;  /* addr_hash[32] → {offset, count} for cache file */
 
+    /* Resource tracking: indices of accounts with storage_mem or code.
+     * Avoids scanning all 33M+ acct_meta entries during eviction. */
+    uint32_t *resource_list;     /* array of acct_meta indices */
+    uint32_t  resource_count;
+    uint32_t  resource_cap;
+
     /* Meta arrays — indexed by sequential meta index (NOT flat_store overlay index).
      * Meta holds typed access + flags. Persistent records in flat_store overlay
      * are synced at checkpoint time. */
@@ -264,6 +270,18 @@ static bool journal_push(state_overlay_t *so, const journal_entry_t *entry) {
     return true;
 }
 
+/* Track account index for eviction scanning — only accounts with resources */
+static void resource_list_add(state_overlay_t *so, uint32_t idx) {
+    if (so->resource_count >= so->resource_cap) {
+        uint32_t nc = so->resource_cap ? so->resource_cap * 2 : 1024;
+        uint32_t *nl = realloc(so->resource_list, nc * sizeof(uint32_t));
+        if (!nl) return;
+        so->resource_list = nl;
+        so->resource_cap = nc;
+    }
+    so->resource_list[so->resource_count++] = idx;
+}
+
 static inline void mark_account_mpt_dirty(state_overlay_t *so, cached_account_t *ca) {
     if (!ca->mpt_dirty) {
         ca->mpt_dirty = true;
@@ -278,7 +296,6 @@ static inline void mark_account_tx_dirty(state_overlay_t *so, cached_account_t *
 
 /* Per-account storage creation — mem_art backed */
 static bool acct_stor_create(state_overlay_t *so, cached_account_t *ca) {
-    (void)so;
     if (ca->storage_mem) return true; /* already exists */
 
     ca->storage_mem = calloc(1, sizeof(mem_art_t));
@@ -322,6 +339,10 @@ static bool acct_stor_create(state_overlay_t *so, cached_account_t *ca) {
         ca->storage_ctx = NULL;
         return false;
     }
+
+    /* Track for eviction scanning */
+    uint32_t idx = (uint32_t)(ca - so->acct_meta.entries);
+    resource_list_add(so, idx);
     return true;
 }
 
@@ -505,6 +526,7 @@ void state_overlay_destroy(state_overlay_t *so) {
     mem_art_destroy(&so->acct_index);
     mem_art_destroy(&so->stor_cache_index);
     if (so->storage_cache_fd >= 0) close(so->storage_cache_fd);
+    free(so->resource_list);
     mem_art_destroy(&so->warm_addrs);
     mem_art_destroy(&so->warm_slots);
     mem_art_destroy(&so->transient);
@@ -1570,25 +1592,30 @@ void state_overlay_evict(state_overlay_t *so) {
     uint64_t threshold = so->current_block > EVICT_AGE_THRESHOLD
                        ? so->current_block - EVICT_AGE_THRESHOLD : 0;
 
-    size_t evicted = 0;
-    for (uint32_t i = 0; i < so->next_acct_idx; i++) {
-        cached_account_t *ca = &so->acct_meta.entries[i];
+    /* Scan only accounts with storage (tracked in resource_list) */
+    uint32_t write_idx = 0;
+    for (uint32_t i = 0; i < so->resource_count; i++) {
+        uint32_t idx = so->resource_list[i];
+        if (idx >= so->next_acct_idx) continue;
+        cached_account_t *ca = &so->acct_meta.entries[idx];
 
-        /* Skip recently accessed accounts */
-        if (ca->last_access_block >= threshold) continue;
+        /* Keep in list if still has storage */
+        if (!ca->storage_mem) continue;
 
-        /* Evict storage if present and clean */
-        if (ca->storage_mem && !ca->storage_dirty && !ca->mpt_dirty) {
-            stor_cache_write_account(so, ca);
-            acct_stor_destroy(ca);
-            evicted++;
+        /* Keep hot accounts in list */
+        if (ca->last_access_block >= threshold ||
+            ca->storage_dirty || ca->mpt_dirty) {
+            so->resource_list[write_idx++] = idx;
+            continue;
         }
 
-        /* Free code */
+        /* Cold + clean → evict */
+        stor_cache_write_account(so, ca);
+        acct_stor_destroy(ca);
         if (ca->code) { free(ca->code); ca->code = NULL; }
+        /* Don't add back to resource_list — evicted */
     }
-
-    (void)evicted; /* for future stats */
+    so->resource_count = write_idx;
 }
 
 /* =========================================================================
