@@ -1161,13 +1161,20 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
 
         if (!acct_has_flag(a, ACCT_EXISTED) ||
             (acct_is_empty(a) && prune_empty)) {
-            /* Delete non-existed or empty+pruned accounts from trie */
             mem_art_delete(&s->acct_index, addr_hash.bytes, 32);
         }
-        /* Existed accounts: already in acct_index from ensure_account.
-         * The trie leaf value (idx) is correct. The encode callback
-         * reads fresh data from accounts[idx] on every root computation.
-         * The mem_art dirty flags propagate from insert/delete. */
+    }
+
+    /* Step 2b: Remove phantom accounts from acct_index.
+     * ensure_account inserts every written-to address into acct_index,
+     * including accounts touched by add_balance(0) that never got EXISTED.
+     * These must not appear in the trie. */
+    for (uint32_t i = 0; i < s->count; i++) {
+        account_t *a = &s->accounts[i];
+        if (acct_has_flag(a, ACCT_EXISTED) && !(acct_is_empty(a) && prune_empty))
+            continue; /* keep */
+        hash_t h = hash_keccak256(a->addr.bytes, 20);
+        mem_art_delete(&s->acct_index, h.bytes, 32);
     }
 
     /* Step 3: Compute account trie root */
