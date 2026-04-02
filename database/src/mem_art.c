@@ -762,7 +762,16 @@ static mem_ref_t insert_recursive(mem_art_t *tree, mem_ref_t ref,
     // Leaf node
     if (MEM_IS_LEAF(ref)) {
         if (leaf_matches(tree, ref, key, key_len)) {
-            // Update existing leaf — allocate new (old becomes dead arena space)
+            // Update existing leaf — overwrite value in place if same size
+            mem_leaf_t *leaf = leaf_ptr(tree, ref);
+            if (leaf->value_len == value_len) {
+                size_t val_off = leaf_value_offset(key_len, value_len);
+                memcpy((uint8_t *)leaf + val_off, value, value_len);
+                *inserted = false;
+                if (out_leaf_ref) *out_leaf_ref = ref;
+                return ref;
+            }
+            // Different value size — allocate new (old becomes dead arena space)
             mem_ref_t new_leaf = alloc_leaf(tree, key, key_len, value, value_len);
             if (new_leaf == MEM_REF_NULL) return ref;
             *inserted = false;
@@ -911,12 +920,20 @@ static mem_ref_t insert_recursive(mem_art_t *tree, mem_ref_t ref,
             // Key is consumed, child should be a leaf — update it
             mem_ref_t old_child = *child_ptr;
             if (MEM_IS_LEAF(old_child) && leaf_matches(tree, old_child, key, key_len)) {
-                mem_ref_t new_leaf = alloc_leaf(tree, key, key_len, value, value_len);
-                if (new_leaf != MEM_REF_NULL) {
-                    child_ptr = find_child_ptr(tree, ref, byte);
-                    *child_ptr = new_leaf;
+                mem_leaf_t *leaf = leaf_ptr(tree, old_child);
+                if (leaf->value_len == value_len) {
+                    size_t val_off = leaf_value_offset(key_len, value_len);
+                    memcpy((uint8_t *)leaf + val_off, value, value_len);
                     *inserted = false;
-                    if (out_leaf_ref) *out_leaf_ref = new_leaf;
+                    if (out_leaf_ref) *out_leaf_ref = old_child;
+                } else {
+                    mem_ref_t new_leaf = alloc_leaf(tree, key, key_len, value, value_len);
+                    if (new_leaf != MEM_REF_NULL) {
+                        child_ptr = find_child_ptr(tree, ref, byte);
+                        *child_ptr = new_leaf;
+                        *inserted = false;
+                        if (out_leaf_ref) *out_leaf_ref = new_leaf;
+                    }
                 }
             }
             return ref;
