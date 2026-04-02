@@ -44,9 +44,9 @@
 #define ACCT_STOR_VAL_SIZE  32   /* slot value BE */
 #define STOR_SLOT_SIZE      64   /* slot_hash[32] + value_be[32] */
 
-/* LRU eviction: scan every 256 blocks, evict if not touched in 1024 blocks */
-#define EVICT_SCAN_INTERVAL 256
-#define EVICT_AGE_THRESHOLD 1024
+/* LRU eviction: scan every 4096 blocks, evict if not touched in 4096 blocks */
+#define EVICT_SCAN_INTERVAL 4096
+#define EVICT_AGE_THRESHOLD 4096
 
 /* Storage cache file entry — stored in stor_cache_index */
 typedef struct __attribute__((packed)) {
@@ -1574,30 +1574,18 @@ void state_overlay_evict(state_overlay_t *so) {
     for (uint32_t i = 0; i < so->next_acct_idx; i++) {
         cached_account_t *ca = &so->acct_meta.entries[i];
 
-        /* Skip accounts without storage — nothing to evict */
-        if (!ca->storage_mem) continue;
-
         /* Skip recently accessed accounts */
         if (ca->last_access_block >= threshold) continue;
 
-        /* Skip dirty accounts — they haven't been checkpointed yet */
-        if (ca->storage_dirty || ca->mpt_dirty) continue;
-
-        /* Write storage to cache file before destroying */
-        stor_cache_write_account(so, ca);
-
-        /* Destroy storage */
-        acct_stor_destroy(ca);
-        evicted++;
-    }
-
-    /* Also free code for cold accounts */
-    for (uint32_t i = 0; i < so->next_acct_idx; i++) {
-        cached_account_t *ca = &so->acct_meta.entries[i];
-        if (ca->code && ca->last_access_block < threshold) {
-            free(ca->code);
-            ca->code = NULL;
+        /* Evict storage if present and clean */
+        if (ca->storage_mem && !ca->storage_dirty && !ca->mpt_dirty) {
+            stor_cache_write_account(so, ca);
+            acct_stor_destroy(ca);
+            evicted++;
         }
+
+        /* Free code */
+        if (ca->code) { free(ca->code); ca->code = NULL; }
     }
 
     (void)evicted; /* for future stats */

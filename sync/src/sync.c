@@ -416,7 +416,7 @@ bool sync_execute_block(sync_t *sync,
     sync->total_gas += br.gas_used;
     sync->last_block = bn;
 
-    /* Periodic stats snapshot + LRU eviction */
+    /* Periodic stats snapshot */
     {
         uint32_t si = sync->config.checkpoint_interval > 0
                     ? sync->config.checkpoint_interval : 256;
@@ -424,11 +424,12 @@ bool sync_execute_block(sync_t *sync,
             sync->last_stats = evm_state_get_stats(sync->state);
             sync->last_stats.exec_ms = sync->exec_ms;
             sync->exec_ms = 0;
-
-            /* Evict cold account storage */
-            evm_state_evict_cache(sync->state);
         }
     }
+
+    /* LRU eviction — less frequent than stats (scanning all accounts is expensive) */
+    if (bn % 4096 == 0)
+        evm_state_evict_cache(sync->state);
 
     block_result_free(&br);
     return true;
