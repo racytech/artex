@@ -964,7 +964,7 @@ void state_create_account(state_t *s, const address_t *addr) {
     a->nonce = 0;
     a->balance = bal;
     a->flags = ACCT_CREATED | ACCT_DIRTY | ACCT_BLOCK_DIRTY |
-               ACCT_MPT_DIRTY | ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED;
+               ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED;
 
     if (r) {
         r->code = NULL;
@@ -1148,8 +1148,33 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
         /* Compute storage root if dirty */
         if (acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
             resource_t *r = get_resource(s, a);
-            if (r && r->storage_mpt) {
-                art_mpt_root_hash(r->storage_mpt, r->storage_root.bytes);
+            if (r && r->storage && mem_art_size(r->storage) > 0) {
+                /* Batch rebuild storage root from storage mem_art */
+                size_t stor_n = mem_art_size(r->storage);
+                mpt_batch_entry_t *stor_entries = calloc(stor_n, sizeof(mpt_batch_entry_t));
+                uint8_t *stor_rlp_buf = malloc(stor_n * 33);
+                size_t si = 0;
+
+                mem_art_iterator_t *it = mem_art_iterator_create(r->storage);
+                while (mem_art_iterator_next(it)) {
+                    size_t klen, vlen;
+                    const uint8_t *ik = mem_art_iterator_key(it, &klen);
+                    const uint8_t *iv = mem_art_iterator_value(it, &vlen);
+                    memcpy(stor_entries[si].key, ik, 32);
+                    size_t rlen = rlp_be(iv, vlen, stor_rlp_buf + si * 33);
+                    stor_entries[si].value = stor_rlp_buf + si * 33;
+                    stor_entries[si].value_len = rlen;
+                    si++;
+                }
+                free(it);
+
+                hash_t stor_root;
+                mpt_compute_root_batch(stor_entries, si, &stor_root);
+                r->storage_root = stor_root;
+                free(stor_entries);
+                free(stor_rlp_buf);
+            } else if (r) {
+                r->storage_root = EMPTY_STORAGE_ROOT;
             }
         }
 
@@ -1187,6 +1212,7 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
             memcpy(entries[n].key, ah.bytes, 32);
             uint8_t bal_be[32]; uint256_to_bytes(&a->balance, bal_be);
             resource_t *r = get_resource(s, a);
+            (void)0; /* storage root computed above */
             uint32_t rlen = build_account_rlp(
                 a->nonce, bal_be,
                 r ? r->storage_root.bytes : EMPTY_STORAGE_ROOT.bytes,
