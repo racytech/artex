@@ -406,6 +406,10 @@ bool sync_execute_block(sync_t *sync,
     if (bn % 1024 == 0) {
         state_t *st = evm_state_get_state(sync->state);
         if (st) {
+            /* Save pre-compaction root for verification */
+            bool prune = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
+            hash_t root_before = evm_state_compute_mpt_root(sync->state, prune);
+
             state_stats_t pre = state_get_stats(st);
             struct timespec _c0, _c1;
             clock_gettime(CLOCK_MONOTONIC, &_c0);
@@ -414,6 +418,13 @@ bool sync_execute_block(sync_t *sync,
             state_stats_t post = state_get_stats(st);
             double ms = (_c1.tv_sec - _c0.tv_sec) * 1000.0 +
                         (_c1.tv_nsec - _c0.tv_nsec) / 1e6;
+
+            /* Re-verify root after compaction */
+            hash_t root_after = evm_state_compute_mpt_root(sync->state, prune);
+            if (memcmp(root_before.bytes, root_after.bytes, 32) != 0) {
+                fprintf(stderr, "FATAL: root mismatch after compaction at block %lu!\n", bn);
+            }
+
             fprintf(stderr, "  compact: %u→%u accts, %.0fMB→%.0fMB, %.0fms\n",
                     pre.account_count, post.account_count,
                     pre.memory_used / 1e6, post.memory_used / 1e6, ms);
