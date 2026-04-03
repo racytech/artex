@@ -1198,44 +1198,18 @@ int main(int argc, char **argv) {
                        tps, mgps, bps, win_secs,
                        remaining / 1000);
 
-                printf("  └ cache: %zuK accts, %zuK slots (%zuMB arena)\n",
-                       ss.cache_accounts / 1000, ss.cache_slots / 1000,
-                       ss.cache_arena_bytes / (1024*1024));
-                printf("  └ flat: %luK accts (%zuMB), %luK slots (%zuMB)\n",
-                       ss.flat_acct_count / 1000,
-                       ss.flat_acct_mem / (1024*1024),
-                       ss.flat_stor_count / 1000,
-                       ss.flat_stor_mem / (1024*1024));
-                if (ss.flat_acct_hit + ss.flat_acct_miss > 0 ||
-                    ss.flat_stor_hit + ss.flat_stor_miss > 0) {
-                    printf("  └ flat: acct %lu/%lu (%.1f%%)  stor %lu/%lu (%.1f%%)\n",
-                           ss.flat_acct_hit, ss.flat_acct_hit + ss.flat_acct_miss,
-                           (ss.flat_acct_hit + ss.flat_acct_miss)
-                               ? 100.0 * ss.flat_acct_hit / (ss.flat_acct_hit + ss.flat_acct_miss) : 0,
-                           ss.flat_stor_hit, ss.flat_stor_hit + ss.flat_stor_miss,
-                           (ss.flat_stor_hit + ss.flat_stor_miss)
-                               ? 100.0 * ss.flat_stor_hit / (ss.flat_stor_hit + ss.flat_stor_miss) : 0);
-                }
-                printf("  └ code: %luK (hit %.1f%%, LRU %u/%uK) RSS %zuMB\n",
-                       ss.code_count / 1000,
-                       (ss.code_cache_hits + ss.code_cache_misses)
-                           ? 100.0 * ss.code_cache_hits / (ss.code_cache_hits + ss.code_cache_misses) : 0,
-                       ss.code_cache_count / 1000, ss.code_cache_capacity / 1000,
-                       rss_mb);
+                /* arena stats are repurposed: flat_acct_count=arena_used, flat_acct_mem=arena_cap */
+                size_t arena_used_mb = ss.flat_acct_count / (1024*1024);
+                size_t arena_cap_mb = ss.flat_acct_mem / (1024*1024);
+                size_t vec_mb = ss.cache_accounts * 80 / (1024*1024);
 
-                double root_total = ss.root_stor_ms + ss.root_acct_ms;
-                if (root_total > 0.1) {
-                    printf("  └ root: stor=%.1f ms  acct=%.1f ms  total=%.1f ms (%zu dirty)\n",
-                           ss.root_stor_ms, ss.root_acct_ms, root_total,
-                           ss.root_dirty_count);
-                    /* art_mpt: no per-commit stats — trie is computed from compact_art */
-                }
+                printf("  └ state: %zuK accts, %zuK stor | vec=%zuMB  arena=%zu/%zuMB  RSS %zuMB\n",
+                       ss.cache_accounts / 1000, ss.cache_slots / 1000,
+                       vec_mb, arena_used_mb, arena_cap_mb, rss_mb);
                 {
-                    double other_ms = win_secs * 1000.0 - ss.exec_ms -
-                                      ss.wait_flush_ms - ss.evict_ms;
-                    printf("  └ exec=%.0fms  root=%.0fms  evict=%.0fms  other=%.0fms\n",
-                           ss.exec_ms, ss.wait_flush_ms, ss.evict_ms,
-                           other_ms > 0 ? other_ms : 0);
+                    double other_ms = win_secs * 1000.0 - ss.exec_ms;
+                    printf("  └ exec=%.0fms  other=%.0fms\n",
+                           ss.exec_ms, other_ms > 0 ? other_ms : 0);
                 }
             }
             window_txs = 0;

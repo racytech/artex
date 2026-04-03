@@ -298,6 +298,8 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
     st.cache_accounts = ss.account_count;
     st.cache_slots = ss.storage_account_count;
     st.cache_arena_bytes = ss.memory_used;
+    st.flat_acct_count = ss.arena_used;   /* repurpose: arena_used */
+    st.flat_acct_mem = ss.arena_cap;      /* repurpose: arena_cap */
     return st;
 }
 
