@@ -133,6 +133,11 @@ void      state_tstore(state_t *s, const address_t *addr,
 
 hash_t state_compute_root(state_t *s, bool prune_empty);
 
+/* Compact: rebuild accounts vector and acct_index with only EXISTED accounts.
+ * Eliminates dead/phantom entries and reclaims mem_art arena space.
+ * Call at checkpoint boundaries when blk_dirty is empty. */
+void state_compact(state_t *s);
+
 /* =========================================================================
  * Stats
  * ========================================================================= */

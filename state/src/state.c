@@ -1234,6 +1234,52 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
     return root;
 }
 
+void state_compact(state_t *s) {
+    if (!s) return;
+
+    /* Count live accounts */
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < s->count; i++) {
+        if (acct_has_flag(&s->accounts[i], ACCT_EXISTED))
+            live++;
+    }
+
+    /* Allocate new vector */
+    uint32_t new_cap = live < ACCT_INIT_CAP ? ACCT_INIT_CAP : live;
+    account_t *new_accts = calloc(new_cap, sizeof(account_t));
+    if (!new_accts) return;
+
+    /* Rebuild acct_index from scratch */
+    mem_art_destroy(&s->acct_index);
+    mem_art_init(&s->acct_index);
+
+    /* Copy live accounts to new vector, insert into fresh acct_index */
+    uint32_t new_count = 0;
+    for (uint32_t i = 0; i < s->count; i++) {
+        account_t *a = &s->accounts[i];
+        if (!acct_has_flag(a, ACCT_EXISTED)) continue;
+
+        /* Update resource_idx — resource vector not compacted, indices stay valid */
+        new_accts[new_count] = *a;
+
+        hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
+        mem_art_insert(&s->acct_index, addr_hash.bytes, 32, &new_count, sizeof(new_count));
+        new_count++;
+    }
+
+    free(s->accounts);
+    s->accounts = new_accts;
+    s->count = new_count;
+    s->capacity = new_cap;
+
+    /* Rebuild art_mpt context (acct_trie_ctx.tree still points to s->acct_index) */
+    if (s->acct_trie_mpt)
+        art_mpt_invalidate_all(s->acct_trie_mpt);
+
+    /* Clear phantom tracking */
+    s->phantom_count = 0;
+}
+
 bool state_load(state_t *s, const char *path) {
     (void)s; (void)path;
     /* TODO: implement */
