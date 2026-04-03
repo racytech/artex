@@ -472,6 +472,10 @@ art_mpt_t *art_mpt_create_iface(art_iface_t iface,
     return am;
 }
 
+void art_mpt_set_no_cache(art_mpt_t *am, bool disable) {
+    if (am) am->no_cache = disable;
+}
+
 art_mpt_t *art_mpt_create(compact_art_t *tree,
                             art_mpt_value_encode_t encode, void *ctx) {
     if (!tree) return NULL;

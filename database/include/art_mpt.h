@@ -55,6 +55,10 @@ art_mpt_t *art_mpt_create(compact_art_t *tree,
 /** Free the hash cache. Does NOT destroy the compact_art tree. */
 void art_mpt_destroy(art_mpt_t *am);
 
+/** Disable hash caching. Useful for small tries where cache overhead
+ *  exceeds the benefit. Cache array is never allocated. */
+void art_mpt_set_no_cache(art_mpt_t *am, bool disable);
+
 /**
  * Insert or update a key in the underlying compact_art, then mark
  * the path from root to key as dirty (invalidate cached hashes).
