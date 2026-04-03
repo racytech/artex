@@ -1148,7 +1148,9 @@ state_stats_t state_get_stats(const state_t *s) {
     st.account_count = s->count;
     st.storage_account_count = s->resource_count;
     /* Rough memory estimate */
-    st.memory_used = (size_t)s->count * sizeof(account_t);
+    st.memory_used = (size_t)s->count * sizeof(account_t) +
+                      s->acct_index.arena_cap +
+                      (size_t)s->res_count * sizeof(resource_t);
     return st;
 }
 
