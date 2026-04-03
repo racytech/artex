@@ -28,6 +28,13 @@
 #define STOR_INIT_CAP       1024
 #define SLOT_KEY_SIZE       52   /* addr[20] + slot_be[32] for originals/warm */
 
+/* EIP-161 RIPEMD special case: address 0x0000...0003.
+ * geth keeps RIPEMD dirty after journal revert so that EIP-161 prunes
+ * it even when the touching CALL fails (OOG). See geth journal.go:touchChange. */
+static const uint8_t RIPEMD_ADDR[20] = {
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3
+};
+
 static const hash_t EMPTY_CODE_HASH = {{
     0xc5,0xd2,0x46,0x01,0x86,0xf7,0x23,0x3c,
     0x92,0x7e,0x7d,0xb2,0xdc,0xc7,0x03,0xc0,
@@ -871,10 +878,23 @@ void state_revert(state_t *s, uint32_t snap) {
 
         switch (je->type) {
         case JE_NONCE:
-            if (a) { a->nonce = je->data.nonce.val; a->flags = je->data.nonce.flags; }
+            if (a) {
+                a->nonce = je->data.nonce.val;
+                /* RIPEMD: keep dirty flags so EIP-161 can prune after OOG revert */
+                if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0)
+                    a->flags = je->data.nonce.flags | (a->flags & (ACCT_DIRTY | ACCT_BLOCK_DIRTY | ACCT_MPT_DIRTY));
+                else
+                    a->flags = je->data.nonce.flags;
+            }
             break;
         case JE_BALANCE:
-            if (a) { a->balance = je->data.balance.val; a->flags = je->data.balance.flags; }
+            if (a) {
+                a->balance = je->data.balance.val;
+                if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0)
+                    a->flags = je->data.balance.flags | (a->flags & (ACCT_DIRTY | ACCT_BLOCK_DIRTY | ACCT_MPT_DIRTY));
+                else
+                    a->flags = je->data.balance.flags;
+            }
             break;
         case JE_CODE:
             if (a) {
