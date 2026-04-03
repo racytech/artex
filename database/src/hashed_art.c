@@ -609,7 +609,8 @@ static bool rbuf_encode_bytes(rlp_buf_t *b, const uint8_t *d, size_t n) {
     }
     size_t ll = 1; size_t tmp = n; while (tmp > 255) { ll++; tmp >>= 8; }
     uint8_t hdr[6]; hdr[0] = 0xb7 + (uint8_t)ll;
-    for (size_t i = ll; i > 0; i--) { hdr[i] = (uint8_t)(n & 0xFF); n >>= 8; }
+    tmp = n;
+    for (size_t i = ll; i > 0; i--) { hdr[i] = (uint8_t)(tmp & 0xFF); tmp >>= 8; }
     return rbuf_append(b, hdr, 1 + ll) && rbuf_append(b, d, n);
 }
 static bool rbuf_list_wrap(rlp_buf_t *out, const rlp_buf_t *payload) {

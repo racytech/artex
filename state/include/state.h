@@ -4,8 +4,8 @@
 /**
  * State — single in-memory Ethereum world state.
  *
- * All accounts in a flat vector indexed by mem_art.
- * Per-account storage in separate mem_arts.
+ * All accounts in a flat vector indexed by hart (hashed ART).
+ * Per-account storage in separate harts.
  * Account trie for MPT root computation.
  * Journal for snapshot/revert.
  * No disk on hot path.
@@ -13,6 +13,7 @@
 
 #include "account.h"
 #include "mem_art.h"
+#include "hashed_art.h"
 #include "hash.h"
 #include "address.h"
 #include "uint256.h"
@@ -151,10 +152,8 @@ typedef struct {
     /* Memory breakdown */
     size_t   acct_vec_bytes;         /* accounts vector: count * 80 */
     size_t   res_vec_bytes;          /* resource vector: res_count * 104 */
-    size_t   acct_arena_bytes;       /* acct_index mem_art arena capacity */
-    size_t   acct_cache_bytes;       /* acct_index art_mpt hash cache */
-    size_t   stor_arena_bytes;       /* all storage mem_art arenas total */
-    size_t   stor_cache_bytes;       /* all storage art_mpt caches total */
+    size_t   acct_arena_bytes;       /* acct_index hart arena (includes hash cache) */
+    size_t   stor_arena_bytes;       /* all storage hart arenas total */
     size_t   total_tracked;          /* sum of above */
 } state_stats_t;
 

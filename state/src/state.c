@@ -8,8 +8,7 @@
 
 #include "state.h"
 #include "code_store.h"
-#include "compact_art.h"
-#include "art_mpt.h"
+#include "hashed_art.h"
 #include "keccak256.h"
 #include "logger.h"
 
@@ -95,14 +94,12 @@ static uint32_t build_account_rlp(uint64_t nonce, const uint8_t balance_be[32],
     return 2 + (uint32_t)pos;
 }
 
-/* Storage value → RLP encode callback for per-account art_mpt */
-static uint32_t stor_value_encode(const uint8_t *key, const void *leaf_val,
-                                   uint32_t val_size, uint8_t *rlp_out,
-                                   void *ctx) {
+/* Storage value → RLP encode callback for hart_root_hash */
+static uint32_t stor_value_encode(const uint8_t key[32], const void *leaf_val,
+                                   uint8_t *rlp_out, void *ctx) {
     (void)key; (void)ctx;
-    /* Storage value: RLP-encode the 32-byte value (strip leading zeros) */
     const uint8_t *v = (const uint8_t *)leaf_val;
-    return (uint32_t)rlp_be(v, val_size, rlp_out);
+    return (uint32_t)rlp_be(v, STOR_VAL_SIZE, rlp_out);
 }
 
 /* =========================================================================
@@ -192,20 +189,16 @@ static void make_slot_key(const address_t *addr, const uint256_t *slot,
  * ========================================================================= */
 
 struct state {
-    /* Account vector + index (also serves as account trie for MPT) */
+    /* Account vector + index (hart also computes MPT root directly) */
     account_t *accounts;
     uint32_t   count;       /* number of accounts in use */
     uint32_t   capacity;    /* allocated slots */
-    mem_art_t  acct_index;  /* addr_hash[32] → uint32_t idx (lookup + trie) */
+    hart_t     acct_index;  /* addr_hash[32] → uint32_t idx (lookup + trie) */
 
     /* Resource vector (only accounts with code/storage) */
     resource_t *resources;
     uint32_t    res_count;
     uint32_t    res_capacity;
-
-    /* Account trie MPT (wraps acct_index via art_iface_mem) */
-    art_iface_mem_ctx_t acct_trie_ctx;
-    art_mpt_t          *acct_trie_mpt;
 
     /* Code store (not owned) */
     code_store_t *code_store;
@@ -257,7 +250,7 @@ struct state {
 static account_t *find_account(const state_t *s, const uint8_t addr[20]) {
     hash_t h = hash_keccak256(addr, 20);
     const uint32_t *pidx = (const uint32_t *)
-        mem_art_get(&((state_t *)s)->acct_index, h.bytes, 32, NULL);
+        hart_get(&((state_t *)s)->acct_index, h.bytes);
     if (!pidx) return NULL;
     uint32_t idx = *pidx;
     if (idx >= s->count) return NULL;
@@ -318,7 +311,7 @@ static account_t *ensure_account(state_t *s, const address_t *addr) {
 
     /* Single index: addr_hash[32] → idx (serves both lookup and trie) */
     hash_t addr_hash = hash_keccak256(addr->bytes, 20);
-    mem_art_insert(&s->acct_index, addr_hash.bytes, 32, &idx, sizeof(idx));
+    hart_insert(&s->acct_index, addr_hash.bytes, &idx);
 
     /* Track as potential phantom — will be checked at compute_root */
     dead_vec_push(&s->phantoms, &s->phantom_count, &s->phantom_cap, idx);
@@ -348,9 +341,9 @@ static void mark_blk_dirty(state_t *s, account_t *a) {
         acct_set_flag(a, ACCT_MPT_DIRTY);
         dirty_push(&s->blk_dirty, a->addr.bytes, 20);
 
-        /* Mark acct_index trie path dirty so art_mpt rehashes. */
+        /* Mark acct_index trie path dirty so hart rehashes. */
         hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
-        mem_art_mark_path_dirty(&s->acct_index, addr_hash.bytes, 32);
+        hart_mark_path_dirty(&s->acct_index, addr_hash.bytes);
     }
 }
 
@@ -374,27 +367,10 @@ static bool ensure_storage(state_t *s, account_t *a) {
     if (!r) return false;
     if (r->storage) return true;
 
-    r->storage = calloc(1, sizeof(mem_art_t));
+    r->storage = calloc(1, sizeof(hart_t));
     if (!r->storage) return false;
-    if (!mem_art_init_cap(r->storage, STOR_INIT_CAP)) {
+    if (!hart_init_cap(r->storage, STOR_VAL_SIZE, STOR_INIT_CAP)) {
         free(r->storage); r->storage = NULL; return false;
-    }
-
-    r->storage_ctx = calloc(1, sizeof(art_iface_mem_ctx_t));
-    if (!r->storage_ctx) {
-        mem_art_destroy(r->storage); free(r->storage); r->storage = NULL;
-        return false;
-    }
-    r->storage_ctx->tree = r->storage;
-    r->storage_ctx->key_size = STOR_KEY_SIZE;
-    r->storage_ctx->value_size = STOR_VAL_SIZE;
-
-    r->storage_mpt = art_mpt_create_iface(
-        art_iface_mem(r->storage_ctx), stor_value_encode, NULL);
-    if (!r->storage_mpt) {
-        free(r->storage_ctx); r->storage_ctx = NULL;
-        mem_art_destroy(r->storage); free(r->storage); r->storage = NULL;
-        return false;
     }
     /* Storage tries: cache ON — 23x faster than without (incremental
      * rehashing skips clean paths). RSS cost ~15KB per storage account. */
@@ -406,18 +382,15 @@ static bool ensure_storage(state_t *s, account_t *a) {
 
 static void destroy_resource_storage(resource_t *r) {
     if (!r) return;
-    if (r->storage_mpt) { art_mpt_destroy(r->storage_mpt); r->storage_mpt = NULL; }
-    if (r->storage_ctx) { free(r->storage_ctx); r->storage_ctx = NULL; }
-    if (r->storage) { mem_art_destroy(r->storage); free(r->storage); r->storage = NULL; }
+    if (r->storage) { hart_destroy(r->storage); free(r->storage); r->storage = NULL; }
 }
 
 static uint256_t storage_read(const state_t *s, const account_t *a,
                                const uint8_t slot_hash[32]) {
     resource_t *r = get_resource(s, a);
     if (!r || !r->storage) return UINT256_ZERO;
-    size_t vlen;
-    const void *val = mem_art_get(r->storage, slot_hash, STOR_KEY_SIZE, &vlen);
-    if (val && vlen == STOR_VAL_SIZE)
+    const void *val = hart_get(r->storage, slot_hash);
+    if (val)
         return uint256_from_bytes((const uint8_t *)val, 32);
     return UINT256_ZERO;
 }
@@ -427,10 +400,9 @@ static uint256_t storage_read(const state_t *s, const account_t *a,
  * ========================================================================= */
 
 /* Account trie encode callback — reads from accounts[] + resources[] */
-static uint32_t acct_trie_encode(const uint8_t *key, const void *leaf_val,
-                                  uint32_t val_size, uint8_t *rlp_out,
-                                  void *user_ctx) {
-    (void)key; (void)val_size;
+static uint32_t acct_trie_encode(const uint8_t key[32], const void *leaf_val,
+                                  uint8_t *rlp_out, void *user_ctx) {
+    (void)key;
     state_t *s = user_ctx;
     uint32_t idx;
     memcpy(&idx, leaf_val, sizeof(idx));
@@ -448,9 +420,6 @@ static uint32_t acct_trie_encode(const uint8_t *key, const void *leaf_val,
         r && acct_has_flag(a, ACCT_HAS_CODE) ? r->code_hash.bytes
                                               : EMPTY_CODE_HASH.bytes,
         rlp_out);
-
-    (void)key;
-
     return len;
 }
 
@@ -463,7 +432,7 @@ state_t *state_create(code_store_t *cs) {
     if (!s->accounts) { free(s); return NULL; }
     s->capacity = ACCT_INIT_CAP;
 
-    mem_art_init(&s->acct_index);
+    hart_init(&s->acct_index, sizeof(uint32_t));
     mem_art_init(&s->warm_addrs);
     mem_art_init(&s->warm_slots);
     mem_art_init(&s->transient);
@@ -480,11 +449,7 @@ state_t *state_create(code_store_t *cs) {
     s->res_count = 1;
 
     /* Account trie MPT — wraps acct_index mem_art */
-    s->acct_trie_ctx.tree = &s->acct_index;
-    s->acct_trie_ctx.key_size = 32;   /* addr_hash */
-    s->acct_trie_ctx.value_size = sizeof(uint32_t);
-    s->acct_trie_mpt = art_mpt_create_iface(
-        art_iface_mem(&s->acct_trie_ctx), acct_trie_encode, s);
+    /* acct_index (hart) computes MPT root directly — no separate art_mpt needed */
 
     return s;
 }
@@ -504,8 +469,7 @@ void state_destroy(state_t *s) {
     free(s->destructed);
     free(s->pruned);
 
-    if (s->acct_trie_mpt) art_mpt_destroy(s->acct_trie_mpt);
-    mem_art_destroy(&s->acct_index);
+    hart_destroy(&s->acct_index);
     mem_art_destroy(&s->warm_addrs);
     mem_art_destroy(&s->warm_slots);
     mem_art_destroy(&s->transient);
@@ -746,10 +710,9 @@ void state_set_storage(state_t *s, const address_t *addr,
     uint8_t val_be[32];
     uint256_to_bytes(value, val_be);
     if (uint256_is_zero(value))
-        mem_art_delete(r->storage, slot_hash.bytes, STOR_KEY_SIZE);
+        hart_delete(r->storage, slot_hash.bytes);
     else
-        mem_art_insert(r->storage, slot_hash.bytes, STOR_KEY_SIZE,
-                       val_be, STOR_VAL_SIZE);
+        hart_insert(r->storage, slot_hash.bytes, val_be);
 
     acct_set_flag(a, ACCT_STORAGE_DIRTY);
     mark_tx_dirty(s, addr);
@@ -763,7 +726,7 @@ bool state_has_storage(state_t *s, const address_t *addr) {
     resource_t *r = get_resource(s, a);
     if (r && memcmp(r->storage_root.bytes, EMPTY_STORAGE_ROOT.bytes, 32) != 0)
         return true;
-    if (r && r->storage && mem_art_size(r->storage) > 0)
+    if (r && r->storage && hart_size(r->storage) > 0)
         return true;
     return false;
 }
@@ -937,12 +900,11 @@ void state_revert(state_t *s, uint32_t snap) {
                 uint8_t slot_be[32]; uint256_to_bytes(&je->data.storage.key, slot_be);
                 hash_t slot_hash = hash_keccak256(slot_be, 32);
                 if (uint256_is_zero(&je->data.storage.val))
-                    mem_art_delete(r->storage, slot_hash.bytes, STOR_KEY_SIZE);
+                    hart_delete(r->storage, slot_hash.bytes);
                 else {
                     uint8_t val_be[32];
                     uint256_to_bytes(&je->data.storage.val, val_be);
-                    mem_art_insert(r->storage, slot_hash.bytes, STOR_KEY_SIZE,
-                                   val_be, STOR_VAL_SIZE);
+                    hart_insert(r->storage, slot_hash.bytes, val_be);
                 }
             }
             if (a) a->flags = je->data.storage.flags;
@@ -1145,8 +1107,8 @@ void state_clear_prestate_dirty(state_t *s) {
          * Without this, acct_trie_encode would see EMPTY_STORAGE_ROOT
          * for prestate accounts whose storage isn't modified by the tx. */
         resource_t *r = get_resource(s, a);
-        if (r && r->storage_mpt) {
-            art_mpt_root_hash(r->storage_mpt, r->storage_root.bytes);
+        if (r && r->storage) {
+            hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
         }
 
         /* Mark prestate accounts as existing — they're in the state trie.
@@ -1177,21 +1139,16 @@ state_stats_t state_get_stats(const state_t *s) {
     st.acct_vec_bytes = (size_t)s->count * sizeof(account_t);
     st.res_vec_bytes = (size_t)s->res_count * sizeof(resource_t);
     st.acct_arena_bytes = s->acct_index.arena_cap;
-    st.acct_cache_bytes = art_mpt_cache_bytes(s->acct_trie_mpt);
 
-    /* Sum storage arenas + caches across all resource entries */
-    size_t stor_arena = 0, stor_cache = 0;
+    size_t stor_arena = 0;
     for (uint32_t i = 1; i < s->res_count; i++) {
         resource_t *r = &s->resources[i];
         if (r->storage) stor_arena += r->storage->arena_cap;
-        if (r->storage_mpt) stor_cache += art_mpt_cache_bytes(r->storage_mpt);
     }
     st.stor_arena_bytes = stor_arena;
-    st.stor_cache_bytes = stor_cache;
 
     st.total_tracked = st.acct_vec_bytes + st.res_vec_bytes +
-                       st.acct_arena_bytes + st.acct_cache_bytes +
-                       st.stor_arena_bytes + st.stor_cache_bytes;
+                       st.acct_arena_bytes + st.stor_arena_bytes;
     return st;
 }
 
@@ -1202,7 +1159,7 @@ state_stats_t state_get_stats(const state_t *s) {
 
 hash_t state_compute_root(state_t *s, bool prune_empty) {
     hash_t root = {0};
-    if (!s || !s->acct_trie_mpt) return root;
+    if (!s) return root;
 
     /* Step 1: For each dirty account, decide existence + compute storage root */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
@@ -1222,8 +1179,8 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
         /* Compute storage root if dirty */
         if (acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
             resource_t *r = get_resource(s, a);
-            if (r && r->storage_mpt) {
-                art_mpt_root_hash(r->storage_mpt, r->storage_root.bytes);
+            if (r && r->storage) {
+                hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
             }
         }
 
@@ -1239,7 +1196,7 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
 
         if (!acct_has_flag(a, ACCT_EXISTED) ||
             (acct_is_empty(a) && prune_empty)) {
-            mem_art_delete(&s->acct_index, addr_hash.bytes, 32);
+            hart_delete(&s->acct_index, addr_hash.bytes);
         }
     }
 
@@ -1255,9 +1212,9 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
                 (acct_is_empty(_a) && prune_empty)) { \
                 hash_t _h = hash_keccak256(_a->addr.bytes, 20); \
                 const uint32_t *_p = (const uint32_t *) \
-                    mem_art_get(&s->acct_index, _h.bytes, 32, NULL); \
+                    hart_get(&s->acct_index, _h.bytes); \
                 if (_p && *_p == (i)) \
-                    mem_art_delete(&s->acct_index, _h.bytes, 32); \
+                    hart_delete(&s->acct_index, _h.bytes); \
             } \
         } \
     } while(0)
@@ -1277,7 +1234,7 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
     #undef SAFE_DELETE_IDX
 
     /* Step 3: Compute account trie root */
-    art_mpt_root_hash(s->acct_trie_mpt, root.bytes);
+    hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
 
     /* Step 4: Clear dirty flags */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
@@ -1313,8 +1270,8 @@ void state_compact(state_t *s) {
     if (!new_accts) return;
 
     /* Rebuild acct_index from scratch */
-    mem_art_destroy(&s->acct_index);
-    mem_art_init(&s->acct_index);
+    hart_destroy(&s->acct_index);
+    hart_init(&s->acct_index, sizeof(uint32_t));
 
     /* Copy live accounts to new vector, insert into fresh acct_index */
     uint32_t new_count = 0;
@@ -1326,7 +1283,7 @@ void state_compact(state_t *s) {
         new_accts[new_count] = *a;
 
         hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
-        mem_art_insert(&s->acct_index, addr_hash.bytes, 32, &new_count, sizeof(new_count));
+        hart_insert(&s->acct_index, addr_hash.bytes, &new_count);
         new_count++;
     }
 
@@ -1360,40 +1317,31 @@ void state_compact(state_t *s) {
      * Eliminates dead leaves from SSTORE overwrites and deletes. */
     for (uint32_t i = 0; i < s->res_count; i++) {
         resource_t *r = &s->resources[i];
-        if (!r->storage || mem_art_size(r->storage) == 0) continue;
+        if (!r->storage || hart_size(r->storage) == 0) continue;
 
         /* Rebuild: iterate old, insert into new */
-        mem_art_t *old = r->storage;
-        mem_art_t *fresh = calloc(1, sizeof(mem_art_t));
+        hart_t *old = r->storage;
+        hart_t *fresh = calloc(1, sizeof(hart_t));
         if (!fresh) continue;
-        if (!mem_art_init_cap(fresh, STOR_INIT_CAP)) { free(fresh); continue; }
+        if (!hart_init_cap(fresh, STOR_VAL_SIZE, STOR_INIT_CAP)) { free(fresh); continue; }
 
-        mem_art_iterator_t *it = mem_art_iterator_create(old);
+        hart_iter_t *it = hart_iter_create(old);
         if (it) {
-            while (mem_art_iterator_next(it)) {
-                size_t klen, vlen;
-                const uint8_t *ik = mem_art_iterator_key(it, &klen);
-                const void *iv = mem_art_iterator_value(it, &vlen);
-                mem_art_insert(fresh, ik, klen, iv, vlen);
+            while (hart_iter_next(it)) {
+                const uint8_t *ik = hart_iter_key(it);
+                const void *iv = hart_iter_value(it);
+                hart_insert(fresh, ik, iv);
             }
-            free(it);
+            hart_iter_destroy(it);
         }
 
         /* Swap */
-        mem_art_destroy(old);
+        hart_destroy(old);
         *old = *fresh;
         free(fresh);
-
-        /* Rebuild storage art_mpt wrapper */
-        if (r->storage_ctx)
-            r->storage_ctx->tree = r->storage;
-        if (r->storage_mpt)
-            art_mpt_invalidate_all(r->storage_mpt);
     }
 
-    /* Rebuild art_mpt context (acct_trie_ctx.tree still points to s->acct_index) */
-    if (s->acct_trie_mpt)
-        art_mpt_invalidate_all(s->acct_trie_mpt);
+    /* acct_index (hart) was rebuilt — all nodes born dirty, hash will be recomputed */
 
     /* Clear dead account tracking */
     s->phantom_count = 0;

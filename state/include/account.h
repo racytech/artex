@@ -14,11 +14,8 @@
 #include "uint256.h"
 #include "hash.h"
 #include "address.h"
-#include "mem_art.h"
-#include "art_iface.h"
+#include "hashed_art.h"
 #include <stdint.h>
-
-typedef struct art_mpt art_mpt_t;
 
 /* =========================================================================
  * Flags — packed into uint16_t
@@ -58,9 +55,7 @@ typedef struct {
     uint8_t  *code;             /*  8 bytes (heap, loaded on demand) */
     uint32_t  code_size;        /*  4 bytes */
     uint32_t  _pad;             /*  4 bytes */
-    mem_art_t            *storage;     /*  8 bytes (NULL if no storage) */
-    art_iface_mem_ctx_t  *storage_ctx; /*  8 bytes (heap) */
-    art_mpt_t            *storage_mpt; /*  8 bytes (heap) */
+    hart_t               *storage;     /*  8 bytes (NULL if no storage) */
 } resource_t;
 
 /* =========================================================================
