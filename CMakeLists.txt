@@ -320,6 +320,13 @@ add_executable(test_state_root state/tests/test_state_root.c)
 target_link_libraries(test_state_root state evm)
 add_test(NAME test_state_root COMMAND test_state_root)
 
+add_library(hashed_art STATIC database/src/hashed_art.c)
+target_include_directories(hashed_art PUBLIC ${CMAKE_SOURCE_DIR}/database/include ${CMAKE_SOURCE_DIR}/common/include)
+target_link_libraries(hashed_art common)
+
+add_executable(test_hashed_art database/tests/test_hashed_art.c)
+target_link_libraries(test_hashed_art hashed_art mem_mpt common)
+
 add_executable(test_state_compaction state/tests/test_state_compaction.c)
 target_link_libraries(test_state_compaction state evm)
 target_include_directories(test_state_compaction PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
