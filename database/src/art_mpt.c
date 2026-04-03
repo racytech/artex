@@ -538,8 +538,12 @@ void art_mpt_root_hash(art_mpt_t *am, uint8_t out[32]) {
 
 void art_mpt_invalidate_all(art_mpt_t *am) {
     if (!am) return;
-    if (am->cache)
-        memset(am->cache, 0, am->cache_cap * sizeof(hash_entry_t));
+    /* Free cache entirely — it will be lazily reallocated at the right
+     * size on the next cache_put. This reclaims memory after compaction
+     * when the underlying arena has been rebuilt with smaller offsets. */
+    free(am->cache);
+    am->cache = NULL;
+    am->cache_cap = 0;
 }
 
 art_mpt_stats_t art_mpt_get_stats(const art_mpt_t *am) {
