@@ -411,9 +411,9 @@ bool sync_execute_block(sync_t *sync,
 
         if (bn % 256 == 0 && st) {
             state_stats_t ss = state_get_stats(st);
-            /* Compact if arena waste > 50% */
-            size_t est_live = (size_t)ss.account_count * 60;
-            if (ss.arena_cap > 0 && est_live < ss.arena_cap / 2)
+            /* Compact if arena waste > 50% (used vs capacity) */
+            if (ss.arena_cap > (64 * 1024 * 1024) &&
+                ss.arena_used < ss.arena_cap / 2)
                 do_compact = true;
             /* Compact if too many dead accounts accumulated (>10K or >10% of total) */
             uint32_t dead = state_dead_count(st);
