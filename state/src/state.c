@@ -880,23 +880,26 @@ void state_revert(state_t *s, uint32_t snap) {
         case JE_NONCE:
             if (a) {
                 a->nonce = je->data.nonce.val;
-                /* Preserve MPT_DIRTY + BLOCK_DIRTY — trie path stays dirty
-                 * regardless of data revert.
-                 * RIPEMD (0x03): also preserve DIRTY so EIP-161 can prune it
-                 * even when the touching CALL fails (OOG). See geth touchChange. */
-                uint16_t keep = ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY;
-                if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0)
-                    keep |= ACCT_DIRTY;
-                a->flags = je->data.nonce.flags | (a->flags & keep);
+                /* RIPEMD (0x03): don't restore any dirty flags — keep them all
+                 * so EIP-161 prunes it even when the touching CALL reverts.
+                 * All others: restore flags but preserve MPT_DIRTY + BLOCK_DIRTY. */
+                if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0) {
+                    /* leave flags as-is */
+                } else {
+                    a->flags = je->data.nonce.flags |
+                               (a->flags & (ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY));
+                }
             }
             break;
         case JE_BALANCE:
             if (a) {
                 a->balance = je->data.balance.val;
-                uint16_t keep_b = ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY;
-                if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0)
-                    keep_b |= ACCT_DIRTY;
-                a->flags = je->data.balance.flags | (a->flags & keep_b);
+                if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0) {
+                    /* leave flags as-is */
+                } else {
+                    a->flags = je->data.balance.flags |
+                               (a->flags & (ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY));
+                }
             }
             break;
         case JE_CODE:
