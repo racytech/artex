@@ -167,6 +167,16 @@ static void dirty_free(dirty_vec_t *v) {
     free(v->keys); v->keys = NULL; v->count = v->cap = 0;
 }
 
+static void dead_vec_push(uint32_t **vec, uint32_t *count, uint32_t *cap, uint32_t idx) {
+    if (*count >= *cap) {
+        uint32_t nc = *cap ? *cap * 2 : 64;
+        uint32_t *nv = realloc(*vec, nc * sizeof(uint32_t));
+        if (!nv) return;
+        *vec = nv; *cap = nc;
+    }
+    (*vec)[(*count)++] = idx;
+}
+
 /* =========================================================================
  * Slot key helpers (addr[20] + slot_be[32] = 52 bytes)
  * ========================================================================= */
@@ -220,12 +230,17 @@ struct state {
     uint32_t  resource_count;
     uint32_t  resource_cap;
 
-    /* Phantom tracking: indices of accounts created by ensure_account
-     * that may not get EXISTED (e.g. add_balance(0) touch targets).
-     * Checked at compute_root time — O(phantoms) instead of O(all_accounts). */
-    uint32_t *phantoms;
+    /* Dead account tracking — three categories, kept separate.
+     * All checked/cleaned at compute_root and compaction time. */
+    uint32_t *phantoms;          /* ensure_account touches that never got EXISTED */
     uint32_t  phantom_count;
     uint32_t  phantom_cap;
+    uint32_t *destructed;        /* self-destructed in commit_tx */
+    uint32_t  destructed_count;
+    uint32_t  destructed_cap;
+    uint32_t *pruned;            /* EIP-161 empty accounts pruned in commit_tx */
+    uint32_t  pruned_count;
+    uint32_t  pruned_cap;
 
     /* Block state */
     uint64_t current_block;
@@ -303,13 +318,7 @@ static account_t *ensure_account(state_t *s, const address_t *addr) {
     mem_art_insert(&s->acct_index, addr_hash.bytes, 32, &idx, sizeof(idx));
 
     /* Track as potential phantom — will be checked at compute_root */
-    if (s->phantom_count >= s->phantom_cap) {
-        uint32_t nc = s->phantom_cap ? s->phantom_cap * 2 : 64;
-        uint32_t *np = realloc(s->phantoms, nc * sizeof(uint32_t));
-        if (np) { s->phantoms = np; s->phantom_cap = nc; }
-    }
-    if (s->phantom_count < s->phantom_cap)
-        s->phantoms[s->phantom_count++] = idx;
+    dead_vec_push(&s->phantoms, &s->phantom_count, &s->phantom_cap, idx);
 
     return a;
 }
@@ -487,6 +496,8 @@ void state_destroy(state_t *s) {
     free(s->accounts);
     free(s->resource_list);
     free(s->phantoms);
+    free(s->destructed);
+    free(s->pruned);
 
     if (s->acct_trie_mpt) art_mpt_destroy(s->acct_trie_mpt);
     mem_art_destroy(&s->acct_index);
@@ -1056,6 +1067,8 @@ void state_commit_tx(state_t *s) {
                 destroy_resource_storage(r);
             }
             mark_blk_dirty(s, a);
+            dead_vec_push(&s->destructed, &s->destructed_count, &s->destructed_cap,
+                         (uint32_t)(a - s->accounts));
             continue;
         }
 
@@ -1068,6 +1081,8 @@ void state_commit_tx(state_t *s) {
         if (s->prune_empty && empty &&
             acct_has_flag(a, ACCT_DIRTY | ACCT_CODE_DIRTY)) {
             acct_clear_flag(a, ACCT_EXISTED);
+            dead_vec_push(&s->pruned, &s->pruned_count, &s->pruned_cap,
+                         (uint32_t)(a - s->accounts));
             mark_blk_dirty(s, a);
         }
 
@@ -1208,23 +1223,37 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
         }
     }
 
-    /* Step 2b: Remove phantom accounts from acct_index.
-     * Only iterates accounts tracked as potential phantoms — O(phantoms)
-     * instead of O(all_accounts). */
-    for (uint32_t pi = 0; pi < s->phantom_count; pi++) {
-        uint32_t i = s->phantoms[pi];
-        if (i >= s->count) continue;
-        account_t *a = &s->accounts[i];
-        if (acct_has_flag(a, ACCT_EXISTED) && !(acct_is_empty(a) && prune_empty))
-            continue; /* became real — keep */
-        hash_t h = hash_keccak256(a->addr.bytes, 20);
-        /* Only delete if acct_index points to THIS entry (not a newer duplicate) */
-        const uint32_t *pidx = (const uint32_t *)
-            mem_art_get(&s->acct_index, h.bytes, 32, NULL);
-        if (pidx && *pidx == i)
-            mem_art_delete(&s->acct_index, h.bytes, 32);
-    }
+    /* Step 2b: Remove dead accounts from acct_index.
+     * Three tracked categories — O(dead) instead of O(all_accounts). */
+
+    /* Helper: safe delete from acct_index (checks idx matches to avoid
+     * deleting a live duplicate at the same address) */
+    #define SAFE_DELETE_IDX(i) do { \
+        if ((i) < s->count) { \
+            account_t *_a = &s->accounts[(i)]; \
+            if (!acct_has_flag(_a, ACCT_EXISTED) || \
+                (acct_is_empty(_a) && prune_empty)) { \
+                hash_t _h = hash_keccak256(_a->addr.bytes, 20); \
+                const uint32_t *_p = (const uint32_t *) \
+                    mem_art_get(&s->acct_index, _h.bytes, 32, NULL); \
+                if (_p && *_p == (i)) \
+                    mem_art_delete(&s->acct_index, _h.bytes, 32); \
+            } \
+        } \
+    } while(0)
+
+    for (uint32_t pi = 0; pi < s->phantom_count; pi++)
+        SAFE_DELETE_IDX(s->phantoms[pi]);
+    for (uint32_t di = 0; di < s->destructed_count; di++)
+        SAFE_DELETE_IDX(s->destructed[di]);
+    for (uint32_t ri = 0; ri < s->pruned_count; ri++)
+        SAFE_DELETE_IDX(s->pruned[ri]);
+
     s->phantom_count = 0;
+    s->destructed_count = 0;
+    s->pruned_count = 0;
+
+    #undef SAFE_DELETE_IDX
 
     /* Step 3: Compute account trie root */
     art_mpt_root_hash(s->acct_trie_mpt, root.bytes);
@@ -1340,8 +1369,10 @@ void state_compact(state_t *s) {
     if (s->acct_trie_mpt)
         art_mpt_invalidate_all(s->acct_trie_mpt);
 
-    /* Clear phantom tracking */
+    /* Clear dead account tracking */
     s->phantom_count = 0;
+    s->destructed_count = 0;
+    s->pruned_count = 0;
 }
 
 bool state_load(state_t *s, const char *path) {
