@@ -1177,6 +1177,8 @@ state_stats_t state_get_stats(const state_t *s) {
                       (size_t)s->res_count * sizeof(resource_t);
     st.arena_used = s->acct_index.arena_used;
     st.arena_cap = s->acct_index.arena_cap;
+    st.mpt_cache_bytes = art_mpt_cache_bytes(s->acct_trie_mpt);
+    st.mpt_cache_cap = art_mpt_cache_cap(s->acct_trie_mpt);
     return st;
 }
 

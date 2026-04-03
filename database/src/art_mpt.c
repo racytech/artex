@@ -476,6 +476,15 @@ void art_mpt_set_no_cache(art_mpt_t *am, bool disable) {
     if (am) am->no_cache = disable;
 }
 
+size_t art_mpt_cache_bytes(const art_mpt_t *am) {
+    if (!am) return 0;
+    return am->cache_cap * sizeof(hash_entry_t);
+}
+
+size_t art_mpt_cache_cap(const art_mpt_t *am) {
+    return am ? am->cache_cap : 0;
+}
+
 art_mpt_t *art_mpt_create(compact_art_t *tree,
                             art_mpt_value_encode_t encode, void *ctx) {
     if (!tree) return NULL;

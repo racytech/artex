@@ -300,6 +300,8 @@ evm_state_stats_t evm_state_get_stats(const evm_state_t *es) {
     st.cache_arena_bytes = ss.memory_used;
     st.flat_acct_count = ss.arena_used;   /* repurpose: arena_used */
     st.flat_acct_mem = ss.arena_cap;      /* repurpose: arena_cap */
+    st.flat_stor_count = ss.mpt_cache_cap; /* repurpose: mpt cache entries */
+    st.flat_stor_mem = ss.mpt_cache_bytes; /* repurpose: mpt cache bytes */
     return st;
 }
 

@@ -59,6 +59,10 @@ void art_mpt_destroy(art_mpt_t *am);
  *  exceeds the benefit. Cache array is never allocated. */
 void art_mpt_set_no_cache(art_mpt_t *am, bool disable);
 
+/** Get hash cache memory usage (entries × sizeof(hash_entry_t)). */
+size_t art_mpt_cache_bytes(const art_mpt_t *am);
+size_t art_mpt_cache_cap(const art_mpt_t *am);
+
 /**
  * Insert or update a key in the underlying compact_art, then mark
  * the path from root to key as dirty (invalidate cached hashes).

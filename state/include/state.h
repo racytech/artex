@@ -148,6 +148,8 @@ typedef struct {
     size_t   memory_used;            /* approximate RSS contribution */
     size_t   arena_used;             /* acct_index arena bytes in use */
     size_t   arena_cap;              /* acct_index arena capacity */
+    size_t   mpt_cache_bytes;        /* acct_index art_mpt hash cache size */
+    size_t   mpt_cache_cap;          /* acct_index art_mpt hash cache entries */
 } state_stats_t;
 
 state_stats_t state_get_stats(const state_t *s);

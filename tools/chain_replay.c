@@ -1198,14 +1198,17 @@ int main(int argc, char **argv) {
                        tps, mgps, bps, win_secs,
                        remaining / 1000);
 
-                /* arena stats are repurposed: flat_acct_count=arena_used, flat_acct_mem=arena_cap */
+                /* repurposed stats: flat_acct_count=arena_used, flat_acct_mem=arena_cap,
+                 * flat_stor_count=mpt_cache_cap, flat_stor_mem=mpt_cache_bytes */
                 size_t arena_used_mb = ss.flat_acct_count / (1024*1024);
                 size_t arena_cap_mb = ss.flat_acct_mem / (1024*1024);
+                size_t mpt_cache_mb = ss.flat_stor_mem / (1024*1024);
                 size_t vec_mb = ss.cache_accounts * 80 / (1024*1024);
 
-                printf("  └ state: %zuK accts, %zuK stor | vec=%zuMB  arena=%zu/%zuMB  RSS %zuMB\n",
+                printf("  └ state: %zuK accts, %zuK stor | vec=%zuMB  arena=%zu/%zuMB  mpt_cache=%zuMB (%zuK entries)  RSS %zuMB\n",
                        ss.cache_accounts / 1000, ss.cache_slots / 1000,
-                       vec_mb, arena_used_mb, arena_cap_mb, rss_mb);
+                       vec_mb, arena_used_mb, arena_cap_mb,
+                       mpt_cache_mb, ss.flat_stor_count / 1000, rss_mb);
                 {
                     double other_ms = win_secs * 1000.0 - ss.exec_ms;
                     printf("  └ exec=%.0fms  other=%.0fms\n",
