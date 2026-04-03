@@ -20,7 +20,7 @@
 #define MI_NODE_48   3
 #define MI_NODE_256  4
 
-#define MI_MAX_PREFIX    20
+#define MI_MAX_PREFIX    8
 #define MI_NODE48_EMPTY  255
 #define MI_NODE_FLAG_DIRTY 0x01
 

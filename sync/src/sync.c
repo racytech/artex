@@ -14,6 +14,7 @@
 #include "sync.h"
 #include "evm.h"
 #include "evm_state.h"
+#include "state.h"
 #include "block_executor.h"
 #include "code_store.h"
 #ifdef ENABLE_HISTORY
@@ -401,9 +402,23 @@ bool sync_execute_block(sync_t *sync,
         }
     }
 
-    /* LRU eviction — less frequent than stats (scanning all accounts is expensive) */
-    if (bn % 4096 == 0)
-        evm_state_evict_cache(sync->state);
+    /* Compaction — reclaim dead arena space and remove phantom accounts */
+    if (bn % 1024 == 0) {
+        state_t *st = evm_state_get_state(sync->state);
+        if (st) {
+            state_stats_t pre = state_get_stats(st);
+            struct timespec _c0, _c1;
+            clock_gettime(CLOCK_MONOTONIC, &_c0);
+            state_compact(st);
+            clock_gettime(CLOCK_MONOTONIC, &_c1);
+            state_stats_t post = state_get_stats(st);
+            double ms = (_c1.tv_sec - _c0.tv_sec) * 1000.0 +
+                        (_c1.tv_nsec - _c0.tv_nsec) / 1e6;
+            fprintf(stderr, "  compact: %u→%u accts, %.0fMB→%.0fMB, %.0fms\n",
+                    pre.account_count, post.account_count,
+                    pre.memory_used / 1e6, post.memory_used / 1e6, ms);
+        }
+    }
 
     block_result_free(&br);
     return true;

@@ -358,4 +358,8 @@ void evm_state_apply_diff_bulk(evm_state_t *es, const struct block_diff_t *out);
 void evm_state_dump_debug(evm_state_t *es, const char *dir);
 #endif
 
+/** Get internal state_t pointer (for compaction, testing). */
+typedef struct state state_t;
+state_t *evm_state_get_state(evm_state_t *es);
+
 #endif // EVM_STATE_H
