@@ -880,20 +880,20 @@ void state_revert(state_t *s, uint32_t snap) {
         case JE_NONCE:
             if (a) {
                 a->nonce = je->data.nonce.val;
-                /* RIPEMD: keep dirty flags so EIP-161 can prune after OOG revert */
-                if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0)
-                    a->flags = je->data.nonce.flags | (a->flags & (ACCT_DIRTY | ACCT_BLOCK_DIRTY | ACCT_MPT_DIRTY));
-                else
-                    a->flags = je->data.nonce.flags;
+                /* Restore flags but preserve MPT_DIRTY — once the trie path
+                 * is dirtied by mark_blk_dirty, the mem_art nodes stay dirty
+                 * regardless of data revert. Also preserves BLOCK_DIRTY which
+                 * matches geth's behavior (block_dirty survives tx boundaries).
+                 * This implicitly handles the RIPEMD EIP-161 special case. */
+                a->flags = je->data.nonce.flags |
+                           (a->flags & (ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY));
             }
             break;
         case JE_BALANCE:
             if (a) {
                 a->balance = je->data.balance.val;
-                if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0)
-                    a->flags = je->data.balance.flags | (a->flags & (ACCT_DIRTY | ACCT_BLOCK_DIRTY | ACCT_MPT_DIRTY));
-                else
-                    a->flags = je->data.balance.flags;
+                a->flags = je->data.balance.flags |
+                           (a->flags & (ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY));
             }
             break;
         case JE_CODE:
