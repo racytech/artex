@@ -1274,6 +1274,62 @@ void state_compact(state_t *s) {
     s->count = new_count;
     s->capacity = new_cap;
 
+    /* Free resources for pruned accounts (no longer in new vector).
+     * Build a set of live resource indices from the new vector. */
+    {
+        bool *res_live = calloc(s->res_capacity, sizeof(bool));
+        if (res_live) {
+            for (uint32_t i = 0; i < new_count; i++) {
+                if (new_accts[i].resource_idx)
+                    res_live[new_accts[i].resource_idx] = true;
+            }
+            for (uint32_t i = 1; i < s->res_count; i++) {
+                if (!res_live[i]) {
+                    resource_t *r = &s->resources[i];
+                    free(r->code);
+                    destroy_resource_storage(r);
+                    memset(r, 0, sizeof(*r));
+                }
+            }
+            free(res_live);
+        }
+    }
+
+    /* Compact storage mem_arts — rebuild arenas for accounts with storage.
+     * Eliminates dead leaves from SSTORE overwrites and deletes. */
+    for (uint32_t i = 0; i < s->res_count; i++) {
+        resource_t *r = &s->resources[i];
+        if (!r->storage || mem_art_size(r->storage) == 0) continue;
+
+        /* Rebuild: iterate old, insert into new */
+        mem_art_t *old = r->storage;
+        mem_art_t *fresh = calloc(1, sizeof(mem_art_t));
+        if (!fresh) continue;
+        if (!mem_art_init_cap(fresh, STOR_INIT_CAP)) { free(fresh); continue; }
+
+        mem_art_iterator_t *it = mem_art_iterator_create(old);
+        if (it) {
+            while (mem_art_iterator_next(it)) {
+                size_t klen, vlen;
+                const uint8_t *ik = mem_art_iterator_key(it, &klen);
+                const void *iv = mem_art_iterator_value(it, &vlen);
+                mem_art_insert(fresh, ik, klen, iv, vlen);
+            }
+            free(it);
+        }
+
+        /* Swap */
+        mem_art_destroy(old);
+        *old = *fresh;
+        free(fresh);
+
+        /* Rebuild storage art_mpt wrapper */
+        if (r->storage_ctx)
+            r->storage_ctx->tree = r->storage;
+        if (r->storage_mpt)
+            art_mpt_invalidate_all(r->storage_mpt);
+    }
+
     /* Rebuild art_mpt context (acct_trie_ctx.tree still points to s->acct_index) */
     if (s->acct_trie_mpt)
         art_mpt_invalidate_all(s->acct_trie_mpt);
