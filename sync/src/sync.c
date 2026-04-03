@@ -402,21 +402,23 @@ bool sync_execute_block(sync_t *sync,
         }
     }
 
-    /* Compaction — reclaim dead arena space and remove phantom accounts.
-     * - Block 2,800,000: forced compaction (flush DoS phantom accumulation)
-     * - After that: compact when arena waste exceeds 50% */
+    /* Compaction — reclaim dead arena space, phantom accounts, and caches.
+     * Threshold-based: compact when phantom+dead accumulation is significant
+     * or arena waste exceeds 50%. Check every 256 blocks. */
     {
         state_t *st = evm_state_get_state(sync->state);
         bool do_compact = false;
 
-        if (bn == 2800000) {
-            do_compact = true;  /* forced post-DoS cleanup */
-        } else if (bn > 2800000 && bn % 256 == 0 && st) {
+        if (bn % 256 == 0 && st) {
             state_stats_t ss = state_get_stats(st);
-            /* Estimate live arena: count * ~60 bytes per entry (leaf + inner node share) */
+            /* Compact if arena waste > 50% */
             size_t est_live = (size_t)ss.account_count * 60;
             if (ss.arena_cap > 0 && est_live < ss.arena_cap / 2)
-                do_compact = true;  /* >50% waste */
+                do_compact = true;
+            /* Compact if too many dead accounts accumulated (>10K or >10% of total) */
+            uint32_t dead = state_dead_count(st);
+            if (dead > 10000 || (ss.account_count > 0 && dead > ss.account_count / 10))
+                do_compact = true;
         }
 
         if (do_compact && st) {

@@ -1277,6 +1277,11 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
     return root;
 }
 
+uint32_t state_dead_count(const state_t *s) {
+    if (!s) return 0;
+    return s->phantom_count + s->destructed_count + s->pruned_count;
+}
+
 void state_compact(state_t *s) {
     if (!s) return;
 
