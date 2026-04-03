@@ -147,12 +147,15 @@ void state_compact(state_t *s);
 
 typedef struct {
     uint32_t account_count;
-    uint32_t storage_account_count;  /* accounts with storage mem_art */
-    size_t   memory_used;            /* approximate RSS contribution */
-    size_t   arena_used;             /* acct_index arena bytes in use */
-    size_t   arena_cap;              /* acct_index arena capacity */
-    size_t   mpt_cache_bytes;        /* acct_index art_mpt hash cache size */
-    size_t   mpt_cache_cap;          /* acct_index art_mpt hash cache entries */
+    uint32_t storage_account_count;
+    /* Memory breakdown */
+    size_t   acct_vec_bytes;         /* accounts vector: count * 80 */
+    size_t   res_vec_bytes;          /* resource vector: res_count * 104 */
+    size_t   acct_arena_bytes;       /* acct_index mem_art arena capacity */
+    size_t   acct_cache_bytes;       /* acct_index art_mpt hash cache */
+    size_t   stor_arena_bytes;       /* all storage mem_art arenas total */
+    size_t   stor_cache_bytes;       /* all storage art_mpt caches total */
+    size_t   total_tracked;          /* sum of above */
 } state_stats_t;
 
 state_stats_t state_get_stats(const state_t *s);

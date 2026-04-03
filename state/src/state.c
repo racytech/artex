@@ -1173,14 +1173,25 @@ state_stats_t state_get_stats(const state_t *s) {
     if (!s) return st;
     st.account_count = s->count;
     st.storage_account_count = s->resource_count;
-    /* Rough memory estimate */
-    st.memory_used = (size_t)s->count * sizeof(account_t) +
-                      s->acct_index.arena_cap +
-                      (size_t)s->res_count * sizeof(resource_t);
-    st.arena_used = s->acct_index.arena_used;
-    st.arena_cap = s->acct_index.arena_cap;
-    st.mpt_cache_bytes = art_mpt_cache_bytes(s->acct_trie_mpt);
-    st.mpt_cache_cap = art_mpt_cache_cap(s->acct_trie_mpt);
+
+    st.acct_vec_bytes = (size_t)s->count * sizeof(account_t);
+    st.res_vec_bytes = (size_t)s->res_count * sizeof(resource_t);
+    st.acct_arena_bytes = s->acct_index.arena_cap;
+    st.acct_cache_bytes = art_mpt_cache_bytes(s->acct_trie_mpt);
+
+    /* Sum storage arenas + caches across all resource entries */
+    size_t stor_arena = 0, stor_cache = 0;
+    for (uint32_t i = 1; i < s->res_count; i++) {
+        resource_t *r = &s->resources[i];
+        if (r->storage) stor_arena += r->storage->arena_cap;
+        if (r->storage_mpt) stor_cache += art_mpt_cache_bytes(r->storage_mpt);
+    }
+    st.stor_arena_bytes = stor_arena;
+    st.stor_cache_bytes = stor_cache;
+
+    st.total_tracked = st.acct_vec_bytes + st.res_vec_bytes +
+                       st.acct_arena_bytes + st.acct_cache_bytes +
+                       st.stor_arena_bytes + st.stor_cache_bytes;
     return st;
 }
 

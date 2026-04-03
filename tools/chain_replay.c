@@ -9,6 +9,7 @@
 
 #include "sync.h"
 #include "evm_state.h"
+#include "state.h"
 #include "era1.h"
 #include "block.h"
 #include "hash.h"
@@ -1198,17 +1199,20 @@ int main(int argc, char **argv) {
                        tps, mgps, bps, win_secs,
                        remaining / 1000);
 
-                /* repurposed stats: flat_acct_count=arena_used, flat_acct_mem=arena_cap,
-                 * flat_stor_count=mpt_cache_cap, flat_stor_mem=mpt_cache_bytes */
-                size_t arena_used_mb = ss.flat_acct_count / (1024*1024);
-                size_t arena_cap_mb = ss.flat_acct_mem / (1024*1024);
-                size_t mpt_cache_mb = ss.flat_stor_mem / (1024*1024);
-                size_t vec_mb = ss.cache_accounts * 80 / (1024*1024);
+                /* Get detailed memory breakdown directly from state */
+                state_t *_st = evm_state_get_state(sync_get_state(sync));
+                state_stats_t ms = _st ? state_get_stats(_st) : (state_stats_t){0};
 
-                printf("  └ state: %zuK accts, %zuK stor | vec=%zuMB  arena=%zu/%zuMB  mpt_cache=%zuMB (%zuK entries)  RSS %zuMB\n",
-                       ss.cache_accounts / 1000, ss.cache_slots / 1000,
-                       vec_mb, arena_used_mb, arena_cap_mb,
-                       mpt_cache_mb, ss.flat_stor_count / 1000, rss_mb);
+                printf("  └ %zuK accts %zuK stor | vec=%zuMB res=%zuMB idx=%zuMB icache=%zuMB stor=%zuMB scache=%zuMB | tracked=%zuMB RSS=%zuMB\n",
+                       ms.account_count / 1000, ms.storage_account_count / 1000,
+                       ms.acct_vec_bytes / (1024*1024),
+                       ms.res_vec_bytes / (1024*1024),
+                       ms.acct_arena_bytes / (1024*1024),
+                       ms.acct_cache_bytes / (1024*1024),
+                       ms.stor_arena_bytes / (1024*1024),
+                       ms.stor_cache_bytes / (1024*1024),
+                       ms.total_tracked / (1024*1024),
+                       rss_mb);
                 {
                     double other_ms = win_secs * 1000.0 - ss.exec_ms;
                     printf("  └ exec=%.0fms  other=%.0fms\n",

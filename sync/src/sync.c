@@ -420,7 +420,7 @@ bool sync_execute_block(sync_t *sync,
         if (do_compact && st) {
             state_stats_t pre = state_get_stats(st);
             fprintf(stderr, "  starting state compaction at block %lu (%u accts, %.0fMB arena)...\n",
-                    bn, pre.account_count, pre.arena_cap / 1e6);
+                    bn, pre.account_count, pre.acct_arena_bytes / 1e6);
             bool prune = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
             hash_t root_before = evm_state_compute_mpt_root(sync->state, prune);
 
@@ -439,7 +439,7 @@ bool sync_execute_block(sync_t *sync,
 
             fprintf(stderr, "  compact @%lu: %u→%u accts, %.0fMB→%.0fMB arena, %.0fms\n",
                     bn, pre.account_count, post.account_count,
-                    pre.arena_cap / 1e6, post.arena_cap / 1e6, ms);
+                    pre.total_tracked / 1e6, post.total_tracked / 1e6, ms);
         }
     }
 
