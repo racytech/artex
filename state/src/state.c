@@ -1172,6 +1172,8 @@ state_stats_t state_get_stats(const state_t *s) {
     st.memory_used = (size_t)s->count * sizeof(account_t) +
                       s->acct_index.arena_cap +
                       (size_t)s->res_count * sizeof(resource_t);
+    st.arena_used = s->acct_index.arena_used;
+    st.arena_cap = s->acct_index.arena_cap;
     return st;
 }
 

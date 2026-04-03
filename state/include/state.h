@@ -146,6 +146,8 @@ typedef struct {
     uint32_t account_count;
     uint32_t storage_account_count;  /* accounts with storage mem_art */
     size_t   memory_used;            /* approximate RSS contribution */
+    size_t   arena_used;             /* acct_index arena bytes in use */
+    size_t   arena_cap;              /* acct_index arena capacity */
 } state_stats_t;
 
 state_stats_t state_get_stats(const state_t *s);

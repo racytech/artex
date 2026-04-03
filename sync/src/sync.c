@@ -402,11 +402,24 @@ bool sync_execute_block(sync_t *sync,
         }
     }
 
-    /* Compaction — reclaim dead arena space and remove phantom accounts */
-    if (bn % 1024 == 0) {
+    /* Compaction — reclaim dead arena space and remove phantom accounts.
+     * - Block 2,800,000: forced compaction (flush DoS phantom accumulation)
+     * - After that: compact when arena waste exceeds 50% */
+    {
         state_t *st = evm_state_get_state(sync->state);
-        if (st) {
-            /* Save pre-compaction root for verification */
+        bool do_compact = false;
+
+        if (bn == 2800000) {
+            do_compact = true;  /* forced post-DoS cleanup */
+        } else if (bn > 2800000 && bn % 256 == 0 && st) {
+            state_stats_t ss = state_get_stats(st);
+            /* Estimate live arena: count * ~60 bytes per entry (leaf + inner node share) */
+            size_t est_live = (size_t)ss.account_count * 60;
+            if (ss.arena_cap > 0 && est_live < ss.arena_cap / 2)
+                do_compact = true;  /* >50% waste */
+        }
+
+        if (do_compact && st) {
             bool prune = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
             hash_t root_before = evm_state_compute_mpt_root(sync->state, prune);
 
@@ -419,15 +432,14 @@ bool sync_execute_block(sync_t *sync,
             double ms = (_c1.tv_sec - _c0.tv_sec) * 1000.0 +
                         (_c1.tv_nsec - _c0.tv_nsec) / 1e6;
 
-            /* Re-verify root after compaction */
             hash_t root_after = evm_state_compute_mpt_root(sync->state, prune);
             if (memcmp(root_before.bytes, root_after.bytes, 32) != 0) {
                 fprintf(stderr, "FATAL: root mismatch after compaction at block %lu!\n", bn);
             }
 
-            fprintf(stderr, "  compact: %u→%u accts, %.0fMB→%.0fMB, %.0fms\n",
-                    pre.account_count, post.account_count,
-                    pre.memory_used / 1e6, post.memory_used / 1e6, ms);
+            fprintf(stderr, "  compact @%lu: %u→%u accts, %.0fMB→%.0fMB arena, %.0fms\n",
+                    bn, pre.account_count, post.account_count,
+                    pre.arena_cap / 1e6, post.arena_cap / 1e6, ms);
         }
     }
 
