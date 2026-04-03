@@ -420,10 +420,12 @@ bool sync_execute_block(sync_t *sync,
         }
 
         if (do_compact && st) {
+            state_stats_t pre = state_get_stats(st);
+            fprintf(stderr, "  starting state compaction at block %lu (%u accts, %.0fMB arena)...\n",
+                    bn, pre.account_count, pre.arena_cap / 1e6);
             bool prune = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
             hash_t root_before = evm_state_compute_mpt_root(sync->state, prune);
 
-            state_stats_t pre = state_get_stats(st);
             struct timespec _c0, _c1;
             clock_gettime(CLOCK_MONOTONIC, &_c0);
             state_compact(st);
