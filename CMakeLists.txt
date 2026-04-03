@@ -52,13 +52,6 @@ add_library(art_database STATIC
 # Disk Table (mmap-backed hash table optimized for pre-hashed keys)
 add_library(disk_table STATIC database/src/disk_table.c)
 
-# Arena (bump allocator for per-account storage)
-add_library(arena STATIC database/src/arena.c)
-target_include_directories(arena PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-
-# Compact ART (used by art_mpt for backward-compatible wrapper)
-add_library(compact_art STATIC database/src/compact_art.c)
-
 # Code Store (content-addressed, append-only, deduplicated)
 add_library(code_store STATIC
     database/src/code_store.c
@@ -93,17 +86,9 @@ set_target_properties(blst PROPERTIES
     IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/third_party/blst/libblst.a
 )
 
-# ART→MPT (compute MPT hashes from compact_art structure)
+# mem_mpt (batch MPT root computation)
 add_library(mem_mpt STATIC database/src/mem_mpt.c)
 target_link_libraries(mem_mpt common)
-
-add_library(art_mpt STATIC
-    database/src/art_mpt.c
-    database/src/art_iface_compact.c
-    database/src/art_iface_mem.c
-)
-target_include_directories(art_mpt PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
-target_link_libraries(art_mpt compact_art art_database common)
 
 
 #==============================================================================
@@ -126,7 +111,7 @@ target_include_directories(state PUBLIC
     ${CMAKE_SOURCE_DIR}/database/include
     ${CMAKE_SOURCE_DIR}/evm/include
 )
-target_link_libraries(state art_database art_mpt hashed_art code_store common)
+target_link_libraries(state art_database hashed_art code_store common)
 
 # EVM (Ethereum Virtual Machine)
 add_library(evm STATIC
@@ -340,20 +325,9 @@ add_executable(test_state_compaction state/tests/test_state_compaction.c)
 target_link_libraries(test_state_compaction state evm)
 target_include_directories(test_state_compaction PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
 
-add_executable(test_art_mpt_incremental state/tests/test_art_mpt_incremental.c)
-target_link_libraries(test_art_mpt_incremental art_mpt art_database mem_mpt common)
-
 add_executable(test_state_dup1 state/tests/test_state_dup1.c)
 target_link_libraries(test_state_dup1 evm)
 target_include_directories(test_state_dup1 PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
-
-add_executable(test_art_mpt_fuzz database/tests/test_art_mpt_fuzz.c)
-target_link_libraries(test_art_mpt_fuzz art_mpt compact_art arena common)
-add_test(NAME test_art_mpt_fuzz COMMAND test_art_mpt_fuzz)
-
-add_executable(test_art_mpt_mem database/tests/test_art_mpt_mem.c)
-target_link_libraries(test_art_mpt_mem art_mpt compact_art art_database common)
-add_test(NAME test_art_mpt_mem COMMAND test_art_mpt_mem)
 
 # Shared library for Python mpt_fuzz.py differential fuzzing
 add_library(mpt_fuzz SHARED tools/mpt_fuzz_lib.c)
@@ -361,16 +335,7 @@ target_include_directories(mpt_fuzz PRIVATE
     ${CMAKE_SOURCE_DIR}/database/include
     ${CMAKE_SOURCE_DIR}/common/include
 )
-target_link_libraries(mpt_fuzz art_mpt compact_art art_database mem_mpt arena hashed_art common)
-
-
-# Test: ART→MPT cross-validation against Python reference vectors
-add_executable(test_art_mpt_vectors database/tests/test_art_mpt_vectors.c)
-target_link_libraries(test_art_mpt_vectors art_mpt compact_art common)
-add_test(NAME test_art_mpt_vectors
-    COMMAND test_art_mpt_vectors
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-)
+target_link_libraries(mpt_fuzz mem_mpt hashed_art common)
 
 #==============================================================================
 # Tests — Networking

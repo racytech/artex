@@ -3,7 +3,7 @@
  *
  * Flat vector of accounts indexed by mem_art. No disk on hot path.
  * Journal for snapshot/revert. Per-account mem_art for storage.
- * Account trie (compact_art + art_mpt) for MPT root computation.
+ * Account trie (hart) for MPT root computation.
  */
 
 #include "state.h"

@@ -119,7 +119,7 @@ int main(int argc, char **argv) {
     print_hash("root", &root_before);
     printf("  accounts: %u (in vector)\n", stats_before.account_count);
     printf("  storage:  %u\n", stats_before.storage_account_count);
-    printf("  memory:   %.1f MB\n", stats_before.memory_used / 1e6);
+    printf("  memory:   %.1f MB\n", (double)stats_before.total_tracked / 1e6);
 
     /* Phase 4: Compact */
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -139,7 +139,7 @@ int main(int argc, char **argv) {
     print_hash("root", &root_after);
     printf("  accounts: %u (in vector)\n", stats_after.account_count);
     printf("  storage:  %u\n", stats_after.storage_account_count);
-    printf("  memory:   %.1f MB\n", stats_after.memory_used / 1e6);
+    printf("  memory:   %.1f MB\n", (double)stats_after.total_tracked / 1e6);
 
     int match = memcmp(root_before.bytes, root_after.bytes, 32) == 0;
     printf("\nRoots match: %s\n", match ? "YES" : "NO");
