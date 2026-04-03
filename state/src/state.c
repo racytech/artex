@@ -242,6 +242,9 @@ struct state {
     uint32_t  pruned_count;
     uint32_t  pruned_cap;
 
+    /* Cumulative dead count — grows across blocks, reset by state_compact */
+    uint32_t  dead_total;
+
     /* Block state */
     uint64_t current_block;
     bool     prune_empty;
@@ -1255,6 +1258,7 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
     for (uint32_t ri = 0; ri < s->pruned_count; ri++)
         SAFE_DELETE_IDX(s->pruned[ri]);
 
+    s->dead_total += s->phantom_count + s->destructed_count + s->pruned_count;
     s->phantom_count = 0;
     s->destructed_count = 0;
     s->pruned_count = 0;
@@ -1279,7 +1283,7 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
 
 uint32_t state_dead_count(const state_t *s) {
     if (!s) return 0;
-    return s->phantom_count + s->destructed_count + s->pruned_count;
+    return s->dead_total + s->phantom_count + s->destructed_count + s->pruned_count;
 }
 
 void state_compact(state_t *s) {
@@ -1384,6 +1388,7 @@ void state_compact(state_t *s) {
     s->phantom_count = 0;
     s->destructed_count = 0;
     s->pruned_count = 0;
+    s->dead_total = 0;
 }
 
 bool state_load(state_t *s, const char *path) {
