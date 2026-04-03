@@ -327,6 +327,15 @@ target_link_libraries(hashed_art common)
 add_executable(test_hashed_art database/tests/test_hashed_art.c)
 target_link_libraries(test_hashed_art hashed_art mem_mpt common)
 
+add_executable(test_hart_scale database/tests/test_hart_scale.c)
+target_link_libraries(test_hart_scale hashed_art common)
+
+add_executable(bench_hart_root database/tests/bench_hart_root.c)
+target_link_libraries(bench_hart_root hashed_art common)
+
+add_executable(bench_hart_profile database/tests/bench_hart_profile.c)
+target_link_libraries(bench_hart_profile hashed_art common)
+
 add_executable(test_state_compaction state/tests/test_state_compaction.c)
 target_link_libraries(test_state_compaction state evm)
 target_include_directories(test_state_compaction PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
@@ -352,7 +361,7 @@ target_include_directories(mpt_fuzz PRIVATE
     ${CMAKE_SOURCE_DIR}/database/include
     ${CMAKE_SOURCE_DIR}/common/include
 )
-target_link_libraries(mpt_fuzz art_mpt compact_art art_database mem_mpt arena common)
+target_link_libraries(mpt_fuzz art_mpt compact_art art_database mem_mpt arena hashed_art common)
 
 
 # Test: ART→MPT cross-validation against Python reference vectors

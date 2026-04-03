@@ -13,6 +13,7 @@
 #include "art_iface.h"
 #include "mem_art.h"
 #include "mem_mpt.h"
+#include "hashed_art.h"
 
 /* =========================================================================
  * mem_mpt batch wrapper
@@ -226,5 +227,54 @@ void mem_art_mpt_ctx_delete(mem_art_mpt_ctx_t *ctx, const uint8_t *key) {
 
 bool mem_art_mpt_ctx_root(mem_art_mpt_ctx_t *ctx, uint8_t *out) {
     art_mpt_root_hash(ctx->am, out);
+    return true;
+}
+
+/* =========================================================================
+ * hashed_art wrapper (hart — ART with embedded MPT hash cache)
+ *
+ * Same interface as mem_art_mpt but uses hart_t directly.
+ * Values are stored as raw RLP bytes (up to 256 bytes).
+ * ========================================================================= */
+
+typedef struct {
+    hart_t tree;
+} hart_ctx_t;
+
+static uint32_t hart_encode_val(const uint8_t key[32], const void *leaf_val,
+                                 uint8_t *rlp_out, void *ctx) {
+    (void)key; (void)ctx;
+    memcpy(rlp_out, leaf_val, 32);
+    return 32;
+}
+
+hart_ctx_t *hart_ctx_create(void) {
+    hart_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) return NULL;
+    if (!hart_init(&ctx->tree, 32)) {
+        free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+void hart_ctx_destroy(hart_ctx_t *ctx) {
+    if (!ctx) return;
+    hart_destroy(&ctx->tree);
+    free(ctx);
+}
+
+void hart_ctx_insert(hart_ctx_t *ctx, const uint8_t *key,
+                      const uint8_t *value, size_t value_len) {
+    (void)value_len; /* always 32 */
+    hart_insert(&ctx->tree, key, value);
+}
+
+void hart_ctx_delete(hart_ctx_t *ctx, const uint8_t *key) {
+    hart_delete(&ctx->tree, key);
+}
+
+bool hart_ctx_root(hart_ctx_t *ctx, uint8_t *out) {
+    hart_root_hash(&ctx->tree, hart_encode_val, NULL, out);
     return true;
 }

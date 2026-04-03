@@ -71,6 +71,24 @@ def load_lib(path):
     lib.mem_art_mpt_ctx_root.restype  = ctypes.c_bool
     lib.mem_art_mpt_ctx_root.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 
+    # --- hashed_art (hart) ---
+    lib.hart_ctx_create.restype  = ctypes.c_void_p
+    lib.hart_ctx_create.argtypes = []
+
+    lib.hart_ctx_destroy.restype  = None
+    lib.hart_ctx_destroy.argtypes = [ctypes.c_void_p]
+
+    lib.hart_ctx_insert.restype  = None
+    lib.hart_ctx_insert.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t
+    ]
+
+    lib.hart_ctx_delete.restype  = None
+    lib.hart_ctx_delete.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+    lib.hart_ctx_root.restype  = ctypes.c_bool
+    lib.hart_ctx_root.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
     return lib
 
 
@@ -83,17 +101,16 @@ def random_key():
     return os.urandom(32)
 
 def random_value():
-    """Random value, 1-128 bytes."""
-    n = random.randint(1, 128)
-    return os.urandom(n)
+    """Random 32-byte value (fixed size, matching hart storage slots)."""
+    return os.urandom(32)
 
 # ============================================================================
 # One round
 # ============================================================================
 
-def run_round(lib, rnd, n, state, mart_ctx):
+def run_round(lib, rnd, n, state, mart_ctx, hart_ctx):
     """
-    Insert/update N random keys across both tries.
+    Insert/update N random keys across all three tries.
     On odd rounds, also delete ~10% of existing keys.
     """
     # Generate operations
@@ -141,9 +158,20 @@ def run_round(lib, rnd, n, state, mart_ctx):
     lib.mem_art_mpt_ctx_root(mart_ctx, mart_root)
     mart_root = mart_root.raw
 
+    # --- hashed_art (hart, incremental) ---
+    for k, v in ops:
+        if v is None:
+            lib.hart_ctx_delete(hart_ctx, k)
+        else:
+            lib.hart_ctx_insert(hart_ctx, k, v, len(v))
+    hart_root = ctypes.create_string_buffer(32)
+    lib.hart_ctx_root(hart_ctx, hart_root)
+    hart_root = hart_root.raw
+
     # --- Compare ---
-    match = (py_root == mart_root)
-    return state, py_root, mart_root, match
+    match_mart = (py_root == mart_root)
+    match_hart = (py_root == hart_root)
+    return state, py_root, mart_root, hart_root, match_mart, match_hart
 
 
 # ============================================================================
@@ -171,12 +199,15 @@ def main():
     lib = load_lib(args.lib)
 
     print(f"seed={seed}  n={args.n}")
-    print(f"backends: python(HexaryTrie) vs mem_art_mpt(mem_art)")
+    print(f"backends: python(HexaryTrie) vs mem_art_mpt(mem_art) vs hart")
     print(f"{'round':>6}  {'keys':>6}  {'state':>7}  {'time':>8}  status")
     print("-" * 55)
 
     mart_ctx = lib.mem_art_mpt_ctx_create()
     assert mart_ctx, "mem_art_mpt_ctx_create failed"
+
+    hart_ctx = lib.hart_ctx_create()
+    assert hart_ctx, "hart_ctx_create failed"
 
     state = {}
     rnd = 0
@@ -184,17 +215,19 @@ def main():
     try:
         while True:
             t0 = time.monotonic()
-            state, py, mart, match = run_round(
-                lib, rnd, args.n, state, mart_ctx)
+            state, py, mart, hart, match_mart, match_hart = run_round(
+                lib, rnd, args.n, state, mart_ctx, hart_ctx)
             dt = time.monotonic() - t0
 
+            match = match_mart and match_hart
             status = "OK" if match else "MISMATCH"
             print(f"{rnd:6d}  {args.n:6d}  {len(state):7d}  {dt:7.3f}s  {status}")
 
             if not match:
                 print(f"\n  MISMATCH at round {rnd}!")
                 print(f"  python:      {py.hex()}")
-                print(f"  mem_art_mpt: {mart.hex()}")
+                print(f"  mem_art_mpt: {mart.hex()}  {'OK' if match_mart else 'FAIL'}")
+                print(f"  hart:        {hart.hex()}  {'OK' if match_hart else 'FAIL'}")
                 print(f"  seed={seed}")
                 sys.exit(1)
 
@@ -204,6 +237,7 @@ def main():
         print(f"\nStopped after {rnd} rounds. All matched.")
     finally:
         lib.mem_art_mpt_ctx_destroy(mart_ctx)
+        lib.hart_ctx_destroy(hart_ctx)
 
 
 if __name__ == "__main__":
