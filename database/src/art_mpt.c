@@ -37,9 +37,10 @@ static const uint8_t EMPTY_ROOT[32] = {
  * ========================================================================= */
 
 typedef struct {
-    uint8_t data[32];   /* inline RLP (len < 32) or keccak hash (len == 32) */
-    uint8_t len;        /* 0 = not cached, 1-31 = inline, 32 = hash */
-    uint8_t depth;      /* byte_depth when computed */
+    uint8_t    data[32];  /* inline RLP (len < 32) or keccak hash (len == 32) */
+    art_ref_t  ref;       /* key: the art_ref_t this entry is for */
+    uint8_t    len;       /* 0 = empty slot, 1-31 = inline, 32 = hash */
+    uint8_t    depth;     /* byte_depth when computed */
 } hash_entry_t;
 
 /* =========================================================================
@@ -155,21 +156,26 @@ static size_t encode_child_ref(const uint8_t *child_rlp, size_t child_rlp_len,
 }
 
 /* =========================================================================
- * Hash cache — indexed by ref offset
+ * Hash cache — fixed-size open-addressing hashmap keyed by art_ref_t
+ *
+ * Replaces the old sparse array (indexed by arena offset) which wasted
+ * memory on gaps. Fixed 16K/64K/256K entries depending on tree size.
+ * On collision, overwrites (LRU-like eviction by overwrite).
  * ========================================================================= */
 
-static inline size_t ref_to_idx(art_ref_t ref) {
-    return (size_t)(ref & 0x7FFFFFFFu);
-}
+#define CACHE_INIT_CAP  4096   /* initial capacity (must be power of 2) */
+#define CACHE_MAX_CAP   262144 /* 256K entries × 38 bytes = 10MB max */
 
 static bool cache_get(art_mpt_t *am, art_ref_t ref,
                        size_t byte_depth, uint8_t *out, size_t *out_len) {
     if (ART_IS_LEAF(ref)) return false;
     if (am->iface.is_dirty(am->iface.ctx, ref)) return false;
-    size_t idx = ref_to_idx(ref);
-    if (idx >= am->cache_cap) return false;
-    const hash_entry_t *e = &am->cache[idx];
-    if (e->len == 0) return false;
+    if (!am->cache || am->cache_cap == 0) return false;
+
+    size_t mask = am->cache_cap - 1;
+    size_t slot = (size_t)(ref * 2654435761u) & mask;  /* Knuth multiplicative hash */
+    const hash_entry_t *e = &am->cache[slot];
+    if (e->ref != ref || e->len == 0) return false;
     if (e->depth != (uint8_t)byte_depth) return false;
     memcpy(out, e->data, e->len);
     *out_len = e->len;
@@ -182,18 +188,19 @@ static void cache_put(art_mpt_t *am, art_ref_t ref,
     if (am->no_cache) return;
     if (data_len == 0 || data_len > 32) return;
 
-    size_t idx = ref_to_idx(ref);
-    if (idx >= am->cache_cap) {
-        size_t new_cap = am->cache_cap ? am->cache_cap * 2 : 4096;
-        while (new_cap <= idx) new_cap *= 2;
-        hash_entry_t *p = realloc(am->cache, new_cap * sizeof(hash_entry_t));
-        if (!p) return;
-        memset(p + am->cache_cap, 0, (new_cap - am->cache_cap) * sizeof(hash_entry_t));
-        am->cache = p;
-        am->cache_cap = new_cap;
+    /* Lazy allocate */
+    if (!am->cache) {
+        am->cache_cap = CACHE_INIT_CAP;
+        am->cache = calloc(am->cache_cap, sizeof(hash_entry_t));
+        if (!am->cache) { am->cache_cap = 0; return; }
     }
 
-    hash_entry_t *e = &am->cache[idx];
+    size_t mask = am->cache_cap - 1;
+    size_t slot = (size_t)(ref * 2654435761u) & mask;
+    hash_entry_t *e = &am->cache[slot];
+
+    /* Overwrite — collision evicts old entry */
+    e->ref = ref;
     memcpy(e->data, data, data_len);
     e->len = (uint8_t)data_len;
     e->depth = (uint8_t)byte_depth;
