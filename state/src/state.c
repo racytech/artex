@@ -1195,50 +1195,40 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     hash_t root = {0};
     if (!s) return root;
 
-    /* Step 1: For each dirty account, decide existence + compute storage root */
+    /* Single pass: promote existence, compute storage roots, prune, clear flags.
+     * One find_account (keccak + hart_get) per dirty account instead of three. */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
-        account_t *a = find_account(s, akey);
+        hash_t ah = hash_keccak256(akey, 20);
+        account_t *a = find_account_h(s, &ah);
         if (!a || !acct_has_flag(a, ACCT_MPT_DIRTY)) continue;
 
-        /* Promote non-empty accounts to existed */
+        /* Promote/demote existence */
         if (acct_has_flag(a, ACCT_BLOCK_DIRTY)) {
-            if (acct_has_flag(a, ACCT_SELF_DESTRUCTED)) {
+            if (acct_has_flag(a, ACCT_SELF_DESTRUCTED))
                 acct_clear_flag(a, ACCT_EXISTED);
-            } else if (!acct_is_empty(a)) {
+            else if (!acct_is_empty(a))
                 acct_set_flag(a, ACCT_EXISTED);
-            }
         }
 
         /* Compute storage root if dirty */
-        if (acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
+        if (compute_hash && acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
             resource_t *r = get_resource(s, a);
-            if (r && r->storage) {
+            if (r && r->storage)
                 hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
-            }
         }
 
-    }
-
-    /* Step 2: Update account trie — insert/delete for dirty accounts */
-    for (size_t d = 0; d < s->blk_dirty.count; d++) {
-        const uint8_t *akey = s->blk_dirty.keys + d * 20;
-        account_t *a = find_account(s, akey);
-        if (!a || !acct_has_flag(a, ACCT_MPT_DIRTY)) continue;
-
-        hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
-
+        /* Delete from acct_index if dead/empty */
         if (!acct_has_flag(a, ACCT_EXISTED) ||
-            (acct_is_empty(a) && prune_empty)) {
-            hart_delete(&s->acct_index, addr_hash.bytes);
-        }
+            (acct_is_empty(a) && prune_empty))
+            hart_delete(&s->acct_index, ah.bytes);
+
+        /* Clear flags */
+        acct_clear_flag(a, ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY |
+                        ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
     }
 
-    /* Step 2b: Remove dead accounts from acct_index.
-     * Three tracked categories — O(dead) instead of O(all_accounts). */
-
-    /* Helper: safe delete from acct_index (checks idx matches to avoid
-     * deleting a live duplicate at the same address) */
+    /* Remove dead accounts from acct_index (phantoms, destructed, pruned) */
     #define SAFE_DELETE_IDX(i) do { \
         if ((i) < s->count) { \
             account_t *_a = &s->accounts[(i)]; \
@@ -1267,18 +1257,10 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
 
     #undef SAFE_DELETE_IDX
 
-    /* Step 3: Compute account trie root (skip if compute_hash is false) */
+    /* Compute account trie root */
     if (compute_hash)
         hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
 
-    /* Step 4: Clear dirty flags */
-    for (size_t d = 0; d < s->blk_dirty.count; d++) {
-        const uint8_t *akey = s->blk_dirty.keys + d * 20;
-        account_t *a = find_account(s, akey);
-        if (!a) continue;
-        acct_clear_flag(a, ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY |
-                        ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
-    }
     dirty_clear(&s->blk_dirty);
     s->blk_dirty_cursor = 0;
 
