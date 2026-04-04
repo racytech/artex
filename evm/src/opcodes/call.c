@@ -6,6 +6,7 @@
 
 #include "opcodes/call.h"
 #include "evm_state.h"
+#include "hash.h"
 #include "evm_stack.h"
 #include "evm_memory.h"
 #include "evm_tracer.h"
@@ -366,6 +367,7 @@ static evm_status_t op_call(evm_t *evm)
         .caller = evm->msg.recipient,
         .recipient = target_addr,
         .code_addr = target_addr,
+        .recipient_hash = hash_keccak256(target_addr.bytes, 20),
         .value = value,
         .input_data = call_args,
         .input_size = args_size_u64,
@@ -526,6 +528,7 @@ static evm_status_t op_callcode(evm_t *evm)
         .caller = evm->msg.recipient,
         .recipient = evm->msg.recipient,   // Execute in current contract's context
         .code_addr = target_addr,          // But use target's code
+        .recipient_hash = evm->msg.recipient_hash, // same context
         .value = value,
         .input_data = call_args,
         .input_size = args_size_u64,
@@ -703,6 +706,7 @@ static evm_status_t op_delegatecall(evm_t *evm)
         .caller = evm->msg.caller,         // Preserve original caller
         .recipient = evm->msg.recipient,   // Execute in current contract's context
         .code_addr = target_addr,          // But use target's code
+        .recipient_hash = evm->msg.recipient_hash, // same context
         .value = evm->msg.value,           // Preserve original value
         .input_data = call_args,
         .input_size = args_size_u64,
@@ -867,6 +871,7 @@ static evm_status_t op_staticcall(evm_t *evm)
         .caller = evm->msg.recipient,
         .recipient = target_addr,
         .code_addr = target_addr,
+        .recipient_hash = hash_keccak256(target_addr.bytes, 20),
         .value = UINT256_ZERO,
         .input_data = call_args,
         .input_size = args_size_u64,
