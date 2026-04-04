@@ -68,6 +68,7 @@ bool hart_mark_path_dirty(hart_t *t, const uint8_t key[32]);
 /* Compute MPT root hash. Only rehashes dirty subtrees.
  * Clean subtrees use the hash embedded in the node. */
 void hart_root_hash(hart_t *t, hart_encode_t encode, void *ctx, uint8_t out[32]);
+void hart_root_hash_avx512(hart_t *t, hart_encode_t encode, void *ctx, uint8_t out[32]);
 
 /* Iterator */
 typedef struct hart_iter hart_iter_t;
