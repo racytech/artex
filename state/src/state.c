@@ -1258,8 +1258,17 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     #undef SAFE_DELETE_IDX
 
     /* Compute account trie root */
-    if (compute_hash)
+    if (compute_hash) {
+        /* Recompute any stale storage roots. In no-validate mode,
+         * storage roots may not have been computed for blocks since the
+         * last snapshot. Scan all resources — hart_is_dirty is O(1) per check. */
+        for (uint32_t i = 1; i < s->res_count; i++) {
+            resource_t *r = &s->resources[i];
+            if (r->storage && hart_is_dirty(r->storage))
+                hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
+        }
         hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
+    }
 
     dirty_clear(&s->blk_dirty);
     s->blk_dirty_cursor = 0;

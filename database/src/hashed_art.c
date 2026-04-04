@@ -588,6 +588,11 @@ bool hart_mark_path_dirty(hart_t *t, const uint8_t key[32]) {
     return false;
 }
 
+bool hart_is_dirty(const hart_t *t) {
+    if (!t || t->root == HART_REF_NULL) return false;
+    return is_node_dirty(t, t->root);
+}
+
 /* =========================================================================
  * MPT Root Hash — embedded hash version
  * ========================================================================= */
