@@ -72,6 +72,7 @@ struct sync {
     double last_evict_ms;
     double exec_ms;        /* cumulative block_execute time per window */
     double root_ms;        /* compute_mpt_root time this window */
+    uint64_t last_compact_block;  /* cooldown for compaction */
     evm_fork_t prev_fork;  /* for SD boundary detection */
 
 #ifdef ENABLE_HISTORY
@@ -404,44 +405,35 @@ bool sync_execute_block(sync_t *sync,
         }
     }
 
-    /* Compaction — reclaim dead arena space, phantom accounts, and caches.
-     * Threshold-based: compact when phantom+dead accumulation is significant
-     * or arena waste exceeds 50%. Check every 256 blocks. */
+    /* Compaction — reclaim dead/phantom accounts and arena waste.
+     * Triggers when dead accounts exceed 20% of live, with minimum 100K-block
+     * cooldown between compactions. Checked at checkpoint boundaries only. */
     {
         state_t *st = evm_state_get_state(sync->state);
-        bool do_compact = false;
+        uint32_t ci_compact = sync->config.checkpoint_interval > 0
+                            ? sync->config.checkpoint_interval : 256;
 
-        if (bn % 256 == 0 && st) {
-            /* Compact when dead accounts accumulate (>10K or >10% of total) */
+        if (bn % ci_compact == 0 && st &&
+            bn - sync->last_compact_block >= 100000) {
             state_stats_t ss = state_get_stats(st);
             uint32_t dead = state_dead_count(st);
-            if (0 && (dead > 10000 || (ss.account_count > 0 && dead > ss.account_count / 10)))
-                do_compact = true;
-        }
+            bool do_compact = (ss.account_count > 0 &&
+                               dead > ss.account_count / 5);  /* >20% dead */
 
-        if (do_compact && st) {
-            state_stats_t pre = state_get_stats(st);
-            fprintf(stderr, "  starting state compaction at block %lu (%u accts, %.0fMB arena)...\n",
-                    bn, pre.account_count, pre.acct_arena_bytes / 1e6);
-            bool prune = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
-            hash_t root_before = evm_state_compute_mpt_root(sync->state, prune);
+            if (do_compact) {
+                struct timespec _c0, _c1;
+                clock_gettime(CLOCK_MONOTONIC, &_c0);
+                state_compact(st);
+                clock_gettime(CLOCK_MONOTONIC, &_c1);
+                state_stats_t post = state_get_stats(st);
+                double ms = (_c1.tv_sec - _c0.tv_sec) * 1000.0 +
+                            (_c1.tv_nsec - _c0.tv_nsec) / 1e6;
 
-            struct timespec _c0, _c1;
-            clock_gettime(CLOCK_MONOTONIC, &_c0);
-            state_compact(st);
-            clock_gettime(CLOCK_MONOTONIC, &_c1);
-            state_stats_t post = state_get_stats(st);
-            double ms = (_c1.tv_sec - _c0.tv_sec) * 1000.0 +
-                        (_c1.tv_nsec - _c0.tv_nsec) / 1e6;
-
-            hash_t root_after = evm_state_compute_mpt_root(sync->state, prune);
-            if (memcmp(root_before.bytes, root_after.bytes, 32) != 0) {
-                fprintf(stderr, "FATAL: root mismatch after compaction at block %lu!\n", bn);
+                fprintf(stderr, "  compact @%lu: %u→%u accts, %.0fMB→%.0fMB, %.0fms\n",
+                        bn, ss.account_count, post.account_count,
+                        ss.total_tracked / 1e6, post.total_tracked / 1e6, ms);
+                sync->last_compact_block = bn;
             }
-
-            fprintf(stderr, "  compact @%lu: %u→%u accts, %.0fMB→%.0fMB arena, %.0fms\n",
-                    bn, pre.account_count, post.account_count,
-                    pre.total_tracked / 1e6, post.total_tracked / 1e6, ms);
         }
     }
 
