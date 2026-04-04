@@ -248,14 +248,20 @@ struct state {
  * Internal helpers
  * ========================================================================= */
 
-static account_t *find_account(const state_t *s, const uint8_t addr[20]) {
-    hash_t h = hash_keccak256(addr, 20);
+/* Core lookup — uses pre-computed addr_hash */
+static account_t *find_account_h(const state_t *s, const hash_t *addr_hash) {
     const uint32_t *pidx = (const uint32_t *)
-        hart_get(&((state_t *)s)->acct_index, h.bytes);
+        hart_get(&((state_t *)s)->acct_index, addr_hash->bytes);
     if (!pidx) return NULL;
     uint32_t idx = *pidx;
     if (idx >= s->count) return NULL;
     return &((state_t *)s)->accounts[idx];
+}
+
+/* Convenience — computes hash internally (for callers without pre-computed hash) */
+static account_t *find_account(const state_t *s, const uint8_t addr[20]) {
+    hash_t h = hash_keccak256(addr, 20);
+    return find_account_h(s, &h);
 }
 
 static resource_t *get_resource(const state_t *s, const account_t *a) {
@@ -285,9 +291,10 @@ static resource_t *ensure_resource(state_t *s, account_t *a) {
     return r;
 }
 
-/* Get or create account. Inserts into acct_index (trie) on creation. */
-static account_t *ensure_account(state_t *s, const address_t *addr) {
-    account_t *existing = find_account(s, addr->bytes);
+/* Get or create account — uses pre-computed addr_hash */
+static account_t *ensure_account_h(state_t *s, const address_t *addr,
+                                    const hash_t *addr_hash) {
+    account_t *existing = find_account_h(s, addr_hash);
     if (existing) {
         existing->last_access_block = s->current_block;
         return existing;
@@ -310,9 +317,7 @@ static account_t *ensure_account(state_t *s, const address_t *addr) {
     address_copy(&a->addr, addr);
     a->last_access_block = s->current_block;
 
-    /* Single index: addr_hash[32] → idx (serves both lookup and trie) */
-    hash_t addr_hash = hash_keccak256(addr->bytes, 20);
-    hart_insert(&s->acct_index, addr_hash.bytes, &idx);
+    hart_insert(&s->acct_index, addr_hash->bytes, &idx);
 
     /* Track as potential phantom — will be checked at compute_root */
     dead_vec_push(&s->phantoms, &s->phantom_count, &s->phantom_cap, idx);
@@ -320,6 +325,10 @@ static account_t *ensure_account(state_t *s, const address_t *addr) {
     return a;
 }
 
+static account_t *ensure_account(state_t *s, const address_t *addr) {
+    hash_t h = hash_keccak256(addr->bytes, 20);
+    return ensure_account_h(s, addr, &h);
+}
 
 static bool journal_push(state_t *s, const journal_entry_t *entry) {
     if (s->journal_len >= s->journal_cap) {
@@ -337,15 +346,17 @@ static void mark_tx_dirty(state_t *s, const address_t *addr) {
     dirty_push(&s->tx_dirty, addr->bytes, 20);
 }
 
-static void mark_blk_dirty(state_t *s, account_t *a) {
+static void mark_blk_dirty_h(state_t *s, account_t *a, const hash_t *addr_hash) {
     if (!acct_has_flag(a, ACCT_MPT_DIRTY)) {
         acct_set_flag(a, ACCT_MPT_DIRTY);
         dirty_push(&s->blk_dirty, a->addr.bytes, 20);
-
-        /* Mark acct_index trie path dirty so hart rehashes. */
-        hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
-        hart_mark_path_dirty(&s->acct_index, addr_hash.bytes);
+        hart_mark_path_dirty(&s->acct_index, addr_hash->bytes);
     }
+}
+
+static void mark_blk_dirty(state_t *s, account_t *a) {
+    hash_t h = hash_keccak256(a->addr.bytes, 20);
+    mark_blk_dirty_h(s, a, &h);
 }
 
 static void resource_list_add(state_t *s, uint32_t idx) {
@@ -544,7 +555,8 @@ uint256_t state_get_balance(state_t *s, const address_t *addr) {
 
 void state_set_nonce(state_t *s, const address_t *addr, uint64_t nonce) {
     if (!s || !addr) return;
-    account_t *a = ensure_account(s, addr);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
     journal_entry_t je = { .type = JE_NONCE, .addr = *addr,
@@ -554,12 +566,13 @@ void state_set_nonce(state_t *s, const address_t *addr, uint64_t nonce) {
     a->nonce = nonce;
     acct_set_flag(a, ACCT_DIRTY | ACCT_BLOCK_DIRTY);
     mark_tx_dirty(s, addr);
-    mark_blk_dirty(s, a);
+    mark_blk_dirty_h(s, a, &ah);
 }
 
 void state_set_balance(state_t *s, const address_t *addr, const uint256_t *bal) {
     if (!s || !addr || !bal) return;
-    account_t *a = ensure_account(s, addr);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
     journal_entry_t je = { .type = JE_BALANCE, .addr = *addr,
@@ -569,22 +582,39 @@ void state_set_balance(state_t *s, const address_t *addr, const uint256_t *bal) 
     a->balance = *bal;
     acct_set_flag(a, ACCT_DIRTY | ACCT_BLOCK_DIRTY);
     mark_tx_dirty(s, addr);
-    mark_blk_dirty(s, a);
+    mark_blk_dirty_h(s, a, &ah);
 }
 
 void state_add_balance(state_t *s, const address_t *addr, const uint256_t *amount) {
     if (!s || !addr || !amount) return;
-    uint256_t bal = state_get_balance(s, addr);
-    uint256_t new_bal = uint256_add(&bal, amount);
-    state_set_balance(s, addr, &new_bal);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    account_t *a = ensure_account_h(s, addr, &ah);
+    if (!a) return;
+
+    journal_entry_t je = { .type = JE_BALANCE, .addr = *addr,
+        .data.balance = { .val = a->balance, .flags = a->flags } };
+    journal_push(s, &je);
+
+    a->balance = uint256_add(&a->balance, amount);
+    acct_set_flag(a, ACCT_DIRTY | ACCT_BLOCK_DIRTY);
+    mark_tx_dirty(s, addr);
+    mark_blk_dirty_h(s, a, &ah);
 }
 
 bool state_sub_balance(state_t *s, const address_t *addr, const uint256_t *amount) {
     if (!s || !addr || !amount) return false;
-    uint256_t bal = state_get_balance(s, addr);
-    if (uint256_lt(&bal, amount)) return false;
-    uint256_t new_bal = uint256_sub(&bal, amount);
-    state_set_balance(s, addr, &new_bal);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    account_t *a = find_account_h(s, &ah);
+    if (!a || uint256_lt(&a->balance, amount)) return false;
+
+    journal_entry_t je = { .type = JE_BALANCE, .addr = *addr,
+        .data.balance = { .val = a->balance, .flags = a->flags } };
+    journal_push(s, &je);
+
+    a->balance = uint256_sub(&a->balance, amount);
+    acct_set_flag(a, ACCT_DIRTY | ACCT_BLOCK_DIRTY);
+    mark_tx_dirty(s, addr);
+    mark_blk_dirty_h(s, a, &ah);
     return true;
 }
 
@@ -595,7 +625,8 @@ bool state_sub_balance(state_t *s, const address_t *addr, const uint256_t *amoun
 void state_set_code(state_t *s, const address_t *addr,
                     const uint8_t *code, uint32_t len) {
     if (!s || !addr) return;
-    account_t *a = ensure_account(s, addr);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
     resource_t *r = ensure_resource(s, a);
@@ -624,7 +655,7 @@ void state_set_code(state_t *s, const address_t *addr,
 
     acct_set_flag(a, ACCT_CODE_DIRTY | ACCT_BLOCK_DIRTY);
     mark_tx_dirty(s, addr);
-    mark_blk_dirty(s, a);
+    mark_blk_dirty_h(s, a, &ah);
 }
 
 const uint8_t *state_get_code(state_t *s, const address_t *addr, uint32_t *out_len) {
@@ -685,7 +716,8 @@ uint256_t state_get_storage(state_t *s, const address_t *addr, const uint256_t *
 void state_set_storage(state_t *s, const address_t *addr,
                        const uint256_t *key, const uint256_t *value) {
     if (!s || !addr || !key || !value) return;
-    account_t *a = ensure_account(s, addr);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
     uint8_t slot_be[32]; uint256_to_bytes(key, slot_be);
@@ -721,7 +753,7 @@ void state_set_storage(state_t *s, const address_t *addr,
 
     acct_set_flag(a, ACCT_STORAGE_DIRTY);
     mark_tx_dirty(s, addr);
-    mark_blk_dirty(s, a);
+    mark_blk_dirty_h(s, a, &ah);
 }
 
 bool state_has_storage(state_t *s, const address_t *addr) {
@@ -959,7 +991,8 @@ void state_revert(state_t *s, uint32_t snap) {
 
 void state_create_account(state_t *s, const address_t *addr) {
     if (!s || !addr) return;
-    account_t *a = ensure_account(s, addr);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
     resource_t *r = get_resource(s, a);
@@ -990,7 +1023,7 @@ void state_create_account(state_t *s, const address_t *addr) {
     }
 
     mark_tx_dirty(s, addr);
-    mark_blk_dirty(s, a);
+    mark_blk_dirty_h(s, a, &ah);
 }
 
 void state_self_destruct(state_t *s, const address_t *addr) {
