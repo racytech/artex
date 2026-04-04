@@ -1030,22 +1030,21 @@ static size_t iter_hash_ref(hart_t *t, hart_ref_t start_ref,
         if (f->phase == 1) {
             /* --- Phase 1: Processing hi-nibble children for multi-hi branch --- */
 
-            /* If we just returned from a child, store its result */
-            if (f->cur_hi > 0 || f->cur_lo > 0) {
-                /* Find where we left off — the slot we were processing */
-                uint8_t prev_hi = f->cur_hi;
+            /* If returning from a child (cur_hi points to the hi we pushed for),
+             * store the child's result before advancing. */
+            if (f->cur_hi < 16 && f->hi_slot_lens[f->cur_hi] == 0xFF) {
+                /* 0xFF = sentinel "waiting for child" */
+                uint8_t hi = f->cur_hi;
                 if (f->in_lo_branch) {
-                    /* Returning from lo-group child */
-                    f->lo_slot_lens[f->lo_keys[prev_hi][f->cur_lo - 1]] = (uint8_t)result_len;
-                    memcpy(f->lo_slots[f->lo_keys[prev_hi][f->cur_lo - 1]], result_buf, result_len);
-                } else if (result_len > 0) {
-                    f->hi_slot_lens[prev_hi] = (uint8_t)result_len;
-                    memcpy(f->hi_slots[prev_hi], result_buf, result_len);
+                    /* Handled in phase 2 */
+                } else {
+                    f->hi_slot_lens[hi] = (uint8_t)result_len;
+                    memcpy(f->hi_slots[hi], result_buf, result_len);
                 }
+                f->cur_hi = hi + 1; /* advance past completed slot */
             }
 
-            /* Advance to next hi child */
-            int single_hi_for_lo = -1;
+            /* Process next hi child */
             while (f->cur_hi < 16) {
                 uint8_t hi = f->cur_hi;
                 if (f->gcounts[hi] == 0) { f->cur_hi++; continue; }
@@ -1060,7 +1059,7 @@ static size_t iter_hash_ref(hart_t *t, hart_ref_t start_ref,
                     child->nib_prefix[0] = f->lo_keys[hi][0];
                     child->nib_prefix_len = 1;
                     child->phase = 0;
-                    f->cur_hi = hi + 1;
+                    f->hi_slot_lens[hi] = 0xFF; /* sentinel: waiting */
                     f->in_lo_branch = 0;
                     sp++;
                     goto next_iter;
@@ -1071,8 +1070,6 @@ static size_t iter_hash_ref(hart_t *t, hart_ref_t start_ref,
                     memset(f->lo_slot_lens, 0, 16);
                     f->cur_lo = 0;
                     f->in_lo_branch = 1;
-                    single_hi_for_lo = hi;
-                    /* Fall through to lo-group processing */
                     f->phase = 2;
                     break;
                 }
@@ -1196,7 +1193,7 @@ void hart_root_hash_avx512(hart_t *t, hart_encode_t encode, void *ctx, uint8_t o
     }
 }
 
-#if 0 /* TODO: iterative produces wrong root with acct_trie_encode — debug needed */
+#if 0 /* WIP: passes failfast (44041) but batch shows 3035 failures — state leak? */
 void hart_root_hash(hart_t *t, hart_encode_t encode, void *ctx, uint8_t out[32]) {
     hart_root_hash_avx512(t, encode, ctx, out);
 }
