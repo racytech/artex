@@ -1512,7 +1512,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* --no-validate: compute and verify root at the last processed block */
+    /* --no-validate: compute and verify root at the last processed block. */
     if (no_validate) {
         sync_status_t fst = sync_get_status(sync);
         uint64_t last = fst.last_block;
@@ -1548,6 +1548,16 @@ int main(int argc, char **argv) {
             if (memcmp(actual.bytes, expected.bytes, 32) == 0) {
                 fprintf(stderr, "  PASS: root matches at block %lu (%.0fms)\n",
                         last, fr_ms);
+                /* Save final snapshot — starting point for CL sync */
+                state_t *st = evm_state_get_state(es);
+                char final_path[256];
+                snprintf(final_path, sizeof(final_path), "%s/state_%lu.bin",
+                         data_dir, last);
+                if (state_save(st, final_path, &actual)) {
+                    state_stats_t ss = state_get_stats(st);
+                    fprintf(stderr, "  saved final snapshot: %u accts, %.0fMB → %s\n",
+                            ss.account_count, ss.total_tracked / 1e6, final_path);
+                }
             } else {
                 fprintf(stderr, "  FAIL: root mismatch at block %lu (%.0fms)\n",
                         last, fr_ms);
