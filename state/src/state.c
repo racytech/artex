@@ -1168,6 +1168,10 @@ void state_commit_block(state_t *s) {
     s->journal_len = 0;
     mem_art_destroy(&s->originals);
     mem_art_init(&s->originals);
+
+    /* Reset addr hash cache — addresses from this block won't repeat next block */
+    mem_art_destroy(&s->addr_hash_cache);
+    mem_art_init(&s->addr_hash_cache);
 }
 
 /* =========================================================================
