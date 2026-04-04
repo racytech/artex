@@ -400,6 +400,7 @@ bool sync_execute_block(sync_t *sync,
         if (bn % si == 0) {
             sync->last_stats = evm_state_get_stats(sync->state);
             sync->last_stats.exec_ms = sync->exec_ms;
+            sync->last_stats.wait_flush_ms = sync->root_ms;
             sync->exec_ms = 0;
             sync->root_ms = 0;
         }

@@ -217,6 +217,7 @@ struct state {
     /* Dirty tracking */
     dirty_vec_t tx_dirty;
     dirty_vec_t blk_dirty;
+    size_t      blk_dirty_cursor;  /* finalize_block processes from here */
 
     /* Resource tracking for eviction */
     uint32_t *resource_list;
@@ -1119,6 +1120,7 @@ void state_clear_prestate_dirty(state_t *s) {
     }
 
     dirty_clear(&s->blk_dirty);
+    s->blk_dirty_cursor = 0;
     dirty_clear(&s->tx_dirty);
     s->journal_len = 0;
     mem_art_destroy(&s->originals);
@@ -1245,6 +1247,7 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
                         ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
     }
     dirty_clear(&s->blk_dirty);
+    s->blk_dirty_cursor = 0;
 
     return root;
 }
@@ -1257,9 +1260,10 @@ void state_finalize_block(state_t *s, bool prune_empty) {
     if (!s) return;
 
     /* Prune dead/empty accounts from trie — must happen every block.
+     * Only process NEW entries since last finalize (cursor → count).
      * Do NOT clear MPT_DIRTY, STORAGE_DIRTY, or blk_dirty — those must
      * accumulate until the checkpoint calls state_compute_root_ex. */
-    for (size_t d = 0; d < s->blk_dirty.count; d++) {
+    for (size_t d = s->blk_dirty_cursor; d < s->blk_dirty.count; d++) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
         account_t *a = find_account(s, akey);
         if (!a || !acct_has_flag(a, ACCT_MPT_DIRTY)) continue;
@@ -1310,8 +1314,10 @@ void state_finalize_block(state_t *s, bool prune_empty) {
 
     #undef SAFE_DELETE_IDX
 
-    /* blk_dirty, MPT_DIRTY, STORAGE_DIRTY are NOT cleared —
+    /* Advance cursor — next finalize starts from here.
+     * blk_dirty, MPT_DIRTY, STORAGE_DIRTY are NOT cleared —
      * they accumulate until state_compute_root_ex processes them. */
+    s->blk_dirty_cursor = s->blk_dirty.count;
 }
 
 uint32_t state_dead_count(const state_t *s) {
