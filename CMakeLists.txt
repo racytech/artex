@@ -334,8 +334,7 @@ add_test(NAME test_state_root COMMAND test_state_root)
 
 add_library(hashed_art STATIC database/src/hashed_art.c)
 target_include_directories(hashed_art PUBLIC ${CMAKE_SOURCE_DIR}/database/include ${CMAKE_SOURCE_DIR}/common/include)
-target_compile_options(hashed_art PRIVATE -mavx512f -mavx512vl)
-target_link_libraries(hashed_art common keccak_avx512)
+target_link_libraries(hashed_art common)
 
 add_executable(test_hashed_art database/tests/test_hashed_art.c)
 target_link_libraries(test_hashed_art hashed_art mem_mpt common)
@@ -349,8 +348,6 @@ target_link_libraries(bench_hart_root hashed_art common)
 add_executable(bench_hart_profile database/tests/bench_hart_profile.c)
 target_link_libraries(bench_hart_profile hashed_art common)
 
-add_executable(bench_hart_avx512 database/tests/bench_hart_avx512.c)
-target_link_libraries(bench_hart_avx512 hashed_art common)
 
 add_executable(test_state_save_load state/tests/test_state_save_load.c)
 target_link_libraries(test_state_save_load state evm)
