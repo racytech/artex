@@ -386,7 +386,6 @@ evm_message_t evm_message_call(const address_t *caller,
         .caller = *caller,
         .recipient = *recipient,
         .code_addr = *recipient,
-        .recipient_hash = hash_keccak256(recipient->bytes, 20),
         .value = *value,
         .input_data = input_data,
         .input_size = input_size,
@@ -406,13 +405,12 @@ evm_message_t evm_message_delegatecall(const address_t *caller,
                                         int32_t depth)
 {
     uint256_t zero_value = {0};
-
+    
     evm_message_t msg = {
         .kind = EVM_DELEGATECALL,
         .caller = *caller,
         .recipient = *caller,        // Recipient stays the same in delegatecall
         .code_addr = *recipient,     // But code comes from the target
-        .recipient_hash = hash_keccak256(caller->bytes, 20), // hash of actual recipient
         .value = zero_value,
         .input_data = input_data,
         .input_size = input_size,
@@ -432,13 +430,12 @@ evm_message_t evm_message_create(const address_t *caller,
                                     int32_t depth)
 {
     address_t zero_addr = {0};
-
+    
     evm_message_t msg = {
         .kind = EVM_CREATE,
         .caller = *caller,
         .recipient = zero_addr,      // Will be computed
         .code_addr = zero_addr,
-        .recipient_hash = {0},       // Set later when address is known
         .value = *value,
         .input_data = init_code,
         .input_size = init_code_size,

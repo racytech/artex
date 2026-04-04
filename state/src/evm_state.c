@@ -165,20 +165,9 @@ uint256_t evm_state_get_storage(evm_state_t *es, const address_t *addr,
     return es ? state_get_storage(es->st, addr, key) : UINT256_ZERO;
 }
 
-uint256_t evm_state_get_storage_h(evm_state_t *es, const hash_t *addr_hash,
-                                   const uint256_t *key) {
-    return es ? state_get_storage_h(es->st, addr_hash, key) : UINT256_ZERO;
-}
-
 void evm_state_set_storage(evm_state_t *es, const address_t *addr,
                             const uint256_t *key, const uint256_t *value) {
     if (es) state_set_storage(es->st, addr, key, value);
-}
-
-void evm_state_set_storage_h(evm_state_t *es, const address_t *addr,
-                              const hash_t *addr_hash,
-                              const uint256_t *key, const uint256_t *value) {
-    if (es) state_set_storage_h(es->st, addr, addr_hash, key, value);
 }
 
 bool evm_state_has_storage(evm_state_t *es, const address_t *addr) {
@@ -190,25 +179,11 @@ uint256_t evm_state_sload(evm_state_t *es, const address_t *addr,
     return es ? state_sload(es->st, addr, key, was_warm) : UINT256_ZERO;
 }
 
-uint256_t evm_state_sload_h(evm_state_t *es, const address_t *addr,
-                             const hash_t *addr_hash,
-                             const uint256_t *key, bool *was_warm) {
-    return es ? state_sload_h(es->st, addr, addr_hash, key, was_warm) : UINT256_ZERO;
-}
-
 void evm_state_sstore_lookup(evm_state_t *es, const address_t *addr,
                                const uint256_t *key,
                                uint256_t *current, uint256_t *original,
                                bool *was_warm) {
     if (es) state_sstore_lookup(es->st, addr, key, current, original, was_warm);
-}
-
-void evm_state_sstore_lookup_h(evm_state_t *es, const address_t *addr,
-                                const hash_t *addr_hash,
-                                const uint256_t *key,
-                                uint256_t *current, uint256_t *original,
-                                bool *was_warm) {
-    if (es) state_sstore_lookup_h(es->st, addr, addr_hash, key, current, original, was_warm);
 }
 
 /* =========================================================================

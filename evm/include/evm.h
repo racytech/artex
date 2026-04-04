@@ -105,7 +105,6 @@ struct evm_message_t
     address_t caller;    // Sender of the message
     address_t recipient; // Recipient address (contract being called)
     address_t code_addr; // Address of code to execute (may differ from recipient)
-    hash_t    recipient_hash; // keccak256(recipient) — cached for state lookups
 
     uint256_t value; // Value transferred in wei
 

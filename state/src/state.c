@@ -214,9 +214,6 @@ struct state {
     mem_art_t transient;
     mem_art_t originals;    /* EIP-2200: slot_key[52] → uint256_t */
 
-    /* Address hash cache: addr[20] → keccak256(addr)[32] */
-    mem_art_t addr_hash_cache;
-
     /* Dirty tracking */
     dirty_vec_t tx_dirty;
     dirty_vec_t blk_dirty;
@@ -251,20 +248,6 @@ struct state {
  * Internal helpers
  * ========================================================================= */
 
-/* Cached addr → keccak256(addr). Computes once, returns cached on repeat. */
-static hash_t addr_hash_cached(state_t *s, const uint8_t addr[20]) {
-    size_t vlen;
-    const void *cached = mem_art_get(&s->addr_hash_cache, addr, 20, &vlen);
-    if (cached && vlen == 32) {
-        hash_t h;
-        memcpy(&h, cached, 32);
-        return h;
-    }
-    hash_t h = hash_keccak256(addr, 20);
-    mem_art_insert(&s->addr_hash_cache, addr, 20, h.bytes, 32);
-    return h;
-}
-
 /* Core lookup — uses pre-computed addr_hash */
 static account_t *find_account_h(const state_t *s, const hash_t *addr_hash) {
     const uint32_t *pidx = (const uint32_t *)
@@ -275,9 +258,9 @@ static account_t *find_account_h(const state_t *s, const hash_t *addr_hash) {
     return &((state_t *)s)->accounts[idx];
 }
 
-/* Convenience — uses addr_hash_cache */
+/* Convenience — computes hash internally (for callers without pre-computed hash) */
 static account_t *find_account(const state_t *s, const uint8_t addr[20]) {
-    hash_t h = addr_hash_cached((state_t *)s, addr);
+    hash_t h = hash_keccak256(addr, 20);
     return find_account_h(s, &h);
 }
 
@@ -343,7 +326,7 @@ static account_t *ensure_account_h(state_t *s, const address_t *addr,
 }
 
 static account_t *ensure_account(state_t *s, const address_t *addr) {
-    hash_t h = addr_hash_cached(s, addr->bytes);
+    hash_t h = hash_keccak256(addr->bytes, 20);
     return ensure_account_h(s, addr, &h);
 }
 
@@ -372,7 +355,7 @@ static void mark_blk_dirty_h(state_t *s, account_t *a, const hash_t *addr_hash) 
 }
 
 static void mark_blk_dirty(state_t *s, account_t *a) {
-    hash_t h = addr_hash_cached(s, a->addr.bytes);
+    hash_t h = hash_keccak256(a->addr.bytes, 20);
     mark_blk_dirty_h(s, a, &h);
 }
 
@@ -462,7 +445,6 @@ state_t *state_create(code_store_t *cs) {
     s->capacity = ACCT_INIT_CAP;
 
     hart_init(&s->acct_index, sizeof(uint32_t));
-    mem_art_init(&s->addr_hash_cache);
     mem_art_init(&s->warm_addrs);
     mem_art_init(&s->warm_slots);
     mem_art_init(&s->transient);
@@ -500,7 +482,6 @@ void state_destroy(state_t *s) {
     free(s->pruned);
 
     hart_destroy(&s->acct_index);
-    mem_art_destroy(&s->addr_hash_cache);
     mem_art_destroy(&s->warm_addrs);
     mem_art_destroy(&s->warm_slots);
     mem_art_destroy(&s->transient);
@@ -574,7 +555,7 @@ uint256_t state_get_balance(state_t *s, const address_t *addr) {
 
 void state_set_nonce(state_t *s, const address_t *addr, uint64_t nonce) {
     if (!s || !addr) return;
-    hash_t ah = addr_hash_cached(s, addr->bytes);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
     account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
@@ -590,7 +571,7 @@ void state_set_nonce(state_t *s, const address_t *addr, uint64_t nonce) {
 
 void state_set_balance(state_t *s, const address_t *addr, const uint256_t *bal) {
     if (!s || !addr || !bal) return;
-    hash_t ah = addr_hash_cached(s, addr->bytes);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
     account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
@@ -606,7 +587,7 @@ void state_set_balance(state_t *s, const address_t *addr, const uint256_t *bal) 
 
 void state_add_balance(state_t *s, const address_t *addr, const uint256_t *amount) {
     if (!s || !addr || !amount) return;
-    hash_t ah = addr_hash_cached(s, addr->bytes);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
     account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
@@ -622,7 +603,7 @@ void state_add_balance(state_t *s, const address_t *addr, const uint256_t *amoun
 
 bool state_sub_balance(state_t *s, const address_t *addr, const uint256_t *amount) {
     if (!s || !addr || !amount) return false;
-    hash_t ah = addr_hash_cached(s, addr->bytes);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
     account_t *a = find_account_h(s, &ah);
     if (!a || uint256_lt(&a->balance, amount)) return false;
 
@@ -644,7 +625,7 @@ bool state_sub_balance(state_t *s, const address_t *addr, const uint256_t *amoun
 void state_set_code(state_t *s, const address_t *addr,
                     const uint8_t *code, uint32_t len) {
     if (!s || !addr) return;
-    hash_t ah = addr_hash_cached(s, addr->bytes);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
     account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
@@ -723,26 +704,20 @@ hash_t state_get_code_hash(state_t *s, const address_t *addr) {
  * Storage
  * ========================================================================= */
 
-uint256_t state_get_storage_h(state_t *s, const hash_t *addr_hash,
-                              const uint256_t *key) {
-    if (!s || !addr_hash || !key) return UINT256_ZERO;
-    account_t *a = find_account_h(s, addr_hash);
+uint256_t state_get_storage(state_t *s, const address_t *addr, const uint256_t *key) {
+    if (!s || !addr || !key) return UINT256_ZERO;
+    account_t *a = find_account(s, addr->bytes);
     if (!a) return UINT256_ZERO;
     uint8_t slot_be[32]; uint256_to_bytes(key, slot_be);
     hash_t slot_hash = hash_keccak256(slot_be, 32);
     return storage_read(s, a, slot_hash.bytes);
 }
 
-uint256_t state_get_storage(state_t *s, const address_t *addr, const uint256_t *key) {
-    if (!s || !addr || !key) return UINT256_ZERO;
-    hash_t ah = addr_hash_cached(s, addr->bytes);
-    return state_get_storage_h(s, &ah, key);
-}
-
-void state_set_storage_h(state_t *s, const address_t *addr, const hash_t *addr_hash,
-                         const uint256_t *key, const uint256_t *value) {
+void state_set_storage(state_t *s, const address_t *addr,
+                       const uint256_t *key, const uint256_t *value) {
     if (!s || !addr || !key || !value) return;
-    account_t *a = ensure_account_h(s, addr, addr_hash);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
     uint8_t slot_be[32]; uint256_to_bytes(key, slot_be);
@@ -754,12 +729,14 @@ void state_set_storage_h(state_t *s, const address_t *addr, const hash_t *addr_h
         .data.storage = { .key = *key, .val = old_value, .flags = a->flags } };
     journal_push(s, &je);
 
+    /* Save original for EIP-2200 */
     uint8_t skey[SLOT_KEY_SIZE];
     make_slot_key(addr, key, skey);
     if (!mem_art_contains(&s->originals, skey, SLOT_KEY_SIZE))
         mem_art_insert(&s->originals, skey, SLOT_KEY_SIZE,
                        &old_value, sizeof(uint256_t));
 
+    /* Write to storage */
     if (!ensure_storage(s, a)) {
         LOG_ERROR("storage create failed for %02x%02x..%02x%02x",
                   addr->bytes[0], addr->bytes[1], addr->bytes[18], addr->bytes[19]);
@@ -776,14 +753,7 @@ void state_set_storage_h(state_t *s, const address_t *addr, const hash_t *addr_h
 
     acct_set_flag(a, ACCT_STORAGE_DIRTY);
     mark_tx_dirty(s, addr);
-    mark_blk_dirty_h(s, a, addr_hash);
-}
-
-void state_set_storage(state_t *s, const address_t *addr,
-                       const uint256_t *key, const uint256_t *value) {
-    if (!s || !addr || !key || !value) return;
-    hash_t ah = addr_hash_cached(s, addr->bytes);
-    state_set_storage_h(s, addr, &ah, key, value);
+    mark_blk_dirty_h(s, a, &ah);
 }
 
 bool state_has_storage(state_t *s, const address_t *addr) {
@@ -802,54 +772,40 @@ bool state_has_storage(state_t *s, const address_t *addr) {
  * SLOAD / SSTORE combined lookups
  * ========================================================================= */
 
-uint256_t state_sload_h(state_t *s, const address_t *addr, const hash_t *addr_hash,
-                        const uint256_t *key, bool *was_warm) {
+uint256_t state_sload(state_t *s, const address_t *addr,
+                      const uint256_t *key, bool *was_warm) {
     if (!s || !addr || !key) { if (was_warm) *was_warm = false; return UINT256_ZERO; }
     if (was_warm) {
         uint8_t skey[SLOT_KEY_SIZE];
         make_slot_key(addr, key, skey);
         *was_warm = mem_art_contains(&s->warm_slots, skey, SLOT_KEY_SIZE);
     }
-    return state_get_storage_h(s, addr_hash, key);
-}
-
-uint256_t state_sload(state_t *s, const address_t *addr,
-                      const uint256_t *key, bool *was_warm) {
-    hash_t ah = addr_hash_cached(s, addr->bytes);
-    return state_sload_h(s, addr, &ah, key, was_warm);
-}
-
-void state_sstore_lookup_h(state_t *s, const address_t *addr, const hash_t *addr_hash,
-                           const uint256_t *key,
-                           uint256_t *current, uint256_t *original,
-                           bool *was_warm) {
-    if (!s || !addr || !key) {
-        if (current) *current = UINT256_ZERO;
-        if (original) *original = UINT256_ZERO;
-        if (was_warm) *was_warm = false;
-        return;
-    }
-    if (current) *current = state_get_storage_h(s, addr_hash, key);
-    if (original) {
-        uint8_t skey[SLOT_KEY_SIZE];
-        make_slot_key(addr, key, skey);
-        const uint256_t *orig = (const uint256_t *)
-            mem_art_get(&s->originals, skey, SLOT_KEY_SIZE, NULL);
-        *original = orig ? *orig : state_get_storage_h(s, addr_hash, key);
-    }
-    if (was_warm) {
-        uint8_t skey[SLOT_KEY_SIZE];
-        make_slot_key(addr, key, skey);
-        *was_warm = mem_art_contains(&s->warm_slots, skey, SLOT_KEY_SIZE);
-    }
+    return state_get_storage(s, addr, key);
 }
 
 void state_sstore_lookup(state_t *s, const address_t *addr,
                          const uint256_t *key,
                          uint256_t *current, uint256_t *original,
                          bool *was_warm) {
-    hash_t ah = addr_hash_cached(s, addr->bytes);
-    state_sstore_lookup_h(s, addr, &ah, key, current, original, was_warm);
+    if (!s || !addr || !key) {
+        if (current) *current = UINT256_ZERO;
+        if (original) *original = UINT256_ZERO;
+        if (was_warm) *was_warm = false;
+        return;
+    }
+    if (current) *current = state_get_storage(s, addr, key);
+    if (original) {
+        uint8_t skey[SLOT_KEY_SIZE];
+        make_slot_key(addr, key, skey);
+        const uint256_t *orig = (const uint256_t *)
+            mem_art_get(&s->originals, skey, SLOT_KEY_SIZE, NULL);
+        *original = orig ? *orig : state_get_storage(s, addr, key);
+    }
+    if (was_warm) {
+        uint8_t skey[SLOT_KEY_SIZE];
+        make_slot_key(addr, key, skey);
+        *was_warm = mem_art_contains(&s->warm_slots, skey, SLOT_KEY_SIZE);
+    }
 }
 
 /* =========================================================================
@@ -1035,7 +991,7 @@ void state_revert(state_t *s, uint32_t snap) {
 
 void state_create_account(state_t *s, const address_t *addr) {
     if (!s || !addr) return;
-    hash_t ah = addr_hash_cached(s, addr->bytes);
+    hash_t ah = hash_keccak256(addr->bytes, 20);
     account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
@@ -1168,10 +1124,6 @@ void state_commit_block(state_t *s) {
     s->journal_len = 0;
     mem_art_destroy(&s->originals);
     mem_art_init(&s->originals);
-
-    /* Reset addr hash cache — addresses from this block won't repeat next block */
-    mem_art_destroy(&s->addr_hash_cache);
-    mem_art_init(&s->addr_hash_cache);
 }
 
 /* =========================================================================
@@ -1271,9 +1223,10 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     /* Step 2: Update account trie — insert/delete for dirty accounts */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
-        hash_t addr_hash = addr_hash_cached(s, akey);
-        account_t *a = find_account_h(s, &addr_hash);
+        account_t *a = find_account(s, akey);
         if (!a || !acct_has_flag(a, ACCT_MPT_DIRTY)) continue;
+
+        hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
 
         if (!acct_has_flag(a, ACCT_EXISTED) ||
             (acct_is_empty(a) && prune_empty)) {
@@ -1284,12 +1237,14 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     /* Step 2b: Remove dead accounts from acct_index.
      * Three tracked categories — O(dead) instead of O(all_accounts). */
 
+    /* Helper: safe delete from acct_index (checks idx matches to avoid
+     * deleting a live duplicate at the same address) */
     #define SAFE_DELETE_IDX(i) do { \
         if ((i) < s->count) { \
             account_t *_a = &s->accounts[(i)]; \
             if (!acct_has_flag(_a, ACCT_EXISTED) || \
                 (acct_is_empty(_a) && prune_empty)) { \
-                hash_t _h = addr_hash_cached(s, _a->addr.bytes); \
+                hash_t _h = hash_keccak256(_a->addr.bytes, 20); \
                 const uint32_t *_p = (const uint32_t *) \
                     hart_get(&s->acct_index, _h.bytes); \
                 if (_p && *_p == (i)) \
@@ -1358,7 +1313,7 @@ void state_finalize_block(state_t *s, bool prune_empty) {
         /* Delete from trie if dead */
         if (!acct_has_flag(a, ACCT_EXISTED) ||
             (acct_is_empty(a) && prune_empty)) {
-            hash_t addr_hash = addr_hash_cached(s, a->addr.bytes);
+            hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
             hart_delete(&s->acct_index, addr_hash.bytes);
         }
     }
@@ -1369,7 +1324,7 @@ void state_finalize_block(state_t *s, bool prune_empty) {
             account_t *_a = &s->accounts[(i)]; \
             if (!acct_has_flag(_a, ACCT_EXISTED) || \
                 (acct_is_empty(_a) && prune_empty)) { \
-                hash_t _h = addr_hash_cached(s, _a->addr.bytes); \
+                hash_t _h = hash_keccak256(_a->addr.bytes, 20); \
                 const uint32_t *_p = (const uint32_t *) \
                     hart_get(&s->acct_index, _h.bytes); \
                 if (_p && *_p == (i)) \

@@ -162,8 +162,7 @@ static evm_status_t op_sload(evm_t *evm)
         // Combined lookup: ensure_slot + warm check in one pass
         // (avoids double make_slot_key + double ART traversal)
         bool was_warm;
-        uint256_t value = evm_state_sload_h(evm->state, &evm->msg.recipient,
-                                                  &evm->msg.recipient_hash, &key, &was_warm);
+        uint256_t value = evm_state_sload(evm->state, &evm->msg.recipient, &key, &was_warm);
         gas_cost = was_warm ? GAS_SLOAD_WARM : GAS_SLOAD_COLD;
 
         if (!was_warm)
@@ -208,7 +207,7 @@ static evm_status_t op_sload(evm_t *evm)
     }
 
     // Load value from storage using current contract address
-    uint256_t value = evm_state_get_storage_h(evm->state, &evm->msg.recipient_hash, &key);
+    uint256_t value = evm_state_get_storage(evm->state, &evm->msg.recipient, &key);
 
     if (g_trace_calls) {
         char addr_hex[41];
@@ -260,9 +259,8 @@ static evm_status_t op_sstore(evm_t *evm)
     // Get current, original, and warm status in a single ensure_slot lookup
     uint256_t current_value, original_value;
     bool was_warm = false;
-    evm_state_sstore_lookup_h(evm->state, &evm->msg.recipient,
-                               &evm->msg.recipient_hash, &key,
-                               &current_value, &original_value, &was_warm);
+    evm_state_sstore_lookup(evm->state, &evm->msg.recipient, &key,
+                             &current_value, &original_value, &was_warm);
 
     {
         // Calculate fork-specific SSTORE gas cost and refund (EIP-2200)
@@ -293,8 +291,7 @@ static evm_status_t op_sstore(evm_t *evm)
     }
 
     // Store value to storage using current contract address
-    evm_state_set_storage_h(evm->state, &evm->msg.recipient,
-                             &evm->msg.recipient_hash, &key, &value);
+    evm_state_set_storage(evm->state, &evm->msg.recipient, &key, &value);
 
     return EVM_SUCCESS;
 }

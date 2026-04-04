@@ -68,26 +68,17 @@ hash_t   state_get_code_hash(state_t *s, const address_t *addr);
  * ========================================================================= */
 
 uint256_t state_get_storage(state_t *s, const address_t *addr, const uint256_t *key);
-uint256_t state_get_storage_h(state_t *s, const hash_t *addr_hash, const uint256_t *key);
 void      state_set_storage(state_t *s, const address_t *addr,
                             const uint256_t *key, const uint256_t *value);
-void      state_set_storage_h(state_t *s, const address_t *addr, const hash_t *addr_hash,
-                              const uint256_t *key, const uint256_t *value);
 bool      state_has_storage(state_t *s, const address_t *addr);
 
 /* SLOAD/SSTORE combined lookups (EIP-2200 gas calculation) */
 uint256_t state_sload(state_t *s, const address_t *addr,
                       const uint256_t *key, bool *was_warm);
-uint256_t state_sload_h(state_t *s, const address_t *addr, const hash_t *addr_hash,
-                        const uint256_t *key, bool *was_warm);
 void      state_sstore_lookup(state_t *s, const address_t *addr,
                               const uint256_t *key,
                               uint256_t *current, uint256_t *original,
                               bool *was_warm);
-void      state_sstore_lookup_h(state_t *s, const address_t *addr, const hash_t *addr_hash,
-                                const uint256_t *key,
-                                uint256_t *current, uint256_t *original,
-                                bool *was_warm);
 
 /* =========================================================================
  * Account lifecycle
