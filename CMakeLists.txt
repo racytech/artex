@@ -354,6 +354,10 @@ target_link_libraries(test_state_save_load state evm)
 target_include_directories(test_state_save_load PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
 add_test(NAME test_state_save_load COMMAND test_state_save_load)
 
+add_executable(test_finalize_bug state/tests/test_finalize_bug.c)
+target_link_libraries(test_finalize_bug state evm)
+target_include_directories(test_finalize_bug PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
+
 add_executable(test_state_compaction state/tests/test_state_compaction.c)
 target_link_libraries(test_state_compaction state evm)
 target_include_directories(test_state_compaction PRIVATE ${CMAKE_SOURCE_DIR}/state/include)

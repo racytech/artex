@@ -1256,26 +1256,32 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
 void state_finalize_block(state_t *s, bool prune_empty) {
     if (!s) return;
 
-    /* Same as state_compute_root steps 1,2,4 — but skip hash computation */
+    /* Prune dead/empty accounts from trie — must happen every block.
+     * Do NOT clear MPT_DIRTY, STORAGE_DIRTY, or blk_dirty — those must
+     * accumulate until the checkpoint calls state_compute_root_ex. */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
         account_t *a = find_account(s, akey);
         if (!a || !acct_has_flag(a, ACCT_MPT_DIRTY)) continue;
 
+        /* Promote/demote existence (consumes BLOCK_DIRTY) */
         if (acct_has_flag(a, ACCT_BLOCK_DIRTY)) {
             if (acct_has_flag(a, ACCT_SELF_DESTRUCTED))
                 acct_clear_flag(a, ACCT_EXISTED);
             else if (!acct_is_empty(a))
                 acct_set_flag(a, ACCT_EXISTED);
+            acct_clear_flag(a, ACCT_BLOCK_DIRTY);
         }
 
-        hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
+        /* Delete from trie if dead */
         if (!acct_has_flag(a, ACCT_EXISTED) ||
             (acct_is_empty(a) && prune_empty)) {
+            hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
             hart_delete(&s->acct_index, addr_hash.bytes);
         }
     }
 
+    /* Clean up dead account lists (consumed by pruning above) */
     #define SAFE_DELETE_IDX(i) do { \
         if ((i) < s->count) { \
             account_t *_a = &s->accounts[(i)]; \
@@ -1304,15 +1310,8 @@ void state_finalize_block(state_t *s, bool prune_empty) {
 
     #undef SAFE_DELETE_IDX
 
-    /* Clear dirty flags (no hash computed — they stay dirty for next compute_root) */
-    for (size_t d = 0; d < s->blk_dirty.count; d++) {
-        const uint8_t *akey = s->blk_dirty.keys + d * 20;
-        account_t *a = find_account(s, akey);
-        if (!a) continue;
-        acct_clear_flag(a, ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY |
-                        ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
-    }
-    dirty_clear(&s->blk_dirty);
+    /* blk_dirty, MPT_DIRTY, STORAGE_DIRTY are NOT cleared —
+     * they accumulate until state_compute_root_ex processes them. */
 }
 
 uint32_t state_dead_count(const state_t *s) {
