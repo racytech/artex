@@ -144,19 +144,32 @@ void     evm_state_set_code(evm_state_t *es, const address_t *addr,
 
 uint256_t evm_state_get_storage(evm_state_t *es, const address_t *addr,
                                 const uint256_t *key);
+uint256_t evm_state_get_storage_h(evm_state_t *es, const hash_t *addr_hash,
+                                   const uint256_t *key);
 /** Get committed (original/pre-transaction) storage value. For EIP-2200. */
 uint256_t evm_state_get_committed_storage(evm_state_t *es, const address_t *addr,
                                           const uint256_t *key);
 /** Combined SLOAD: ensure_slot + warm check in one pass. */
 uint256_t evm_state_sload(evm_state_t *es, const address_t *addr,
                            const uint256_t *key, bool *was_warm);
+uint256_t evm_state_sload_h(evm_state_t *es, const address_t *addr,
+                             const hash_t *addr_hash,
+                             const uint256_t *key, bool *was_warm);
 /** Combined SSTORE lookup: ensure_slot + warm check + current/original in one pass. */
 void      evm_state_sstore_lookup(evm_state_t *es, const address_t *addr,
                                    const uint256_t *key,
                                    uint256_t *current, uint256_t *original,
                                    bool *was_warm);
+void      evm_state_sstore_lookup_h(evm_state_t *es, const address_t *addr,
+                                     const hash_t *addr_hash,
+                                     const uint256_t *key,
+                                     uint256_t *current, uint256_t *original,
+                                     bool *was_warm);
 void      evm_state_set_storage(evm_state_t *es, const address_t *addr,
                                 const uint256_t *key, const uint256_t *value);
+void      evm_state_set_storage_h(evm_state_t *es, const address_t *addr,
+                                   const hash_t *addr_hash,
+                                   const uint256_t *key, const uint256_t *value);
 
 /** EIP-7610: Check if account has any non-zero storage (for CREATE collision detection). */
 bool evm_state_has_storage(evm_state_t *es, const address_t *addr);

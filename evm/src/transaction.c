@@ -685,6 +685,7 @@ bool transaction_execute(
         .caller = tx->sender,
         .recipient = recipient,
         .code_addr = code_addr,
+        .recipient_hash = hash_keccak256(recipient.bytes, 20),
         .value = tx->value,
         .input_data = tx->data,
         .input_size = tx->data_size,

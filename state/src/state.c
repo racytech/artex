@@ -704,20 +704,26 @@ hash_t state_get_code_hash(state_t *s, const address_t *addr) {
  * Storage
  * ========================================================================= */
 
-uint256_t state_get_storage(state_t *s, const address_t *addr, const uint256_t *key) {
-    if (!s || !addr || !key) return UINT256_ZERO;
-    account_t *a = find_account(s, addr->bytes);
+uint256_t state_get_storage_h(state_t *s, const hash_t *addr_hash,
+                              const uint256_t *key) {
+    if (!s || !addr_hash || !key) return UINT256_ZERO;
+    account_t *a = find_account_h(s, addr_hash);
     if (!a) return UINT256_ZERO;
     uint8_t slot_be[32]; uint256_to_bytes(key, slot_be);
     hash_t slot_hash = hash_keccak256(slot_be, 32);
     return storage_read(s, a, slot_hash.bytes);
 }
 
-void state_set_storage(state_t *s, const address_t *addr,
-                       const uint256_t *key, const uint256_t *value) {
-    if (!s || !addr || !key || !value) return;
+uint256_t state_get_storage(state_t *s, const address_t *addr, const uint256_t *key) {
+    if (!s || !addr || !key) return UINT256_ZERO;
     hash_t ah = hash_keccak256(addr->bytes, 20);
-    account_t *a = ensure_account_h(s, addr, &ah);
+    return state_get_storage_h(s, &ah, key);
+}
+
+void state_set_storage_h(state_t *s, const address_t *addr, const hash_t *addr_hash,
+                         const uint256_t *key, const uint256_t *value) {
+    if (!s || !addr || !key || !value) return;
+    account_t *a = ensure_account_h(s, addr, addr_hash);
     if (!a) return;
 
     uint8_t slot_be[32]; uint256_to_bytes(key, slot_be);
@@ -729,14 +735,12 @@ void state_set_storage(state_t *s, const address_t *addr,
         .data.storage = { .key = *key, .val = old_value, .flags = a->flags } };
     journal_push(s, &je);
 
-    /* Save original for EIP-2200 */
     uint8_t skey[SLOT_KEY_SIZE];
     make_slot_key(addr, key, skey);
     if (!mem_art_contains(&s->originals, skey, SLOT_KEY_SIZE))
         mem_art_insert(&s->originals, skey, SLOT_KEY_SIZE,
                        &old_value, sizeof(uint256_t));
 
-    /* Write to storage */
     if (!ensure_storage(s, a)) {
         LOG_ERROR("storage create failed for %02x%02x..%02x%02x",
                   addr->bytes[0], addr->bytes[1], addr->bytes[18], addr->bytes[19]);
@@ -753,7 +757,14 @@ void state_set_storage(state_t *s, const address_t *addr,
 
     acct_set_flag(a, ACCT_STORAGE_DIRTY);
     mark_tx_dirty(s, addr);
-    mark_blk_dirty_h(s, a, &ah);
+    mark_blk_dirty_h(s, a, addr_hash);
+}
+
+void state_set_storage(state_t *s, const address_t *addr,
+                       const uint256_t *key, const uint256_t *value) {
+    if (!s || !addr || !key || !value) return;
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    state_set_storage_h(s, addr, &ah, key, value);
 }
 
 bool state_has_storage(state_t *s, const address_t *addr) {
@@ -772,40 +783,54 @@ bool state_has_storage(state_t *s, const address_t *addr) {
  * SLOAD / SSTORE combined lookups
  * ========================================================================= */
 
-uint256_t state_sload(state_t *s, const address_t *addr,
-                      const uint256_t *key, bool *was_warm) {
+uint256_t state_sload_h(state_t *s, const address_t *addr, const hash_t *addr_hash,
+                        const uint256_t *key, bool *was_warm) {
     if (!s || !addr || !key) { if (was_warm) *was_warm = false; return UINT256_ZERO; }
     if (was_warm) {
         uint8_t skey[SLOT_KEY_SIZE];
         make_slot_key(addr, key, skey);
         *was_warm = mem_art_contains(&s->warm_slots, skey, SLOT_KEY_SIZE);
     }
-    return state_get_storage(s, addr, key);
+    return state_get_storage_h(s, addr_hash, key);
 }
 
-void state_sstore_lookup(state_t *s, const address_t *addr,
-                         const uint256_t *key,
-                         uint256_t *current, uint256_t *original,
-                         bool *was_warm) {
+uint256_t state_sload(state_t *s, const address_t *addr,
+                      const uint256_t *key, bool *was_warm) {
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    return state_sload_h(s, addr, &ah, key, was_warm);
+}
+
+void state_sstore_lookup_h(state_t *s, const address_t *addr, const hash_t *addr_hash,
+                           const uint256_t *key,
+                           uint256_t *current, uint256_t *original,
+                           bool *was_warm) {
     if (!s || !addr || !key) {
         if (current) *current = UINT256_ZERO;
         if (original) *original = UINT256_ZERO;
         if (was_warm) *was_warm = false;
         return;
     }
-    if (current) *current = state_get_storage(s, addr, key);
+    if (current) *current = state_get_storage_h(s, addr_hash, key);
     if (original) {
         uint8_t skey[SLOT_KEY_SIZE];
         make_slot_key(addr, key, skey);
         const uint256_t *orig = (const uint256_t *)
             mem_art_get(&s->originals, skey, SLOT_KEY_SIZE, NULL);
-        *original = orig ? *orig : state_get_storage(s, addr, key);
+        *original = orig ? *orig : state_get_storage_h(s, addr_hash, key);
     }
     if (was_warm) {
         uint8_t skey[SLOT_KEY_SIZE];
         make_slot_key(addr, key, skey);
         *was_warm = mem_art_contains(&s->warm_slots, skey, SLOT_KEY_SIZE);
     }
+}
+
+void state_sstore_lookup(state_t *s, const address_t *addr,
+                         const uint256_t *key,
+                         uint256_t *current, uint256_t *original,
+                         bool *was_warm) {
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    state_sstore_lookup_h(s, addr, &ah, key, current, original, was_warm);
 }
 
 /* =========================================================================
