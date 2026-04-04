@@ -275,8 +275,16 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     return evm_state_compute_state_root_ex(es, prune_empty);
 }
 
+hash_t evm_state_compute_state_root_ex2(evm_state_t *es, bool prune_empty, bool compute_hash) {
+    return es ? state_compute_root_ex(es->st, prune_empty, compute_hash) : (hash_t){0};
+}
+
 void evm_state_prune_empty_accounts(evm_state_t *es) {
     (void)es; /* no mass prune — EIP-161 handled per-tx in commit_tx */
+}
+
+void evm_state_finalize_block(evm_state_t *es, bool prune_empty) {
+    if (es) state_finalize_block(es->st, prune_empty);
 }
 
 /* =========================================================================

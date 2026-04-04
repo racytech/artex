@@ -76,6 +76,33 @@ add_library(common STATIC
 )
 target_link_libraries(common snappy)
 
+# Keccak AVX2 (4-way parallel)
+add_library(keccak_avx2 STATIC common/src/keccak256_avx2.c)
+target_include_directories(keccak_avx2 PUBLIC ${CMAKE_SOURCE_DIR}/common/include)
+target_compile_options(keccak_avx2 PRIVATE -mavx2)
+
+add_executable(bench_keccak_avx2 common/tests/bench_keccak_avx2.c)
+target_link_libraries(bench_keccak_avx2 keccak_avx2 common)
+target_compile_options(bench_keccak_avx2 PRIVATE -mavx2)
+
+add_executable(test_keccak_avx2 common/tests/test_keccak_avx2.c)
+target_link_libraries(test_keccak_avx2 keccak_avx2 common)
+target_compile_options(test_keccak_avx2 PRIVATE -mavx2)
+add_test(NAME test_keccak_avx2 COMMAND test_keccak_avx2)
+
+# Keccak AVX-512 (8-way parallel)
+add_library(keccak_avx512 STATIC common/src/keccak256_avx512.c)
+target_include_directories(keccak_avx512 PUBLIC ${CMAKE_SOURCE_DIR}/common/include)
+target_compile_options(keccak_avx512 PRIVATE -mavx512f -mavx512vl)
+
+add_executable(bench_keccak_all common/tests/bench_keccak_all.c)
+target_link_libraries(bench_keccak_all keccak_avx512 keccak_avx2 common)
+target_compile_options(bench_keccak_all PRIVATE -mavx2 -mavx512f -mavx512vl)
+
+add_executable(fuzz_keccak common/tests/fuzz_keccak.c)
+target_link_libraries(fuzz_keccak keccak_avx512 keccak_avx2 common)
+target_compile_options(fuzz_keccak PRIVATE -mavx2 -mavx512f -mavx512vl)
+
 #==============================================================================
 # Libraries — Crypto
 #==============================================================================

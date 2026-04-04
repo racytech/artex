@@ -462,6 +462,11 @@ bool sync_execute_block_live(sync_t *sync,
 
     uint64_t bn = header->number;
 
+    /* Skip expensive root hash except at checkpoint intervals */
+    uint32_t ci2 = sync->config.checkpoint_interval > 0
+                 ? sync->config.checkpoint_interval : 256;
+    sync->evm->skip_root_hash = (bn % ci2 != 0);
+
     /* Execute block (block_hashes contains hashes up to block bn-1) */
     block_result_t br = block_execute(sync->evm, header, body,
                                       sync->block_hashes
@@ -492,8 +497,10 @@ bool sync_execute_block_live(sync_t *sync,
         return true;
     }
 
-    /* Immediate state root validation */
-    if (sync->config.validate_state_root) {
+    /* Periodic state root validation (every checkpoint_interval blocks) */
+    uint32_t ci = sync->config.checkpoint_interval > 0
+                ? sync->config.checkpoint_interval : 256;
+    if (sync->config.validate_state_root && bn % ci == 0) {
 
         bool prune_empty = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
         hash_t actual = evm_state_compute_mpt_root(sync->state, prune_empty);

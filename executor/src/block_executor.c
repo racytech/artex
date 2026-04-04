@@ -714,9 +714,11 @@ block_result_t block_execute(evm_t *evm,
     }
 #endif
 
-    /* Compute state root — prune empty accounts post-Spurious Dragon (EIP-161). */
+    /* Compute state root — prune empty accounts post-Spurious Dragon (EIP-161).
+     * When skip_root_hash is set, skip the expensive hash but still prune. */
     bool prune_empty = (evm->fork >= FORK_SPURIOUS_DRAGON);
-    result.state_root = evm_state_compute_state_root_ex(evm->state, prune_empty);
+    result.state_root = evm_state_compute_state_root_ex2(
+        evm->state, prune_empty, !evm->skip_root_hash);
     result.gas_used = cumulative_gas;
 
     return result;

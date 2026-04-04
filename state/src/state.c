@@ -1156,7 +1156,7 @@ state_stats_t state_get_stats(const state_t *s) {
  * save/load — TODO: implement serialization
  * ========================================================================= */
 
-hash_t state_compute_root(state_t *s, bool prune_empty) {
+hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     hash_t root = {0};
     if (!s) return root;
 
@@ -1232,8 +1232,9 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
 
     #undef SAFE_DELETE_IDX
 
-    /* Step 3: Compute account trie root */
-    hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
+    /* Step 3: Compute account trie root (skip if compute_hash is false) */
+    if (compute_hash)
+        hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
 
     /* Step 4: Clear dirty flags */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
@@ -1246,6 +1247,72 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
     dirty_clear(&s->blk_dirty);
 
     return root;
+}
+
+hash_t state_compute_root(state_t *s, bool prune_empty) {
+    return state_compute_root_ex(s, prune_empty, true);
+}
+
+void state_finalize_block(state_t *s, bool prune_empty) {
+    if (!s) return;
+
+    /* Same as state_compute_root steps 1,2,4 — but skip hash computation */
+    for (size_t d = 0; d < s->blk_dirty.count; d++) {
+        const uint8_t *akey = s->blk_dirty.keys + d * 20;
+        account_t *a = find_account(s, akey);
+        if (!a || !acct_has_flag(a, ACCT_MPT_DIRTY)) continue;
+
+        if (acct_has_flag(a, ACCT_BLOCK_DIRTY)) {
+            if (acct_has_flag(a, ACCT_SELF_DESTRUCTED))
+                acct_clear_flag(a, ACCT_EXISTED);
+            else if (!acct_is_empty(a))
+                acct_set_flag(a, ACCT_EXISTED);
+        }
+
+        hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
+        if (!acct_has_flag(a, ACCT_EXISTED) ||
+            (acct_is_empty(a) && prune_empty)) {
+            hart_delete(&s->acct_index, addr_hash.bytes);
+        }
+    }
+
+    #define SAFE_DELETE_IDX(i) do { \
+        if ((i) < s->count) { \
+            account_t *_a = &s->accounts[(i)]; \
+            if (!acct_has_flag(_a, ACCT_EXISTED) || \
+                (acct_is_empty(_a) && prune_empty)) { \
+                hash_t _h = hash_keccak256(_a->addr.bytes, 20); \
+                const uint32_t *_p = (const uint32_t *) \
+                    hart_get(&s->acct_index, _h.bytes); \
+                if (_p && *_p == (i)) \
+                    hart_delete(&s->acct_index, _h.bytes); \
+            } \
+        } \
+    } while(0)
+
+    for (uint32_t pi = 0; pi < s->phantom_count; pi++)
+        SAFE_DELETE_IDX(s->phantoms[pi]);
+    for (uint32_t di = 0; di < s->destructed_count; di++)
+        SAFE_DELETE_IDX(s->destructed[di]);
+    for (uint32_t ri = 0; ri < s->pruned_count; ri++)
+        SAFE_DELETE_IDX(s->pruned[ri]);
+
+    s->dead_total += s->phantom_count + s->destructed_count + s->pruned_count;
+    s->phantom_count = 0;
+    s->destructed_count = 0;
+    s->pruned_count = 0;
+
+    #undef SAFE_DELETE_IDX
+
+    /* Clear dirty flags (no hash computed — they stay dirty for next compute_root) */
+    for (size_t d = 0; d < s->blk_dirty.count; d++) {
+        const uint8_t *akey = s->blk_dirty.keys + d * 20;
+        account_t *a = find_account(s, akey);
+        if (!a) continue;
+        acct_clear_flag(a, ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY |
+                        ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
+    }
+    dirty_clear(&s->blk_dirty);
 }
 
 uint32_t state_dead_count(const state_t *s) {

@@ -217,6 +217,9 @@ struct evm_t
 
     // Precomputed JUMPDEST bitmap (valid during evm_interpret, NULL otherwise)
     const uint8_t *jumpdest_bitmap;
+
+    // Block executor: skip MPT root hash computation (still prunes empty accounts)
+    bool skip_root_hash;
 };
 
 //==============================================================================
