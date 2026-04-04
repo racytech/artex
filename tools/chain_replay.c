@@ -465,6 +465,8 @@ int main(int argc, char **argv) {
     uint64_t save_state_block = UINT64_MAX;
     const char *save_state_path = NULL;
     const char *load_state_path = NULL;
+    bool no_validate = false;
+    uint64_t snapshot_every = 0;  /* 0 = disabled */
 #ifdef ENABLE_HISTORY
     bool no_history = false;
 #endif
@@ -512,6 +514,12 @@ int main(int argc, char **argv) {
             trace_block = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
 #endif
+        } else if (strcmp(argv[1 + arg_offset], "--no-validate") == 0) {
+            no_validate = true;
+            arg_offset++;
+        } else if (strcmp(argv[1 + arg_offset], "--snapshot-every") == 0 && arg_offset + 2 < argc) {
+            snapshot_every = (uint64_t)atoll(argv[2 + arg_offset]);
+            arg_offset += 2;
         } else if (strcmp(argv[1 + arg_offset], "--save-state") == 0 && arg_offset + 2 < argc) {
             save_state_block = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
@@ -543,6 +551,8 @@ int main(int argc, char **argv) {
             "  --resume              Resume from existing MPT state (reads .meta)\n"
             "  --no-history          Disable per-block state diff history\n"
             "  --trace-block N       Enable EIP-3155 EVM trace for block N (to stderr)\n"
+            "  --no-validate         Skip all root validation, compute once at end\n"
+            "  --snapshot-every N    Auto-save state every N blocks (e.g. 1000000)\n"
             "  --save-state N [P]    Save full state after block N to binary file P\n"
             "                        (default: state_<N>.bin)\n"
             "  --load-state P        Load state from binary file P, resume from that block\n"
@@ -656,7 +666,7 @@ int main(int argc, char **argv) {
         .verkle_commit_dir   = NULL,
         .mpt_path            = NULL,
         .checkpoint_interval = validate_every,
-        .validate_state_root = true,
+        .validate_state_root = !no_validate,
 #ifdef ENABLE_DEBUG
         .no_evict            = no_evict,
 #endif
@@ -1325,6 +1335,19 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* --snapshot-every: auto-save state at regular intervals */
+        if (snapshot_every > 0 && bn % snapshot_every == 0) {
+            state_t *st = evm_state_get_state(sync_get_state(sync));
+            char snap_path[256];
+            snprintf(snap_path, sizeof(snap_path), "%s/state_%lu.bin",
+                     data_dir, bn);
+            if (state_save(st, snap_path, &header.state_root)) {
+                state_stats_t ss = state_get_stats(st);
+                fprintf(stderr, "  snapshot @%lu: %u accts, %.0fMB → %s\n",
+                        bn, ss.account_count, ss.total_tracked / 1e6, snap_path);
+            }
+        }
+
         bool block_ok = result.ok;
 
         block_body_free(&body);
@@ -1459,6 +1482,51 @@ int main(int argc, char **argv) {
 
             LOG_ERROR("First failure at block %lu - stopping.", bn);
             break;
+        }
+    }
+
+    /* --no-validate: compute and verify root at the last processed block */
+    if (no_validate) {
+        sync_status_t fst = sync_get_status(sync);
+        uint64_t last = fst.last_block;
+        if (last > 0) {
+            fprintf(stderr, "\nComputing final state root at block %lu...\n", last);
+            evm_state_t *es = sync_get_state(sync);
+            bool prune = (last >= 2675000);
+            struct timespec _fr0, _fr1;
+            clock_gettime(CLOCK_MONOTONIC, &_fr0);
+            hash_t actual = evm_state_compute_mpt_root(es, prune);
+            clock_gettime(CLOCK_MONOTONIC, &_fr1);
+            double fr_ms = (_fr1.tv_sec - _fr0.tv_sec) * 1000.0 +
+                           (_fr1.tv_nsec - _fr0.tv_nsec) / 1e6;
+
+            /* Read expected root from era1 header */
+            hash_t expected = {0};
+            if (archive_ensure(&archive, last, false, era1_dir)) {
+                uint8_t *h_rlp = NULL; size_t h_len = 0;
+                uint8_t *b_rlp = NULL; size_t b_len = 0;
+                if (era1_read_block(&archive.current, last,
+                                     &h_rlp, &h_len, &b_rlp, &b_len)) {
+                    block_header_t hdr;
+                    if (block_header_decode_rlp(&hdr, h_rlp, h_len))
+                        expected = hdr.state_root;
+                    free(h_rlp); free(b_rlp);
+                }
+            }
+
+            char got_hex[67], exp_hex[67];
+            hash_to_hex(&actual, got_hex);
+            hash_to_hex(&expected, exp_hex);
+
+            if (memcmp(actual.bytes, expected.bytes, 32) == 0) {
+                fprintf(stderr, "  PASS: root matches at block %lu (%.0fms)\n",
+                        last, fr_ms);
+            } else {
+                fprintf(stderr, "  FAIL: root mismatch at block %lu (%.0fms)\n",
+                        last, fr_ms);
+                fprintf(stderr, "  got:      %s\n", got_hex);
+                fprintf(stderr, "  expected: %s\n", exp_hex);
+            }
         }
     }
 
