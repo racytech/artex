@@ -321,6 +321,11 @@ target_link_libraries(bench_hart_root hashed_art common)
 add_executable(bench_hart_profile database/tests/bench_hart_profile.c)
 target_link_libraries(bench_hart_profile hashed_art common)
 
+add_executable(test_state_save_load state/tests/test_state_save_load.c)
+target_link_libraries(test_state_save_load state evm)
+target_include_directories(test_state_save_load PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
+add_test(NAME test_state_save_load COMMAND test_state_save_load)
+
 add_executable(test_state_compaction state/tests/test_state_compaction.c)
 target_link_libraries(test_state_compaction state evm)
 target_include_directories(test_state_compaction PRIVATE ${CMAKE_SOURCE_DIR}/state/include)

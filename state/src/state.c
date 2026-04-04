@@ -496,6 +496,10 @@ void state_begin_block(state_t *s, uint64_t block_number) {
     if (s) s->current_block = block_number;
 }
 
+uint64_t state_get_block(const state_t *s) {
+    return s ? s->current_block : 0;
+}
+
 void state_set_prune_empty(state_t *s, bool enabled) {
     if (s) s->prune_empty = enabled;
 }
@@ -859,26 +863,21 @@ void state_revert(state_t *s, uint32_t snap) {
         case JE_NONCE:
             if (a) {
                 a->nonce = je->data.nonce.val;
-                /* RIPEMD (0x03): don't restore any dirty flags — keep them all
-                 * so EIP-161 prunes it even when the touching CALL reverts.
-                 * All others: restore flags but preserve MPT_DIRTY + BLOCK_DIRTY. */
-                if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0) {
-                    /* leave flags as-is */
-                } else {
-                    a->flags = je->data.nonce.flags |
-                               (a->flags & (ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY));
-                }
+                /* RIPEMD (0x03): keep dirty flags so EIP-161 can prune after OOG revert.
+                 * See geth journal.go:touchChange. Tested to 4M+ blocks (2c08d3a). */
+                if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0)
+                    a->flags = je->data.nonce.flags | (a->flags & (ACCT_DIRTY | ACCT_BLOCK_DIRTY | ACCT_MPT_DIRTY));
+                else
+                    a->flags = je->data.nonce.flags;
             }
             break;
         case JE_BALANCE:
             if (a) {
                 a->balance = je->data.balance.val;
-                if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0) {
-                    /* leave flags as-is */
-                } else {
-                    a->flags = je->data.balance.flags |
-                               (a->flags & (ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY));
-                }
+                if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0)
+                    a->flags = je->data.balance.flags | (a->flags & (ACCT_DIRTY | ACCT_BLOCK_DIRTY | ACCT_MPT_DIRTY));
+                else
+                    a->flags = je->data.balance.flags;
             }
             break;
         case JE_CODE:
@@ -1350,14 +1349,212 @@ void state_compact(state_t *s) {
     s->dead_total = 0;
 }
 
-bool state_load(state_t *s, const char *path) {
-    (void)s; (void)path;
-    /* TODO: implement */
+/* =========================================================================
+ * Save / Load — binary snapshot of full state
+ *
+ * Format (little-endian):
+ *   Header:  magic("ART1", 4) + block_number(8) + state_root(32) + account_count(4)
+ *   Per account:
+ *     addr(20) + nonce(8) + balance(32) + code_hash(32) + storage_root(32) +
+ *     code_size(4) + storage_count(4)
+ *     [storage_count × (key(32) + value(32))]
+ *
+ * Code bytes are NOT saved — code_store has them on disk.
+ * On load, acct_index and storage harts are rebuilt from scratch.
+ * ========================================================================= */
+
+#define STATE_MAGIC "ART1"
+
+static bool write_all(FILE *f, const void *buf, size_t n) {
+    return fwrite(buf, 1, n, f) == n;
+}
+
+static bool read_all(FILE *f, void *buf, size_t n) {
+    return fread(buf, 1, n, f) == n;
+}
+
+bool state_save(const state_t *s, const char *path, const hash_t *state_root) {
+    if (!s || !path) return false;
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+
+    /* Count live accounts */
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < s->count; i++) {
+        if (acct_has_flag(&s->accounts[i], ACCT_EXISTED)) live++;
+    }
+
+    /* Header */
+    static const uint8_t zero_root[32] = {0};
+    if (!write_all(f, STATE_MAGIC, 4)) goto fail;
+    if (!write_all(f, &s->current_block, 8)) goto fail;
+    if (!write_all(f, state_root ? state_root->bytes : zero_root, 32)) goto fail;
+    if (!write_all(f, &live, 4)) goto fail;
+
+    /* Accounts */
+    for (uint32_t i = 0; i < s->count; i++) {
+        const account_t *a = &s->accounts[i];
+        if (!acct_has_flag(a, ACCT_EXISTED)) continue;
+
+        if (!write_all(f, a->addr.bytes, 20)) goto fail;
+        if (!write_all(f, &a->nonce, 8)) goto fail;
+        if (!write_all(f, &a->balance, 32)) goto fail;
+
+        /* Code hash + storage root (from resource, or defaults) */
+        const resource_t *r = (a->resource_idx > 0 && a->resource_idx < s->res_count)
+                              ? &s->resources[a->resource_idx] : NULL;
+
+        const uint8_t *ch = (r && acct_has_flag(a, ACCT_HAS_CODE))
+                            ? r->code_hash.bytes : EMPTY_CODE_HASH.bytes;
+        const uint8_t *sr = r ? r->storage_root.bytes : EMPTY_STORAGE_ROOT.bytes;
+
+        if (!write_all(f, ch, 32)) goto fail;
+        if (!write_all(f, sr, 32)) goto fail;
+
+        /* Code size (for reference; code itself is in code_store) */
+        uint32_t code_size = (r && acct_has_flag(a, ACCT_HAS_CODE)) ? r->code_size : 0;
+        if (!write_all(f, &code_size, 4)) goto fail;
+
+        /* Storage entries */
+        uint32_t stor_count = 0;
+        if (r && r->storage) stor_count = (uint32_t)hart_size(r->storage);
+        if (!write_all(f, &stor_count, 4)) goto fail;
+
+        if (stor_count > 0 && r->storage) {
+            hart_iter_t *it = hart_iter_create(r->storage);
+            if (it) {
+                while (hart_iter_next(it)) {
+                    if (!write_all(f, hart_iter_key(it), 32)) {
+                        hart_iter_destroy(it); goto fail;
+                    }
+                    if (!write_all(f, hart_iter_value(it), 32)) {
+                        hart_iter_destroy(it); goto fail;
+                    }
+                }
+                hart_iter_destroy(it);
+            }
+        }
+    }
+
+    fclose(f);
+    return true;
+fail:
+    fclose(f);
     return false;
 }
 
-bool state_save(const state_t *s, const char *path) {
-    (void)s; (void)path;
-    /* TODO: implement */
+bool state_load(state_t *s, const char *path, hash_t *out_root) {
+    if (!s || !path) return false;
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+
+    /* Header */
+    char magic[4];
+    if (!read_all(f, magic, 4) || memcmp(magic, STATE_MAGIC, 4) != 0) goto fail;
+    uint64_t block_number;
+    if (!read_all(f, &block_number, 8)) goto fail;
+    hash_t saved_root;
+    if (!read_all(f, &saved_root, 32)) goto fail;
+    if (out_root) *out_root = saved_root;
+    uint32_t acct_count;
+    if (!read_all(f, &acct_count, 4)) goto fail;
+
+    /* Reset state */
+    hart_destroy(&s->acct_index);
+    hart_init(&s->acct_index, sizeof(uint32_t));
+    for (uint32_t i = 1; i < s->res_count; i++) {
+        resource_t *r = &s->resources[i];
+        if (r->storage) { hart_destroy(r->storage); free(r->storage); r->storage = NULL; }
+        free(r->code); r->code = NULL;
+    }
+    s->count = 0;
+    s->res_count = 1; /* slot 0 reserved */
+    s->current_block = block_number;
+
+    /* Load accounts */
+    for (uint32_t i = 0; i < acct_count; i++) {
+        address_t addr;
+        uint64_t nonce;
+        uint256_t balance;
+        uint8_t code_hash[32], storage_root[32];
+        uint32_t code_size, stor_count;
+
+        if (!read_all(f, addr.bytes, 20)) goto fail;
+        if (!read_all(f, &nonce, 8)) goto fail;
+        if (!read_all(f, &balance, 32)) goto fail;
+        if (!read_all(f, code_hash, 32)) goto fail;
+        if (!read_all(f, storage_root, 32)) goto fail;
+        if (!read_all(f, &code_size, 4)) goto fail;
+        if (!read_all(f, &stor_count, 4)) goto fail;
+
+        /* Grow accounts vector if needed */
+        if (s->count >= s->capacity) {
+            uint32_t nc = s->capacity * 2;
+            account_t *na = realloc(s->accounts, nc * sizeof(account_t));
+            if (!na) goto fail;
+            memset(na + s->capacity, 0, (nc - s->capacity) * sizeof(account_t));
+            s->accounts = na;
+            s->capacity = nc;
+        }
+
+        uint32_t idx = s->count++;
+        account_t *a = &s->accounts[idx];
+        memset(a, 0, sizeof(*a));
+        a->addr = addr;
+        a->nonce = nonce;
+        a->balance = balance;
+        a->flags = ACCT_EXISTED;
+
+        /* Insert into acct_index */
+        hash_t addr_hash = hash_keccak256(addr.bytes, 20);
+        hart_insert(&s->acct_index, addr_hash.bytes, &idx);
+
+        bool has_code = memcmp(code_hash, EMPTY_CODE_HASH.bytes, 32) != 0;
+        bool has_stor = stor_count > 0 ||
+                        memcmp(storage_root, EMPTY_STORAGE_ROOT.bytes, 32) != 0;
+
+        if (has_code || has_stor) {
+            /* Allocate resource */
+            if (s->res_count >= s->res_capacity) {
+                uint32_t nc = s->res_capacity * 2;
+                resource_t *nr = realloc(s->resources, nc * sizeof(resource_t));
+                if (!nr) goto fail;
+                memset(nr + s->res_capacity, 0, (nc - s->res_capacity) * sizeof(resource_t));
+                s->resources = nr;
+                s->res_capacity = nc;
+            }
+            uint32_t ridx = s->res_count++;
+            a->resource_idx = ridx;
+            resource_t *r = &s->resources[ridx];
+            memset(r, 0, sizeof(*r));
+            memcpy(r->code_hash.bytes, code_hash, 32);
+            memcpy(r->storage_root.bytes, storage_root, 32);
+            r->code_size = code_size;
+
+            if (has_code) acct_set_flag(a, ACCT_HAS_CODE);
+
+            /* Load storage */
+            if (stor_count > 0) {
+                r->storage = calloc(1, sizeof(hart_t));
+                if (!r->storage) goto fail;
+                if (!hart_init_cap(r->storage, STOR_VAL_SIZE, STOR_INIT_CAP)) {
+                    free(r->storage); r->storage = NULL; goto fail;
+                }
+                for (uint32_t j = 0; j < stor_count; j++) {
+                    uint8_t skey[32], sval[32];
+                    if (!read_all(f, skey, 32)) goto fail;
+                    if (!read_all(f, sval, 32)) goto fail;
+                    hart_insert(r->storage, skey, sval);
+                }
+            }
+        }
+    }
+
+    fclose(f);
+    fprintf(stderr, "state_load: %u accounts from %s (block %lu)\n",
+            acct_count, path, block_number);
+    return true;
+fail:
+    fclose(f);
     return false;
 }

@@ -413,7 +413,7 @@ bool sync_execute_block(sync_t *sync,
             /* Compact when dead accounts accumulate (>10K or >10% of total) */
             state_stats_t ss = state_get_stats(st);
             uint32_t dead = state_dead_count(st);
-            if (dead > 10000 || (ss.account_count > 0 && dead > ss.account_count / 10))
+            if (0 && (dead > 10000 || (ss.account_count > 0 && dead > ss.account_count / 10)))
                 do_compact = true;
         }
 

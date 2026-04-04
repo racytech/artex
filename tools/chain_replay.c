@@ -462,6 +462,9 @@ int main(int argc, char **argv) {
 #endif
     uint64_t dump_prestate_block = UINT64_MAX;
     const char *dump_prestate_path = NULL;
+    uint64_t save_state_block = UINT64_MAX;
+    const char *save_state_path = NULL;
+    const char *load_state_path = NULL;
 #ifdef ENABLE_HISTORY
     bool no_history = false;
 #endif
@@ -509,6 +512,12 @@ int main(int argc, char **argv) {
             trace_block = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
 #endif
+        } else if (strcmp(argv[1 + arg_offset], "--save-state") == 0 && arg_offset + 2 < argc) {
+            save_state_block = (uint64_t)atoll(argv[2 + arg_offset]);
+            arg_offset += 2;
+        } else if (strcmp(argv[1 + arg_offset], "--load-state") == 0 && arg_offset + 2 < argc) {
+            load_state_path = argv[2 + arg_offset];
+            arg_offset += 2;
         } else if (strcmp(argv[1 + arg_offset], "--dump-prestate") == 0 && arg_offset + 2 < argc) {
             dump_prestate_block = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
@@ -534,6 +543,9 @@ int main(int argc, char **argv) {
             "  --resume              Resume from existing MPT state (reads .meta)\n"
             "  --no-history          Disable per-block state diff history\n"
             "  --trace-block N       Enable EIP-3155 EVM trace for block N (to stderr)\n"
+            "  --save-state N [P]    Save full state after block N to binary file P\n"
+            "                        (default: state_<N>.bin)\n"
+            "  --load-state P        Load state from binary file P, resume from that block\n"
             "  --dump-prestate N [P] Dump pre-state alloc.json for block N to path P\n"
             "                        (default: alloc_<N>.json). Two-pass: executes block\n"
             "                        to discover accessed accounts, then reloads checkpoint\n"
@@ -679,7 +691,50 @@ int main(int argc, char **argv) {
 
     uint64_t start_block = (user_start > 0) ? user_start : 1;
 
-    if (resume_mode) {
+    if (load_state_path) {
+        /* Load state from binary snapshot */
+        evm_state_t *es = sync_get_state(sync);
+        state_t *st = evm_state_get_state(es);
+        hash_t loaded_root;
+        if (!state_load(st, load_state_path, &loaded_root)) {
+            LOG_ERR("Failed to load state from %s", load_state_path);
+#ifdef ENABLE_TUI
+            if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
+#endif
+            sync_destroy(sync);
+            archive_close(&archive);
+            return 1;
+        }
+        state_stats_t ss = state_get_stats(st);
+        /* current_block was set by state_load */
+        uint64_t loaded_block = state_get_block(st);
+        start_block = loaded_block + 1;
+        char root_hex[67];
+        hash_to_hex(&loaded_root, root_hex);
+        LOG_INFO("Loaded state: %u accounts at block %lu from %s (root: %s)",
+                 ss.account_count, loaded_block, load_state_path, root_hex);
+
+        /* Populate block hash ring from era1 */
+        uint64_t hash_start = loaded_block >= 256 ? loaded_block - 255 : 0;
+        size_t hash_count = (size_t)(loaded_block - hash_start + 1);
+        hash_t *hashes = calloc(hash_count, sizeof(hash_t));
+        if (hashes) {
+            for (uint64_t i = 0; i < hash_count; i++) {
+                uint64_t hbn = hash_start + i;
+                if (archive_ensure(&archive, hbn, false, era1_dir)) {
+                    uint8_t *h_rlp = NULL; size_t h_len = 0;
+                    uint8_t *b_rlp = NULL; size_t b_len = 0;
+                    if (era1_read_block(&archive.current, hbn,
+                                         &h_rlp, &h_len, &b_rlp, &b_len)) {
+                        hashes[i] = hash_keccak256(h_rlp, h_len);
+                        free(h_rlp); free(b_rlp);
+                    }
+                }
+            }
+            sync_resume(sync, loaded_block, hashes, hash_count);
+            free(hashes);
+        }
+    } else if (resume_mode) {
         /* Read .meta to find last good block */
         char meta_path[512];
         snprintf(meta_path, sizeof(meta_path), "%s.meta", mpt_path);
@@ -1244,6 +1299,26 @@ int main(int argc, char **argv) {
             free(hdr_rlp);
             free(body_rlp);
             break;
+        }
+
+        /* --save-state: save full state after target block */
+        if (bn == save_state_block) {
+            state_t *st = evm_state_get_state(sync_get_state(sync));
+            char default_save[256];
+            const char *sp = save_state_path;
+            if (!sp) {
+                snprintf(default_save, sizeof(default_save),
+                         "state_%lu.bin", bn);
+                sp = default_save;
+            }
+            fprintf(stderr, "Saving state at block %lu to %s...\n", bn, sp);
+            if (state_save(st, sp, &header.state_root)) {
+                state_stats_t ss = state_get_stats(st);
+                fprintf(stderr, "  saved: %u accounts, %.0fMB tracked\n",
+                        ss.account_count, ss.total_tracked / 1e6);
+            } else {
+                fprintf(stderr, "  FAILED to save state!\n");
+            }
         }
 
         bool block_ok = result.ok;

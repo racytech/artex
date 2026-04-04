@@ -30,9 +30,11 @@ typedef struct state state_t;
 state_t *state_create(code_store_t *cs);
 void     state_destroy(state_t *s);
 
-/* Load/save full state to file (graceful shutdown / restart) */
-bool state_load(state_t *s, const char *path);
-bool state_save(const state_t *s, const char *path);
+/* Load/save full state to file (graceful shutdown / restart).
+ * state_save stores the given state_root in the header.
+ * state_load returns the stored root via out_root (if non-NULL). */
+bool state_load(state_t *s, const char *path, hash_t *out_root);
+bool state_save(const state_t *s, const char *path, const hash_t *state_root);
 
 /* =========================================================================
  * Account access
@@ -104,6 +106,7 @@ void state_commit_block(state_t *s);
 
 /* Set current block number (for LRU tracking) */
 void state_begin_block(state_t *s, uint64_t block_number);
+uint64_t state_get_block(const state_t *s);
 
 /* EIP-161: enable empty account pruning post-Spurious Dragon */
 void state_set_prune_empty(state_t *s, bool enabled);
