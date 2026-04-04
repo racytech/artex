@@ -351,6 +351,7 @@ bool sync_execute_block(sync_t *sync,
     clock_gettime(CLOCK_MONOTONIC, &_exec1);
     sync->exec_ms += (_exec1.tv_sec - _exec0.tv_sec) * 1000.0 +
                      (_exec1.tv_nsec - _exec0.tv_nsec) / 1e6;
+    sync->root_ms += br.root_ms;
 
     /* Store current block's hash AFTER execution so it doesn't overwrite
      * the hash 256 blocks ago (same ring buffer slot) during execution. */
@@ -399,6 +400,7 @@ bool sync_execute_block(sync_t *sync,
             sync->last_stats = evm_state_get_stats(sync->state);
             sync->last_stats.exec_ms = sync->exec_ms;
             sync->exec_ms = 0;
+            sync->root_ms = 0;
         }
     }
 

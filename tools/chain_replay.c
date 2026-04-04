@@ -1267,9 +1267,13 @@ int main(int argc, char **argv) {
                        ms.total_tracked / (1024*1024),
                        rss_mb);
                 {
+                    double root_ms = ss.wait_flush_ms;
+                    double evm_ms = ss.exec_ms - root_ms;
                     double other_ms = win_secs * 1000.0 - ss.exec_ms;
-                    printf("  └ exec=%.0fms  other=%.0fms\n",
-                           ss.exec_ms, other_ms > 0 ? other_ms : 0);
+                    printf("  └ evm=%.0fms  root=%.0fms  other=%.0fms\n",
+                           evm_ms > 0 ? evm_ms : 0,
+                           root_ms,
+                           other_ms > 0 ? other_ms : 0);
                 }
             }
             window_txs = 0;

@@ -60,6 +60,7 @@ typedef struct {
 
     uint32_t    transfer_count;  /* simple ETH transfers (no code, no calldata) */
     uint32_t    call_count;      /* contract calls / creates */
+    double      root_ms;         /* time spent in state root computation */
 } block_result_t;
 
 /**
