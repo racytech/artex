@@ -386,7 +386,7 @@ bool sync_execute_block(sync_t *sync,
         br.receipts = NULL;
         br.receipt_count = 0;
         sync->blocks_fail++;
-    } else if (sync->config.validate_state_root &&
+    } else if (sync->config.validate_state_root && !sync->evm->skip_root_hash &&
                memcmp(br.state_root.bytes, header->state_root.bytes, 32) != 0) {
         result->ok    = false;
         result->error = SYNC_ROOT_MISMATCH;

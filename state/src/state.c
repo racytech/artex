@@ -1288,7 +1288,7 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
         if (s->storage_roots_stale) {
             for (uint32_t i = 1; i < s->res_count; i++) {
                 resource_t *r = &s->resources[i];
-                if (r->storage && hart_is_dirty(r->storage))
+                if (r->storage)
                     hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
             }
             s->storage_roots_stale = false;
