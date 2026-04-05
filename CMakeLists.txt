@@ -378,6 +378,11 @@ target_include_directories(mpt_fuzz PRIVATE
 )
 target_link_libraries(mpt_fuzz mem_mpt hashed_art common)
 
+add_executable(test_eviction state/tests/test_eviction.c)
+target_link_libraries(test_eviction state evm)
+target_include_directories(test_eviction PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
+add_test(NAME test_eviction COMMAND test_eviction)
+
 #==============================================================================
 # Tests — Networking
 #==============================================================================
