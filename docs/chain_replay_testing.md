@@ -3,7 +3,7 @@
 ## Full Run (from genesis)
 
 ```bash
-./chain_replay --no-tui --data-dir <dir> <era1_dir> <genesis.json> 0 <end_block>
+./chain_replay --data-dir <dir> <era1_dir> <genesis.json> 0 <end_block>
 ```
 
 State files created in `<dir>/`:
@@ -49,7 +49,7 @@ Code store (`chain_replay_code`) is read-only — already populated from step 1.
 ### 5. Resume chain_replay from C+1
 
 ```bash
-./chain_replay --resume --no-tui --data-dir <dir> <era1_dir> <genesis.json> <C+1> <end>
+./chain_replay --resume --data-dir <dir> <era1_dir> <genesis.json> <C+1> <end>
 ```
 
 Resume flow:
@@ -85,7 +85,6 @@ Truncation: `state_history_truncate(sh, last_block)` — already implemented.
 
 | Flag | Description |
 |------|-------------|
-| `--no-tui` | Disable ncurses UI |
 | `--clean` | Delete state files, start fresh |
 | `--data-dir DIR` | State file directory (default: `data/`) |
 | `--resume` | Resume from `.meta` (truncates history to safe block) |

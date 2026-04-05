@@ -24,9 +24,6 @@
 #include <sys/stat.h>
 #include <pthread.h>
 #include "evm_tracer.h"
-#ifdef ENABLE_TUI
-#include "tui.h"
-#endif
 #include "logger.h"
 
 #ifdef ENABLE_DEBUG
@@ -470,7 +467,6 @@ int main(int argc, char **argv) {
 #ifdef ENABLE_HISTORY
     bool no_history = false;
 #endif
-    bool use_tui = true;
     uint32_t validate_every = CHECKPOINT_INTERVAL;
     /* Default data dir: ~/.artex */
     char default_data_dir[512];
@@ -480,10 +476,7 @@ int main(int argc, char **argv) {
     const char *data_dir = default_data_dir;
     int arg_offset = 0;
     while (arg_offset + 1 < argc && argv[1 + arg_offset][0] == '-') {
-        if (strcmp(argv[1 + arg_offset], "--no-tui") == 0) {
-            use_tui = false;
-            arg_offset++;
-        } else if (strcmp(argv[1 + arg_offset], "--clean") == 0) {
+        if (strcmp(argv[1 + arg_offset], "--clean") == 0) {
             force_clean = true;
             arg_offset++;
         } else if (strcmp(argv[1 + arg_offset], "--follow") == 0) {
@@ -544,7 +537,6 @@ int main(int argc, char **argv) {
             "Usage: %s [options] <era1_dir> <genesis.json> [start_block] [end_block]\n"
             "\n"
             "Options:\n"
-            "  --no-tui              Disable ncurses terminal UI\n"
             "  --clean               Delete existing state files, start from genesis\n"
             "  --follow              Wait for new era1 files instead of stopping\n"
             "  --data-dir DIR        Set data directory for all state files (default: ~/.artex)\n"
@@ -585,59 +577,10 @@ int main(int argc, char **argv) {
     sa.sa_handler = sigint_handler;
     sigaction(SIGINT, &sa, NULL);  /* intentionally no SA_RESTART for SIGINT */
 
-    /* Initialize TUI before heavy work so user sees progress */
-#ifdef ENABLE_TUI
-    if (use_tui) {
-        if (!tui_init()) {
-            use_tui = false;
-        } else {
-            freopen("/dev/null", "w", stdout);
-            freopen("/tmp/chain_replay_tui.log", "w", stderr);
-
-            /* Build info bar */
-            char build[256];
-            snprintf(build, sizeof(build), "ARTEX  "
-                "MPT:%s  VERKLE:%s  HISTORY:%s  DEBUG:%s  EVM_TRACE:%s  CKPT:%d",
-                "ON",
-                "off",
-#ifdef ENABLE_HISTORY
-                "ON",
-#else
-                "off",
-#endif
-#ifdef ENABLE_DEBUG
-                "ON",
-#else
-                "off",
-#endif
-#ifdef ENABLE_EVM_TRACE
-                "ON",
-#else
-                "off",
-#endif
-                CHECKPOINT_INTERVAL
-            );
-            tui_set_build_info(build);
-
-            LOG_INFO("Starting chain_replay...");
-            LOG_INFO("Era1 dir: %s", era1_dir);
-            LOG_INFO("Genesis:  %s", genesis_path);
-            LOG_INFO("Data dir: %s", data_dir);
-            LOG_WARN("Press Ctrl+C for graceful shutdown");
-        }
-    }
-#else
-    (void)use_tui;
-    use_tui = false;
-#endif
-
     /* Open era1 archive */
     era1_archive_t archive;
     if (!archive_open(&archive, era1_dir)) {
         LOG_ERR("Failed to open era1 directory: %s", era1_dir);
-#ifdef ENABLE_TUI
-        if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
-#endif
         return 1;
     }
     LOG_INFO("Era1 archive: %zu files in %s", archive.count, era1_dir);
@@ -679,15 +622,9 @@ int main(int argc, char **argv) {
     cfg.code_store_path = code_path;
 
     LOG_INFO("Loading state...");
-#ifdef ENABLE_TUI
-    if (use_tui) { tui_tick(); }
-#endif
     sync_t *sync = sync_create(&cfg);
     if (!sync) {
         LOG_ERR("Failed to create sync engine");
-#ifdef ENABLE_TUI
-        if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
-#endif
         archive_close(&archive);
         return 1;
     }
@@ -711,9 +648,6 @@ int main(int argc, char **argv) {
         hash_t loaded_root;
         if (!state_load(st, load_state_path, &loaded_root)) {
             LOG_ERR("Failed to load state from %s", load_state_path);
-#ifdef ENABLE_TUI
-            if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
-#endif
             sync_destroy(sync);
             archive_close(&archive);
             return 1;
@@ -757,9 +691,6 @@ int main(int argc, char **argv) {
             meta.magic != META_MAGIC) {
             if (mf) fclose(mf);
             LOG_ERR("No valid .meta file at %s — cannot resume", meta_path);
-#ifdef ENABLE_TUI
-            if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
-#endif
             sync_destroy(sync);
             archive_close(&archive);
             return 1;
@@ -808,9 +739,6 @@ int main(int argc, char **argv) {
 
         if (!sync_load_genesis(sync, genesis_path, &gen_hash)) {
             LOG_ERR("Failed to load genesis state");
-#ifdef ENABLE_TUI
-            if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
-#endif
             sync_destroy(sync);
             archive_close(&archive);
             return 1;
@@ -825,10 +753,7 @@ int main(int argc, char **argv) {
         ? (uint64_t)(archive.count * ERA1_BLOCKS_PER_FILE - 1)
         : end_block;
 
-    if (!use_tui)
-        printf("Replaying blocks %lu to %lu...\n\n", start_block, display_end);
-    else
-        LOG_INFO("Replaying blocks %lu to %lu...", start_block, display_end);
+    printf("Replaying blocks %lu to %lu...\n\n", start_block, display_end);
 
     uint64_t window_txs = 0;
     uint64_t window_gas = 0;
@@ -836,17 +761,6 @@ int main(int argc, char **argv) {
     uint64_t window_calls = 0;
     struct timespec t_window;
     clock_gettime(CLOCK_MONOTONIC, &t_window);
-    struct timespec t_last_tui_update = {0, 0}; /* force immediate first update */
-
-    /* TUI rolling window — independent of checkpoint window for smooth stats */
-    uint64_t tui_window_blocks = 0;
-    uint64_t tui_window_txs = 0;
-    uint64_t tui_window_gas = 0;
-    uint64_t tui_window_transfers = 0;
-    uint64_t tui_window_calls = 0;
-    struct timespec t_tui_window;
-    clock_gettime(CLOCK_MONOTONIC, &t_tui_window);
-    #define TUI_WINDOW_SECS 2.0  /* reset rolling window every 2s */
 
 
     /* Start block prefetch thread */
@@ -855,9 +769,6 @@ int main(int argc, char **argv) {
         LOG_ERR("Failed to start block prefetch");
         sync_destroy(sync);
         archive_close(&archive);
-#ifdef ENABLE_TUI
-        if (use_tui) { tui_set_finished(); while (tui_tick()) usleep(50000); tui_shutdown(); freopen("/dev/tty", "w", stdout); freopen("/dev/tty", "w", stderr); }
-#endif
         return 1;
     }
 
@@ -1125,80 +1036,6 @@ int main(int argc, char **argv) {
         window_calls += result.call_count;
         window_gas += result.gas_used;
 
-#ifdef ENABLE_TUI
-        if (use_tui) {
-            tui_window_blocks++;
-            tui_window_txs += result.tx_count;
-            tui_window_gas += result.gas_used;
-            tui_window_transfers += result.transfer_count;
-            tui_window_calls += result.call_count;
-
-            if (!tui_tick()) {
-                g_shutdown = 1;
-                g_shutdown_pending = true;
-            }
-            /* Update stats panel every ~0.5s for live feel */
-            struct timespec t_tui_now;
-            clock_gettime(CLOCK_MONOTONIC, &t_tui_now);
-            double tui_dt = (t_tui_now.tv_sec - t_last_tui_update.tv_sec) +
-                            (t_tui_now.tv_nsec - t_last_tui_update.tv_nsec) / 1e9;
-            if (tui_dt >= 0.5) {
-                double elapsed = (t_tui_now.tv_sec - t_start.tv_sec) +
-                                 (t_tui_now.tv_nsec - t_start.tv_nsec) / 1e9;
-                double tui_win = (t_tui_now.tv_sec - t_tui_window.tv_sec) +
-                                 (t_tui_now.tv_nsec - t_tui_window.tv_nsec) / 1e9;
-                double bps = tui_window_blocks / (tui_win > 0 ? tui_win : 1);
-                double ltps = tui_window_txs / (tui_win > 0 ? tui_win : 1);
-                double lmgps = (tui_window_gas / 1e6) / (tui_win > 0 ? tui_win : 1);
-                evm_state_stats_t lss = sync_get_state_stats(sync);
-                sync_history_stats_t lhs = sync_get_history_stats(sync);
-                sync_status_t lst = sync_get_status(sync);
-                tui_stats_t ts = {
-                    .block_number     = bn,
-                    .target_block     = display_end < PARIS_BLOCK ? display_end : PARIS_BLOCK,
-                    .blocks_per_sec   = bps,
-                    .tps              = ltps,
-                    .mgas_per_sec     = lmgps,
-                    .window_secs      = tui_win,
-                    .window_txs       = tui_window_txs,
-                    .window_transfers = tui_window_transfers,
-                    .window_calls     = tui_window_calls,
-                    .checkpoint_interval = validate_every,
-                    .cache_accounts   = lss.cache_accounts,
-                    .cache_slots      = lss.cache_slots,
-                    .cache_arena_mb   = lss.cache_arena_bytes / (1024*1024),
-                    .rss_mb           = get_rss_kb() / 1024,
-                    .total_blocks_ok  = lst.blocks_ok,
-                    .total_blocks_fail = lst.blocks_fail,
-                    .elapsed_secs     = elapsed,
-                    .root_stor_ms     = lss.root_stor_ms,
-                    .root_acct_ms     = lss.root_acct_ms,
-                    .root_dirty_count = lss.root_dirty_count,
-                    .flat_acct_count = lss.flat_acct_count,
-                    .flat_stor_count = lss.flat_stor_count,
-                    .code_count       = lss.code_count,
-                    .code_cache_hit_pct = (lss.code_cache_hits + lss.code_cache_misses)
-                        ? 100.0 * lss.code_cache_hits / (lss.code_cache_hits + lss.code_cache_misses) : 0,
-                    .flush_ms         = 0,
-                    .checkpoint_total_ms = 0,
-                    .history_blocks   = lhs.blocks,
-                    .history_mb       = lhs.disk_mb,
-                };
-                tui_update_stats(&ts);
-                t_last_tui_update = t_tui_now;
-
-                /* Reset rolling window if enough time has passed */
-                if (tui_win >= TUI_WINDOW_SECS) {
-                    tui_window_blocks = 0;
-                    tui_window_txs = 0;
-                    tui_window_gas = 0;
-                    tui_window_transfers = 0;
-                    tui_window_calls = 0;
-                    t_tui_window = t_tui_now;
-                }
-            }
-        }
-#endif
 
         /* Progress every CHECKPOINT_INTERVAL blocks, on failure, or last block */
         if (bn % CHECKPOINT_INTERVAL == 0 || !result.ok || bn == end_block) {
@@ -1215,44 +1052,6 @@ int main(int argc, char **argv) {
             size_t rss_mb = get_rss_kb() / 1024;
             sync_status_t st = sync_get_status(sync);
 
-#ifdef ENABLE_TUI
-            if (use_tui) {
-                tui_stats_t ts = {
-                    .block_number     = bn,
-                    .target_block     = display_end < PARIS_BLOCK ? display_end : PARIS_BLOCK,
-                    .blocks_per_sec   = bps,
-                    .tps              = tps,
-                    .mgas_per_sec     = mgps,
-                    .window_secs      = win_secs,
-                    .window_txs       = window_txs,
-                    .window_transfers = window_transfers,
-                    .window_calls     = window_calls,
-                    .checkpoint_interval = validate_every,
-                    .cache_accounts   = ss.cache_accounts,
-                    .cache_slots      = ss.cache_slots,
-                    .cache_arena_mb   = ss.cache_arena_bytes / (1024*1024),
-                    .rss_mb           = rss_mb,
-                    .total_blocks_ok  = st.blocks_ok,
-                    .total_blocks_fail = st.blocks_fail,
-                    .elapsed_secs     = elapsed,
-                    .root_stor_ms     = ss.root_stor_ms,
-                    .root_acct_ms     = ss.root_acct_ms,
-                    .root_dirty_count = ss.root_dirty_count,
-                    .flat_acct_count = ss.flat_acct_count,
-                    .flat_stor_count = ss.flat_stor_count,
-                    .code_count       = ss.code_count,
-                    .code_cache_hit_pct = (ss.code_cache_hits + ss.code_cache_misses)
-                        ? 100.0 * ss.code_cache_hits / (ss.code_cache_hits + ss.code_cache_misses) : 0,
-                    .flush_ms         = 0,
-                    .checkpoint_total_ms = 0,
-                    .history_blocks   = hs.blocks,
-                    .history_mb       = hs.disk_mb,
-                };
-                tui_update_stats(&ts);
-                if (bn % CHECKPOINT_INTERVAL == 0)
-                    LOG_INFO("Checkpoint validated at block %lu", bn);
-            } else
-#endif
             {
                 uint64_t remaining = (bn < PARIS_BLOCK) ? PARIS_BLOCK - bn : 0;
                 printf("Block %lu | %lu txs (%luT %luC) | %.0f tps | %.1f Mgas/s | %.0f blk/s | %.1fs/256blk | %luK to Paris\n",
@@ -1579,29 +1378,6 @@ int main(int argc, char **argv) {
 
     sync_status_t st = sync_get_status(sync);
 
-#ifdef ENABLE_TUI
-    if (use_tui) {
-        /* Show summary in log panel, then wait for 'q' */
-        LOG_INFO("===== Summary =====");
-        LOG_INFO("Blocks OK:     %lu", st.blocks_ok);
-        LOG_INFO("Blocks failed: %lu", st.blocks_fail);
-        LOG_INFO("Total gas:     %lu", st.total_gas);
-        LOG_INFO("Elapsed:       %.1f s", elapsed);
-        LOG_INFO("Speed:         %.0f blk/s",
-                 (st.blocks_ok + st.blocks_fail) / (elapsed > 0 ? elapsed : 1));
-
-        tui_set_finished();
-
-        /* Block until user presses 'q' */
-        while (tui_tick()) {
-            usleep(50000);  /* 50ms — responsive without burning CPU */
-        }
-
-        tui_shutdown();
-        freopen("/dev/tty", "w", stdout);
-        freopen("/dev/tty", "w", stderr);
-    } else
-#endif
     {
         printf("\n===== Summary =====\n");
         printf("Blocks OK:     %lu\n", st.blocks_ok);

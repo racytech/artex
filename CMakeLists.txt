@@ -693,22 +693,11 @@ if(CJSON_FOUND)
     target_include_directories(sync PRIVATE ${CJSON_INCLUDE_DIRS})
     set(SYNC_LIBS block_executor evm common ${CJSON_LIBRARIES} code_store)
     target_link_libraries(sync ${SYNC_LIBS})
-    # TUI (ncurses terminal UI, optional)
-    find_package(Curses QUIET)
-    if(CURSES_FOUND)
-        add_library(tui STATIC tui/src/tui.c)
-        target_include_directories(tui PUBLIC ${CMAKE_SOURCE_DIR}/tui/include)
-        target_link_libraries(tui common ${CURSES_LIBRARIES} pthread)
-    endif()
 
     # Chain replay tool
     add_executable(chain_replay tools/chain_replay.c)
     target_compile_definitions(chain_replay PRIVATE CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL})
     target_link_libraries(chain_replay sync)
-    if(CURSES_FOUND)
-        target_link_libraries(chain_replay tui)
-        target_compile_definitions(chain_replay PRIVATE ENABLE_TUI=1)
-    endif()
 
     # History query tool
     add_executable(history_query tools/history_query.c)
