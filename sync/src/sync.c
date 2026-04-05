@@ -73,6 +73,7 @@ struct sync {
     double exec_ms;        /* cumulative block_execute time per window */
     double root_ms;        /* compute_mpt_root time this window */
     uint64_t last_compact_block;  /* cooldown for compaction */
+    uint64_t last_evict_block;   /* cooldown for storage eviction */
     evm_fork_t prev_fork;  /* for SD boundary detection */
 
 #ifdef ENABLE_HISTORY
@@ -434,24 +435,40 @@ bool sync_execute_block(sync_t *sync,
                 struct timespec _c0, _c1;
                 clock_gettime(CLOCK_MONOTONIC, &_c0);
                 state_compact(st);
-
-                /* Evict cold storage harts after compaction —
-                 * compaction rebuilds harts, good time to evict cold ones */
-                uint32_t n_evicted = evm_state_evict_cold_storage(sync->state);
-
                 clock_gettime(CLOCK_MONOTONIC, &_c1);
                 state_stats_t post = state_get_stats(st);
                 double ms = (_c1.tv_sec - _c0.tv_sec) * 1000.0 +
                             (_c1.tv_nsec - _c0.tv_nsec) / 1e6;
 
-                fprintf(stderr, "  compact @%lu: %u→%u accts, %.0fMB→%.0fMB, %.0fms",
+                fprintf(stderr, "  compact @%lu: %u→%u accts, %.0fMB→%.0fMB, %.0fms\n",
                         bn, ss.account_count, post.account_count,
                         ss.total_tracked / 1e6, post.total_tracked / 1e6, ms);
-                if (n_evicted > 0)
-                    fprintf(stderr, " | evicted %u storage harts", n_evicted);
-                fprintf(stderr, "\n");
                 sync->last_compact_block = bn;
             }
+        }
+    }
+
+    /* Cold storage eviction — evict inactive storage harts to disk.
+     * Runs every 10K blocks independently of compaction. */
+    {
+        uint32_t ci_evict = sync->config.checkpoint_interval > 0
+                          ? sync->config.checkpoint_interval : 256;
+        if (bn % ci_evict == 0 && bn - sync->last_evict_block >= 10000) {
+            struct timespec _e0, _e1;
+            clock_gettime(CLOCK_MONOTONIC, &_e0);
+            uint32_t n_evicted = evm_state_evict_cold_storage(sync->state);
+            clock_gettime(CLOCK_MONOTONIC, &_e1);
+
+            if (n_evicted > 0) {
+                double ms = (_e1.tv_sec - _e0.tv_sec) * 1000.0 +
+                            (_e1.tv_nsec - _e0.tv_nsec) / 1e6;
+                state_t *st = evm_state_get_state(sync->state);
+                state_stats_t post = state_get_stats(st);
+                fprintf(stderr, "  evict @%lu: %u harts evicted, stor=%.0fMB, %.0fms\n",
+                        bn, n_evicted, post.stor_arena_bytes / 1e6, ms);
+                sync->last_evict_ms = ms;
+            }
+            sync->last_evict_block = bn;
         }
     }
 
