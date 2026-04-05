@@ -245,6 +245,7 @@ struct state {
     /* Block state */
     uint64_t current_block;
     bool     prune_empty;
+    bool     storage_roots_stale;  /* true if any block skipped storage root computation */
 };
 
 /* =========================================================================
@@ -1231,10 +1232,14 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
         }
 
         /* Compute storage root if dirty */
-        if (compute_hash && acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
-            resource_t *r = get_resource(s, a);
-            if (r && r->storage)
-                hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
+        if (acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
+            if (compute_hash) {
+                resource_t *r = get_resource(s, a);
+                if (r && r->storage)
+                    hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
+            } else {
+                s->storage_roots_stale = true;
+            }
         }
 
         /* Delete from acct_index if dead/empty */
@@ -1278,11 +1283,15 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
 
     /* Compute account trie root */
     if (compute_hash) {
-        /* Recompute stale storage roots — scan all resources for dirty harts */
-        for (uint32_t i = 1; i < s->res_count; i++) {
-            resource_t *r = &s->resources[i];
-            if (r->storage && hart_is_dirty(r->storage))
-                hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
+        /* Recompute stale storage roots — only needed if previous blocks
+         * skipped storage root computation (no-validate or checkpoint mode) */
+        if (s->storage_roots_stale) {
+            for (uint32_t i = 1; i < s->res_count; i++) {
+                resource_t *r = &s->resources[i];
+                if (r->storage && hart_is_dirty(r->storage))
+                    hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
+            }
+            s->storage_roots_stale = false;
         }
         hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
     }
