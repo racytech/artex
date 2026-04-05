@@ -35,7 +35,6 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/common/include
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/executor/include
-    ${CMAKE_SOURCE_DIR}/net/include
     ${CMAKE_SOURCE_DIR}/third_party
     ${CMAKE_SOURCE_DIR}/third_party/blst/bindings
 )
@@ -193,91 +192,23 @@ target_include_directories(block_executor PUBLIC
 target_link_libraries(block_executor evm mem_mpt common secp256k1 pthread)
 
 #==============================================================================
-# Libraries — Networking / Portal
+# Libraries — Crypto utilities
 #==============================================================================
 
 # HKDF-SHA256 (RFC 5869 key derivation, uses BLST for SHA-256)
 add_library(hkdf STATIC
-    net/src/hkdf.c
+    common/src/hkdf.c
 )
 target_link_libraries(hkdf blst)
 
-# AES-128 CTR + GCM (AES-NI intrinsics)
-add_library(aes STATIC
-    net/src/aes.c
-)
-target_compile_options(aes PRIVATE -maes)
-
 # secp256k1 wrapper (thin C wrapper over libsecp256k1)
 add_library(secp256k1_wrap STATIC
-    net/src/secp256k1_wrap.c
+    common/src/secp256k1_wrap.c
 )
 target_include_directories(secp256k1_wrap PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/secp256k1/include
 )
 target_link_libraries(secp256k1_wrap secp256k1)
-
-# SSZ — Simple Serialize (Portal Network subset)
-add_library(ssz STATIC
-    net/src/ssz.c
-)
-
-# ENR — Ethereum Node Record (EIP-778)
-add_library(enr STATIC
-    net/src/enr.c
-)
-target_link_libraries(enr common secp256k1_wrap)
-
-# Discv5 Packet Codec (wire protocol encoding/decoding)
-add_library(discv5_codec STATIC
-    net/src/discv5_codec.c
-)
-target_link_libraries(discv5_codec hkdf aes secp256k1_wrap blst)
-
-# Discv5 Session Management (handshake state + LRU cache)
-add_library(discv5_session STATIC
-    net/src/discv5_session.c
-)
-target_link_libraries(discv5_session discv5_codec secp256k1_wrap blst)
-
-# Discv5 Kademlia Routing Table (256 k-buckets, XOR distance)
-add_library(discv5_table STATIC
-    net/src/discv5_table.c
-)
-
-# Discv5 Protocol Engine (full protocol: codec + sessions + table + UDP)
-add_library(discv5 STATIC
-    net/src/discv5.c
-)
-target_link_libraries(discv5 discv5_codec discv5_session discv5_table enr common secp256k1_wrap hkdf aes blst)
-
-# uTP — micro Transport Protocol (BEP29 over Discv5 TALKREQ)
-add_library(utp STATIC
-    net/src/utp.c
-)
-
-# Portal Wire Protocol — message codec (SSZ-encoded)
-add_library(portal_wire STATIC
-    net/src/portal_wire.c
-)
-target_link_libraries(portal_wire ssz)
-
-# Portal Overlay Table — Kademlia routing with data_radius
-add_library(portal_table STATIC
-    net/src/portal_table.c
-)
-target_link_libraries(portal_table blst)
-
-# History Network — content key codec + content ID derivation
-add_library(history STATIC
-    net/src/history.c
-)
-
-# Portal Overlay Handler — generic sub-protocol integration layer
-add_library(portal STATIC
-    net/src/portal.c
-)
-target_link_libraries(portal portal_wire portal_table discv5 utp)
 
 #==============================================================================
 # Tests — Database
@@ -383,133 +314,6 @@ target_link_libraries(test_eviction state evm)
 target_include_directories(test_eviction PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
 add_test(NAME test_eviction COMMAND test_eviction)
 
-#==============================================================================
-# Tests — Networking
-#==============================================================================
-
-# Test: HKDF-SHA256 (RFC 5869 + Discv5 key derivation vectors)
-add_executable(test_hkdf
-    net/tests/test_hkdf.c
-)
-target_link_libraries(test_hkdf hkdf)
-add_test(NAME test_hkdf COMMAND test_hkdf)
-
-# Test: AES-128 CTR + GCM (NIST + Discv5 vectors)
-add_executable(test_aes
-    net/tests/test_aes.c
-)
-target_link_libraries(test_aes aes)
-target_compile_options(test_aes PRIVATE -maes)
-add_test(NAME test_aes COMMAND test_aes)
-
-# Test: secp256k1 wrapper (ECDSA, ECDH, key operations)
-add_executable(test_secp256k1_wrap
-    net/tests/test_secp256k1_wrap.c
-)
-target_include_directories(test_secp256k1_wrap PRIVATE
-    ${CMAKE_SOURCE_DIR}/third_party/secp256k1/include
-)
-target_link_libraries(test_secp256k1_wrap secp256k1_wrap)
-add_test(NAME test_secp256k1_wrap COMMAND test_secp256k1_wrap)
-
-# Test: SSZ (Portal Network subset)
-add_executable(test_ssz
-    net/tests/test_ssz.c
-)
-target_link_libraries(test_ssz ssz)
-add_test(NAME test_ssz COMMAND test_ssz)
-
-# Test: ENR (Ethereum Node Record — EIP-778)
-add_executable(test_enr
-    net/tests/test_enr.c
-)
-target_link_libraries(test_enr enr)
-add_test(NAME test_enr COMMAND test_enr)
-
-# Test: Discv5 Packet Codec (wire protocol test vectors)
-add_executable(test_discv5_codec
-    net/tests/test_discv5_codec.c
-)
-target_link_libraries(test_discv5_codec discv5_codec enr)
-add_test(NAME test_discv5_codec COMMAND test_discv5_codec)
-
-# Test: Discv5 Session Management (handshake state + LRU cache)
-add_executable(test_discv5_session
-    net/tests/test_discv5_session.c
-)
-target_link_libraries(test_discv5_session discv5_session)
-add_test(NAME test_discv5_session COMMAND test_discv5_session)
-
-# Test: Discv5 Kademlia Routing Table
-add_executable(test_discv5_table
-    net/tests/test_discv5_table.c
-)
-target_link_libraries(test_discv5_table discv5_table)
-add_test(NAME test_discv5_table COMMAND test_discv5_table)
-
-# Test: Discv5 Protocol Engine
-add_executable(test_discv5
-    net/tests/test_discv5.c
-)
-target_link_libraries(test_discv5 discv5)
-add_test(NAME test_discv5 COMMAND test_discv5)
-
-# Test: uTP (micro Transport Protocol — BEP29 test vectors + loopback)
-add_executable(test_utp
-    net/tests/test_utp.c
-)
-target_link_libraries(test_utp utp)
-add_test(NAME test_utp COMMAND test_utp)
-
-# Test: Portal Wire Protocol (message codec test vectors)
-add_executable(test_portal_wire
-    net/tests/test_portal_wire.c
-)
-target_link_libraries(test_portal_wire portal_wire ssz)
-add_test(NAME test_portal_wire COMMAND test_portal_wire)
-
-# Test: Portal Overlay Table (Kademlia + radius filtering)
-add_executable(test_portal_table
-    net/tests/test_portal_table.c
-)
-target_link_libraries(test_portal_table portal_table blst)
-add_test(NAME test_portal_table COMMAND test_portal_table)
-
-# Test: History Network (content key codec + content ID derivation)
-add_executable(test_history
-    net/tests/test_history.c
-)
-target_link_libraries(test_history history)
-add_test(NAME test_history COMMAND test_history)
-
-# Test: Portal Overlay Handler (sub-protocol integration)
-add_executable(test_portal
-    net/tests/test_portal.c
-)
-target_link_libraries(test_portal portal history)
-add_test(NAME test_portal COMMAND test_portal)
-
-# Test: Roundtrip (encode→decode→verify for all codecs, random inputs)
-add_executable(test_roundtrip
-    net/tests/test_roundtrip.c
-)
-target_link_libraries(test_roundtrip common portal_wire ssz discv5 utp history)
-add_test(NAME test_roundtrip COMMAND test_roundtrip)
-
-# Test: uTP Stress (concurrent connections, packet loss, large transfers)
-add_executable(test_utp_stress
-    net/tests/test_utp_stress.c
-)
-target_link_libraries(test_utp_stress utp)
-add_test(NAME test_utp_stress COMMAND test_utp_stress)
-
-# Test: Loopback Integration (full stack — Discv5 + Portal via real UDP on localhost)
-add_executable(test_loopback
-    net/tests/test_loopback.c
-)
-target_link_libraries(test_loopback portal discv5 portal_wire ssz history)
-add_test(NAME test_loopback COMMAND test_loopback)
-
 add_executable(test_block_executor
     executor/tests/test_block_executor.c
 )
@@ -556,7 +360,7 @@ add_library(engine_jwt STATIC
 )
 target_include_directories(engine_jwt PUBLIC
     ${CMAKE_SOURCE_DIR}/engine/include
-    ${CMAKE_SOURCE_DIR}/net/include
+
 )
 target_link_libraries(engine_jwt hkdf)
 
@@ -742,7 +546,7 @@ if(CJSON_FOUND)
         # EVM t8n tool (state transition, geth-compatible)
         add_executable(evm_t8n tools/evm_t8n.c)
         target_include_directories(evm_t8n PRIVATE
-            ${CMAKE_SOURCE_DIR}/net/include
+        
             ${CMAKE_SOURCE_DIR}/third_party/secp256k1/include
         )
         target_link_libraries(evm_t8n integration_tests secp256k1_wrap)
@@ -750,7 +554,7 @@ if(CJSON_FOUND)
         # EVM statetest runner (geth/evmone-compatible, for GoEVMLab runtest)
         add_executable(evm_statetest tools/evm_statetest.c)
         target_include_directories(evm_statetest PRIVATE
-            ${CMAKE_SOURCE_DIR}/net/include
+        
             ${CMAKE_SOURCE_DIR}/third_party/secp256k1/include
         )
         target_link_libraries(evm_statetest integration_tests secp256k1_wrap)
@@ -782,6 +586,5 @@ message(STATUS "  - code_store (content-addressed bytecode storage)")
 message(STATUS "  - evm (Ethereum Virtual Machine)")
 message(STATUS "  - block_executor (block decode + execution)")
 message(STATUS "  - sync (block execution + validation + checkpointing)")
-message(STATUS "  - portal (Portal Network stack)")
 message(STATUS "========================================")
 message(STATUS "")

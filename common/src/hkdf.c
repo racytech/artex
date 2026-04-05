@@ -10,7 +10,7 @@
  *   block_size = 64 bytes for SHA-256
  */
 
-#include "../include/hkdf.h"
+#include "hkdf.h"
 #include <blst.h>
 #include <stdlib.h>
 #include <string.h>
