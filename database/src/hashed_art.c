@@ -593,6 +593,23 @@ bool hart_is_dirty(const hart_t *t) {
     return is_node_dirty(t, t->root);
 }
 
+static void invalidate_recursive(hart_t *t, hart_ref_t ref) {
+    if (ref == HART_REF_NULL || HART_IS_LEAF(ref)) return;
+    mark_dirty(t, ref);
+    void *n = ref_ptr(t, ref);
+    switch (node_type(n)) {
+    case NODE_4:   { node4_t *nn = n;   for (int i = 0; i < nn->num_children; i++) invalidate_recursive(t, nn->children[i]); break; }
+    case NODE_16:  { node16_t *nn = n;  for (int i = 0; i < nn->num_children; i++) invalidate_recursive(t, nn->children[i]); break; }
+    case NODE_48:  { node48_t *nn = n;  for (int i = 0; i < 256; i++) if (nn->index[i] != NODE48_EMPTY) invalidate_recursive(t, nn->children[nn->index[i]]); break; }
+    case NODE_256: { node256_t *nn = n; for (int i = 0; i < 256; i++) if (nn->children[i]) invalidate_recursive(t, nn->children[i]); break; }
+    }
+}
+
+void hart_invalidate_all(hart_t *t) {
+    if (!t || t->root == HART_REF_NULL) return;
+    invalidate_recursive(t, t->root);
+}
+
 /* =========================================================================
  * MPT Root Hash — embedded hash version
  * ========================================================================= */

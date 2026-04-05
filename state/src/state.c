@@ -1278,13 +1278,15 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
 
     /* Compute account trie root */
     if (compute_hash) {
-        /* Recompute stale storage roots. In no-validate mode, per-block calls
-         * skip storage root computation but clear ACCT_STORAGE_DIRTY. Scan all
-         * resources for dirty storage harts — hart_is_dirty is O(1) per check. */
+        /* Force all nodes dirty — invalidates any cached hashes to ensure
+         * full recomputation. Safety net against stale cache bugs. */
+        hart_invalidate_all(&s->acct_index);
         for (uint32_t i = 1; i < s->res_count; i++) {
             resource_t *r = &s->resources[i];
-            if (r->storage && hart_is_dirty(r->storage))
+            if (r->storage) {
+                hart_invalidate_all(r->storage);
                 hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
+            }
         }
         hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
     }
