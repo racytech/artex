@@ -160,6 +160,11 @@ size_t state_collect_accessed_storage_keys(const state_t *s,
  * Call at checkpoint boundaries when blk_dirty is empty. */
 void state_compact(state_t *s);
 
+/* Cold storage eviction — evict inactive storage harts to disk. */
+void     state_set_evict_path(state_t *s, const char *dir);
+void     state_set_evict_threshold(state_t *s, uint64_t blocks);
+uint32_t state_evict_cold_storage(state_t *s);
+
 /* =========================================================================
  * Stats
  * ========================================================================= */

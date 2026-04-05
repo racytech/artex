@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 /* =========================================================================
  * Constants
@@ -247,11 +249,20 @@ struct state {
     bool     prune_empty;
     bool     storage_roots_stale;  /* true if any block skipped storage root computation */
 
+    /* Cold storage eviction */
+    int       evict_fd;           /* fd for storage_evict.dat (-1 = not open) */
+    uint64_t  evict_file_size;    /* current append position */
+    uint64_t  evict_threshold;    /* blocks of inactivity before eviction */
+    char      evict_path[512];    /* path to storage_evict.dat */
+
     /* dump-prestate support: preserved dirty list + slot key tracking */
     dirty_vec_t last_dirty;       /* blk_dirty from last compute_root (addr[20]) */
     dirty_vec_t accessed_slots;   /* addr[20]+slot_be[32] = 52 bytes each */
     bool        track_accesses;   /* set before target block to enable tracking */
 };
+
+/* Forward declarations */
+static bool state_reload_storage(state_t *s, account_t *a, resource_t *r);
 
 /* =========================================================================
  * Internal helpers
@@ -402,13 +413,15 @@ static bool ensure_storage(state_t *s, account_t *a) {
     if (!r) return false;
     if (r->storage) return true;
 
+    /* Reload from eviction file if available */
+    if (r->evict_count > 0 && state_reload_storage(s, a, r))
+        return true;
+
     r->storage = calloc(1, sizeof(hart_t));
     if (!r->storage) return false;
     if (!hart_init_cap(r->storage, STOR_VAL_SIZE, STOR_INIT_CAP)) {
         free(r->storage); r->storage = NULL; return false;
     }
-    /* Storage tries: cache ON — 23x faster than without (incremental
-     * rehashing skips clean paths). RSS cost ~15KB per storage account. */
 
     uint32_t idx = (uint32_t)(a - s->accounts);
     resource_list_add(s, idx);
@@ -420,10 +433,56 @@ static void destroy_resource_storage(resource_t *r) {
     if (r->storage) { hart_destroy(r->storage); free(r->storage); r->storage = NULL; }
 }
 
+/* =========================================================================
+ * Cold storage eviction — reload from disk
+ * ========================================================================= */
+
+static bool state_reload_storage(state_t *s, account_t *a, resource_t *r) {
+    if (!r || r->evict_count == 0 || s->evict_fd < 0) return false;
+
+    size_t nbytes = (size_t)r->evict_count * 64;
+    uint8_t *buf = malloc(nbytes);
+    if (!buf) return false;
+
+    ssize_t rd = pread(s->evict_fd, buf, nbytes, (off_t)r->evict_offset);
+    if (rd != (ssize_t)nbytes) {
+        free(buf);
+        return false;
+    }
+
+    /* Create hart and populate */
+    r->storage = calloc(1, sizeof(hart_t));
+    if (!r->storage) { free(buf); return false; }
+    size_t cap = (size_t)r->evict_count * 96; /* ~96 bytes/entry in hart arena */
+    if (cap < STOR_INIT_CAP) cap = STOR_INIT_CAP;
+    if (!hart_init_cap(r->storage, STOR_VAL_SIZE, cap)) {
+        free(r->storage); r->storage = NULL; free(buf); return false;
+    }
+
+    for (uint32_t i = 0; i < r->evict_count; i++) {
+        const uint8_t *key = buf + i * 64;
+        const uint8_t *val = buf + i * 64 + 32;
+        hart_insert(r->storage, key, val);
+    }
+
+    free(buf);
+    r->evict_offset = 0;
+    r->evict_count = 0;
+
+    /* Track in resource list for stats */
+    uint32_t idx = (uint32_t)(a - s->accounts);
+    resource_list_add(s, idx);
+    return true;
+}
+
 static uint256_t storage_read(const state_t *s, const account_t *a,
                                const uint8_t slot_hash[32]) {
     resource_t *r = get_resource(s, a);
-    if (!r || !r->storage) return UINT256_ZERO;
+    if (!r) return UINT256_ZERO;
+    /* Reload from eviction file if needed */
+    if (!r->storage && r->evict_count > 0)
+        state_reload_storage((state_t *)s, (account_t *)a, r);
+    if (!r->storage) return UINT256_ZERO;
     const void *val = hart_get(r->storage, slot_hash);
     if (val)
         return uint256_from_bytes((const uint8_t *)val, 32);
@@ -484,8 +543,9 @@ state_t *state_create(code_store_t *cs) {
     s->res_capacity = 1024;
     s->res_count = 1;
 
-    /* Account trie MPT — wraps acct_index mem_art */
-    /* acct_index (hart) computes MPT root directly — no separate art_mpt needed */
+    /* Cold storage eviction — disabled until path is set */
+    s->evict_fd = -1;
+    s->evict_threshold = 50000; /* default: evict after 50K blocks of inactivity */
 
     return s;
 }
@@ -524,6 +584,7 @@ void state_destroy(state_t *s) {
     dirty_free(&s->blk_dirty);
     dirty_free(&s->last_dirty);
     dirty_free(&s->accessed_slots);
+    if (s->evict_fd >= 0) close(s->evict_fd);
     free(s);
 }
 
@@ -1569,6 +1630,100 @@ void state_compact(state_t *s) {
  * On load, acct_index and storage harts are rebuilt from scratch.
  * ========================================================================= */
 
+/* =========================================================================
+ * Cold storage eviction — evict to disk
+ * ========================================================================= */
+
+void state_set_evict_path(state_t *s, const char *dir) {
+    if (!s || !dir) return;
+    snprintf(s->evict_path, sizeof(s->evict_path), "%s/storage_evict.dat", dir);
+}
+
+void state_set_evict_threshold(state_t *s, uint64_t blocks) {
+    if (s) s->evict_threshold = blocks;
+}
+
+static bool evict_ensure_fd(state_t *s) {
+    if (s->evict_fd >= 0) return true;
+    if (s->evict_path[0] == '\0') return false;
+    s->evict_fd = open(s->evict_path, O_RDWR | O_CREAT, 0644);
+    if (s->evict_fd < 0) return false;
+    /* Seek to end for append position */
+    off_t end = lseek(s->evict_fd, 0, SEEK_END);
+    s->evict_file_size = (end > 0) ? (uint64_t)end : 0;
+    return true;
+}
+
+uint32_t state_evict_cold_storage(state_t *s) {
+    if (!s || s->evict_threshold == 0) return 0;
+    if (!evict_ensure_fd(s)) return 0;
+
+    uint32_t evicted = 0;
+    uint64_t bytes_written = 0;
+
+    for (uint32_t i = 1; i < s->res_count; i++) {
+        resource_t *r = &s->resources[i];
+        if (!r->storage) continue;
+
+        size_t n = hart_size(r->storage);
+        if (n == 0) continue;
+
+        /* Find the account that owns this resource */
+        /* Walk accounts looking for resource_idx == i */
+        account_t *a = NULL;
+        for (uint32_t j = 0; j < s->count; j++) {
+            if (s->accounts[j].resource_idx == i) {
+                a = &s->accounts[j];
+                break;
+            }
+        }
+        if (!a) continue;
+
+        /* Check coldness */
+        if (s->current_block - a->last_access_block < s->evict_threshold)
+            continue;
+
+        /* Skip dirty accounts (modified this block, need root computation) */
+        if (acct_has_flag(a, ACCT_MPT_DIRTY) || acct_has_flag(a, ACCT_STORAGE_DIRTY))
+            continue;
+
+        /* Write entries to eviction file */
+        uint64_t offset = s->evict_file_size;
+        size_t nbytes = n * 64;
+        uint8_t *buf = malloc(nbytes);
+        if (!buf) continue;
+
+        size_t pos = 0;
+        hart_iter_t *it = hart_iter_create(r->storage);
+        if (it) {
+            while (hart_iter_next(it)) {
+                memcpy(buf + pos, hart_iter_key(it), 32);
+                memcpy(buf + pos + 32, hart_iter_value(it), 32);
+                pos += 64;
+            }
+            hart_iter_destroy(it);
+        }
+
+        ssize_t wr = pwrite(s->evict_fd, buf, pos, (off_t)offset);
+        free(buf);
+        if (wr != (ssize_t)pos) continue;
+
+        s->evict_file_size += pos;
+        r->evict_offset = offset;
+        r->evict_count = (uint32_t)n;
+
+        destroy_resource_storage(r);
+        evicted++;
+        bytes_written += pos;
+    }
+
+    return evicted;
+}
+
+/* =========================================================================
+ * State save/load
+ * ========================================================================= */
+
 #define STATE_MAGIC "ART1"
 
 static bool write_all(FILE *f, const void *buf, size_t n) {
@@ -1621,12 +1776,15 @@ bool state_save(const state_t *s, const char *path, const hash_t *state_root) {
         uint32_t code_size = (r && acct_has_flag(a, ACCT_HAS_CODE)) ? r->code_size : 0;
         if (!write_all(f, &code_size, 4)) goto fail;
 
-        /* Storage entries */
+        /* Storage entries — from hart (in-memory) or eviction file (on-disk) */
         uint32_t stor_count = 0;
-        if (r && r->storage) stor_count = (uint32_t)hart_size(r->storage);
+        if (r && r->storage)
+            stor_count = (uint32_t)hart_size(r->storage);
+        else if (r && r->evict_count > 0)
+            stor_count = r->evict_count;
         if (!write_all(f, &stor_count, 4)) goto fail;
 
-        if (stor_count > 0 && r->storage) {
+        if (stor_count > 0 && r && r->storage) {
             hart_iter_t *it = hart_iter_create(r->storage);
             if (it) {
                 while (hart_iter_next(it)) {
@@ -1638,6 +1796,17 @@ bool state_save(const state_t *s, const char *path, const hash_t *state_root) {
                     }
                 }
                 hart_iter_destroy(it);
+            }
+        } else if (stor_count > 0 && r && r->evict_count > 0 && s->evict_fd >= 0) {
+            /* Copy directly from eviction file */
+            size_t nbytes = (size_t)stor_count * 64;
+            uint8_t *buf = malloc(nbytes);
+            if (buf) {
+                ssize_t rd = pread(s->evict_fd, buf, nbytes, (off_t)r->evict_offset);
+                if (rd == (ssize_t)nbytes) {
+                    if (!write_all(f, buf, nbytes)) { free(buf); goto fail; }
+                }
+                free(buf);
             }
         }
     }

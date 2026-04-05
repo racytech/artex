@@ -692,6 +692,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     LOG_INFO("State loaded successfully");
+    /* Enable cold storage eviction */
+    evm_state_set_evict_path(sync_get_state(sync), data_dir);
+
     {
         evm_state_stats_t dbg_ss = sync_get_state_stats(sync);
         LOG_INFO("state: %lu accts, %lu storage_accts",

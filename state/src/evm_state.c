@@ -399,5 +399,16 @@ void evm_state_disable_access_tracking(evm_state_t *es) {
 
 void evm_state_dump_debug(evm_state_t *es, const char *dir) {
     (void)es; (void)dir;
-    /* TODO: implement for state_v2 */
+}
+
+void evm_state_set_evict_path(evm_state_t *es, const char *dir) {
+    if (es) state_set_evict_path(es->st, dir);
+}
+
+void evm_state_set_evict_threshold(evm_state_t *es, uint64_t blocks) {
+    if (es) state_set_evict_threshold(es->st, blocks);
+}
+
+uint32_t evm_state_evict_cold_storage(evm_state_t *es) {
+    return es ? state_evict_cold_storage(es->st) : 0;
 }

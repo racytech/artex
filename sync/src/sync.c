@@ -434,14 +434,22 @@ bool sync_execute_block(sync_t *sync,
                 struct timespec _c0, _c1;
                 clock_gettime(CLOCK_MONOTONIC, &_c0);
                 state_compact(st);
+
+                /* Evict cold storage harts after compaction —
+                 * compaction rebuilds harts, good time to evict cold ones */
+                uint32_t n_evicted = evm_state_evict_cold_storage(sync->state);
+
                 clock_gettime(CLOCK_MONOTONIC, &_c1);
                 state_stats_t post = state_get_stats(st);
                 double ms = (_c1.tv_sec - _c0.tv_sec) * 1000.0 +
                             (_c1.tv_nsec - _c0.tv_nsec) / 1e6;
 
-                fprintf(stderr, "  compact @%lu: %u→%u accts, %.0fMB→%.0fMB, %.0fms\n",
+                fprintf(stderr, "  compact @%lu: %u→%u accts, %.0fMB→%.0fMB, %.0fms",
                         bn, ss.account_count, post.account_count,
                         ss.total_tracked / 1e6, post.total_tracked / 1e6, ms);
+                if (n_evicted > 0)
+                    fprintf(stderr, " | evicted %u storage harts", n_evicted);
+                fprintf(stderr, "\n");
                 sync->last_compact_block = bn;
             }
         }
