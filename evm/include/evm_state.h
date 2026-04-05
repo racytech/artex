@@ -326,17 +326,24 @@ void evm_state_dump_mpt(evm_state_t *es, const char *path);
 void evm_state_dump_alloc_json(evm_state_t *es, const char *path);
 
 /**
- * Collect all cached account addresses into a flat array.
+ * Collect dirty account addresses from the last block execution.
  * Returns number of addresses written. Caller provides buffer.
  */
 size_t evm_state_collect_addresses(evm_state_t *es, address_t *out, size_t max_count);
 
 /**
- * Collect all cached storage slot keys for a given address.
- * Writes uint256_t slot keys to out. Returns count.
+ * Collect accessed storage slot keys for a given address.
+ * Requires access tracking enabled. Returns count.
  */
 size_t evm_state_collect_storage_keys(evm_state_t *es, const address_t *addr,
                                        uint256_t *out, size_t max_count);
+
+/**
+ * Enable/disable storage access tracking for dump-prestate.
+ * Call enable before the target block, disable after collecting.
+ */
+void evm_state_enable_access_tracking(evm_state_t *es);
+void evm_state_disable_access_tracking(evm_state_t *es);
 
 #ifdef ENABLE_HISTORY
 /**

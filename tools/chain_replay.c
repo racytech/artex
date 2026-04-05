@@ -884,12 +884,17 @@ int main(int argc, char **argv) {
         block_body_t body = blk.body;
         hash_t blk_hash = blk.blk_hash;
 
-        /* Flush pre-execution state for dump-prestate (before target block runs) */
+        /* Save pre-execution state for dump-prestate (before target block runs) */
         if (bn == dump_prestate_block) {
             evm_state_t *pre_es = sync_get_state(sync);
-            bool pe = (header.number >= 2675000);
-            evm_state_compute_mpt_root(pre_es, pe);
-            evm_state_flush(pre_es);
+            state_t *pre_st = evm_state_get_state(pre_es);
+            char prestate_tmp[256];
+            snprintf(prestate_tmp, sizeof(prestate_tmp), "/tmp/artex_prestate_%lu.bin", bn);
+            fprintf(stderr, "dump-prestate: saving pre-state to %s...\n", prestate_tmp);
+            if (!state_save(pre_st, prestate_tmp, NULL)) {
+                LOG_ERROR("Failed to save pre-state for dump-prestate");
+            }
+            evm_state_enable_access_tracking(pre_es);
         }
 
         /* Enable EVM tracing for the target block */
@@ -920,18 +925,29 @@ int main(int argc, char **argv) {
         }
 #endif
 
-        /* Dump prestate for this block (two-pass) */
+        /* Dump prestate for this block */
         if (bn == dump_prestate_block) {
             evm_state_t *es = sync_get_state(sync);
+            evm_state_disable_access_tracking(es);
 
-            /* Pass 1: Collect all accessed addresses and storage keys */
+            /* Collect dirty addresses and storage keys from execution */
             #define MAX_ADDRS  8192
             #define MAX_SLOTS  65536
             address_t *addrs = malloc(MAX_ADDRS * sizeof(address_t));
             size_t n_addrs = evm_state_collect_addresses(es, addrs, MAX_ADDRS);
-            printf("Prestate: collected %zu addresses from cache\n", n_addrs);
 
-            /* Collect storage keys per address */
+            /* Also include coinbase (miner reward touches it) */
+            {
+                bool have_cb = false;
+                for (size_t ci = 0; ci < n_addrs; ci++) {
+                    if (memcmp(addrs[ci].bytes, header.coinbase.bytes, 20) == 0)
+                        { have_cb = true; break; }
+                }
+                if (!have_cb && n_addrs < MAX_ADDRS)
+                    addrs[n_addrs++] = header.coinbase;
+            }
+            fprintf(stderr, "dump-prestate: %zu dirty addresses\n", n_addrs);
+
             typedef struct { address_t addr; uint256_t *keys; size_t count; } addr_slots_t;
             addr_slots_t *addr_slots = malloc(n_addrs * sizeof(addr_slots_t));
             uint256_t *slot_buf = malloc(MAX_SLOTS * sizeof(uint256_t));
@@ -939,48 +955,33 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < n_addrs; i++) {
                 addr_slots[i].addr = addrs[i];
                 size_t n = evm_state_collect_storage_keys(es, &addrs[i],
-                    slot_buf + total_slots,
-                    MAX_SLOTS - total_slots);
+                    slot_buf + total_slots, MAX_SLOTS - total_slots);
                 addr_slots[i].keys = slot_buf + total_slots;
                 addr_slots[i].count = n;
                 total_slots += n;
             }
-            printf("Prestate: collected %zu storage keys\n", total_slots);
+            fprintf(stderr, "dump-prestate: %zu storage keys\n", total_slots);
 
-            /* Pass 2: Destroy sync, recreate from flushed pre-execution state */
-            sync_destroy(sync);
-            sync = sync_create(&cfg);
-            if (!sync) {
-                fprintf(stderr, "Failed to recreate sync for prestate dump\n");
+            /* Load pre-execution state from saved binary */
+            char prestate_tmp[256];
+            snprintf(prestate_tmp, sizeof(prestate_tmp), "/tmp/artex_prestate_%lu.bin", bn);
+            evm_state_t *pre = evm_state_create(NULL);
+            if (!pre) {
+                fprintf(stderr, "Failed to create pre-state for dump\n");
                 free(addrs); free(addr_slots); free(slot_buf);
-                archive_close(&archive);
-                return 1;
+                block_body_free(&body); free(hdr_rlp); free(body_rlp);
+                break;
             }
-
-            /* Re-populate block hash ring (lost on sync_destroy) */
-            {
-                uint64_t bh_start = bn > 256 ? bn - 256 : 0;
-                size_t bh_count = (size_t)(bn - bh_start);
-                hash_t *bh_hashes = calloc(bh_count, sizeof(hash_t));
-                if (bh_hashes) {
-                    for (uint64_t i = 0; i < bh_count; i++) {
-                        uint64_t bh_bn = bh_start + i;
-                        if (archive_ensure(&archive, bh_bn, false, era1_dir)) {
-                            uint8_t *h_rlp = NULL; size_t h_len = 0;
-                            uint8_t *b_rlp = NULL; size_t b_len = 0;
-                            if (era1_read_block(&archive.current, bh_bn,
-                                                 &h_rlp, &h_len, &b_rlp, &b_len)) {
-                                bh_hashes[i] = hash_keccak256(h_rlp, h_len);
-                                free(h_rlp); free(b_rlp);
-                            }
-                        }
-                    }
-                    sync_resume(sync, bn - 1, bh_hashes, bh_count);
-                    free(bh_hashes);
-                }
+            state_t *pre_st = evm_state_get_state(pre);
+            hash_t pre_root;
+            if (!state_load(pre_st, prestate_tmp, &pre_root)) {
+                fprintf(stderr, "Failed to load pre-state from %s\n", prestate_tmp);
+                evm_state_destroy(pre);
+                free(addrs); free(addr_slots); free(slot_buf);
+                block_body_free(&body); free(hdr_rlp); free(body_rlp);
+                break;
             }
-
-            es = sync_get_state(sync);
+            fprintf(stderr, "dump-prestate: loaded pre-state from %s\n", prestate_tmp);
 
             /* Build output path */
             char default_path[256];
@@ -989,10 +990,11 @@ int main(int argc, char **argv) {
                 dump_prestate_path = default_path;
             }
 
-            /* Query each address/slot from clean state and dump as alloc.json */
+            /* Query from pre-state and dump as alloc.json */
             FILE *out = fopen(dump_prestate_path, "w");
             if (!out) {
                 fprintf(stderr, "Failed to open %s for writing\n", dump_prestate_path);
+                evm_state_destroy(pre);
                 free(addrs); free(addr_slots); free(slot_buf);
                 break;
             }
@@ -1000,10 +1002,8 @@ int main(int argc, char **argv) {
             fprintf(out, "{\n");
             for (size_t i = 0; i < n_addrs; i++) {
                 address_t *a = &addrs[i];
-                /* Touch the account to load it into cache */
-                bool exists = evm_state_exists(es, a);
-                uint64_t nonce = evm_state_get_nonce(es, a);
-                uint256_t balance = evm_state_get_balance(es, a);
+                uint64_t nonce = evm_state_get_nonce(pre, a);
+                uint256_t balance = evm_state_get_balance(pre, a);
 
                 if (i > 0) fprintf(out, ",\n");
                 fprintf(out, "  \"0x");
@@ -1013,17 +1013,17 @@ int main(int argc, char **argv) {
                 /* Balance */
                 uint8_t bal[32]; uint256_to_bytes(&balance, bal);
                 fprintf(out, "    \"balance\": \"0x");
-                int s = 0; while (s < 31 && bal[s] == 0) s++;
-                for (int j = s; j < 32; j++) fprintf(out, "%02x", bal[j]);
+                int bstart = 0; while (bstart < 31 && bal[bstart] == 0) bstart++;
+                for (int j = bstart; j < 32; j++) fprintf(out, "%02x", bal[j]);
                 fprintf(out, "\",\n");
 
                 /* Nonce */
                 fprintf(out, "    \"nonce\": \"0x%lx\"", nonce);
 
                 /* Code */
-                uint32_t code_size = evm_state_get_code_size(es, a);
+                uint32_t code_size = evm_state_get_code_size(pre, a);
                 if (code_size > 0) {
-                    const uint8_t *code = evm_state_get_code_ptr(es, a, &code_size);
+                    const uint8_t *code = evm_state_get_code_ptr(pre, a, &code_size);
                     if (code && code_size > 0) {
                         fprintf(out, ",\n    \"code\": \"0x");
                         for (uint32_t c = 0; c < code_size; c++)
@@ -1034,15 +1034,11 @@ int main(int argc, char **argv) {
 
                 /* Storage */
                 if (addr_slots[i].count > 0) {
-                    fprintf(stderr, "  dumping %zu slots for 0x", addr_slots[i].count);
-                    for (int j = 0; j < 20; j++) fprintf(stderr, "%02x", a->bytes[j]);
-                    fprintf(stderr, "\n");
                     fprintf(out, ",\n    \"storage\": {");
                     bool first_slot = true;
-                    size_t zero_count = 0;
                     for (size_t si = 0; si < addr_slots[i].count; si++) {
-                        uint256_t val = evm_state_get_storage(es, a, &addr_slots[i].keys[si]);
-                        if (uint256_is_zero(&val)) { zero_count++; continue; }
+                        uint256_t val = evm_state_get_storage(pre, a, &addr_slots[i].keys[si]);
+                        if (uint256_is_zero(&val)) continue;
                         if (!first_slot) fprintf(out, ",");
                         first_slot = false;
                         uint8_t kbe[32], vbe[32];
@@ -1055,22 +1051,18 @@ int main(int argc, char **argv) {
                         fprintf(out, "\"");
                     }
                     fprintf(out, "\n    }");
-                    if (zero_count > 0)
-                        fprintf(stderr, "    %zu slots returned zero\n", zero_count);
                 }
 
                 fprintf(out, "\n  }");
-                (void)exists;
             }
             fprintf(out, "\n}\n");
             fclose(out);
 
-            printf("Prestate dumped to %s (%zu accounts, %zu storage keys)\n",
+            fprintf(stderr, "Prestate dumped to %s (%zu accounts, %zu storage keys)\n",
                    dump_prestate_path, n_addrs, total_slots);
 
-            /* Write env.json with blockHashes for BLOCKHASH opcode support */
+            /* Write env.json */
             {
-                /* Derive env path from alloc path (same directory) */
                 char env_path[512];
                 const char *last_slash = strrchr(dump_prestate_path, '/');
                 if (last_slash) {
@@ -1110,18 +1102,19 @@ int main(int argc, char **argv) {
                     }
                     fprintf(ef, "\n  }\n}\n");
                     fclose(ef);
-                    printf("Environment dumped to %s (with %lu block hashes)\n",
-                           env_path, bn - start_bh);
+                    fprintf(stderr, "Environment dumped to %s\n", env_path);
                 }
             }
 
+            evm_state_destroy(pre);
+            unlink(prestate_tmp);
             free(addrs);
             free(addr_slots);
             free(slot_buf);
             block_body_free(&body);
             free(hdr_rlp);
             free(body_rlp);
-            break;  /* done — exit main loop */
+            break;
         }
 
         window_txs += result.tx_count;

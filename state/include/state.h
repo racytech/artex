@@ -146,6 +146,15 @@ void   state_invalidate_all(state_t *s);
 /* Number of tracked dead accounts (phantoms + destructed + pruned). */
 uint32_t state_dead_count(const state_t *s);
 
+/* dump-prestate: access tracking + collection.
+ * Enable tracking before the target block, then collect after execution. */
+void   state_enable_access_tracking(state_t *s);
+void   state_disable_access_tracking(state_t *s);
+size_t state_collect_dirty_addresses(const state_t *s, address_t *out, size_t max);
+size_t state_collect_accessed_storage_keys(const state_t *s,
+                                           const address_t *addr,
+                                           uint256_t *out, size_t max);
+
 /* Compact: rebuild accounts vector and acct_index with only EXISTED accounts.
  * Eliminates dead/phantom entries and reclaims mem_art arena space.
  * Call at checkpoint boundaries when blk_dirty is empty. */

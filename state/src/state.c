@@ -246,6 +246,11 @@ struct state {
     uint64_t current_block;
     bool     prune_empty;
     bool     storage_roots_stale;  /* true if any block skipped storage root computation */
+
+    /* dump-prestate support: preserved dirty list + slot key tracking */
+    dirty_vec_t last_dirty;       /* blk_dirty from last compute_root (addr[20]) */
+    dirty_vec_t accessed_slots;   /* addr[20]+slot_be[32] = 52 bytes each */
+    bool        track_accesses;   /* set before target block to enable tracking */
 };
 
 /* =========================================================================
@@ -517,6 +522,8 @@ void state_destroy(state_t *s) {
 
     dirty_free(&s->tx_dirty);
     dirty_free(&s->blk_dirty);
+    dirty_free(&s->last_dirty);
+    dirty_free(&s->accessed_slots);
     free(s);
 }
 
@@ -726,6 +733,11 @@ hash_t state_get_code_hash(state_t *s, const address_t *addr) {
 
 uint256_t state_get_storage(state_t *s, const address_t *addr, const uint256_t *key) {
     if (!s || !addr || !key) return UINT256_ZERO;
+    if (s->track_accesses) {
+        uint8_t sk[SLOT_KEY_SIZE];
+        make_slot_key(addr, key, sk);
+        dirty_push(&s->accessed_slots, sk, SLOT_KEY_SIZE);
+    }
     account_t *a = find_account(s, addr->bytes);
     if (!a) return UINT256_ZERO;
     uint8_t slot_be[32]; uint256_to_bytes(key, slot_be);
@@ -736,6 +748,11 @@ uint256_t state_get_storage(state_t *s, const address_t *addr, const uint256_t *
 void state_set_storage(state_t *s, const address_t *addr,
                        const uint256_t *key, const uint256_t *value) {
     if (!s || !addr || !key || !value) return;
+    if (s->track_accesses) {
+        uint8_t sk[SLOT_KEY_SIZE];
+        make_slot_key(addr, key, sk);
+        dirty_push(&s->accessed_slots, sk, SLOT_KEY_SIZE);
+    }
     hash_t ah = addr_hash_cached(s, addr->bytes);
     account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
@@ -1296,6 +1313,10 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
         hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
     }
 
+    /* Swap blk_dirty → last_dirty (preserves for dump-prestate callers) */
+    dirty_vec_t tmp = s->last_dirty;
+    s->last_dirty = s->blk_dirty;
+    s->blk_dirty = tmp;
     dirty_clear(&s->blk_dirty);
     s->blk_dirty_cursor = 0;
 
@@ -1386,6 +1407,56 @@ void state_finalize_block(state_t *s, bool prune_empty) {
 uint32_t state_dead_count(const state_t *s) {
     if (!s) return 0;
     return s->dead_total + s->phantom_count + s->destructed_count + s->pruned_count;
+}
+
+/* =========================================================================
+ * dump-prestate: access tracking + collection
+ * ========================================================================= */
+
+void state_enable_access_tracking(state_t *s) {
+    if (!s) return;
+    s->track_accesses = true;
+    dirty_clear(&s->accessed_slots);
+}
+
+void state_disable_access_tracking(state_t *s) {
+    if (!s) return;
+    s->track_accesses = false;
+    dirty_clear(&s->accessed_slots);
+}
+
+size_t state_collect_dirty_addresses(const state_t *s, address_t *out, size_t max) {
+    if (!s || !out || max == 0) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < s->last_dirty.count && n < max; i++) {
+        const uint8_t *akey = s->last_dirty.keys + i * 20;
+        /* Deduplicate: skip if already seen */
+        bool dup = false;
+        for (size_t j = 0; j < n; j++) {
+            if (memcmp(out[j].bytes, akey, 20) == 0) { dup = true; break; }
+        }
+        if (!dup) memcpy(out[n++].bytes, akey, 20);
+    }
+    return n;
+}
+
+size_t state_collect_accessed_storage_keys(const state_t *s,
+                                           const address_t *addr,
+                                           uint256_t *out, size_t max) {
+    if (!s || !addr || !out || max == 0) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < s->accessed_slots.count && n < max; i++) {
+        const uint8_t *entry = s->accessed_slots.keys + i * SLOT_KEY_SIZE;
+        if (memcmp(entry, addr->bytes, 20) != 0) continue;
+        /* Deduplicate */
+        uint256_t slot = uint256_from_bytes(entry + 20, 32);
+        bool dup = false;
+        for (size_t j = 0; j < n; j++) {
+            if (uint256_eq(&out[j], &slot)) { dup = true; break; }
+        }
+        if (!dup) out[n++] = slot;
+    }
+    return n;
 }
 
 void state_compact(state_t *s) {

@@ -381,9 +381,20 @@ state_t *evm_state_get_state(evm_state_t *es) {
 }
 
 size_t evm_state_collect_addresses(evm_state_t *es, address_t *out, size_t max_count) {
-    (void)es; (void)out; (void)max_count;
-    /* TODO: iterate accounts vector */
-    return 0;
+    return es ? state_collect_dirty_addresses(es->st, out, max_count) : 0;
+}
+
+size_t evm_state_collect_storage_keys(evm_state_t *es, const address_t *addr,
+                                       uint256_t *out, size_t max_count) {
+    return es ? state_collect_accessed_storage_keys(es->st, addr, out, max_count) : 0;
+}
+
+void evm_state_enable_access_tracking(evm_state_t *es) {
+    if (es) state_enable_access_tracking(es->st);
+}
+
+void evm_state_disable_access_tracking(evm_state_t *es) {
+    if (es) state_disable_access_tracking(es->st);
 }
 
 void evm_state_dump_debug(evm_state_t *es, const char *dir) {
