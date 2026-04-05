@@ -1823,6 +1823,12 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
 
+    /* Truncate eviction file — stale data from previous runs */
+    if (s->evict_fd >= 0) {
+        ftruncate(s->evict_fd, 0);
+        s->evict_file_size = 0;
+    }
+
     /* Header */
     char magic[4];
     if (!read_all(f, magic, 4) || memcmp(magic, STATE_MAGIC, 4) != 0) goto fail;
@@ -1908,8 +1914,22 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
 
             if (has_code) acct_set_flag(a, ACCT_HAS_CODE);
 
-            /* Load storage */
-            if (stor_count > 0) {
+            /* Load storage — stream to eviction file if available, else into hart */
+            if (stor_count > 0 && evict_ensure_fd(s)) {
+                /* Write directly to eviction file — lazy reload on access */
+                size_t nbytes = (size_t)stor_count * 64;
+                uint8_t *buf = malloc(nbytes);
+                if (!buf) goto fail;
+                if (!read_all(f, buf, nbytes)) { free(buf); goto fail; }
+                ssize_t wr = pwrite(s->evict_fd, buf, nbytes,
+                                    (off_t)s->evict_file_size);
+                free(buf);
+                if (wr != (ssize_t)nbytes) goto fail;
+                r->evict_offset = s->evict_file_size;
+                r->evict_count = stor_count;
+                s->evict_file_size += nbytes;
+            } else if (stor_count > 0) {
+                /* Fallback: load into hart (no eviction path set) */
                 r->storage = calloc(1, sizeof(hart_t));
                 if (!r->storage) goto fail;
                 if (!hart_init_cap(r->storage, STOR_VAL_SIZE, STOR_INIT_CAP)) {

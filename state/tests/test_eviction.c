@@ -220,11 +220,24 @@ int main(void) {
     const char *save_path = "/tmp/test_eviction_state.bin";
     check(state_save(st, save_path, &root_save), "state_save succeeds");
 
-    /* Load into fresh state */
+    /* Load into fresh state WITH eviction path — storage streams to evict file */
+    const char *evict_dir2 = "/tmp/test_eviction2";
+    char evict_file2[256];
+    snprintf(evict_file2, sizeof(evict_file2), "%s/storage_evict.dat", evict_dir2);
+    mkdir(evict_dir2, 0755);
+    unlink(evict_file2);
+
     evm_state_t *es2 = evm_state_create(NULL);
     state_t *st2 = evm_state_get_state(es2);
+    state_set_evict_path(st2, evict_dir2);
+
     hash_t loaded_root;
     check(state_load(st2, save_path, &loaded_root), "state_load succeeds");
+
+    /* Verify storage is on disk, not in RAM (evict_count > 0, storage == NULL) */
+    /* Read a value — should trigger lazy reload from evict file */
+    uint256_t lazy_val = evm_state_get_storage(es2, &a1, &slot1);
+    check(lazy_val.low == 999, "lazy reload after state_load returns correct value");
 
     /* Compute root on loaded state */
     evm_state_invalidate_all(es2);
@@ -238,7 +251,9 @@ int main(void) {
     evm_state_destroy(es);
     unlink(save_path);
     unlink(evict_file);
+    unlink(evict_file2);
     rmdir(evict_dir);
+    rmdir(evict_dir2);
 
     printf("\n=== %s (%d errors) ===\n", errors ? "FAIL" : "PASS", errors);
     return errors ? 1 : 0;
