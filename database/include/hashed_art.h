@@ -65,6 +65,9 @@ size_t      hart_size(const hart_t *t);
 /* Mark path from root to key as dirty (for external modifications) */
 bool hart_mark_path_dirty(hart_t *t, const uint8_t key[32]);
 
+/* Check if tree has any dirty nodes (root node dirty = tree needs rehashing) */
+bool hart_is_dirty(const hart_t *t);
+
 /* Compute MPT root hash. Only rehashes dirty subtrees.
  * Clean subtrees use the hash embedded in the node. */
 void hart_root_hash(hart_t *t, hart_encode_t encode, void *ctx, uint8_t out[32]);

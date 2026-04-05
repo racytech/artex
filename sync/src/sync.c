@@ -340,6 +340,15 @@ bool sync_execute_block(sync_t *sync,
         sync->prev_fork = upcoming_fork;
     }
 
+    /* Skip root hash when validate_state_root is false (no-validate mode) */
+    if (!sync->config.validate_state_root) {
+        sync->evm->skip_root_hash = true;
+    } else {
+        uint32_t ci = sync->config.checkpoint_interval > 0
+                    ? sync->config.checkpoint_interval : 256;
+        sync->evm->skip_root_hash = (bn % ci != 0);
+    }
+
     /* Execute block */
     struct timespec _exec0, _exec1;
     clock_gettime(CLOCK_MONOTONIC, &_exec0);

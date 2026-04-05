@@ -1214,8 +1214,11 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
         /* Compute storage root if dirty */
         if (compute_hash && acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
             resource_t *r = get_resource(s, a);
-            if (r && r->storage)
+            if (r && r->storage) {
+                fprintf(stderr, "  [root] storage hart_root_hash for acct %u (compute_hash=%d)\n",
+                        (unsigned)(a - s->accounts), compute_hash);
                 hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
+            }
         }
 
         /* Delete from acct_index if dead/empty */
@@ -1258,8 +1261,17 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     #undef SAFE_DELETE_IDX
 
     /* Compute account trie root */
-    if (compute_hash)
+    if (compute_hash) {
+        /* Recompute stale storage roots. In no-validate mode, per-block calls
+         * skip storage root computation but clear ACCT_STORAGE_DIRTY. Scan all
+         * resources for dirty storage harts — hart_is_dirty is O(1) per check. */
+        for (uint32_t i = 1; i < s->res_count; i++) {
+            resource_t *r = &s->resources[i];
+            if (r->storage && hart_is_dirty(r->storage))
+                hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
+        }
         hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
+    }
 
     dirty_clear(&s->blk_dirty);
     s->blk_dirty_cursor = 0;
