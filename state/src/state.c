@@ -1214,11 +1214,8 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
         /* Compute storage root if dirty */
         if (compute_hash && acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
             resource_t *r = get_resource(s, a);
-            if (r && r->storage) {
-                fprintf(stderr, "  [root] storage hart_root_hash for acct %u (compute_hash=%d)\n",
-                        (unsigned)(a - s->accounts), compute_hash);
+            if (r && r->storage)
                 hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
-            }
         }
 
         /* Delete from acct_index if dead/empty */
