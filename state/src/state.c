@@ -1659,25 +1659,18 @@ uint32_t state_evict_cold_storage(state_t *s) {
     if (!evict_ensure_fd(s)) return 0;
 
     uint32_t evicted = 0;
-    uint64_t bytes_written = 0;
 
-    for (uint32_t i = 1; i < s->res_count; i++) {
-        resource_t *r = &s->resources[i];
+    /* Iterate accounts (not resources) to avoid O(accounts × resources) scan */
+    for (uint32_t i = 0; i < s->count; i++) {
+        account_t *a = &s->accounts[i];
+        if (!a->resource_idx) continue;
+        if (!acct_has_flag(a, ACCT_EXISTED)) continue;
+
+        resource_t *r = &s->resources[a->resource_idx];
         if (!r->storage) continue;
 
         size_t n = hart_size(r->storage);
         if (n == 0) continue;
-
-        /* Find the account that owns this resource */
-        /* Walk accounts looking for resource_idx == i */
-        account_t *a = NULL;
-        for (uint32_t j = 0; j < s->count; j++) {
-            if (s->accounts[j].resource_idx == i) {
-                a = &s->accounts[j];
-                break;
-            }
-        }
-        if (!a) continue;
 
         /* Check coldness */
         if (s->current_block - a->last_access_block < s->evict_threshold)
@@ -1686,6 +1679,11 @@ uint32_t state_evict_cold_storage(state_t *s) {
         /* Skip dirty accounts (modified this block, need root computation) */
         if (acct_has_flag(a, ACCT_MPT_DIRTY) || acct_has_flag(a, ACCT_STORAGE_DIRTY))
             continue;
+
+        /* Ensure storage_root is current before evicting — in no-validate mode
+         * roots may be stale (compute_hash=false skips root computation) */
+        if (hart_is_dirty(r->storage))
+            hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
 
         /* Write entries to eviction file */
         uint64_t offset = s->evict_file_size;
@@ -1714,7 +1712,6 @@ uint32_t state_evict_cold_storage(state_t *s) {
 
         destroy_resource_storage(r);
         evicted++;
-        bytes_written += pos;
     }
 
     return evicted;
@@ -1824,7 +1821,7 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
     if (!f) return false;
 
     /* Truncate eviction file — stale data from previous runs */
-    if (s->evict_fd >= 0) {
+    if (evict_ensure_fd(s)) {
         ftruncate(s->evict_fd, 0);
         s->evict_file_size = 0;
     }
