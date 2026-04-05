@@ -1278,15 +1278,11 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
 
     /* Compute account trie root */
     if (compute_hash) {
-        /* Force all nodes dirty — invalidates any cached hashes to ensure
-         * full recomputation. Safety net against stale cache bugs. */
-        hart_invalidate_all(&s->acct_index);
+        /* Recompute stale storage roots — scan all resources for dirty harts */
         for (uint32_t i = 1; i < s->res_count; i++) {
             resource_t *r = &s->resources[i];
-            if (r->storage) {
-                hart_invalidate_all(r->storage);
+            if (r->storage && hart_is_dirty(r->storage))
                 hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
-            }
         }
         hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
     }
@@ -1299,6 +1295,15 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     mem_art_init(&s->addr_hash_cache);
 
     return root;
+}
+
+void state_invalidate_all(state_t *s) {
+    if (!s) return;
+    hart_invalidate_all(&s->acct_index);
+    for (uint32_t i = 1; i < s->res_count; i++) {
+        resource_t *r = &s->resources[i];
+        if (r->storage) hart_invalidate_all(r->storage);
+    }
 }
 
 hash_t state_compute_root(state_t *s, bool prune_empty) {

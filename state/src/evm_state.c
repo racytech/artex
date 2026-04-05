@@ -283,6 +283,10 @@ void evm_state_prune_empty_accounts(evm_state_t *es) {
     (void)es; /* no mass prune — EIP-161 handled per-tx in commit_tx */
 }
 
+void evm_state_invalidate_all(evm_state_t *es) {
+    if (es) state_invalidate_all(es->st);
+}
+
 void evm_state_finalize_block(evm_state_t *es, bool prune_empty) {
     if (es) state_finalize_block(es->st, prune_empty);
 }

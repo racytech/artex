@@ -1343,6 +1343,9 @@ int main(int argc, char **argv) {
             state_t *st = evm_state_get_state(snap_es);
             bool prune = (bn >= 2675000);
 
+            /* Force full recomputation — no stale cached hashes */
+            evm_state_invalidate_all(snap_es);
+
             struct timespec _sr0, _sr1;
             clock_gettime(CLOCK_MONOTONIC, &_sr0);
             hash_t snap_root = evm_state_compute_mpt_root(snap_es, prune);
@@ -1519,6 +1522,7 @@ int main(int argc, char **argv) {
         if (last > 0) {
             fprintf(stderr, "\nComputing final state root at block %lu...\n", last);
             evm_state_t *es = sync_get_state(sync);
+            evm_state_invalidate_all(es);
             bool prune = (last >= 2675000);
             struct timespec _fr0, _fr1;
             clock_gettime(CLOCK_MONOTONIC, &_fr0);

@@ -139,6 +139,10 @@ hash_t state_compute_root(state_t *s, bool prune_empty);
 hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash);
 void   state_finalize_block(state_t *s, bool prune_empty);
 
+/* Force full recomputation on next compute_root — invalidates all cached
+ * hashes in account index and all storage harts. Use at snapshot time. */
+void   state_invalidate_all(state_t *s);
+
 /* Number of tracked dead accounts (phantoms + destructed + pruned). */
 uint32_t state_dead_count(const state_t *s);
 
