@@ -409,6 +409,10 @@ void evm_state_set_evict_threshold(evm_state_t *es, uint64_t blocks) {
     if (es) state_set_evict_threshold(es->st, blocks);
 }
 
+void evm_state_set_evict_budget(evm_state_t *es, size_t bytes) {
+    if (es) state_set_evict_budget(es->st, bytes);
+}
+
 uint32_t evm_state_evict_cold_storage(evm_state_t *es) {
     return es ? state_evict_cold_storage(es->st) : 0;
 }

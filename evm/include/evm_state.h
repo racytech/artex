@@ -275,6 +275,7 @@ void evm_state_prune_empty_accounts(evm_state_t *es);
 /* Cold storage eviction — evict inactive storage harts to disk. */
 void     evm_state_set_evict_path(evm_state_t *es, const char *dir);
 void     evm_state_set_evict_threshold(evm_state_t *es, uint64_t blocks);
+void     evm_state_set_evict_budget(evm_state_t *es, size_t bytes);
 uint32_t evm_state_evict_cold_storage(evm_state_t *es);
 
 // ============================================================================

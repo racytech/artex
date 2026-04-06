@@ -252,7 +252,8 @@ struct state {
     /* Cold storage eviction */
     int       evict_fd;           /* fd for storage_evict.dat (-1 = not open) */
     uint64_t  evict_file_size;    /* current append position */
-    uint64_t  evict_threshold;    /* blocks of inactivity before eviction */
+    uint64_t  evict_threshold;    /* blocks of inactivity before eviction (starting threshold) */
+    size_t    evict_budget;       /* target max stor_arena_bytes (0 = unlimited) */
     char      evict_path[512];    /* path to storage_evict.dat */
 
     /* dump-prestate support: preserved dirty list + slot key tracking */
@@ -482,6 +483,9 @@ static uint256_t storage_read(const state_t *s, const account_t *a,
                                const uint8_t slot_hash[32]) {
     resource_t *r = get_resource(s, a);
     if (!r) return UINT256_ZERO;
+    /* Track access for eviction — one write per account per block */
+    if (a->last_access_block != s->current_block)
+        ((account_t *)a)->last_access_block = s->current_block;
     /* Reload from eviction file if needed */
     if (!r->storage && r->evict_count > 0)
         state_reload_storage((state_t *)s, (account_t *)a, r);
@@ -1650,6 +1654,10 @@ void state_set_evict_threshold(state_t *s, uint64_t blocks) {
     if (s) s->evict_threshold = blocks;
 }
 
+void state_set_evict_budget(state_t *s, size_t bytes) {
+    if (s) s->evict_budget = bytes;
+}
+
 static bool evict_ensure_fd(state_t *s) {
     if (s->evict_fd >= 0) return true;
     if (s->evict_path[0] == '\0') return false;
@@ -1661,65 +1669,101 @@ static bool evict_ensure_fd(state_t *s) {
     return true;
 }
 
+/* Evict a single account's storage to the eviction file.
+ * Returns true on success. */
+static bool evict_one(state_t *s, account_t *a, resource_t *r) {
+    size_t n = hart_size(r->storage);
+    if (n == 0) return false;
+
+    /* Skip dirty accounts (modified this block, need root computation) */
+    if (acct_has_flag(a, ACCT_MPT_DIRTY) || acct_has_flag(a, ACCT_STORAGE_DIRTY))
+        return false;
+
+    /* Ensure storage_root is current before evicting — in no-validate mode
+     * roots may be stale (compute_hash=false skips root computation) */
+    if (hart_is_dirty(r->storage))
+        hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
+
+    /* Write entries to eviction file */
+    uint64_t offset = s->evict_file_size;
+    size_t nbytes = n * 64;
+    uint8_t *buf = malloc(nbytes);
+    if (!buf) return false;
+
+    size_t pos = 0;
+    hart_iter_t *it = hart_iter_create(r->storage);
+    if (it) {
+        while (hart_iter_next(it)) {
+            memcpy(buf + pos, hart_iter_key(it), 32);
+            memcpy(buf + pos + 32, hart_iter_value(it), 32);
+            pos += 64;
+        }
+        hart_iter_destroy(it);
+    }
+
+    ssize_t wr = pwrite(s->evict_fd, buf, pos, (off_t)offset);
+    free(buf);
+    if (wr != (ssize_t)pos) return false;
+
+    s->evict_file_size += pos;
+    r->evict_offset = offset;
+    r->evict_count = (uint32_t)n;
+    destroy_resource_storage(r);
+    return true;
+}
+
 uint32_t state_evict_cold_storage(state_t *s) {
-    if (!s || s->evict_threshold == 0) return 0;
+    if (!s) return 0;
     if (!evict_ensure_fd(s)) return 0;
 
+    /* Check if we're over budget */
+    size_t stor_arena = 0;
+    if (s->evict_budget > 0) {
+        for (uint32_t i = 1; i < s->res_count; i++) {
+            resource_t *r = &s->resources[i];
+            if (r->storage) stor_arena += r->storage->arena_cap;
+        }
+        if (stor_arena <= s->evict_budget) return 0;  /* under budget — nothing to do */
+    } else if (s->evict_threshold == 0) {
+        return 0;  /* no budget and no threshold — disabled */
+    }
+
+    /* Adaptive threshold: start at evict_threshold, halve if still over budget.
+     * Without a budget, single pass at evict_threshold. */
+    uint64_t threshold = s->evict_threshold > 0 ? s->evict_threshold : 50000;
     uint32_t evicted = 0;
 
-    /* Iterate all accounts — skip early on no resource_idx.
-     * resource_list can't be used here: it has duplicates and stale
-     * indices after compaction. The inner loop is cheap (two field checks). */
-    for (uint32_t i = 0; i < s->count; i++) {
-        account_t *a = &s->accounts[i];
-        if (!a->resource_idx) continue;
+    for (int pass = 0; pass < 8; pass++) {  /* max 8 halvings: 50K → 195 blocks */
+        for (uint32_t i = 0; i < s->count; i++) {
+            account_t *a = &s->accounts[i];
+            if (!a->resource_idx) continue;
 
-        resource_t *r = &s->resources[a->resource_idx];
-        if (!r->storage) continue;
+            resource_t *r = &s->resources[a->resource_idx];
+            if (!r->storage) continue;
 
-        size_t n = hart_size(r->storage);
-        if (n == 0) continue;
+            if (s->current_block - a->last_access_block < threshold)
+                continue;
 
-        /* Check coldness */
-        if (s->current_block - a->last_access_block < s->evict_threshold)
-            continue;
-
-        /* Skip dirty accounts (modified this block, need root computation) */
-        if (acct_has_flag(a, ACCT_MPT_DIRTY) || acct_has_flag(a, ACCT_STORAGE_DIRTY))
-            continue;
-
-        /* Ensure storage_root is current before evicting — in no-validate mode
-         * roots may be stale (compute_hash=false skips root computation) */
-        if (hart_is_dirty(r->storage))
-            hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
-
-        /* Write entries to eviction file */
-        uint64_t offset = s->evict_file_size;
-        size_t nbytes = n * 64;
-        uint8_t *buf = malloc(nbytes);
-        if (!buf) continue;
-
-        size_t pos = 0;
-        hart_iter_t *it = hart_iter_create(r->storage);
-        if (it) {
-            while (hart_iter_next(it)) {
-                memcpy(buf + pos, hart_iter_key(it), 32);
-                memcpy(buf + pos + 32, hart_iter_value(it), 32);
-                pos += 64;
+            if (evict_one(s, a, r)) {
+                evicted++;
+                stor_arena -= r->storage ? r->storage->arena_cap : 0;
             }
-            hart_iter_destroy(it);
         }
 
-        ssize_t wr = pwrite(s->evict_fd, buf, pos, (off_t)offset);
-        free(buf);
-        if (wr != (ssize_t)pos) continue;
+        /* Check if under budget now */
+        if (s->evict_budget == 0) break;  /* no budget — single pass */
 
-        s->evict_file_size += pos;
-        r->evict_offset = offset;
-        r->evict_count = (uint32_t)n;
+        /* Recompute arena (evict_one freed harts, so arena changed) */
+        stor_arena = 0;
+        for (uint32_t i = 1; i < s->res_count; i++) {
+            resource_t *r = &s->resources[i];
+            if (r->storage) stor_arena += r->storage->arena_cap;
+        }
+        if (stor_arena <= s->evict_budget) break;
 
-        destroy_resource_storage(r);
-        evicted++;
+        /* Still over budget — halve threshold for more aggressive eviction */
+        threshold /= 2;
+        if (threshold < 64) break;  /* minimum: don't evict accounts accessed 64 blocks ago */
     }
 
     return evicted;

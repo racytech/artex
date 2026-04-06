@@ -163,6 +163,7 @@ void state_compact(state_t *s);
 /* Cold storage eviction — evict inactive storage harts to disk. */
 void     state_set_evict_path(state_t *s, const char *dir);
 void     state_set_evict_threshold(state_t *s, uint64_t blocks);
+void     state_set_evict_budget(state_t *s, size_t bytes);
 uint32_t state_evict_cold_storage(state_t *s);
 
 /* =========================================================================

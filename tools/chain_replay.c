@@ -464,6 +464,7 @@ int main(int argc, char **argv) {
     const char *load_state_path = NULL;
     bool no_validate = false;
     uint64_t snapshot_every = 0;  /* 0 = disabled */
+    size_t storage_budget_mb = 0; /* 0 = unlimited */
 #ifdef ENABLE_HISTORY
     bool no_history = false;
 #endif
@@ -513,6 +514,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[1 + arg_offset], "--snapshot-every") == 0 && arg_offset + 2 < argc) {
             snapshot_every = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
+        } else if (strcmp(argv[1 + arg_offset], "--storage-budget") == 0 && arg_offset + 2 < argc) {
+            storage_budget_mb = (size_t)atoll(argv[2 + arg_offset]);
+            arg_offset += 2;
         } else if (strcmp(argv[1 + arg_offset], "--save-state") == 0 && arg_offset + 2 < argc) {
             save_state_block = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
@@ -545,6 +549,7 @@ int main(int argc, char **argv) {
             "  --trace-block N       Enable EIP-3155 EVM trace for block N (to stderr)\n"
             "  --no-validate         Skip all root validation, compute once at end\n"
             "  --snapshot-every N    Auto-save state every N blocks (e.g. 1000000)\n"
+            "  --storage-budget N    Target storage memory in MB (default: 0 = unlimited)\n"
             "  --save-state N [P]    Save full state after block N to binary file P\n"
             "                        (default: state_<N>.bin)\n"
             "  --load-state P        Load state from binary file P, resume from that block\n"
@@ -631,6 +636,9 @@ int main(int argc, char **argv) {
     LOG_INFO("State loaded successfully");
     /* Enable cold storage eviction */
     evm_state_set_evict_path(sync_get_state(sync), data_dir);
+    if (storage_budget_mb > 0)
+        evm_state_set_evict_budget(sync_get_state(sync),
+                                   storage_budget_mb * 1024ULL * 1024ULL);
 
     {
         evm_state_stats_t dbg_ss = sync_get_state_stats(sync);
