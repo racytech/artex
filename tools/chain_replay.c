@@ -1063,8 +1063,10 @@ int main(int argc, char **argv) {
                 state_t *_st = evm_state_get_state(sync_get_state(sync));
                 state_stats_t ms = _st ? state_get_stats(_st) : (state_stats_t){0};
 
-                printf("  └ %zuK accts %zuK stor | vec=%zuMB res=%zuMB idx=%zuMB stor=%zuMB | tracked=%zuMB RSS=%zuMB\n",
-                       ms.account_count / 1000, ms.storage_account_count / 1000,
+                printf("  └ %zuK accts %uK stor(%uK mem %uK disk) | vec=%zuMB res=%zuMB idx=%zuMB stor=%zuMB | tracked=%zuMB RSS=%zuMB\n",
+                       ms.account_count / 1000,
+                       ms.stor_in_memory / 1000 + ms.stor_evicted / 1000,
+                       ms.stor_in_memory / 1000, ms.stor_evicted / 1000,
                        ms.acct_vec_bytes / (1024*1024),
                        ms.res_vec_bytes / (1024*1024),
                        ms.acct_arena_bytes / (1024*1024),

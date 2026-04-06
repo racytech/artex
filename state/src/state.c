@@ -1276,11 +1276,15 @@ state_stats_t state_get_stats(const state_t *s) {
     st.acct_arena_bytes = s->acct_index.arena_cap;
 
     size_t stor_arena = 0;
+    uint32_t in_mem = 0, on_disk = 0;
     for (uint32_t i = 1; i < s->res_count; i++) {
         resource_t *r = &s->resources[i];
-        if (r->storage) stor_arena += r->storage->arena_cap;
+        if (r->storage) { stor_arena += r->storage->arena_cap; in_mem++; }
+        else if (r->evict_count > 0) on_disk++;
     }
     st.stor_arena_bytes = stor_arena;
+    st.stor_in_memory = in_mem;
+    st.stor_evicted = on_disk;
 
     st.total_tracked = st.acct_vec_bytes + st.res_vec_bytes +
                        st.acct_arena_bytes + st.stor_arena_bytes;

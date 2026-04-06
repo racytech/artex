@@ -172,6 +172,8 @@ uint32_t state_evict_cold_storage(state_t *s);
 typedef struct {
     uint32_t account_count;
     uint32_t storage_account_count;
+    uint32_t stor_in_memory;         /* storage harts currently in RAM */
+    uint32_t stor_evicted;           /* storage harts on disk (eviction file) */
     /* Memory breakdown */
     size_t   acct_vec_bytes;         /* accounts vector: count * 80 */
     size_t   res_vec_bytes;          /* resource vector: res_count * 104 */
