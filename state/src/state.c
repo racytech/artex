@@ -256,6 +256,11 @@ struct state {
     size_t    evict_budget;       /* target max stor_arena_bytes (0 = unlimited) */
     char      evict_path[512];    /* path to storage_evict.dat */
 
+    /* Incremental stats — avoid O(resources) scan on every stats call */
+    size_t    stor_arena_total;   /* sum of all in-memory hart arena_cap */
+    uint32_t  stor_in_memory;    /* count of resources with r->storage != NULL */
+    uint32_t  stor_evicted;      /* count of resources with evict_count > 0 */
+
     /* dump-prestate support: preserved dirty list + slot key tracking */
     dirty_vec_t last_dirty;       /* blk_dirty from last compute_root (addr[20]) */
     dirty_vec_t accessed_slots;   /* addr[20]+slot_be[32] = 52 bytes each */
@@ -424,14 +429,21 @@ static bool ensure_storage(state_t *s, account_t *a) {
         free(r->storage); r->storage = NULL; return false;
     }
 
+    s->stor_arena_total += r->storage->arena_cap;
+    s->stor_in_memory++;
+
     uint32_t idx = (uint32_t)(a - s->accounts);
     resource_list_add(s, idx);
     return true;
 }
 
-static void destroy_resource_storage(resource_t *r) {
-    if (!r) return;
-    if (r->storage) { hart_destroy(r->storage); free(r->storage); r->storage = NULL; }
+static void destroy_resource_storage(state_t *s, resource_t *r) {
+    if (!r || !r->storage) return;
+    if (s) {
+        s->stor_arena_total -= r->storage->arena_cap;
+        s->stor_in_memory--;
+    }
+    hart_destroy(r->storage); free(r->storage); r->storage = NULL;
 }
 
 /* =========================================================================
@@ -467,6 +479,9 @@ static bool state_reload_storage(state_t *s, account_t *a, resource_t *r) {
     }
 
     free(buf);
+    s->stor_arena_total += r->storage->arena_cap;
+    s->stor_in_memory++;
+    s->stor_evicted--;
     r->evict_offset = 0;
     r->evict_count = 0;
 
@@ -563,7 +578,7 @@ void state_destroy(state_t *s) {
     for (uint32_t i = 0; i < s->res_count; i++) {
         resource_t *r = &s->resources[i];
         free(r->code);
-        destroy_resource_storage(r);
+        destroy_resource_storage(s, r);
     }
     free(s->resources);
     free(s->accounts);
@@ -1124,7 +1139,7 @@ void state_create_account(state_t *s, const address_t *addr) {
         r->code_size = 0;
         r->code_hash = EMPTY_CODE_HASH;
         r->storage_root = EMPTY_STORAGE_ROOT;
-        destroy_resource_storage(r);
+        destroy_resource_storage(s, r);
     }
 
     mark_tx_dirty(s, addr);
@@ -1169,7 +1184,7 @@ void state_commit_tx(state_t *s) {
                 if (r->code) { free(r->code); r->code = NULL; }
                 r->code_size = 0;
                 r->storage_root = EMPTY_STORAGE_ROOT;
-                destroy_resource_storage(r);
+                destroy_resource_storage(s, r);
             }
             mark_blk_dirty(s, a);
             dead_vec_push(&s->destructed, &s->destructed_count, &s->destructed_cap,
@@ -1279,16 +1294,9 @@ state_stats_t state_get_stats(const state_t *s) {
     st.res_vec_bytes = (size_t)s->res_count * sizeof(resource_t);
     st.acct_arena_bytes = s->acct_index.arena_cap;
 
-    size_t stor_arena = 0;
-    uint32_t in_mem = 0, on_disk = 0;
-    for (uint32_t i = 1; i < s->res_count; i++) {
-        resource_t *r = &s->resources[i];
-        if (r->storage) { stor_arena += r->storage->arena_cap; in_mem++; }
-        else if (r->evict_count > 0) on_disk++;
-    }
-    st.stor_arena_bytes = stor_arena;
-    st.stor_in_memory = in_mem;
-    st.stor_evicted = on_disk;
+    st.stor_arena_bytes = s->stor_arena_total;
+    st.stor_in_memory = s->stor_in_memory;
+    st.stor_evicted = s->stor_evicted;
 
     st.total_tracked = st.acct_vec_bytes + st.res_vec_bytes +
                        st.acct_arena_bytes + st.stor_arena_bytes;
@@ -1582,7 +1590,7 @@ void state_compact(state_t *s) {
                 if (!res_live[i]) {
                     resource_t *r = &s->resources[i];
                     free(r->code);
-                    destroy_resource_storage(r);
+                    destroy_resource_storage(s, r);
                     memset(r, 0, sizeof(*r));
                 }
             }
@@ -1614,9 +1622,11 @@ void state_compact(state_t *s) {
             hart_iter_destroy(it);
         }
 
-        /* Swap */
+        /* Swap — update arena tracking */
+        s->stor_arena_total -= old->arena_cap;
         hart_destroy(old);
         *old = *fresh;
+        s->stor_arena_total += old->arena_cap;
         free(fresh);
     }
 
@@ -1710,7 +1720,8 @@ static bool evict_one(state_t *s, account_t *a, resource_t *r) {
     s->evict_file_size += pos;
     r->evict_offset = offset;
     r->evict_count = (uint32_t)n;
-    destroy_resource_storage(r);
+    destroy_resource_storage(s, r);
+    s->stor_evicted++;
     return true;
 }
 
@@ -1719,13 +1730,8 @@ uint32_t state_evict_cold_storage(state_t *s) {
     if (!evict_ensure_fd(s)) return 0;
 
     /* Check if we're over budget */
-    size_t stor_arena = 0;
     if (s->evict_budget > 0) {
-        for (uint32_t i = 1; i < s->res_count; i++) {
-            resource_t *r = &s->resources[i];
-            if (r->storage) stor_arena += r->storage->arena_cap;
-        }
-        if (stor_arena <= s->evict_budget) return 0;  /* under budget — nothing to do */
+        if (s->stor_arena_total <= s->evict_budget) return 0;
     } else if (s->evict_threshold == 0) {
         return 0;  /* no budget and no threshold — disabled */
     }
@@ -1748,20 +1754,12 @@ uint32_t state_evict_cold_storage(state_t *s) {
 
             if (evict_one(s, a, r)) {
                 evicted++;
-                stor_arena -= r->storage ? r->storage->arena_cap : 0;
             }
         }
 
         /* Check if under budget now */
         if (s->evict_budget == 0) break;  /* no budget — single pass */
-
-        /* Recompute arena (evict_one freed harts, so arena changed) */
-        stor_arena = 0;
-        for (uint32_t i = 1; i < s->res_count; i++) {
-            resource_t *r = &s->resources[i];
-            if (r->storage) stor_arena += r->storage->arena_cap;
-        }
-        if (stor_arena <= s->evict_budget) break;
+        if (s->stor_arena_total <= s->evict_budget) break;
 
         /* Still over budget — halve threshold for more aggressive eviction */
         threshold /= 2;
@@ -1927,6 +1925,9 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
         ftruncate(s->evict_fd, 0);
         s->evict_file_size = 0;
     }
+    s->stor_arena_total = 0;
+    s->stor_in_memory = 0;
+    s->stor_evicted = 0;
 
     /* Header */
     char magic[4];
@@ -2027,6 +2028,7 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
                 r->evict_offset = s->evict_file_size;
                 r->evict_count = stor_count;
                 s->evict_file_size += nbytes;
+                s->stor_evicted++;
             } else if (stor_count > 0) {
                 /* Fallback: load into hart (no eviction path set) */
                 r->storage = calloc(1, sizeof(hart_t));
@@ -2040,6 +2042,8 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
                     if (!read_all(f, sval, 32)) goto fail;
                     hart_insert(r->storage, skey, sval);
                 }
+                s->stor_arena_total += r->storage->arena_cap;
+                s->stor_in_memory++;
             }
         }
     }
