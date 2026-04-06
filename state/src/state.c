@@ -469,6 +469,9 @@ static bool state_reload_storage(state_t *s, account_t *a, resource_t *r) {
     r->evict_offset = 0;
     r->evict_count = 0;
 
+    /* Mark as recently accessed — prevents immediate re-eviction */
+    a->last_access_block = s->current_block;
+
     /* Track in resource list for stats */
     uint32_t idx = (uint32_t)(a - s->accounts);
     resource_list_add(s, idx);
