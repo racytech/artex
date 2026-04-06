@@ -1769,6 +1769,54 @@ uint32_t state_evict_cold_storage(state_t *s) {
     return evicted;
 }
 
+void state_compact_evict_file(state_t *s) {
+    if (!s || s->evict_fd < 0) return;
+
+    /* Count live evicted entries */
+    uint32_t live = 0;
+    for (uint32_t i = 1; i < s->res_count; i++) {
+        if (s->resources[i].evict_count > 0) live++;
+    }
+    if (live == 0) {
+        /* Nothing evicted — just truncate */
+        ftruncate(s->evict_fd, 0);
+        s->evict_file_size = 0;
+        return;
+    }
+
+    /* Create temp file, copy only live entries */
+    char tmp_path[520];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", s->evict_path);
+    int tmp_fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (tmp_fd < 0) return;
+
+    uint64_t new_offset = 0;
+    for (uint32_t i = 1; i < s->res_count; i++) {
+        resource_t *r = &s->resources[i];
+        if (r->evict_count == 0) continue;
+
+        size_t nbytes = (size_t)r->evict_count * 64;
+        uint8_t *buf = malloc(nbytes);
+        if (!buf) { close(tmp_fd); unlink(tmp_path); return; }
+
+        ssize_t rd = pread(s->evict_fd, buf, nbytes, (off_t)r->evict_offset);
+        if (rd != (ssize_t)nbytes) { free(buf); close(tmp_fd); unlink(tmp_path); return; }
+
+        ssize_t wr = pwrite(tmp_fd, buf, nbytes, (off_t)new_offset);
+        free(buf);
+        if (wr != (ssize_t)nbytes) { close(tmp_fd); unlink(tmp_path); return; }
+
+        r->evict_offset = new_offset;
+        new_offset += nbytes;
+    }
+
+    /* Swap files */
+    close(s->evict_fd);
+    rename(tmp_path, s->evict_path);
+    s->evict_fd = tmp_fd;
+    s->evict_file_size = new_offset;
+}
+
 /* =========================================================================
  * State save/load
  * ========================================================================= */

@@ -416,3 +416,7 @@ void evm_state_set_evict_budget(evm_state_t *es, size_t bytes) {
 uint32_t evm_state_evict_cold_storage(evm_state_t *es) {
     return es ? state_evict_cold_storage(es->st) : 0;
 }
+
+void evm_state_compact_evict_file(evm_state_t *es) {
+    if (es) state_compact_evict_file(es->st);
+}

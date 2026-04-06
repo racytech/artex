@@ -435,6 +435,7 @@ bool sync_execute_block(sync_t *sync,
                 struct timespec _c0, _c1;
                 clock_gettime(CLOCK_MONOTONIC, &_c0);
                 state_compact(st);
+                evm_state_compact_evict_file(sync->state);
                 clock_gettime(CLOCK_MONOTONIC, &_c1);
                 state_stats_t post = state_get_stats(st);
                 double ms = (_c1.tv_sec - _c0.tv_sec) * 1000.0 +
