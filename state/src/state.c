@@ -1596,11 +1596,13 @@ void state_compact(state_t *s) {
         resource_t *r = &s->resources[i];
         if (!r->storage || hart_size(r->storage) == 0) continue;
 
-        /* Rebuild: iterate old, insert into new */
+        /* Rebuild: iterate old, insert into new with right-sized arena */
         hart_t *old = r->storage;
         hart_t *fresh = calloc(1, sizeof(hart_t));
         if (!fresh) continue;
-        if (!hart_init_cap(fresh, STOR_VAL_SIZE, STOR_INIT_CAP)) { free(fresh); continue; }
+        size_t cap = old->arena_used + old->arena_used / 4;  /* 25% headroom */
+        if (cap < STOR_INIT_CAP) cap = STOR_INIT_CAP;
+        if (!hart_init_cap(fresh, STOR_VAL_SIZE, cap)) { free(fresh); continue; }
 
         hart_iter_t *it = hart_iter_create(old);
         if (it) {

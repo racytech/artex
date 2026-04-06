@@ -78,8 +78,8 @@ typedef struct {
 static hart_ref_t arena_alloc(hart_t *t, size_t bytes, bool is_leaf) {
     size_t aligned = (t->arena_used + 15) & ~(size_t)15;
     if (aligned + bytes > t->arena_cap) {
-        size_t nc = t->arena_cap ? t->arena_cap * 2 : 4096;
-        while (aligned + bytes > nc) nc *= 2;
+        size_t nc = t->arena_cap ? t->arena_cap + t->arena_cap / 2 : 4096;
+        while (aligned + bytes > nc) nc = nc + nc / 2;
         uint8_t *na = realloc(t->arena, nc);
         if (!na) return HART_REF_NULL;
         t->arena = na;
