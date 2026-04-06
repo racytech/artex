@@ -1660,14 +1660,12 @@ uint32_t state_evict_cold_storage(state_t *s) {
 
     uint32_t evicted = 0;
 
-    /* Iterate resource_list — only accounts with in-memory storage harts,
-     * not all 100M+ accounts. Populated by ensure_storage/reload. */
-    for (uint32_t ri = 0; ri < s->resource_count; ri++) {
-        uint32_t idx = s->resource_list[ri];
-        if (idx >= s->count) continue;
-        account_t *a = &s->accounts[idx];
+    /* Iterate all accounts — skip early on no resource_idx.
+     * resource_list can't be used here: it has duplicates and stale
+     * indices after compaction. The inner loop is cheap (two field checks). */
+    for (uint32_t i = 0; i < s->count; i++) {
+        account_t *a = &s->accounts[i];
         if (!a->resource_idx) continue;
-        if (!acct_has_flag(a, ACCT_EXISTED)) continue;
 
         resource_t *r = &s->resources[a->resource_idx];
         if (!r->storage) continue;
