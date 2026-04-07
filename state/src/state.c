@@ -959,10 +959,15 @@ void state_set_storage(state_t *s, const address_t *addr,
 
     uint8_t val_be[32];
     uint256_to_bytes(value, val_be);
+    size_t cap_before = r->storage->arena_cap;
     if (uint256_is_zero(value))
         hart_delete(r->storage, slot_hash.bytes);
     else
         hart_insert(r->storage, slot_hash.bytes, val_be);
+
+    /* Track arena growth from realloc inside hart_insert */
+    if (r->storage->arena_cap != cap_before)
+        s->stor_arena_total += r->storage->arena_cap - cap_before;
 
     acct_set_flag(a, ACCT_STORAGE_DIRTY);
     mark_tx_dirty(s, addr);
