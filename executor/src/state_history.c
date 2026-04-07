@@ -835,6 +835,49 @@ void state_history_apply_diff(evm_state_t *es, const block_diff_t *diff) {
      * For bulk reconstruction, skip per-block commit for performance. */
 }
 
+void state_history_revert_diff(evm_state_t *es, const block_diff_t *diff) {
+    if (!es || !diff) return;
+
+    /* Process groups in reverse order */
+    for (int i = (int)diff->group_count - 1; i >= 0; i--) {
+        const addr_diff_t *g = &diff->groups[i];
+
+        /* Revert storage slots first (reverse order) */
+        for (int j = (int)g->slot_count - 1; j >= 0; j--) {
+            evm_state_set_storage(es, &g->addr,
+                                   &g->slots[j].slot, &g->slots[j].old_value);
+        }
+
+        /* Revert account fields */
+        if (g->field_mask & FIELD_CODE_HASH)
+            evm_state_set_code_hash(es, &g->addr, &g->old_code_hash);
+
+        if (g->field_mask & FIELD_BALANCE)
+            evm_state_set_balance(es, &g->addr, &g->old_balance);
+
+        if (g->field_mask & FIELD_NONCE)
+            evm_state_set_nonce(es, &g->addr, g->old_nonce);
+
+        if (g->flags & ACCT_DIFF_CREATED) {
+            /* Account was created in this block — delete it to revert */
+            evm_state_set_nonce(es, &g->addr, 0);
+            uint256_t zero = UINT256_ZERO_INIT;
+            evm_state_set_balance(es, &g->addr, &zero);
+            /* TODO: proper account deletion from trie */
+        }
+
+        if (g->flags & ACCT_DIFF_DESTRUCTED) {
+            /* Account was destructed — restore old values */
+            evm_state_set_nonce(es, &g->addr, g->old_nonce);
+            evm_state_set_balance(es, &g->addr, &g->old_balance);
+            if (g->field_mask & FIELD_CODE_HASH)
+                evm_state_set_code_hash(es, &g->addr, &g->old_code_hash);
+        }
+    }
+
+    /* Caller must invalidate hashes and mark dirty after revert */
+}
+
 uint64_t state_history_replay(state_history_t *sh,
                                evm_state_t *es,
                                uint64_t first_block,
@@ -862,4 +905,56 @@ uint64_t state_history_replay(state_history_t *sh,
     LOG_HIST_INFO("history: replay complete — %lu blocks applied (%lu..%lu)",
            count, first_block, last_block);
     return count;
+}
+
+uint64_t state_history_revert_to(state_history_t *sh,
+                                  evm_state_t *es,
+                                  uint64_t target_block) {
+    if (!sh || !es) return 0;
+
+    /* Find the current head block from the ring */
+    size_t tail = atomic_load(&sh->ring.tail);
+    size_t head = atomic_load(&sh->ring.head);
+    if (head == tail) return 0;  /* ring empty */
+
+    /* Find the newest block number in the ring */
+    size_t newest_idx = (head - 1) & (DIFF_RING_CAP - 1);
+    uint64_t newest_block = sh->ring.slots[newest_idx].block_number;
+
+    if (target_block >= newest_block) return 0;  /* nothing to revert */
+
+    uint64_t reverted = 0;
+
+    /* Walk backwards from newest to target+1, reverting each */
+    for (uint64_t bn = newest_block; bn > target_block; bn--) {
+        /* Find this block in the ring */
+        bool found = false;
+        for (size_t idx = head; idx != tail; ) {
+            idx = (idx - 1) & (DIFF_RING_CAP - 1);
+            if (sh->ring.slots[idx].block_number == bn) {
+                state_history_revert_diff(es, &sh->ring.slots[idx]);
+                reverted++;
+                found = true;
+                break;
+            }
+            if (idx == tail) break;
+        }
+        if (!found) {
+            LOG_HIST_ERROR("history: revert failed — block %lu not in ring", bn);
+            break;
+        }
+    }
+
+    if (reverted > 0) {
+        /* Invalidate all cached hashes — state has been rewound */
+        evm_state_invalidate_all(es);
+
+        /* Truncate ring: remove reverted entries */
+        state_history_truncate(sh, target_block);
+
+        LOG_HIST_INFO("history: reverted %lu blocks (%lu → %lu)",
+               reverted, newest_block, target_block);
+    }
+
+    return reverted;
 }
