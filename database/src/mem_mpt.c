@@ -154,9 +154,15 @@ static bool leaf_hash(const uint8_t *suffix, size_t suffix_len,
 
     /* Slow path: large values — build RLP manually with heap allocation */
     /* RLP(encoded_path): header + data */
-    size_t path_rlp_len = encoded_len <= 55 ? 1 + encoded_len
-                        : encoded_len <= 0xFF ? 2 + encoded_len
-                        : 3 + encoded_len;
+    size_t path_rlp_len;
+    if (encoded_len == 1 && encoded_path[0] < 0x80)
+        path_rlp_len = 1;  /* single byte < 0x80: no length prefix */
+    else if (encoded_len <= 55)
+        path_rlp_len = 1 + encoded_len;
+    else if (encoded_len <= 0xFF)
+        path_rlp_len = 2 + encoded_len;
+    else
+        path_rlp_len = 3 + encoded_len;
     /* RLP(value): header + data */
     size_t val_rlp_len;
     if (value_len == 1 && value[0] < 0x80)
@@ -198,14 +204,18 @@ static bool leaf_hash(const uint8_t *suffix, size_t suffix_len,
         for (int i = (int)ll - 1; i >= 0; i--) buf[pos++] = lb[i];
     }
     /* Write RLP(encoded_path) */
-    if (encoded_len <= 55) {
+    if (encoded_len == 1 && encoded_path[0] < 0x80) {
+        buf[pos++] = encoded_path[0];  /* single byte < 0x80: as-is */
+    } else if (encoded_len <= 55) {
         buf[pos++] = 0x80 + (uint8_t)encoded_len;
+        memcpy(buf + pos, encoded_path, encoded_len); pos += encoded_len;
     } else if (encoded_len <= 0xFF) {
         buf[pos++] = 0xb8; buf[pos++] = (uint8_t)encoded_len;
+        memcpy(buf + pos, encoded_path, encoded_len); pos += encoded_len;
     } else {
         buf[pos++] = 0xb9; buf[pos++] = (uint8_t)(encoded_len >> 8); buf[pos++] = (uint8_t)(encoded_len & 0xFF);
+        memcpy(buf + pos, encoded_path, encoded_len); pos += encoded_len;
     }
-    memcpy(buf + pos, encoded_path, encoded_len); pos += encoded_len;
     /* Write RLP(value) */
     if (value_len == 1 && value[0] < 0x80) {
         buf[pos++] = value[0];

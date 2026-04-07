@@ -414,6 +414,30 @@ bool test_runner_run_engine_test(test_runner_t *runner,
             continue;
         }
 
+        /* Debug: dump receipt details for failing tests */
+        if (runner->config.verbose) {
+            for (size_t ri = 0; ri < block_result.receipt_count; ri++) {
+                printf("    receipt[%zu]: type=%u status=%u cum_gas=%lu logs=%zu\n",
+                       ri, block_result.receipts[ri].tx_type,
+                       block_result.receipts[ri].status_code,
+                       block_result.receipts[ri].cumulative_gas,
+                       block_result.receipts[ri].log_count);
+                for (size_t li = 0; li < block_result.receipts[ri].log_count; li++) {
+                    evm_log_t *log = &block_result.receipts[ri].logs[li];
+                    printf("      log[%zu]: addr=0x", li);
+                    for (int j = 0; j < 20; j++) printf("%02x", log->address.bytes[j]);
+                    printf(" topics=%u data_len=%u\n", log->topic_count, log->data_len);
+                }
+                /* Print bloom hash for receipt comparison */
+                {
+                    uint32_t bloom_sum = 0;
+                    for (int bi = 0; bi < 256; bi++)
+                        bloom_sum += block_result.receipts[ri].logs_bloom[bi];
+                    printf("    receipt[%zu] bloom_sum=%u\n", ri, bloom_sum);
+                }
+            }
+        }
+
         /* Verify receipt root */
         hash_t expected_receipt_root;
         memcpy(expected_receipt_root.bytes, payload->receipts_root, 32);
