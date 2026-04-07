@@ -5,6 +5,7 @@
 #include "transaction.h"
 #include "evm.h"
 #include "evm_state.h"
+#include "block_diff.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -64,11 +65,9 @@ typedef struct {
 
     bool        deposit_layout_invalid;  /* EIP-6110: invalid deposit event ABI layout */
 
-#ifdef ENABLE_HISTORY
-    /* Block diff for undo/reorg (populated by block_execute).
+    /* Block diff for undo/reorg (always populated by block_execute).
      * Caller must free via block_diff_free if non-zero group_count. */
     block_diff_t diff;
-#endif
 } block_result_t;
 
 /**

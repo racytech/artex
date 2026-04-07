@@ -8,9 +8,7 @@
 #include "evm_state.h"
 #include "state.h"
 #include "code_store.h"
-#ifdef ENABLE_HISTORY
-#include "state_history.h"
-#endif
+#include "block_diff.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -372,11 +370,7 @@ bool evm_state_is_created(evm_state_t *es, const address_t *addr) {
  * ========================================================================= */
 
 void evm_state_collect_block_diff(evm_state_t *es, struct block_diff_t *diff) {
-#ifdef ENABLE_HISTORY
     if (es && diff) state_collect_block_diff(es->st, diff);
-#else
-    (void)es; (void)diff;
-#endif
 }
 
 #ifdef ENABLE_DEBUG

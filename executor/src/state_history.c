@@ -836,46 +836,7 @@ void state_history_apply_diff(evm_state_t *es, const block_diff_t *diff) {
      * For bulk reconstruction, skip per-block commit for performance. */
 }
 
-void state_history_revert_diff(evm_state_t *es, const block_diff_t *diff) {
-    if (!es || !diff) return;
-
-    state_t *st = evm_state_get_state(es);
-    if (!st) return;
-
-    /* Process groups in reverse order using raw writes
-     * (skip journal, dirty tracking, block originals) */
-    for (int i = (int)diff->group_count - 1; i >= 0; i--) {
-        const addr_diff_t *g = &diff->groups[i];
-
-        /* Revert storage slots first (reverse order) */
-        for (int j = (int)g->slot_count - 1; j >= 0; j--) {
-            state_set_storage_raw(st, &g->addr,
-                                  &g->slots[j].slot, &g->slots[j].old_value);
-        }
-
-        /* Revert account fields */
-        if (g->field_mask & FIELD_BALANCE)
-            state_set_balance_raw(st, &g->addr, &g->old_balance);
-
-        if (g->field_mask & FIELD_NONCE)
-            state_set_nonce_raw(st, &g->addr, g->old_nonce);
-
-        if (g->flags & ACCT_DIFF_CREATED) {
-            /* Account was created in this block — zero it out to revert */
-            state_set_nonce_raw(st, &g->addr, 0);
-            uint256_t zero = UINT256_ZERO;
-            state_set_balance_raw(st, &g->addr, &zero);
-        }
-
-        if (g->flags & ACCT_DIFF_DESTRUCTED) {
-            /* Account was destructed — restore old values */
-            state_set_nonce_raw(st, &g->addr, g->old_nonce);
-            state_set_balance_raw(st, &g->addr, &g->old_balance);
-        }
-    }
-
-    /* Caller must invalidate hashes and mark dirty after revert */
-}
+/* block_diff_revert is implemented in state.c (uses state_set_*_raw) */
 
 uint64_t state_history_replay(state_history_t *sh,
                                evm_state_t *es,
@@ -931,7 +892,7 @@ uint64_t state_history_revert_to(state_history_t *sh,
         for (size_t idx = head; idx != tail; ) {
             idx = (idx - 1) & (DIFF_RING_CAP - 1);
             if (sh->ring.slots[idx].block_number == bn) {
-                state_history_revert_diff(es, &sh->ring.slots[idx]);
+                block_diff_revert(es, &sh->ring.slots[idx]);
                 reverted++;
                 found = true;
                 break;

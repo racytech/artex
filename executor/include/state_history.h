@@ -1,9 +1,7 @@
 #ifndef ART_EXECUTOR_STATE_HISTORY_H
 #define ART_EXECUTOR_STATE_HISTORY_H
 
-#include "address.h"
-#include "hash.h"
-#include "uint256.h"
+#include "block_diff.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -48,53 +46,7 @@ extern "C" {
  * Corrupt trailing records are truncated.
  * ========================================================================= */
 
-/* ── Per-block diff types ─────────────────────────────────────────────── */
-
-/* Account flags */
-#define ACCT_DIFF_CREATED      (1 << 0)
-#define ACCT_DIFF_DESTRUCTED   (1 << 1)
-#define ACCT_DIFF_TOUCHED      (1 << 2)  /* touched this block but no value change */
-#define ACCT_DIFF_FINAL_DIRTY  (1 << 3)  /* block_dirty was true at diff collection */
-
-/* Field bitmask — which account fields changed */
-#define FIELD_NONCE     (1 << 0)
-#define FIELD_BALANCE   (1 << 1)
-#define FIELD_CODE_HASH (1 << 2)
-
-/** Single storage slot change. */
-typedef struct {
-    uint256_t slot;
-    uint256_t value;        /* new value (forward replay) */
-    uint256_t old_value;    /* previous value (reverse replay / undo) */
-} slot_diff_t;
-
-/** Per-address diff group: account fields + storage slots. */
-typedef struct {
-    address_t   addr;
-    uint8_t     flags;       /* ACCT_DIFF_CREATED | ACCT_DIFF_DESTRUCTED */
-    uint8_t     field_mask;  /* FIELD_NONCE | FIELD_BALANCE | FIELD_CODE_HASH */
-    uint64_t    nonce;       /* new nonce (valid if field_mask & FIELD_NONCE) */
-    uint64_t    old_nonce;   /* previous nonce (for undo) */
-    uint256_t   balance;     /* new balance (valid if field_mask & FIELD_BALANCE) */
-    uint256_t   old_balance; /* previous balance (for undo) */
-    hash_t      code_hash;   /* new code_hash (valid if field_mask & FIELD_CODE_HASH) */
-    hash_t      old_code_hash; /* previous code_hash (for undo) */
-    slot_diff_t *slots;      /* heap-allocated array */
-    uint16_t    slot_count;
-} addr_diff_t;
-
-/** Per-block diff: array of address groups. */
-typedef struct block_diff_t {
-    uint64_t     block_number;
-    addr_diff_t *groups;        /* heap-allocated array */
-    uint16_t     group_count;
-} block_diff_t;
-
-/** Free a block_diff_t's heap allocations (not the struct itself). */
-void block_diff_free(block_diff_t *diff);
-
-/** Deep-copy a block_diff_t (allocates new groups + slots arrays). */
-void block_diff_clone(const block_diff_t *src, block_diff_t *dst);
+/* Per-block diff types are in block_diff.h (always available) */
 
 /* ── SPSC ring buffer for diffs ───────────────────────────────────────── */
 
@@ -193,18 +145,8 @@ uint64_t state_history_replay(state_history_t *sh,
                                uint64_t first_block,
                                uint64_t last_block);
 
-/* ── Reverse replay API (undo / reorg) ─────────────────────────────────── */
-
-/**
- * Revert a single block diff (reverse replay / undo).
- * Writes old_nonce, old_balance, old_code_hash, old_value for each entry.
- * Handles ACCT_DIFF_CREATED (revert = delete account) and
- * ACCT_DIFF_DESTRUCTED (revert = restore old values).
- *
- * After revert, caller must invalidate cached hashes and mark dirty
- * accounts for root recomputation.
- */
-void state_history_revert_diff(struct evm_state *es, const block_diff_t *diff);
+/* block_diff_revert() is in block_diff.h (always available).
+ * state_history_revert_to() uses the in-memory ring + block_diff_revert. */
 
 /**
  * Revert state from current block back to target_block.

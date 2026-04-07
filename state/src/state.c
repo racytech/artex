@@ -12,9 +12,7 @@
 #include "keccak256.h"
 #include "logger.h"
 
-#ifdef ENABLE_HISTORY
-#include "state_history.h"
-#endif
+#include "block_diff.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -1648,8 +1646,6 @@ size_t state_collect_accessed_storage_keys(const state_t *s,
     return n;
 }
 
-#ifdef ENABLE_HISTORY
-
 /* Callback context for storage diff collection */
 typedef struct {
     state_t     *s;
@@ -1776,7 +1772,49 @@ void state_collect_block_diff(state_t *s, block_diff_t *out) {
     out->groups = groups;
     out->group_count = group_count;
 }
-#endif /* ENABLE_HISTORY */
+
+/* =========================================================================
+ * Block diff revert — undo a block's state changes (always available)
+ * ========================================================================= */
+
+void block_diff_revert(struct evm_state *es, const block_diff_t *diff) {
+    if (!es || !diff) return;
+
+    /* evm_state_get_state is in evm_state.c — use the extern declaration */
+    extern state_t *evm_state_get_state(struct evm_state *);
+    state_t *st = evm_state_get_state(es);
+    if (!st) return;
+
+    /* Process groups in reverse order using raw writes
+     * (skip journal, dirty tracking, block originals) */
+    for (int i = (int)diff->group_count - 1; i >= 0; i--) {
+        const addr_diff_t *g = &diff->groups[i];
+
+        /* Revert storage slots first (reverse order) */
+        for (int j = (int)g->slot_count - 1; j >= 0; j--) {
+            state_set_storage_raw(st, &g->addr,
+                                  &g->slots[j].slot, &g->slots[j].old_value);
+        }
+
+        /* Revert account fields */
+        if (g->field_mask & FIELD_BALANCE)
+            state_set_balance_raw(st, &g->addr, &g->old_balance);
+
+        if (g->field_mask & FIELD_NONCE)
+            state_set_nonce_raw(st, &g->addr, g->old_nonce);
+
+        if (g->flags & ACCT_DIFF_CREATED) {
+            state_set_nonce_raw(st, &g->addr, 0);
+            uint256_t zero = UINT256_ZERO;
+            state_set_balance_raw(st, &g->addr, &zero);
+        }
+
+        if (g->flags & ACCT_DIFF_DESTRUCTED) {
+            state_set_nonce_raw(st, &g->addr, g->old_nonce);
+            state_set_balance_raw(st, &g->addr, &g->old_balance);
+        }
+    }
+}
 
 void state_compact(state_t *s) {
     if (!s) return;

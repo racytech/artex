@@ -736,19 +736,18 @@ block_result_t block_execute(evm_t *evm,
     /* Finalize state: flush dirty accounts/storage to state_db */
     evm_state_finalize(evm->state);
 
-#ifdef ENABLE_HISTORY
     /* Capture state diff before dirty flags are cleared by compute_state_root.
-     * Always populate result.diff for undo support; also push to history ring. */
-    {
-        memset(&result.diff, 0, sizeof(result.diff));
-        result.diff.block_number = header->number;
-        evm_state_collect_block_diff(evm->state, &result.diff);
+     * Always populated for undo/reorg support. */
+    memset(&result.diff, 0, sizeof(result.diff));
+    result.diff.block_number = header->number;
+    evm_state_collect_block_diff(evm->state, &result.diff);
 
-        if (history) {
-            block_diff_t hist_diff;
-            block_diff_clone(&result.diff, &hist_diff);
-            state_history_push(history, &hist_diff);
-        }
+#ifdef ENABLE_HISTORY
+    /* Push diff to history ring for disk persistence (optional) */
+    if (history) {
+        block_diff_t hist_diff;
+        block_diff_clone(&result.diff, &hist_diff);
+        state_history_push(history, &hist_diff);
     }
 #endif
 
@@ -786,8 +785,6 @@ void block_result_free(block_result_t *result) {
         result->request_lengths = NULL;
         result->request_count = 0;
 
-#ifdef ENABLE_HISTORY
         block_diff_free(&result->diff);
-#endif
     }
 }
