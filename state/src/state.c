@@ -1870,37 +1870,9 @@ void state_compact(state_t *s) {
         }
     }
 
-    /* Compact storage mem_arts — rebuild arenas for accounts with storage.
-     * Eliminates dead leaves from SSTORE overwrites and deletes. */
-    for (uint32_t i = 0; i < s->res_count; i++) {
-        resource_t *r = &s->resources[i];
-        if (!r->storage || hart_size(r->storage) == 0) continue;
-
-        /* Rebuild: iterate old, insert into new with right-sized arena */
-        hart_t *old = r->storage;
-        hart_t *fresh = calloc(1, sizeof(hart_t));
-        if (!fresh) continue;
-        size_t cap = old->arena_used + old->arena_used / 4;  /* 25% headroom */
-        if (cap < STOR_INIT_CAP) cap = STOR_INIT_CAP;
-        if (!hart_init_cap(fresh, STOR_VAL_SIZE, cap)) { free(fresh); continue; }
-
-        hart_iter_t *it = hart_iter_create(old);
-        if (it) {
-            while (hart_iter_next(it)) {
-                const uint8_t *ik = hart_iter_key(it);
-                const void *iv = hart_iter_value(it);
-                hart_insert(fresh, ik, iv);
-            }
-            hart_iter_destroy(it);
-        }
-
-        /* Swap — update arena tracking */
-        s->stor_arena_total -= old->arena_cap;
-        hart_destroy(old);
-        *old = *fresh;
-        s->stor_arena_total += old->arena_cap;
-        free(fresh);
-    }
+    /* Trim overallocated storage arenas — much faster than full rebuild.
+     * hart_trim: realloc to used+25%, O(1) per hart. */
+    state_trim_storage(s);
 
     /* acct_index (hart) was rebuilt — all nodes born dirty, hash will be recomputed */
 

@@ -428,9 +428,8 @@ bool sync_execute_block(sync_t *sync,
             bn - sync->last_compact_block >= 100000) {
             state_stats_t ss = state_get_stats(st);
             uint32_t dead = state_dead_count(st);
-            bool do_compact = (dead > 500000 ||  /* absolute: >500K dead */
-                               (ss.account_count > 0 &&
-                                dead > ss.account_count / 20));  /* relative: >5% dead */
+            bool do_compact = (ss.account_count > 0 &&
+                               dead > ss.account_count / 10);  /* >10% dead */
 
             if (do_compact) {
                 struct timespec _c0, _c1;
