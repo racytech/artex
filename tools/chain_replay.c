@@ -640,13 +640,6 @@ int main(int argc, char **argv) {
         evm_state_set_evict_budget(sync_get_state(sync),
                                    storage_budget_mb * 1024ULL * 1024ULL);
 
-    {
-        evm_state_stats_t dbg_ss = sync_get_state_stats(sync);
-        LOG_INFO("state: %lu accts, %lu storage_accts",
-                 (unsigned long)dbg_ss.cache_accounts,
-                 (unsigned long)dbg_ss.cache_slots);
-    }
-
     uint64_t start_block = (user_start > 0) ? user_start : 1;
 
     if (load_state_path) {
