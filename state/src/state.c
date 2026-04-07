@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <xmmintrin.h>
 
 /* =========================================================================
  * Constants
@@ -309,7 +310,12 @@ static account_t *find_account_h(const state_t *s, const hash_t *addr_hash) {
     if (!pidx) return NULL;
     uint32_t idx = *pidx;
     if (idx >= s->count) return NULL;
-    return &((state_t *)s)->accounts[idx];
+    account_t *a = &((state_t *)s)->accounts[idx];
+    /* Prefetch account data + resource (next cache lines to be accessed) */
+    _mm_prefetch((const char *)a, _MM_HINT_T0);
+    if (a->resource_idx && a->resource_idx < s->res_count)
+        _mm_prefetch((const char *)&s->resources[a->resource_idx], _MM_HINT_T0);
+    return a;
 }
 
 /* Convenience — uses addr_hash_cache */
@@ -320,7 +326,11 @@ static account_t *find_account(const state_t *s, const uint8_t addr[20]) {
 
 static resource_t *get_resource(const state_t *s, const account_t *a) {
     if (!a->resource_idx) return NULL;
-    return &((state_t *)s)->resources[a->resource_idx];
+    resource_t *r = &((state_t *)s)->resources[a->resource_idx];
+    /* Prefetch storage arena root — next access will be hart_get on this arena */
+    if (r->storage && r->storage->arena)
+        _mm_prefetch((const char *)r->storage->arena, _MM_HINT_T0);
+    return r;
 }
 
 static resource_t *ensure_resource(state_t *s, account_t *a) {
