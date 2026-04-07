@@ -58,6 +58,28 @@ void hart_destroy(hart_t *t);
 /* Shrink arena to fit used data. Returns bytes freed (0 if nothing to shrink). */
 size_t hart_trim(hart_t *t);
 
+/* Arena-direct dump/load — serialize hart as header + raw arena bytes.
+ * Much faster than entry-by-entry iteration (no rebuild on load). */
+
+/* Header stored on disk before the arena bytes */
+typedef struct {
+    hart_ref_t root;
+    uint32_t   size;        /* number of key-value pairs */
+    uint32_t   arena_used;  /* bytes of arena data following this header */
+    uint16_t   value_size;
+    uint16_t   _pad;
+} hart_dump_header_t;
+
+/* Returns total bytes needed: sizeof(header) + arena_used */
+size_t hart_dump_size(const hart_t *t);
+
+/* Write header + arena to buffer. Buffer must be >= hart_dump_size(t). */
+void hart_dump(const hart_t *t, uint8_t *buf);
+
+/* Restore hart from dumped buffer. Allocates arena, copies data.
+ * Returns true on success. Caller must hart_destroy when done. */
+bool hart_load(hart_t *t, const uint8_t *buf, size_t buf_len);
+
 /* Operations */
 bool        hart_insert(hart_t *t, const uint8_t key[32], const void *value);
 bool        hart_delete(hart_t *t, const uint8_t key[32]);

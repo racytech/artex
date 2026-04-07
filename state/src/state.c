@@ -481,7 +481,8 @@ static void destroy_resource_storage(state_t *s, resource_t *r) {
 static bool state_reload_storage(state_t *s, account_t *a, resource_t *r) {
     if (!r || r->evict_count == 0 || s->evict_fd < 0) return false;
 
-    size_t nbytes = (size_t)r->evict_count * 64;
+    /* evict_count = total dump bytes (header + arena) */
+    size_t nbytes = (size_t)r->evict_count;
     uint8_t *buf = malloc(nbytes);
     if (!buf) return false;
 
@@ -491,19 +492,11 @@ static bool state_reload_storage(state_t *s, account_t *a, resource_t *r) {
         return false;
     }
 
-    /* Create hart and populate */
+    /* Restore hart from arena dump — no per-entry insert needed */
     r->storage = calloc(1, sizeof(hart_t));
     if (!r->storage) { free(buf); return false; }
-    size_t cap = (size_t)r->evict_count * 96; /* ~96 bytes/entry in hart arena */
-    if (cap < STOR_INIT_CAP) cap = STOR_INIT_CAP;
-    if (!hart_init_cap(r->storage, STOR_VAL_SIZE, cap)) {
+    if (!hart_load(r->storage, buf, nbytes)) {
         free(r->storage); r->storage = NULL; free(buf); return false;
-    }
-
-    for (uint32_t i = 0; i < r->evict_count; i++) {
-        const uint8_t *key = buf + i * 64;
-        const uint8_t *val = buf + i * 64 + 32;
-        hart_insert(r->storage, key, val);
     }
 
     free(buf);
@@ -1399,6 +1392,22 @@ state_stats_t state_get_stats(const state_t *s) {
     st.stor_in_memory = s->stor_in_memory;
     st.stor_evicted = s->stor_evicted;
 
+    /* Debug: verify incremental counter matches actual scan (every call) */
+    {
+        size_t actual = 0;
+        uint32_t actual_count = 0;
+        for (uint32_t i = 1; i < s->res_count; i++) {
+            resource_t *r = &s->resources[i];
+            if (r->storage) { actual += r->storage->arena_cap; actual_count++; }
+        }
+        if (actual != s->stor_arena_total || actual_count != s->stor_in_memory)
+            fprintf(stderr, "  STOR_VERIFY: tracked=%zuMB actual=%zuMB (delta=%+ldMB) "
+                    "count: tracked=%u actual=%u\n",
+                    s->stor_arena_total / (1024*1024), actual / (1024*1024),
+                    ((long)actual - (long)s->stor_arena_total) / (1024*1024),
+                    s->stor_in_memory, actual_count);
+    }
+
     st.total_tracked = st.acct_vec_bytes + st.res_vec_bytes +
                        st.acct_arena_bytes + st.stor_arena_bytes;
     return st;
@@ -1940,30 +1949,21 @@ static bool evict_one(state_t *s, account_t *a, resource_t *r) {
     if (hart_is_dirty(r->storage))
         hart_root_hash(r->storage, stor_value_encode, NULL, r->storage_root.bytes);
 
-    /* Write entries to eviction file */
+    /* Dump hart arena directly to eviction file */
     uint64_t offset = s->evict_file_size;
-    size_t nbytes = n * 64;
-    uint8_t *buf = malloc(nbytes);
+    size_t dump_sz = hart_dump_size(r->storage);
+    uint8_t *buf = malloc(dump_sz);
     if (!buf) return false;
 
-    size_t pos = 0;
-    hart_iter_t *it = hart_iter_create(r->storage);
-    if (it) {
-        while (hart_iter_next(it)) {
-            memcpy(buf + pos, hart_iter_key(it), 32);
-            memcpy(buf + pos + 32, hart_iter_value(it), 32);
-            pos += 64;
-        }
-        hart_iter_destroy(it);
-    }
+    hart_dump(r->storage, buf);
 
-    ssize_t wr = pwrite(s->evict_fd, buf, pos, (off_t)offset);
+    ssize_t wr = pwrite(s->evict_fd, buf, dump_sz, (off_t)offset);
     free(buf);
-    if (wr != (ssize_t)pos) return false;
+    if (wr != (ssize_t)dump_sz) return false;
 
-    s->evict_file_size += pos;
+    s->evict_file_size += dump_sz;
     r->evict_offset = offset;
-    r->evict_count = (uint32_t)n;
+    r->evict_count = (uint32_t)dump_sz;
     destroy_resource_storage(s, r);
     s->stor_evicted++;
     return true;
@@ -2052,7 +2052,7 @@ void state_compact_evict_file(state_t *s) {
         resource_t *r = &s->resources[i];
         if (r->evict_count == 0) continue;
 
-        size_t nbytes = (size_t)r->evict_count * 64;
+        size_t nbytes = (size_t)r->evict_count;  /* dump bytes */
         uint8_t *buf = malloc(nbytes);
         if (!buf) { close(tmp_fd); unlink(tmp_path); return; }
 
@@ -2132,13 +2132,9 @@ bool state_save(const state_t *s, const char *path, const hash_t *state_root) {
 
         /* Storage entries — from hart (in-memory) or eviction file (on-disk) */
         uint32_t stor_count = 0;
-        if (r && r->storage)
+        if (r && r->storage) {
             stor_count = (uint32_t)hart_size(r->storage);
-        else if (r && r->evict_count > 0)
-            stor_count = r->evict_count;
-        if (!write_all(f, &stor_count, 4)) goto fail;
-
-        if (stor_count > 0 && r && r->storage) {
+            if (!write_all(f, &stor_count, 4)) goto fail;
             hart_iter_t *it = hart_iter_create(r->storage);
             if (it) {
                 while (hart_iter_next(it)) {
@@ -2151,17 +2147,39 @@ bool state_save(const state_t *s, const char *path, const hash_t *state_root) {
                 }
                 hart_iter_destroy(it);
             }
-        } else if (stor_count > 0 && r && r->evict_count > 0 && s->evict_fd >= 0) {
-            /* Copy directly from eviction file */
-            size_t nbytes = (size_t)stor_count * 64;
+        } else if (r && r->evict_count > 0 && s->evict_fd >= 0) {
+            /* Load arena dump, restore hart, iterate entries */
+            size_t nbytes = (size_t)r->evict_count;
             uint8_t *buf = malloc(nbytes);
             if (buf) {
                 ssize_t rd = pread(s->evict_fd, buf, nbytes, (off_t)r->evict_offset);
                 if (rd == (ssize_t)nbytes) {
-                    if (!write_all(f, buf, nbytes)) { free(buf); goto fail; }
+                    hart_t tmp;
+                    if (hart_load(&tmp, buf, nbytes)) {
+                        stor_count = (uint32_t)tmp.size;
+                        if (!write_all(f, &stor_count, 4)) {
+                            hart_destroy(&tmp); free(buf); goto fail;
+                        }
+                        hart_iter_t *it = hart_iter_create(&tmp);
+                        if (it) {
+                            while (hart_iter_next(it)) {
+                                if (!write_all(f, hart_iter_key(it), 32) ||
+                                    !write_all(f, hart_iter_value(it), 32)) {
+                                    hart_iter_destroy(it); hart_destroy(&tmp);
+                                    free(buf); goto fail;
+                                }
+                            }
+                            hart_iter_destroy(it);
+                        }
+                        hart_destroy(&tmp);
+                    }
                 }
                 free(buf);
+            } else {
+                if (!write_all(f, &stor_count, 4)) goto fail;
             }
+        } else {
+            if (!write_all(f, &stor_count, 4)) goto fail;
         }
     }
 
@@ -2271,20 +2289,32 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
 
             if (has_code) acct_set_flag(a, ACCT_HAS_CODE);
 
-            /* Load storage — stream to eviction file if available, else into hart */
+            /* Load storage — build hart, dump arena to eviction file */
             if (stor_count > 0 && evict_ensure_fd(s)) {
-                /* Write directly to eviction file — lazy reload on access */
-                size_t nbytes = (size_t)stor_count * 64;
-                uint8_t *buf = malloc(nbytes);
-                if (!buf) goto fail;
-                if (!read_all(f, buf, nbytes)) { free(buf); goto fail; }
-                ssize_t wr = pwrite(s->evict_fd, buf, nbytes,
+                /* Build temporary hart from key-value pairs */
+                hart_t tmp;
+                size_t cap = (size_t)stor_count * 96;
+                if (cap < STOR_INIT_CAP) cap = STOR_INIT_CAP;
+                if (!hart_init_cap(&tmp, STOR_VAL_SIZE, cap)) goto fail;
+                for (uint32_t j = 0; j < stor_count; j++) {
+                    uint8_t skey[32], sval[32];
+                    if (!read_all(f, skey, 32)) { hart_destroy(&tmp); goto fail; }
+                    if (!read_all(f, sval, 32)) { hart_destroy(&tmp); goto fail; }
+                    hart_insert(&tmp, skey, sval);
+                }
+                /* Dump arena to eviction file */
+                size_t dump_sz = hart_dump_size(&tmp);
+                uint8_t *buf = malloc(dump_sz);
+                if (!buf) { hart_destroy(&tmp); goto fail; }
+                hart_dump(&tmp, buf);
+                hart_destroy(&tmp);
+                ssize_t wr = pwrite(s->evict_fd, buf, dump_sz,
                                     (off_t)s->evict_file_size);
                 free(buf);
-                if (wr != (ssize_t)nbytes) goto fail;
+                if (wr != (ssize_t)dump_sz) goto fail;
                 r->evict_offset = s->evict_file_size;
-                r->evict_count = stor_count;
-                s->evict_file_size += nbytes;
+                r->evict_count = (uint32_t)dump_sz;
+                s->evict_file_size += dump_sz;
                 s->stor_evicted++;
             } else if (stor_count > 0) {
                 /* Fallback: load into hart (no eviction path set) */
