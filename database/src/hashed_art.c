@@ -87,14 +87,16 @@ static uint32_t *free_list_for_type(hart_t *t, int type) {
 }
 
 /* Return a dead node/leaf to its type-specific free list.
- * The first 4 bytes of the dead slot store the next pointer (arena offset). */
+ * Free list stores shifted refs (not raw offsets) to support arenas > 4GB.
+ * The first 4 bytes of the dead slot store the next ref. */
 static void arena_free(hart_t *t, hart_ref_t ref, int type) {
     if (ref == HART_REF_NULL) return;
-    uint32_t offset = (ref & 0x7FFFFFFFu) << 4;
+    size_t offset = (size_t)(ref & 0x7FFFFFFFu) << 4;
     uint32_t *head = free_list_for_type(t, type);
-    /* Store current head as next pointer in the freed slot */
+    /* Store current head ref as next pointer in the freed slot */
+    uint32_t ref_clean = ref & 0x7FFFFFFFu;  /* strip leaf bit */
     *(uint32_t *)(t->arena + offset) = *head;
-    *head = offset;
+    *head = ref_clean;
 }
 
 static hart_ref_t arena_alloc(hart_t *t, size_t bytes, bool is_leaf) {
@@ -122,11 +124,12 @@ static hart_ref_t arena_alloc(hart_t *t, size_t bytes, bool is_leaf) {
 static hart_ref_t arena_alloc_or_recycle(hart_t *t, size_t bytes, bool is_leaf, int node_type) {
     uint32_t *head = free_list_for_type(t, node_type);
     if (*head != 0) {
-        uint32_t offset = *head;
-        /* Pop from free list — next pointer stored in first 4 bytes */
+        uint32_t ref_val = *head;  /* shifted ref, not raw offset */
+        size_t offset = (size_t)ref_val << 4;
+        /* Pop from free list — next ref stored in first 4 bytes */
         *head = *(uint32_t *)(t->arena + offset);
         memset(t->arena + offset, 0, bytes);
-        hart_ref_t ref = (hart_ref_t)(offset >> 4);
+        hart_ref_t ref = ref_val;
         if (is_leaf) ref |= 0x80000000u;
         return ref;
     }
