@@ -1880,9 +1880,8 @@ void state_compact(state_t *s) {
         }
     }
 
-    /* Trim overallocated storage arenas — much faster than full rebuild.
-     * hart_trim: realloc to used+25%, O(1) per hart. */
-    state_trim_storage(s);
+    /* With arena freelist, storage harts don't accumulate dead space.
+     * No rebuild or trim needed. */
 
     /* acct_index (hart) was rebuilt — all nodes born dirty, hash will be recomputed */
 
