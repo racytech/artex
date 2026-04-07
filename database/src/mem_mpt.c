@@ -55,7 +55,13 @@ static size_t hex_prefix_encode(const uint8_t *nibbles, size_t nibble_len,
 static void keccak256(const uint8_t *data, size_t len, uint8_t out[32]) {
     SHA3_CTX ctx;
     keccak_init(&ctx);
-    keccak_update(&ctx, data, (uint16_t)len);
+    /* keccak_update takes uint16_t — feed in chunks for large inputs */
+    while (len > 0) {
+        uint16_t chunk = (len > 65535) ? 65535 : (uint16_t)len;
+        keccak_update(&ctx, data, chunk);
+        data += chunk;
+        len -= chunk;
+    }
     keccak_final(&ctx, out);
 }
 
