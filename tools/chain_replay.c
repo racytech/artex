@@ -465,6 +465,7 @@ int main(int argc, char **argv) {
     bool no_validate = false;
     uint64_t snapshot_every = 0;  /* 0 = disabled */
     size_t storage_budget_mb = 0; /* 0 = unlimited */
+    uint32_t storage_cache = 0;  /* 0 = unlimited, else max harts in LRU */
 #ifdef ENABLE_HISTORY
     bool no_history = false;
 #endif
@@ -516,6 +517,9 @@ int main(int argc, char **argv) {
             arg_offset += 2;
         } else if (strcmp(argv[1 + arg_offset], "--storage-budget") == 0 && arg_offset + 2 < argc) {
             storage_budget_mb = (size_t)atoll(argv[2 + arg_offset]);
+            arg_offset += 2;
+        } else if (strcmp(argv[1 + arg_offset], "--storage-cache") == 0 && arg_offset + 2 < argc) {
+            storage_cache = (uint32_t)atoi(argv[2 + arg_offset]);
             arg_offset += 2;
         } else if (strcmp(argv[1 + arg_offset], "--save-state") == 0 && arg_offset + 2 < argc) {
             save_state_block = (uint64_t)atoll(argv[2 + arg_offset]);
@@ -634,8 +638,10 @@ int main(int argc, char **argv) {
         return 1;
     }
     LOG_INFO("State loaded successfully");
-    /* Enable cold storage eviction */
+    /* Enable cold storage eviction + LRU */
     evm_state_set_evict_path(sync_get_state(sync), data_dir);
+    if (storage_cache > 0)
+        evm_state_set_lru_capacity(sync_get_state(sync), storage_cache);
     if (storage_budget_mb > 0)
         evm_state_set_evict_budget(sync_get_state(sync),
                                    storage_budget_mb * 1024ULL * 1024ULL);

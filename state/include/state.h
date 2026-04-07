@@ -166,6 +166,7 @@ void     state_set_evict_threshold(state_t *s, uint64_t blocks);
 void     state_set_evict_budget(state_t *s, size_t bytes);
 uint32_t state_evict_cold_storage(state_t *s);
 void     state_compact_evict_file(state_t *s);
+void     state_set_lru_capacity(state_t *s, uint32_t max_harts);
 size_t   state_trim_storage(state_t *s);
 
 /* Raw setters for undo — skip journal, dirty tracking, block originals */

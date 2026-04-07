@@ -54,9 +54,13 @@ typedef struct {
     hash_t    storage_root;     /* 32 bytes */
     uint8_t  *code;             /*  8 bytes (heap, loaded on demand) */
     uint32_t  code_size;        /*  4 bytes */
-    uint32_t  evict_count;      /*  4 bytes — entries on disk (0 = not evicted) */
+    uint32_t  evict_count;      /*  4 bytes — dump bytes on disk (0 = not evicted) */
     hart_t   *storage;          /*  8 bytes (NULL if no storage or evicted) */
     uint64_t  evict_offset;     /*  8 bytes — byte offset in storage_evict.dat */
+    /* LRU doubly-linked list (resource indices, 0 = none) */
+    uint32_t  lru_prev;         /*  4 bytes */
+    uint32_t  lru_next;         /*  4 bytes */
+    uint32_t  acct_idx;         /*  4 bytes — reverse mapping to accounts[] */
 } resource_t;
 
 /* =========================================================================

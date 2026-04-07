@@ -276,6 +276,14 @@ struct state {
     uint32_t  stor_in_memory;    /* count of resources with r->storage != NULL */
     uint32_t  stor_evicted;      /* count of resources with evict_count > 0 */
 
+    /* Storage LRU — doubly-linked list of resource indices with in-memory harts.
+     * head = most recently accessed, tail = least recently accessed.
+     * Resource index 0 is reserved (no resource), so 0 = end of list. */
+    uint32_t  lru_head;          /* resource index of MRU */
+    uint32_t  lru_tail;          /* resource index of LRU (eviction candidate) */
+    uint32_t  lru_count;         /* number of entries in LRU */
+    uint32_t  lru_capacity;      /* max entries (0 = unlimited, use budget) */
+
     /* dump-prestate support: preserved dirty list + slot key tracking */
     dirty_vec_t last_dirty;       /* blk_dirty from last compute_root (addr[20]) */
     dirty_vec_t accessed_slots;   /* addr[20]+slot_be[32] = 52 bytes each */
@@ -284,6 +292,11 @@ struct state {
 
 /* Forward declarations */
 static bool state_reload_storage(state_t *s, account_t *a, resource_t *r);
+static void lru_touch(state_t *s, uint32_t ridx);
+static void lru_push_front(state_t *s, uint32_t ridx);
+static bool lru_evict_tail(state_t *s);
+static bool evict_ensure_fd(state_t *s);
+static bool evict_one(state_t *s, account_t *a, resource_t *r);
 
 /* =========================================================================
  * Internal helpers
@@ -330,6 +343,9 @@ static resource_t *get_resource(const state_t *s, const account_t *a) {
     /* Prefetch storage arena root — next access will be hart_get on this arena */
     if (r->storage && r->storage->arena)
         _mm_prefetch((const char *)r->storage->arena, _MM_HINT_T0);
+    /* Touch LRU — move to front on access */
+    if (r->storage)
+        lru_touch((state_t *)s, a->resource_idx);
     return r;
 }
 
@@ -351,6 +367,7 @@ static resource_t *ensure_resource(state_t *s, account_t *a) {
     memset(r, 0, sizeof(*r));
     r->code_hash = EMPTY_CODE_HASH;
     r->storage_root = EMPTY_STORAGE_ROOT;
+    r->acct_idx = (uint32_t)(a - s->accounts);
     a->resource_idx = ridx;
     return r;
 }
@@ -470,9 +487,72 @@ static bool ensure_storage(state_t *s, account_t *a) {
     s->stor_arena_total += r->storage->arena_cap;
     s->stor_in_memory++;
 
+    /* Add to LRU + evict if over capacity */
+    lru_push_front(s, a->resource_idx);
+    while (s->lru_capacity > 0 && s->lru_count > s->lru_capacity)
+        lru_evict_tail(s);
+
     uint32_t idx = (uint32_t)(a - s->accounts);
     resource_list_add(s, idx);
     return true;
+}
+
+/* =========================================================================
+ * Storage LRU — doubly-linked list of in-memory storage harts
+ * ========================================================================= */
+
+/* Remove a resource from the LRU list (does not evict) */
+static void lru_remove(state_t *s, uint32_t ridx) {
+    resource_t *r = &s->resources[ridx];
+    uint32_t prev = r->lru_prev, next = r->lru_next;
+    if (prev) s->resources[prev].lru_next = next;
+    else      s->lru_head = next;
+    if (next) s->resources[next].lru_prev = prev;
+    else      s->lru_tail = prev;
+    r->lru_prev = r->lru_next = 0;
+    s->lru_count--;
+}
+
+/* Push a resource to the front (most recently used) */
+static void lru_push_front(state_t *s, uint32_t ridx) {
+    resource_t *r = &s->resources[ridx];
+    r->lru_prev = 0;
+    r->lru_next = s->lru_head;
+    if (s->lru_head)
+        s->resources[s->lru_head].lru_prev = ridx;
+    s->lru_head = ridx;
+    if (!s->lru_tail) s->lru_tail = ridx;
+    s->lru_count++;
+}
+
+/* Touch: move to front (called on every storage access) */
+static void lru_touch(state_t *s, uint32_t ridx) {
+    if (!ridx || s->lru_head == ridx) return;  /* already front or invalid */
+    resource_t *r = &s->resources[ridx];
+    if (r->lru_prev || r->lru_next || s->lru_tail == ridx) {
+        /* Already in list — remove first */
+        lru_remove(s, ridx);
+    }
+    lru_push_front(s, ridx);
+}
+
+
+/* Evict the LRU tail if over capacity. Returns true if evicted. */
+static bool lru_evict_tail(state_t *s) {
+    if (!s->lru_tail) return false;
+    uint32_t ridx = s->lru_tail;
+    resource_t *r = &s->resources[ridx];
+    if (!r->storage) { lru_remove(s, ridx); return false; }
+
+    /* Use reverse mapping to find account — O(1) */
+    account_t *a = (r->acct_idx < s->count) ? &s->accounts[r->acct_idx] : NULL;
+    if (!a || a->resource_idx != ridx) { lru_remove(s, ridx); return false; }
+
+    /* Remove from LRU before evicting */
+    lru_remove(s, ridx);
+
+    if (!evict_ensure_fd(s)) return false;
+    return evict_one(s, a, r);
 }
 
 static void destroy_resource_storage(state_t *s, resource_t *r) {
@@ -516,8 +596,13 @@ static bool state_reload_storage(state_t *s, account_t *a, resource_t *r) {
     r->evict_offset = 0;
     r->evict_count = 0;
 
-    /* Mark as recently accessed — prevents immediate re-eviction */
+    /* Mark as recently accessed */
     a->last_access_block = s->current_block;
+
+    /* Add to LRU front + evict tail if over capacity */
+    lru_push_front(s, a->resource_idx);
+    while (s->lru_capacity > 0 && s->lru_count > s->lru_capacity)
+        lru_evict_tail(s);
 
     /* Track in resource list for stats */
     uint32_t idx = (uint32_t)(a - s->accounts);
@@ -1916,6 +2001,10 @@ void state_set_evict_budget(state_t *s, size_t bytes) {
     if (s) s->evict_budget = bytes;
 }
 
+void state_set_lru_capacity(state_t *s, uint32_t max_harts) {
+    if (s) s->lru_capacity = max_harts;
+}
+
 static bool evict_ensure_fd(state_t *s) {
     if (s->evict_fd >= 0) return true;
     if (s->evict_path[0] == '\0') return false;
@@ -2273,6 +2362,7 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
             a->resource_idx = ridx;
             resource_t *r = &s->resources[ridx];
             memset(r, 0, sizeof(*r));
+            r->acct_idx = idx;
             memcpy(r->code_hash.bytes, code_hash, 32);
             memcpy(r->storage_root.bytes, storage_root, 32);
             r->code_size = code_size;

@@ -414,6 +414,10 @@ void evm_state_set_evict_budget(evm_state_t *es, size_t bytes) {
     if (es) state_set_evict_budget(es->st, bytes);
 }
 
+void evm_state_set_lru_capacity(evm_state_t *es, uint32_t max_harts) {
+    if (es) state_set_lru_capacity(es->st, max_harts);
+}
+
 uint32_t evm_state_evict_cold_storage(evm_state_t *es) {
     return es ? state_evict_cold_storage(es->st) : 0;
 }
