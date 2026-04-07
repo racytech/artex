@@ -729,6 +729,49 @@ void state_set_balance(state_t *s, const address_t *addr, const uint256_t *bal) 
     mark_blk_dirty_h(s, a, &ah);
 }
 
+/* Raw variants for undo — skip journal, dirty tracking, block originals.
+ * Only modify the value and mark acct_index path dirty for root recomputation. */
+void state_set_nonce_raw(state_t *s, const address_t *addr, uint64_t nonce) {
+    if (!s || !addr) return;
+    account_t *a = find_account(s, addr->bytes);
+    if (!a) return;
+    a->nonce = nonce;
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    hart_mark_path_dirty(&s->acct_index, ah.bytes);
+}
+
+void state_set_balance_raw(state_t *s, const address_t *addr, const uint256_t *bal) {
+    if (!s || !addr || !bal) return;
+    account_t *a = find_account(s, addr->bytes);
+    if (!a) return;
+    a->balance = *bal;
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    hart_mark_path_dirty(&s->acct_index, ah.bytes);
+}
+
+void state_set_storage_raw(state_t *s, const address_t *addr,
+                           const uint256_t *key, const uint256_t *value) {
+    if (!s || !addr || !key || !value) return;
+    account_t *a = find_account(s, addr->bytes);
+    if (!a) return;
+    if (!ensure_storage(s, a)) return;
+    resource_t *r = get_resource(s, a);
+    if (!r || !r->storage) return;
+
+    uint8_t slot_be[32]; uint256_to_bytes(key, slot_be);
+    hash_t slot_hash = hash_keccak256(slot_be, 32);
+
+    if (uint256_is_zero(value))
+        hart_delete(r->storage, slot_hash.bytes);
+    else {
+        uint8_t val_be[32]; uint256_to_bytes(value, val_be);
+        hart_insert(r->storage, slot_hash.bytes, val_be);
+    }
+    /* Mark storage dirty for root recomputation */
+    hash_t ah = hash_keccak256(addr->bytes, 20);
+    hart_mark_path_dirty(&s->acct_index, ah.bytes);
+}
+
 void state_add_balance(state_t *s, const address_t *addr, const uint256_t *amount) {
     if (!s || !addr || !amount) return;
     hash_t ah = addr_hash_cached(s, addr->bytes);

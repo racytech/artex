@@ -167,6 +167,12 @@ void     state_set_evict_budget(state_t *s, size_t bytes);
 uint32_t state_evict_cold_storage(state_t *s);
 void     state_compact_evict_file(state_t *s);
 
+/* Raw setters for undo — skip journal, dirty tracking, block originals */
+void state_set_nonce_raw(state_t *s, const address_t *addr, uint64_t nonce);
+void state_set_balance_raw(state_t *s, const address_t *addr, const uint256_t *bal);
+void state_set_storage_raw(state_t *s, const address_t *addr,
+                           const uint256_t *key, const uint256_t *value);
+
 /* Block diff collection for history/undo log (requires ENABLE_HISTORY) */
 struct block_diff_t;
 void     state_collect_block_diff(state_t *s, struct block_diff_t *out);

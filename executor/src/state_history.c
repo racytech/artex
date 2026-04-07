@@ -1,5 +1,6 @@
 #include "state_history.h"
 #include "evm_state.h"
+#include "state.h"
 #include "logger.h"
 
 #include <stdio.h>
@@ -838,40 +839,38 @@ void state_history_apply_diff(evm_state_t *es, const block_diff_t *diff) {
 void state_history_revert_diff(evm_state_t *es, const block_diff_t *diff) {
     if (!es || !diff) return;
 
-    /* Process groups in reverse order */
+    state_t *st = evm_state_get_state(es);
+    if (!st) return;
+
+    /* Process groups in reverse order using raw writes
+     * (skip journal, dirty tracking, block originals) */
     for (int i = (int)diff->group_count - 1; i >= 0; i--) {
         const addr_diff_t *g = &diff->groups[i];
 
         /* Revert storage slots first (reverse order) */
         for (int j = (int)g->slot_count - 1; j >= 0; j--) {
-            evm_state_set_storage(es, &g->addr,
-                                   &g->slots[j].slot, &g->slots[j].old_value);
+            state_set_storage_raw(st, &g->addr,
+                                  &g->slots[j].slot, &g->slots[j].old_value);
         }
 
         /* Revert account fields */
-        if (g->field_mask & FIELD_CODE_HASH)
-            evm_state_set_code_hash(es, &g->addr, &g->old_code_hash);
-
         if (g->field_mask & FIELD_BALANCE)
-            evm_state_set_balance(es, &g->addr, &g->old_balance);
+            state_set_balance_raw(st, &g->addr, &g->old_balance);
 
         if (g->field_mask & FIELD_NONCE)
-            evm_state_set_nonce(es, &g->addr, g->old_nonce);
+            state_set_nonce_raw(st, &g->addr, g->old_nonce);
 
         if (g->flags & ACCT_DIFF_CREATED) {
-            /* Account was created in this block — delete it to revert */
-            evm_state_set_nonce(es, &g->addr, 0);
-            uint256_t zero = UINT256_ZERO_INIT;
-            evm_state_set_balance(es, &g->addr, &zero);
-            /* TODO: proper account deletion from trie */
+            /* Account was created in this block — zero it out to revert */
+            state_set_nonce_raw(st, &g->addr, 0);
+            uint256_t zero = UINT256_ZERO;
+            state_set_balance_raw(st, &g->addr, &zero);
         }
 
         if (g->flags & ACCT_DIFF_DESTRUCTED) {
             /* Account was destructed — restore old values */
-            evm_state_set_nonce(es, &g->addr, g->old_nonce);
-            evm_state_set_balance(es, &g->addr, &g->old_balance);
-            if (g->field_mask & FIELD_CODE_HASH)
-                evm_state_set_code_hash(es, &g->addr, &g->old_code_hash);
+            state_set_nonce_raw(st, &g->addr, g->old_nonce);
+            state_set_balance_raw(st, &g->addr, &g->old_balance);
         }
     }
 
