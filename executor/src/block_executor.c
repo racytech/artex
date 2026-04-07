@@ -581,13 +581,22 @@ block_result_t block_execute(evm_t *evm,
             0x00, 0x00, 0x00, 0x00, 0x21, 0x9a, 0xb5, 0x40, 0x35, 0x6c,
             0xbb, 0x83, 0x9c, 0xbe, 0x05, 0x30, 0x3d, 0x77, 0x05, 0xfa
         };
+        /* DepositEvent(bytes,bytes,bytes,bytes,bytes) topic0 */
+        static const uint8_t DEPOSIT_TOPIC[32] = {
+            0x64, 0x9b, 0xbc, 0x62, 0xd0, 0xe3, 0x13, 0x42,
+            0xaf, 0xea, 0x4e, 0x5c, 0xd8, 0x2d, 0x40, 0x49,
+            0xe7, 0xe1, 0xee, 0x91, 0x2f, 0xc0, 0x88, 0x9a,
+            0xa7, 0x90, 0x80, 0x3b, 0xe3, 0x90, 0x38, 0xc5
+        };
         {
-            /* Count deposit logs first */
+            /* Count deposit logs — must match address AND topic0 */
             size_t deposit_count = 0;
             for (size_t r = 0; r < result.receipt_count; r++) {
                 for (size_t l = 0; l < result.receipts[r].log_count; l++) {
                     evm_log_t *log = &result.receipts[r].logs[l];
-                    if (memcmp(log->address.bytes, DEPOSIT_ADDR, 20) == 0)
+                    if (memcmp(log->address.bytes, DEPOSIT_ADDR, 20) == 0 &&
+                        log->topic_count >= 1 &&
+                        memcmp(log->topics[0].bytes, DEPOSIT_TOPIC, 32) == 0)
                         deposit_count++;
                 }
             }
@@ -601,7 +610,9 @@ block_result_t block_execute(evm_t *evm,
                     for (size_t r = 0; r < result.receipt_count; r++) {
                         for (size_t l = 0; l < result.receipts[r].log_count; l++) {
                             evm_log_t *log = &result.receipts[r].logs[l];
-                            if (memcmp(log->address.bytes, DEPOSIT_ADDR, 20) != 0)
+                            if (memcmp(log->address.bytes, DEPOSIT_ADDR, 20) != 0 ||
+                                log->topic_count < 1 ||
+                                memcmp(log->topics[0].bytes, DEPOSIT_TOPIC, 32) != 0)
                                 continue;
                             /* ABI-decoded deposit log data (576 bytes):
                              * 5 offsets (160B) + 5 length-prefixed fields.
