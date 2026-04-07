@@ -410,6 +410,8 @@ static void mark_blk_dirty_h(state_t *s, account_t *a, const hash_t *addr_hash) 
 
         /* Capture pre-block account snapshot for undo log (first touch only) */
         if (!mem_art_contains(&s->blk_orig_acct, a->addr.bytes, 20)) {
+            if (a->addr.bytes[0] == 0x94 && a->addr.bytes[1] == 0x32)
+                fprintf(stderr, "  SNAP_CAPTURE: 9432 nonce=%lu\n", a->nonce);
             resource_t *r = get_resource(s, a);
             acct_snapshot_t snap = {
                 .nonce = a->nonce,
@@ -703,6 +705,9 @@ void state_set_nonce(state_t *s, const address_t *addr, uint64_t nonce) {
     account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
+    /* Capture undo snapshot BEFORE modifying the value */
+    mark_blk_dirty_h(s, a, &ah);
+
     journal_entry_t je = { .type = JE_NONCE, .addr = *addr,
         .data.nonce = { .val = a->nonce, .flags = a->flags } };
     journal_push(s, &je);
@@ -710,7 +715,6 @@ void state_set_nonce(state_t *s, const address_t *addr, uint64_t nonce) {
     a->nonce = nonce;
     acct_set_flag(a, ACCT_DIRTY | ACCT_BLOCK_DIRTY);
     mark_tx_dirty(s, addr);
-    mark_blk_dirty_h(s, a, &ah);
 }
 
 void state_set_balance(state_t *s, const address_t *addr, const uint256_t *bal) {
@@ -719,6 +723,8 @@ void state_set_balance(state_t *s, const address_t *addr, const uint256_t *bal) 
     account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
+    mark_blk_dirty_h(s, a, &ah);
+
     journal_entry_t je = { .type = JE_BALANCE, .addr = *addr,
         .data.balance = { .val = a->balance, .flags = a->flags } };
     journal_push(s, &je);
@@ -726,7 +732,6 @@ void state_set_balance(state_t *s, const address_t *addr, const uint256_t *bal) 
     a->balance = *bal;
     acct_set_flag(a, ACCT_DIRTY | ACCT_BLOCK_DIRTY);
     mark_tx_dirty(s, addr);
-    mark_blk_dirty_h(s, a, &ah);
 }
 
 /* Raw variants for undo — skip journal, dirty tracking, block originals.
@@ -778,6 +783,8 @@ void state_add_balance(state_t *s, const address_t *addr, const uint256_t *amoun
     account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
+    mark_blk_dirty_h(s, a, &ah);
+
     journal_entry_t je = { .type = JE_BALANCE, .addr = *addr,
         .data.balance = { .val = a->balance, .flags = a->flags } };
     journal_push(s, &je);
@@ -785,7 +792,6 @@ void state_add_balance(state_t *s, const address_t *addr, const uint256_t *amoun
     a->balance = uint256_add(&a->balance, amount);
     acct_set_flag(a, ACCT_DIRTY | ACCT_BLOCK_DIRTY);
     mark_tx_dirty(s, addr);
-    mark_blk_dirty_h(s, a, &ah);
 }
 
 bool state_sub_balance(state_t *s, const address_t *addr, const uint256_t *amount) {
@@ -794,6 +800,8 @@ bool state_sub_balance(state_t *s, const address_t *addr, const uint256_t *amoun
     account_t *a = find_account_h(s, &ah);
     if (!a || uint256_lt(&a->balance, amount)) return false;
 
+    mark_blk_dirty_h(s, a, &ah);
+
     journal_entry_t je = { .type = JE_BALANCE, .addr = *addr,
         .data.balance = { .val = a->balance, .flags = a->flags } };
     journal_push(s, &je);
@@ -801,7 +809,6 @@ bool state_sub_balance(state_t *s, const address_t *addr, const uint256_t *amoun
     a->balance = uint256_sub(&a->balance, amount);
     acct_set_flag(a, ACCT_DIRTY | ACCT_BLOCK_DIRTY);
     mark_tx_dirty(s, addr);
-    mark_blk_dirty_h(s, a, &ah);
     return true;
 }
 
@@ -815,6 +822,8 @@ void state_set_code(state_t *s, const address_t *addr,
     hash_t ah = addr_hash_cached(s, addr->bytes);
     account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
+
+    mark_blk_dirty_h(s, a, &ah);
 
     resource_t *r = ensure_resource(s, a);
     if (!r) return;
@@ -842,7 +851,6 @@ void state_set_code(state_t *s, const address_t *addr,
 
     acct_set_flag(a, ACCT_CODE_DIRTY | ACCT_BLOCK_DIRTY);
     mark_tx_dirty(s, addr);
-    mark_blk_dirty_h(s, a, &ah);
 }
 
 const uint8_t *state_get_code(state_t *s, const address_t *addr, uint32_t *out_len) {
@@ -917,6 +925,9 @@ void state_set_storage(state_t *s, const address_t *addr,
     account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
+    /* Capture undo snapshot BEFORE any modifications */
+    mark_blk_dirty_h(s, a, &ah);
+
     uint8_t slot_be[32]; uint256_to_bytes(key, slot_be);
     hash_t slot_hash = hash_keccak256(slot_be, 32);
 
@@ -955,7 +966,6 @@ void state_set_storage(state_t *s, const address_t *addr,
 
     acct_set_flag(a, ACCT_STORAGE_DIRTY);
     mark_tx_dirty(s, addr);
-    mark_blk_dirty_h(s, a, &ah);
 }
 
 bool state_has_storage(state_t *s, const address_t *addr) {
@@ -1197,6 +1207,8 @@ void state_create_account(state_t *s, const address_t *addr) {
     account_t *a = ensure_account_h(s, addr, &ah);
     if (!a) return;
 
+    mark_blk_dirty_h(s, a, &ah);
+
     resource_t *r = get_resource(s, a);
     journal_entry_t je = { .type = JE_CREATE, .addr = *addr,
         .data.create = {
@@ -1225,7 +1237,6 @@ void state_create_account(state_t *s, const address_t *addr) {
     }
 
     mark_tx_dirty(s, addr);
-    mark_blk_dirty_h(s, a, &ah);
 }
 
 void state_self_destruct(state_t *s, const address_t *addr) {
@@ -1694,6 +1705,9 @@ void state_collect_block_diff(state_t *s, block_diff_t *out) {
         const acct_snapshot_t *snap = (const acct_snapshot_t *)
             mem_art_get(&s->blk_orig_acct, akey, 20, NULL);
 
+        if (akey[0] == 0x94 && akey[1] == 0x32)
+            fprintf(stderr, "  DIFF_CHECK: 9432 snap=%s snap_nonce=%lu cur_nonce=%lu\n",
+                    snap ? "Y" : "N", snap ? snap->nonce : 99, a->nonce);
         bool nonce_changed = snap && (a->nonce != snap->nonce);
         bool balance_changed = snap && !uint256_is_equal(&a->balance, &snap->balance);
         resource_t *r = get_resource(s, a);
