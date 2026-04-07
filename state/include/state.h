@@ -167,6 +167,10 @@ void     state_set_evict_budget(state_t *s, size_t bytes);
 uint32_t state_evict_cold_storage(state_t *s);
 void     state_compact_evict_file(state_t *s);
 
+/* Block diff collection for history/undo log (requires ENABLE_HISTORY) */
+struct block_diff_t;
+void     state_collect_block_diff(state_t *s, struct block_diff_t *out);
+
 /* =========================================================================
  * Stats
  * ========================================================================= */

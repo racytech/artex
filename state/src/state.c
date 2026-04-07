@@ -12,6 +12,10 @@
 #include "keccak256.h"
 #include "logger.h"
 
+#ifdef ENABLE_HISTORY
+#include "state_history.h"
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -139,6 +143,14 @@ typedef struct {
     } data;
 } journal_entry_t;
 
+/* Snapshot of account fields for block undo log */
+typedef struct {
+    uint64_t  nonce;
+    uint256_t balance;
+    hash_t    code_hash;
+    bool      existed;
+} acct_snapshot_t;
+
 /* =========================================================================
  * Dirty tracking
  * ========================================================================= */
@@ -220,6 +232,10 @@ struct state {
     dirty_vec_t tx_dirty;
     dirty_vec_t blk_dirty;
     size_t      blk_dirty_cursor;  /* finalize_block processes from here */
+
+    /* Block-level originals for undo log — capture pre-block values on first write */
+    mem_art_t blk_orig_acct;  /* addr[20] → acct_snapshot_t (first account state per block) */
+    mem_art_t blk_orig_stor;  /* slot_key[52] → uint256_t (first storage value per block) */
 
     /* Address hash cache: addr[20] → keccak256(addr)[32], reset per block */
     mem_art_t addr_hash_cache;
@@ -391,6 +407,20 @@ static void mark_blk_dirty_h(state_t *s, account_t *a, const hash_t *addr_hash) 
         acct_set_flag(a, ACCT_MPT_DIRTY);
         dirty_push(&s->blk_dirty, a->addr.bytes, 20);
         hart_mark_path_dirty(&s->acct_index, addr_hash->bytes);
+
+        /* Capture pre-block account snapshot for undo log (first touch only) */
+        if (!mem_art_contains(&s->blk_orig_acct, a->addr.bytes, 20)) {
+            resource_t *r = get_resource(s, a);
+            acct_snapshot_t snap = {
+                .nonce = a->nonce,
+                .balance = a->balance,
+                .code_hash = (r && acct_has_flag(a, ACCT_HAS_CODE))
+                             ? r->code_hash : EMPTY_CODE_HASH,
+                .existed = acct_has_flag(a, ACCT_EXISTED),
+            };
+            mem_art_insert(&s->blk_orig_acct, a->addr.bytes, 20,
+                           &snap, sizeof(snap));
+        }
     }
 }
 
@@ -554,6 +584,8 @@ state_t *state_create(code_store_t *cs) {
     mem_art_init(&s->warm_slots);
     mem_art_init(&s->transient);
     mem_art_init(&s->originals);
+    mem_art_init(&s->blk_orig_acct);
+    mem_art_init(&s->blk_orig_stor);
 
     s->journal = malloc(JOURNAL_INIT_CAP * sizeof(journal_entry_t));
     if (!s->journal) { free(s->accounts); free(s); return NULL; }
@@ -593,6 +625,8 @@ void state_destroy(state_t *s) {
     mem_art_destroy(&s->warm_slots);
     mem_art_destroy(&s->transient);
     mem_art_destroy(&s->originals);
+    mem_art_destroy(&s->blk_orig_acct);
+    mem_art_destroy(&s->blk_orig_stor);
 
     for (uint32_t i = 0; i < s->journal_len; i++) {
         if (s->journal[i].type == JE_CODE)
@@ -849,11 +883,16 @@ void state_set_storage(state_t *s, const address_t *addr,
         .data.storage = { .key = *key, .val = old_value, .flags = a->flags } };
     journal_push(s, &je);
 
-    /* Save original for EIP-2200 */
+    /* Save original for EIP-2200 (per-tx) */
     uint8_t skey[SLOT_KEY_SIZE];
     make_slot_key(addr, key, skey);
     if (!mem_art_contains(&s->originals, skey, SLOT_KEY_SIZE))
         mem_art_insert(&s->originals, skey, SLOT_KEY_SIZE,
+                       &old_value, sizeof(uint256_t));
+
+    /* Save block-level original for undo log (first write per block) */
+    if (!mem_art_contains(&s->blk_orig_stor, skey, SLOT_KEY_SIZE))
+        mem_art_insert(&s->blk_orig_stor, skey, SLOT_KEY_SIZE,
                        &old_value, sizeof(uint256_t));
 
     /* Write to storage */
@@ -1400,6 +1439,10 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     dirty_clear(&s->blk_dirty);
     s->blk_dirty_cursor = 0;
 
+    /* Clear block-level originals (consumed by diff collection before this point) */
+    mem_art_destroy(&s->blk_orig_acct); mem_art_init(&s->blk_orig_acct);
+    mem_art_destroy(&s->blk_orig_stor); mem_art_init(&s->blk_orig_stor);
+
     /* Reset addr hash cache — addresses from this block won't repeat next block */
     mem_art_destroy(&s->addr_hash_cache);
     mem_art_init(&s->addr_hash_cache);
@@ -1538,6 +1581,133 @@ size_t state_collect_accessed_storage_keys(const state_t *s,
     }
     return n;
 }
+
+#ifdef ENABLE_HISTORY
+
+/* Callback context for storage diff collection */
+typedef struct {
+    state_t     *s;
+    addr_diff_t *groups;
+    uint16_t     group_count;
+    uint16_t     group_cap;
+} stor_cb_ctx_t;
+
+static bool stor_diff_cb(const uint8_t *key, size_t key_len,
+                         const void *value, size_t value_len,
+                         void *user_data) {
+    (void)key_len; (void)value_len;
+    stor_cb_ctx_t *ctx = (stor_cb_ctx_t *)user_data;
+    const uint8_t *addr_bytes = key;
+    const uint256_t *old_val = (const uint256_t *)value;
+
+    address_t addr;
+    memcpy(addr.bytes, addr_bytes, 20);
+    uint256_t slot = uint256_from_bytes(key + 20, 32);
+    uint256_t cur_val = state_get_storage(ctx->s, &addr, &slot);
+
+    if (uint256_is_equal(&cur_val, old_val)) return true;
+
+    /* Find or create group */
+    addr_diff_t *g = NULL;
+    for (uint16_t i = 0; i < ctx->group_count; i++) {
+        if (memcmp(ctx->groups[i].addr.bytes, addr_bytes, 20) == 0) {
+            g = &ctx->groups[i]; break;
+        }
+    }
+    if (!g) {
+        if (ctx->group_count >= ctx->group_cap) {
+            ctx->group_cap *= 2;
+            ctx->groups = realloc(ctx->groups,
+                                  ctx->group_cap * sizeof(addr_diff_t));
+        }
+        g = &ctx->groups[ctx->group_count++];
+        memset(g, 0, sizeof(*g));
+        memcpy(g->addr.bytes, addr_bytes, 20);
+    }
+
+    g->slots = realloc(g->slots, (g->slot_count + 1) * sizeof(slot_diff_t));
+    slot_diff_t *sd = &g->slots[g->slot_count++];
+    sd->slot = slot;
+    sd->value = cur_val;
+    sd->old_value = *old_val;
+    return true;
+}
+
+void state_collect_block_diff(state_t *s, block_diff_t *out) {
+    if (!s || !out) return;
+
+    uint16_t group_cap = 64;
+    uint16_t group_count = 0;
+    addr_diff_t *groups = calloc(group_cap, sizeof(addr_diff_t));
+    if (!groups) return;
+
+    /* Walk blk_dirty — all accounts modified in this block */
+    for (size_t d = 0; d < s->blk_dirty.count; d++) {
+        const uint8_t *akey = s->blk_dirty.keys + d * 20;
+        account_t *a = find_account(s, akey);
+        if (!a) continue;
+
+        /* Get old values from block originals */
+        const acct_snapshot_t *snap = (const acct_snapshot_t *)
+            mem_art_get(&s->blk_orig_acct, akey, 20, NULL);
+
+        bool nonce_changed = snap && (a->nonce != snap->nonce);
+        bool balance_changed = snap && !uint256_is_equal(&a->balance, &snap->balance);
+        resource_t *r = get_resource(s, a);
+        hash_t cur_code = (r && acct_has_flag(a, ACCT_HAS_CODE))
+                          ? r->code_hash : EMPTY_CODE_HASH;
+        bool code_changed = snap &&
+            memcmp(cur_code.bytes, snap->code_hash.bytes, 32) != 0;
+        bool is_created = snap && !snap->existed && acct_has_flag(a, ACCT_EXISTED);
+        bool is_destructed = acct_has_flag(a, ACCT_SELF_DESTRUCTED);
+
+        if (!nonce_changed && !balance_changed && !code_changed &&
+            !is_created && !is_destructed)
+            continue;  /* no account-level change */
+
+        if (group_count >= group_cap) {
+            group_cap *= 2;
+            groups = realloc(groups, group_cap * sizeof(addr_diff_t));
+        }
+        addr_diff_t *g = &groups[group_count++];
+        memset(g, 0, sizeof(*g));
+        memcpy(g->addr.bytes, akey, 20);
+
+        if (is_created) g->flags |= ACCT_DIFF_CREATED;
+        if (is_destructed) g->flags |= ACCT_DIFF_DESTRUCTED;
+
+        if (nonce_changed) {
+            g->field_mask |= FIELD_NONCE;
+            g->nonce = a->nonce;
+            g->old_nonce = snap->nonce;
+        }
+        if (balance_changed) {
+            g->field_mask |= FIELD_BALANCE;
+            g->balance = a->balance;
+            g->old_balance = snap->balance;
+        }
+        if (code_changed) {
+            g->field_mask |= FIELD_CODE_HASH;
+            g->code_hash = cur_code;
+            g->old_code_hash = snap->code_hash;
+        }
+    }
+
+    /* Walk blk_orig_stor for storage diffs via mem_art_foreach.
+     * Keys are slot_key[52] = addr[20] + slot_be[32].
+     * Values are uint256_t old_value. */
+    {
+        stor_cb_ctx_t ctx = { .s = s, .groups = groups,
+                              .group_count = group_count, .group_cap = group_cap };
+        mem_art_foreach(&s->blk_orig_stor, stor_diff_cb, &ctx);
+        groups = ctx.groups;
+        group_count = ctx.group_count;
+    }
+
+    out->groups = groups;
+    out->group_count = group_count;
+}
+#endif /* ENABLE_HISTORY */
 
 void state_compact(state_t *s) {
     if (!s) return;

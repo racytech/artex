@@ -61,10 +61,11 @@ extern "C" {
 #define FIELD_BALANCE   (1 << 1)
 #define FIELD_CODE_HASH (1 << 2)
 
-/** Single storage slot change (new value only). */
+/** Single storage slot change. */
 typedef struct {
     uint256_t slot;
-    uint256_t value;        /* new value */
+    uint256_t value;        /* new value (forward replay) */
+    uint256_t old_value;    /* previous value (reverse replay / undo) */
 } slot_diff_t;
 
 /** Per-address diff group: account fields + storage slots. */
@@ -73,8 +74,11 @@ typedef struct {
     uint8_t     flags;       /* ACCT_DIFF_CREATED | ACCT_DIFF_DESTRUCTED */
     uint8_t     field_mask;  /* FIELD_NONCE | FIELD_BALANCE | FIELD_CODE_HASH */
     uint64_t    nonce;       /* new nonce (valid if field_mask & FIELD_NONCE) */
+    uint64_t    old_nonce;   /* previous nonce (for undo) */
     uint256_t   balance;     /* new balance (valid if field_mask & FIELD_BALANCE) */
+    uint256_t   old_balance; /* previous balance (for undo) */
     hash_t      code_hash;   /* new code_hash (valid if field_mask & FIELD_CODE_HASH) */
+    hash_t      old_code_hash; /* previous code_hash (for undo) */
     slot_diff_t *slots;      /* heap-allocated array */
     uint16_t    slot_count;
 } addr_diff_t;
@@ -188,6 +192,28 @@ uint64_t state_history_replay(state_history_t *sh,
                                struct evm_state *es,
                                uint64_t first_block,
                                uint64_t last_block);
+
+/* ── Reverse replay API (undo / reorg) ─────────────────────────────────── */
+
+/**
+ * Revert a single block diff (reverse replay / undo).
+ * Writes old_nonce, old_balance, old_code_hash, old_value for each entry.
+ * Handles ACCT_DIFF_CREATED (revert = delete account) and
+ * ACCT_DIFF_DESTRUCTED (revert = restore old values).
+ *
+ * After revert, caller must invalidate cached hashes and mark dirty
+ * accounts for root recomputation.
+ */
+void state_history_revert_diff(struct evm_state *es, const block_diff_t *diff);
+
+/**
+ * Revert state from current block back to target_block.
+ * Reads diffs from the in-memory ring and reverts each in sequence.
+ * Returns number of blocks reverted (0 on failure or target not in ring).
+ */
+uint64_t state_history_revert_to(state_history_t *sh,
+                                  struct evm_state *es,
+                                  uint64_t target_block);
 
 #ifdef __cplusplus
 }
