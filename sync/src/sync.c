@@ -454,7 +454,7 @@ bool sync_execute_block(sync_t *sync,
     {
         uint32_t ci_evict = sync->config.checkpoint_interval > 0
                           ? sync->config.checkpoint_interval : 256;
-        if (bn % ci_evict == 0 && bn - sync->last_evict_block >= 10000) {
+        if (bn % ci_evict == 0 && bn - sync->last_evict_block >= 1000) {
             struct timespec _e0, _e1;
             clock_gettime(CLOCK_MONOTONIC, &_e0);
             uint32_t n_evicted = evm_state_evict_cold_storage(sync->state);
