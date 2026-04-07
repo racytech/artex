@@ -368,6 +368,19 @@ bool test_runner_run_engine_test(test_runner_t *runner,
                    block_result.success);
         }
 
+        /* If block execution detected an invalidity, treat as rejection */
+        if (block_result.deposit_layout_invalid && payload->validation_error != NULL) {
+            if (runner->config.verbose) {
+                printf("    Expected error: %s (deposit layout invalid = correct rejection)\n",
+                       payload->validation_error);
+            }
+            evm_state_revert(runner->state, pre_block_snap);
+            block_result_free(&block_result);
+            block_body_free(&body);
+            block_hashes[hdr.number % 256] = *(const hash_t *)payload->block_hash;
+            continue;
+        }
+
         /* If the payload expects a validation error (invalid block),
          * revert state and skip root/bloom checks. */
         if (payload->validation_error != NULL) {

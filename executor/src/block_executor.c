@@ -605,16 +605,53 @@ block_result_t block_execute(evm_t *evm,
                                 continue;
                             /* ABI-decoded deposit log data (576 bytes):
                              * 5 offsets (160B) + 5 length-prefixed fields.
-                             * Extract raw field bytes at known offsets. */
-                            /* Skip logs with insufficient data */
-                            if (log->data_len >= 576) {
-                                memcpy(req_bufs[0] + off,       log->data + 192, 48);  /* pubkey */
-                                memcpy(req_bufs[0] + off + 48,  log->data + 288, 32);  /* withdrawal_credentials */
-                                memcpy(req_bufs[0] + off + 80,  log->data + 352, 8);   /* amount */
-                                memcpy(req_bufs[0] + off + 88,  log->data + 416, 96);  /* signature */
-                                memcpy(req_bufs[0] + off + 184, log->data + 544, 8);   /* index */
-                                off += 192;
+                             * Validate layout per EIP-6110 before extracting.
+                             * Invalid layout → mark block invalid. */
+                            if (log->data_len < 576) {
+                                result.deposit_layout_invalid = true;
+                                continue;
                             }
+                            /* Validate ABI offsets and field lengths */
+                            {
+                                const uint8_t *d = log->data;
+                                /* Read uint64 from last 8 bytes of 32-byte word */
+                                #define W64(off) ( \
+                                    ((uint64_t)d[(off)+24]<<56) | ((uint64_t)d[(off)+25]<<48) | \
+                                    ((uint64_t)d[(off)+26]<<40) | ((uint64_t)d[(off)+27]<<32) | \
+                                    ((uint64_t)d[(off)+28]<<24) | ((uint64_t)d[(off)+29]<<16) | \
+                                    ((uint64_t)d[(off)+30]<<8)  |  (uint64_t)d[(off)+31])
+                                /* Check first 24 bytes of word are zero */
+                                #define HI0(off) ( \
+                                    d[(off)]==0 && d[(off)+1]==0 && d[(off)+2]==0 && d[(off)+3]==0 && \
+                                    d[(off)+4]==0 && d[(off)+5]==0 && d[(off)+6]==0 && d[(off)+7]==0 && \
+                                    d[(off)+8]==0 && d[(off)+9]==0 && d[(off)+10]==0 && d[(off)+11]==0 && \
+                                    d[(off)+12]==0 && d[(off)+13]==0 && d[(off)+14]==0 && d[(off)+15]==0 && \
+                                    d[(off)+16]==0 && d[(off)+17]==0 && d[(off)+18]==0 && d[(off)+19]==0 && \
+                                    d[(off)+20]==0 && d[(off)+21]==0 && d[(off)+22]==0 && d[(off)+23]==0)
+                                bool valid =
+                                    HI0(0)   && W64(0)   == 0xa0  &&  /* pubkey offset */
+                                    HI0(32)  && W64(32)  == 0x100 &&  /* withdrawal_creds offset */
+                                    HI0(64)  && W64(64)  == 0x140 &&  /* amount offset */
+                                    HI0(96)  && W64(96)  == 0x180 &&  /* signature offset */
+                                    HI0(128) && W64(128) == 0x200 &&  /* index offset */
+                                    HI0(160) && W64(160) == 48  &&    /* pubkey length */
+                                    HI0(256) && W64(256) == 32  &&    /* withdrawal_creds length */
+                                    HI0(320) && W64(320) == 8   &&    /* amount length */
+                                    HI0(384) && W64(384) == 96  &&    /* signature length */
+                                    HI0(512) && W64(512) == 8;        /* index length */
+                                #undef W64
+                                #undef HI0
+                                if (!valid) {
+                                    result.deposit_layout_invalid = true;
+                                    continue;
+                                }
+                            }
+                            memcpy(req_bufs[0] + off,       log->data + 192, 48);  /* pubkey */
+                            memcpy(req_bufs[0] + off + 48,  log->data + 288, 32);  /* withdrawal_credentials */
+                            memcpy(req_bufs[0] + off + 80,  log->data + 352, 8);   /* amount */
+                            memcpy(req_bufs[0] + off + 88,  log->data + 416, 96);  /* signature */
+                            memcpy(req_bufs[0] + off + 184, log->data + 544, 8);   /* index */
+                            off += 192;
                         }
                     }
                     req_lens[0] = off;

@@ -61,6 +61,8 @@ typedef struct {
     uint32_t    transfer_count;  /* simple ETH transfers (no code, no calldata) */
     uint32_t    call_count;      /* contract calls / creates */
     double      root_ms;         /* time spent in state root computation */
+
+    bool        deposit_layout_invalid;  /* EIP-6110: invalid deposit event ABI layout */
 } block_result_t;
 
 /**
