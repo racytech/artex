@@ -373,7 +373,32 @@ bool mpt_compute_root_batch(mpt_batch_entry_t *entries, size_t count,
 
 //==============================================================================
 // Unsecured trie (variable-length raw keys)
+//
+// Unlike secured tries (32-byte hashed keys), unsecured tries can have
+// very short keys (e.g., RLP-encoded indices: 0x80, 0x01, ...). This means
+// leaf and extension nodes can be < 32 bytes RLP. Per the Ethereum spec,
+// child nodes < 32 bytes are embedded inline in the parent, not hashed.
 //==============================================================================
+
+/* Node reference: either raw RLP (< 32 bytes, embedded) or a hash (== 32 bytes).
+ * Max embedded size is 31 bytes. Buffer is 32 to fit either case. */
+typedef struct {
+    uint8_t data[32];
+    uint8_t len;   /* if < 32: raw RLP to embed; if == 32: keccak hash */
+} node_ref_t;
+
+/* Convert a node's RLP to a reference: embed if < 32 bytes, hash if >= 32 */
+static node_ref_t make_node_ref(const uint8_t *rlp, size_t rlp_len) {
+    node_ref_t ref;
+    if (rlp_len < 32) {
+        memcpy(ref.data, rlp, rlp_len);
+        ref.len = (uint8_t)rlp_len;
+    } else {
+        keccak256(rlp, rlp_len, ref.data);
+        ref.len = 32;
+    }
+    return ref;
+}
 
 typedef struct {
     uint8_t nibbles[64];      // max 32 bytes = 64 nibbles
@@ -382,20 +407,79 @@ typedef struct {
     size_t value_len;
 } batch_leaf_var_t;
 
-static bool build_subtrie_var(batch_leaf_var_t *leaves, size_t start, size_t end,
-                               size_t depth, hash_t *out) {
+/* Leaf node: RLP([hex_prefix(suffix, true), value]) → node_ref */
+static node_ref_t leaf_ref(const uint8_t *suffix, size_t suffix_len,
+                           const uint8_t *value, size_t value_len) {
+    uint8_t encoded_path[33];
+    size_t encoded_len = hex_prefix_encode(suffix, suffix_len, true, encoded_path);
+
+    rlp_sbuf_t payload; sbuf_reset(&payload);
+    sbuf_encode_bytes(&payload, encoded_path, encoded_len);
+    sbuf_encode_bytes(&payload, value, value_len);
+
+    rlp_sbuf_t node; sbuf_reset(&node);
+    sbuf_list_wrap(&node, &payload);
+
+    return make_node_ref(node.data, node.len);
+}
+
+/* Extension node: RLP([hex_prefix(path, false), child_ref]) → node_ref */
+static node_ref_t extension_ref(const uint8_t *path, size_t path_len,
+                                const node_ref_t *child) {
+    uint8_t encoded_path[33];
+    size_t encoded_len = hex_prefix_encode(path, path_len, false, encoded_path);
+
+    rlp_sbuf_t payload; sbuf_reset(&payload);
+    sbuf_encode_bytes(&payload, encoded_path, encoded_len);
+    /* Child: if < 32 bytes embed raw, if == 32 encode as string */
+    if (child->len < 32)
+        sbuf_append(&payload, child->data, child->len);
+    else
+        sbuf_encode_bytes(&payload, child->data, 32);
+
+    rlp_sbuf_t node; sbuf_reset(&node);
+    sbuf_list_wrap(&node, &payload);
+
+    return make_node_ref(node.data, node.len);
+}
+
+/* Branch node: RLP([child0, child1, ..., child15, value]) → node_ref */
+static node_ref_t branch_ref(const node_ref_t children[16]) {
+    rlp_sbuf_t payload; sbuf_reset(&payload);
+
+    for (int i = 0; i < 16; i++) {
+        if (children[i].len == 0)
+            sbuf_encode_empty(&payload);
+        else if (children[i].len < 32)
+            sbuf_append(&payload, children[i].data, children[i].len);
+        else
+            sbuf_encode_bytes(&payload, children[i].data, 32);
+    }
+    sbuf_encode_empty(&payload);  /* value slot — always empty */
+
+    rlp_sbuf_t node; sbuf_reset(&node);
+    sbuf_list_wrap(&node, &payload);
+
+    return make_node_ref(node.data, node.len);
+}
+
+static node_ref_t build_subtrie_var(batch_leaf_var_t *leaves, size_t start,
+                                    size_t end, size_t depth) {
+    node_ref_t empty = {.len = 0};
     size_t count = end - start;
 
     if (count == 0) {
+        /* Empty subtrie — encode as empty string hash */
         const uint8_t empty_rlp[] = {0x80};
-        keccak256(empty_rlp, sizeof(empty_rlp), out->bytes);
-        return true;
+        keccak256(empty_rlp, sizeof(empty_rlp), empty.data);
+        empty.len = 32;
+        return empty;
     }
 
     if (count == 1) {
         size_t remaining = leaves[start].nibble_count - depth;
-        return leaf_hash(&leaves[start].nibbles[depth], remaining,
-                         leaves[start].value, leaves[start].value_len, out);
+        return leaf_ref(&leaves[start].nibbles[depth], remaining,
+                        leaves[start].value, leaves[start].value_len);
     }
 
     /* Find minimum remaining nibble count across all leaves */
@@ -417,14 +501,12 @@ static bool build_subtrie_var(batch_leaf_var_t *leaves, size_t start, size_t end
     }
 
     if (common_len > 0) {
-        hash_t child;
-        if (!build_subtrie_var(leaves, start, end, depth + common_len, &child))
-            return false;
-        return extension_hash(&leaves[start].nibbles[depth], common_len, &child, out);
+        node_ref_t child = build_subtrie_var(leaves, start, end, depth + common_len);
+        return extension_ref(&leaves[start].nibbles[depth], common_len, &child);
     }
 
     /* Branch node */
-    hash_t children[16];
+    node_ref_t children[16];
     memset(children, 0, sizeof(children));
 
     size_t i = start;
@@ -434,13 +516,11 @@ static bool build_subtrie_var(batch_leaf_var_t *leaves, size_t start, size_t end
         while (group_end < end && leaves[group_end].nibbles[depth] == nibble)
             group_end++;
 
-        if (!build_subtrie_var(leaves, i, group_end, depth + 1, &children[nibble]))
-            return false;
-
+        children[nibble] = build_subtrie_var(leaves, i, group_end, depth + 1);
         i = group_end;
     }
 
-    return branch_hash(children, out);
+    return branch_ref(children);
 }
 
 static int compare_unsecured_entries(const void *a, const void *b) {
@@ -484,8 +564,15 @@ bool mpt_compute_root_unsecured(mpt_unsecured_entry_t *entries,
         leaves[i].value_len    = entries[i].value_len;
     }
 
-    bool ok = build_subtrie_var(leaves, 0, count, 0, out_root);
-
+    node_ref_t ref = build_subtrie_var(leaves, 0, count, 0);
     free(leaves);
-    return ok;
+
+    /* Root is always a hash — even if the node is < 32 bytes */
+    if (ref.len == 0) return false;
+    if (ref.len == 32) {
+        memcpy(out_root->bytes, ref.data, 32);
+    } else {
+        keccak256(ref.data, ref.len, out_root->bytes);
+    }
+    return true;
 }
