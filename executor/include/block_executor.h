@@ -9,7 +9,7 @@
 #include <stdbool.h>
 
 #ifdef ENABLE_HISTORY
-typedef struct state_history state_history_t;
+#include "state_history.h"
 #endif
 #ifdef __cplusplus
 extern "C" {
@@ -63,6 +63,12 @@ typedef struct {
     double      root_ms;         /* time spent in state root computation */
 
     bool        deposit_layout_invalid;  /* EIP-6110: invalid deposit event ABI layout */
+
+#ifdef ENABLE_HISTORY
+    /* Block diff for undo/reorg (populated by block_execute).
+     * Caller must free via block_diff_free if non-zero group_count. */
+    block_diff_t diff;
+#endif
 } block_result_t;
 
 /**

@@ -727,26 +727,16 @@ block_result_t block_execute(evm_t *evm,
 
 #ifdef ENABLE_HISTORY
     /* Capture state diff before dirty flags are cleared by compute_state_root.
-     * Collect once, push to both consumers independently. */
+     * Always populate result.diff for undo support; also push to history ring. */
     {
-        bool need_diff = false;
-#ifdef ENABLE_HISTORY
-        if (history) need_diff = true;
-#endif
-        if (need_diff) {
-            block_diff_t diff;
-            memset(&diff, 0, sizeof(diff));
-            diff.block_number = header->number;
-            evm_state_collect_block_diff(evm->state, &diff);
+        memset(&result.diff, 0, sizeof(result.diff));
+        result.diff.block_number = header->number;
+        evm_state_collect_block_diff(evm->state, &result.diff);
 
-#ifdef ENABLE_HISTORY
-            if (history) {
-                block_diff_t hist_diff;
-                block_diff_clone(&diff, &hist_diff);
-                state_history_push(history, &hist_diff);
-            }
-#endif
-            block_diff_free(&diff);
+        if (history) {
+            block_diff_t hist_diff;
+            block_diff_clone(&result.diff, &hist_diff);
+            state_history_push(history, &hist_diff);
         }
     }
 #endif
@@ -784,5 +774,9 @@ void block_result_free(block_result_t *result) {
         result->requests = NULL;
         result->request_lengths = NULL;
         result->request_count = 0;
+
+#ifdef ENABLE_HISTORY
+        block_diff_free(&result->diff);
+#endif
     }
 }

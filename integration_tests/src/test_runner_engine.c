@@ -371,10 +371,15 @@ bool test_runner_run_engine_test(test_runner_t *runner,
         /* If block execution detected an invalidity, treat as rejection */
         if (block_result.deposit_layout_invalid && payload->validation_error != NULL) {
             if (runner->config.verbose) {
-                printf("    Expected error: %s (deposit layout invalid = correct rejection)\n",
-                       payload->validation_error);
+                printf("    Expected error: %s (deposit layout invalid = correct rejection, diff groups=%u)\n",
+                       payload->validation_error, block_result.diff.group_count);
             }
+#ifdef ENABLE_HISTORY
+            state_history_revert_diff(runner->state, &block_result.diff);
+            evm_state_invalidate_all(runner->state);
+#else
             evm_state_revert(runner->state, pre_block_snap);
+#endif
             block_result_free(&block_result);
             block_body_free(&body);
             block_hashes[hdr.number % 256] = *(const hash_t *)payload->block_hash;
@@ -382,13 +387,18 @@ bool test_runner_run_engine_test(test_runner_t *runner,
         }
 
         /* If the payload expects a validation error (invalid block),
-         * revert state and skip root/bloom checks. */
+         * revert state via undo log. */
         if (payload->validation_error != NULL) {
             if (runner->config.verbose) {
-                printf("    Expected error: %s (reverting state)\n",
+                printf("    Expected error: %s (reverting via undo diff)\n",
                        payload->validation_error);
             }
+#ifdef ENABLE_HISTORY
+            state_history_revert_diff(runner->state, &block_result.diff);
+            evm_state_invalidate_all(runner->state);
+#else
             evm_state_revert(runner->state, pre_block_snap);
+#endif
             block_result_free(&block_result);
             block_body_free(&body);
             block_hashes[hdr.number % 256] = computed_hash;

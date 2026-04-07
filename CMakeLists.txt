@@ -167,6 +167,7 @@ if(ENABLE_DEBUG)
 endif()
 if(ENABLE_HISTORY)
     target_compile_definitions(evm PUBLIC ENABLE_HISTORY=1)
+    target_compile_definitions(state PRIVATE ENABLE_HISTORY=1)
 endif()
 
 #==============================================================================
