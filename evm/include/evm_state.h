@@ -278,6 +278,7 @@ void     evm_state_set_evict_threshold(evm_state_t *es, uint64_t blocks);
 void     evm_state_set_evict_budget(evm_state_t *es, size_t bytes);
 uint32_t evm_state_evict_cold_storage(evm_state_t *es);
 void     evm_state_compact_evict_file(evm_state_t *es);
+size_t   evm_state_trim_storage(evm_state_t *es);
 
 // ============================================================================
 // Cache / Store Statistics

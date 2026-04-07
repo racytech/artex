@@ -421,3 +421,7 @@ uint32_t evm_state_evict_cold_storage(evm_state_t *es) {
 void evm_state_compact_evict_file(evm_state_t *es) {
     if (es) state_compact_evict_file(es->st);
 }
+
+size_t evm_state_trim_storage(evm_state_t *es) {
+    return es ? state_trim_storage(es->st) : 0;
+}

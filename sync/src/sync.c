@@ -461,15 +461,20 @@ bool sync_execute_block(sync_t *sync,
             uint32_t n_evicted = evm_state_evict_cold_storage(sync->state);
             clock_gettime(CLOCK_MONOTONIC, &_e1);
 
-            if (n_evicted > 0) {
-                double ms = (_e1.tv_sec - _e0.tv_sec) * 1000.0 +
-                            (_e1.tv_nsec - _e0.tv_nsec) / 1e6;
+            /* Trim overallocated arenas after eviction */
+            size_t trimmed = evm_state_trim_storage(sync->state);
+
+            clock_gettime(CLOCK_MONOTONIC, &_e1);
+            double ms = (_e1.tv_sec - _e0.tv_sec) * 1000.0 +
+                        (_e1.tv_nsec - _e0.tv_nsec) / 1e6;
+
+            if (n_evicted > 0 || trimmed > 0) {
                 state_t *evst = evm_state_get_state(sync->state);
                 state_stats_t evss = state_get_stats(evst);
-                fprintf(stderr, "  evict @%lu: %u harts evicted, stor=%.0fMB, %.0fms\n",
-                        bn, n_evicted, evss.stor_arena_bytes / 1e6, ms);
+                fprintf(stderr, "  evict @%lu: %u evicted, %.0fMB trimmed, stor=%.0fMB, %.0fms\n",
+                        bn, n_evicted, trimmed / 1e6,
+                        evss.stor_arena_bytes / 1e6, ms);
                 sync->last_evict_ms = ms;
-                /* Refresh stats so next checkpoint print reflects eviction */
                 sync->last_stats = evm_state_get_stats(sync->state);
             }
             sync->last_evict_block = bn;

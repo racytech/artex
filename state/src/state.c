@@ -2046,6 +2046,19 @@ uint32_t state_evict_cold_storage(state_t *s) {
     return evicted;
 }
 
+size_t state_trim_storage(state_t *s) {
+    if (!s) return 0;
+    size_t total_freed = 0;
+    for (uint32_t i = 1; i < s->res_count; i++) {
+        resource_t *r = &s->resources[i];
+        if (!r->storage) continue;
+        size_t freed = hart_trim(r->storage);
+        total_freed += freed;
+    }
+    s->stor_arena_total -= total_freed;
+    return total_freed;
+}
+
 void state_compact_evict_file(state_t *s) {
     if (!s || s->evict_fd < 0) return;
 

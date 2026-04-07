@@ -902,6 +902,20 @@ bool hart_init_cap(hart_t *t, uint16_t value_size, size_t initial_cap) {
     return true;
 }
 
+size_t hart_trim(hart_t *t) {
+    if (!t || !t->arena || t->arena_used >= t->arena_cap) return 0;
+    /* Don't shrink below 256 or below used+25% headroom */
+    size_t target = t->arena_used + t->arena_used / 4;
+    if (target < 256) target = 256;
+    if (target >= t->arena_cap) return 0;
+    uint8_t *na = realloc(t->arena, target);
+    if (!na) return 0;
+    size_t freed = t->arena_cap - target;
+    t->arena = na;
+    t->arena_cap = target;
+    return freed;
+}
+
 void hart_destroy(hart_t *t) {
     if (!t) return;
     free(t->arena);

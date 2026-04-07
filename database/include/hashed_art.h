@@ -55,6 +55,9 @@ bool hart_init(hart_t *t, uint16_t value_size);
 bool hart_init_cap(hart_t *t, uint16_t value_size, size_t initial_cap);
 void hart_destroy(hart_t *t);
 
+/* Shrink arena to fit used data. Returns bytes freed (0 if nothing to shrink). */
+size_t hart_trim(hart_t *t);
+
 /* Operations */
 bool        hart_insert(hart_t *t, const uint8_t key[32], const void *value);
 bool        hart_delete(hart_t *t, const uint8_t key[32]);
