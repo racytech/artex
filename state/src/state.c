@@ -766,12 +766,16 @@ void state_set_storage_raw(state_t *s, const address_t *addr,
     uint8_t slot_be[32]; uint256_to_bytes(key, slot_be);
     hash_t slot_hash = hash_keccak256(slot_be, 32);
 
+    size_t cap_before = r->storage->arena_cap;
     if (uint256_is_zero(value))
         hart_delete(r->storage, slot_hash.bytes);
     else {
         uint8_t val_be[32]; uint256_to_bytes(value, val_be);
         hart_insert(r->storage, slot_hash.bytes, val_be);
     }
+    if (r->storage->arena_cap != cap_before)
+        s->stor_arena_total += r->storage->arena_cap - cap_before;
+
     /* Mark storage dirty for root recomputation */
     hash_t ah = hash_keccak256(addr->bytes, 20);
     hart_mark_path_dirty(&s->acct_index, ah.bytes);
@@ -1148,6 +1152,7 @@ void state_revert(state_t *s, uint32_t snap) {
             if (r && r->storage) {
                 uint8_t slot_be[32]; uint256_to_bytes(&je->data.storage.key, slot_be);
                 hash_t slot_hash = hash_keccak256(slot_be, 32);
+                size_t cap_before = r->storage->arena_cap;
                 if (uint256_is_zero(&je->data.storage.val))
                     hart_delete(r->storage, slot_hash.bytes);
                 else {
@@ -1155,6 +1160,8 @@ void state_revert(state_t *s, uint32_t snap) {
                     uint256_to_bytes(&je->data.storage.val, val_be);
                     hart_insert(r->storage, slot_hash.bytes, val_be);
                 }
+                if (r->storage->arena_cap != cap_before)
+                    s->stor_arena_total += r->storage->arena_cap - cap_before;
             }
             if (a) a->flags = je->data.storage.flags;
             break;
