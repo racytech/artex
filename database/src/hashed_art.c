@@ -988,6 +988,53 @@ size_t hart_trim(hart_t *t) {
     return freed;
 }
 
+size_t hart_dump_size(const hart_t *t) {
+    if (!t) return 0;
+    return sizeof(hart_dump_hdr_t) + t->arena_used;
+}
+
+void hart_dump(const hart_t *t, uint8_t *buf) {
+    if (!t || !buf) return;
+    hart_dump_hdr_t *h = (hart_dump_hdr_t *)buf;
+    h->root = t->root;
+    h->size = (uint32_t)t->size;
+    h->arena_used = (uint32_t)t->arena_used;
+    h->value_size = t->value_size;
+    h->free_node4 = t->free_node4;
+    h->free_node16 = t->free_node16;
+    h->free_node48 = t->free_node48;
+    h->free_node256 = t->free_node256;
+    h->free_leaf = t->free_leaf;
+    h->_pad = 0;
+    if (t->arena_used > 0 && t->arena)
+        memcpy(buf + sizeof(hart_dump_hdr_t), t->arena, t->arena_used);
+}
+
+bool hart_load(hart_t *t, const uint8_t *buf, size_t buf_len) {
+    if (!t || !buf || buf_len < sizeof(hart_dump_hdr_t)) return false;
+    const hart_dump_hdr_t *h = (const hart_dump_hdr_t *)buf;
+    if (buf_len < sizeof(hart_dump_hdr_t) + h->arena_used) return false;
+
+    memset(t, 0, sizeof(*t));
+    t->root = h->root;
+    t->size = h->size;
+    t->value_size = h->value_size;
+    t->arena_used = h->arena_used;
+    t->free_node4 = h->free_node4;
+    t->free_node16 = h->free_node16;
+    t->free_node48 = h->free_node48;
+    t->free_node256 = h->free_node256;
+    t->free_leaf = h->free_leaf;
+
+    size_t cap = h->arena_used + h->arena_used / 4;
+    if (cap < 256) cap = 256;
+    t->arena = malloc(cap);
+    if (!t->arena) return false;
+    t->arena_cap = cap;
+    memcpy(t->arena, buf + sizeof(hart_dump_hdr_t), h->arena_used);
+    return true;
+}
+
 void hart_destroy(hart_t *t) {
     if (!t) return;
     free(t->arena);
