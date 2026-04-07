@@ -408,8 +408,6 @@ static void mark_blk_dirty_h(state_t *s, account_t *a, const hash_t *addr_hash) 
 
         /* Capture pre-block account snapshot for undo log (first touch only) */
         if (!mem_art_contains(&s->blk_orig_acct, a->addr.bytes, 20)) {
-            if (a->addr.bytes[0] == 0x94 && a->addr.bytes[1] == 0x32)
-                fprintf(stderr, "  SNAP_CAPTURE: 9432 nonce=%lu\n", a->nonce);
             resource_t *r = get_resource(s, a);
             acct_snapshot_t snap = {
                 .nonce = a->nonce,
@@ -1713,9 +1711,6 @@ void state_collect_block_diff(state_t *s, block_diff_t *out) {
         const acct_snapshot_t *snap = (const acct_snapshot_t *)
             mem_art_get(&s->blk_orig_acct, akey, 20, NULL);
 
-        if (akey[0] == 0x94 && akey[1] == 0x32)
-            fprintf(stderr, "  DIFF_CHECK: 9432 snap=%s snap_nonce=%lu cur_nonce=%lu\n",
-                    snap ? "Y" : "N", snap ? snap->nonce : 99, a->nonce);
         bool nonce_changed = snap && (a->nonce != snap->nonce);
         bool balance_changed = snap && !uint256_is_equal(&a->balance, &snap->balance);
         resource_t *r = get_resource(s, a);
