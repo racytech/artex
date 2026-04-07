@@ -413,14 +413,23 @@ static node_ref_t leaf_ref(const uint8_t *suffix, size_t suffix_len,
     uint8_t encoded_path[33];
     size_t encoded_len = hex_prefix_encode(suffix, suffix_len, true, encoded_path);
 
-    rlp_sbuf_t payload; sbuf_reset(&payload);
-    sbuf_encode_bytes(&payload, encoded_path, encoded_len);
-    sbuf_encode_bytes(&payload, value, value_len);
+    /* Fast path: small values fit in the stack buffer */
+    if (value_len + encoded_len + 16 <= sizeof(((rlp_sbuf_t *)0)->data)) {
+        rlp_sbuf_t payload; sbuf_reset(&payload);
+        sbuf_encode_bytes(&payload, encoded_path, encoded_len);
+        sbuf_encode_bytes(&payload, value, value_len);
 
-    rlp_sbuf_t node; sbuf_reset(&node);
-    sbuf_list_wrap(&node, &payload);
+        rlp_sbuf_t node; sbuf_reset(&node);
+        sbuf_list_wrap(&node, &payload);
 
-    return make_node_ref(node.data, node.len);
+        return make_node_ref(node.data, node.len);
+    }
+
+    /* Slow path: large values — use the existing leaf_hash (always >= 32 bytes) */
+    node_ref_t ref;
+    leaf_hash(suffix, suffix_len, value, value_len, (hash_t *)ref.data);
+    ref.len = 32;
+    return ref;
 }
 
 /* Extension node: RLP([hex_prefix(path, false), child_ref]) → node_ref */
