@@ -72,10 +72,36 @@ typedef struct {
 /* Leaf is raw bytes in arena: key[32] followed by value[value_size]. */
 
 /* =========================================================================
- * Arena allocator
+ * Arena allocator with per-type free list recycling
  * ========================================================================= */
 
+/* Get pointer to the free list head for a given node type */
+static uint32_t *free_list_for_type(hart_t *t, int type) {
+    switch (type) {
+    case NODE_4:   return &t->free_node4;
+    case NODE_16:  return &t->free_node16;
+    case NODE_48:  return &t->free_node48;
+    case NODE_256: return &t->free_node256;
+    default:       return &t->free_leaf;
+    }
+}
+
+/* Return a dead node/leaf to its type-specific free list.
+ * The first 4 bytes of the dead slot store the next pointer (arena offset). */
+static void arena_free(hart_t *t, hart_ref_t ref, int type) {
+    if (ref == HART_REF_NULL) return;
+    uint32_t offset = (ref & 0x7FFFFFFFu) << 4;
+    uint32_t *head = free_list_for_type(t, type);
+    /* Store current head as next pointer in the freed slot */
+    *(uint32_t *)(t->arena + offset) = *head;
+    *head = offset;
+}
+
 static hart_ref_t arena_alloc(hart_t *t, size_t bytes, bool is_leaf) {
+    /* Check free list first for the matching size class */
+    int type = is_leaf ? -1 : -2; /* placeholder — caller sets type via alloc_node/alloc_leaf */
+    /* Free list recycling is handled by alloc_node_or_recycle below */
+
     size_t aligned = (t->arena_used + 15) & ~(size_t)15;
     if (aligned + bytes > t->arena_cap) {
         size_t nc = t->arena_cap ? t->arena_cap + t->arena_cap / 2 : 4096;
@@ -92,8 +118,31 @@ static hart_ref_t arena_alloc(hart_t *t, size_t bytes, bool is_leaf) {
     return ref;
 }
 
+/* Try to recycle from free list, fall back to arena_alloc */
+static hart_ref_t arena_alloc_or_recycle(hart_t *t, size_t bytes, bool is_leaf, int node_type) {
+    uint32_t *head = free_list_for_type(t, node_type);
+    if (*head != 0) {
+        uint32_t offset = *head;
+        /* Pop from free list — next pointer stored in first 4 bytes */
+        *head = *(uint32_t *)(t->arena + offset);
+        memset(t->arena + offset, 0, bytes);
+        hart_ref_t ref = (hart_ref_t)(offset >> 4);
+        if (is_leaf) ref |= 0x80000000u;
+        return ref;
+    }
+    return arena_alloc(t, bytes, is_leaf);
+}
+
 static inline void *ref_ptr(const hart_t *t, hart_ref_t ref) {
     return t->arena + ((size_t)(ref & 0x7FFFFFFFu) << 4);
+}
+
+/* Prefetch a node/leaf into L1 cache (non-blocking) */
+static inline void prefetch_ref(const hart_t *t, hart_ref_t ref) {
+    if (ref != HART_REF_NULL) {
+        const void *p = t->arena + ((size_t)(ref & 0x7FFFFFFFu) << 4);
+        _mm_prefetch((const char *)p, _MM_HINT_T0);
+    }
 }
 
 /* =========================================================================
@@ -155,7 +204,7 @@ static inline bool leaf_matches(const hart_t *t, hart_ref_t ref, const uint8_t k
 
 static hart_ref_t alloc_leaf(hart_t *t, const uint8_t key[32], const void *value) {
     size_t total = KEY_SIZE + t->value_size;
-    hart_ref_t ref = arena_alloc(t, total, true);
+    hart_ref_t ref = arena_alloc_or_recycle(t, total, true, -1);
     if (ref == HART_REF_NULL) return ref;
     uint8_t *p = ref_ptr(t, ref);
     memcpy(p, key, KEY_SIZE);
@@ -206,7 +255,7 @@ static hart_ref_t alloc_node(hart_t *t, uint8_t type) {
     case NODE_256: sz = sizeof(node256_t); break;
     default: return HART_REF_NULL;
     }
-    hart_ref_t ref = arena_alloc(t, sz, false);
+    hart_ref_t ref = arena_alloc_or_recycle(t, sz, false, type);
     if (ref == HART_REF_NULL) return ref;
     void *n = ref_ptr(t, ref);
     *(uint8_t *)n = type;
@@ -231,7 +280,7 @@ static hart_ref_t add_child(hart_t *t, hart_ref_t nref, uint8_t byte, hart_ref_t
             nn->num_children++;
             return nref;
         }
-        /* Grow to node16 */
+        /* Grow to node16 — old node4 becomes dead */
         hart_ref_t new_ref = alloc_node(t, NODE_16);
         if (new_ref == HART_REF_NULL) return nref;
         nn = ref_ptr(t, nref);
@@ -246,6 +295,7 @@ static hart_ref_t add_child(hart_t *t, hart_ref_t nref, uint8_t byte, hart_ref_t
         nn16->keys[pos] = byte;
         nn16->children[pos] = child;
         nn16->num_children = 5;
+        arena_free(t, nref, NODE_4);
         return new_ref;
     }
     case NODE_16: {
@@ -260,7 +310,7 @@ static hart_ref_t add_child(hart_t *t, hart_ref_t nref, uint8_t byte, hart_ref_t
             nn->num_children++;
             return nref;
         }
-        /* Grow to node48 */
+        /* Grow to node48 — old node16 becomes dead */
         hart_ref_t new_ref = alloc_node(t, NODE_48);
         if (new_ref == HART_REF_NULL) return nref;
         nn = ref_ptr(t, nref);
@@ -272,6 +322,7 @@ static hart_ref_t add_child(hart_t *t, hart_ref_t nref, uint8_t byte, hart_ref_t
         nn48->index[byte] = 16;
         nn48->children[16] = child;
         nn48->num_children = 17;
+        arena_free(t, nref, NODE_16);
         return new_ref;
     }
     case NODE_48: {
@@ -286,7 +337,7 @@ static hart_ref_t add_child(hart_t *t, hart_ref_t nref, uint8_t byte, hart_ref_t
             nn->num_children++;
             return nref;
         }
-        /* Grow to node256 */
+        /* Grow to node256 — old node48 becomes dead */
         hart_ref_t new_ref = alloc_node(t, NODE_256);
         if (new_ref == HART_REF_NULL) return nref;
         nn = ref_ptr(t, nref);
@@ -297,6 +348,7 @@ static hart_ref_t add_child(hart_t *t, hart_ref_t nref, uint8_t byte, hart_ref_t
         }
         nn256->children[byte] = child;
         nn256->num_children = nn->num_children + 1;
+        arena_free(t, nref, NODE_48);
         return new_ref;
     }
     case NODE_256: {
@@ -375,6 +427,7 @@ static hart_ref_t insert_recursive(hart_t *t, hart_ref_t ref,
 
     if (child_ptr) {
         hart_ref_t old_child = *child_ptr;
+        prefetch_ref(t, old_child);
         hart_ref_t new_child = insert_recursive(t, old_child, key, value, depth + 1, inserted);
         if (new_child != old_child) {
             child_ptr = find_child_ptr(t, ref, byte);
@@ -434,6 +487,7 @@ static hart_ref_t remove_child(hart_t *t, hart_ref_t nref, uint8_t byte) {
                     memcpy(n4->keys, nn->keys, nn->num_children);
                     memcpy(n4->children, nn->children,
                            nn->num_children * sizeof(hart_ref_t));
+                    arena_free(t, nref, NODE_16);
                     return new_ref;
                 }
                 return nref;
@@ -461,6 +515,7 @@ static hart_ref_t remove_child(hart_t *t, hart_ref_t nref, uint8_t byte) {
                         n16->num_children++;
                     }
                 }
+                arena_free(t, nref, NODE_48);
                 return new_ref;
             }
         }
@@ -484,6 +539,7 @@ static hart_ref_t remove_child(hart_t *t, hart_ref_t nref, uint8_t byte) {
                         n48->num_children++;
                     }
                 }
+                arena_free(t, nref, NODE_256);
                 return new_ref;
             }
         }
@@ -501,6 +557,7 @@ static hart_ref_t delete_recursive(hart_t *t, hart_ref_t ref,
     if (HART_IS_LEAF(ref)) {
         if (leaf_matches(t, ref, key)) {
             *deleted = true;
+            arena_free(t, ref, -1);  /* -1 = leaf type */
             return HART_REF_NULL;
         }
         return ref;
@@ -513,6 +570,7 @@ static hart_ref_t delete_recursive(hart_t *t, hart_ref_t ref,
     mark_dirty(t, ref);
 
     hart_ref_t old_child = *child_ptr;
+    prefetch_ref(t, old_child);
     hart_ref_t new_child = delete_recursive(t, old_child, key, depth + 1, deleted);
 
     if (new_child != old_child) {
@@ -559,6 +617,7 @@ const void *hart_get(const hart_t *t, const uint8_t key[32]) {
         hart_ref_t *child = find_child_ptr(t, ref, key[depth]);
         if (!child) return NULL;
         ref = *child;
+        prefetch_ref(t, ref);  /* prefetch next node while processing current */
         depth++;
     }
     return NULL;
@@ -778,6 +837,8 @@ static size_t hash_lo_group(hart_t *t, const uint8_t *lo_keys,
     uint8_t slots[16][33];
     uint8_t slot_lens[16] = {0};
     for (int j = 0; j < count; j++) {
+        /* Prefetch next child while hashing current */
+        if (j + 1 < count) prefetch_ref(t, lo_refs[j + 1]);
         slot_lens[lo_keys[j]] = (uint8_t)
             hash_ref(t, lo_refs[j], next_depth, encode, ctx,
                      NULL, 0, slots[lo_keys[j]]);
@@ -842,6 +903,14 @@ static size_t hash_ref(hart_t *t, hart_ref_t ref, size_t byte_depth,
     uint8_t hi_slots[16][33]; uint8_t hi_slot_lens[16] = {0};
     for (int hi = 0; hi < 16; hi++) {
         if (gcounts[hi] == 0) continue;
+        /* Prefetch next occupied slot's children while processing current */
+        for (int next = hi + 1; next < 16; next++) {
+            if (gcounts[next] > 0) {
+                for (int j = 0; j < gcounts[next]; j++)
+                    prefetch_ref(t, lo_refs[next][j]);
+                break;
+            }
+        }
         if (gcounts[hi] == 1) {
             uint8_t lo_nib = lo_keys[hi][0];
             hi_slot_lens[hi] = (uint8_t)hash_ref(t, lo_refs[hi][0], next_depth, encode, ctx, &lo_nib, 1, hi_slots[hi]);
