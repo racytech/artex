@@ -637,7 +637,6 @@ int main(int argc, char **argv) {
         archive_close(&archive);
         return 1;
     }
-    LOG_INFO("State loaded successfully");
     /* Enable cold storage eviction + LRU */
     evm_state_set_evict_path(sync_get_state(sync), data_dir);
     if (storage_cache > 0)
