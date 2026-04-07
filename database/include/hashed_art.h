@@ -48,13 +48,6 @@ typedef struct {
     size_t     arena_used;
     size_t     arena_cap;
     uint16_t   value_size;    /* fixed: 4 or 32 */
-    /* Per-type free lists — arena offsets, 0 = empty list.
-     * Dead nodes are recycled before appending new ones. */
-    uint32_t   free_node4;
-    uint32_t   free_node16;
-    uint32_t   free_node48;
-    uint32_t   free_node256;
-    uint32_t   free_leaf;
 } hart_t;
 
 /* Lifecycle */
