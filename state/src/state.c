@@ -491,10 +491,11 @@ static bool ensure_storage(state_t *s, account_t *a) {
     s->stor_arena_total += r->storage->arena_cap;
     s->stor_in_memory++;
 
-    /* Add to LRU + evict if over capacity */
+    /* Add to LRU + evict if over capacity (break if no candidate found) */
     lru_push_front(s, a->resource_idx);
-    while (s->lru_capacity > 0 && s->lru_count > s->lru_capacity)
-        lru_evict_tail(s);
+    while (s->lru_capacity > 0 && s->lru_count > s->lru_capacity) {
+        if (!lru_evict_tail(s)) break;
+    }
 
     uint32_t idx = (uint32_t)(a - s->accounts);
     resource_list_add(s, idx);
@@ -630,8 +631,9 @@ static bool state_reload_storage(state_t *s, account_t *a, resource_t *r) {
 
     /* Add to LRU front + evict tail if over capacity */
     lru_push_front(s, a->resource_idx);
-    while (s->lru_capacity > 0 && s->lru_count > s->lru_capacity)
-        lru_evict_tail(s);
+    while (s->lru_capacity > 0 && s->lru_count > s->lru_capacity) {
+        if (!lru_evict_tail(s)) break;
+    }
 
     /* Track in resource list for stats */
     uint32_t idx = (uint32_t)(a - s->accounts);
