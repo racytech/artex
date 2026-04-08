@@ -148,6 +148,12 @@ void evm_destroy(evm_t *evm)
 
     evm_logs_clear(evm);
 
+    // Free cached stacks/memories
+    for (int i = 0; i < evm->cached_stack_count; i++)
+        evm_stack_destroy(evm->cached_stacks[i]);
+    for (int i = 0; i < evm->cached_memory_count; i++)
+        evm_memory_destroy(evm->cached_memories[i]);
+
     free(evm);
 }
 
@@ -530,9 +536,21 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         // Save parent's execution context
         saved_context = evm_save_context(evm);
 
-        // Create new stack and memory for this subcall
-        evm->stack = evm_stack_create();
-        evm->memory = evm_memory_create();
+        // Acquire stack+memory from cache or create new
+        if (evm->cached_stack_count > 0) {
+            evm->stack = evm->cached_stacks[--evm->cached_stack_count];
+            evm->stack->size = 0;
+        } else {
+            evm->stack = evm_stack_create();
+        }
+        if (evm->cached_memory_count > 0) {
+            evm->memory = evm->cached_memories[--evm->cached_memory_count];
+            if (evm->memory->size > 0)
+                memset(evm->memory->data, 0, evm->memory->size);
+            evm->memory->size = 0;
+        } else {
+            evm->memory = evm_memory_create();
+        }
 
         if (!evm->stack || !evm->memory)
         {
@@ -685,8 +703,12 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         // Cleanup subcall context and set return data on parent
         if (is_subcall)
         {
-            evm_stack_destroy(evm->stack);
-            evm_memory_destroy(evm->memory);
+            if (evm->cached_stack_count < 8)
+                evm->cached_stacks[evm->cached_stack_count++] = evm->stack;
+            else evm_stack_destroy(evm->stack);
+            if (evm->cached_memory_count < 8)
+                evm->cached_memories[evm->cached_memory_count++] = evm->memory;
+            else evm_memory_destroy(evm->memory);
             evm_restore_context(evm, &saved_context);
 
             // Transfer result's output buffer to parent's return_data
@@ -725,8 +747,12 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
             uint64_t subcall_gas_remaining = evm->gas_left;
             if (is_subcall)
             {
-                evm_stack_destroy(evm->stack);
-                evm_memory_destroy(evm->memory);
+                if (evm->cached_stack_count < 8)
+                    evm->cached_stacks[evm->cached_stack_count++] = evm->stack;
+                else evm_stack_destroy(evm->stack);
+                if (evm->cached_memory_count < 8)
+                    evm->cached_memories[evm->cached_memory_count++] = evm->memory;
+                else evm_memory_destroy(evm->memory);
                 evm_restore_context(evm, &saved_context);
                 if (evm->return_data) { free(evm->return_data); evm->return_data = NULL; }
                 evm->return_data_size = 0;
