@@ -30,6 +30,7 @@
 #define STOR_KEY_SIZE       32
 #define STOR_VAL_SIZE       32
 #define STOR_INIT_CAP       1024
+#define WHALE_THRESHOLD     10000  /* don't evict accounts with >10K storage slots */
 #define SLOT_KEY_SIZE       52   /* addr[20] + slot_be[32] for originals/warm */
 
 /* EIP-161 RIPEMD special case: address 0x0000...0003.
@@ -537,22 +538,32 @@ static void lru_touch(state_t *s, uint32_t ridx) {
 }
 
 
-/* Evict the LRU tail if over capacity. Returns true if evicted. */
+/* Evict the LRU tail if over capacity. Skips whales. Returns true if evicted. */
 static bool lru_evict_tail(state_t *s) {
-    if (!s->lru_tail) return false;
+    /* Walk from tail towards head, skip whales, evict first eligible */
     uint32_t ridx = s->lru_tail;
-    resource_t *r = &s->resources[ridx];
-    if (!r->storage) { lru_remove(s, ridx); return false; }
+    int attempts = 0;
+    while (ridx && attempts < 100) {
+        resource_t *r = &s->resources[ridx];
+        uint32_t prev = r->lru_prev;  /* save before potential removal */
 
-    /* Use reverse mapping to find account — O(1) */
-    account_t *a = (r->acct_idx < s->count) ? &s->accounts[r->acct_idx] : NULL;
-    if (!a || a->resource_idx != ridx) { lru_remove(s, ridx); return false; }
+        if (!r->storage) { lru_remove(s, ridx); ridx = prev; continue; }
 
-    /* Remove from LRU before evicting */
-    lru_remove(s, ridx);
+        /* Skip whales — don't evict, just move past */
+        if (hart_size(r->storage) > WHALE_THRESHOLD) {
+            ridx = prev;
+            attempts++;
+            continue;
+        }
 
-    if (!evict_ensure_fd(s)) return false;
-    return evict_one(s, a, r);
+        account_t *a = (r->acct_idx < s->count) ? &s->accounts[r->acct_idx] : NULL;
+        if (!a || a->resource_idx != ridx) { lru_remove(s, ridx); ridx = prev; continue; }
+
+        lru_remove(s, ridx);
+        if (!evict_ensure_fd(s)) return false;
+        return evict_one(s, a, r);
+    }
+    return false;  /* no eligible candidate found */
 }
 
 static void destroy_resource_storage(state_t *s, resource_t *r) {
@@ -2042,6 +2053,9 @@ static bool evict_ensure_fd(state_t *s) {
 static bool evict_one(state_t *s, account_t *a, resource_t *r) {
     size_t n = hart_size(r->storage);
     if (n == 0) return false;
+
+    /* Don't evict whale contracts — they'd just reload immediately */
+    if (n > WHALE_THRESHOLD) return false;
 
     /* Skip dirty accounts (modified this block, need root computation) */
     if (acct_has_flag(a, ACCT_MPT_DIRTY) || acct_has_flag(a, ACCT_STORAGE_DIRTY))
