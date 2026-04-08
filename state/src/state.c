@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
 #include <xmmintrin.h>
 
 /* =========================================================================
@@ -276,6 +277,8 @@ struct state {
     size_t    stor_arena_total;   /* sum of all in-memory hart arena_cap */
     uint32_t  stor_in_memory;    /* count of resources with r->storage != NULL */
     uint32_t  stor_evicted;      /* count of resources with evict_count > 0 */
+    uint64_t  stor_reload_count; /* reloads from disk this window (reset at stats) */
+    double    stor_reload_ms;    /* cumulative reload time this window */
 
     /* Storage LRU — doubly-linked list of resource indices with in-memory harts.
      * head = most recently accessed, tail = least recently accessed.
@@ -582,6 +585,9 @@ static void destroy_resource_storage(state_t *s, resource_t *r) {
 static bool state_reload_storage(state_t *s, account_t *a, resource_t *r) {
     if (!r || r->evict_count == 0 || s->evict_fd < 0) return false;
 
+    struct timespec _r0, _r1;
+    clock_gettime(CLOCK_MONOTONIC, &_r0);
+
     size_t nbytes = (size_t)r->evict_count * 64;
     uint8_t *buf = malloc(nbytes);
     if (!buf) return false;
@@ -613,6 +619,11 @@ static bool state_reload_storage(state_t *s, account_t *a, resource_t *r) {
     s->stor_evicted--;
     r->evict_offset = 0;
     r->evict_count = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &_r1);
+    s->stor_reload_count++;
+    s->stor_reload_ms += (_r1.tv_sec - _r0.tv_sec) * 1000.0 +
+                         (_r1.tv_nsec - _r0.tv_nsec) / 1e6;
 
     /* Mark as recently accessed */
     a->last_access_block = s->current_block;
@@ -1521,6 +1532,13 @@ state_stats_t state_get_stats(const state_t *s) {
 
     st.total_tracked = st.acct_vec_bytes + st.res_vec_bytes +
                        st.acct_arena_bytes + st.stor_arena_bytes;
+
+    /* Reload stats — read and reset */
+    st.stor_reloads = ((state_t *)s)->stor_reload_count;
+    st.stor_reload_ms = ((state_t *)s)->stor_reload_ms;
+    ((state_t *)s)->stor_reload_count = 0;
+    ((state_t *)s)->stor_reload_ms = 0;
+
     return st;
 }
 

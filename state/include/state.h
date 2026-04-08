@@ -194,6 +194,9 @@ typedef struct {
     size_t   acct_arena_bytes;       /* acct_index hart arena (includes hash cache) */
     size_t   stor_arena_bytes;       /* all storage hart arenas total */
     size_t   total_tracked;          /* sum of above */
+    /* Reload stats (per window, reset on read) */
+    uint64_t stor_reloads;           /* disk reloads this window */
+    double   stor_reload_ms;         /* cumulative reload time this window */
 } state_stats_t;
 
 state_stats_t state_get_stats(const state_t *s);

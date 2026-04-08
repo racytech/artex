@@ -1083,10 +1083,13 @@ int main(int argc, char **argv) {
                     double root_ms = ss.wait_flush_ms;
                     double evm_ms = ss.exec_ms - root_ms;
                     double other_ms = win_secs * 1000.0 - ss.exec_ms;
-                    printf("  └ evm=%.0fms  root=%.0fms  other=%.0fms\n",
+                    printf("  └ evm=%.0fms  root=%.0fms  other=%.0fms",
                            evm_ms > 0 ? evm_ms : 0,
                            root_ms,
                            other_ms > 0 ? other_ms : 0);
+                    if (ms.stor_reloads > 0)
+                        printf("  reload=%lu/%.0fms", ms.stor_reloads, ms.stor_reload_ms);
+                    printf("\n");
                 }
             }
             window_txs = 0;
