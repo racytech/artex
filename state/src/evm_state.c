@@ -70,7 +70,7 @@ flat_state_t *evm_state_get_flat_state(const evm_state_t *es) {
 }
 
 void evm_state_set_storage_path(evm_state_t *es, const char *path) {
-    (void)es; (void)path; /* no storage file in v2 */
+    if (es) state_set_storage_path(es->st, path);
 }
 
 /* =========================================================================
@@ -403,29 +403,29 @@ void evm_state_dump_debug(evm_state_t *es, const char *dir) {
 }
 
 void evm_state_set_evict_path(evm_state_t *es, const char *dir) {
-    if (es) state_set_evict_path(es->st, dir);
+    (void)es; (void)dir; /* no-op: eviction removed, use storage_hart pool */
 }
 
 void evm_state_set_evict_threshold(evm_state_t *es, uint64_t blocks) {
-    if (es) state_set_evict_threshold(es->st, blocks);
+    (void)es; (void)blocks; /* no-op: eviction removed */
 }
 
 void evm_state_set_evict_budget(evm_state_t *es, size_t bytes) {
-    if (es) state_set_evict_budget(es->st, bytes);
+    (void)es; (void)bytes; /* no-op: eviction removed */
 }
 
 void evm_state_set_lru_capacity(evm_state_t *es, uint32_t max_harts) {
-    if (es) state_set_lru_capacity(es->st, max_harts);
+    (void)es; (void)max_harts; /* no-op: LRU removed */
 }
 
 uint32_t evm_state_evict_cold_storage(evm_state_t *es) {
-    return es ? state_evict_cold_storage(es->st) : 0;
+    (void)es; return 0; /* no-op: eviction removed */
 }
 
 void evm_state_compact_evict_file(evm_state_t *es) {
-    if (es) state_compact_evict_file(es->st);
+    (void)es; /* no-op: eviction removed */
 }
 
 size_t evm_state_trim_storage(evm_state_t *es) {
-    return es ? state_trim_storage(es->st) : 0;
+    (void)es; return 0; /* no-op: eviction removed */
 }

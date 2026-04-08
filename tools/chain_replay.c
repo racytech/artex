@@ -451,9 +451,6 @@ int main(int argc, char **argv) {
     bool force_clean = false;
     bool follow_mode = false;
     bool resume_mode = false;
-#ifdef ENABLE_DEBUG
-    bool no_evict = false;
-#endif
 #ifdef ENABLE_EVM_TRACE
     uint64_t trace_block = UINT64_MAX;  /* UINT64_MAX = no tracing */
 #endif
@@ -464,8 +461,6 @@ int main(int argc, char **argv) {
     const char *load_state_path = NULL;
     bool no_validate = false;
     uint64_t snapshot_every = 0;  /* 0 = disabled */
-    size_t storage_budget_mb = 0; /* 0 = unlimited */
-    uint32_t storage_cache = 0;  /* 0 = unlimited, else max harts in LRU */
 #ifdef ENABLE_HISTORY
     bool no_history = false;
 #endif
@@ -484,11 +479,6 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[1 + arg_offset], "--follow") == 0) {
             follow_mode = true;
             arg_offset++;
-#ifdef ENABLE_DEBUG
-        } else if (strcmp(argv[1 + arg_offset], "--no-evict") == 0) {
-            no_evict = true;
-            arg_offset++;
-#endif
         } else if (strcmp(argv[1 + arg_offset], "--data-dir") == 0 && arg_offset + 2 < argc) {
             data_dir = argv[2 + arg_offset];
             arg_offset += 2;
@@ -514,12 +504,6 @@ int main(int argc, char **argv) {
             arg_offset++;
         } else if (strcmp(argv[1 + arg_offset], "--snapshot-every") == 0 && arg_offset + 2 < argc) {
             snapshot_every = (uint64_t)atoll(argv[2 + arg_offset]);
-            arg_offset += 2;
-        } else if (strcmp(argv[1 + arg_offset], "--storage-budget") == 0 && arg_offset + 2 < argc) {
-            storage_budget_mb = (size_t)atoll(argv[2 + arg_offset]);
-            arg_offset += 2;
-        } else if (strcmp(argv[1 + arg_offset], "--storage-cache") == 0 && arg_offset + 2 < argc) {
-            storage_cache = (uint32_t)atoi(argv[2 + arg_offset]);
             arg_offset += 2;
         } else if (strcmp(argv[1 + arg_offset], "--save-state") == 0 && arg_offset + 2 < argc) {
             save_state_block = (uint64_t)atoll(argv[2 + arg_offset]);
@@ -553,7 +537,6 @@ int main(int argc, char **argv) {
             "  --trace-block N       Enable EIP-3155 EVM trace for block N (to stderr)\n"
             "  --no-validate         Skip all root validation, compute once at end\n"
             "  --snapshot-every N    Auto-save state every N blocks (e.g. 1000000)\n"
-            "  --storage-budget N    Target storage memory in MB (default: 0 = unlimited)\n"
             "  --save-state N [P]    Save full state after block N to binary file P\n"
             "                        (default: state_<N>.bin)\n"
             "  --load-state P        Load state from binary file P, resume from that block\n"
@@ -619,9 +602,6 @@ int main(int argc, char **argv) {
         .mpt_path            = NULL,
         .checkpoint_interval = validate_every,
         .validate_state_root = !no_validate,
-#ifdef ENABLE_DEBUG
-        .no_evict            = no_evict,
-#endif
     };
 #ifdef ENABLE_HISTORY
     if (!no_history)
@@ -637,13 +617,8 @@ int main(int argc, char **argv) {
         archive_close(&archive);
         return 1;
     }
-    /* Enable cold storage eviction + LRU */
-    evm_state_set_evict_path(sync_get_state(sync), data_dir);
-    if (storage_cache > 0)
-        evm_state_set_lru_capacity(sync_get_state(sync), storage_cache);
-    if (storage_budget_mb > 0)
-        evm_state_set_evict_budget(sync_get_state(sync),
-                                   storage_budget_mb * 1024ULL * 1024ULL);
+    /* Set storage pool path (mmap-backed per-account ART tries) */
+    evm_state_set_storage_path(sync_get_state(sync), data_dir);
 
     uint64_t start_block = (user_start > 0) ? user_start : 1;
 
@@ -1069,27 +1044,22 @@ int main(int argc, char **argv) {
                 state_t *_st = evm_state_get_state(sync_get_state(sync));
                 state_stats_t ms = _st ? state_get_stats(_st) : (state_stats_t){0};
 
-                printf("  └ %zuK accts %uK stor(%uK mem %uK disk) | vec=%zuMB res=%zuMB idx=%zuMB stor=%zuMB | tracked=%zuMB RSS=%zuMB\n",
+                printf("  └ %zuK accts %uK res | vec=%zuMB res=%zuMB idx=%zuMB | tracked=%zuMB RSS=%zuMB\n",
                        ms.account_count / 1000,
-                       ms.stor_in_memory / 1000 + ms.stor_evicted / 1000,
-                       ms.stor_in_memory / 1000, ms.stor_evicted / 1000,
+                       ms.storage_account_count / 1000,
                        ms.acct_vec_bytes / (1024*1024),
                        ms.res_vec_bytes / (1024*1024),
                        ms.acct_arena_bytes / (1024*1024),
-                       ms.stor_arena_bytes / (1024*1024),
                        ms.total_tracked / (1024*1024),
                        rss_mb);
                 {
                     double root_ms = ss.wait_flush_ms;
                     double evm_ms = ss.exec_ms - root_ms;
                     double other_ms = win_secs * 1000.0 - ss.exec_ms;
-                    printf("  └ evm=%.0fms  root=%.0fms  other=%.0fms",
+                    printf("  └ evm=%.0fms  root=%.0fms  other=%.0fms\n",
                            evm_ms > 0 ? evm_ms : 0,
                            root_ms,
                            other_ms > 0 ? other_ms : 0);
-                    if (ms.stor_reloads > 0)
-                        printf("  reload=%lu/%.0fms", ms.stor_reloads, ms.stor_reload_ms);
-                    printf("\n");
                 }
             }
             window_txs = 0;

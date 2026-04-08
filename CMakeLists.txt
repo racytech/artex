@@ -137,7 +137,7 @@ target_include_directories(state PUBLIC
     ${CMAKE_SOURCE_DIR}/database/include
     ${CMAKE_SOURCE_DIR}/evm/include
 )
-target_link_libraries(state art_database hashed_art code_store common)
+target_link_libraries(state art_database hashed_art storage_hart code_store common)
 
 # EVM (Ethereum Virtual Machine)
 add_library(evm STATIC
@@ -268,6 +268,10 @@ add_library(hashed_art STATIC database/src/hashed_art.c)
 target_include_directories(hashed_art PUBLIC ${CMAKE_SOURCE_DIR}/database/include ${CMAKE_SOURCE_DIR}/common/include)
 target_link_libraries(hashed_art common)
 
+add_library(storage_hart STATIC database/src/storage_hart.c)
+target_include_directories(storage_hart PUBLIC ${CMAKE_SOURCE_DIR}/database/include ${CMAKE_SOURCE_DIR}/common/include)
+target_link_libraries(storage_hart common)
+
 add_executable(test_hashed_art database/tests/test_hashed_art.c)
 target_link_libraries(test_hashed_art hashed_art mem_mpt common)
 
@@ -310,10 +314,11 @@ target_include_directories(mpt_fuzz PRIVATE
 )
 target_link_libraries(mpt_fuzz mem_mpt hashed_art common)
 
-add_executable(test_eviction state/tests/test_eviction.c)
-target_link_libraries(test_eviction state evm)
-target_include_directories(test_eviction PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
-add_test(NAME test_eviction COMMAND test_eviction)
+# test_eviction disabled — eviction system replaced by storage_hart pool
+# add_executable(test_eviction state/tests/test_eviction.c)
+# target_link_libraries(test_eviction state evm)
+# target_include_directories(test_eviction PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
+# add_test(NAME test_eviction COMMAND test_eviction)
 
 add_executable(test_block_executor
     executor/tests/test_block_executor.c

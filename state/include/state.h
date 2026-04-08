@@ -160,14 +160,8 @@ size_t state_collect_accessed_storage_keys(const state_t *s,
  * Call at checkpoint boundaries when blk_dirty is empty. */
 void state_compact(state_t *s);
 
-/* Cold storage eviction — evict inactive storage harts to disk. */
-void     state_set_evict_path(state_t *s, const char *dir);
-void     state_set_evict_threshold(state_t *s, uint64_t blocks);
-void     state_set_evict_budget(state_t *s, size_t bytes);
-uint32_t state_evict_cold_storage(state_t *s);
-void     state_compact_evict_file(state_t *s);
-void     state_set_lru_capacity(state_t *s, uint32_t max_harts);
-size_t   state_trim_storage(state_t *s);
+/* Set path for storage pool file (<dir>/storage_pool.dat). */
+void     state_set_storage_path(state_t *s, const char *dir);
 
 /* Raw setters for undo — skip journal, dirty tracking, block originals */
 void state_set_nonce_raw(state_t *s, const address_t *addr, uint64_t nonce);
@@ -186,17 +180,11 @@ void     state_collect_block_diff(state_t *s, struct block_diff_t *out);
 typedef struct {
     uint32_t account_count;
     uint32_t storage_account_count;
-    uint32_t stor_in_memory;         /* storage harts currently in RAM */
-    uint32_t stor_evicted;           /* storage harts on disk (eviction file) */
     /* Memory breakdown */
-    size_t   acct_vec_bytes;         /* accounts vector: count * 80 */
-    size_t   res_vec_bytes;          /* resource vector: res_count * 104 */
-    size_t   acct_arena_bytes;       /* acct_index hart arena (includes hash cache) */
-    size_t   stor_arena_bytes;       /* all storage hart arenas total */
+    size_t   acct_vec_bytes;
+    size_t   res_vec_bytes;
+    size_t   acct_arena_bytes;       /* acct_index hart arena */
     size_t   total_tracked;          /* sum of above */
-    /* Reload stats (per window, reset on read) */
-    uint64_t stor_reloads;           /* disk reloads this window */
-    double   stor_reload_ms;         /* cumulative reload time this window */
 } state_stats_t;
 
 state_stats_t state_get_stats(const state_t *s);
