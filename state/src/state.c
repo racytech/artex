@@ -218,6 +218,10 @@ struct state {
     /* Code store (not owned) */
     code_store_t *code_store;
 
+    /* Storage: shared mpt_store for all accounts (disk-backed, persistent) */
+    mpt_store_t *storage_mpt;        /* NULL until path is set */
+    char         storage_mpt_path[512];
+
     /* Journal */
     journal_entry_t *journal;
     uint32_t journal_len;
@@ -241,20 +245,15 @@ struct state {
     /* Address hash cache: addr[20] → keccak256(addr)[32], reset per block */
     mem_art_t addr_hash_cache;
 
-    /* Resource tracking for eviction */
-    uint32_t *resource_list;
-    uint32_t  resource_count;
-    uint32_t  resource_cap;
-
     /* Dead account tracking — three categories, kept separate.
      * All checked/cleaned at compute_root and compaction time. */
-    uint32_t *phantoms;          /* ensure_account touches that never got EXISTED */
+    uint32_t *phantoms;
     uint32_t  phantom_count;
     uint32_t  phantom_cap;
-    uint32_t *destructed;        /* self-destructed in commit_tx */
+    uint32_t *destructed;
     uint32_t  destructed_count;
     uint32_t  destructed_cap;
-    uint32_t *pruned;            /* EIP-161 empty accounts pruned in commit_tx */
+    uint32_t *pruned;
     uint32_t  pruned_count;
     uint32_t  pruned_cap;
 
@@ -264,43 +263,13 @@ struct state {
     /* Block state */
     uint64_t current_block;
     bool     prune_empty;
-    bool     storage_roots_stale;  /* true if any block skipped storage root computation */
-
-    /* Cold storage eviction */
-    int       evict_fd;           /* fd for storage_evict.dat (-1 = not open) */
-    uint64_t  evict_file_size;    /* current append position */
-    uint64_t  evict_threshold;    /* blocks of inactivity before eviction (starting threshold) */
-    size_t    evict_budget;       /* target max stor_arena_bytes (0 = unlimited) */
-    char      evict_path[512];    /* path to storage_evict.dat */
-
-    /* Incremental stats — avoid O(resources) scan on every stats call */
-    size_t    stor_arena_total;   /* sum of all in-memory hart arena_cap */
-    uint32_t  stor_in_memory;    /* count of resources with r->storage != NULL */
-    uint32_t  stor_evicted;      /* count of resources with evict_count > 0 */
-    uint64_t  stor_reload_count; /* reloads from disk this window (reset at stats) */
-    double    stor_reload_ms;    /* cumulative reload time this window */
-
-    /* Storage LRU — doubly-linked list of resource indices with in-memory harts.
-     * head = most recently accessed, tail = least recently accessed.
-     * Resource index 0 is reserved (no resource), so 0 = end of list. */
-    uint32_t  lru_head;          /* resource index of MRU */
-    uint32_t  lru_tail;          /* resource index of LRU (eviction candidate) */
-    uint32_t  lru_count;         /* number of entries in LRU */
-    uint32_t  lru_capacity;      /* max entries (0 = unlimited, use budget) */
+    bool     storage_roots_stale;
 
     /* dump-prestate support: preserved dirty list + slot key tracking */
-    dirty_vec_t last_dirty;       /* blk_dirty from last compute_root (addr[20]) */
-    dirty_vec_t accessed_slots;   /* addr[20]+slot_be[32] = 52 bytes each */
-    bool        track_accesses;   /* set before target block to enable tracking */
+    dirty_vec_t last_dirty;
+    dirty_vec_t accessed_slots;
+    bool        track_accesses;
 };
-
-/* Forward declarations */
-static bool state_reload_storage(state_t *s, account_t *a, resource_t *r);
-static void lru_touch(state_t *s, uint32_t ridx);
-static void lru_push_front(state_t *s, uint32_t ridx);
-static bool lru_evict_tail(state_t *s);
-static bool evict_ensure_fd(state_t *s);
-static bool evict_one(state_t *s, account_t *a, resource_t *r);
 
 /* =========================================================================
  * Internal helpers
