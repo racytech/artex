@@ -51,6 +51,22 @@ add_library(art_database STATIC
 # Disk Table (mmap-backed hash table optimized for pre-hashed keys)
 add_library(disk_table STATIC database/src/disk_table.c)
 
+# Bloom Filter
+add_library(bloom_filter STATIC database/src/bloom_filter.c)
+target_link_libraries(bloom_filter common m)
+
+# Node Cache
+add_library(node_cache STATIC database/src/node_cache.c)
+target_link_libraries(node_cache common)
+
+# MPT Store (persistent Merkle Patricia Trie)
+add_library(mpt_store STATIC database/src/mpt_store.c)
+target_link_libraries(mpt_store disk_table node_cache bloom_filter common)
+
+# Benchmark: hart vs mpt_store comparison
+add_executable(bench_storage_compare database/tests/bench_storage_compare.c)
+target_link_libraries(bench_storage_compare hashed_art mpt_store common)
+
 # Code Store (content-addressed, append-only, deduplicated)
 add_library(code_store STATIC
     database/src/code_store.c
