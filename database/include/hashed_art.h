@@ -65,22 +65,6 @@ void hart_destroy(hart_t *t);
 /* Shrink arena to fit used data. Returns bytes freed (0 if nothing to shrink). */
 size_t hart_trim(hart_t *t);
 
-/* Arena-direct dump/load — serialize hart as header + raw arena bytes.
- * With freelist enabled, arenas have no dead space — dump is compact. */
-typedef struct {
-    hart_ref_t root;
-    uint32_t   size;
-    uint32_t   arena_used;
-    uint16_t   value_size;
-    /* Free list heads — preserved across dump/load */
-    uint32_t   free_node4, free_node16, free_node48, free_node256, free_leaf;
-    uint16_t   _pad;
-} hart_dump_hdr_t;
-
-size_t hart_dump_size(const hart_t *t);
-void   hart_dump(const hart_t *t, uint8_t *buf);
-bool   hart_load(hart_t *t, const uint8_t *buf, size_t buf_len);
-
 /* Operations */
 bool        hart_insert(hart_t *t, const uint8_t key[32], const void *value);
 bool        hart_delete(hart_t *t, const uint8_t key[32]);
