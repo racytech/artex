@@ -73,6 +73,14 @@ bool storage_hart_get(const storage_hart_pool_t *pool,
                       const uint8_t key[32], uint8_t val[32]);
 
 /**
+ * Pre-allocate arena for expected number of entries.
+ * Call before bulk loading (e.g. state_load) to avoid repeated arena growth.
+ * Estimates ~90 bytes per entry for the ART trie overhead.
+ */
+void storage_hart_reserve(storage_hart_pool_t *pool, storage_hart_t *sh,
+                          uint32_t expected_entries);
+
+/**
  * Set a storage slot value. Inserts or updates.
  * Returns true on success. May grow the arena (relocate in pool).
  */

@@ -1990,19 +1990,23 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
 
             /* Load storage into storage_hart */
             if (stor_count > 0 && s->stor_pool) {
+                storage_hart_reserve(s->stor_pool, &r->storage, stor_count);
                 for (uint32_t j = 0; j < stor_count; j++) {
                     uint8_t skey[32], sval[32];
                     if (!read_all(f, skey, 32) || !read_all(f, sval, 32)) goto fail;
                     storage_hart_put(s->stor_pool, &r->storage, skey, sval);
                 }
-                if ((i + 1) % 100000 == 0)
-                    fprintf(stderr, "  state_load: %u/%u accounts loaded\n",
-                            i + 1, acct_count);
+                if (stor_count > 100000) {
+                    fprintf(stderr, "  state_load: acct %u/%u loaded %u storage slots\n",
+                            i, acct_count, stor_count);
+                }
             } else if (stor_count > 0) {
                 /* No pool — skip storage entries */
                 fseek(f, (long)stor_count * 64, SEEK_CUR);
             }
         }
+        if ((i + 1) % 1000000 == 0)
+            fprintf(stderr, "  state_load: %u/%u accounts...\n", i + 1, acct_count);
     }
 
     if (s->stor_pool) storage_hart_pool_sync(s->stor_pool);

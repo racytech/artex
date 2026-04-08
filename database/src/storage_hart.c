@@ -42,7 +42,7 @@
 #define NODE48_EMPTY     255
 #define SH_REF_NULL      0
 
-#define NUM_SIZE_CLASSES  25
+#define NUM_SIZE_CLASSES  33  /* max 2^32 = 4GB per arena (whale contracts) */
 #define INITIAL_MAP_SIZE  (64ULL * 1024)
 #define MAX_HDR_FREE      200
 
@@ -101,7 +101,7 @@ typedef struct __attribute__((packed)) {
     uint64_t data_size;
     uint64_t free_total_bytes;
     uint32_t free_counts[NUM_SIZE_CLASSES];
-    uint8_t  free_data[3972];
+    uint8_t  free_data[3940];
 } shrt_header_t;
 
 _Static_assert(sizeof(shrt_header_t) <= PAGE_SIZE, "header must fit in one page");
@@ -199,7 +199,7 @@ static bool ensure_mapped(storage_hart_pool_t *pool, uint64_t need) {
         pool->base = nb;
     } else {
         pool->base = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
-                          MAP_SHARED, pool->fd, 0);
+                          MAP_PRIVATE, pool->fd, 0);
         if (pool->base == MAP_FAILED) return false;
     }
     pool->mapped = new_size;
@@ -314,6 +314,10 @@ storage_hart_pool_t *storage_hart_pool_create(const char *path) {
         return NULL;
     }
 
+    /* Unlink immediately — fd stays open, ftruncate/mremap still work.
+     * No 90GB file on disk. Pages live in anonymous memory (MAP_PRIVATE). */
+    unlink(path);
+
     write_header(pool);
     return pool;
 }
@@ -337,7 +341,7 @@ storage_hart_pool_t *storage_hart_pool_open(const char *path) {
     pool->path = strdup(path);
     pool->mapped = (size_t)sb.st_size;
     pool->base = mmap(NULL, pool->mapped, PROT_READ | PROT_WRITE,
-                      MAP_SHARED, fd, 0);
+                      MAP_PRIVATE, fd, 0);
     if (pool->base == MAP_FAILED) {
         close(fd);
         free(pool->path);
@@ -405,22 +409,25 @@ static bool arena_ensure(storage_hart_pool_t *pool, storage_hart_t *sh,
     uint32_t aligned = (sh->arena_used + 15) & ~(uint32_t)15;
     if (aligned + needed <= sh->arena_cap) return true;
 
-    /* Grow 1.5x until it fits */
+    /* Jump directly to needed size (avoid repeated 1.5x copies) */
+    uint32_t min_cap = aligned + needed;
     uint32_t new_cap = sh->arena_cap ? sh->arena_cap + sh->arena_cap / 2
                                      : INITIAL_ARENA_CAP;
-    while (aligned + needed > new_cap)
-        new_cap = new_cap + new_cap / 2;
+    if (new_cap < min_cap) new_cap = min_cap;
 
     uint64_t pool_cap;
     uint64_t new_offset = pool_alloc(pool, new_cap, &pool_cap);
     if (new_offset == 0) return false;
 
-    /* Copy old data */
+    /* Copy old data — use offsets not pointers since pool_alloc may mremap */
     if (sh->arena_offset != 0 && sh->arena_used > 0) {
-        uint8_t *old_base = pool->base + PAGE_SIZE + sh->arena_offset;
-        uint8_t *new_base = pool->base + PAGE_SIZE + new_offset;
-        memcpy(new_base, old_base, sh->arena_used);
-        pool_free(pool, sh->arena_offset, sh->arena_cap);
+        uint64_t old_offset = sh->arena_offset;
+        uint32_t old_used = sh->arena_used;
+        uint32_t old_cap = sh->arena_cap;
+        memcpy(pool->base + PAGE_SIZE + new_offset,
+               pool->base + PAGE_SIZE + old_offset,
+               old_used);
+        pool_free(pool, old_offset, old_cap);
     }
 
     sh->arena_offset = new_offset;
@@ -429,6 +436,16 @@ static bool arena_ensure(storage_hart_pool_t *pool, storage_hart_t *sh,
 }
 
 /** Allocate bytes from the arena bump allocator. */
+void storage_hart_reserve(storage_hart_pool_t *pool, storage_hart_t *sh,
+                          uint32_t expected_entries) {
+    if (!pool || !sh || expected_entries == 0) return;
+    /* ~90 bytes per entry (64 leaf + ~26 node overhead) */
+    uint32_t needed = expected_entries * 90;
+    if (needed < 256) needed = 256;
+    if (sh->arena_cap >= needed) return;
+    arena_ensure(pool, sh, needed);
+}
+
 static sh_ref_t arena_alloc(storage_hart_pool_t *pool, storage_hart_t *sh,
                             uint32_t bytes, bool is_leaf) {
     uint32_t aligned = (sh->arena_used + 15) & ~(uint32_t)15;
