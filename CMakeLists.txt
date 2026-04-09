@@ -181,6 +181,7 @@ set(BLOCK_EXECUTOR_SOURCES
     executor/src/block_executor.c
     executor/src/dao_fork.c
     executor/src/era1.c
+    executor/src/era.c
 )
 if(ENABLE_HISTORY)
     list(APPEND BLOCK_EXECUTOR_SOURCES executor/src/state_history.c)
@@ -503,6 +504,43 @@ if(CJSON_FOUND)
     target_include_directories(sync PRIVATE ${CJSON_INCLUDE_DIRS})
     set(SYNC_LIBS block_executor evm common ${CJSON_LIBRARIES} code_store)
     target_link_libraries(sync ${SYNC_LIBS})
+
+    # Portal Network library
+    add_library(portal_net STATIC
+        net/src/aes.c
+        net/src/discv5.c
+        net/src/discv5_codec.c
+        net/src/discv5_session.c
+        net/src/discv5_table.c
+        net/src/enr.c
+        net/src/history.c
+        net/src/hkdf.c
+        net/src/portal.c
+        net/src/portal_table.c
+        net/src/portal_wire.c
+        net/src/secp256k1_wrap.c
+        net/src/ssz.c
+        net/src/utp.c
+    )
+    target_include_directories(portal_net PUBLIC
+        ${CMAKE_SOURCE_DIR}/net/include
+        ${CMAKE_SOURCE_DIR}/third_party/blst/bindings
+    )
+    target_compile_options(portal_net PRIVATE -maes -msse2)
+    target_link_libraries(portal_net blst secp256k1 common)
+
+    # Portal Network tests
+    add_executable(test_portal_loopback net/tests/test_loopback.c)
+    target_include_directories(test_portal_loopback PRIVATE ${CMAKE_SOURCE_DIR}/net/include)
+    target_link_libraries(test_portal_loopback portal_net)
+    add_test(NAME test_portal_loopback COMMAND test_portal_loopback)
+
+    # Portal node tool
+    add_executable(portal_node tools/portal_node.c)
+    target_include_directories(portal_node PRIVATE
+        ${CMAKE_SOURCE_DIR}/net/include
+        ${CMAKE_SOURCE_DIR}/common/include)
+    target_link_libraries(portal_node portal_net)
 
     # Chain replay tool
     add_executable(chain_replay tools/chain_replay.c)
