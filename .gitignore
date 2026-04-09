@@ -165,3 +165,7 @@ todo-checklist-old.md
 eip-*.md
 
 save
+
+# External binaries
+lighthouse*/
+perf.data*

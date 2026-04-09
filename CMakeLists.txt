@@ -506,8 +506,13 @@ if(CJSON_FOUND)
 
     # Chain replay tool
     add_executable(chain_replay tools/chain_replay.c)
-    target_compile_definitions(chain_replay PRIVATE CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL})
-    target_link_libraries(chain_replay sync)
+    target_compile_definitions(chain_replay PRIVATE
+        CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL}
+        ENABLE_ENGINE_API)
+    target_include_directories(chain_replay PRIVATE
+        ${CMAKE_SOURCE_DIR}/engine/include
+        ${CJSON_INCLUDE_DIRS})
+    target_link_libraries(chain_replay sync engine ${CJSON_LIBRARIES})
 
     # History query tool
     add_executable(history_query tools/history_query.c)

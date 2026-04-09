@@ -3,8 +3,10 @@
  *
  * Re-executes Ethereum blocks from Era1 archive files.
  * Uses the sync engine for execution, validation, and checkpointing.
+ * After reaching Paris (The Merge), optionally starts the Engine API
+ * for CL-driven post-merge sync.
  *
- * Usage: ./chain_replay [--clean] [--follow] <era1_dir> <genesis.json> [start_block] [end_block]
+ * Usage: ./chain_replay [options] <era1_dir> <genesis.json> [start_block] [end_block]
  */
 
 #include "sync.h"
@@ -13,6 +15,9 @@
 #include "era1.h"
 #include "block.h"
 #include "hash.h"
+#ifdef ENABLE_ENGINE_API
+#include "engine.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -108,6 +113,9 @@ static void set_data_paths(const char *data_dir) {
 
 static volatile sig_atomic_t g_shutdown = 0;
 static volatile sig_atomic_t g_shutdown_pending = 0;
+#ifdef ENABLE_ENGINE_API
+static engine_t *g_engine = NULL;
+#endif
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -117,6 +125,10 @@ static void sigint_handler(int sig) {
     } else {
         g_shutdown = 1;
     }
+#ifdef ENABLE_ENGINE_API
+    if (g_engine)
+        engine_stop(g_engine);
+#endif
 }
 
 /* =========================================================================
@@ -464,6 +476,11 @@ int main(int argc, char **argv) {
 #ifdef ENABLE_HISTORY
     bool no_history = false;
 #endif
+#ifdef ENABLE_ENGINE_API
+    const char *jwt_secret_path = NULL;
+    const char *engine_host = "127.0.0.1";
+    uint16_t engine_port = 8551;
+#endif
     uint32_t validate_every = CHECKPOINT_INTERVAL;
     /* Default data dir: ~/.artex */
     char default_data_dir[512];
@@ -519,6 +536,17 @@ int main(int argc, char **argv) {
                 dump_prestate_path = argv[1 + arg_offset];
                 arg_offset++;
             }
+#ifdef ENABLE_ENGINE_API
+        } else if (strcmp(argv[1 + arg_offset], "--jwt-secret") == 0 && arg_offset + 2 < argc) {
+            jwt_secret_path = argv[2 + arg_offset];
+            arg_offset += 2;
+        } else if (strcmp(argv[1 + arg_offset], "--engine-port") == 0 && arg_offset + 2 < argc) {
+            engine_port = (uint16_t)atoi(argv[2 + arg_offset]);
+            arg_offset += 2;
+        } else if (strcmp(argv[1 + arg_offset], "--engine-host") == 0 && arg_offset + 2 < argc) {
+            engine_host = argv[2 + arg_offset];
+            arg_offset += 2;
+#endif
         } else {
             break;
         }
@@ -545,6 +573,13 @@ int main(int argc, char **argv) {
             "                        to discover accessed accounts, then reloads checkpoint\n"
             "                        and dumps their pre-execution values.\n"
             "  --validate-every N    Validate state root every N blocks (default: %d)\n"
+#ifdef ENABLE_ENGINE_API
+            "\n"
+            "Engine API (post-merge CL sync):\n"
+            "  --jwt-secret <path>   JWT secret hex file (enables Engine API after Paris)\n"
+            "  --engine-port <n>     Engine API port (default: 8551)\n"
+            "  --engine-host <addr>  Engine API listen address (default: 127.0.0.1)\n"
+#endif
             "\n"
             "Validates state root every %d blocks\n",
             argv[0], CHECKPOINT_INTERVAL, CHECKPOINT_INTERVAL);
@@ -769,7 +804,11 @@ int main(int argc, char **argv) {
         /* Get next block from prefetch thread */
         prefetched_block_t blk;
         if (!prefetch_get(&prefetch, &blk)) {
-            LOG_ERROR("Block %lu: prefetch failed", bn);
+            if (bn > PARIS_BLOCK) {
+                LOG_INFO("No more era1 blocks at %lu (past Paris)", bn);
+            } else {
+                LOG_ERROR("Block %lu: prefetch failed", bn);
+            }
             break;
         }
 
@@ -1347,6 +1386,54 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* =====================================================================
+     * Engine API — post-merge CL sync
+     * If we've reached Paris and --jwt-secret was provided, start the
+     * Engine API server and wait for the CL to send post-merge blocks.
+     * ===================================================================== */
+#ifdef ENABLE_ENGINE_API
+    bool prefetch_stopped = false;
+    if (jwt_secret_path && !g_shutdown) {
+        sync_status_t pre_engine_st = sync_get_status(sync);
+        if (pre_engine_st.last_block >= PARIS_BLOCK - 1 && pre_engine_st.blocks_fail == 0) {
+            /* Stop prefetch thread — no more era1 blocks */
+            prefetch_stop(&prefetch);
+            prefetch_stopped = true;
+
+            LOG_INFO("Reached Paris (block %lu) — starting Engine API", pre_engine_st.last_block);
+            sync_set_live_mode(sync, true);
+
+            engine_config_t eng_cfg = {
+                .host = engine_host,
+                .port = engine_port,
+                .jwt_secret_path = jwt_secret_path,
+                .evm = NULL,
+                .evm_state = NULL,
+                .sync = sync,
+            };
+
+            engine_t *eng = engine_create(&eng_cfg);
+            if (!eng) {
+                LOG_ERROR("Failed to create Engine API server");
+            } else {
+                g_engine = eng;
+                LOG_INFO("Engine API listening on %s:%d", engine_host, engine_port);
+                LOG_INFO("Waiting for CL connection...");
+
+                /* Reset shutdown flag — era1 replay may have set it
+                 * if we caught SIGINT during the last few blocks */
+                g_shutdown = 0;
+
+                engine_run(eng);  /* blocking — returns on SIGINT/SIGTERM */
+
+                LOG_INFO("Engine API stopped");
+                g_engine = NULL;
+                engine_destroy(eng);
+            }
+        }
+    }
+#endif
+
     /* Block SIGINT during cleanup — flush must complete cleanly */
     sigset_t block_set, old_set;
     sigemptyset(&block_set);
@@ -1370,7 +1457,10 @@ int main(int argc, char **argv) {
     }
 
     /* Stop prefetch and destroy sync (flushes + msyncs all data to disk) */
-    prefetch_stop(&prefetch);
+#ifdef ENABLE_ENGINE_API
+    if (!prefetch_stopped)
+#endif
+        prefetch_stop(&prefetch);
     sync_ensure_flushed(sync);
     sync_destroy(sync);
 
