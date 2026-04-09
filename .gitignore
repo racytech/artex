@@ -170,3 +170,7 @@ save
 lighthouse*/
 perf.data*
 start_lighthouse.sh
+download_era.sh
+
+# Era data files
+data/era/

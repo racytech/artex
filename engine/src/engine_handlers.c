@@ -746,8 +746,9 @@ static cJSON *forkchoice_updated_common(const cJSON *params, void *ctx_ptr,
 
     if (!engine_store_has(ctx->store, fc.head_block_hash)) {
         ps.status = PAYLOAD_SYNCING;
-        ps.has_latest_valid_hash = false;
-        fprintf(stderr, "ENGINE forkchoiceUpdated: head not found → SYNCING\n");
+        ps.has_latest_valid_hash = false;  /* spec: null for SYNCING */
+        fprintf(stderr, "ENGINE forkchoiceUpdated: head not found → SYNCING (our head: %lu)\n",
+                ctx->sync ? sync_get_status((const sync_t *)ctx->sync).last_block : 0);
     } else {
         engine_store_set_forkchoice(ctx->store,
                                      fc.head_block_hash,
