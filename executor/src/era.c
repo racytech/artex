@@ -227,30 +227,32 @@ static bool parse_execution_payload(const uint8_t *ep, size_t ep_len,
     /* Detect fork from extra_data offset (first variable field) */
     uint32_t extra_data_off = read_le32(ep + EP_EXTRA_DATA_OFF);
 
-    /* Bellatrix: fixed=508, Capella: fixed=512, Deneb: fixed=528 */
+    /* Detect fork from fixed part size (= extra_data_off value).
+     * Bellatrix: 508, Capella: 512 (+withdrawals_offset), Deneb: 528 (+blob gas fields) */
     bool is_deneb   = (extra_data_off >= 528);
     bool is_capella = (!is_deneb && extra_data_off >= 512);
 
-    /* Transaction and withdrawal offsets */
-    uint32_t tx_off = 0, wd_off = 0;
+    /* Transaction offset is always at byte 504 (all forks) */
+    uint32_t tx_off = read_le32(ep + 504);
+    uint32_t wd_off = 0;
 
-    if (is_deneb) {
-        hdr->has_blob_gas = true;
-        hdr->blob_gas_used   = read_le64(ep + 504);
-        hdr->excess_blob_gas = read_le64(ep + 512);
-        tx_off = read_le32(ep + 520);
-        wd_off = read_le32(ep + 524);
-    } else if (is_capella) {
-        tx_off = read_le32(ep + 508);
-        wd_off = read_le32(ep + 504);
-    } else {
-        tx_off = read_le32(ep + 504);
+    if (is_capella || is_deneb) {
+        /* Withdrawals offset at byte 508 (Capella+) */
+        wd_off = read_le32(ep + 508);
+        hdr->has_withdrawals_root = true;
     }
 
-    /* Extra data: runs from extra_data_off to the next variable field */
-    uint32_t ed_end = tx_off;
-    if (wd_off && wd_off < ed_end) ed_end = wd_off;
-    size_t ed_len = (ed_end > extra_data_off) ? ed_end - extra_data_off : 0;
+    if (is_deneb) {
+        /* blob_gas_used at 512, excess_blob_gas at 520 */
+        hdr->has_blob_gas = true;
+        hdr->blob_gas_used   = read_le64(ep + 512);
+        hdr->excess_blob_gas = read_le64(ep + 520);
+    }
+
+    /* SSZ variable fields appear in declaration order after the fixed part:
+     * extra_data, then transactions, then withdrawals (Capella+).
+     * extra_data runs from extra_data_off to the next variable field start. */
+    size_t ed_len = (tx_off > extra_data_off) ? tx_off - extra_data_off : 0;
     if (ed_len > 32) ed_len = 32;
     if (extra_data_off + ed_len <= ep_len) {
         memcpy(hdr->extra_data, ep + extra_data_off, ed_len);
@@ -311,7 +313,6 @@ static bool parse_execution_payload(const uint8_t *ep, size_t ep_len,
 
     /* === Withdrawals (Capella+) === */
     if ((is_capella || is_deneb) && wd_off > 0 && wd_off < ep_len) {
-        hdr->has_withdrawals_root = true;
         size_t wd_region = ep_len - wd_off;
 
         /* Withdrawal is fixed 44 bytes: index(8) + validator(8) + addr(20) + amount(8) */
@@ -350,7 +351,6 @@ bool era_iter_next(era_iter_t *it,
     while (it->pos + ENTRY_HEADER_SIZE <= fsize) {
         uint16_t typ = read_le16(fdata + it->pos);
         uint32_t length = read_le32(fdata + it->pos + 2);
-        size_t entry_start = it->pos;
         size_t value_start = it->pos + ENTRY_HEADER_SIZE;
 
         it->pos = value_start + length;  /* advance past this entry */
@@ -377,7 +377,14 @@ bool era_iter_next(era_iter_t *it,
         const uint8_t *ep = find_execution_payload(ssz, ssz_len, &ep_len);
 
         if (!ep || ep_len < 508) {
-            /* Pre-merge block (no execution payload) — skip */
+            free(ssz);
+            continue;
+        }
+
+        /* Check block_number > 0 — pre-merge Bellatrix blocks have an
+         * all-zero execution payload that parses but has no real data */
+        uint64_t bn = read_le64(ep + EP_BLOCK_NUMBER);
+        if (bn == 0) {
             free(ssz);
             continue;
         }
