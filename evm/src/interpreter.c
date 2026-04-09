@@ -865,7 +865,8 @@ op_calldataload:
     }
     NEXT();
 
-op_calldatasize: PUSH_VAL(GAS_BASE, ((uint256_t){ (uint128_t)evm->msg.input_size, 0 }))
+op_calldatasize:
+    PUSH_VAL(GAS_BASE, ((uint256_t){ (uint128_t)evm->msg.input_size, 0 }))
 
 op_calldatacopy:
     status = op_calldatacopy(evm);

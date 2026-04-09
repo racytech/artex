@@ -806,9 +806,13 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
 
     if (is_subcall)
     {
-        // Destroy subcall's stack and memory
-        evm_stack_destroy(evm->stack);
-        evm_memory_destroy(evm->memory);
+        // Cache subcall's stack and memory for reuse
+        if (evm->cached_stack_count < 8)
+            evm->cached_stacks[evm->cached_stack_count++] = evm->stack;
+        else evm_stack_destroy(evm->stack);
+        if (evm->cached_memory_count < 8)
+            evm->cached_memories[evm->cached_memory_count++] = evm->memory;
+        else evm_memory_destroy(evm->memory);
 
         // Restore parent's context
         evm_restore_context(evm, &saved_context);

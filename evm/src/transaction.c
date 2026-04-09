@@ -693,6 +693,7 @@ bool transaction_execute(
         .is_static = false
     };
 
+
     // Execute EVM
     evm_result_t evm_result;
     if (!evm_execute(evm, &msg, &evm_result)) {

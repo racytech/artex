@@ -382,7 +382,7 @@ state_t *evm_state_get_state(evm_state_t *es) {
 }
 
 size_t evm_state_collect_addresses(evm_state_t *es, address_t *out, size_t max_count) {
-    return es ? state_collect_dirty_addresses(es->st, out, max_count) : 0;
+    return es ? state_collect_accessed_addresses(es->st, out, max_count) : 0;
 }
 
 size_t evm_state_collect_storage_keys(evm_state_t *es, const address_t *addr,
