@@ -30,6 +30,9 @@ typedef struct state state_t;
 state_t *state_create(code_store_t *cs);
 void     state_destroy(state_t *s);
 
+/* Set number of threads for parallel storage root computation (0 or 1 = serial). */
+void     state_set_root_threads(state_t *s, uint32_t n);
+
 /* Load/save full state to file (graceful shutdown / restart).
  * state_save stores the given state_root in the header.
  * state_load returns the stored root via out_root (if non-NULL). */
@@ -151,6 +154,7 @@ uint32_t state_dead_count(const state_t *s);
 void   state_enable_access_tracking(state_t *s);
 void   state_disable_access_tracking(state_t *s);
 size_t state_collect_dirty_addresses(const state_t *s, address_t *out, size_t max);
+size_t state_collect_accessed_addresses(const state_t *s, address_t *out, size_t max);
 size_t state_collect_accessed_storage_keys(const state_t *s,
                                            const address_t *addr,
                                            uint256_t *out, size_t max);

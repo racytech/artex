@@ -303,6 +303,10 @@ add_executable(test_state_compaction state/tests/test_state_compaction.c)
 target_link_libraries(test_state_compaction state evm)
 target_include_directories(test_state_compaction PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
 
+add_executable(bench_parallel_root state/tests/bench_parallel_root.c)
+target_link_libraries(bench_parallel_root state evm)
+target_include_directories(bench_parallel_root PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
+
 add_executable(test_state_dup1 state/tests/test_state_dup1.c)
 target_link_libraries(test_state_dup1 evm)
 target_include_directories(test_state_dup1 PRIVATE ${CMAKE_SOURCE_DIR}/state/include)

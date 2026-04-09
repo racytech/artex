@@ -260,8 +260,12 @@ struct state {
     storage_hart_pool_t *stor_pool;
     char                 stor_pool_path[512];
 
-    /* dump-prestate support: preserved dirty list + slot key tracking */
+    /* Parallel root computation */
+    uint32_t root_threads;            /* 0 or 1 = serial */
+
+    /* dump-prestate support: preserved dirty list + access tracking */
     dirty_vec_t last_dirty;       /* blk_dirty from last compute_root (addr[20]) */
+    dirty_vec_t accessed_addrs;   /* addr[20] — all accounts read or written */
     dirty_vec_t accessed_slots;   /* addr[20]+slot_be[32] = 52 bytes each */
     bool        track_accesses;   /* set before target block to enable tracking */
 };
@@ -494,6 +498,10 @@ state_t *state_create(code_store_t *cs) {
     return s;
 }
 
+void state_set_root_threads(state_t *s, uint32_t n) {
+    if (s) s->root_threads = n;
+}
+
 void state_destroy(state_t *s) {
     if (!s) return;
 
@@ -529,6 +537,7 @@ void state_destroy(state_t *s) {
     dirty_free(&s->tx_dirty);
     dirty_free(&s->blk_dirty);
     dirty_free(&s->last_dirty);
+    dirty_free(&s->accessed_addrs);
     dirty_free(&s->accessed_slots);
 
     if (s->stor_pool) {
@@ -561,13 +570,20 @@ void state_set_prune_empty(state_t *s, bool enabled) {
  * Account access
  * ========================================================================= */
 
+static inline void track_addr_access(state_t *s, const address_t *addr) {
+    if (s->track_accesses)
+        dirty_push(&s->accessed_addrs, addr->bytes, 20);
+}
+
 account_t *state_get_account(state_t *s, const address_t *addr) {
     if (!s || !addr) return NULL;
+    track_addr_access(s, addr);
     return find_account(s, addr->bytes);
 }
 
 bool state_exists(state_t *s, const address_t *addr) {
     if (!s || !addr) return false;
+    track_addr_access(s, addr);
     account_t *a = find_account(s, addr->bytes);
     if (!a) return false;
     return acct_has_flag(a, ACCT_EXISTED) ||
@@ -578,18 +594,21 @@ bool state_exists(state_t *s, const address_t *addr) {
 
 bool state_is_empty(state_t *s, const address_t *addr) {
     if (!s || !addr) return true;
+    track_addr_access(s, addr);
     account_t *a = find_account(s, addr->bytes);
     return !a || acct_is_empty(a);
 }
 
 uint64_t state_get_nonce(state_t *s, const address_t *addr) {
     if (!s || !addr) return 0;
+    track_addr_access(s, addr);
     account_t *a = find_account(s, addr->bytes);
     return a ? a->nonce : 0;
 }
 
 uint256_t state_get_balance(state_t *s, const address_t *addr) {
     if (!s || !addr) return UINT256_ZERO;
+    track_addr_access(s, addr);
     account_t *a = find_account(s, addr->bytes);
     return a ? a->balance : UINT256_ZERO;
 }
@@ -752,6 +771,7 @@ void state_set_code(state_t *s, const address_t *addr,
 
 const uint8_t *state_get_code(state_t *s, const address_t *addr, uint32_t *out_len) {
     if (!s || !addr) { if (out_len) *out_len = 0; return NULL; }
+    track_addr_access(s, addr);
     account_t *a = find_account(s, addr->bytes);
     if (!a || !acct_has_flag(a, ACCT_HAS_CODE)) { if (out_len) *out_len = 0; return NULL; }
 
@@ -786,6 +806,7 @@ uint32_t state_get_code_size(state_t *s, const address_t *addr) {
 
 hash_t state_get_code_hash(state_t *s, const address_t *addr) {
     if (!s || !addr) return EMPTY_CODE_HASH;
+    track_addr_access(s, addr);
     account_t *a = find_account(s, addr->bytes);
     if (!a || !acct_has_flag(a, ACCT_HAS_CODE)) return EMPTY_CODE_HASH;
     resource_t *r = get_resource(s, a);
@@ -799,6 +820,7 @@ hash_t state_get_code_hash(state_t *s, const address_t *addr) {
 uint256_t state_get_storage(state_t *s, const address_t *addr, const uint256_t *key) {
     if (!s || !addr || !key) return UINT256_ZERO;
     if (s->track_accesses) {
+        track_addr_access(s, addr);
         uint8_t sk[SLOT_KEY_SIZE];
         make_slot_key(addr, key, sk);
         dirty_push(&s->accessed_slots, sk, SLOT_KEY_SIZE);
@@ -1301,12 +1323,115 @@ state_stats_t state_get_stats(const state_t *s) {
  * save/load — TODO: implement serialization
  * ========================================================================= */
 
+/* --- Parallel storage root worker --- */
+typedef struct {
+    state_t             *s;
+    resource_t          *resources;
+    uint32_t             start;
+    uint32_t             end;
+    storage_hart_pool_t *pool;
+} stor_root_work_t;
+
+static void *stor_root_worker(void *arg) {
+    stor_root_work_t *w = (stor_root_work_t *)arg;
+    for (uint32_t i = w->start; i < w->end; i++) {
+        resource_t *r = &w->resources[i];
+        if (!storage_hart_empty(&r->storage))
+            storage_hart_root_hash(w->pool, &r->storage,
+                                   stor_value_encode, NULL,
+                                   r->storage_root.bytes);
+        else
+            r->storage_root = EMPTY_STORAGE_ROOT;
+    }
+    return NULL;
+}
+
+static void compute_storage_roots_parallel(state_t *s) {
+    uint32_t n = s->res_count - 1;  /* skip slot 0 */
+    if (n == 0) return;
+
+    uint32_t nt = s->root_threads;
+    if (nt > n) nt = n;
+
+    pthread_t threads[nt];
+    stor_root_work_t work[nt];
+    uint32_t per = n / nt;
+    uint32_t rem = n % nt;
+    uint32_t pos = 1;  /* start from 1, skip slot 0 */
+
+    for (uint32_t t = 0; t < nt; t++) {
+        uint32_t count = per + (t < rem ? 1 : 0);
+        work[t] = (stor_root_work_t){
+            .s = s, .resources = s->resources,
+            .start = pos, .end = pos + count,
+            .pool = s->stor_pool
+        };
+        pos += count;
+        pthread_create(&threads[t], NULL, stor_root_worker, &work[t]);
+    }
+    for (uint32_t t = 0; t < nt; t++)
+        pthread_join(threads[t], NULL);
+}
+
+/* --- Parallel dirty storage root worker --- */
+typedef struct {
+    state_t             *s;
+    const uint8_t       *dirty_keys;   /* dirty addr[20] array */
+    size_t               start;
+    size_t               end;
+    storage_hart_pool_t *pool;
+} dirty_stor_work_t;
+
+static void *dirty_stor_worker(void *arg) {
+    dirty_stor_work_t *w = (dirty_stor_work_t *)arg;
+    for (size_t d = w->start; d < w->end; d++) {
+        const uint8_t *akey = w->dirty_keys + d * 20;
+        hash_t ah = hash_keccak256(akey, 20);
+        account_t *a = find_account_h(w->s, &ah);
+        if (!a || !acct_has_flag(a, ACCT_STORAGE_DIRTY)) continue;
+        resource_t *r = get_resource(w->s, a);
+        if (!r) continue;
+        if (!storage_hart_empty(&r->storage))
+            storage_hart_root_hash(w->pool, &r->storage,
+                                   stor_value_encode, NULL,
+                                   r->storage_root.bytes);
+        else
+            r->storage_root = EMPTY_STORAGE_ROOT;
+    }
+    return NULL;
+}
+
 hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     hash_t root = {0};
     if (!s) return root;
 
-    /* Single pass: promote existence, compute storage roots, prune, clear flags.
-     * One find_account (keccak + hart_get) per dirty account instead of three. */
+    bool parallel = compute_hash && s->root_threads > 1;
+
+    /* If parallel, launch storage root threads first while we do the rest. */
+    uint32_t nt = 0;
+    pthread_t *threads = NULL;
+    dirty_stor_work_t *dwork = NULL;
+    if (parallel && s->blk_dirty.count > 0) {
+        nt = s->root_threads;
+        if (nt > s->blk_dirty.count) nt = (uint32_t)s->blk_dirty.count;
+        threads = alloca(nt * sizeof(pthread_t));
+        dwork = alloca(nt * sizeof(dirty_stor_work_t));
+        size_t per = s->blk_dirty.count / nt;
+        size_t rem = s->blk_dirty.count % nt;
+        size_t pos = 0;
+        for (uint32_t t = 0; t < nt; t++) {
+            size_t count = per + (t < rem ? 1 : 0);
+            dwork[t] = (dirty_stor_work_t){
+                .s = s, .dirty_keys = s->blk_dirty.keys,
+                .start = pos, .end = pos + count,
+                .pool = s->stor_pool
+            };
+            pos += count;
+            pthread_create(&threads[t], NULL, dirty_stor_worker, &dwork[t]);
+        }
+    }
+
+    /* Single pass: promote existence, compute storage roots (serial), prune, clear flags. */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
         hash_t ah = hash_keccak256(akey, 20);
@@ -1321,8 +1446,8 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
                 acct_set_flag(a, ACCT_EXISTED);
         }
 
-        /* Compute storage root if dirty */
-        if (acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
+        /* Compute storage root if dirty — only if serial (parallel threads handle it) */
+        if (!parallel && acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
             if (compute_hash) {
                 resource_t *r = get_resource(s, a);
                 if (r && !storage_hart_empty(&r->storage))
@@ -1344,6 +1469,12 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
         /* Clear flags */
         acct_clear_flag(a, ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY |
                         ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
+    }
+
+    /* Wait for parallel storage root threads */
+    if (threads) {
+        for (uint32_t t = 0; t < nt; t++)
+            pthread_join(threads[t], NULL);
     }
 
     /* Remove dead accounts from acct_index (phantoms, destructed, pruned) */
@@ -1380,14 +1511,18 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
         /* Recompute stale storage roots — only needed if previous blocks
          * skipped storage root computation (no-validate or checkpoint mode) */
         if (s->storage_roots_stale) {
-            for (uint32_t i = 1; i < s->res_count; i++) {
-                resource_t *r = &s->resources[i];
-                if (!storage_hart_empty(&r->storage))
-                    storage_hart_root_hash(s->stor_pool, &r->storage,
-                                           stor_value_encode, NULL,
-                                           r->storage_root.bytes);
-                else
-                    r->storage_root = EMPTY_STORAGE_ROOT;
+            if (s->root_threads > 1) {
+                compute_storage_roots_parallel(s);
+            } else {
+                for (uint32_t i = 1; i < s->res_count; i++) {
+                    resource_t *r = &s->resources[i];
+                    if (!storage_hart_empty(&r->storage))
+                        storage_hart_root_hash(s->stor_pool, &r->storage,
+                                               stor_value_encode, NULL,
+                                               r->storage_root.bytes);
+                    else
+                        r->storage_root = EMPTY_STORAGE_ROOT;
+                }
             }
             s->storage_roots_stale = false;
         }
@@ -1502,12 +1637,14 @@ uint32_t state_dead_count(const state_t *s) {
 void state_enable_access_tracking(state_t *s) {
     if (!s) return;
     s->track_accesses = true;
+    dirty_clear(&s->accessed_addrs);
     dirty_clear(&s->accessed_slots);
 }
 
 void state_disable_access_tracking(state_t *s) {
     if (!s) return;
     s->track_accesses = false;
+    dirty_clear(&s->accessed_addrs);
     dirty_clear(&s->accessed_slots);
 }
 
@@ -1516,7 +1653,20 @@ size_t state_collect_dirty_addresses(const state_t *s, address_t *out, size_t ma
     size_t n = 0;
     for (size_t i = 0; i < s->last_dirty.count && n < max; i++) {
         const uint8_t *akey = s->last_dirty.keys + i * 20;
-        /* Deduplicate: skip if already seen */
+        bool dup = false;
+        for (size_t j = 0; j < n; j++) {
+            if (memcmp(out[j].bytes, akey, 20) == 0) { dup = true; break; }
+        }
+        if (!dup) memcpy(out[n++].bytes, akey, 20);
+    }
+    return n;
+}
+
+size_t state_collect_accessed_addresses(const state_t *s, address_t *out, size_t max) {
+    if (!s || !out || max == 0) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < s->accessed_addrs.count && n < max; i++) {
+        const uint8_t *akey = s->accessed_addrs.keys + i * 20;
         bool dup = false;
         for (size_t j = 0; j < n; j++) {
             if (memcmp(out[j].bytes, akey, 20) == 0) { dup = true; break; }
