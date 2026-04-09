@@ -1407,15 +1407,13 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
 
     bool parallel = compute_hash && s->root_threads > 1;
 
-    /* If parallel, launch storage root threads first while we do the rest. */
-    uint32_t nt = 0;
-    pthread_t *threads = NULL;
-    dirty_stor_work_t *dwork = NULL;
-    if (parallel && s->blk_dirty.count > 0) {
-        nt = s->root_threads;
+    /* Phase 1: compute dirty storage roots (parallel or serial).
+     * Must complete BEFORE the flag-clearing pass below. */
+    if (compute_hash && parallel && s->blk_dirty.count > 0) {
+        uint32_t nt = s->root_threads;
         if (nt > s->blk_dirty.count) nt = (uint32_t)s->blk_dirty.count;
-        threads = alloca(nt * sizeof(pthread_t));
-        dwork = alloca(nt * sizeof(dirty_stor_work_t));
+        pthread_t threads[nt];
+        dirty_stor_work_t dwork[nt];
         size_t per = s->blk_dirty.count / nt;
         size_t rem = s->blk_dirty.count % nt;
         size_t pos = 0;
@@ -1429,9 +1427,12 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
             pos += count;
             pthread_create(&threads[t], NULL, dirty_stor_worker, &dwork[t]);
         }
+        for (uint32_t t = 0; t < nt; t++)
+            pthread_join(threads[t], NULL);
     }
 
-    /* Single pass: promote existence, compute storage roots (serial), prune, clear flags. */
+    /* Phase 2: single pass — promote existence, compute storage roots (serial only),
+     * prune dead accounts, clear flags. */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
         hash_t ah = hash_keccak256(akey, 20);
@@ -1446,7 +1447,7 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
                 acct_set_flag(a, ACCT_EXISTED);
         }
 
-        /* Compute storage root if dirty — only if serial (parallel threads handle it) */
+        /* Compute storage root if dirty — only in serial mode (parallel done above) */
         if (!parallel && acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
             if (compute_hash) {
                 resource_t *r = get_resource(s, a);
@@ -1469,12 +1470,6 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
         /* Clear flags */
         acct_clear_flag(a, ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY |
                         ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
-    }
-
-    /* Wait for parallel storage root threads */
-    if (threads) {
-        for (uint32_t t = 0; t < nt; t++)
-            pthread_join(threads[t], NULL);
     }
 
     /* Remove dead accounts from acct_index (phantoms, destructed, pruned) */
