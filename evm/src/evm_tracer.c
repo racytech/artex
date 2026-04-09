@@ -85,6 +85,7 @@ static const char *opcode_name(uint8_t op) {
 /* ---- Global state ---- */
 
 evm_tracer_t g_evm_tracer = { .out = NULL, .enabled = false };
+int g_trace_tx_index = -1;  /* -1 = trace all txs */
 
 /* Per-thread pending trace (single-threaded EVM, so global is fine). */
 /* One per call depth, max 1024+1. We only allocate one and reuse since

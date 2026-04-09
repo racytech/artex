@@ -12,6 +12,7 @@
 #include "rlp.h"
 #include "hash.h"
 #include "evm_state.h"
+#include "evm_tracer.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -437,9 +438,25 @@ block_result_t block_execute(evm_t *evm,
         else
             result.call_count++;
 
+        /* Enable/disable per-tx tracing */
+#ifdef ENABLE_EVM_TRACE
+        bool trace_this_tx = g_evm_tracer.out &&
+                             g_trace_tx_index >= 0 &&
+                             (size_t)g_trace_tx_index == i;
+        if (trace_this_tx) {
+            g_evm_tracer.enabled = true;
+            fprintf(g_evm_tracer.out, "=== TX %zu trace ===\n", i);
+        }
+#endif
+
         /* Execute transaction */
         transaction_result_t tx_result;
         bool ok = transaction_execute(evm, &tx, &tx_env, &tx_result);
+
+#ifdef ENABLE_EVM_TRACE
+        if (trace_this_tx)
+            g_evm_tracer.enabled = false;
+#endif
 
         /* Fill receipt */
         result.receipts[i].success = ok;

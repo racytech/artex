@@ -56,6 +56,10 @@ typedef struct {
 
 extern evm_tracer_t g_evm_tracer;
 
+/* Per-tx trace filter: when >= 0, only trace this tx index within the block.
+ * Set by --trace-tx N.  -1 = trace all txs (default when --trace-block used). */
+extern int g_trace_tx_index;
+
 /**
  * Initialise the tracer.  Call once before any EVM execution.
  * @param out   Output stream (e.g. stderr, or fopen'd file)
