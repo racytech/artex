@@ -70,6 +70,9 @@ typedef struct {
     /* Per-tx receipts (only populated on gas mismatch, caller must free) */
     tx_receipt_t *receipts;
     size_t        receipt_count;
+
+    /* Block diff for undo/prestate dump (caller must call block_diff_free) */
+    block_diff_t  diff;
 } sync_block_result_t;
 
 typedef struct {

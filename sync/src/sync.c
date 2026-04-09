@@ -446,6 +446,10 @@ bool sync_execute_block(sync_t *sync,
         }
     }
 
+    /* Move block diff to caller (before block_result_free frees it) */
+    result->diff = br.diff;
+    memset(&br.diff, 0, sizeof(br.diff));  /* prevent double-free */
+
     block_result_free(&br);
     return true;
 }

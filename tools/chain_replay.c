@@ -13,7 +13,10 @@
 #include "evm_state.h"
 #include "state.h"
 #include "era1.h"
+#include "era.h"
 #include "block.h"
+#include "block_diff.h"
+#include "rlp.h"
 #include "hash.h"
 #ifdef ENABLE_ENGINE_API
 #include "engine.h"
@@ -313,15 +316,29 @@ typedef struct {
     bool            valid;       /* decode succeeded */
 } prefetched_block_t;
 
+/* Era file archive — sequential iteration over sorted era files */
+typedef struct {
+    char     **paths;
+    size_t     count;
+    size_t     current_idx;
+    era_t      current;
+    era_iter_t iter;
+    bool       active;        /* true once we've switched to era files */
+} era_archive_t;
+
 typedef struct {
     pthread_t       thread;
     pthread_mutex_t mutex;
     pthread_cond_t  cond_ready;    /* prefetch → main: block is ready */
     pthread_cond_t  cond_consumed; /* main → prefetch: buffer consumed */
 
-    era1_archive_t  archive;       /* own archive instance */
+    era1_archive_t  archive;       /* own archive instance (era1) */
     const char     *era1_dir;
     bool            follow_mode;
+
+    /* Post-merge era file support */
+    era_archive_t   era_archive;
+    const char     *era_dir;
 
     prefetched_block_t buf;        /* single-slot buffer */
     bool            has_data;      /* buffer contains a ready block */
@@ -331,8 +348,96 @@ typedef struct {
     bool            error;         /* prefetch hit a fatal error */
 } block_prefetch_t;
 
+/* ---- Era file archive helpers ---- */
+
+static bool era_archive_open(era_archive_t *ea, const char *dir) {
+    memset(ea, 0, sizeof(*ea));
+    if (!dir) return false;
+
+    DIR *d = opendir(dir);
+    if (!d) return false;
+
+    size_t cap = 64;
+    ea->paths = malloc(cap * sizeof(char *));
+    if (!ea->paths) { closedir(d); return false; }
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        size_t nlen = strlen(ent->d_name);
+        if (nlen < 4 || strcmp(ent->d_name + nlen - 4, ".era") != 0)
+            continue;
+        /* Skip .era1 files */
+        if (nlen >= 5 && strcmp(ent->d_name + nlen - 5, ".era1") == 0)
+            continue;
+        if (ea->count >= cap) {
+            cap *= 2;
+            ea->paths = realloc(ea->paths, cap * sizeof(char *));
+        }
+        size_t pathlen = strlen(dir) + 1 + nlen + 1;
+        ea->paths[ea->count] = malloc(pathlen);
+        snprintf(ea->paths[ea->count], pathlen, "%s/%s", dir, ent->d_name);
+        ea->count++;
+    }
+    closedir(d);
+
+    if (ea->count > 0)
+        qsort(ea->paths, ea->count, sizeof(char *), cmp_strings);
+    return true;
+}
+
+static void era_archive_close(era_archive_t *ea) {
+    if (ea->active) era_close(&ea->current);
+    for (size_t i = 0; i < ea->count; i++) free(ea->paths[i]);
+    free(ea->paths);
+    memset(ea, 0, sizeof(*ea));
+}
+
+/* Try to read the next post-merge block from era files.
+ * Opens the next era file when the current one is exhausted.
+ * Returns true and fills blk, or false when no more blocks. */
+static bool era_archive_next(era_archive_t *ea, prefetched_block_t *blk) {
+    while (1) {
+        /* Try current file's iterator */
+        if (ea->active) {
+            uint64_t slot;
+            if (era_iter_next(&ea->iter, &blk->header, &blk->body,
+                              blk->blk_hash.bytes, &slot)) {
+                blk->block_number = blk->header.number;
+                blk->hdr_rlp = NULL;  /* no RLP for era blocks */
+                blk->body_rlp = NULL;
+                blk->hdr_len = 0;
+                blk->body_len = 0;
+                blk->valid = true;
+                return true;
+            }
+            /* Current file exhausted */
+            era_close(&ea->current);
+            ea->active = false;
+            ea->current_idx++;
+        }
+
+        /* Open next file */
+        if (ea->current_idx >= ea->count)
+            return false;  /* no more files */
+
+        if (!era_open(&ea->current, ea->paths[ea->current_idx])) {
+            fprintf(stderr, "Failed to open era file: %s\n",
+                    ea->paths[ea->current_idx]);
+            ea->current_idx++;
+            continue;
+        }
+
+        ea->iter = era_iter(&ea->current);
+        ea->active = true;
+        fprintf(stderr, "  era: opened %s\n", ea->paths[ea->current_idx]);
+    }
+}
+
+/* ---- Prefetch thread ---- */
+
 static void *prefetch_thread_fn(void *arg) {
     block_prefetch_t *pf = (block_prefetch_t *)arg;
+    bool using_era = false;  /* switched to post-merge era files */
 
     while (1) {
         pthread_mutex_lock(&pf->mutex);
@@ -346,53 +451,80 @@ static void *prefetch_thread_fn(void *arg) {
             break;
         }
 
-        uint64_t bn = pf->next_block++;
+        uint64_t bn = pf->next_block;
         pthread_mutex_unlock(&pf->mutex);
 
-        /* Read + decode outside the lock */
         prefetched_block_t blk;
         memset(&blk, 0, sizeof(blk));
         blk.block_number = bn;
         blk.valid = false;
 
-        if (!archive_ensure(&pf->archive, bn, pf->follow_mode, pf->era1_dir)) {
-            pthread_mutex_lock(&pf->mutex);
-            pf->error = true;
-            pf->has_data = false;
-            pthread_cond_signal(&pf->cond_ready);
-            pthread_mutex_unlock(&pf->mutex);
-            break;
+        if (!using_era) {
+            /* --- Era1 path (pre-merge) --- */
+            if (!archive_ensure(&pf->archive, bn, pf->follow_mode, pf->era1_dir)) {
+                /* Era1 exhausted — try switching to era files */
+                if (pf->era_dir && pf->era_archive.count > 0) {
+                    using_era = true;
+                    LOG_INFO("Switching from era1 to era files at block %lu", bn);
+                    continue;  /* retry with era path */
+                }
+                pthread_mutex_lock(&pf->mutex);
+                pf->error = true;
+                pf->has_data = false;
+                pthread_cond_signal(&pf->cond_ready);
+                pthread_mutex_unlock(&pf->mutex);
+                break;
+            }
+
+            if (!era1_read_block(&pf->archive.current, bn,
+                                 &blk.hdr_rlp, &blk.hdr_len,
+                                 &blk.body_rlp, &blk.body_len)) {
+                if (pf->era_dir && pf->era_archive.count > 0) {
+                    using_era = true;
+                    LOG_INFO("Switching from era1 to era files at block %lu", bn);
+                    continue;
+                }
+                pthread_mutex_lock(&pf->mutex);
+                pf->error = true;
+                pf->has_data = false;
+                pthread_cond_signal(&pf->cond_ready);
+                pthread_mutex_unlock(&pf->mutex);
+                break;
+            }
+
+            blk.blk_hash = hash_keccak256(blk.hdr_rlp, blk.hdr_len);
+
+            if (!block_header_decode_rlp(&blk.header, blk.hdr_rlp, blk.hdr_len) ||
+                !block_body_decode_rlp(&blk.body, blk.body_rlp, blk.body_len)) {
+                free(blk.hdr_rlp);
+                free(blk.body_rlp);
+                pthread_mutex_lock(&pf->mutex);
+                pf->error = true;
+                pf->has_data = false;
+                pthread_cond_signal(&pf->cond_ready);
+                pthread_mutex_unlock(&pf->mutex);
+                break;
+            }
+
+            blk.valid = true;
+        } else {
+            /* --- Era path (post-merge) --- */
+            if (!era_archive_next(&pf->era_archive, &blk)) {
+                pthread_mutex_lock(&pf->mutex);
+                pf->error = true;
+                pf->has_data = false;
+                pthread_cond_signal(&pf->cond_ready);
+                pthread_mutex_unlock(&pf->mutex);
+                break;
+            }
+            /* Update bn from the actual block number (era files are sequential,
+             * next_block might not match if there were skipped slots) */
+            bn = blk.block_number;
         }
-
-        if (!era1_read_block(&pf->archive.current, bn,
-                             &blk.hdr_rlp, &blk.hdr_len,
-                             &blk.body_rlp, &blk.body_len)) {
-            pthread_mutex_lock(&pf->mutex);
-            pf->error = true;
-            pf->has_data = false;
-            pthread_cond_signal(&pf->cond_ready);
-            pthread_mutex_unlock(&pf->mutex);
-            break;
-        }
-
-        blk.blk_hash = hash_keccak256(blk.hdr_rlp, blk.hdr_len);
-
-        if (!block_header_decode_rlp(&blk.header, blk.hdr_rlp, blk.hdr_len) ||
-            !block_body_decode_rlp(&blk.body, blk.body_rlp, blk.body_len)) {
-            free(blk.hdr_rlp);
-            free(blk.body_rlp);
-            pthread_mutex_lock(&pf->mutex);
-            pf->error = true;
-            pf->has_data = false;
-            pthread_cond_signal(&pf->cond_ready);
-            pthread_mutex_unlock(&pf->mutex);
-            break;
-        }
-
-        blk.valid = true;
 
         /* Hand off to consumer */
         pthread_mutex_lock(&pf->mutex);
+        pf->next_block = bn + 1;
         pf->buf = blk;
         pf->has_data = true;
         pthread_cond_signal(&pf->cond_ready);
@@ -403,6 +535,7 @@ static void *prefetch_thread_fn(void *arg) {
 }
 
 static bool prefetch_start(block_prefetch_t *pf, const char *era1_dir,
+                           const char *era_dir,
                            uint64_t start_block, uint64_t end_block,
                            bool follow) {
     memset(pf, 0, sizeof(*pf));
@@ -411,12 +544,17 @@ static bool prefetch_start(block_prefetch_t *pf, const char *era1_dir,
     pthread_cond_init(&pf->cond_consumed, NULL);
 
     pf->era1_dir = era1_dir;
+    pf->era_dir = era_dir;
     pf->follow_mode = follow;
     pf->next_block = start_block;
     pf->end_block = end_block;
 
     if (!archive_open(&pf->archive, era1_dir))
         return false;
+
+    /* Open era archive for post-merge blocks (optional) */
+    if (era_dir)
+        era_archive_open(&pf->era_archive, era_dir);
 
     pthread_create(&pf->thread, NULL, prefetch_thread_fn, pf);
     return true;
@@ -449,6 +587,7 @@ static void prefetch_stop(block_prefetch_t *pf) {
 
     pthread_join(pf->thread, NULL);
     archive_close(&pf->archive);
+    era_archive_close(&pf->era_archive);
     pthread_mutex_destroy(&pf->mutex);
     pthread_cond_destroy(&pf->cond_ready);
     pthread_cond_destroy(&pf->cond_consumed);
@@ -465,6 +604,7 @@ int main(int argc, char **argv) {
     bool resume_mode = false;
 #ifdef ENABLE_EVM_TRACE
     uint64_t trace_block = UINT64_MAX;  /* UINT64_MAX = no tracing */
+    int trace_tx = -1;                  /* -1 = trace all txs in trace_block */
 #endif
     uint64_t dump_prestate_block = UINT64_MAX;
     const char *dump_prestate_path = NULL;
@@ -515,6 +655,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[1 + arg_offset], "--trace-block") == 0 && arg_offset + 2 < argc) {
             trace_block = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
+        } else if (strcmp(argv[1 + arg_offset], "--trace-tx") == 0 && arg_offset + 2 < argc) {
+            trace_tx = atoi(argv[2 + arg_offset]);
+            arg_offset += 2;
 #endif
         } else if (strcmp(argv[1 + arg_offset], "--no-validate") == 0) {
             no_validate = true;
@@ -552,9 +695,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (argc - arg_offset < 3) {
+    if (argc - arg_offset < 1) {
         fprintf(stderr,
-            "Usage: %s [options] <era1_dir> <genesis.json> [start_block] [end_block]\n"
+            "Usage: %s [options] [start_block] [end_block]\n"
             "\n"
             "Options:\n"
             "  --clean               Delete existing state files, start from genesis\n"
@@ -563,6 +706,7 @@ int main(int argc, char **argv) {
             "  --resume              Resume from existing MPT state (reads .meta)\n"
             "  --no-history          Disable per-block state diff history\n"
             "  --trace-block N       Enable EIP-3155 EVM trace for block N (to stderr)\n"
+            "  --trace-tx N          Only trace tx index N within --trace-block (default: all)\n"
             "  --no-validate         Skip all root validation, compute once at end\n"
             "  --snapshot-every N    Auto-save state every N blocks (e.g. 1000000)\n"
             "  --save-state N [P]    Save full state after block N to binary file P\n"
@@ -591,12 +735,12 @@ int main(int argc, char **argv) {
     /* Ensure data directory exists */
     mkdir(data_dir, 0755);
 
-    const char *era1_dir     = argv[1 + arg_offset];
-    const char *genesis_path = argv[2 + arg_offset];
-    uint64_t user_start = (argc - arg_offset > 3)
-                          ? (uint64_t)atoll(argv[3 + arg_offset]) : 0;
-    uint64_t end_block  = (argc - arg_offset > 4)
-                          ? (uint64_t)atoll(argv[4 + arg_offset]) : UINT64_MAX;
+    const char *era1_dir     = "data/era1";
+    const char *genesis_path = "data/mainnet_genesis.json";
+    uint64_t user_start = (argc - arg_offset > 1)
+                          ? (uint64_t)atoll(argv[1 + arg_offset]) : 0;
+    uint64_t end_block  = (argc - arg_offset > 2)
+                          ? (uint64_t)atoll(argv[2 + arg_offset]) : UINT64_MAX;
 
     /* Install signal handler — no SA_RESTART so blocking reads can be interrupted */
     struct sigaction sa;
@@ -655,6 +799,9 @@ int main(int argc, char **argv) {
     /* Set storage pool path (mmap-backed per-account ART tries) */
     evm_state_set_storage_path(sync_get_state(sync), data_dir);
 
+    /* Enable parallel storage root computation (4 threads) */
+    state_set_root_threads(evm_state_get_state(sync_get_state(sync)), 4);
+
     uint64_t start_block = (user_start > 0) ? user_start : 1;
 
     if (load_state_path) {
@@ -697,6 +844,9 @@ int main(int argc, char **argv) {
             sync_resume(sync, loaded_block, hashes, hash_count);
             free(hashes);
         }
+
+        /* Truncate history to loaded block (discard stale diffs from prior runs) */
+        sync_truncate_history(sync, loaded_block);
     } else if (resume_mode) {
         /* Read .meta to find last good block */
         char meta_path[512];
@@ -779,9 +929,20 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t_window);
 
 
+    /* Derive era directory from era1 directory: data/era1 → data/era */
+    char era_dir[512] = {0};
+    {
+        size_t len = strlen(era1_dir);
+        if (len > 1 && era1_dir[len - 1] == '1') {
+            memcpy(era_dir, era1_dir, len - 1);  /* strip trailing '1' */
+        } else {
+            snprintf(era_dir, sizeof(era_dir), "%s/../era", era1_dir);
+        }
+    }
+
     /* Start block prefetch thread */
     block_prefetch_t prefetch;
-    if (!prefetch_start(&prefetch, era1_dir, start_block, end_block, follow_mode)) {
+    if (!prefetch_start(&prefetch, era1_dir, era_dir, start_block, end_block, follow_mode)) {
         LOG_ERR("Failed to start block prefetch");
         sync_destroy(sync);
         archive_close(&archive);
@@ -818,24 +979,22 @@ int main(int argc, char **argv) {
         block_body_t body = blk.body;
         hash_t blk_hash = blk.blk_hash;
 
-        /* Save pre-execution state for dump-prestate (before target block runs) */
+        /* Enable access tracking for dump-prestate target block */
         if (bn == dump_prestate_block) {
-            evm_state_t *pre_es = sync_get_state(sync);
-            state_t *pre_st = evm_state_get_state(pre_es);
-            char prestate_tmp[256];
-            snprintf(prestate_tmp, sizeof(prestate_tmp), "/tmp/artex_prestate_%lu.bin", bn);
-            fprintf(stderr, "dump-prestate: saving pre-state to %s...\n", prestate_tmp);
-            if (!state_save(pre_st, prestate_tmp, NULL)) {
-                LOG_ERROR("Failed to save pre-state for dump-prestate");
-            }
-            evm_state_enable_access_tracking(pre_es);
+            evm_state_enable_access_tracking(sync_get_state(sync));
         }
 
         /* Enable EVM tracing for the target block */
 #ifdef ENABLE_EVM_TRACE
         if (bn == trace_block) {
+            g_trace_tx_index = trace_tx;
             evm_tracer_init(stderr);
-            fprintf(stderr, "=== EVM TRACE: block %lu ===\n", bn);
+            /* If tracing a specific tx, don't enable globally —
+             * block_executor will toggle per-tx based on g_trace_tx_index */
+            if (trace_tx >= 0)
+                g_evm_tracer.enabled = false;
+            fprintf(stderr, "=== EVM TRACE: block %lu%s ===\n", bn,
+                    trace_tx >= 0 ? "" : " (all txs)");
         }
 #endif
 
@@ -859,18 +1018,18 @@ int main(int argc, char **argv) {
         }
 #endif
 
-        /* Dump prestate for this block */
+        /* Dump prestate for this block using block_diff_revert */
         if (bn == dump_prestate_block) {
             evm_state_t *es = sync_get_state(sync);
-            evm_state_disable_access_tracking(es);
 
-            /* Collect dirty addresses and storage keys from execution */
+            /* Collect accessed addresses and storage keys BEFORE disabling
+             * tracking (disable clears the accessed_slots list) */
             #define MAX_ADDRS  8192
             #define MAX_SLOTS  65536
             address_t *addrs = malloc(MAX_ADDRS * sizeof(address_t));
             size_t n_addrs = evm_state_collect_addresses(es, addrs, MAX_ADDRS);
 
-            /* Also include coinbase (miner reward touches it) */
+            /* Also include coinbase */
             {
                 bool have_cb = false;
                 for (size_t ci = 0; ci < n_addrs; ci++) {
@@ -880,7 +1039,6 @@ int main(int argc, char **argv) {
                 if (!have_cb && n_addrs < MAX_ADDRS)
                     addrs[n_addrs++] = header.coinbase;
             }
-            fprintf(stderr, "dump-prestate: %zu dirty addresses\n", n_addrs);
 
             typedef struct { address_t addr; uint256_t *keys; size_t count; } addr_slots_t;
             addr_slots_t *addr_slots = malloc(n_addrs * sizeof(addr_slots_t));
@@ -894,28 +1052,14 @@ int main(int argc, char **argv) {
                 addr_slots[i].count = n;
                 total_slots += n;
             }
-            fprintf(stderr, "dump-prestate: %zu storage keys\n", total_slots);
 
-            /* Load pre-execution state from saved binary */
-            char prestate_tmp[256];
-            snprintf(prestate_tmp, sizeof(prestate_tmp), "/tmp/artex_prestate_%lu.bin", bn);
-            evm_state_t *pre = evm_state_create(NULL);
-            if (!pre) {
-                fprintf(stderr, "Failed to create pre-state for dump\n");
-                free(addrs); free(addr_slots); free(slot_buf);
-                block_body_free(&body); free(hdr_rlp); free(body_rlp);
-                break;
-            }
-            state_t *pre_st = evm_state_get_state(pre);
-            hash_t pre_root;
-            if (!state_load(pre_st, prestate_tmp, &pre_root)) {
-                fprintf(stderr, "Failed to load pre-state from %s\n", prestate_tmp);
-                evm_state_destroy(pre);
-                free(addrs); free(addr_slots); free(slot_buf);
-                block_body_free(&body); free(hdr_rlp); free(body_rlp);
-                break;
-            }
-            fprintf(stderr, "dump-prestate: loaded pre-state from %s\n", prestate_tmp);
+            evm_state_disable_access_tracking(es);
+            LOG_INFO("dump-prestate: %zu addresses, %zu storage keys", n_addrs, total_slots);
+
+            /* Use block diff from execution result to revert to pre-block state */
+            LOG_INFO("dump-prestate: block_diff has %u groups", result.diff.group_count);
+            block_diff_revert(es, &result.diff);
+            LOG_INFO("dump-prestate: reverted block via block_diff");
 
             /* Build output path */
             char default_path[256];
@@ -924,11 +1068,10 @@ int main(int argc, char **argv) {
                 dump_prestate_path = default_path;
             }
 
-            /* Query from pre-state and dump as alloc.json */
+            /* Query from pre-block state and dump as alloc.json */
             FILE *out = fopen(dump_prestate_path, "w");
             if (!out) {
                 fprintf(stderr, "Failed to open %s for writing\n", dump_prestate_path);
-                evm_state_destroy(pre);
                 free(addrs); free(addr_slots); free(slot_buf);
                 break;
             }
@@ -936,8 +1079,8 @@ int main(int argc, char **argv) {
             fprintf(out, "{\n");
             for (size_t i = 0; i < n_addrs; i++) {
                 address_t *a = &addrs[i];
-                uint64_t nonce = evm_state_get_nonce(pre, a);
-                uint256_t balance = evm_state_get_balance(pre, a);
+                uint64_t nonce = evm_state_get_nonce(es, a);
+                uint256_t balance = evm_state_get_balance(es, a);
 
                 if (i > 0) fprintf(out, ",\n");
                 fprintf(out, "  \"0x");
@@ -955,9 +1098,9 @@ int main(int argc, char **argv) {
                 fprintf(out, "    \"nonce\": \"0x%lx\"", nonce);
 
                 /* Code */
-                uint32_t code_size = evm_state_get_code_size(pre, a);
+                uint32_t code_size = evm_state_get_code_size(es, a);
                 if (code_size > 0) {
-                    const uint8_t *code = evm_state_get_code_ptr(pre, a, &code_size);
+                    const uint8_t *code = evm_state_get_code_ptr(es, a, &code_size);
                     if (code && code_size > 0) {
                         fprintf(out, ",\n    \"code\": \"0x");
                         for (uint32_t c = 0; c < code_size; c++)
@@ -971,7 +1114,7 @@ int main(int argc, char **argv) {
                     fprintf(out, ",\n    \"storage\": {");
                     bool first_slot = true;
                     for (size_t si = 0; si < addr_slots[i].count; si++) {
-                        uint256_t val = evm_state_get_storage(pre, a, &addr_slots[i].keys[si]);
+                        uint256_t val = evm_state_get_storage(es, a, &addr_slots[i].keys[si]);
                         if (uint256_is_zero(&val)) continue;
                         if (!first_slot) fprintf(out, ",");
                         first_slot = false;
@@ -992,8 +1135,8 @@ int main(int argc, char **argv) {
             fprintf(out, "\n}\n");
             fclose(out);
 
-            fprintf(stderr, "Prestate dumped to %s (%zu accounts, %zu storage keys)\n",
-                   dump_prestate_path, n_addrs, total_slots);
+            LOG_INFO("dump-prestate: alloc written to %s (%zu accounts, %zu slots)",
+                     dump_prestate_path, n_addrs, total_slots);
 
             /* Write env.json */
             {
@@ -1018,6 +1161,24 @@ int main(int argc, char **argv) {
                     fprintf(ef, "  \"currentGasLimit\": \"0x%lx\",\n", header.gas_limit);
                     fprintf(ef, "  \"currentNumber\": \"0x%lx\",\n", header.number);
                     fprintf(ef, "  \"currentTimestamp\": \"0x%lx\",\n", header.timestamp);
+
+                    if (header.has_base_fee) {
+                        uint8_t bf[32]; uint256_to_bytes(&header.base_fee, bf);
+                        fprintf(ef, "  \"currentBaseFee\": \"0x");
+                        int s = 0; while (s < 31 && bf[s] == 0) s++;
+                        for (int j = s; j < 32; j++) fprintf(ef, "%02x", bf[j]);
+                        fprintf(ef, "\",\n");
+                    }
+                    if (header.number >= 15537394) {
+                        fprintf(ef, "  \"currentRandom\": \"0x");
+                        for (int j = 0; j < 32; j++) fprintf(ef, "%02x", header.mix_hash.bytes[j]);
+                        fprintf(ef, "\",\n");
+                    }
+                    if (header.has_blob_gas) {
+                        fprintf(ef, "  \"currentBlobGasUsed\": \"0x%lx\",\n", header.blob_gas_used);
+                        fprintf(ef, "  \"currentExcessBlobGas\": \"0x%lx\",\n", header.excess_blob_gas);
+                    }
+
                     fprintf(ef, "  \"parentHash\": \"0x");
                     for (int j = 0; j < 32; j++) fprintf(ef, "%02x", header.parent_hash.bytes[j]);
                     fprintf(ef, "\",\n");
@@ -1036,18 +1197,17 @@ int main(int argc, char **argv) {
                     }
                     fprintf(ef, "\n  }\n}\n");
                     fclose(ef);
-                    fprintf(stderr, "Environment dumped to %s\n", env_path);
+                    LOG_INFO("dump-prestate: env.json written to %s", env_path);
                 }
             }
 
-            evm_state_destroy(pre);
-            unlink(prestate_tmp);
             free(addrs);
             free(addr_slots);
             free(slot_buf);
             block_body_free(&body);
             free(hdr_rlp);
             free(body_rlp);
+            block_diff_free(&result.diff);
             break;
         }
 
@@ -1073,11 +1233,9 @@ int main(int argc, char **argv) {
             sync_status_t st = sync_get_status(sync);
 
             {
-                uint64_t remaining = (bn < PARIS_BLOCK) ? PARIS_BLOCK - bn : 0;
-                printf("Block %lu | %lu txs (%luT %luC) | %.0f tps | %.1f Mgas/s | %.0f blk/s | %.1fs/256blk | %luK to Paris\n",
+                printf("Block %lu | %lu txs (%luT %luC) | %.0f tps | %.1f Mgas/s | %.0f blk/s | %.1fs/256blk\n",
                        bn, window_txs, window_transfers, window_calls,
-                       tps, mgps, bps, win_secs,
-                       remaining / 1000);
+                       tps, mgps, bps, win_secs);
 
                 /* Get detailed memory breakdown directly from state */
                 state_t *_st = evm_state_get_state(sync_get_state(sync));
@@ -1198,6 +1356,7 @@ int main(int argc, char **argv) {
         block_body_free(&body);
         free(hdr_rlp);
         free(body_rlp);
+        block_diff_free(&result.diff);
 
         if (!block_ok) {
             if (result.error == SYNC_GAS_MISMATCH) {
@@ -1223,6 +1382,7 @@ int main(int argc, char **argv) {
                     free(result.receipts);
                     result.receipts = NULL;
                 }
+
             } else if (result.error == SYNC_ROOT_MISMATCH) {
                 char got_hex[67], exp_hex[67];
                 hash_to_hex(&result.actual_root, got_hex);
@@ -1269,19 +1429,17 @@ int main(int argc, char **argv) {
                 }
             }
 
-            /* Auto-dump pre/post state for the failing block */
+            /* Auto-dump state for the failing block */
             {
                 char auto_dir[512];
                 snprintf(auto_dir, sizeof(auto_dir), "known_issues/block_%lu", bn);
                 mkdir("known_issues", 0755);
                 mkdir(auto_dir, 0755);
-                LOG_INFO("auto-dumping pre/post state to %s/ ...", auto_dir);
+                LOG_INFO("auto-dumping state to %s/ ...", auto_dir);
 
                 evm_state_t *es = sync_get_state(sync);
 
 #ifdef ENABLE_HISTORY
-                /* pre_alloc.json (original values) + post_alloc.json (current values)
-                 * with debug flags on each account */
                 evm_state_dump_debug(es, auto_dir);
 #endif
 
@@ -1299,6 +1457,24 @@ int main(int argc, char **argv) {
                     fprintf(ef, "  \"currentGasLimit\": \"0x%lx\",\n", header.gas_limit);
                     fprintf(ef, "  \"currentNumber\": \"0x%lx\",\n", header.number);
                     fprintf(ef, "  \"currentTimestamp\": \"0x%lx\",\n", header.timestamp);
+
+                    if (header.has_base_fee) {
+                        uint8_t bf[32]; uint256_to_bytes(&header.base_fee, bf);
+                        fprintf(ef, "  \"currentBaseFee\": \"0x");
+                        int s = 0; while (s < 31 && bf[s] == 0) s++;
+                        for (int j = s; j < 32; j++) fprintf(ef, "%02x", bf[j]);
+                        fprintf(ef, "\",\n");
+                    }
+                    if (header.number >= 15537394) {
+                        fprintf(ef, "  \"currentRandom\": \"0x");
+                        for (int j = 0; j < 32; j++) fprintf(ef, "%02x", header.mix_hash.bytes[j]);
+                        fprintf(ef, "\",\n");
+                    }
+                    if (header.has_blob_gas) {
+                        fprintf(ef, "  \"currentBlobGasUsed\": \"0x%lx\",\n", header.blob_gas_used);
+                        fprintf(ef, "  \"currentExcessBlobGas\": \"0x%lx\",\n", header.excess_blob_gas);
+                    }
+
                     fprintf(ef, "  \"parentHash\": \"0x");
                     for (int j = 0; j < 32; j++) fprintf(ef, "%02x", header.parent_hash.bytes[j]);
                     fprintf(ef, "\",\n");
@@ -1317,8 +1493,11 @@ int main(int argc, char **argv) {
                     }
                     fprintf(ef, "\n  }\n}\n");
                     fclose(ef);
+                    LOG_INFO("env.json written to %s", env_p);
                 }
 
+                /* Hint: use --dump-prestate N to get full alloc.json with pre-state */
+                LOG_WARN("hint: rerun with --dump-prestate %lu for full pre-state alloc.json", bn);
             }
 
             /* Discard dirty state so destroy doesn't flush failing block to MPT.
