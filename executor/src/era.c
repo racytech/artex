@@ -290,7 +290,16 @@ static bool parse_execution_payload(const uint8_t *ep, size_t ep_len,
                     if (t_start >= tx_region || t_end > tx_region || t_end <= t_start)
                         { ok = false; break; }
 
-                    list->data.list.items[t] = rlp_string(tx_data + t_start, t_end - t_start);
+                    const uint8_t *tx_bytes = tx_data + t_start;
+                    size_t tx_len = t_end - t_start;
+
+                    if (tx_len > 0 && tx_bytes[0] >= 0xc0) {
+                        /* Legacy transaction — RLP list, parse it */
+                        list->data.list.items[t] = rlp_decode(tx_bytes, tx_len);
+                    } else {
+                        /* Typed transaction — raw bytes (type + RLP payload) */
+                        list->data.list.items[t] = rlp_string(tx_bytes, tx_len);
+                    }
                     if (!list->data.list.items[t]) { ok = false; break; }
                 }
 
