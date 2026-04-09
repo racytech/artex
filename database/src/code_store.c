@@ -543,6 +543,9 @@ bool code_store_put(code_store_t *cs, const uint8_t code_hash[32],
         return false;
     }
 
+    /* Update header so data_size survives crashes */
+    write_data_header(cs);
+
     /* Pre-populate cache so first get() is a hit */
     if (cs->cache && code_len > 0)
         ccache_put(cs->cache, code_hash, code, code_len);
