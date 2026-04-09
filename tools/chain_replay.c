@@ -804,7 +804,7 @@ int main(int argc, char **argv) {
         /* Get next block from prefetch thread */
         prefetched_block_t blk;
         if (!prefetch_get(&prefetch, &blk)) {
-            if (bn > PARIS_BLOCK) {
+            if (bn >= PARIS_BLOCK) {
                 LOG_INFO("No more era1 blocks at %lu (past Paris)", bn);
             } else {
                 LOG_ERROR("Block %lu: prefetch failed", bn);
@@ -1330,8 +1330,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* --no-validate: compute and verify root at the last processed block. */
-    if (no_validate) {
+    /* --no-validate: compute and verify root at the last processed block.
+     * Skip if no blocks were actually executed (e.g. loaded snapshot at Paris). */
+    if (no_validate && sync_get_status(sync).blocks_ok > 0) {
         sync_status_t fst = sync_get_status(sync);
         uint64_t last = fst.last_block;
         if (last > 0) {

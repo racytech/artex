@@ -521,6 +521,11 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
             hash_t blk_hash;
             memcpy(blk_hash.bytes, payload.block_hash, 32);
 
+            fprintf(stderr, "ENGINE newPayload: block %lu (%zu txs, %lu gas)\n",
+                    (unsigned long)payload.block_number,
+                    payload.tx_count,
+                    (unsigned long)payload.gas_used);
+
             sync_block_result_t sync_result;
             if (!sync_execute_block_live((sync_t *)ctx->sync, &header, &body,
                                          &blk_hash, &sync_result)) {
@@ -528,6 +533,8 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
                 status.has_latest_valid_hash = true;
                 memcpy(status.latest_valid_hash, payload.parent_hash, 32);
                 status.validation_error = "block execution failed";
+                fprintf(stderr, "ENGINE newPayload: block %lu → INVALID (execution failed)\n",
+                        (unsigned long)payload.block_number);
             } else if (!sync_result.ok) {
                 status.status = PAYLOAD_INVALID;
                 status.has_latest_valid_hash = true;
@@ -538,10 +545,15 @@ static cJSON *new_payload_common(const cJSON *params, void *ctx_ptr,
                     status.validation_error = "invalid state root";
                 else
                     status.validation_error = "validation failed";
+                fprintf(stderr, "ENGINE newPayload: block %lu → INVALID (%s)\n",
+                        (unsigned long)payload.block_number, status.validation_error);
             } else {
                 status.status = PAYLOAD_VALID;
                 status.has_latest_valid_hash = true;
                 memcpy(status.latest_valid_hash, payload.block_hash, 32);
+                fprintf(stderr, "ENGINE newPayload: block %lu → VALID (%zu txs, %lu gas)\n",
+                        (unsigned long)payload.block_number,
+                        sync_result.tx_count, sync_result.gas_used);
 
                 if (!engine_store_put(ctx->store, &payload, true)) {
                     *err_code = -32603;
@@ -735,6 +747,7 @@ static cJSON *forkchoice_updated_common(const cJSON *params, void *ctx_ptr,
     if (!engine_store_has(ctx->store, fc.head_block_hash)) {
         ps.status = PAYLOAD_SYNCING;
         ps.has_latest_valid_hash = false;
+        fprintf(stderr, "ENGINE forkchoiceUpdated: head not found → SYNCING\n");
     } else {
         engine_store_set_forkchoice(ctx->store,
                                      fc.head_block_hash,
@@ -745,6 +758,7 @@ static cJSON *forkchoice_updated_common(const cJSON *params, void *ctx_ptr,
         ps.status = PAYLOAD_VALID;
         ps.has_latest_valid_hash = true;
         memcpy(ps.latest_valid_hash, fc.head_block_hash, 32);
+        fprintf(stderr, "ENGINE forkchoiceUpdated: → VALID\n");
     }
 
     cJSON *result = cJSON_CreateObject();
@@ -902,6 +916,8 @@ cJSON *engine_exchangeCapabilities(const cJSON *params, const cJSON *id,
     (void)params; (void)id; (void)ctx_ptr;
     (void)err_code; (void)err_msg;
 
+    fprintf(stderr, "ENGINE exchangeCapabilities: CL connected\n");
+
     cJSON *result = cJSON_CreateArray();
     cJSON_AddItemToArray(result, cJSON_CreateString("engine_newPayloadV1"));
     cJSON_AddItemToArray(result, cJSON_CreateString("engine_newPayloadV2"));
@@ -916,6 +932,19 @@ cJSON *engine_exchangeCapabilities(const cJSON *params, const cJSON *id,
     cJSON_AddItemToArray(result, cJSON_CreateString("engine_getPayloadV4"));
     cJSON_AddItemToArray(result, cJSON_CreateString("engine_exchangeCapabilities"));
     return result;
+}
+
+/* =========================================================================
+ * eth_syncing — EL health check (required by Lighthouse upcheck)
+ * ========================================================================= */
+
+static cJSON *eth_syncing(const cJSON *params, const cJSON *id,
+                           void *ctx_ptr, int *err_code,
+                           const char **err_msg) {
+    (void)params; (void)id; (void)ctx_ptr;
+    (void)err_code; (void)err_msg;
+    /* Return false = not syncing (we're ready to accept blocks) */
+    return cJSON_CreateFalse();
 }
 
 /* =========================================================================
@@ -935,4 +964,5 @@ void engine_register_handlers(engine_rpc_t *rpc) {
     engine_rpc_register(rpc, "engine_getPayloadV3", engine_getPayloadV3);
     engine_rpc_register(rpc, "engine_getPayloadV4", engine_getPayloadV4);
     engine_rpc_register(rpc, "engine_exchangeCapabilities", engine_exchangeCapabilities);
+    engine_rpc_register(rpc, "eth_syncing", eth_syncing);
 }

@@ -133,6 +133,7 @@ char *engine_rpc_dispatch(engine_rpc_t *rpc,
     }
 
     if (!handler) {
+        fprintf(stderr, "ENGINE RPC: unknown method '%s'\n", method->valuestring);
         char *r = build_error_response(id, RPC_ERR_METHOD_NOT_FOUND,
                                        "method not found", resp_len);
         cJSON_Delete(root);
