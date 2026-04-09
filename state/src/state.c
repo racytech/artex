@@ -1386,6 +1386,8 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
                     storage_hart_root_hash(s->stor_pool, &r->storage,
                                            stor_value_encode, NULL,
                                            r->storage_root.bytes);
+                else
+                    r->storage_root = EMPTY_STORAGE_ROOT;
             }
             s->storage_roots_stale = false;
         }
