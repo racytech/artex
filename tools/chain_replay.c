@@ -925,6 +925,7 @@ int main(int argc, char **argv) {
     uint64_t window_gas = 0;
     uint64_t window_transfers = 0;
     uint64_t window_calls = 0;
+    uint64_t next_snapshot_target = snapshot_every > 0 ? snapshot_every : UINT64_MAX;
     struct timespec t_window;
     clock_gettime(CLOCK_MONOTONIC, &t_window);
 
@@ -1311,44 +1312,23 @@ int main(int argc, char **argv) {
         /* --snapshot-every: validate root + save state at regular intervals.
          * Only saves if root matches — every snapshot on disk is guaranteed correct.
          * If root mismatches, stop — bug is in the last snapshot_every blocks. */
-        if (snapshot_every > 0 && bn % snapshot_every == 0) {
-            evm_state_t *snap_es = sync_get_state(sync);
-            state_t *st = evm_state_get_state(snap_es);
-            bool prune = (bn >= 2675000);
-
-            /* Force full recomputation — no stale cached hashes */
-            evm_state_invalidate_all(snap_es);
-
-            struct timespec _sr0, _sr1;
-            clock_gettime(CLOCK_MONOTONIC, &_sr0);
-            hash_t snap_root = evm_state_compute_mpt_root(snap_es, prune);
-            clock_gettime(CLOCK_MONOTONIC, &_sr1);
-            double sr_ms = (_sr1.tv_sec - _sr0.tv_sec) * 1000.0 +
-                           (_sr1.tv_nsec - _sr0.tv_nsec) / 1e6;
-
-            if (memcmp(snap_root.bytes, header.state_root.bytes, 32) != 0) {
-                char got_hex[67], exp_hex[67];
-                hash_to_hex(&snap_root, got_hex);
-                hash_to_hex(&header.state_root, exp_hex);
-                LOG_ERROR("Snapshot validation FAILED at block %lu (%.0fms)", bn, sr_ms);
-                LOG_ERROR("got:      %s", got_hex);
-                LOG_ERROR("expected: %s", exp_hex);
-                LOG_WARN("hint: bug is in blocks %lu..%lu",
-                         bn > snapshot_every ? bn - snapshot_every + 1 : 1, bn);
-                block_body_free(&body);
-                free(hdr_rlp);
-                free(body_rlp);
-                break;
-            }
-
+        /* Save snapshot at the first checkpoint after each snapshot_every boundary.
+         * Uses the root already computed by sync_execute_block — no invalidate_all.
+         * E.g. with snapshot_every=1M and validate_every=8192:
+         *   1M → snapshot at block 1,007,616 (first 8192-aligned block >= 1M) */
+        if (snapshot_every > 0 && result.ok &&
+            bn % validate_every == 0 &&     /* this is a checkpoint */
+            bn >= next_snapshot_target) {    /* past the snapshot boundary */
+            state_t *st = evm_state_get_state(sync_get_state(sync));
             char snap_path[256];
             snprintf(snap_path, sizeof(snap_path), "%s/state_%lu.bin",
                      data_dir, bn);
-            if (state_save(st, snap_path, &snap_root)) {
+            if (state_save(st, snap_path, &result.actual_root)) {
                 state_stats_t ss = state_get_stats(st);
-                fprintf(stderr, "  snapshot @%lu: root OK, %u accts, %.0fMB, %.0fms → %s\n",
-                        bn, ss.account_count, ss.total_tracked / 1e6, sr_ms, snap_path);
+                fprintf(stderr, "  snapshot @%lu: %u accts, %.0fMB → %s\n",
+                        bn, ss.account_count, ss.total_tracked / 1e6, snap_path);
             }
+            next_snapshot_target = ((bn / snapshot_every) + 1) * snapshot_every;
         }
 
         bool block_ok = result.ok;
