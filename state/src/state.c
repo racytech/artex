@@ -19,6 +19,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <stdatomic.h>
+#include <pthread.h>
 #include <xmmintrin.h>
 
 /* =========================================================================
@@ -260,8 +262,29 @@ struct state {
     storage_hart_pool_t *stor_pool;
     char                 stor_pool_path[512];
 
-    /* Parallel root computation */
-    uint32_t root_threads;            /* 0 or 1 = serial */
+    /* Parallel root computation — persistent thread pool */
+    struct root_pool {
+        pthread_t      *threads;
+        uint32_t        count;         /* number of worker threads */
+        pthread_mutex_t mutex;
+        pthread_cond_t  work_ready;    /* workers wait on this */
+        pthread_cond_t  work_done;     /* main thread waits on this */
+        volatile uint32_t active;      /* workers currently running */
+        volatile bool   shutdown;
+
+        /* Per-job parameters (set by main thread before signaling) */
+        enum { ROOT_JOB_NONE, ROOT_JOB_DIRTY, ROOT_JOB_ALL } job_type;
+        /* For DIRTY jobs: */
+        const uint8_t       *dirty_keys;
+        size_t               dirty_count;
+        /* For ALL jobs: */
+        resource_t          *resources;
+        uint32_t             res_count;
+        /* Shared: */
+        state_t             *state;
+        storage_hart_pool_t *pool;
+        _Atomic size_t       next_idx;  /* work-stealing index */
+    } root_pool;
 
     /* dump-prestate support: preserved dirty list + access tracking */
     dirty_vec_t last_dirty;       /* blk_dirty from last compute_root (addr[20]) */
@@ -498,12 +521,124 @@ state_t *state_create(code_store_t *cs) {
     return s;
 }
 
+/* --- Root pool worker thread --- */
+static void *root_pool_worker(void *arg) {
+    state_t *s = (state_t *)arg;
+    struct root_pool *rp = &s->root_pool;
+
+    for (;;) {
+        pthread_mutex_lock(&rp->mutex);
+        while (rp->job_type == ROOT_JOB_NONE && !rp->shutdown)
+            pthread_cond_wait(&rp->work_ready, &rp->mutex);
+        if (rp->shutdown) { pthread_mutex_unlock(&rp->mutex); break; }
+        int job = rp->job_type;
+        pthread_mutex_unlock(&rp->mutex);
+
+        /* Work-steal loop */
+        if (job == ROOT_JOB_DIRTY) {
+            for (;;) {
+                size_t idx = atomic_fetch_add(&rp->next_idx, 1);
+                if (idx >= rp->dirty_count) break;
+                const uint8_t *akey = rp->dirty_keys + idx * 20;
+                hash_t ah = hash_keccak256(akey, 20);
+                account_t *a = find_account_h(rp->state, &ah);
+                if (!a || !acct_has_flag(a, ACCT_STORAGE_DIRTY)) continue;
+                resource_t *r = get_resource(rp->state, a);
+                if (!r) continue;
+                if (!storage_hart_empty(&r->storage))
+                    storage_hart_root_hash(rp->pool, &r->storage,
+                                           stor_value_encode, NULL,
+                                           r->storage_root.bytes);
+                else
+                    r->storage_root = EMPTY_STORAGE_ROOT;
+            }
+        } else if (job == ROOT_JOB_ALL) {
+            for (;;) {
+                size_t idx = atomic_fetch_add(&rp->next_idx, 1);
+                if (idx >= rp->res_count) break;
+                uint32_t ri = (uint32_t)idx + 1;  /* skip slot 0 */
+                resource_t *r = &rp->resources[ri];
+                if (!storage_hart_empty(&r->storage))
+                    storage_hart_root_hash(rp->pool, &r->storage,
+                                           stor_value_encode, NULL,
+                                           r->storage_root.bytes);
+                else
+                    r->storage_root = EMPTY_STORAGE_ROOT;
+            }
+        }
+
+        /* Signal completion */
+        uint32_t remaining = __sync_sub_and_fetch(&rp->active, 1);
+        if (remaining == 0) {
+            pthread_mutex_lock(&rp->mutex);
+            rp->job_type = ROOT_JOB_NONE;
+            pthread_cond_signal(&rp->work_done);
+            pthread_mutex_unlock(&rp->mutex);
+        }
+    }
+    return NULL;
+}
+
 void state_set_root_threads(state_t *s, uint32_t n) {
-    if (s) s->root_threads = n;
+    if (!s) return;
+
+    /* Shut down existing pool */
+    if (s->root_pool.threads) {
+        pthread_mutex_lock(&s->root_pool.mutex);
+        s->root_pool.shutdown = true;
+        pthread_cond_broadcast(&s->root_pool.work_ready);
+        pthread_mutex_unlock(&s->root_pool.mutex);
+        for (uint32_t i = 0; i < s->root_pool.count; i++)
+            pthread_join(s->root_pool.threads[i], NULL);
+        free(s->root_pool.threads);
+        pthread_mutex_destroy(&s->root_pool.mutex);
+        pthread_cond_destroy(&s->root_pool.work_ready);
+        pthread_cond_destroy(&s->root_pool.work_done);
+        memset(&s->root_pool, 0, sizeof(s->root_pool));
+    }
+
+    if (n <= 1) return;
+
+    /* Create pool */
+    s->root_pool.count = n;
+    s->root_pool.shutdown = false;
+    s->root_pool.job_type = ROOT_JOB_NONE;
+    pthread_mutex_init(&s->root_pool.mutex, NULL);
+    pthread_cond_init(&s->root_pool.work_ready, NULL);
+    pthread_cond_init(&s->root_pool.work_done, NULL);
+
+    s->root_pool.threads = calloc(n, sizeof(pthread_t));
+    for (uint32_t i = 0; i < n; i++)
+        pthread_create(&s->root_pool.threads[i], NULL, root_pool_worker, s);
+}
+
+/* Dispatch a job to the root pool and wait for completion */
+static void root_pool_dispatch(state_t *s, int job_type,
+                               const uint8_t *dirty_keys, size_t dirty_count,
+                               resource_t *resources, uint32_t res_count) {
+    struct root_pool *rp = &s->root_pool;
+    pthread_mutex_lock(&rp->mutex);
+    rp->job_type = job_type;
+    rp->dirty_keys = dirty_keys;
+    rp->dirty_count = dirty_count;
+    rp->resources = resources;
+    rp->res_count = res_count;
+    rp->state = s;
+    rp->pool = s->stor_pool;
+    atomic_store(&rp->next_idx, 0);
+    rp->active = rp->count;
+    pthread_cond_broadcast(&rp->work_ready);
+    /* Wait for all workers to finish */
+    while (rp->job_type != ROOT_JOB_NONE)
+        pthread_cond_wait(&rp->work_done, &rp->mutex);
+    pthread_mutex_unlock(&rp->mutex);
 }
 
 void state_destroy(state_t *s) {
     if (!s) return;
+
+    /* Shut down root pool */
+    state_set_root_threads(s, 0);
 
     for (uint32_t i = 0; i < s->res_count; i++) {
         resource_t *r = &s->resources[i];
@@ -1323,112 +1458,18 @@ state_stats_t state_get_stats(const state_t *s) {
  * save/load — TODO: implement serialization
  * ========================================================================= */
 
-/* --- Parallel storage root worker --- */
-typedef struct {
-    state_t             *s;
-    resource_t          *resources;
-    uint32_t             start;
-    uint32_t             end;
-    storage_hart_pool_t *pool;
-} stor_root_work_t;
-
-static void *stor_root_worker(void *arg) {
-    stor_root_work_t *w = (stor_root_work_t *)arg;
-    for (uint32_t i = w->start; i < w->end; i++) {
-        resource_t *r = &w->resources[i];
-        if (!storage_hart_empty(&r->storage))
-            storage_hart_root_hash(w->pool, &r->storage,
-                                   stor_value_encode, NULL,
-                                   r->storage_root.bytes);
-        else
-            r->storage_root = EMPTY_STORAGE_ROOT;
-    }
-    return NULL;
-}
-
-static void compute_storage_roots_parallel(state_t *s) {
-    uint32_t n = s->res_count - 1;  /* skip slot 0 */
-    if (n == 0) return;
-
-    uint32_t nt = s->root_threads;
-    if (nt > n) nt = n;
-
-    pthread_t threads[nt];
-    stor_root_work_t work[nt];
-    uint32_t per = n / nt;
-    uint32_t rem = n % nt;
-    uint32_t pos = 1;  /* start from 1, skip slot 0 */
-
-    for (uint32_t t = 0; t < nt; t++) {
-        uint32_t count = per + (t < rem ? 1 : 0);
-        work[t] = (stor_root_work_t){
-            .s = s, .resources = s->resources,
-            .start = pos, .end = pos + count,
-            .pool = s->stor_pool
-        };
-        pos += count;
-        pthread_create(&threads[t], NULL, stor_root_worker, &work[t]);
-    }
-    for (uint32_t t = 0; t < nt; t++)
-        pthread_join(threads[t], NULL);
-}
-
-/* --- Parallel dirty storage root worker --- */
-typedef struct {
-    state_t             *s;
-    const uint8_t       *dirty_keys;   /* dirty addr[20] array */
-    size_t               start;
-    size_t               end;
-    storage_hart_pool_t *pool;
-} dirty_stor_work_t;
-
-static void *dirty_stor_worker(void *arg) {
-    dirty_stor_work_t *w = (dirty_stor_work_t *)arg;
-    for (size_t d = w->start; d < w->end; d++) {
-        const uint8_t *akey = w->dirty_keys + d * 20;
-        hash_t ah = hash_keccak256(akey, 20);
-        account_t *a = find_account_h(w->s, &ah);
-        if (!a || !acct_has_flag(a, ACCT_STORAGE_DIRTY)) continue;
-        resource_t *r = get_resource(w->s, a);
-        if (!r) continue;
-        if (!storage_hart_empty(&r->storage))
-            storage_hart_root_hash(w->pool, &r->storage,
-                                   stor_value_encode, NULL,
-                                   r->storage_root.bytes);
-        else
-            r->storage_root = EMPTY_STORAGE_ROOT;
-    }
-    return NULL;
-}
-
 hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     hash_t root = {0};
     if (!s) return root;
 
-    bool parallel = compute_hash && s->root_threads > 1;
+    bool has_pool = s->root_pool.threads != NULL;
 
     /* Phase 1: compute dirty storage roots (parallel or serial).
      * Must complete BEFORE the flag-clearing pass below. */
-    if (compute_hash && parallel && s->blk_dirty.count > 0) {
-        uint32_t nt = s->root_threads;
-        if (nt > s->blk_dirty.count) nt = (uint32_t)s->blk_dirty.count;
-        pthread_t threads[nt];
-        dirty_stor_work_t dwork[nt];
-        size_t per = s->blk_dirty.count / nt;
-        size_t rem = s->blk_dirty.count % nt;
-        size_t pos = 0;
-        for (uint32_t t = 0; t < nt; t++) {
-            size_t count = per + (t < rem ? 1 : 0);
-            dwork[t] = (dirty_stor_work_t){
-                .s = s, .dirty_keys = s->blk_dirty.keys,
-                .start = pos, .end = pos + count,
-                .pool = s->stor_pool
-            };
-            pos += count;
-            pthread_create(&threads[t], NULL, dirty_stor_worker, &dwork[t]);
-        }
-        for (uint32_t t = 0; t < nt; t++)
-            pthread_join(threads[t], NULL);
+    if (compute_hash && has_pool && s->blk_dirty.count > 0) {
+        root_pool_dispatch(s, ROOT_JOB_DIRTY,
+                           s->blk_dirty.keys, s->blk_dirty.count,
+                           NULL, 0);
     }
 
     /* Phase 2: single pass — promote existence, compute storage roots (serial only),
@@ -1447,8 +1488,8 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
                 acct_set_flag(a, ACCT_EXISTED);
         }
 
-        /* Compute storage root if dirty — only in serial mode (parallel done above) */
-        if (!parallel && acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
+        /* Compute storage root if dirty — only in serial mode (pool done above) */
+        if (!has_pool && acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
             if (compute_hash) {
                 resource_t *r = get_resource(s, a);
                 if (r && !storage_hart_empty(&r->storage))
@@ -1514,8 +1555,9 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
         /* Recompute stale storage roots — only needed if previous blocks
          * skipped storage root computation (no-validate or checkpoint mode) */
         if (s->storage_roots_stale) {
-            if (s->root_threads > 1) {
-                compute_storage_roots_parallel(s);
+            if (has_pool) {
+                root_pool_dispatch(s, ROOT_JOB_ALL, NULL, 0,
+                                   s->resources, s->res_count - 1);
             } else {
                 for (uint32_t i = 1; i < s->res_count; i++) {
                     resource_t *r = &s->resources[i];
