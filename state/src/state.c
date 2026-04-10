@@ -500,6 +500,7 @@ void state_destroy(state_t *s) {
     for (uint32_t i = 0; i < s->res_count; i++) {
         resource_t *r = &s->resources[i];
         free(r->code);
+        free(r->jumpdest_bitmap);
         if (s->stor_pool && !storage_hart_empty(&r->storage))
             storage_hart_clear(s->stor_pool, &r->storage);
     }
@@ -733,6 +734,7 @@ void state_set_code(state_t *s, const address_t *addr,
 
     r->code = NULL;
     r->code_size = 0;
+    if (r->jumpdest_bitmap) { free(r->jumpdest_bitmap); r->jumpdest_bitmap = NULL; }
 
     if (code && len > 0) {
         r->code = malloc(len);
@@ -771,6 +773,31 @@ const uint8_t *state_get_code(state_t *s, const address_t *addr, uint32_t *out_l
     }
     if (out_len) *out_len = r->code_size;
     return r->code;
+}
+
+const uint8_t *state_get_jumpdest_bitmap(state_t *s, const address_t *addr) {
+    if (!s || !addr) return NULL;
+    account_t *a = find_account(s, addr->bytes);
+    if (!a || !acct_has_flag(a, ACCT_HAS_CODE)) return NULL;
+    resource_t *r = get_resource(s, a);
+    if (!r || !r->code || r->code_size == 0) return NULL;
+
+    if (!r->jumpdest_bitmap) {
+        size_t bitmap_bytes = (r->code_size + 7) / 8;
+        r->jumpdest_bitmap = calloc(bitmap_bytes, 1);
+        if (!r->jumpdest_bitmap) return NULL;
+        uint64_t pc = 0;
+        while (pc < r->code_size) {
+            uint8_t op = r->code[pc];
+            if (op == 0x5b) /* JUMPDEST */
+                r->jumpdest_bitmap[pc >> 3] |= (1u << (pc & 7));
+            if (op >= 0x60 && op <= 0x7f)
+                pc += 1 + (op - 0x60 + 1);
+            else
+                pc++;
+        }
+    }
+    return r->jumpdest_bitmap;
 }
 
 uint32_t state_get_code_size(state_t *s, const address_t *addr) {

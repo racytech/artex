@@ -164,9 +164,16 @@ evm_result_t evm_interpret(evm_t *evm)
     } // end debug output
 
 
-    // Build JUMPDEST bitmap for O(1) jump validation
-    uint8_t *jumpdest_bitmap = build_jumpdest_bitmap(evm->code, evm->code_size);
-    evm->jumpdest_bitmap = jumpdest_bitmap;
+    // Use cached JUMPDEST bitmap if available, otherwise build fresh
+    uint8_t *jumpdest_bitmap = NULL;
+    bool bitmap_owned = false;
+    if (evm->jumpdest_bitmap) {
+        jumpdest_bitmap = (uint8_t *)evm->jumpdest_bitmap;
+    } else {
+        jumpdest_bitmap = build_jumpdest_bitmap(evm->code, evm->code_size);
+        evm->jumpdest_bitmap = jumpdest_bitmap;
+        bitmap_owned = true;
+    }
 
     // Computed goto dispatch table (GCC/Clang extension)
     static const void *dispatch_table[256] = {
@@ -1363,8 +1370,9 @@ error:
 done:
     // Emit any remaining pending trace (e.g. when pc >= code_size)
     EVM_TRACE_EXIT(evm, NULL);
-    // Free JUMPDEST bitmap
-    free(jumpdest_bitmap);
+    // Free JUMPDEST bitmap only if we built it (not cached from state)
+    if (bitmap_owned)
+        free(jumpdest_bitmap);
     evm->jumpdest_bitmap = NULL;
     // Create result with output data
     evm_result_t res = evm_result_create(status, evm->gas_left, evm->gas_refund, evm->return_data, evm->return_data_size);

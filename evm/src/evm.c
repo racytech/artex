@@ -664,6 +664,7 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         // For CREATE, the input_data IS the init code
         evm->code = msg->input_data;
         evm->code_size = msg->input_size;
+        evm->jumpdest_bitmap = NULL;  // init code needs fresh bitmap
 
         // Calldata is empty for CREATE operations (initcode is code, not calldata)
         evm->msg.input_data = NULL;
@@ -727,18 +728,20 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
         const uint8_t *contract_code = evm_state_get_code_ptr(evm->state, &msg->code_addr, &code_len);
 
         // EIP-7702: If code is a delegation designator, load delegated code
+        address_t code_source = msg->code_addr;
         if (contract_code && code_len == 23 &&
             contract_code[0] == 0xef && contract_code[1] == 0x01 && contract_code[2] == 0x00)
         {
-            address_t delegate_addr;
-            memcpy(delegate_addr.bytes, &contract_code[3], 20);
-            contract_code = evm_state_get_code_ptr(evm->state, &delegate_addr, &code_len);
+            memcpy(code_source.bytes, &contract_code[3], 20);
+            contract_code = evm_state_get_code_ptr(evm->state, &code_source, &code_len);
         }
 
         if (contract_code && code_len > 0)
         {
             evm->code = contract_code;
             evm->code_size = code_len;
+            evm->jumpdest_bitmap = evm_state_get_jumpdest_bitmap(
+                evm->state, &code_source);
         }
         else
         {

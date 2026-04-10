@@ -135,6 +135,8 @@ bool     evm_state_get_code(evm_state_t *es, const address_t *addr,
 /** Return pointer to cached code bytes (valid for lifetime of evm_state). */
 const uint8_t *evm_state_get_code_ptr(evm_state_t *es, const address_t *addr,
                                        uint32_t *out_len);
+/** Return cached JUMPDEST bitmap for contract code (built on first call). */
+const uint8_t *evm_state_get_jumpdest_bitmap(evm_state_t *es, const address_t *addr);
 void     evm_state_set_code(evm_state_t *es, const address_t *addr,
                             const uint8_t *code, uint32_t len);
 

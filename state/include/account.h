@@ -54,6 +54,7 @@ typedef struct {
     hash_t          storage_root;  /* 32 bytes */
     uint8_t        *code;          /*  8 bytes (heap, loaded on demand) */
     uint32_t        code_size;     /*  4 bytes */
+    uint8_t        *jumpdest_bitmap; /* cached JUMPDEST bitmap (1 bit per byte) */
     storage_hart_t  storage;       /* per-account storage trie (mmap-backed) */
 } resource_t;
 

@@ -60,6 +60,7 @@ bool state_sub_balance(state_t *s, const address_t *addr, const uint256_t *amoun
 void state_set_code(state_t *s, const address_t *addr,
                     const uint8_t *code, uint32_t len);
 const uint8_t *state_get_code(state_t *s, const address_t *addr, uint32_t *out_len);
+const uint8_t *state_get_jumpdest_bitmap(state_t *s, const address_t *addr);
 uint32_t state_get_code_size(state_t *s, const address_t *addr);
 hash_t   state_get_code_hash(state_t *s, const address_t *addr);
 

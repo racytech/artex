@@ -143,6 +143,10 @@ const uint8_t *evm_state_get_code_ptr(evm_state_t *es, const address_t *addr,
     return state_get_code(es->st, addr, out_len);
 }
 
+const uint8_t *evm_state_get_jumpdest_bitmap(evm_state_t *es, const address_t *addr) {
+    return es ? state_get_jumpdest_bitmap(es->st, addr) : NULL;
+}
+
 uint32_t evm_state_get_code_size(evm_state_t *es, const address_t *addr) {
     return es ? state_get_code_size(es->st, addr) : 0;
 }

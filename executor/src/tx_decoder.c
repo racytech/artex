@@ -569,13 +569,24 @@ bool tx_decode_rlp(transaction_t *tx, const rlp_item_t *item,
     }
 
     if (rlp_get_type(item) == RLP_TYPE_STRING) {
-        /* Typed transaction — RLP string: type_byte || RLP(fields) */
         const bytes_t *b = rlp_get_string(item);
         if (!b || b->len < 2) return false;
 
         uint8_t type_byte = b->data[0];
 
-        /* Decode inner RLP (after type byte) */
+        /* Legacy tx wrapped in RLP string (from SSZ/era files):
+         * first byte >= 0x80 means RLP-encoded, not a type prefix */
+        if (type_byte >= 0x80) {
+            rlp_item_t *decoded = rlp_decode(b->data, b->len);
+            if (!decoded) return false;
+            bool ok = (rlp_get_type(decoded) == RLP_TYPE_LIST) &&
+                      decode_legacy(tx, decoded, chain_id);
+            rlp_item_free(decoded);
+            if (!ok) tx_decoded_free(tx);
+            return ok;
+        }
+
+        /* Typed transaction: type_byte || RLP(fields) */
         rlp_item_t *inner = rlp_decode(b->data + 1, b->len - 1);
         if (!inner || rlp_get_type(inner) != RLP_TYPE_LIST) {
             if (inner) rlp_item_free(inner);
