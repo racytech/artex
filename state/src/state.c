@@ -254,7 +254,11 @@ struct state {
     /* Block state */
     uint64_t current_block;
     bool     prune_empty;
-    bool     storage_roots_stale;  /* true if any block skipped storage root computation */
+
+    /* Storage root dirty bitmap — 1 bit per resource index.
+     * Set by finalize_block when STORAGE_DIRTY, cleared by compute_root. */
+    uint8_t *stor_dirty_bits;
+    uint32_t stor_dirty_cap;     /* capacity in bits (>= res_capacity) */
 
     /* Storage pool — mmap-backed per-account ART trie */
     storage_hart_pool_t *stor_pool;
@@ -269,6 +273,28 @@ struct state {
 /* =========================================================================
  * Internal helpers
  * ========================================================================= */
+
+/* Storage root dirty bitmap helpers */
+static inline void stor_dirty_set(state_t *s, uint32_t idx) {
+    if (idx < s->stor_dirty_cap)
+        s->stor_dirty_bits[idx / 8] |= (1u << (idx % 8));
+}
+static inline bool stor_dirty_test(const state_t *s, uint32_t idx) {
+    return idx < s->stor_dirty_cap &&
+           (s->stor_dirty_bits[idx / 8] & (1u << (idx % 8))) != 0;
+}
+static void stor_dirty_grow(state_t *s, uint32_t min_cap) {
+    if (min_cap <= s->stor_dirty_cap) return;
+    uint32_t new_cap = s->stor_dirty_cap ? s->stor_dirty_cap * 2 : 1024;
+    while (new_cap < min_cap) new_cap *= 2;
+    uint32_t old_bytes = (s->stor_dirty_cap + 7) / 8;
+    uint32_t new_bytes = (new_cap + 7) / 8;
+    uint8_t *nb = realloc(s->stor_dirty_bits, new_bytes);
+    if (!nb) return;
+    memset(nb + old_bytes, 0, new_bytes - old_bytes);
+    s->stor_dirty_bits = nb;
+    s->stor_dirty_cap = new_cap;
+}
 
 /* Cached addr → keccak256(addr). Computes once per address per block. */
 static hash_t addr_hash_cached(state_t *s, const uint8_t addr[20]) {
@@ -321,6 +347,7 @@ static resource_t *ensure_resource(state_t *s, account_t *a) {
         memset(nr + s->res_capacity, 0, (nc - s->res_capacity) * sizeof(resource_t));
         s->resources = nr;
         s->res_capacity = nc;
+        stor_dirty_grow(s, nc);
     }
 
     uint32_t ridx = s->res_count++;
@@ -485,6 +512,11 @@ state_t *state_create(code_store_t *cs) {
     s->res_capacity = 1024;
     s->res_count = 1;
 
+    /* Storage root dirty bitmap */
+    s->stor_dirty_cap = 1024;
+    s->stor_dirty_bits = calloc((1024 + 7) / 8, 1);
+    if (!s->stor_dirty_bits) { free(s->resources); free(s->journal); free(s->accounts); free(s); return NULL; }
+
     /* Default storage pool on tmpfs — replaced by state_set_storage_path if called */
     char tmp[64];
     snprintf(tmp, sizeof(tmp), "/dev/shm/artex_stor_%d.dat", (int)getpid());
@@ -505,6 +537,7 @@ void state_destroy(state_t *s) {
             storage_hart_clear(s->stor_pool, &r->storage);
     }
     free(s->resources);
+    free(s->stor_dirty_bits);
     free(s->accounts);
     free(s->phantoms);
     free(s->destructed);
@@ -1328,22 +1361,68 @@ state_stats_t state_get_stats(const state_t *s) {
  * save/load — TODO: implement serialization
  * ========================================================================= */
 
-hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
+void state_invalidate_all(state_t *s) {
+    if (!s) return;
+    hart_invalidate_all(&s->acct_index);
+    for (uint32_t i = 1; i < s->res_count; i++) {
+        resource_t *r = &s->resources[i];
+        if (!storage_hart_empty(&r->storage))
+            storage_hart_invalidate(s->stor_pool, &r->storage);
+        stor_dirty_set(s, i);
+    }
+}
+
+/**
+ * Compute Merkle root. Requires state_finalize_block() was called for
+ * every block since the last root computation.
+ *
+ *   1. Recompute dirty storage roots (tracked via bitmap)
+ *   2. Compute hart_root_hash
+ */
+hash_t state_compute_root(state_t *s, bool prune_empty) {
+    (void)prune_empty;
     hash_t root = {0};
     if (!s) return root;
 
-    /* Non-checkpoint: finalize per-block state, skip root computation */
-    if (!compute_hash) {
-        state_finalize_block(s, prune_empty);
-        return root;
+    /* Recompute storage roots for resources marked dirty by finalize_block */
+    uint32_t bitmap_bytes = (s->stor_dirty_cap + 7) / 8;
+    for (uint32_t b = 0; b < bitmap_bytes; b++) {
+        if (!s->stor_dirty_bits[b]) continue;  /* skip clean byte (8 resources) */
+        for (uint32_t bit = 0; bit < 8; bit++) {
+            if (!(s->stor_dirty_bits[b] & (1u << bit))) continue;
+            uint32_t idx = b * 8 + bit;
+            if (idx == 0 || idx >= s->res_count) continue;
+            resource_t *r = &s->resources[idx];
+            if (!storage_hart_empty(&r->storage))
+                storage_hart_root_hash(s->stor_pool, &r->storage,
+                                       stor_value_encode, NULL,
+                                       r->storage_root.bytes);
+            else
+                r->storage_root = EMPTY_STORAGE_ROOT;
+        }
     }
+    memset(s->stor_dirty_bits, 0, bitmap_bytes);
 
-    /* Checkpoint: full root computation.
-     * Process all accumulated dirty entries, compute storage roots,
-     * delete dead accounts from trie, compute Merkle root. */
+    /* Compute Merkle root */
+    hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
+
+    return root;
+}
+
+/* Backward-compat wrapper — compute_hash param ignored. */
+hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool _unused) {
+    (void)_unused;
+    return state_compute_root(s, prune_empty);
+}
+
+void state_finalize_block(state_t *s, bool prune_empty) {
+    if (!s) return;
+
+    /* Per-block state processing: promote/demote existence, delete dead
+     * accounts from acct_index, mark stale storage roots, clear flags. */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
-        hash_t ah = hash_keccak256(akey, 20);
+        hash_t ah = addr_hash_cached(s, akey);
         account_t *a = find_account_h(s, &ah);
         if (!a || !acct_has_flag(a, ACCT_MPT_DIRTY)) continue;
 
@@ -1355,20 +1434,16 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
                 acct_set_flag(a, ACCT_EXISTED);
         }
 
-        /* Compute storage root if dirty */
-        if (acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
-            resource_t *r = get_resource(s, a);
-            if (r && !storage_hart_empty(&r->storage))
-                storage_hart_root_hash(s->stor_pool, &r->storage,
-                                       stor_value_encode, NULL,
-                                       r->storage_root.bytes);
-            else if (r)
-                r->storage_root = EMPTY_STORAGE_ROOT;
-        }
+        /* Delete from acct_index if dead/empty — compaction cleans up
+         * orphaned slots if the account is re-touched in a later block. */
+        bool dead = !acct_has_flag(a, ACCT_EXISTED) ||
+                    (acct_is_empty(a) && prune_empty);
 
-        /* Delete from acct_index if dead/empty */
-        if (!acct_has_flag(a, ACCT_EXISTED) ||
-            (acct_is_empty(a) && prune_empty))
+        /* Mark live accounts for storage root recomputation (skip dead — orphaned) */
+        if (acct_has_flag(a, ACCT_STORAGE_DIRTY) && a->resource_idx && !dead)
+            stor_dirty_set(s, a->resource_idx);
+
+        if (dead)
             hart_delete(&s->acct_index, ah.bytes);
 
         /* Clear flags */
@@ -1376,13 +1451,15 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
                         ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
     }
 
-    /* Remove dead accounts from acct_index (phantoms, destructed, pruned) */
+    /* Delete dead accounts from acct_index (phantoms, destructed, pruned).
+     * Guard: only delete if account is truly dead — it may have been
+     * re-created in a later tx within the same block. */
     #define SAFE_DELETE_IDX(i) do { \
         if ((i) < s->count) { \
             account_t *_a = &s->accounts[(i)]; \
             if (!acct_has_flag(_a, ACCT_EXISTED) || \
                 (acct_is_empty(_a) && prune_empty)) { \
-                hash_t _h = hash_keccak256(_a->addr.bytes, 20); \
+                hash_t _h = addr_hash_cached(s, _a->addr.bytes); \
                 const uint32_t *_p = (const uint32_t *) \
                     hart_get(&s->acct_index, _h.bytes); \
                 if (_p && *_p == (i)) \
@@ -1398,96 +1475,22 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     for (uint32_t ri = 0; ri < s->pruned_count; ri++)
         SAFE_DELETE_IDX(s->pruned[ri]);
 
+    #undef SAFE_DELETE_IDX
     s->dead_total += s->phantom_count + s->destructed_count + s->pruned_count;
     s->phantom_count = 0;
     s->destructed_count = 0;
     s->pruned_count = 0;
 
-    #undef SAFE_DELETE_IDX
-
-    /* Recompute stale storage roots — needed if previous blocks ran in
-     * no-validate mode and skipped per-account storage root computation */
-    if (s->storage_roots_stale) {
-        for (uint32_t i = 1; i < s->res_count; i++) {
-            resource_t *r = &s->resources[i];
-            if (!storage_hart_empty(&r->storage))
-                storage_hart_root_hash(s->stor_pool, &r->storage,
-                                       stor_value_encode, NULL,
-                                       r->storage_root.bytes);
-            else
-                r->storage_root = EMPTY_STORAGE_ROOT;
-        }
-        s->storage_roots_stale = false;
-    }
-    hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
-
-    /* Swap blk_dirty → last_dirty (preserves for dump-prestate callers) */
+    /* Swap blk_dirty → last_dirty (preserves for diff collection) */
     dirty_vec_t tmp = s->last_dirty;
     s->last_dirty = s->blk_dirty;
     s->blk_dirty = tmp;
     dirty_clear(&s->blk_dirty);
     s->blk_dirty_cursor = 0;
-
-    /* Clear block-level originals (consumed by diff collection before this point) */
-    mem_art_destroy(&s->blk_orig_acct); mem_art_init(&s->blk_orig_acct);
-    mem_art_destroy(&s->blk_orig_stor); mem_art_init(&s->blk_orig_stor);
-
-    /* Reset addr hash cache */
-    mem_art_destroy(&s->addr_hash_cache);
-    mem_art_init(&s->addr_hash_cache);
-
-    return root;
 }
 
-void state_invalidate_all(state_t *s) {
+void state_reset_block(state_t *s) {
     if (!s) return;
-    hart_invalidate_all(&s->acct_index);
-    for (uint32_t i = 1; i < s->res_count; i++) {
-        resource_t *r = &s->resources[i];
-        if (!storage_hart_empty(&r->storage))
-            storage_hart_invalidate(s->stor_pool, &r->storage);
-    }
-}
-
-hash_t state_compute_root(state_t *s, bool prune_empty) {
-    return state_compute_root_ex(s, prune_empty, true);
-}
-
-void state_finalize_block(state_t *s, bool prune_empty) {
-    if (!s) return;
-
-    /* Per-block state processing — same as compute_root_ex but without
-     * computing the Merkle root or storage roots. NO hart_delete — dead
-     * accounts stay in the index (ACCT_EXISTED cleared) until compute_root_ex
-     * removes them at checkpoint/snapshot time. */
-    for (size_t d = 0; d < s->blk_dirty.count; d++) {
-        const uint8_t *akey = s->blk_dirty.keys + d * 20;
-        account_t *a = find_account(s, akey);
-        if (!a || !acct_has_flag(a, ACCT_MPT_DIRTY)) continue;
-
-        /* Promote/demote existence */
-        if (acct_has_flag(a, ACCT_BLOCK_DIRTY)) {
-            if (acct_has_flag(a, ACCT_SELF_DESTRUCTED))
-                acct_clear_flag(a, ACCT_EXISTED);
-            else if (!acct_is_empty(a))
-                acct_set_flag(a, ACCT_EXISTED);
-        }
-
-        /* Mark storage roots stale (will be recomputed at checkpoint) */
-        if (acct_has_flag(a, ACCT_STORAGE_DIRTY))
-            s->storage_roots_stale = true;
-
-        /* Clear flags — same as compute_root_ex */
-        acct_clear_flag(a, ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY |
-                        ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
-    }
-
-    /* Swap blk_dirty — same as compute_root_ex */
-    dirty_vec_t tmp = s->last_dirty;
-    s->last_dirty = s->blk_dirty;
-    s->blk_dirty = tmp;
-    dirty_clear(&s->blk_dirty);
-    s->blk_dirty_cursor = 0;
 
     /* Clear per-block originals */
     mem_art_destroy(&s->blk_orig_acct); mem_art_init(&s->blk_orig_acct);
@@ -1790,6 +1793,10 @@ void state_compact(state_t *s) {
     s->destructed_count = 0;
     s->pruned_count = 0;
     s->dead_total = 0;
+
+    /* Mark all storage roots dirty — acct_index was rebuilt from scratch */
+    for (uint32_t i = 1; i < s->res_count; i++)
+        stor_dirty_set(s, i);
 }
 
 /* =========================================================================
@@ -2020,6 +2027,11 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
     }
 
     if (s->stor_pool) storage_hart_pool_sync(s->stor_pool);
+
+    /* Mark all loaded storage roots dirty — they were serialized,
+     * need recomputation from storage harts at next compute_root */
+    for (uint32_t i = 1; i < s->res_count; i++)
+        stor_dirty_set(s, i);
 
     fclose(f);
     fprintf(stderr, "state_load: %u accounts from %s (block %lu)\n",

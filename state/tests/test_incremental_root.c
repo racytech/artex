@@ -3,8 +3,8 @@
  *
  * Simulates --validate-every-256 pattern:
  *   1. Build initial state, compute root (caches hashes)
- *   2. Modify accounts over N "blocks" with compute_root_ex(false)
- *   3. Checkpoint: compute_root_ex(true) — incremental
+ *   2. Modify accounts over N "blocks" with finalize_block
+ *   3. Checkpoint: compute_root — incremental
  *   4. Compare with full recomputation (rebuild harts from scratch)
  *
  * If they differ, dirty flag propagation is broken.
@@ -65,9 +65,12 @@ static void sim_block(evm_state_t *es, state_t *st, int block_num,
 
     evm_state_commit_tx(es);
 
-    /* Simulate block_execute calling state_compute_root_ex */
+    /* Simulate block_execute: finalize every block, compute root at checkpoint */
     bool prune = (block_num >= 10);
-    state_compute_root_ex(st, prune, compute_hash);
+    state_finalize_block(st, prune);
+    if (compute_hash)
+        state_compute_root(st, prune);
+    state_reset_block(st);
 }
 
 /* Full recomputation: save state, reload into fresh instance, compute root */

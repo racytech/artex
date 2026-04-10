@@ -264,6 +264,7 @@ bool evm_state_finalize(evm_state_t *es);
 hash_t evm_state_compute_state_root_ex(evm_state_t *es, bool prune_empty);
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty);
 void   evm_state_finalize_block(evm_state_t *es, bool prune_empty);
+void   evm_state_reset_block(evm_state_t *es);
 hash_t evm_state_compute_state_root_ex2(evm_state_t *es, bool prune_empty, bool compute_hash);
 void   evm_state_invalidate_all(evm_state_t *es);
 

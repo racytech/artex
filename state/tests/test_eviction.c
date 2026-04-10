@@ -131,7 +131,8 @@ int main(void) {
             evm_state_set_storage(es, &a3, &slot1, &touch_val);
             evm_state_commit_tx(es);
         }
-        evm_state_compute_state_root_ex2(es, false, false);
+        evm_state_finalize_block(es, false);
+        evm_state_reset_block(es);
     }
 
     /* Compute reference root AFTER all modifications (including a3 at block 15) */
@@ -182,7 +183,8 @@ int main(void) {
     /* Make a1 cold again */
     for (uint64_t b = 21; b <= 40; b++) {
         evm_state_begin_block(es, b);
-        evm_state_compute_state_root_ex2(es, false, false);
+        evm_state_finalize_block(es, false);
+        evm_state_reset_block(es);
     }
     n_evicted = state_evict_cold_storage(st);
     printf("  evicted: %u accounts\n", n_evicted);
@@ -207,7 +209,8 @@ int main(void) {
     /* Make a2, a3 cold and evict */
     for (uint64_t b = 42; b <= 60; b++) {
         evm_state_begin_block(es, b);
-        evm_state_compute_state_root_ex2(es, false, false);
+        evm_state_finalize_block(es, false);
+        evm_state_reset_block(es);
     }
     state_evict_cold_storage(st);
 

@@ -751,17 +751,25 @@ block_result_t block_execute(evm_t *evm,
     }
 #endif
 
-    /* Compute state root — prune empty accounts post-Spurious Dragon (EIP-161).
-     * When skip_root_hash is set, skip the expensive hash but still prune. */
+    /* Per-block finalization — always runs: promotes/demotes existence,
+     * marks stale storage roots, clears dirty flags, swaps dirty buffer. */
     bool prune_empty = (evm->fork >= FORK_SPURIOUS_DRAGON);
+    evm_state_finalize_block(evm->state, prune_empty);
+
+    /* Compute state root at checkpoint — prune empty accounts post-EIP-161. */
     struct timespec _rt0, _rt1;
     clock_gettime(CLOCK_MONOTONIC, &_rt0);
-    result.state_root = evm_state_compute_state_root_ex2(
-        evm->state, prune_empty, !evm->skip_root_hash);
+    if (!evm->skip_root_hash) {
+        result.state_root = evm_state_compute_state_root_ex(evm->state, prune_empty);
+    }
     clock_gettime(CLOCK_MONOTONIC, &_rt1);
     result.root_ms = (_rt1.tv_sec - _rt0.tv_sec) * 1000.0 +
                      (_rt1.tv_nsec - _rt0.tv_nsec) / 1e6;
     result.gas_used = cumulative_gas;
+
+    /* Reset per-block caches (addr hash, originals) — after compute_root
+     * so it can still benefit from the warm addr_hash_cache. */
+    evm_state_reset_block(evm->state);
 
     return result;
 }

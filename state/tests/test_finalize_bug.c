@@ -5,7 +5,7 @@
  *   Block 1: modify account A's storage
  *   → state_finalize_block (non-checkpoint, clears flags + blk_dirty)
  *   Block 2: modify account B's balance (different account)
- *   → state_compute_root_ex(compute_hash=true) (checkpoint)
+ *   → state_compute_root (checkpoint)
  *
  * Compare with reference that calls state_compute_root every block.
  * If they differ, the bug is confirmed.
@@ -105,6 +105,7 @@ int main(void) {
     evm_state_set_storage(test, &a1, &skey1, &sval2);
     evm_state_commit_tx(test);
     state_finalize_block(test_st, false);
+    state_reset_block(test_st);
     evm_state_commit(test);
 
     /* Block 2: modify a2 balance — checkpoint (compute hash) */

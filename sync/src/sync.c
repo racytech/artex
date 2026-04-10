@@ -276,7 +276,7 @@ bool sync_load_genesis(sync_t *sync, const char *genesis_json_path,
     /* Commit genesis as original state (EIP-2200) + flush */
     evm_state_commit(sync->state);
     evm_state_finalize(sync->state);
-    evm_state_compute_state_root_ex(sync->state, false);
+    evm_state_compute_mpt_root(sync->state, false);
 
     /* Store genesis block hash */
     if (genesis_hash)
@@ -424,7 +424,6 @@ bool sync_execute_block(sync_t *sync,
                             ? sync->config.checkpoint_interval : 256;
 
         if (bn % ci_compact == 0 && st &&
-            !sync->evm->skip_root_hash &&
             bn - sync->last_compact_block >= 100000) {
             state_stats_t ss = state_get_stats(st);
             uint32_t dead = state_dead_count(st);

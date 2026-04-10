@@ -139,6 +139,7 @@ void      state_tstore(state_t *s, const address_t *addr,
 hash_t state_compute_root(state_t *s, bool prune_empty);
 hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash);
 void   state_finalize_block(state_t *s, bool prune_empty);
+void   state_reset_block(state_t *s);
 
 /* Force full recomputation on next compute_root — invalidates all cached
  * hashes in account index and all storage harts. Use at snapshot time. */
