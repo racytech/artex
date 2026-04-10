@@ -1248,7 +1248,7 @@ void state_commit_tx(state_t *s) {
 void state_commit_block(state_t *s) {
     if (!s) return;
 
-    for (size_t d = 0; d < s->blk_dirty.count; d++) {
+    for (size_t d = s->blk_dirty_cursor; d < s->blk_dirty.count; d++) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
         account_t *a = find_account(s, akey);
         if (!a) continue;
@@ -1332,7 +1332,7 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     hash_t root = {0};
     if (!s) return root;
 
-    /* Non-checkpoint: just finalize and return zero hash */
+    /* Non-checkpoint: finalize per-block state, skip root computation */
     if (!compute_hash) {
         state_finalize_block(s, prune_empty);
         return root;
@@ -1455,40 +1455,45 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
 
 void state_finalize_block(state_t *s, bool prune_empty) {
     if (!s) return;
-    (void)prune_empty;
 
-    /* Lightweight per-block finalization. Only promotes/demotes existence
-     * for correct EVM semantics. NO hart_delete — dead accounts stay in
-     * the index (with ACCT_EXISTED cleared) until compute_root_ex removes
-     * them at checkpoint time. This prevents the duplicate-account bug
-     * where hart_delete + subsequent ensure_account creates a new slot,
-     * orphaning the original's storage/code. */
-    for (size_t d = s->blk_dirty_cursor; d < s->blk_dirty.count; d++) {
+    /* Per-block state processing — same as compute_root_ex but without
+     * computing the Merkle root or storage roots. NO hart_delete — dead
+     * accounts stay in the index (ACCT_EXISTED cleared) until compute_root_ex
+     * removes them at checkpoint/snapshot time. */
+    for (size_t d = 0; d < s->blk_dirty.count; d++) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
         account_t *a = find_account(s, akey);
         if (!a || !acct_has_flag(a, ACCT_MPT_DIRTY)) continue;
 
+        /* Promote/demote existence */
         if (acct_has_flag(a, ACCT_BLOCK_DIRTY)) {
             if (acct_has_flag(a, ACCT_SELF_DESTRUCTED))
                 acct_clear_flag(a, ACCT_EXISTED);
             else if (!acct_is_empty(a))
                 acct_set_flag(a, ACCT_EXISTED);
-            acct_clear_flag(a, ACCT_BLOCK_DIRTY);
         }
+
+        /* Mark storage roots stale (will be recomputed at checkpoint) */
+        if (acct_has_flag(a, ACCT_STORAGE_DIRTY))
+            s->storage_roots_stale = true;
+
+        /* Clear flags — same as compute_root_ex */
+        acct_clear_flag(a, ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY |
+                        ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
     }
 
-    /* Advance cursor — next finalize starts from here.
-     * blk_dirty, MPT_DIRTY, STORAGE_DIRTY are NOT cleared —
-     * they accumulate until state_compute_root_ex processes them.
-     * Phantom/destructed/pruned lists also accumulate. */
-    s->blk_dirty_cursor = s->blk_dirty.count;
+    /* Swap blk_dirty — same as compute_root_ex */
+    dirty_vec_t tmp = s->last_dirty;
+    s->last_dirty = s->blk_dirty;
+    s->blk_dirty = tmp;
+    dirty_clear(&s->blk_dirty);
+    s->blk_dirty_cursor = 0;
 
-    /* Clear per-block originals — diff collection already consumed them.
-     * Without this, originals accumulate and produce bloated diffs. */
+    /* Clear per-block originals */
     mem_art_destroy(&s->blk_orig_acct); mem_art_init(&s->blk_orig_acct);
     mem_art_destroy(&s->blk_orig_stor); mem_art_init(&s->blk_orig_stor);
 
-    /* Reset addr hash cache — addresses from this block unlikely to repeat */
+    /* Reset addr hash cache */
     mem_art_destroy(&s->addr_hash_cache);
     mem_art_init(&s->addr_hash_cache);
 }
