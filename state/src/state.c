@@ -1469,7 +1469,9 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
      * blk_dirty, flags, phantom/destructed/pruned all persist.
      * ================================================================ */
     if (!compute_hash) {
-        s->storage_roots_stale = true;
+        /* Don't set storage_roots_stale — dirty accounts accumulate in
+         * blk_dirty with ACCT_STORAGE_DIRTY and will be processed at the
+         * next checkpoint. The stale flag is only for invalidate_all. */
         mem_art_destroy(&s->blk_orig_acct); mem_art_init(&s->blk_orig_acct);
         mem_art_destroy(&s->blk_orig_stor); mem_art_init(&s->blk_orig_stor);
         mem_art_destroy(&s->addr_hash_cache); mem_art_init(&s->addr_hash_cache);
