@@ -1462,10 +1462,16 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
             }
         }
 
-        /* Delete from acct_index if dead/empty */
-        if (!acct_has_flag(a, ACCT_EXISTED) ||
-            (acct_is_empty(a) && prune_empty))
-            hart_delete(&s->acct_index, ah.bytes);
+        /* Delete from acct_index if dead/empty — only at checkpoint blocks.
+         * At non-checkpoint blocks (compute_hash=false) we must NOT delete
+         * because find_account_h relies on acct_index for lookups. Deleting
+         * here would cause ensure_account_h to create a duplicate entry,
+         * losing the original account's storage/code. */
+        if (compute_hash) {
+            if (!acct_has_flag(a, ACCT_EXISTED) ||
+                (acct_is_empty(a) && prune_empty))
+                hart_delete(&s->acct_index, ah.bytes);
+        }
 
         /* Clear flags */
         acct_clear_flag(a, ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY |
@@ -1487,17 +1493,19 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
         } \
     } while(0)
 
-    for (uint32_t pi = 0; pi < s->phantom_count; pi++)
-        SAFE_DELETE_IDX(s->phantoms[pi]);
-    for (uint32_t di = 0; di < s->destructed_count; di++)
-        SAFE_DELETE_IDX(s->destructed[di]);
-    for (uint32_t ri = 0; ri < s->pruned_count; ri++)
-        SAFE_DELETE_IDX(s->pruned[ri]);
+    if (compute_hash) {
+        for (uint32_t pi = 0; pi < s->phantom_count; pi++)
+            SAFE_DELETE_IDX(s->phantoms[pi]);
+        for (uint32_t di = 0; di < s->destructed_count; di++)
+            SAFE_DELETE_IDX(s->destructed[di]);
+        for (uint32_t ri = 0; ri < s->pruned_count; ri++)
+            SAFE_DELETE_IDX(s->pruned[ri]);
 
-    s->dead_total += s->phantom_count + s->destructed_count + s->pruned_count;
-    s->phantom_count = 0;
-    s->destructed_count = 0;
-    s->pruned_count = 0;
+        s->dead_total += s->phantom_count + s->destructed_count + s->pruned_count;
+        s->phantom_count = 0;
+        s->destructed_count = 0;
+        s->pruned_count = 0;
+    }
 
     #undef SAFE_DELETE_IDX
 
