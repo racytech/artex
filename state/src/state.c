@@ -1464,32 +1464,16 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
 
     bool has_pool = s->root_pool.threads != NULL;
 
-    /* ================================================================
-     * Non-checkpoint: accumulate dirty state for the next checkpoint.
-     * blk_dirty, flags, phantom/destructed/pruned all persist.
-     * ================================================================ */
-    if (!compute_hash) {
-        /* Don't set storage_roots_stale — dirty accounts accumulate in
-         * blk_dirty with ACCT_STORAGE_DIRTY and will be processed at the
-         * next checkpoint. The stale flag is only for invalidate_all. */
-        mem_art_destroy(&s->blk_orig_acct); mem_art_init(&s->blk_orig_acct);
-        mem_art_destroy(&s->blk_orig_stor); mem_art_init(&s->blk_orig_stor);
-        mem_art_destroy(&s->addr_hash_cache); mem_art_init(&s->addr_hash_cache);
-        return root;
-    }
-
-    /* ================================================================
-     * Checkpoint: process all accumulated dirty accounts.
-     * ================================================================ */
-
-    /* Phase 1: compute storage roots (parallel or serial) */
-    if (has_pool && s->blk_dirty.count > 0) {
+    /* Phase 1: compute dirty storage roots (parallel or serial).
+     * Must complete BEFORE the flag-clearing pass below. */
+    if (compute_hash && has_pool && s->blk_dirty.count > 0) {
         root_pool_dispatch(s, ROOT_JOB_DIRTY,
                            s->blk_dirty.keys, s->blk_dirty.count,
                            NULL, 0);
     }
 
-    /* Phase 2: promote existence, compute storage roots (serial), prune, clear flags */
+    /* Phase 2: promote existence, compute storage roots, clear flags.
+     * Runs every block. hart_delete deferred to checkpoint only. */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
         hash_t ah = hash_keccak256(akey, 20);
@@ -1504,28 +1488,34 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
                 acct_set_flag(a, ACCT_EXISTED);
         }
 
-        /* Compute storage root (serial only — pool handled above) */
-        if (!has_pool && acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
-            resource_t *r = get_resource(s, a);
-            if (r && !storage_hart_empty(&r->storage))
-                storage_hart_root_hash(s->stor_pool, &r->storage,
-                                       stor_value_encode, NULL,
-                                       r->storage_root.bytes);
-            else if (r)
-                r->storage_root = EMPTY_STORAGE_ROOT;
+        /* Compute storage root if dirty */
+        if (acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
+            if (compute_hash && !has_pool) {
+                resource_t *r = get_resource(s, a);
+                if (r && !storage_hart_empty(&r->storage))
+                    storage_hart_root_hash(s->stor_pool, &r->storage,
+                                           stor_value_encode, NULL,
+                                           r->storage_root.bytes);
+                else if (r)
+                    r->storage_root = EMPTY_STORAGE_ROOT;
+            } else if (!compute_hash) {
+                s->storage_roots_stale = true;
+            }
         }
 
-        /* Delete from acct_index if dead/empty */
-        if (!acct_has_flag(a, ACCT_EXISTED) ||
-            (acct_is_empty(a) && prune_empty))
-            hart_delete(&s->acct_index, ah.bytes);
+        /* Delete from acct_index — checkpoint only (find_account_h needs it) */
+        if (compute_hash) {
+            if (!acct_has_flag(a, ACCT_EXISTED) ||
+                (acct_is_empty(a) && prune_empty))
+                hart_delete(&s->acct_index, ah.bytes);
+        }
 
         /* Clear flags */
         acct_clear_flag(a, ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY |
                         ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
     }
 
-    /* Remove dead accounts from acct_index (phantoms, destructed, pruned) */
+    /* Remove dead accounts — checkpoint only */
     #define SAFE_DELETE_IDX(i) do { \
         if ((i) < s->count) { \
             account_t *_a = &s->accounts[(i)]; \
@@ -1540,43 +1530,46 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
         } \
     } while(0)
 
-    for (uint32_t pi = 0; pi < s->phantom_count; pi++)
-        SAFE_DELETE_IDX(s->phantoms[pi]);
-    for (uint32_t di = 0; di < s->destructed_count; di++)
-        SAFE_DELETE_IDX(s->destructed[di]);
-    for (uint32_t ri = 0; ri < s->pruned_count; ri++)
-        SAFE_DELETE_IDX(s->pruned[ri]);
+    if (compute_hash) {
+        for (uint32_t pi = 0; pi < s->phantom_count; pi++)
+            SAFE_DELETE_IDX(s->phantoms[pi]);
+        for (uint32_t di = 0; di < s->destructed_count; di++)
+            SAFE_DELETE_IDX(s->destructed[di]);
+        for (uint32_t ri = 0; ri < s->pruned_count; ri++)
+            SAFE_DELETE_IDX(s->pruned[ri]);
 
-    s->dead_total += s->phantom_count + s->destructed_count + s->pruned_count;
-    s->phantom_count = 0;
-    s->destructed_count = 0;
-    s->pruned_count = 0;
+        s->dead_total += s->phantom_count + s->destructed_count + s->pruned_count;
+        s->phantom_count = 0;
+        s->destructed_count = 0;
+        s->pruned_count = 0;
+    }
 
     #undef SAFE_DELETE_IDX
 
-    /* Recompute stale storage roots (all resources) */
-    if (s->storage_roots_stale) {
-        if (has_pool) {
-            root_pool_dispatch(s, ROOT_JOB_ALL, NULL, 0,
-                               s->resources, s->res_count - 1);
-        } else {
-            for (uint32_t i = 1; i < s->res_count; i++) {
-                resource_t *r = &s->resources[i];
-                if (!storage_hart_empty(&r->storage))
-                    storage_hart_root_hash(s->stor_pool, &r->storage,
-                                           stor_value_encode, NULL,
-                                           r->storage_root.bytes);
-                else
-                    r->storage_root = EMPTY_STORAGE_ROOT;
+    /* Compute account trie root */
+    if (compute_hash) {
+        /* Recompute stale storage roots (all resources) */
+        if (s->storage_roots_stale) {
+            if (has_pool) {
+                root_pool_dispatch(s, ROOT_JOB_ALL, NULL, 0,
+                                   s->resources, s->res_count - 1);
+            } else {
+                for (uint32_t i = 1; i < s->res_count; i++) {
+                    resource_t *r = &s->resources[i];
+                    if (!storage_hart_empty(&r->storage))
+                        storage_hart_root_hash(s->stor_pool, &r->storage,
+                                               stor_value_encode, NULL,
+                                               r->storage_root.bytes);
+                    else
+                        r->storage_root = EMPTY_STORAGE_ROOT;
+                }
             }
+            s->storage_roots_stale = false;
         }
-        s->storage_roots_stale = false;
+        hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
     }
 
-    /* Compute account trie root */
-    hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
-
-    /* Swap blk_dirty → last_dirty, clear for next interval */
+    /* Swap blk_dirty → last_dirty, clear for next block */
     dirty_vec_t tmp = s->last_dirty;
     s->last_dirty = s->blk_dirty;
     s->blk_dirty = tmp;
