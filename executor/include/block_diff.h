@@ -52,14 +52,14 @@ typedef struct {
     hash_t      code_hash;   /* new code_hash (valid if field_mask & FIELD_CODE_HASH) */
     hash_t      old_code_hash; /* previous code_hash (for undo) */
     slot_diff_t *slots;      /* heap-allocated array */
-    uint16_t    slot_count;
+    uint32_t    slot_count;
 } addr_diff_t;
 
 /** Per-block diff: array of address groups. */
 typedef struct block_diff_t {
     uint64_t     block_number;
     addr_diff_t *groups;        /* heap-allocated array */
-    uint16_t     group_count;
+    uint32_t     group_count;
 } block_diff_t;
 
 /** Free a block_diff_t's heap allocations (not the struct itself). */

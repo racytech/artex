@@ -415,14 +415,16 @@ bool sync_execute_block(sync_t *sync,
     }
 
     /* Compaction — reclaim dead/phantom accounts and arena waste.
-     * Triggers when dead accounts exceed 20% of live, with minimum 100K-block
-     * cooldown between compactions. Checked at checkpoint boundaries only. */
+     * Only runs after root computation (compute_hash=true) at checkpoint
+     * boundaries, so hart_delete has already cleaned dead entries from
+     * the trie. Minimum 100K-block cooldown between compactions. */
     {
         state_t *st = evm_state_get_state(sync->state);
         uint32_t ci_compact = sync->config.checkpoint_interval > 0
                             ? sync->config.checkpoint_interval : 256;
 
         if (bn % ci_compact == 0 && st &&
+            !sync->evm->skip_root_hash &&
             bn - sync->last_compact_block >= 100000) {
             state_stats_t ss = state_get_stats(st);
             uint32_t dead = state_dead_count(st);
@@ -505,18 +507,16 @@ bool sync_execute_block_live(sync_t *sync,
         return true;
     }
 
-    /* Periodic state root validation (every checkpoint_interval blocks) */
+    /* Periodic state root validation (every checkpoint_interval blocks).
+     * Uses the root already computed by block_execute — no recomputation. */
     uint32_t ci = sync->config.checkpoint_interval > 0
                 ? sync->config.checkpoint_interval : 256;
     if (sync->config.validate_state_root && bn % ci == 0) {
 
-        bool prune_empty = (sync->evm->fork >= FORK_SPURIOUS_DRAGON);
-        hash_t actual = evm_state_compute_mpt_root(sync->state, prune_empty);
-
-        if (memcmp(actual.bytes, header->state_root.bytes, 32) != 0) {
+        if (memcmp(br.state_root.bytes, header->state_root.bytes, 32) != 0) {
             result->ok    = false;
             result->error = SYNC_ROOT_MISMATCH;
-            result->actual_root   = actual;
+            result->actual_root   = br.state_root;
             result->expected_root = header->state_root;
             sync->blocks_fail++;
             sync->total_gas += br.gas_used;

@@ -1305,8 +1305,15 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     hash_t root = {0};
     if (!s) return root;
 
-    /* Single pass: promote existence, compute storage roots, prune, clear flags.
-     * One find_account (keccak + hart_get) per dirty account instead of three. */
+    /* Non-checkpoint: just finalize and return zero hash */
+    if (!compute_hash) {
+        state_finalize_block(s, prune_empty);
+        return root;
+    }
+
+    /* Checkpoint: full root computation.
+     * Process all accumulated dirty entries, compute storage roots,
+     * delete dead accounts from trie, compute Merkle root. */
     for (size_t d = 0; d < s->blk_dirty.count; d++) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
         hash_t ah = hash_keccak256(akey, 20);
@@ -1323,17 +1330,13 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
 
         /* Compute storage root if dirty */
         if (acct_has_flag(a, ACCT_STORAGE_DIRTY)) {
-            if (compute_hash) {
-                resource_t *r = get_resource(s, a);
-                if (r && !storage_hart_empty(&r->storage))
-                    storage_hart_root_hash(s->stor_pool, &r->storage,
-                                           stor_value_encode, NULL,
-                                           r->storage_root.bytes);
-                else if (r)
-                    r->storage_root = EMPTY_STORAGE_ROOT;
-            } else {
-                s->storage_roots_stale = true;
-            }
+            resource_t *r = get_resource(s, a);
+            if (r && !storage_hart_empty(&r->storage))
+                storage_hart_root_hash(s->stor_pool, &r->storage,
+                                       stor_value_encode, NULL,
+                                       r->storage_root.bytes);
+            else if (r)
+                r->storage_root = EMPTY_STORAGE_ROOT;
         }
 
         /* Delete from acct_index if dead/empty */
@@ -1375,24 +1378,21 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
 
     #undef SAFE_DELETE_IDX
 
-    /* Compute account trie root */
-    if (compute_hash) {
-        /* Recompute stale storage roots — only needed if previous blocks
-         * skipped storage root computation (no-validate or checkpoint mode) */
-        if (s->storage_roots_stale) {
-            for (uint32_t i = 1; i < s->res_count; i++) {
-                resource_t *r = &s->resources[i];
-                if (!storage_hart_empty(&r->storage))
-                    storage_hart_root_hash(s->stor_pool, &r->storage,
-                                           stor_value_encode, NULL,
-                                           r->storage_root.bytes);
-                else
-                    r->storage_root = EMPTY_STORAGE_ROOT;
-            }
-            s->storage_roots_stale = false;
+    /* Recompute stale storage roots — needed if previous blocks ran in
+     * no-validate mode and skipped per-account storage root computation */
+    if (s->storage_roots_stale) {
+        for (uint32_t i = 1; i < s->res_count; i++) {
+            resource_t *r = &s->resources[i];
+            if (!storage_hart_empty(&r->storage))
+                storage_hart_root_hash(s->stor_pool, &r->storage,
+                                       stor_value_encode, NULL,
+                                       r->storage_root.bytes);
+            else
+                r->storage_root = EMPTY_STORAGE_ROOT;
         }
-        hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
+        s->storage_roots_stale = false;
     }
+    hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
 
     /* Swap blk_dirty → last_dirty (preserves for dump-prestate callers) */
     dirty_vec_t tmp = s->last_dirty;
@@ -1405,7 +1405,7 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash) {
     mem_art_destroy(&s->blk_orig_acct); mem_art_init(&s->blk_orig_acct);
     mem_art_destroy(&s->blk_orig_stor); mem_art_init(&s->blk_orig_stor);
 
-    /* Reset addr hash cache — addresses from this block won't repeat next block */
+    /* Reset addr hash cache */
     mem_art_destroy(&s->addr_hash_cache);
     mem_art_init(&s->addr_hash_cache);
 
@@ -1428,17 +1428,19 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
 
 void state_finalize_block(state_t *s, bool prune_empty) {
     if (!s) return;
+    (void)prune_empty;
 
-    /* Prune dead/empty accounts from trie — must happen every block.
-     * Only process NEW entries since last finalize (cursor → count).
-     * Do NOT clear MPT_DIRTY, STORAGE_DIRTY, or blk_dirty — those must
-     * accumulate until the checkpoint calls state_compute_root_ex. */
+    /* Lightweight per-block finalization. Only promotes/demotes existence
+     * for correct EVM semantics. NO hart_delete — dead accounts stay in
+     * the index (with ACCT_EXISTED cleared) until compute_root_ex removes
+     * them at checkpoint time. This prevents the duplicate-account bug
+     * where hart_delete + subsequent ensure_account creates a new slot,
+     * orphaning the original's storage/code. */
     for (size_t d = s->blk_dirty_cursor; d < s->blk_dirty.count; d++) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
         account_t *a = find_account(s, akey);
         if (!a || !acct_has_flag(a, ACCT_MPT_DIRTY)) continue;
 
-        /* Promote/demote existence (consumes BLOCK_DIRTY) */
         if (acct_has_flag(a, ACCT_BLOCK_DIRTY)) {
             if (acct_has_flag(a, ACCT_SELF_DESTRUCTED))
                 acct_clear_flag(a, ACCT_EXISTED);
@@ -1446,48 +1448,22 @@ void state_finalize_block(state_t *s, bool prune_empty) {
                 acct_set_flag(a, ACCT_EXISTED);
             acct_clear_flag(a, ACCT_BLOCK_DIRTY);
         }
-
-        /* Delete from trie if dead */
-        if (!acct_has_flag(a, ACCT_EXISTED) ||
-            (acct_is_empty(a) && prune_empty)) {
-            hash_t addr_hash = hash_keccak256(a->addr.bytes, 20);
-            hart_delete(&s->acct_index, addr_hash.bytes);
-        }
     }
-
-    /* Clean up dead account lists (consumed by pruning above) */
-    #define SAFE_DELETE_IDX(i) do { \
-        if ((i) < s->count) { \
-            account_t *_a = &s->accounts[(i)]; \
-            if (!acct_has_flag(_a, ACCT_EXISTED) || \
-                (acct_is_empty(_a) && prune_empty)) { \
-                hash_t _h = hash_keccak256(_a->addr.bytes, 20); \
-                const uint32_t *_p = (const uint32_t *) \
-                    hart_get(&s->acct_index, _h.bytes); \
-                if (_p && *_p == (i)) \
-                    hart_delete(&s->acct_index, _h.bytes); \
-            } \
-        } \
-    } while(0)
-
-    for (uint32_t pi = 0; pi < s->phantom_count; pi++)
-        SAFE_DELETE_IDX(s->phantoms[pi]);
-    for (uint32_t di = 0; di < s->destructed_count; di++)
-        SAFE_DELETE_IDX(s->destructed[di]);
-    for (uint32_t ri = 0; ri < s->pruned_count; ri++)
-        SAFE_DELETE_IDX(s->pruned[ri]);
-
-    s->dead_total += s->phantom_count + s->destructed_count + s->pruned_count;
-    s->phantom_count = 0;
-    s->destructed_count = 0;
-    s->pruned_count = 0;
-
-    #undef SAFE_DELETE_IDX
 
     /* Advance cursor — next finalize starts from here.
      * blk_dirty, MPT_DIRTY, STORAGE_DIRTY are NOT cleared —
-     * they accumulate until state_compute_root_ex processes them. */
+     * they accumulate until state_compute_root_ex processes them.
+     * Phantom/destructed/pruned lists also accumulate. */
     s->blk_dirty_cursor = s->blk_dirty.count;
+
+    /* Clear per-block originals — diff collection already consumed them.
+     * Without this, originals accumulate and produce bloated diffs. */
+    mem_art_destroy(&s->blk_orig_acct); mem_art_init(&s->blk_orig_acct);
+    mem_art_destroy(&s->blk_orig_stor); mem_art_init(&s->blk_orig_stor);
+
+    /* Reset addr hash cache — addresses from this block unlikely to repeat */
+    mem_art_destroy(&s->addr_hash_cache);
+    mem_art_init(&s->addr_hash_cache);
 }
 
 uint32_t state_dead_count(const state_t *s) {
@@ -1549,8 +1525,8 @@ size_t state_collect_accessed_storage_keys(const state_t *s,
 typedef struct {
     state_t     *s;
     addr_diff_t *groups;
-    uint16_t     group_count;
-    uint16_t     group_cap;
+    uint32_t     group_count;
+    uint32_t     group_cap;
 } stor_cb_ctx_t;
 
 static bool stor_diff_cb(const uint8_t *key, size_t key_len,
@@ -1570,7 +1546,7 @@ static bool stor_diff_cb(const uint8_t *key, size_t key_len,
 
     /* Find or create group */
     addr_diff_t *g = NULL;
-    for (uint16_t i = 0; i < ctx->group_count; i++) {
+    for (uint32_t i = 0; i < ctx->group_count; i++) {
         if (memcmp(ctx->groups[i].addr.bytes, addr_bytes, 20) == 0) {
             g = &ctx->groups[i]; break;
         }
@@ -1597,13 +1573,13 @@ static bool stor_diff_cb(const uint8_t *key, size_t key_len,
 void state_collect_block_diff(state_t *s, block_diff_t *out) {
     if (!s || !out) return;
 
-    uint16_t group_cap = 64;
-    uint16_t group_count = 0;
+    uint32_t group_cap = 64;
+    uint32_t group_count = 0;
     addr_diff_t *groups = calloc(group_cap, sizeof(addr_diff_t));
     if (!groups) return;
 
-    /* Walk blk_dirty — all accounts modified in this block */
-    for (size_t d = 0; d < s->blk_dirty.count; d++) {
+    /* Walk blk_dirty — only NEW entries since last finalize (cursor → count) */
+    for (size_t d = s->blk_dirty_cursor; d < s->blk_dirty.count; d++) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
         account_t *a = find_account(s, akey);
         if (!a) continue;

@@ -54,11 +54,11 @@ static uint32_t crc32c(const uint8_t *data, size_t len) {
 /* Index entry: block_number(8) + dat_offset(8) = 16 bytes */
 #define IDX_ENTRY_SIZE  16
 
-/* Data record header: block_number(8) + record_len(4) + group_count(2) + reserved(2) = 16 bytes */
+/* Data record header: block_number(8) + record_len(4) + group_count(4) = 16 bytes */
 #define DAT_RECORD_HEADER 16
 
-/* Per-group fixed header: addr(20) + flags(1) + field_mask(1) + slot_count(2) = 24 bytes */
-#define GROUP_HEADER_SIZE 24
+/* Per-group fixed header: addr(20) + flags(1) + field_mask(1) + slot_count(4) = 26 bytes */
+#define GROUP_HEADER_SIZE 26
 
 /* =========================================================================
  * Internal state
@@ -86,7 +86,7 @@ struct state_history {
 
 void block_diff_free(block_diff_t *diff) {
     if (!diff) return;
-    for (uint16_t i = 0; i < diff->group_count; i++)
+    for (uint32_t i = 0; i < diff->group_count; i++)
         free(diff->groups[i].slots);
     free(diff->groups);
     diff->groups = NULL;
@@ -102,7 +102,7 @@ void block_diff_clone(const block_diff_t *src, block_diff_t *dst) {
     }
     dst->groups = malloc(src->group_count * sizeof(addr_diff_t));
     if (!dst->groups) { dst->group_count = 0; return; }
-    for (uint16_t i = 0; i < src->group_count; i++) {
+    for (uint32_t i = 0; i < src->group_count; i++) {
         dst->groups[i] = src->groups[i];
         if (src->groups[i].slot_count > 0) {
             size_t sz = src->groups[i].slot_count * sizeof(slot_diff_t);
@@ -244,7 +244,7 @@ static size_t group_payload_size(const addr_diff_t *g) {
 static size_t serialize_diff(const block_diff_t *diff, uint8_t **out) {
     /* Compute total record_len (everything after the 16-byte header, before CRC) */
     size_t record_len = 0;
-    for (uint16_t i = 0; i < diff->group_count; i++)
+    for (uint32_t i = 0; i < diff->group_count; i++)
         record_len += GROUP_HEADER_SIZE + group_payload_size(&diff->groups[i]);
 
     size_t total = DAT_RECORD_HEADER + record_len + 4; /* +4 CRC32 */
@@ -254,19 +254,18 @@ static size_t serialize_diff(const block_diff_t *diff, uint8_t **out) {
     /* Record header */
     write_u64(buf, diff->block_number);
     write_u32(buf + 8, (uint32_t)record_len);
-    write_u16(buf + 12, diff->group_count);
-    write_u16(buf + 14, 0); /* reserved */
+    write_u32(buf + 12, diff->group_count);
 
     /* Groups */
     uint8_t *p = buf + DAT_RECORD_HEADER;
-    for (uint16_t i = 0; i < diff->group_count; i++) {
+    for (uint32_t i = 0; i < diff->group_count; i++) {
         const addr_diff_t *g = &diff->groups[i];
 
         /* Group header */
         memcpy(p, g->addr.bytes, 20); p += 20;
         *p++ = g->flags;
         *p++ = g->field_mask;
-        write_u16(p, g->slot_count); p += 2;
+        write_u32(p, g->slot_count); p += 4;
 
         /* Conditional account fields */
         if (g->field_mask & FIELD_NONCE) {
@@ -280,7 +279,7 @@ static size_t serialize_diff(const block_diff_t *diff, uint8_t **out) {
         }
 
         /* Storage slots */
-        for (uint16_t j = 0; j < g->slot_count; j++) {
+        for (uint32_t j = 0; j < g->slot_count; j++) {
             uint256_to_bytes(&g->slots[j].slot, p); p += 32;
             uint256_to_bytes(&g->slots[j].value, p); p += 32;
         }
@@ -300,7 +299,7 @@ static bool deserialize_diff(const uint8_t *buf, size_t buf_len,
 
     out->block_number = read_u64(buf);
     /* record_len at buf+8, used by caller for sizing */
-    out->group_count = read_u16(buf + 12);
+    out->group_count = read_u32(buf + 12);
 
     out->groups = NULL;
     if (out->group_count > 0) {
@@ -311,14 +310,14 @@ static bool deserialize_diff(const uint8_t *buf, size_t buf_len,
     const uint8_t *p = buf + DAT_RECORD_HEADER;
     const uint8_t *end = buf + buf_len;
 
-    for (uint16_t i = 0; i < out->group_count; i++) {
+    for (uint32_t i = 0; i < out->group_count; i++) {
         addr_diff_t *g = &out->groups[i];
 
         if (p + GROUP_HEADER_SIZE > end) goto fail;
         memcpy(g->addr.bytes, p, 20); p += 20;
         g->flags = *p++;
         g->field_mask = *p++;
-        g->slot_count = read_u16(p); p += 2;
+        g->slot_count = read_u32(p); p += 4;
 
         if (g->field_mask & FIELD_NONCE) {
             if (p + 8 > end) goto fail;
@@ -338,7 +337,7 @@ static bool deserialize_diff(const uint8_t *buf, size_t buf_len,
             if (p + (size_t)g->slot_count * 64 > end) goto fail;
             g->slots = calloc(g->slot_count, sizeof(slot_diff_t));
             if (!g->slots) goto fail;
-            for (uint16_t j = 0; j < g->slot_count; j++) {
+            for (uint32_t j = 0; j < g->slot_count; j++) {
                 g->slots[j].slot = uint256_from_bytes(p, 32); p += 32;
                 g->slots[j].value = uint256_from_bytes(p, 32); p += 32;
             }
@@ -398,7 +397,7 @@ static void *consumer_thread(void *arg) {
 
         /* Accumulate stats for periodic log */
         interval_accounts += diff.group_count;
-        for (uint16_t i = 0; i < diff.group_count; i++) {
+        for (uint32_t i = 0; i < diff.group_count; i++) {
             interval_slots += diff.groups[i].slot_count;
             if (diff.groups[i].flags & ACCT_DIFF_CREATED)
                 interval_created++;
@@ -798,7 +797,7 @@ void state_history_truncate(state_history_t *sh, uint64_t last_block) {
 void state_history_apply_diff(evm_state_t *es, const block_diff_t *diff) {
     if (!es || !diff) return;
 
-    for (uint16_t i = 0; i < diff->group_count; i++) {
+    for (uint32_t i = 0; i < diff->group_count; i++) {
         const addr_diff_t *g = &diff->groups[i];
 
         /* Don't skip any entry — even CREATED+empty entries need processing

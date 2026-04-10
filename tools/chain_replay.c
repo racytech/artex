@@ -552,9 +552,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (argc - arg_offset < 3) {
+    if (argc - arg_offset > 1 && strcmp(argv[1 + arg_offset], "--help") == 0) {
         fprintf(stderr,
-            "Usage: %s [options] <era1_dir> <genesis.json> [start_block] [end_block]\n"
+            "Usage: %s [options] [start_block] [end_block]\n"
             "\n"
             "Options:\n"
             "  --clean               Delete existing state files, start from genesis\n"
@@ -569,9 +569,6 @@ int main(int argc, char **argv) {
             "                        (default: state_<N>.bin)\n"
             "  --load-state P        Load state from binary file P, resume from that block\n"
             "  --dump-prestate N [P] Dump pre-state alloc.json for block N to path P\n"
-            "                        (default: alloc_<N>.json). Two-pass: executes block\n"
-            "                        to discover accessed accounts, then reloads checkpoint\n"
-            "                        and dumps their pre-execution values.\n"
             "  --validate-every N    Validate state root every N blocks (default: %d)\n"
 #ifdef ENABLE_ENGINE_API
             "\n"
@@ -580,10 +577,9 @@ int main(int argc, char **argv) {
             "  --engine-port <n>     Engine API port (default: 8551)\n"
             "  --engine-host <addr>  Engine API listen address (default: 127.0.0.1)\n"
 #endif
-            "\n"
-            "Validates state root every %d blocks\n",
-            argv[0], CHECKPOINT_INTERVAL, CHECKPOINT_INTERVAL);
-        return 1;
+            "\n",
+            argv[0], CHECKPOINT_INTERVAL);
+        return 0;
     }
 
     set_data_paths(data_dir);
@@ -591,12 +587,12 @@ int main(int argc, char **argv) {
     /* Ensure data directory exists */
     mkdir(data_dir, 0755);
 
-    const char *era1_dir     = argv[1 + arg_offset];
-    const char *genesis_path = argv[2 + arg_offset];
-    uint64_t user_start = (argc - arg_offset > 3)
-                          ? (uint64_t)atoll(argv[3 + arg_offset]) : 0;
-    uint64_t end_block  = (argc - arg_offset > 4)
-                          ? (uint64_t)atoll(argv[4 + arg_offset]) : UINT64_MAX;
+    const char *era1_dir     = "data/era1";
+    const char *genesis_path = "data/mainnet_genesis.json";
+    uint64_t user_start = (argc - arg_offset > 1)
+                          ? (uint64_t)atoll(argv[1 + arg_offset]) : 0;
+    uint64_t end_block  = (argc - arg_offset > 2)
+                          ? (uint64_t)atoll(argv[2 + arg_offset]) : UINT64_MAX;
 
     /* Install signal handler — no SA_RESTART so blocking reads can be interrupted */
     struct sigaction sa;
@@ -1073,11 +1069,9 @@ int main(int argc, char **argv) {
             sync_status_t st = sync_get_status(sync);
 
             {
-                uint64_t remaining = (bn < PARIS_BLOCK) ? PARIS_BLOCK - bn : 0;
-                printf("Block %lu | %lu txs (%luT %luC) | %.0f tps | %.1f Mgas/s | %.0f blk/s | %.1fs/256blk | %luK to Paris\n",
+                printf("Block %lu | %lu txs (%luT %luC) | %.0f tps | %.1f Mgas/s | %.0f blk/s | %.1fs/256blk\n",
                        bn, window_txs, window_transfers, window_calls,
-                       tps, mgps, bps, win_secs,
-                       remaining / 1000);
+                       tps, mgps, bps, win_secs);
 
                 /* Get detailed memory breakdown directly from state */
                 state_t *_st = evm_state_get_state(sync_get_state(sync));
@@ -1152,8 +1146,11 @@ int main(int argc, char **argv) {
 
         /* --snapshot-every: validate root + save state at regular intervals.
          * Only saves if root matches — every snapshot on disk is guaranteed correct.
-         * If root mismatches, stop — bug is in the last snapshot_every blocks. */
-        if (snapshot_every > 0 && bn % snapshot_every == 0) {
+         * If root mismatches, stop — bug is in the last snapshot_every blocks.
+         * Aligned to checkpoint boundaries so incremental root is valid. */
+        if (snapshot_every > 0 && bn % validate_every == 0 &&
+            bn >= snapshot_every &&
+            (bn / snapshot_every) > ((bn - validate_every) / snapshot_every)) {
             evm_state_t *snap_es = sync_get_state(sync);
             state_t *st = evm_state_get_state(snap_es);
             bool prune = (bn >= 2675000);
