@@ -68,6 +68,7 @@ size_t hart_trim(hart_t *t);
 /* Operations */
 bool        hart_insert(hart_t *t, const uint8_t key[32], const void *value);
 bool        hart_delete(hart_t *t, const uint8_t key[32]);
+bool        hart_delete_get(hart_t *t, const uint8_t key[32], void *out_value);
 const void *hart_get(const hart_t *t, const uint8_t key[32]);
 bool        hart_contains(const hart_t *t, const uint8_t key[32]);
 size_t      hart_size(const hart_t *t);

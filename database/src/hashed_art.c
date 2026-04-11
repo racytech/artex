@@ -554,11 +554,14 @@ static hart_ref_t remove_child(hart_t *t, hart_ref_t nref, uint8_t byte) {
 
 static hart_ref_t delete_recursive(hart_t *t, hart_ref_t ref,
                                     const uint8_t key[32],
-                                    size_t depth, bool *deleted) {
+                                    size_t depth, bool *deleted,
+                                    void *out_value) {
     if (ref == HART_REF_NULL) return HART_REF_NULL;
 
     if (HART_IS_LEAF(ref)) {
         if (leaf_matches(t, ref, key)) {
+            if (out_value)
+                memcpy(out_value, leaf_value(t, ref), t->value_size);
             *deleted = true;
             arena_free(t, ref, -1);  /* -1 = leaf type */
             return HART_REF_NULL;
@@ -574,7 +577,7 @@ static hart_ref_t delete_recursive(hart_t *t, hart_ref_t ref,
 
     hart_ref_t old_child = *child_ptr;
     prefetch_ref(t, old_child);
-    hart_ref_t new_child = delete_recursive(t, old_child, key, depth + 1, deleted);
+    hart_ref_t new_child = delete_recursive(t, old_child, key, depth + 1, deleted, out_value);
 
     if (new_child != old_child) {
         if (new_child == HART_REF_NULL) {
@@ -601,7 +604,15 @@ static hart_ref_t delete_recursive(hart_t *t, hart_ref_t ref,
 bool hart_delete(hart_t *t, const uint8_t key[32]) {
     if (!t || !key) return false;
     bool deleted = false;
-    t->root = delete_recursive(t, t->root, key, 0, &deleted);
+    t->root = delete_recursive(t, t->root, key, 0, &deleted, NULL);
+    if (deleted) t->size--;
+    return deleted;
+}
+
+bool hart_delete_get(hart_t *t, const uint8_t key[32], void *out_value) {
+    if (!t || !key) return false;
+    bool deleted = false;
+    t->root = delete_recursive(t, t->root, key, 0, &deleted, out_value);
     if (deleted) t->size--;
     return deleted;
 }

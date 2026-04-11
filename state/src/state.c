@@ -1334,6 +1334,12 @@ void state_clear_prestate_dirty(state_t *s) {
     s->journal_len = 0;
     mem_art_destroy(&s->originals);
     mem_art_init(&s->originals);
+
+    /* Clear dead lists accumulated during prestate loading —
+     * prestate accounts are NOT phantoms/pruned/destructed. */
+    s->phantom_count = 0;
+    s->destructed_count = 0;
+    s->pruned_count = 0;
 }
 
 /* =========================================================================
@@ -1434,17 +1440,33 @@ void state_finalize_block(state_t *s, bool prune_empty) {
                 acct_set_flag(a, ACCT_EXISTED);
         }
 
-        /* Delete from acct_index if dead/empty — compaction cleans up
-         * orphaned slots if the account is re-touched in a later block. */
-        bool dead = !acct_has_flag(a, ACCT_EXISTED) ||
-                    (acct_is_empty(a) && prune_empty);
+        /* Dead = not existed.  commit_tx already clears ACCT_EXISTED for
+         * EIP-161 pruned accounts, so we only need to check the flag.
+         * Do NOT add "is_empty && prune_empty" here — that would kill
+         * existed empty accounts whose touch was reverted (OOG). */
+        bool dead = !acct_has_flag(a, ACCT_EXISTED);
 
         /* Mark live accounts for storage root recomputation (skip dead — orphaned) */
         if (acct_has_flag(a, ACCT_STORAGE_DIRTY) && a->resource_idx && !dead)
             stor_dirty_set(s, a->resource_idx);
 
-        if (dead)
-            hart_delete(&s->acct_index, ah.bytes);
+        if (dead) {
+            uint32_t del_idx;
+            if (hart_delete_get(&s->acct_index, ah.bytes, &del_idx)) {
+                /* Clean up orphaned slot immediately */
+                account_t *da = &s->accounts[del_idx];
+                resource_t *dr = get_resource(s, da);
+                if (dr) {
+                    free(dr->code); dr->code = NULL;
+                    free(dr->jumpdest_bitmap); dr->jumpdest_bitmap = NULL;
+                    dr->code_size = 0;
+                    dr->code_hash = EMPTY_CODE_HASH;
+                    dr->storage_root = EMPTY_STORAGE_ROOT;
+                    if (s->stor_pool && !storage_hart_empty(&dr->storage))
+                        storage_hart_clear(s->stor_pool, &dr->storage);
+                }
+            }
+        }
 
         /* Clear flags */
         acct_clear_flag(a, ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY |
@@ -1457,13 +1479,25 @@ void state_finalize_block(state_t *s, bool prune_empty) {
     #define SAFE_DELETE_IDX(i) do { \
         if ((i) < s->count) { \
             account_t *_a = &s->accounts[(i)]; \
-            if (!acct_has_flag(_a, ACCT_EXISTED) || \
-                (acct_is_empty(_a) && prune_empty)) { \
+            if (!acct_has_flag(_a, ACCT_EXISTED)) { \
                 hash_t _h = addr_hash_cached(s, _a->addr.bytes); \
                 const uint32_t *_p = (const uint32_t *) \
                     hart_get(&s->acct_index, _h.bytes); \
-                if (_p && *_p == (i)) \
-                    hart_delete(&s->acct_index, _h.bytes); \
+                if (_p && *_p == (i)) { \
+                    uint32_t _del; \
+                    if (hart_delete_get(&s->acct_index, _h.bytes, &_del)) { \
+                        resource_t *_dr = get_resource(s, &s->accounts[_del]); \
+                        if (_dr) { \
+                            free(_dr->code); _dr->code = NULL; \
+                            free(_dr->jumpdest_bitmap); _dr->jumpdest_bitmap = NULL; \
+                            _dr->code_size = 0; \
+                            _dr->code_hash = EMPTY_CODE_HASH; \
+                            _dr->storage_root = EMPTY_STORAGE_ROOT; \
+                            if (s->stor_pool && !storage_hart_empty(&_dr->storage)) \
+                                storage_hart_clear(s->stor_pool, &_dr->storage); \
+                        } \
+                    } \
+                } \
             } \
         } \
     } while(0)

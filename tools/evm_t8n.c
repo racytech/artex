@@ -548,6 +548,7 @@ int main(int argc, char **argv) {
     /* --- Populate pre-state --- */
     test_runner_setup_state(state, accounts, account_count);
     evm_state_commit(state);
+    evm_state_clear_prestate_dirty(state);
 
     /* --- Set block environment (must happen before prune_empty so fork is known) --- */
     evm_block_env_t evm_env;
