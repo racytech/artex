@@ -415,8 +415,8 @@ static void mark_tx_dirty(state_t *s, const address_t *addr) {
 }
 
 static void mark_blk_dirty_h(state_t *s, account_t *a, const hash_t *addr_hash) {
-    if (!acct_has_flag(a, ACCT_MPT_DIRTY)) {
-        acct_set_flag(a, ACCT_MPT_DIRTY);
+    if (!acct_has_flag(a, ACCT_IN_BLK_DIRTY)) {
+        acct_set_flag(a, ACCT_IN_BLK_DIRTY);
         dirty_push(&s->blk_dirty, a->addr.bytes, 20);
         hart_mark_path_dirty(&s->acct_index, addr_hash->bytes);
 
@@ -606,8 +606,7 @@ bool state_exists(state_t *s, const address_t *addr) {
     if (!a) return false;
     return acct_has_flag(a, ACCT_EXISTED) ||
            acct_has_flag(a, ACCT_CREATED) ||
-           acct_has_flag(a, ACCT_DIRTY) ||
-           acct_has_flag(a, ACCT_BLOCK_DIRTY);
+           acct_has_flag(a, ACCT_DIRTY);
 }
 
 bool state_is_empty(state_t *s, const address_t *addr) {
@@ -642,7 +641,7 @@ void state_set_nonce(state_t *s, const address_t *addr, uint64_t nonce) {
     journal_push(s, &je);
 
     a->nonce = nonce;
-    acct_set_flag(a, ACCT_DIRTY | ACCT_BLOCK_DIRTY);
+    acct_set_flag(a, ACCT_DIRTY);
     mark_tx_dirty(s, addr);
 }
 
@@ -659,7 +658,7 @@ void state_set_balance(state_t *s, const address_t *addr, const uint256_t *bal) 
     journal_push(s, &je);
 
     a->balance = *bal;
-    acct_set_flag(a, ACCT_DIRTY | ACCT_BLOCK_DIRTY);
+    acct_set_flag(a, ACCT_DIRTY);
     mark_tx_dirty(s, addr);
 }
 
@@ -721,7 +720,7 @@ void state_add_balance(state_t *s, const address_t *addr, const uint256_t *amoun
     journal_push(s, &je);
 
     a->balance = uint256_add(&a->balance, amount);
-    acct_set_flag(a, ACCT_DIRTY | ACCT_BLOCK_DIRTY);
+    acct_set_flag(a, ACCT_DIRTY);
     mark_tx_dirty(s, addr);
 }
 
@@ -738,7 +737,7 @@ bool state_sub_balance(state_t *s, const address_t *addr, const uint256_t *amoun
     journal_push(s, &je);
 
     a->balance = uint256_sub(&a->balance, amount);
-    acct_set_flag(a, ACCT_DIRTY | ACCT_BLOCK_DIRTY);
+    acct_set_flag(a, ACCT_DIRTY);
     mark_tx_dirty(s, addr);
     return true;
 }
@@ -781,7 +780,7 @@ void state_set_code(state_t *s, const address_t *addr,
         r->code_hash = EMPTY_CODE_HASH;
     }
 
-    acct_set_flag(a, ACCT_CODE_DIRTY | ACCT_BLOCK_DIRTY);
+    acct_set_flag(a, ACCT_DIRTY);
     mark_tx_dirty(s, addr);
 }
 
@@ -1069,7 +1068,7 @@ void state_revert(state_t *s, uint32_t snap) {
                 /* RIPEMD (0x03): keep dirty flags so EIP-161 can prune after OOG revert.
                  * See geth journal.go:touchChange. Tested to 4M+ blocks (2c08d3a). */
                 if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0)
-                    a->flags = je->data.nonce.flags | (a->flags & (ACCT_DIRTY | ACCT_BLOCK_DIRTY | ACCT_MPT_DIRTY));
+                    a->flags = je->data.nonce.flags | (a->flags & (ACCT_DIRTY | ACCT_IN_BLK_DIRTY));
                 else
                     a->flags = je->data.nonce.flags;
             }
@@ -1078,7 +1077,7 @@ void state_revert(state_t *s, uint32_t snap) {
             if (a) {
                 a->balance = je->data.balance.val;
                 if (s->prune_empty && memcmp(je->addr.bytes, RIPEMD_ADDR, 20) == 0)
-                    a->flags = je->data.balance.flags | (a->flags & (ACCT_DIRTY | ACCT_BLOCK_DIRTY | ACCT_MPT_DIRTY));
+                    a->flags = je->data.balance.flags | (a->flags & (ACCT_DIRTY | ACCT_IN_BLK_DIRTY));
                 else
                     a->flags = je->data.balance.flags;
             }
@@ -1185,8 +1184,8 @@ void state_create_account(state_t *s, const address_t *addr) {
     uint256_t bal = a->balance; /* preserve balance */
     a->nonce = 0;
     a->balance = bal;
-    a->flags = ACCT_CREATED | ACCT_DIRTY | ACCT_BLOCK_DIRTY |
-               ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED;
+    a->flags = ACCT_CREATED | ACCT_DIRTY |
+               ACCT_STORAGE_DIRTY;
 
     if (r) {
         r->code = NULL;
@@ -1229,8 +1228,8 @@ void state_commit_tx(state_t *s) {
             a->nonce = 0;
             acct_clear_flag(a, ACCT_HAS_CODE);
             acct_clear_flag(a, ACCT_EXISTED | ACCT_CREATED | ACCT_DIRTY |
-                           ACCT_CODE_DIRTY | ACCT_BLOCK_DIRTY | ACCT_SELF_DESTRUCTED);
-            acct_set_flag(a, ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
+                           ACCT_SELF_DESTRUCTED);
+            acct_set_flag(a, ACCT_STORAGE_DIRTY);
 
             resource_t *r = get_resource(s, a);
             if (r) {
@@ -1249,12 +1248,12 @@ void state_commit_tx(state_t *s) {
 
         bool empty = acct_is_empty(a);
         bool touched = acct_has_flag(a, ACCT_EXISTED | ACCT_CREATED |
-                                    ACCT_DIRTY | ACCT_CODE_DIRTY);
+                                    ACCT_DIRTY);
         if (touched && (!empty || !s->prune_empty))
             acct_set_flag(a, ACCT_EXISTED);
 
         if (s->prune_empty && empty &&
-            acct_has_flag(a, ACCT_DIRTY | ACCT_CODE_DIRTY)) {
+            acct_has_flag(a, ACCT_DIRTY)) {
             acct_clear_flag(a, ACCT_EXISTED);
             dead_vec_push(&s->pruned, &s->pruned_count, &s->pruned_cap,
                          (uint32_t)(a - s->accounts));
@@ -1262,7 +1261,7 @@ void state_commit_tx(state_t *s) {
         }
 
         acct_clear_flag(a, ACCT_CREATED | ACCT_DIRTY |
-                        ACCT_CODE_DIRTY | ACCT_SELF_DESTRUCTED);
+                        ACCT_SELF_DESTRUCTED);
     }
 
     dirty_clear(&s->tx_dirty);
@@ -1288,12 +1287,12 @@ void state_commit_block(state_t *s) {
 
         bool empty = acct_is_empty(a);
         bool touched = acct_has_flag(a, ACCT_EXISTED | ACCT_CREATED |
-                                    ACCT_DIRTY | ACCT_CODE_DIRTY);
+                                    ACCT_DIRTY);
         if (touched && (!empty || !s->prune_empty))
             acct_set_flag(a, ACCT_EXISTED);
 
         acct_clear_flag(a, ACCT_CREATED | ACCT_DIRTY |
-                        ACCT_CODE_DIRTY | ACCT_SELF_DESTRUCTED);
+                        ACCT_SELF_DESTRUCTED);
     }
 
     s->journal_len = 0;
@@ -1324,8 +1323,7 @@ void state_clear_prestate_dirty(state_t *s) {
          * Required for correct EIP-161 pruning decisions in commit_tx. */
         acct_set_flag(a, ACCT_EXISTED);
 
-        acct_clear_flag(a, ACCT_DIRTY | ACCT_CODE_DIRTY | ACCT_MPT_DIRTY |
-                        ACCT_BLOCK_DIRTY | ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
+        acct_clear_flag(a, ACCT_DIRTY | ACCT_IN_BLK_DIRTY | ACCT_STORAGE_DIRTY);
     }
 
     dirty_clear(&s->blk_dirty);
@@ -1430,15 +1428,13 @@ void state_finalize_block(state_t *s, bool prune_empty) {
         const uint8_t *akey = s->blk_dirty.keys + d * 20;
         hash_t ah = addr_hash_cached(s, akey);
         account_t *a = find_account_h(s, &ah);
-        if (!a || !acct_has_flag(a, ACCT_MPT_DIRTY)) continue;
+        if (!a || !acct_has_flag(a, ACCT_IN_BLK_DIRTY)) continue;
 
         /* Promote/demote existence */
-        if (acct_has_flag(a, ACCT_BLOCK_DIRTY)) {
-            if (acct_has_flag(a, ACCT_SELF_DESTRUCTED))
-                acct_clear_flag(a, ACCT_EXISTED);
-            else if (!acct_is_empty(a))
-                acct_set_flag(a, ACCT_EXISTED);
-        }
+        if (acct_has_flag(a, ACCT_SELF_DESTRUCTED))
+            acct_clear_flag(a, ACCT_EXISTED);
+        else if (!acct_is_empty(a))
+            acct_set_flag(a, ACCT_EXISTED);
 
         /* Dead = not existed.  commit_tx already clears ACCT_EXISTED for
          * EIP-161 pruned accounts, so we only need to check the flag.
@@ -1469,8 +1465,7 @@ void state_finalize_block(state_t *s, bool prune_empty) {
         }
 
         /* Clear flags */
-        acct_clear_flag(a, ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY |
-                        ACCT_STORAGE_DIRTY | ACCT_STORAGE_CLEARED);
+        acct_clear_flag(a, ACCT_IN_BLK_DIRTY | ACCT_STORAGE_DIRTY);
     }
 
     /* Delete dead accounts from acct_index (phantoms, destructed, pruned).

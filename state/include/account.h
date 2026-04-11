@@ -21,16 +21,13 @@
  * Flags — packed into uint16_t
  * ========================================================================= */
 
-#define ACCT_EXISTED         (1 << 0)
-#define ACCT_DIRTY           (1 << 1)
-#define ACCT_CODE_DIRTY      (1 << 2)
-#define ACCT_STORAGE_DIRTY   (1 << 3)
-#define ACCT_STORAGE_CLEARED (1 << 4)
-#define ACCT_CREATED         (1 << 5)
-#define ACCT_SELF_DESTRUCTED (1 << 6)
-#define ACCT_HAS_CODE        (1 << 7)
-#define ACCT_MPT_DIRTY       (1 << 8)
-#define ACCT_BLOCK_DIRTY     (1 << 9)
+#define ACCT_EXISTED         (1 << 0)  /* account is in the state trie */
+#define ACCT_DIRTY           (1 << 1)  /* nonce/balance/code changed this tx */
+#define ACCT_STORAGE_DIRTY   (1 << 2)  /* storage changed this block */
+#define ACCT_CREATED         (1 << 3)  /* CREATE'd this tx */
+#define ACCT_SELF_DESTRUCTED (1 << 4)  /* SELFDESTRUCT this tx */
+#define ACCT_HAS_CODE        (1 << 5)  /* account has non-empty code */
+#define ACCT_IN_BLK_DIRTY    (1 << 6)  /* already in blk_dirty list this block */
 
 /* =========================================================================
  * account_t — compact, every account (80 bytes)

@@ -140,7 +140,7 @@ static int test_basic_round_trip(void) {
     for (int i = 0; i < 5; i++) {
         account_t *a = state_get_account(st2, &addrs[i]);
         if (a) {
-            acct_set_flag(a, ACCT_EXISTED | ACCT_DIRTY | ACCT_MPT_DIRTY | ACCT_BLOCK_DIRTY);
+            acct_set_flag(a, ACCT_EXISTED | ACCT_DIRTY | ACCT_IN_BLK_DIRTY);
             /* Re-mark storage dirty if present */
             if (state_has_storage(st2, &addrs[i]))
                 acct_set_flag(a, ACCT_STORAGE_DIRTY);
