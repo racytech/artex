@@ -414,38 +414,9 @@ bool sync_execute_block(sync_t *sync,
         }
     }
 
-    /* Compaction — reclaim dead/phantom accounts and arena waste.
-     * Only runs after root computation (compute_hash=true) at checkpoint
-     * boundaries, so hart_delete has already cleaned dead entries from
-     * the trie. Minimum 100K-block cooldown between compactions. */
-    {
-        state_t *st = evm_state_get_state(sync->state);
-        uint32_t ci_compact = sync->config.checkpoint_interval > 0
-                            ? sync->config.checkpoint_interval : 256;
-
-        if (bn % ci_compact == 0 && st &&
-            bn - sync->last_compact_block >= 100000) {
-            state_stats_t ss = state_get_stats(st);
-            uint32_t dead = state_dead_count(st);
-            bool do_compact = (ss.account_count > 0 &&
-                               dead > ss.account_count / 10);  /* >10% dead */
-
-            if (do_compact) {
-                struct timespec _c0, _c1;
-                clock_gettime(CLOCK_MONOTONIC, &_c0);
-                state_compact(st);
-                clock_gettime(CLOCK_MONOTONIC, &_c1);
-                state_stats_t post = state_get_stats(st);
-                double ms = (_c1.tv_sec - _c0.tv_sec) * 1000.0 +
-                            (_c1.tv_nsec - _c0.tv_nsec) / 1e6;
-
-                fprintf(stderr, "  compact @%lu: %u→%u accts, %.0fMB→%.0fMB, %.0fms\n",
-                        bn, ss.account_count, post.account_count,
-                        ss.total_tracked / 1e6, post.total_tracked / 1e6, ms);
-                sync->last_compact_block = bn;
-            }
-        }
-    }
+    /* Compaction disabled — free list recycling for account/resource vectors
+     * + MADV_DONTNEED on storage pool arenas handles memory reclamation.
+     * Compaction would invalidate free list indices. */
 
     block_result_free(&br);
     return true;

@@ -192,8 +192,14 @@ static void header_to_evm_block_env(const block_header_t *hdr,
     env->number = hdr->number;
     env->timestamp = hdr->timestamp;
     env->gas_limit = hdr->gas_limit;
-    uint256_copy(&env->difficulty, &hdr->difficulty);
     address_copy(&env->coinbase, &hdr->coinbase);
+
+    /* Post-merge (EIP-4399): DIFFICULTY opcode returns PREVRANDAO.
+     * Pre-merge: difficulty from block header as usual. */
+    if (uint256_is_zero(&hdr->difficulty))
+        memcpy(&env->difficulty, hdr->mix_hash.bytes, 32);  /* prevRandao → difficulty */
+    else
+        uint256_copy(&env->difficulty, &hdr->difficulty);
 
     if (hdr->has_base_fee)
         uint256_copy(&env->base_fee, &hdr->base_fee);

@@ -13,6 +13,7 @@
 #include "evm_state.h"
 #include "state.h"
 #include "era1.h"
+#include "era.h"
 #include "block.h"
 #include "hash.h"
 #ifdef ENABLE_ENGINE_API
@@ -297,6 +298,75 @@ static bool archive_ensure(era1_archive_t *ar, uint64_t block_number,
 }
 
 /* =========================================================================
+ * Era archive (post-merge) — sequential iteration over .era files
+ * ========================================================================= */
+
+typedef struct {
+    char     **paths;
+    size_t     count;
+    era_t      current;
+    era_iter_t iter;
+    int        current_idx;
+} era_archive_t;
+
+static bool era_archive_open(era_archive_t *ar, const char *dir) {
+    memset(ar, 0, sizeof(*ar));
+    ar->current_idx = -1;
+
+    DIR *d = opendir(dir);
+    if (!d) return false;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        size_t nlen = strlen(ent->d_name);
+        if (nlen < 4 || strcmp(ent->d_name + nlen - 4, ".era") != 0)
+            continue;
+        if (nlen >= 5 && strcmp(ent->d_name + nlen - 5, ".era1") == 0)
+            continue;
+        char **np = realloc(ar->paths, (ar->count + 1) * sizeof(char *));
+        if (!np) { closedir(d); return false; }
+        ar->paths = np;
+        char full[1024];
+        snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name);
+        ar->paths[ar->count++] = strdup(full);
+    }
+    closedir(d);
+
+    if (ar->count == 0) return false;
+    qsort(ar->paths, ar->count, sizeof(char *), cmp_strings);
+    return true;
+}
+
+static void era_archive_close(era_archive_t *ar) {
+    if (ar->current_idx >= 0) era_close(&ar->current);
+    for (size_t i = 0; i < ar->count; i++) free(ar->paths[i]);
+    free(ar->paths);
+    memset(ar, 0, sizeof(*ar));
+    ar->current_idx = -1;
+}
+
+static bool era_archive_next(era_archive_t *ar,
+                             block_header_t *hdr, block_body_t *body,
+                             uint8_t block_hash[32]) {
+    while (1) {
+        if (ar->current_idx >= 0) {
+            uint64_t slot;
+            if (era_iter_next(&ar->iter, hdr, body, block_hash, &slot))
+                return true;
+            era_close(&ar->current);
+            ar->current_idx++;
+        } else {
+            ar->current_idx = 0;
+        }
+        if ((size_t)ar->current_idx >= ar->count)
+            return false;
+        if (!era_open(&ar->current, ar->paths[ar->current_idx]))
+            return false;
+        ar->iter = era_iter(&ar->current);
+    }
+}
+
+/* =========================================================================
  * Block prefetch — decode next block while executor runs current one
  * ========================================================================= */
 
@@ -311,6 +381,7 @@ typedef struct {
     hash_t          blk_hash;
     uint64_t        block_number;
     bool            valid;       /* decode succeeded */
+    bool            era_transition; /* first post-merge block */
 } prefetched_block_t;
 
 typedef struct {
@@ -319,8 +390,11 @@ typedef struct {
     pthread_cond_t  cond_ready;    /* prefetch → main: block is ready */
     pthread_cond_t  cond_consumed; /* main → prefetch: buffer consumed */
 
-    era1_archive_t  archive;       /* own archive instance */
+    era1_archive_t  archive;       /* own archive instance (pre-merge) */
     const char     *era1_dir;
+    const char     *era_dir;       /* post-merge era directory */
+    era_archive_t   era_archive;   /* post-merge era archive */
+    bool            era_mode;      /* switched to post-merge */
     bool            follow_mode;
 
     prefetched_block_t buf;        /* single-slot buffer */
@@ -331,13 +405,41 @@ typedef struct {
     bool            error;         /* prefetch hit a fatal error */
 } block_prefetch_t;
 
+static bool prefetch_era1_block(block_prefetch_t *pf, prefetched_block_t *blk,
+                                uint64_t bn) {
+    if (!archive_ensure(&pf->archive, bn, pf->follow_mode, pf->era1_dir))
+        return false;
+    if (!era1_read_block(&pf->archive.current, bn,
+                         &blk->hdr_rlp, &blk->hdr_len,
+                         &blk->body_rlp, &blk->body_len))
+        return false;
+    blk->blk_hash = hash_keccak256(blk->hdr_rlp, blk->hdr_len);
+    if (!block_header_decode_rlp(&blk->header, blk->hdr_rlp, blk->hdr_len) ||
+        !block_body_decode_rlp(&blk->body, blk->body_rlp, blk->body_len)) {
+        free(blk->hdr_rlp);
+        free(blk->body_rlp);
+        blk->hdr_rlp = NULL;
+        blk->body_rlp = NULL;
+        return false;
+    }
+    return true;
+}
+
+static bool prefetch_era_block(block_prefetch_t *pf, prefetched_block_t *blk) {
+    if (!era_archive_next(&pf->era_archive, &blk->header, &blk->body,
+                          blk->blk_hash.bytes))
+        return false;
+    blk->hdr_rlp = NULL;   /* no raw RLP for era blocks */
+    blk->body_rlp = NULL;
+    return true;
+}
+
 static void *prefetch_thread_fn(void *arg) {
     block_prefetch_t *pf = (block_prefetch_t *)arg;
 
     while (1) {
         pthread_mutex_lock(&pf->mutex);
 
-        /* Wait until buffer is consumed or stop requested */
         while (pf->has_data && !pf->stop)
             pthread_cond_wait(&pf->cond_consumed, &pf->mutex);
 
@@ -349,38 +451,37 @@ static void *prefetch_thread_fn(void *arg) {
         uint64_t bn = pf->next_block++;
         pthread_mutex_unlock(&pf->mutex);
 
-        /* Read + decode outside the lock */
         prefetched_block_t blk;
         memset(&blk, 0, sizeof(blk));
         blk.block_number = bn;
         blk.valid = false;
 
-        if (!archive_ensure(&pf->archive, bn, pf->follow_mode, pf->era1_dir)) {
-            pthread_mutex_lock(&pf->mutex);
-            pf->error = true;
-            pf->has_data = false;
-            pthread_cond_signal(&pf->cond_ready);
-            pthread_mutex_unlock(&pf->mutex);
-            break;
+        bool ok;
+        if (!pf->era_mode) {
+            ok = prefetch_era1_block(pf, &blk, bn);
+            if (!ok && bn >= PARIS_BLOCK && pf->era_dir) {
+                /* era1 exhausted — switch to post-merge era files */
+                LOG_INFO("Switching to post-merge era files at block %lu", bn);
+                if (era_archive_open(&pf->era_archive, pf->era_dir)) {
+                    pf->era_mode = true;
+                    /* Skip era blocks until we reach bn */
+                    while (1) {
+                        ok = prefetch_era_block(pf, &blk);
+                        if (!ok) break;
+                        if (blk.header.number == bn) {
+                            blk.era_transition = true;
+                            break;
+                        }
+                        if (blk.header.number > bn) { ok = false; break; }
+                        block_body_free(&blk.body);
+                    }
+                }
+            }
+        } else {
+            ok = prefetch_era_block(pf, &blk);
         }
 
-        if (!era1_read_block(&pf->archive.current, bn,
-                             &blk.hdr_rlp, &blk.hdr_len,
-                             &blk.body_rlp, &blk.body_len)) {
-            pthread_mutex_lock(&pf->mutex);
-            pf->error = true;
-            pf->has_data = false;
-            pthread_cond_signal(&pf->cond_ready);
-            pthread_mutex_unlock(&pf->mutex);
-            break;
-        }
-
-        blk.blk_hash = hash_keccak256(blk.hdr_rlp, blk.hdr_len);
-
-        if (!block_header_decode_rlp(&blk.header, blk.hdr_rlp, blk.hdr_len) ||
-            !block_body_decode_rlp(&blk.body, blk.body_rlp, blk.body_len)) {
-            free(blk.hdr_rlp);
-            free(blk.body_rlp);
+        if (!ok) {
             pthread_mutex_lock(&pf->mutex);
             pf->error = true;
             pf->has_data = false;
@@ -391,7 +492,6 @@ static void *prefetch_thread_fn(void *arg) {
 
         blk.valid = true;
 
-        /* Hand off to consumer */
         pthread_mutex_lock(&pf->mutex);
         pf->buf = blk;
         pf->has_data = true;
@@ -403,6 +503,7 @@ static void *prefetch_thread_fn(void *arg) {
 }
 
 static bool prefetch_start(block_prefetch_t *pf, const char *era1_dir,
+                           const char *era_dir,
                            uint64_t start_block, uint64_t end_block,
                            bool follow) {
     memset(pf, 0, sizeof(*pf));
@@ -411,12 +512,44 @@ static bool prefetch_start(block_prefetch_t *pf, const char *era1_dir,
     pthread_cond_init(&pf->cond_consumed, NULL);
 
     pf->era1_dir = era1_dir;
+    pf->era_dir = era_dir;
     pf->follow_mode = follow;
     pf->next_block = start_block;
     pf->end_block = end_block;
 
-    if (!archive_open(&pf->archive, era1_dir))
-        return false;
+    /* Start in era mode if already past Paris */
+    if (start_block >= PARIS_BLOCK && era_dir) {
+        if (!era_archive_open(&pf->era_archive, era_dir))
+            return false;
+        pf->era_mode = true;
+        /* Skip era blocks before start_block.
+         * Stop as soon as we see start_block or later — don't consume it,
+         * the prefetch thread needs it. We can't "put back" an era block,
+         * so instead skip only blocks strictly before start_block. */
+        while (1) {
+            prefetched_block_t tmp;
+            memset(&tmp, 0, sizeof(tmp));
+            if (!era_archive_next(&pf->era_archive, &tmp.header, &tmp.body,
+                                  tmp.blk_hash.bytes))
+                return false;
+            if (tmp.header.number >= start_block) {
+                /* This is the block the thread needs. Stash it in the
+                 * prefetch buffer so the thread delivers it first. */
+                tmp.valid = true;
+                tmp.block_number = tmp.header.number;
+                tmp.hdr_rlp = NULL;
+                tmp.body_rlp = NULL;
+                pf->buf = tmp;
+                pf->has_data = true;
+                pf->next_block = start_block + 1; /* thread picks up after this */
+                break;
+            }
+            block_body_free(&tmp.body);
+        }
+    } else {
+        if (!archive_open(&pf->archive, era1_dir))
+            return false;
+    }
 
     pthread_create(&pf->thread, NULL, prefetch_thread_fn, pf);
     return true;
@@ -449,6 +582,7 @@ static void prefetch_stop(block_prefetch_t *pf) {
 
     pthread_join(pf->thread, NULL);
     archive_close(&pf->archive);
+    if (pf->era_mode) era_archive_close(&pf->era_archive);
     pthread_mutex_destroy(&pf->mutex);
     pthread_cond_destroy(&pf->cond_ready);
     pthread_cond_destroy(&pf->cond_consumed);
@@ -588,6 +722,7 @@ int main(int argc, char **argv) {
     mkdir(data_dir, 0755);
 
     const char *era1_dir     = "data/era1";
+    const char *era_dir      = "data/era";
     const char *genesis_path = "data/mainnet_genesis.json";
     uint64_t user_start = (argc - arg_offset > 1)
                           ? (uint64_t)atoll(argv[1 + arg_offset]) : 0;
@@ -777,7 +912,7 @@ int main(int argc, char **argv) {
 
     /* Start block prefetch thread */
     block_prefetch_t prefetch;
-    if (!prefetch_start(&prefetch, era1_dir, start_block, end_block, follow_mode)) {
+    if (!prefetch_start(&prefetch, era1_dir, era_dir, start_block, end_block, follow_mode)) {
         LOG_ERR("Failed to start block prefetch");
         sync_destroy(sync);
         archive_close(&archive);
@@ -800,11 +935,7 @@ int main(int argc, char **argv) {
         /* Get next block from prefetch thread */
         prefetched_block_t blk;
         if (!prefetch_get(&prefetch, &blk)) {
-            if (bn >= PARIS_BLOCK) {
-                LOG_INFO("No more era1 blocks at %lu (past Paris)", bn);
-            } else {
-                LOG_ERROR("Block %lu: prefetch failed", bn);
-            }
+            LOG_INFO("No more blocks at %lu (era1 + era exhausted)", bn);
             break;
         }
 
@@ -813,6 +944,53 @@ int main(int argc, char **argv) {
         block_header_t header = blk.header;
         block_body_t body = blk.body;
         hash_t blk_hash = blk.blk_hash;
+
+        /* Era transition: validate + save snapshot at last pre-merge block */
+        if (blk.era_transition) {
+            uint64_t last_pre_merge = bn - 1;
+            LOG_INFO("Paris transition at block %lu — computing pre-merge state root", bn);
+            evm_state_t *snap_es = sync_get_state(sync);
+            state_t *snap_st = evm_state_get_state(snap_es);
+            evm_state_invalidate_all(snap_es);
+            hash_t pre_merge_root = evm_state_compute_mpt_root(snap_es, true);
+
+            /* Read expected root from last era1 block header */
+            hash_t expected = {0};
+            if (archive_ensure(&archive, last_pre_merge, false, era1_dir)) {
+                uint8_t *h_rlp = NULL; size_t h_len = 0;
+                uint8_t *b_rlp = NULL; size_t b_len = 0;
+                if (era1_read_block(&archive.current, last_pre_merge,
+                                     &h_rlp, &h_len, &b_rlp, &b_len)) {
+                    block_header_t last_hdr;
+                    if (block_header_decode_rlp(&last_hdr, h_rlp, h_len))
+                        expected = last_hdr.state_root;
+                    free(h_rlp); free(b_rlp);
+                }
+            }
+
+            char got_hex[67], exp_hex[67];
+            hash_to_hex(&pre_merge_root, got_hex);
+            hash_to_hex(&expected, exp_hex);
+
+            if (memcmp(pre_merge_root.bytes, expected.bytes, 32) == 0) {
+                LOG_INFO("Pre-merge root MATCHES at block %lu", last_pre_merge);
+                char snap_path[256];
+                snprintf(snap_path, sizeof(snap_path), "%s/state_%lu.bin",
+                         data_dir, last_pre_merge);
+                if (state_save(snap_st, snap_path, &pre_merge_root)) {
+                    LOG_INFO("Saved pre-merge snapshot: %s", snap_path);
+                } else {
+                    LOG_ERROR("Failed to save pre-merge snapshot");
+                }
+            } else {
+                LOG_ERROR("Pre-merge root MISMATCH at block %lu", last_pre_merge);
+                LOG_ERROR("got:      %s", got_hex);
+                LOG_ERROR("expected: %s", exp_hex);
+                block_body_free(&body);
+                free(hdr_rlp); free(body_rlp);
+                break;
+            }
+        }
 
         /* Save pre-execution state for dump-prestate (before target block runs) */
         if (bn == dump_prestate_block) {

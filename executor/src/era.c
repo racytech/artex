@@ -171,9 +171,12 @@ static const uint8_t *find_execution_payload(const uint8_t *ssz, size_t ssz_len,
     uint32_t ep_off = read_le32(body + 380);
     if (ep_off >= body_len) return NULL;
 
-    /* EP extends to next variable field offset or end of body */
+    /* EP extends to next variable field offset or end of body.
+     * Bellatrix: body fixed = 384, EP is last variable field → ep_end = body_len.
+     * Capella+:  body fixed ≥ 388, bls_to_execution_changes offset at 384. */
     size_t ep_end = body_len;
-    if (body_len >= 388) {
+    uint32_t body_fixed = read_le32(body + 200); /* proposer_slashings offset = body fixed size */
+    if (body_fixed > 384 && body_len >= body_fixed) {
         uint32_t next_off = read_le32(body + 384);
         if (next_off > ep_off && next_off <= body_len)
             ep_end = next_off;
