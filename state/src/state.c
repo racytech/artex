@@ -1391,6 +1391,7 @@ state_stats_t state_get_stats(const state_t *s) {
 void state_invalidate_all(state_t *s) {
     if (!s) return;
     hart_invalidate_all(&s->acct_index);
+    stor_dirty_grow(s, s->res_count);
     for (uint32_t i = 1; i < s->res_count; i++) {
         resource_t *r = &s->resources[i];
         if (!storage_hart_empty(&r->storage))
@@ -2093,8 +2094,9 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
 
     if (s->stor_pool) storage_hart_pool_sync(s->stor_pool);
 
-    /* Mark all loaded storage roots dirty — they were serialized,
-     * need recomputation from storage harts at next compute_root */
+    /* Grow bitmap to cover all loaded resources, then mark dirty —
+     * storage roots need recomputation from storage harts at next compute_root */
+    stor_dirty_grow(s, s->res_count);
     for (uint32_t i = 1; i < s->res_count; i++)
         stor_dirty_set(s, i);
 

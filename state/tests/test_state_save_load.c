@@ -201,10 +201,127 @@ static int test_empty_state(void) {
     return 0;
 }
 
+/**
+ * Test with many accounts + storage to exercise bitmap growth.
+ * Uses invalidate_all + compute_mpt_root (the real chain_replay flow).
+ */
+static int test_large_round_trip(void) {
+    printf("\ntest_large_round_trip:\n");
+
+    evm_state_t *es = evm_state_create(NULL);
+    if (!es) { printf("  FAIL: create\n"); return 1; }
+
+    state_t *st = evm_state_get_state(es);
+    state_begin_block(st, 99999);
+
+    /* Create 2000 accounts, 500 with storage (5 slots each) */
+    address_t addrs[2000];
+    for (int i = 0; i < 2000; i++) {
+        addrs[i] = (address_t){0};
+        addrs[i].bytes[0] = (uint8_t)(i >> 8);
+        addrs[i].bytes[1] = (uint8_t)(i & 0xFF);
+
+        evm_state_set_nonce(es, &addrs[i], (uint64_t)(i + 1));
+        uint256_t bal = uint256_from_uint64((uint64_t)(i + 1) * 1000);
+        evm_state_set_balance(es, &addrs[i], &bal);
+        evm_state_mark_existed(es, &addrs[i]);
+
+        /* Every 4th account gets storage */
+        if (i % 4 == 0) {
+            for (int j = 0; j < 5; j++) {
+                uint256_t sk = uint256_from_uint64((uint64_t)(i * 100 + j));
+                uint256_t sv = uint256_from_uint64((uint64_t)(i * 100 + j + 1));
+                evm_state_set_storage(es, &addrs[i], &sk, &sv);
+            }
+        }
+    }
+
+    /* Compute root through the real path */
+    evm_state_commit(es);
+    evm_state_clear_prestate_dirty(es);
+    evm_state_invalidate_all(es);
+    hash_t root1 = evm_state_compute_mpt_root(es, false);
+    print_hash("original root", root1.bytes);
+
+    state_stats_t ss1 = state_get_stats(st);
+    printf("  accounts=%u resources=%u\n", ss1.account_count, ss1.storage_account_count);
+
+    /* Save */
+    if (!state_save(st, TEST_FILE, &root1)) {
+        printf("  FAIL: save\n");
+        evm_state_destroy(es);
+        return 1;
+    }
+    evm_state_destroy(es);
+
+    /* Load into fresh state */
+    evm_state_t *es2 = evm_state_create(NULL);
+    state_t *st2 = evm_state_get_state(es2);
+    hash_t loaded_root;
+    if (!state_load(st2, TEST_FILE, &loaded_root)) {
+        printf("  FAIL: load\n");
+        evm_state_destroy(es2);
+        return 1;
+    }
+
+    state_stats_t ss2 = state_get_stats(st2);
+    printf("  loaded: accounts=%u resources=%u\n",
+           ss2.account_count, ss2.storage_account_count);
+
+    /* Recompute root through invalidate_all + compute_mpt_root (chain_replay path) */
+    evm_state_invalidate_all(es2);
+    hash_t root2 = evm_state_compute_mpt_root(es2, false);
+    print_hash("loaded root ", root2.bytes);
+
+    int errors = 0;
+    if (memcmp(root1.bytes, root2.bytes, 32) != 0) {
+        printf("  FAIL: roots don't match!\n");
+        errors++;
+    } else {
+        printf("  OK: roots match\n");
+    }
+
+    /* Verify sample data */
+    for (int i = 0; i < 2000; i += 100) {
+        if (state_get_nonce(st2, &addrs[i]) != (uint64_t)(i + 1)) {
+            printf("  FAIL: acct %d nonce\n", i);
+            errors++;
+        }
+        if (i % 4 == 0) {
+            uint256_t sk = uint256_from_uint64((uint64_t)(i * 100));
+            uint256_t expected = uint256_from_uint64((uint64_t)(i * 100 + 1));
+            uint256_t got = state_get_storage(st2, &addrs[i], &sk);
+            if (!uint256_eq(&got, &expected)) {
+                printf("  FAIL: acct %d storage\n", i);
+                errors++;
+            }
+        }
+    }
+
+    /* Execute a block after load — verify state works for execution */
+    evm_state_begin_block(es2, 100000);
+    uint256_t new_bal = uint256_from_uint64(999999);
+    evm_state_set_balance(es2, &addrs[0], &new_bal);
+    evm_state_commit_tx(es2);
+    evm_state_invalidate_all(es2);
+    hash_t root3 = evm_state_compute_mpt_root(es2, false);
+    if (memcmp(root2.bytes, root3.bytes, 32) == 0) {
+        printf("  FAIL: root unchanged after modification\n");
+        errors++;
+    } else {
+        printf("  OK: root changed after post-load modification\n");
+    }
+
+    evm_state_destroy(es2);
+    unlink(TEST_FILE);
+    return errors;
+}
+
 int main(void) {
     int errors = 0;
     errors += test_basic_round_trip();
     errors += test_empty_state();
+    errors += test_large_round_trip();
     printf("\n=== %s (%d errors) ===\n", errors ? "FAIL" : "PASS", errors);
     return errors ? 1 : 0;
 }
