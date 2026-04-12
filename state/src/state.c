@@ -201,14 +201,24 @@ static void make_slot_key(const address_t *addr, const uint256_t *slot,
 struct state {
     /* Account vector + index (hart also computes MPT root directly) */
     account_t *accounts;
-    uint32_t   count;       /* number of accounts in use */
+    uint32_t   count;       /* high-water mark (next append index) */
     uint32_t   capacity;    /* allocated slots */
     hart_t     acct_index;  /* addr_hash[32] → uint32_t idx (lookup + trie) */
 
+    /* Account slot free list — reuse deleted slots before appending */
+    uint32_t  *acct_free;
+    uint32_t   acct_free_count;
+    uint32_t   acct_free_cap;
+
     /* Resource vector (only accounts with code/storage) */
     resource_t *resources;
-    uint32_t    res_count;
+    uint32_t    res_count;     /* high-water mark */
     uint32_t    res_capacity;
+
+    /* Resource slot free list */
+    uint32_t  *res_free;
+    uint32_t   res_free_count;
+    uint32_t   res_free_cap;
 
     /* Code store (not owned) */
     code_store_t *code_store;
@@ -339,18 +349,22 @@ static resource_t *get_resource(const state_t *s, const account_t *a) {
 static resource_t *ensure_resource(state_t *s, account_t *a) {
     if (a->resource_idx) return &s->resources[a->resource_idx];
 
-    /* Grow resource vector if needed */
-    if (s->res_count >= s->res_capacity) {
-        uint32_t nc = s->res_capacity ? s->res_capacity * 2 : 1024;
-        resource_t *nr = realloc(s->resources, nc * sizeof(resource_t));
-        if (!nr) return NULL;
-        memset(nr + s->res_capacity, 0, (nc - s->res_capacity) * sizeof(resource_t));
-        s->resources = nr;
-        s->res_capacity = nc;
-        stor_dirty_grow(s, nc);
+    /* Reuse freed slot or append */
+    uint32_t ridx;
+    if (s->res_free_count > 0) {
+        ridx = s->res_free[--s->res_free_count];
+    } else {
+        if (s->res_count >= s->res_capacity) {
+            uint32_t nc = s->res_capacity ? s->res_capacity * 2 : 1024;
+            resource_t *nr = realloc(s->resources, nc * sizeof(resource_t));
+            if (!nr) return NULL;
+            memset(nr + s->res_capacity, 0, (nc - s->res_capacity) * sizeof(resource_t));
+            s->resources = nr;
+            s->res_capacity = nc;
+            stor_dirty_grow(s, nc);
+        }
+        ridx = s->res_count++;
     }
-
-    uint32_t ridx = s->res_count++;
     resource_t *r = &s->resources[ridx];
     memset(r, 0, sizeof(*r));
     r->code_hash = EMPTY_CODE_HASH;
@@ -368,17 +382,21 @@ static account_t *ensure_account_h(state_t *s, const address_t *addr,
         return existing;
     }
 
-    /* Grow vector if needed */
-    if (s->count >= s->capacity) {
-        uint32_t nc = s->capacity ? s->capacity * 2 : ACCT_INIT_CAP;
-        account_t *na = realloc(s->accounts, nc * sizeof(account_t));
-        if (!na) return NULL;
-        memset(na + s->capacity, 0, (nc - s->capacity) * sizeof(account_t));
-        s->accounts = na;
-        s->capacity = nc;
+    /* Reuse freed slot or append */
+    uint32_t idx;
+    if (s->acct_free_count > 0) {
+        idx = s->acct_free[--s->acct_free_count];
+    } else {
+        if (s->count >= s->capacity) {
+            uint32_t nc = s->capacity ? s->capacity * 2 : ACCT_INIT_CAP;
+            account_t *na = realloc(s->accounts, nc * sizeof(account_t));
+            if (!na) return NULL;
+            memset(na + s->capacity, 0, (nc - s->capacity) * sizeof(account_t));
+            s->accounts = na;
+            s->capacity = nc;
+        }
+        idx = s->count++;
     }
-
-    uint32_t idx = s->count++;
     account_t *a = &s->accounts[idx];
     memset(a, 0, sizeof(*a));
 
@@ -542,6 +560,8 @@ void state_destroy(state_t *s) {
     free(s->phantoms);
     free(s->destructed);
     free(s->pruned);
+    free(s->acct_free);
+    free(s->res_free);
 
     hart_destroy(&s->acct_index);
     mem_art_destroy(&s->addr_hash_cache);
@@ -1348,10 +1368,13 @@ state_stats_t state_get_stats(const state_t *s) {
     state_stats_t st = {0};
     if (!s) return st;
     st.account_count = s->count;
+    st.account_live = (uint32_t)hart_size(&s->acct_index);
+    st.acct_free_count = s->acct_free_count;
     st.storage_account_count = s->res_count;
+    st.res_free_count = s->res_free_count;
 
-    st.acct_vec_bytes = (size_t)s->count * sizeof(account_t);
-    st.res_vec_bytes = (size_t)s->res_count * sizeof(resource_t);
+    st.acct_vec_bytes = (size_t)s->capacity * sizeof(account_t);
+    st.res_vec_bytes = (size_t)s->res_capacity * sizeof(resource_t);
     st.acct_arena_bytes = s->acct_index.arena_cap;
 
     st.total_tracked = st.acct_vec_bytes + st.res_vec_bytes +
@@ -1449,7 +1472,7 @@ void state_finalize_block(state_t *s, bool prune_empty) {
         if (dead) {
             uint32_t del_idx;
             if (hart_delete_get(&s->acct_index, ah.bytes, &del_idx)) {
-                /* Clean up orphaned slot immediately */
+                /* Clean up orphaned resources + recycle slots */
                 account_t *da = &s->accounts[del_idx];
                 resource_t *dr = get_resource(s, da);
                 if (dr) {
@@ -1460,7 +1483,12 @@ void state_finalize_block(state_t *s, bool prune_empty) {
                     dr->storage_root = EMPTY_STORAGE_ROOT;
                     if (s->stor_pool && !storage_hart_empty(&dr->storage))
                         storage_hart_clear(s->stor_pool, &dr->storage);
+                    dead_vec_push(&s->res_free, &s->res_free_count,
+                                  &s->res_free_cap, da->resource_idx);
+                    da->resource_idx = 0;
                 }
+                dead_vec_push(&s->acct_free, &s->acct_free_count,
+                              &s->acct_free_cap, del_idx);
             }
         }
 
@@ -1481,7 +1509,8 @@ void state_finalize_block(state_t *s, bool prune_empty) {
                 if (_p && *_p == (i)) { \
                     uint32_t _del; \
                     if (hart_delete_get(&s->acct_index, _h.bytes, &_del)) { \
-                        resource_t *_dr = get_resource(s, &s->accounts[_del]); \
+                        account_t *_da = &s->accounts[_del]; \
+                        resource_t *_dr = get_resource(s, _da); \
                         if (_dr) { \
                             free(_dr->code); _dr->code = NULL; \
                             free(_dr->jumpdest_bitmap); _dr->jumpdest_bitmap = NULL; \
@@ -1490,7 +1519,12 @@ void state_finalize_block(state_t *s, bool prune_empty) {
                             _dr->storage_root = EMPTY_STORAGE_ROOT; \
                             if (s->stor_pool && !storage_hart_empty(&_dr->storage)) \
                                 storage_hart_clear(s->stor_pool, &_dr->storage); \
+                            dead_vec_push(&s->res_free, &s->res_free_count, \
+                                          &s->res_free_cap, _da->resource_idx); \
+                            _da->resource_idx = 0; \
                         } \
+                        dead_vec_push(&s->acct_free, &s->acct_free_count, \
+                                      &s->acct_free_cap, _del); \
                     } \
                 } \
             } \
@@ -1817,11 +1851,13 @@ void state_compact(state_t *s) {
 
     /* acct_index (hart) was rebuilt — all nodes born dirty, hash will be recomputed */
 
-    /* Clear dead account tracking */
+    /* Clear dead account tracking + free lists (compaction closes all gaps) */
     s->phantom_count = 0;
     s->destructed_count = 0;
     s->pruned_count = 0;
     s->dead_total = 0;
+    s->acct_free_count = 0;
+    s->res_free_count = 0;
 
     /* Mark all storage roots dirty — acct_index was rebuilt from scratch */
     for (uint32_t i = 1; i < s->res_count; i++)

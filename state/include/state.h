@@ -180,8 +180,11 @@ void     state_collect_block_diff(state_t *s, struct block_diff_t *out);
  * ========================================================================= */
 
 typedef struct {
-    uint32_t account_count;
-    uint32_t storage_account_count;
+    uint32_t account_count;          /* high-water mark (includes dead slots) */
+    uint32_t account_live;           /* live accounts in hart */
+    uint32_t acct_free_count;        /* recycled account slots available */
+    uint32_t storage_account_count;  /* resource high-water mark */
+    uint32_t res_free_count;         /* recycled resource slots available */
     /* Memory breakdown */
     size_t   acct_vec_bytes;
     size_t   res_vec_bytes;
