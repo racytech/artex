@@ -235,6 +235,14 @@ static void pool_free(storage_hart_pool_t *pool, uint64_t offset, uint64_t cap) 
     if (class_bytes(cls) != cap) return;
     fl_push(&pool->free_lists[cls], offset);
     pool->free_total_bytes += cap;
+
+    /* Release physical pages back to OS — the virtual range stays valid
+     * and will fault in fresh zero pages if reused by pool_alloc. */
+    uint8_t *ptr = pool->base + PAGE_SIZE + offset;
+    uint64_t aligned_start = ((uintptr_t)ptr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint64_t aligned_end = ((uintptr_t)ptr + cap) & ~(PAGE_SIZE - 1);
+    if (aligned_end > aligned_start)
+        madvise((void *)aligned_start, aligned_end - aligned_start, MADV_DONTNEED);
 }
 
 /* =========================================================================
