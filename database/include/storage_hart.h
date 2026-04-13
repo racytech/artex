@@ -45,8 +45,8 @@ void storage_hart_pool_sync(storage_hart_pool_t *pool);
 
 typedef struct {
     uint64_t arena_offset;  /* byte offset of arena in pool file (0 = none) */
-    uint32_t arena_used;    /* bytes used in arena */
-    uint32_t arena_cap;     /* allocated capacity (bytes) */
+    uint64_t arena_used;    /* bytes used in arena */
+    uint64_t arena_cap;     /* allocated capacity (bytes) */
     uint32_t count;         /* number of live entries (leaves) */
     uint32_t root_ref;      /* ref to root node within arena (0 = empty) */
     /* Per-type freelist heads (arena-relative offsets, 0 = empty) */

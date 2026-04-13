@@ -184,6 +184,11 @@ static bool ensure_mapped(storage_hart_pool_t *pool, uint64_t need) {
     while (new_size < total)
         new_size = new_size < INITIAL_MAP_SIZE ? INITIAL_MAP_SIZE : new_size + new_size / 2;
 
+    fprintf(stderr, "POOL_GROW: %zuMB -> %zuMB (need=%luMB, data_size=%luMB)\n",
+            pool->mapped / (1024*1024), new_size / (1024*1024),
+            (unsigned long)(need / (1024*1024)),
+            (unsigned long)(pool->data_size / (1024*1024)));
+
     if (ftruncate(pool->fd, (off_t)new_size) != 0) {
         fprintf(stderr, "storage_hart: ftruncate failed size=%zu: %m\n", new_size);
         return false;
@@ -414,14 +419,30 @@ static inline void sh_prefetch_ref(const storage_hart_pool_t *pool,
 /** Ensure the arena has room for `needed` more bytes. May relocate in pool. */
 static bool arena_ensure(storage_hart_pool_t *pool, storage_hart_t *sh,
                          uint32_t needed) {
-    uint32_t aligned = (sh->arena_used + 15) & ~(uint32_t)15;
+    uint64_t aligned = (sh->arena_used + 15) & ~(uint64_t)15;
     if (aligned + needed <= sh->arena_cap) return true;
 
-    /* Jump directly to needed size (avoid repeated 1.5x copies) */
-    uint32_t min_cap = aligned + needed;
-    uint32_t new_cap = sh->arena_cap ? sh->arena_cap + sh->arena_cap / 2
-                                     : INITIAL_ARENA_CAP;
+    /* Grow strategy: 1.5x up to 1GB, then fixed 256MB increments.
+     * Avoids copying gigabytes for a few bytes of new storage. */
+    #define ARENA_LINEAR_THRESHOLD (1ULL * 1024 * 1024 * 1024)  /* 1GB */
+    #define ARENA_LINEAR_STEP     (256ULL * 1024 * 1024)        /* 256MB */
+    uint64_t min_cap = aligned + needed;
+    uint64_t new_cap;
+    if (sh->arena_cap == 0) {
+        new_cap = INITIAL_ARENA_CAP;
+    } else if (sh->arena_cap >= ARENA_LINEAR_THRESHOLD) {
+        new_cap = sh->arena_cap + ARENA_LINEAR_STEP;
+    } else {
+        new_cap = sh->arena_cap + sh->arena_cap / 2;
+    }
     if (new_cap < min_cap) new_cap = min_cap;
+
+    if (new_cap >= 1024*1024) {
+        fprintf(stderr, "ARENA_GROW: %luMB -> %luMB (used=%luMB, needed=%u)\n",
+                (unsigned long)(sh->arena_cap / (1024*1024)),
+                (unsigned long)(new_cap / (1024*1024)),
+                (unsigned long)(sh->arena_used / (1024*1024)), needed);
+    }
 
     uint64_t pool_cap;
     uint64_t new_offset = pool_alloc(pool, new_cap, &pool_cap);
@@ -430,8 +451,8 @@ static bool arena_ensure(storage_hart_pool_t *pool, storage_hart_t *sh,
     /* Copy old data — use offsets not pointers since pool_alloc may mremap */
     if (sh->arena_offset != 0 && sh->arena_used > 0) {
         uint64_t old_offset = sh->arena_offset;
-        uint32_t old_used = sh->arena_used;
-        uint32_t old_cap = sh->arena_cap;
+        uint64_t old_used = sh->arena_used;
+        uint64_t old_cap = sh->arena_cap;
         memcpy(pool->base + PAGE_SIZE + new_offset,
                pool->base + PAGE_SIZE + old_offset,
                old_used);
@@ -439,7 +460,7 @@ static bool arena_ensure(storage_hart_pool_t *pool, storage_hart_t *sh,
     }
 
     sh->arena_offset = new_offset;
-    sh->arena_cap = (uint32_t)pool_cap;
+    sh->arena_cap = pool_cap;
     return true;
 }
 
@@ -456,11 +477,11 @@ void storage_hart_reserve(storage_hart_pool_t *pool, storage_hart_t *sh,
 
 static sh_ref_t arena_alloc(storage_hart_pool_t *pool, storage_hart_t *sh,
                             uint32_t bytes, bool is_leaf) {
-    uint32_t aligned = (sh->arena_used + 15) & ~(uint32_t)15;
+    uint64_t aligned = (sh->arena_used + 15) & ~(uint64_t)15;
 
     if (aligned + bytes > sh->arena_cap) {
         if (!arena_ensure(pool, sh, bytes)) return SH_REF_NULL;
-        aligned = (sh->arena_used + 15) & ~(uint32_t)15;
+        aligned = (sh->arena_used + 15) & ~(uint64_t)15;
     }
 
     sh->arena_used = aligned + bytes;
@@ -524,7 +545,7 @@ static bool arena_init(storage_hart_pool_t *pool, storage_hart_t *sh) {
     if (offset == 0) return false;
 
     sh->arena_offset = offset;
-    sh->arena_cap = (uint32_t)pool_cap;
+    sh->arena_cap = pool_cap;
     sh->arena_used = 16;  /* skip ref 0 as sentinel */
     sh->root_ref = SH_REF_NULL;
     sh->count = 0;

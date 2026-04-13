@@ -6,6 +6,7 @@
  * Account trie (hart) for MPT root computation.
  */
 
+#define _GNU_SOURCE
 #include "state.h"
 #include "code_store.h"
 #include "hashed_art.h"
@@ -20,6 +21,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <xmmintrin.h>
+#include <sys/mman.h>
 
 /* =========================================================================
  * Constants
@@ -49,6 +51,25 @@ static const hash_t EMPTY_STORAGE_ROOT = {{
     0x5b,0x48,0xe0,0x1b,0x99,0x6c,0xad,0xc0,
     0x01,0x62,0x2f,0xb5,0xe3,0x63,0xb4,0x21
 }};
+
+/* =========================================================================
+ * mmap'd vector helpers — grow via mremap (no copy, no temp spike)
+ * ========================================================================= */
+
+static void *vec_alloc(size_t bytes) {
+    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return (p == MAP_FAILED) ? NULL : p;
+}
+
+static void *vec_grow(void *old, size_t old_bytes, size_t new_bytes) {
+    void *p = mremap(old, old_bytes, new_bytes, MREMAP_MAYMOVE);
+    return (p == MAP_FAILED) ? NULL : p;
+}
+
+static void vec_free(void *p, size_t bytes) {
+    if (p) munmap(p, bytes);
+}
 
 /* =========================================================================
  * RLP helpers (for account trie encoding)
@@ -355,8 +376,15 @@ static resource_t *ensure_resource(state_t *s, account_t *a) {
         ridx = s->res_free[--s->res_free_count];
     } else {
         if (s->res_count >= s->res_capacity) {
-            uint32_t nc = s->res_capacity ? s->res_capacity * 2 : 1024;
-            resource_t *nr = realloc(s->resources, nc * sizeof(resource_t));
+            uint32_t nc = s->res_capacity + s->res_capacity / 2;  /* 1.5x growth */
+            if (nc < 1024) nc = 1024;
+            size_t old_bytes = (size_t)s->res_capacity * sizeof(resource_t);
+            size_t new_bytes = (size_t)nc * sizeof(resource_t);
+            fprintf(stderr, "RES_GROW: %uM -> %uM (%.1fGB -> %.1fGB)\n",
+                    s->res_capacity / 1000000, nc / 1000000,
+                    (double)old_bytes / (1024*1024*1024),
+                    (double)new_bytes / (1024*1024*1024));
+            resource_t *nr = vec_grow(s->resources, old_bytes, new_bytes);
             if (!nr) return NULL;
             memset(nr + s->res_capacity, 0, (nc - s->res_capacity) * sizeof(resource_t));
             s->resources = nr;
@@ -388,8 +416,15 @@ static account_t *ensure_account_h(state_t *s, const address_t *addr,
         idx = s->acct_free[--s->acct_free_count];
     } else {
         if (s->count >= s->capacity) {
-            uint32_t nc = s->capacity ? s->capacity * 2 : ACCT_INIT_CAP;
-            account_t *na = realloc(s->accounts, nc * sizeof(account_t));
+            uint32_t nc = s->capacity + s->capacity / 2;  /* 1.5x growth */
+            if (nc < ACCT_INIT_CAP) nc = ACCT_INIT_CAP;
+            size_t old_bytes = (size_t)s->capacity * sizeof(account_t);
+            size_t new_bytes = (size_t)nc * sizeof(account_t);
+            fprintf(stderr, "ACCT_GROW: %uM -> %uM (%.1fGB -> %.1fGB)\n",
+                    s->capacity / 1000000, nc / 1000000,
+                    (double)old_bytes / (1024*1024*1024),
+                    (double)new_bytes / (1024*1024*1024));
+            account_t *na = vec_grow(s->accounts, old_bytes, new_bytes);
             if (!na) return NULL;
             memset(na + s->capacity, 0, (nc - s->capacity) * sizeof(account_t));
             s->accounts = na;
@@ -507,7 +542,7 @@ state_t *state_create(code_store_t *cs) {
     if (!s) return NULL;
 
     s->code_store = cs;
-    s->accounts = calloc(ACCT_INIT_CAP, sizeof(account_t));
+    s->accounts = vec_alloc(ACCT_INIT_CAP * sizeof(account_t));
     if (!s->accounts) { free(s); return NULL; }
     s->capacity = ACCT_INIT_CAP;
 
@@ -521,19 +556,19 @@ state_t *state_create(code_store_t *cs) {
     mem_art_init(&s->blk_orig_stor);
 
     s->journal = malloc(JOURNAL_INIT_CAP * sizeof(journal_entry_t));
-    if (!s->journal) { free(s->accounts); free(s); return NULL; }
+    if (!s->journal) { vec_free(s->accounts, ACCT_INIT_CAP * sizeof(account_t)); free(s); return NULL; }
     s->journal_cap = JOURNAL_INIT_CAP;
 
     /* Reserve resource index 0 as "none" (resource_idx=0 means no resource) */
-    s->resources = calloc(1024, sizeof(resource_t));
-    if (!s->resources) { free(s->journal); free(s->accounts); free(s); return NULL; }
+    s->resources = vec_alloc(1024 * sizeof(resource_t));
+    if (!s->resources) { free(s->journal); vec_free(s->accounts, ACCT_INIT_CAP * sizeof(account_t)); free(s); return NULL; }
     s->res_capacity = 1024;
     s->res_count = 1;
 
     /* Storage root dirty bitmap */
     s->stor_dirty_cap = 1024;
     s->stor_dirty_bits = calloc((1024 + 7) / 8, 1);
-    if (!s->stor_dirty_bits) { free(s->resources); free(s->journal); free(s->accounts); free(s); return NULL; }
+    if (!s->stor_dirty_bits) { vec_free(s->resources, 1024 * sizeof(resource_t)); free(s->journal); vec_free(s->accounts, ACCT_INIT_CAP * sizeof(account_t)); free(s); return NULL; }
 
     /* Default storage pool on tmpfs — replaced by state_set_storage_path if called */
     char tmp[64];
@@ -554,9 +589,9 @@ void state_destroy(state_t *s) {
         if (s->stor_pool && !storage_hart_empty(&r->storage))
             storage_hart_clear(s->stor_pool, &r->storage);
     }
-    free(s->resources);
+    vec_free(s->resources, (size_t)s->res_capacity * sizeof(resource_t));
     free(s->stor_dirty_bits);
-    free(s->accounts);
+    vec_free(s->accounts, (size_t)s->capacity * sizeof(account_t));
     free(s->phantoms);
     free(s->destructed);
     free(s->pruned);
@@ -1799,7 +1834,7 @@ void state_compact(state_t *s) {
 
     /* Allocate new vector */
     uint32_t new_cap = live < ACCT_INIT_CAP ? ACCT_INIT_CAP : live;
-    account_t *new_accts = calloc(new_cap, sizeof(account_t));
+    account_t *new_accts = vec_alloc((size_t)new_cap * sizeof(account_t));
     if (!new_accts) return;
 
     /* Rebuild acct_index from scratch */
@@ -1820,7 +1855,7 @@ void state_compact(state_t *s) {
         new_count++;
     }
 
-    free(s->accounts);
+    vec_free(s->accounts, (size_t)s->capacity * sizeof(account_t));
     s->accounts = new_accts;
     s->count = new_count;
     s->capacity = new_cap;
@@ -2027,8 +2062,10 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
 
         /* Grow accounts vector if needed */
         if (s->count >= s->capacity) {
-            uint32_t nc = s->capacity * 2;
-            account_t *na = realloc(s->accounts, nc * sizeof(account_t));
+            uint32_t nc = s->capacity + s->capacity / 2;
+            size_t old_bytes = (size_t)s->capacity * sizeof(account_t);
+            size_t new_bytes = (size_t)nc * sizeof(account_t);
+            account_t *na = vec_grow(s->accounts, old_bytes, new_bytes);
             if (!na) goto fail;
             memset(na + s->capacity, 0, (nc - s->capacity) * sizeof(account_t));
             s->accounts = na;
@@ -2054,8 +2091,10 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
         if (has_code || has_stor) {
             /* Allocate resource */
             if (s->res_count >= s->res_capacity) {
-                uint32_t nc = s->res_capacity * 2;
-                resource_t *nr = realloc(s->resources, nc * sizeof(resource_t));
+                uint32_t nc = s->res_capacity + s->res_capacity / 2;
+                size_t old_bytes = (size_t)s->res_capacity * sizeof(resource_t);
+                size_t new_bytes = (size_t)nc * sizeof(resource_t);
+                resource_t *nr = vec_grow(s->resources, old_bytes, new_bytes);
                 if (!nr) goto fail;
                 memset(nr + s->res_capacity, 0, (nc - s->res_capacity) * sizeof(resource_t));
                 s->resources = nr;
