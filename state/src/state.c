@@ -1569,8 +1569,8 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
     }
     memset(s->stor_dirty_bits, 0, bitmap_bytes);
 
-    /* Compute account trie root (sequential — depends on all storage roots) */
-    hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
+    /* Compute account trie root — parallel for large trees (4 threads on 16 hi-nibble groups) */
+    hart_root_hash_parallel(&s->acct_index, acct_trie_encode, s, root.bytes);
 
     return root;
 }

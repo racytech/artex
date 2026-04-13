@@ -967,6 +967,148 @@ void hart_root_hash(hart_t *t, hart_encode_t encode, void *ctx, uint8_t out[32])
 }
 
 /* =========================================================================
+ * Parallel root hash — split root node's 16 hi-nibble groups across threads
+ * ========================================================================= */
+
+#include <pthread.h>
+
+typedef struct {
+    hart_t        *t;
+    hart_encode_t  encode;
+    void          *ctx;
+    size_t         next_depth;
+    /* Input: which hi-nibble groups to process */
+    int            hi_start;
+    int            hi_end;
+    uint8_t        gcounts[16];
+    uint8_t        lo_keys[16][16];
+    hart_ref_t     lo_refs[16][16];
+    /* Output: computed slots */
+    uint8_t        hi_slots[16][33];
+    uint8_t        hi_slot_lens[16];
+} hart_hash_worker_t;
+
+static void *hart_hash_worker_fn(void *arg) {
+    hart_hash_worker_t *w = (hart_hash_worker_t *)arg;
+    for (int hi = w->hi_start; hi < w->hi_end; hi++) {
+        if (w->gcounts[hi] == 0) continue;
+        if (w->gcounts[hi] == 1) {
+            uint8_t lo_nib = w->lo_keys[hi][0];
+            w->hi_slot_lens[hi] = (uint8_t)hash_ref(
+                w->t, w->lo_refs[hi][0], w->next_depth,
+                w->encode, w->ctx, &lo_nib, 1, w->hi_slots[hi]);
+        } else {
+            w->hi_slot_lens[hi] = (uint8_t)hash_lo_group(
+                w->t, w->lo_keys[hi], w->lo_refs[hi], w->gcounts[hi],
+                w->next_depth, w->encode, w->ctx, w->hi_slots[hi]);
+        }
+    }
+    return NULL;
+}
+
+#define HART_PAR_THREADS 4
+
+void hart_root_hash_parallel(hart_t *t, hart_encode_t encode, void *ctx,
+                             uint8_t out[32]) {
+    if (!t || t->root == HART_REF_NULL) {
+        memcpy(out, EMPTY_ROOT, 32);
+        return;
+    }
+
+    /* Only parallelize if root is a large node */
+    if (HART_IS_LEAF(t->root)) {
+        hart_root_hash(t, encode, ctx, out);
+        return;
+    }
+
+    void *n = ref_ptr(t, t->root);
+    int ntype = node_type(n);
+
+    /* Only worth parallelizing for Node48/Node256 at root */
+    if (ntype != NODE_48 && ntype != NODE_256) {
+        hart_root_hash(t, encode, ctx, out);
+        return;
+    }
+
+    /* Decompose root into 16 hi-nibble groups (same as hash_ref) */
+    uint8_t lo_keys[16][16];
+    hart_ref_t lo_refs[16][16];
+    uint8_t gcounts[16] = {0};
+    int nchildren = 0;
+
+    if (ntype == NODE_48) {
+        node48_t *nn = n;
+        for (int i = 0; i < 256; i++) {
+            if (nn->index[i] != NODE48_EMPTY) {
+                uint8_t hi = i >> 4, lo = i & 0xF;
+                int g = gcounts[hi]++;
+                lo_keys[hi][g] = lo;
+                lo_refs[hi][g] = nn->children[nn->index[i]];
+                nchildren++;
+            }
+        }
+    } else {
+        node256_t *nn = n;
+        for (int i = 0; i < 256; i++) {
+            if (nn->children[i]) {
+                uint8_t hi = i >> 4, lo = i & 0xF;
+                int g = gcounts[hi]++;
+                lo_keys[hi][g] = lo;
+                lo_refs[hi][g] = nn->children[i];
+                nchildren++;
+            }
+        }
+    }
+
+    size_t next_depth = 1;
+
+    /* Split 16 hi-groups across threads */
+    hart_hash_worker_t workers[HART_PAR_THREADS];
+    pthread_t tids[HART_PAR_THREADS];
+
+    for (int th = 0; th < HART_PAR_THREADS; th++) {
+        workers[th].t = t;
+        workers[th].encode = encode;
+        workers[th].ctx = ctx;
+        workers[th].next_depth = next_depth;
+        workers[th].hi_start = th * 4;
+        workers[th].hi_end = (th + 1) * 4;
+        memcpy(workers[th].gcounts, gcounts, sizeof(gcounts));
+        memcpy(workers[th].lo_keys, lo_keys, sizeof(lo_keys));
+        memcpy(workers[th].lo_refs, lo_refs, sizeof(lo_refs));
+        memset(workers[th].hi_slot_lens, 0, sizeof(workers[th].hi_slot_lens));
+        pthread_create(&tids[th], NULL, hart_hash_worker_fn, &workers[th]);
+    }
+
+    /* Collect results */
+    uint8_t hi_slots[16][33];
+    uint8_t hi_slot_lens[16] = {0};
+    for (int th = 0; th < HART_PAR_THREADS; th++) {
+        pthread_join(tids[th], NULL);
+        for (int hi = workers[th].hi_start; hi < workers[th].hi_end; hi++) {
+            memcpy(hi_slots[hi], workers[th].hi_slots[hi], 33);
+            hi_slot_lens[hi] = workers[th].hi_slot_lens[hi];
+        }
+    }
+
+    /* Build root branch RLP and hash */
+    uint8_t node_hash[33];
+    size_t node_hash_len = build_branch_rlp(hi_slots, hi_slot_lens, node_hash);
+
+    n = ref_ptr(t, t->root);
+    memcpy(node_hash_mut(n), node_hash, 32);
+    clear_dirty(t, t->root);
+
+    if (node_hash_len == 32) {
+        memcpy(out, node_hash, 32);
+    } else if (node_hash_len > 0 && node_hash_len < 32) {
+        hart_keccak(node_hash, node_hash_len, out);
+    } else {
+        memcpy(out, EMPTY_ROOT, 32);
+    }
+}
+
+/* =========================================================================
  * Lifecycle
  * ========================================================================= */
 

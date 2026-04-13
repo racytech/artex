@@ -86,6 +86,9 @@ void hart_invalidate_all(hart_t *t);
  * Clean subtrees use the hash embedded in the node. */
 void hart_root_hash(hart_t *t, hart_encode_t encode, void *ctx, uint8_t out[32]);
 
+/* Parallel root hash — splits root's 16 hi-nibble groups across 4 threads. */
+void hart_root_hash_parallel(hart_t *t, hart_encode_t encode, void *ctx, uint8_t out[32]);
+
 /* Iterator */
 typedef struct hart_iter hart_iter_t;
 hart_iter_t    *hart_iter_create(const hart_t *t);

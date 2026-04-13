@@ -27,7 +27,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Compiler flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -g -msse4.2")
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -O0 -DDEBUG")
-set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG -flto=2 -march=native -fprofile-dir=/tmp/pgo -fprofile-use=/tmp/pgo -fprofile-correction")
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG -flto=2 -march=native")
 
 # Include directories
 include_directories(
@@ -225,6 +225,13 @@ target_link_libraries(artex block_executor evm state common ${CJSON_LIBRARIES})
 
 add_executable(test_artex lib/test_artex.c)
 target_link_libraries(test_artex artex)
+
+add_executable(test_hart_parallel database/tests/test_hart_parallel.c)
+target_include_directories(test_hart_parallel PRIVATE
+    ${CMAKE_SOURCE_DIR}/database/include
+    ${CMAKE_SOURCE_DIR}/common/include
+)
+target_link_libraries(test_hart_parallel hashed_art mem_mpt common pthread)
 
 add_executable(test_tx_analysis executor/tests/test_tx_analysis.c)
 target_include_directories(test_tx_analysis PRIVATE
