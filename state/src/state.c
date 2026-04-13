@@ -53,6 +53,18 @@ static const hash_t EMPTY_STORAGE_ROOT = {{
 }};
 
 /* =========================================================================
+ * Address hash cache — fixed-size direct-mapped, persistent across blocks
+ * ========================================================================= */
+
+#define ADDR_HASH_CACHE_BITS  22
+#define ADDR_HASH_CACHE_SIZE  (1u << ADDR_HASH_CACHE_BITS)  /* 4M entries, ~208MB */
+
+typedef struct {
+    uint8_t addr[20];
+    uint8_t hash[32];
+} addr_hash_entry_t;
+
+/* =========================================================================
  * mmap'd vector helpers — grow via mremap (no copy, no temp spike)
  * ========================================================================= */
 
@@ -264,8 +276,8 @@ struct state {
     mem_art_t blk_orig_acct;  /* addr[20] → acct_snapshot_t (first account state per block) */
     mem_art_t blk_orig_stor;  /* slot_key[52] → uint256_t (first storage value per block) */
 
-    /* Address hash cache: addr[20] → keccak256(addr)[32], reset per block */
-    mem_art_t addr_hash_cache;
+    /* Address hash cache: fixed-size direct-mapped, persistent across blocks */
+    addr_hash_entry_t *addr_hash_cache;
 
     /* Dead account tracking — three categories, kept separate.
      * All checked/cleaned at compute_root and compaction time. */
@@ -328,16 +340,24 @@ static void stor_dirty_grow(state_t *s, uint32_t min_cap) {
 }
 
 /* Cached addr → keccak256(addr). Computes once per address per block. */
+static inline uint32_t addr_cache_idx(const uint8_t addr[20]) {
+    return (addr[0] | ((uint32_t)addr[1] << 8) |
+            ((uint32_t)addr[2] << 16) | ((uint32_t)addr[3] << 24))
+           & (ADDR_HASH_CACHE_SIZE - 1);
+}
+
 static hash_t addr_hash_cached(state_t *s, const uint8_t addr[20]) {
-    size_t vlen;
-    const void *cached = mem_art_get(&s->addr_hash_cache, addr, 20, &vlen);
-    if (cached && vlen == 32) {
+    uint32_t idx = addr_cache_idx(addr);
+    addr_hash_entry_t *e = &s->addr_hash_cache[idx];
+    /* Check hit: addr matches AND hash is non-zero (empty slot has all zeros) */
+    if (memcmp(e->addr, addr, 20) == 0 && (e->hash[0] | e->hash[1])) {
         hash_t h;
-        memcpy(&h, cached, 32);
+        memcpy(&h, e->hash, 32);
         return h;
     }
     hash_t h = hash_keccak256(addr, 20);
-    mem_art_insert(&s->addr_hash_cache, addr, 20, h.bytes, 32);
+    memcpy(e->addr, addr, 20);
+    memcpy(e->hash, h.bytes, 32);
     return h;
 }
 
@@ -547,7 +567,8 @@ state_t *state_create(code_store_t *cs) {
     s->capacity = ACCT_INIT_CAP;
 
     hart_init(&s->acct_index, sizeof(uint32_t));
-    mem_art_init(&s->addr_hash_cache);
+    s->addr_hash_cache = vec_alloc(ADDR_HASH_CACHE_SIZE * sizeof(addr_hash_entry_t));
+    if (!s->addr_hash_cache) { vec_free(s->accounts, ACCT_INIT_CAP * sizeof(account_t)); free(s); return NULL; }
     mem_art_init(&s->warm_addrs);
     mem_art_init(&s->warm_slots);
     mem_art_init(&s->transient);
@@ -599,7 +620,7 @@ void state_destroy(state_t *s) {
     free(s->res_free);
 
     hart_destroy(&s->acct_index);
-    mem_art_destroy(&s->addr_hash_cache);
+    vec_free(s->addr_hash_cache, ADDR_HASH_CACHE_SIZE * sizeof(addr_hash_entry_t));
     mem_art_destroy(&s->warm_addrs);
     mem_art_destroy(&s->warm_slots);
     mem_art_destroy(&s->transient);
@@ -1678,9 +1699,8 @@ void state_reset_block(state_t *s) {
     mem_art_destroy(&s->blk_orig_acct); mem_art_init(&s->blk_orig_acct);
     mem_art_destroy(&s->blk_orig_stor); mem_art_init(&s->blk_orig_stor);
 
-    /* Reset addr hash cache */
-    mem_art_destroy(&s->addr_hash_cache);
-    mem_art_init(&s->addr_hash_cache);
+    /* addr_hash_cache is NOT reset — keccak256 is a pure function,
+     * cached values never go stale. Persists across blocks. */
 }
 
 uint32_t state_dead_count(const state_t *s) {
