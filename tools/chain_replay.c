@@ -821,21 +821,47 @@ int main(int argc, char **argv) {
         LOG_INFO("Loaded state: %u accounts at block %lu from %s (root: %s)",
                  ss.account_count, loaded_block, load_state_path, root_hex);
 
-        /* Populate block hash ring from era1 */
+        /* Populate block hash ring from era1 or era files.
+         * Post-merge blocks are in era files, not era1. */
         uint64_t hash_start = loaded_block >= 256 ? loaded_block - 255 : 0;
         size_t hash_count = (size_t)(loaded_block - hash_start + 1);
         hash_t *hashes = calloc(hash_count, sizeof(hash_t));
         if (hashes) {
-            for (uint64_t i = 0; i < hash_count; i++) {
-                uint64_t hbn = hash_start + i;
-                if (archive_ensure(&archive, hbn, false, era1_dir)) {
-                    uint8_t *h_rlp = NULL; size_t h_len = 0;
-                    uint8_t *b_rlp = NULL; size_t b_len = 0;
-                    if (era1_read_block(&archive.current, hbn,
-                                         &h_rlp, &h_len, &b_rlp, &b_len)) {
-                        hashes[i] = hash_keccak256(h_rlp, h_len);
-                        free(h_rlp); free(b_rlp);
+            if (loaded_block < PARIS_BLOCK) {
+                /* Pre-merge: read from era1 */
+                for (uint64_t i = 0; i < hash_count; i++) {
+                    uint64_t hbn = hash_start + i;
+                    if (archive_ensure(&archive, hbn, false, era1_dir)) {
+                        uint8_t *h_rlp = NULL; size_t h_len = 0;
+                        uint8_t *b_rlp = NULL; size_t b_len = 0;
+                        if (era1_read_block(&archive.current, hbn,
+                                             &h_rlp, &h_len, &b_rlp, &b_len)) {
+                            hashes[i] = hash_keccak256(h_rlp, h_len);
+                            free(h_rlp); free(b_rlp);
+                        }
                     }
+                }
+            } else if (era_dir) {
+                /* Post-merge: read block hashes from era files */
+                era_archive_t hash_ar;
+                if (era_archive_open(&hash_ar, era_dir)) {
+                    block_header_t hdr;
+                    block_body_t body;
+                    uint8_t blk_hash[32];
+                    /* Skip to hash_start */
+                    while (era_archive_next(&hash_ar, &hdr, &body, blk_hash)) {
+                        if (hdr.number >= hash_start) {
+                            if (hdr.number <= loaded_block) {
+                                size_t idx = (size_t)(hdr.number - hash_start);
+                                memcpy(hashes[idx].bytes, blk_hash, 32);
+                            }
+                            block_body_free(&body);
+                            if (hdr.number >= loaded_block) break;
+                            continue;
+                        }
+                        block_body_free(&body);
+                    }
+                    era_archive_close(&hash_ar);
                 }
             }
             sync_resume(sync, loaded_block, hashes, hash_count);
@@ -909,9 +935,13 @@ int main(int argc, char **argv) {
     struct timespec t_start, t_now;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-    uint64_t display_end = end_block == UINT64_MAX
-        ? (uint64_t)(archive.count * ERA1_BLOCKS_PER_FILE - 1)
-        : end_block;
+    uint64_t display_end = end_block;
+    if (end_block == UINT64_MAX) {
+        if (start_block >= PARIS_BLOCK)
+            display_end = 0;  /* unknown end — era files don't have a fixed count */
+        else
+            display_end = (uint64_t)(archive.count * ERA1_BLOCKS_PER_FILE - 1);
+    }
 
     printf("Replaying blocks %lu to %lu...\n\n", start_block, display_end);
 
