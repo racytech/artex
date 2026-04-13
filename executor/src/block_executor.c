@@ -287,6 +287,172 @@ static uint256_t get_block_reward(evm_fork_t fork) {
 }
 
 /* =========================================================================
+ * Block execution helpers — standalone functions matching block_execute chunks.
+ * To be used by both block_execute (replay) and block_produce (build).
+ * ========================================================================= */
+
+/**
+ * Set up EVM and transaction environments from a block header.
+ * Applies block hashes to the EVM env if provided.
+ */
+static void block_setup_env(evm_t *evm,
+                            const block_header_t *header,
+                            const hash_t *block_hashes,
+                            evm_block_env_t *evm_env,
+                            block_env_t *tx_env) {
+    header_to_evm_block_env(header, evm_env, evm->chain_config);
+    if (block_hashes)
+        memcpy(evm_env->block_hash, block_hashes, sizeof(evm_env->block_hash));
+    evm_set_block_env(evm, evm_env);
+    header_to_block_env(header, tx_env);
+}
+
+/**
+ * Pre-block initialization: prune mode, commit originals, begin block,
+ * DAO fork, EIP-4788 beacon root, EIP-2935 history.
+ */
+static void block_pre_init(evm_t *evm, const block_header_t *header) {
+    uint64_t chain_id = evm->chain_config ? evm->chain_config->chain_id : 1;
+
+    evm_state_set_prune_empty(evm->state, evm->fork >= FORK_SPURIOUS_DRAGON);
+    evm_state_commit(evm->state);
+    evm_state_begin_block(evm->state, header->number);
+
+    /* DAO fork: drain 116 accounts into refund contract */
+    if (header->number == DAO_FORK_BLOCK && chain_id == 1)
+        apply_dao_fork(evm->state);
+
+    /* EIP-4788: Store parent beacon block root (Cancun+) */
+    if (evm->fork >= FORK_CANCUN && header->has_parent_beacon_root) {
+        static const uint8_t BEACON_ROOT_ADDR[20] = {
+            0x00, 0x0F, 0x3d, 0xf6, 0xD7, 0x32, 0x80, 0x7E, 0xf1, 0x31,
+            0x9f, 0xB7, 0xB8, 0xbB, 0x85, 0x22, 0xd0, 0xBe, 0xac, 0x02
+        };
+        system_call(evm, BEACON_ROOT_ADDR,
+                    header->parent_beacon_root.bytes, 32, NULL, NULL);
+    }
+
+    /* EIP-2935: Store parent block hash in history contract (Prague+) */
+    if (evm->fork >= FORK_PRAGUE) {
+        static const uint8_t HISTORY_ADDR[20] = {
+            0x00, 0x00, 0xf9, 0x08, 0x27, 0xf1, 0xc5, 0x3a, 0x10, 0xcb,
+            0x7a, 0x02, 0x33, 0x5b, 0x17, 0x53, 0x20, 0x00, 0x29, 0x35
+        };
+        system_call(evm, HISTORY_ADDR,
+                    header->parent_hash.bytes, 32, NULL, NULL);
+    }
+}
+
+/**
+ * Pay block rewards (PoW only — zero after The Merge).
+ * Includes uncle inclusion bonuses.
+ */
+static void block_pay_rewards(evm_t *evm, const block_header_t *header,
+                              const block_body_t *body) {
+    uint256_t base_reward = get_block_reward(evm->fork);
+    if (uint256_is_zero(&base_reward)) return;
+
+    uint256_t miner_reward = base_reward;
+    size_t uncle_count = block_body_uncle_count(body);
+    for (size_t u = 0; u < uncle_count; u++) {
+        uint256_t thirty_two = uint256_from_uint64(32);
+        uint256_t uncle_bonus = uint256_div(&base_reward, &thirty_two);
+        miner_reward = uint256_add(&miner_reward, &uncle_bonus);
+
+        block_header_t uncle_hdr;
+        if (block_body_get_uncle(body, u, &uncle_hdr)) {
+            if (uncle_hdr.number >= header->number ||
+                header->number - uncle_hdr.number > 7)
+                continue;
+            uint64_t depth = uncle_hdr.number + 8 - header->number;
+            if (g_trace_calls) {
+                fprintf(stderr, "UNCLE[%zu] number=%lu depth=%lu coinbase=%02x%02x..%02x%02x\n",
+                        u, uncle_hdr.number, depth,
+                        uncle_hdr.coinbase.bytes[0], uncle_hdr.coinbase.bytes[1],
+                        uncle_hdr.coinbase.bytes[18], uncle_hdr.coinbase.bytes[19]);
+            }
+            uint256_t depth_u = uint256_from_uint64(depth);
+            uint256_t eight = uint256_from_uint64(8);
+            uint256_t uncle_miner_reward = uint256_mul(&base_reward, &depth_u);
+            uncle_miner_reward = uint256_div(&uncle_miner_reward, &eight);
+            evm_state_add_balance(evm->state, &uncle_hdr.coinbase,
+                                  &uncle_miner_reward);
+        }
+    }
+    evm_state_add_balance(evm->state, &header->coinbase, &miner_reward);
+}
+
+/**
+ * Process EIP-4895 withdrawals (Shanghai+).
+ */
+static void block_process_withdrawals(evm_t *evm, const block_body_t *body) {
+    for (size_t w = 0; w < body->withdrawal_count; w++) {
+        uint256_t gwei = uint256_from_uint64(body->withdrawals[w].amount_gwei);
+        uint256_t multiplier = uint256_from_uint64(1000000000ULL);
+        uint256_t amount_wei = uint256_mul(&gwei, &multiplier);
+        evm_state_add_balance(evm->state, &body->withdrawals[w].address,
+                              &amount_wei);
+    }
+}
+
+/**
+ * Aggregate per-tx blooms into block bloom, compute receipt root.
+ */
+static void block_aggregate_receipts(tx_receipt_t *receipts, size_t count,
+                                     uint8_t block_bloom[256],
+                                     hash_t *receipt_root) {
+    memset(block_bloom, 0, 256);
+    for (size_t i = 0; i < count; i++)
+        bloom_or(block_bloom, receipts[i].logs_bloom);
+    *receipt_root = compute_receipt_root(receipts, count);
+}
+
+/**
+ * Finalize block state: flush dirty, capture diff, finalize_block,
+ * compute root, reset per-block caches.
+ * Returns state root.
+ */
+static hash_t block_finalize_state(evm_t *evm,
+#ifdef ENABLE_HISTORY
+                                   state_history_t *history,
+                                   block_diff_t *diff,
+                                   uint64_t block_number,
+#endif
+                                   double *root_ms_out) {
+    evm_state_finalize(evm->state);
+
+#ifdef ENABLE_HISTORY
+    if (diff) {
+        memset(diff, 0, sizeof(*diff));
+        diff->block_number = block_number;
+        evm_state_collect_block_diff(evm->state, diff);
+    }
+    if (history && diff) {
+        block_diff_t hist_diff;
+        block_diff_clone(diff, &hist_diff);
+        state_history_push(history, &hist_diff);
+    }
+#endif
+
+    bool prune_empty = (evm->fork >= FORK_SPURIOUS_DRAGON);
+    evm_state_finalize_block(evm->state, prune_empty);
+
+    struct timespec _rt0, _rt1;
+    clock_gettime(CLOCK_MONOTONIC, &_rt0);
+    hash_t root = {0};
+    if (!evm->skip_root_hash)
+        root = evm_state_compute_state_root_ex(evm->state, prune_empty);
+    clock_gettime(CLOCK_MONOTONIC, &_rt1);
+
+    if (root_ms_out)
+        *root_ms_out = (_rt1.tv_sec - _rt0.tv_sec) * 1000.0 +
+                       (_rt1.tv_nsec - _rt0.tv_nsec) / 1e6;
+
+    evm_state_reset_block(evm->state);
+    return root;
+}
+
+/* =========================================================================
  * Block execution
  * ========================================================================= */
 
@@ -801,5 +967,209 @@ void block_result_free(block_result_t *result) {
 #ifdef ENABLE_HISTORY
         block_diff_free(&result->diff);
 #endif
+    }
+}
+
+/* =========================================================================
+ * Block Production
+ * ========================================================================= */
+
+/** Build a synthetic block_header_t from production params. */
+static void params_to_header(const block_produce_params_t *p,
+                             block_header_t *hdr) {
+    memset(hdr, 0, sizeof(*hdr));
+    address_copy(&hdr->coinbase, &p->coinbase);
+    hdr->number    = p->block_number;
+    hdr->timestamp = p->timestamp;
+    hdr->gas_limit = p->gas_limit;
+    hash_copy(&hdr->parent_hash, &p->parent_hash);
+    hash_copy(&hdr->mix_hash, &p->prev_randao);
+
+    /* Post-merge: difficulty = 0 */
+    hdr->difficulty = UINT256_ZERO;
+    hdr->nonce = 0;
+
+    if (p->has_base_fee) {
+        hdr->has_base_fee = true;
+        uint256_copy(&hdr->base_fee, &p->base_fee);
+    }
+    if (p->has_blob_gas) {
+        hdr->has_blob_gas = true;
+        hdr->excess_blob_gas = p->excess_blob_gas;
+    }
+    if (p->has_parent_beacon_root) {
+        hdr->has_parent_beacon_root = true;
+        hash_copy(&hdr->parent_beacon_root, &p->parent_beacon_root);
+    }
+    if (p->withdrawal_count > 0)
+        hdr->has_withdrawals_root = true;
+}
+
+block_produce_result_t block_produce(evm_t *evm,
+                                     const block_produce_params_t *params,
+                                     const uint8_t *const *txs_rlp,
+                                     const size_t *txs_len,
+                                     size_t tx_count,
+                                     const hash_t *block_hashes) {
+    block_produce_result_t result;
+    memset(&result, 0, sizeof(result));
+
+    if (!evm || !params) {
+        result.ok = false;
+        return result;
+    }
+
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    /* Build synthetic header from params */
+    block_header_t header;
+    params_to_header(params, &header);
+
+    /* Set up environments */
+    evm_block_env_t evm_env;
+    block_env_t tx_env;
+    block_setup_env(evm, &header, block_hashes, &evm_env, &tx_env);
+
+    /* Pre-block init (commit, begin_block, system calls) */
+    block_pre_init(evm, &header);
+
+    /* Determine chain ID */
+    uint64_t chain_id = evm->chain_config ? evm->chain_config->chain_id : 1;
+
+    /* Allocate receipts for worst case (all txs succeed) */
+    if (tx_count > 0) {
+        result.receipts = calloc(tx_count, sizeof(tx_receipt_t));
+        if (!result.receipts) {
+            result.ok = false;
+            return result;
+        }
+    }
+
+    uint64_t cumulative_gas = 0;
+    size_t accepted = 0;
+    size_t rejected = 0;
+
+    for (size_t i = 0; i < tx_count; i++) {
+        if (!txs_rlp[i] || txs_len[i] == 0) {
+            rejected++;
+            continue;
+        }
+
+        /* Decode transaction from raw bytes */
+        transaction_t tx;
+        if (!tx_decode_raw(&tx, txs_rlp[i], txs_len[i], chain_id)) {
+            rejected++;
+            continue;
+        }
+
+        /* Check gas fits in remaining block space */
+        if (cumulative_gas + tx.gas_limit > params->gas_limit) {
+            tx_decoded_free(&tx);
+            rejected++;
+            continue;
+        }
+
+        /* Validate (nonce, balance, etc.) without executing */
+        if (!transaction_validate(evm->state, &tx, &tx_env)) {
+            tx_decoded_free(&tx);
+            rejected++;
+            continue;
+        }
+
+        /* Execute */
+        transaction_result_t tx_result;
+        bool ok = transaction_execute(evm, &tx, &tx_env, &tx_result);
+
+        /* Fill receipt */
+        tx_receipt_t *rcpt = &result.receipts[accepted];
+        rcpt->success = ok;
+        rcpt->gas_used = ok ? tx_result.gas_used : 0;
+        cumulative_gas += rcpt->gas_used;
+        rcpt->cumulative_gas = cumulative_gas;
+        rcpt->tx_type = (uint8_t)tx.type;
+        rcpt->status_code = (ok && tx_result.status == EVM_SUCCESS) ? 1 : 0;
+
+        if (ok && tx_result.contract_created) {
+            rcpt->contract_created = true;
+            address_copy(&rcpt->contract_addr, &tx_result.contract_address);
+        }
+
+        if (ok) {
+            rcpt->logs = tx_result.logs;
+            rcpt->log_count = tx_result.log_count;
+            tx_result.logs = NULL;
+            tx_result.log_count = 0;
+            transaction_result_free(&tx_result);
+        } else {
+            rcpt->logs = NULL;
+            rcpt->log_count = 0;
+        }
+
+        /* Compute per-tx bloom */
+        bloom_from_logs(rcpt->logs_bloom, rcpt->logs, rcpt->log_count);
+
+        tx_decoded_free(&tx);
+        evm_state_commit_tx(evm->state);
+        accepted++;
+    }
+
+    result.tx_count = accepted;
+    result.tx_rejected = rejected;
+    result.receipt_count = accepted;
+
+    /* Process withdrawals (Shanghai+) */
+    if (params->withdrawal_count > 0 && params->withdrawals) {
+        block_body_t synth_body = {0};
+        synth_body.withdrawals = params->withdrawals;
+        synth_body.withdrawal_count = params->withdrawal_count;
+        block_process_withdrawals(evm, &synth_body);
+    }
+
+    /* Aggregate blooms + receipt root */
+    block_aggregate_receipts(result.receipts, accepted,
+                             result.logs_bloom, &result.receipt_root);
+
+    /* Finalize state + compute root */
+    evm_state_finalize(evm->state);
+    bool prune_empty = (evm->fork >= FORK_SPURIOUS_DRAGON);
+    evm_state_finalize_block(evm->state, prune_empty);
+
+    struct timespec t_root0, t_root1;
+    clock_gettime(CLOCK_MONOTONIC, &t_root0);
+    result.state_root = evm_state_compute_state_root_ex(evm->state, prune_empty);
+    clock_gettime(CLOCK_MONOTONIC, &t_root1);
+    result.root_ms = (t_root1.tv_sec - t_root0.tv_sec) * 1000.0 +
+                     (t_root1.tv_nsec - t_root0.tv_nsec) / 1e6;
+
+    evm_state_reset_block(evm->state);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    result.exec_ms = (t_end.tv_sec - t_start.tv_sec) * 1000.0 +
+                     (t_end.tv_nsec - t_start.tv_nsec) / 1e6;
+
+    result.gas_used = cumulative_gas;
+    result.ok = true;
+    return result;
+}
+
+void block_produce_result_free(block_produce_result_t *result) {
+    if (result) {
+        for (size_t i = 0; i < result->receipt_count; i++) {
+            for (size_t j = 0; j < result->receipts[i].log_count; j++)
+                evm_log_free(&result->receipts[i].logs[j]);
+            free(result->receipts[i].logs);
+        }
+        free(result->receipts);
+        result->receipts = NULL;
+        result->receipt_count = 0;
+
+        for (size_t i = 0; i < result->request_count; i++)
+            free(result->requests[i]);
+        free(result->requests);
+        free(result->request_lengths);
+        result->requests = NULL;
+        result->request_lengths = NULL;
+        result->request_count = 0;
     }
 }

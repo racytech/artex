@@ -99,6 +99,86 @@ block_result_t block_execute(evm_t *evm,
  */
 void block_result_free(block_result_t *result);
 
+/* =========================================================================
+ * Block Production
+ * ========================================================================= */
+
+/**
+ * Block environment parameters for block production.
+ * Caller specifies the block context; the engine fills in the rest.
+ */
+typedef struct {
+    address_t coinbase;
+    uint64_t  timestamp;
+    uint64_t  gas_limit;
+    uint64_t  block_number;       /* 0 = last_block + 1 */
+    hash_t    parent_hash;
+    hash_t    prev_randao;        /* post-merge: PREVRANDAO */
+    uint256_t base_fee;
+    bool      has_base_fee;       /* false for pre-London */
+
+    /* Cancun+ */
+    uint64_t  excess_blob_gas;
+    bool      has_blob_gas;
+    hash_t    parent_beacon_root;
+    bool      has_parent_beacon_root;
+
+    /* Withdrawals (Shanghai+) */
+    withdrawal_t *withdrawals;
+    size_t        withdrawal_count;
+} block_produce_params_t;
+
+/**
+ * Block production result.
+ */
+typedef struct {
+    bool        ok;
+    hash_t      state_root;
+    hash_t      receipt_root;
+    uint8_t     logs_bloom[256];
+    uint64_t    gas_used;
+    size_t      tx_count;         /* successfully executed */
+    size_t      tx_rejected;      /* skipped (bad nonce, insufficient balance, etc.) */
+
+    tx_receipt_t *receipts;       /* per-tx receipts (caller must free) */
+    size_t        receipt_count;
+
+    /* EIP-7685 requests (Prague+) */
+    uint8_t   **requests;
+    size_t     *request_lengths;
+    size_t      request_count;
+
+    double      exec_ms;
+    double      root_ms;
+} block_produce_result_t;
+
+/**
+ * Execute transactions and produce a block.
+ *
+ * Takes raw RLP-encoded transactions. Invalid transactions (bad nonce,
+ * insufficient balance, gas exceeds remaining) are skipped.
+ * Returns the assembled block result with state root, receipts, bloom.
+ *
+ * @param evm          EVM instance (with state and chain config)
+ * @param params       Block environment parameters
+ * @param txs_rlp      Array of pointers to raw RLP-encoded transactions
+ * @param txs_len      Array of lengths for each transaction
+ * @param tx_count     Number of transactions to attempt
+ * @param block_hashes Optional: 256 recent block hashes for BLOCKHASH opcode
+ * @return Block production result
+ */
+block_produce_result_t block_produce(evm_t *evm,
+                                     const block_produce_params_t *params,
+                                     const uint8_t *const *txs_rlp,
+                                     const size_t *txs_len,
+                                     size_t tx_count,
+                                     const hash_t *block_hashes);
+
+/**
+ * Free block produce result resources.
+ */
+void block_produce_result_free(block_produce_result_t *result);
+
 #ifdef __cplusplus
 }
 #endif
