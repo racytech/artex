@@ -47,11 +47,10 @@ typedef struct { uint8_t bytes[32]; } rx_uint256_t;
 
 typedef enum {
     RX_CHAIN_MAINNET = 1,
-    RX_CHAIN_SEPOLIA = 11155111,
 } rx_chain_id_t;
 
 typedef struct {
-    rx_chain_id_t chain_id;
+    rx_chain_id_t chain_id;    /* only RX_CHAIN_MAINNET supported */
 } rx_config_t;
 
 /* ========================================================================
@@ -81,10 +80,16 @@ void rx_engine_destroy(rx_engine_t *engine);
 bool rx_engine_load_genesis(rx_engine_t *engine, const char *path,
                             const rx_hash_t *genesis_hash);
 
-/** Load state from a binary snapshot. Call instead of load_genesis. */
+/**
+ * Load state from a binary snapshot. Call instead of load_genesis.
+ * Also loads block hash ring from a separate .hashes file if present.
+ */
 bool rx_engine_load_state(rx_engine_t *engine, const char *path);
 
-/** Save current state to a binary snapshot. */
+/**
+ * Save current state to a binary snapshot.
+ * Also saves block hash ring to a separate .hashes file (256*32 bytes).
+ */
 bool rx_engine_save_state(rx_engine_t *engine, const char *path);
 
 /* ========================================================================
@@ -122,7 +127,14 @@ rx_hash_t rx_compute_state_root(rx_engine_t *engine);
  * State queries
  * ======================================================================== */
 
-/** Get state handle for queries. Valid for lifetime of engine. */
+/**
+ * Get state handle for queries.
+ *
+ * State queries are only valid between block executions — after
+ * rx_execute_block_rlp returns and before the next call. The state
+ * reflects the finalized result of the last executed block.
+ * Do not query state while a block is executing.
+ */
 rx_state_t *rx_engine_get_state(rx_engine_t *engine);
 
 /** Check if account exists in state. */
@@ -158,6 +170,25 @@ rx_uint256_t rx_get_storage(rx_state_t *state, const rx_address_t *addr,
 
 /** Get last executed block number. Returns 0 before first block. */
 uint64_t rx_get_block_number(const rx_engine_t *engine);
+
+/* ========================================================================
+ * Logging
+ * ======================================================================== */
+
+typedef enum {
+    RX_LOG_ERROR = 0,
+    RX_LOG_WARN  = 1,
+    RX_LOG_INFO  = 2,
+    RX_LOG_DEBUG = 3,
+} rx_log_level_t;
+
+/**
+ * Set a log callback. By default the library is silent.
+ * The callback receives the level, a null-terminated message,
+ * and the userdata pointer passed here.
+ */
+typedef void (*rx_log_fn)(rx_log_level_t level, const char *msg, void *userdata);
+void rx_set_logger(rx_engine_t *engine, rx_log_fn fn, void *userdata);
 
 /* ========================================================================
  * Version
