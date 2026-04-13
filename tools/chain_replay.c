@@ -338,6 +338,35 @@ static bool era_archive_open(era_archive_t *ar, const char *dir) {
     return true;
 }
 
+/**
+ * Skip ahead in the era archive to approximately target_block.
+ * Probes the first block of each era file to find the right starting point.
+ * Only decompresses one block per file — avoids scanning millions of blocks.
+ */
+static void era_archive_skip_to(era_archive_t *ar, uint64_t target_block) {
+    if (ar->count == 0 || target_block == 0) return;
+
+    for (size_t i = 0; i < ar->count; i++) {
+        era_t probe;
+        if (!era_open(&probe, ar->paths[i])) continue;
+        era_iter_t it = era_iter(&probe);
+        block_header_t hdr;
+        block_body_t body;
+        uint8_t hash[32];
+        uint64_t slot;
+        bool got = era_iter_next(&it, &hdr, &body, hash, &slot);
+        era_close(&probe);
+        if (!got) continue;
+        block_body_free(&body);
+
+        if (hdr.number > target_block && i > 0) {
+            ar->current_idx = (int)(i - 1) - 1;
+            return;
+        }
+    }
+    ar->current_idx = (int)(ar->count - 1) - 1;
+}
+
 static void era_archive_close(era_archive_t *ar) {
     if (ar->current_idx >= 0) era_close(&ar->current);
     for (size_t i = 0; i < ar->count; i++) free(ar->paths[i]);
@@ -535,10 +564,8 @@ static bool prefetch_start(block_prefetch_t *pf, const char *era1_dir,
         if (!era_archive_open(&pf->era_archive, era_dir))
             return false;
         pf->era_mode = true;
-        /* Skip era blocks before start_block.
-         * Stop as soon as we see start_block or later — don't consume it,
-         * the prefetch thread needs it. We can't "put back" an era block,
-         * so instead skip only blocks strictly before start_block. */
+        /* Skip to the right era file, then scan within it */
+        era_archive_skip_to(&pf->era_archive, start_block);
         while (1) {
             prefetched_block_t tmp;
             memset(&tmp, 0, sizeof(tmp));
@@ -748,13 +775,12 @@ int main(int argc, char **argv) {
     sa.sa_handler = sigint_handler;
     sigaction(SIGINT, &sa, NULL);  /* intentionally no SA_RESTART for SIGINT */
 
-    /* Open era1 archive */
+    /* Open era1 archive (optional — not needed for post-merge snapshot loads) */
     era1_archive_t archive;
-    if (!archive_open(&archive, era1_dir)) {
-        LOG_ERR("Failed to open era1 directory: %s", era1_dir);
-        return 1;
+    memset(&archive, 0, sizeof(archive));
+    if (archive_open(&archive, era1_dir)) {
+        LOG_INFO("Era1 archive: %zu files in %s", archive.count, era1_dir);
     }
-    LOG_INFO("Era1 archive: %zu files in %s", archive.count, era1_dir);
 
     /* Clean up old state if requested */
     if (force_clean) {
@@ -845,6 +871,7 @@ int main(int argc, char **argv) {
                 /* Post-merge: read block hashes from era files */
                 era_archive_t hash_ar;
                 if (era_archive_open(&hash_ar, era_dir)) {
+                    era_archive_skip_to(&hash_ar, hash_start);
                     block_header_t hdr;
                     block_body_t body;
                     uint8_t blk_hash[32];
