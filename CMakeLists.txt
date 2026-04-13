@@ -27,7 +27,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Compiler flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -g -msse4.2")
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -O0 -DDEBUG")
-set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG -flto=2 -march=native")
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG -flto=2 -march=native -fprofile-dir=/tmp/pgo -fprofile-use=/tmp/pgo -fprofile-correction")
 
 # Include directories
 include_directories(
@@ -178,6 +178,7 @@ set(BLOCK_EXECUTOR_SOURCES
     executor/src/block.c
     executor/src/tx_decoder.c
     executor/src/tx_pipeline.c
+    executor/src/tx_analysis.c
     executor/src/block_executor.c
     executor/src/dao_fork.c
 )
@@ -223,6 +224,16 @@ target_link_libraries(artex block_executor evm state common ${CJSON_LIBRARIES})
 
 add_executable(test_artex lib/test_artex.c)
 target_link_libraries(test_artex artex)
+
+add_executable(test_tx_analysis executor/tests/test_tx_analysis.c)
+target_include_directories(test_tx_analysis PRIVATE
+    ${CMAKE_SOURCE_DIR}/executor/include
+    ${CMAKE_SOURCE_DIR}/era_reader/include
+    ${CMAKE_SOURCE_DIR}/evm/include
+    ${CMAKE_SOURCE_DIR}/state/include
+    ${CMAKE_SOURCE_DIR}/common/include
+)
+target_link_libraries(test_tx_analysis block_executor era_reader evm state common secp256k1_wrap snappy pthread)
 
 add_executable(bench_parallel_decode executor/tests/bench_parallel_decode.c)
 target_include_directories(bench_parallel_decode PRIVATE

@@ -118,11 +118,15 @@ static volatile sig_atomic_t g_shutdown_pending = 0;
 static engine_t *g_engine = NULL;
 #endif
 
+/* Flush PGO profile data on signal (only exists with -fprofile-generate) */
+void __gcov_dump(void) __attribute__((weak));
+
 static void sigint_handler(int sig) {
     (void)sig;
     if (g_shutdown) {
-        /* Second Ctrl+C — force immediate exit from loop */
-        g_shutdown = 2;
+        /* Second Ctrl+C — flush PGO and force exit */
+        if (__gcov_dump) __gcov_dump();
+        _exit(0);
     } else {
         g_shutdown = 1;
     }
