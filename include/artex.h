@@ -54,6 +54,30 @@ typedef struct {
 } rx_config_t;
 
 /* ========================================================================
+ * Receipts and logs
+ * ======================================================================== */
+
+typedef struct {
+    rx_address_t address;        /* contract that emitted the log */
+    rx_hash_t   *topics;         /* indexed topics (0-4) */
+    uint8_t      topic_count;
+    uint8_t     *data;           /* non-indexed data */
+    size_t       data_len;
+} rx_log_t;
+
+typedef struct {
+    uint8_t      status;         /* 0 = fail, 1 = success */
+    uint8_t      tx_type;        /* 0=legacy, 1=2930, 2=1559, 3=4844 */
+    uint64_t     gas_used;       /* gas consumed by this tx */
+    uint64_t     cumulative_gas; /* cumulative gas after this tx */
+    uint8_t      logs_bloom[256];
+    rx_log_t    *logs;           /* log entries */
+    size_t       log_count;
+    bool         contract_created;
+    rx_address_t contract_addr;  /* valid if contract_created */
+} rx_receipt_t;
+
+/* ========================================================================
  * Block execution result
  * ======================================================================== */
 
@@ -64,7 +88,11 @@ typedef struct {
     rx_hash_t   state_root;      /* post-execution state root */
     rx_hash_t   receipt_root;    /* receipt trie root */
     uint8_t     logs_bloom[256]; /* aggregate bloom filter */
+    rx_receipt_t *receipts;      /* per-tx receipts (tx_count entries) */
 } rx_block_result_t;
+
+/** Free receipt data inside a block result. */
+void rx_block_result_free(rx_block_result_t *result);
 
 /* ========================================================================
  * Engine lifecycle
