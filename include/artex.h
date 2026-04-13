@@ -51,6 +51,8 @@ typedef enum {
 
 typedef struct {
     rx_chain_id_t chain_id;    /* only RX_CHAIN_MAINNET supported */
+    const char   *data_dir;    /* directory for code_store and other disk state.
+                                  NULL = in-memory only (no persistence). */
 } rx_config_t;
 
 /* ========================================================================

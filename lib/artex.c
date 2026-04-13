@@ -18,6 +18,7 @@
 #include "hash.h"
 #include "uint256.h"
 #include "address.h"
+#include "code_store.h"
 
 #include <cjson/cJSON.h>
 #include <stdlib.h>
@@ -33,6 +34,7 @@
 struct rx_engine {
     evm_state_t            *state;
     evm_t                  *evm;
+    code_store_t           *cs;           /* contract bytecode store (optional) */
     const chain_config_t   *chain_config;
     hash_t                  block_hashes[BLOCK_HASH_WINDOW];
     uint64_t                last_block;
@@ -70,8 +72,18 @@ rx_engine_t *rx_engine_create(const rx_config_t *config) {
 
     e->chain_config = chain_config_mainnet();
 
-    e->state = evm_state_create(NULL);
+    /* Open code store if data_dir provided */
+    if (config->data_dir) {
+        char cs_path[1024];
+        snprintf(cs_path, sizeof(cs_path), "%s/code_store", config->data_dir);
+        e->cs = code_store_open(cs_path);
+        if (!e->cs)
+            e->cs = code_store_create(cs_path, 500000);
+    }
+
+    e->state = evm_state_create(e->cs);
     if (!e->state) {
+        if (e->cs) code_store_destroy(e->cs);
         free(e);
         return NULL;
     }
@@ -90,6 +102,7 @@ void rx_engine_destroy(rx_engine_t *engine) {
     if (!engine) return;
     if (engine->evm) evm_destroy(engine->evm);
     if (engine->state) evm_state_destroy(engine->state);
+    if (engine->cs) code_store_destroy(engine->cs);
     free(engine);
 }
 
