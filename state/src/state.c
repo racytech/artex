@@ -1504,8 +1504,7 @@ static void *stor_root_worker_fn(void *arg) {
 
 /* Number of worker threads for parallel storage root computation.
  * Only used when dirty count is high enough to justify threading. */
-#define STOR_ROOT_THREADS     8
-#define STOR_ROOT_PAR_THRESH  256  /* min dirty resources to go parallel */
+#define STOR_ROOT_PAR_THRESH  64   /* min dirty resources to go parallel */
 
 hash_t state_compute_root(state_t *s, bool prune_empty) {
     (void)prune_empty;
@@ -1524,13 +1523,13 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
         }
     }
 
-    if (dirty_count >= STOR_ROOT_PAR_THRESH && bitmap_bytes >= STOR_ROOT_THREADS) {
-        /* Parallel: split bitmap range across threads */
-        int nthreads = STOR_ROOT_THREADS;
+    if (dirty_count >= STOR_ROOT_PAR_THRESH) {
+        /* Adaptive thread count: 4 threads for 64-255 dirty, 8 for 256+ */
+        int nthreads = (dirty_count >= 256) ? 8 : 4;
         if (nthreads > (int)bitmap_bytes) nthreads = (int)bitmap_bytes;
 
-        pthread_t tids[STOR_ROOT_THREADS];
-        stor_root_worker_t workers[STOR_ROOT_THREADS];
+        pthread_t tids[8];
+        stor_root_worker_t workers[8];
         uint32_t chunk = bitmap_bytes / nthreads;
 
         for (int t = 0; t < nthreads; t++) {
