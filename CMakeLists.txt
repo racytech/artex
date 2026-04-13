@@ -207,6 +207,21 @@ target_include_directories(era_reader PUBLIC
 target_link_libraries(era_reader common snappy)
 
 #==============================================================================
+# Libraries — Public API (libartex)
+#==============================================================================
+
+add_library(artex STATIC lib/artex.c)
+target_include_directories(artex PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/executor/include
+    ${CMAKE_SOURCE_DIR}/evm/include
+    ${CMAKE_SOURCE_DIR}/state/include
+    ${CMAKE_SOURCE_DIR}/common/include
+    ${CJSON_INCLUDE_DIRS}
+)
+target_link_libraries(artex block_executor evm state common ${CJSON_LIBRARIES})
+
+#==============================================================================
 # Libraries — Crypto utilities
 #==============================================================================
 
