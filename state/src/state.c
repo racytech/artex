@@ -1442,15 +1442,27 @@ void state_invalidate_all(state_t *s) {
  *   1. Recompute dirty storage roots (tracked via bitmap)
  *   2. Compute hart_root_hash
  */
-hash_t state_compute_root(state_t *s, bool prune_empty) {
-    (void)prune_empty;
-    hash_t root = {0};
-    if (!s) return root;
+/* -------------------------------------------------------------------------
+ * Parallel storage root computation
+ * ------------------------------------------------------------------------- */
 
-    /* Recompute storage roots for resources marked dirty by finalize_block */
-    uint32_t bitmap_bytes = (s->stor_dirty_cap + 7) / 8;
-    for (uint32_t b = 0; b < bitmap_bytes; b++) {
-        if (!s->stor_dirty_bits[b]) continue;  /* skip clean byte (8 resources) */
+#include <pthread.h>
+#include <sched.h>
+
+typedef struct {
+    state_t            *s;
+    uint32_t            start_byte;  /* bitmap byte range [start, end) */
+    uint32_t            end_byte;
+    uint32_t            computed;    /* count of storage roots computed */
+} stor_root_worker_t;
+
+static void *stor_root_worker_fn(void *arg) {
+    stor_root_worker_t *w = (stor_root_worker_t *)arg;
+    state_t *s = w->s;
+    uint32_t computed = 0;
+
+    for (uint32_t b = w->start_byte; b < w->end_byte; b++) {
+        if (!s->stor_dirty_bits[b]) continue;
         for (uint32_t bit = 0; bit < 8; bit++) {
             if (!(s->stor_dirty_bits[b] & (1u << bit))) continue;
             uint32_t idx = b * 8 + bit;
@@ -1462,11 +1474,82 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
                                        r->storage_root.bytes);
             else
                 r->storage_root = EMPTY_STORAGE_ROOT;
+            computed++;
+        }
+    }
+    w->computed = computed;
+    return NULL;
+}
+
+/* Number of worker threads for parallel storage root computation.
+ * Only used when dirty count is high enough to justify threading. */
+#define STOR_ROOT_THREADS     8
+#define STOR_ROOT_PAR_THRESH  256  /* min dirty resources to go parallel */
+
+hash_t state_compute_root(state_t *s, bool prune_empty) {
+    (void)prune_empty;
+    hash_t root = {0};
+    if (!s) return root;
+
+    uint32_t bitmap_bytes = (s->stor_dirty_cap + 7) / 8;
+
+    /* Count dirty resources to decide serial vs parallel */
+    uint32_t dirty_count = 0;
+    for (uint32_t b = 0; b < bitmap_bytes; b++) {
+        if (s->stor_dirty_bits[b]) {
+            /* popcount of byte */
+            uint8_t v = s->stor_dirty_bits[b];
+            while (v) { dirty_count++; v &= v - 1; }
+        }
+    }
+
+    if (dirty_count >= STOR_ROOT_PAR_THRESH && bitmap_bytes >= STOR_ROOT_THREADS) {
+        /* Parallel: split bitmap range across threads */
+        int nthreads = STOR_ROOT_THREADS;
+        if (nthreads > (int)bitmap_bytes) nthreads = (int)bitmap_bytes;
+
+        pthread_t tids[STOR_ROOT_THREADS];
+        stor_root_worker_t workers[STOR_ROOT_THREADS];
+        uint32_t chunk = bitmap_bytes / nthreads;
+
+        for (int t = 0; t < nthreads; t++) {
+            workers[t].s = s;
+            workers[t].start_byte = t * chunk;
+            workers[t].end_byte = (t == nthreads - 1) ? bitmap_bytes : (t + 1) * chunk;
+            workers[t].computed = 0;
+            pthread_create(&tids[t], NULL, stor_root_worker_fn, &workers[t]);
+        }
+
+        uint32_t total = 0;
+        for (int t = 0; t < nthreads; t++) {
+            pthread_join(tids[t], NULL);
+            total += workers[t].computed;
+        }
+
+        if (total > 0)
+            fprintf(stderr, "  storage roots: %u computed (%d threads)\n",
+                    total, nthreads);
+    } else {
+        /* Serial: small number of dirty resources */
+        for (uint32_t b = 0; b < bitmap_bytes; b++) {
+            if (!s->stor_dirty_bits[b]) continue;
+            for (uint32_t bit = 0; bit < 8; bit++) {
+                if (!(s->stor_dirty_bits[b] & (1u << bit))) continue;
+                uint32_t idx = b * 8 + bit;
+                if (idx == 0 || idx >= s->res_count) continue;
+                resource_t *r = &s->resources[idx];
+                if (!storage_hart_empty(&r->storage))
+                    storage_hart_root_hash(s->stor_pool, &r->storage,
+                                           stor_value_encode, NULL,
+                                           r->storage_root.bytes);
+                else
+                    r->storage_root = EMPTY_STORAGE_ROOT;
+            }
         }
     }
     memset(s->stor_dirty_bits, 0, bitmap_bytes);
 
-    /* Compute Merkle root */
+    /* Compute account trie root (sequential — depends on all storage roots) */
     hart_root_hash(&s->acct_index, acct_trie_encode, s, root.bytes);
 
     return root;
