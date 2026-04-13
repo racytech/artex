@@ -6,6 +6,7 @@
  */
 
 #include "tx_analysis.h"
+#include "bytecode_scan.h"
 #include "mem_art.h"
 #include <stdlib.h>
 #include <string.h>
@@ -17,13 +18,27 @@
 
 /** Classify a transaction for parallelism analysis. */
 typedef enum {
-    TX_CLASS_TRANSFER,  /* simple ETH transfer: no data, not create */
-    TX_CLASS_CONTRACT,  /* contract call or create: touches unknown state */
+    TX_CLASS_INDEPENDENT,  /* only touches {sender, to}: safe to parallelize */
+    TX_CLASS_CONTRACT,     /* may touch unknown state: must run serially */
 } tx_class_t;
 
-static tx_class_t tx_classify(const transaction_t *tx) {
+static tx_class_t tx_classify(const transaction_t *tx, evm_state_t *state) {
+    /* Simple transfer: no data, not create */
     if (!tx->is_create && tx->data_size == 0)
-        return TX_CLASS_TRANSFER;
+        return TX_CLASS_INDEPENDENT;
+
+    /* CREATE always touches unknown state */
+    if (tx->is_create)
+        return TX_CLASS_CONTRACT;
+
+    /* Contract call: check if bytecode makes external calls */
+    if (state) {
+        uint32_t code_len = 0;
+        const uint8_t *code = evm_state_get_code_ptr(state, &tx->to, &code_len);
+        if (code && code_len > 0 && !bytecode_has_calls(code, code_len))
+            return TX_CLASS_INDEPENDENT;  /* self-contained contract */
+    }
+
     return TX_CLASS_CONTRACT;
 }
 
@@ -32,7 +47,7 @@ static tx_class_t tx_classify(const transaction_t *tx) {
  * ========================================================================= */
 
 void tx_analyze(const prepared_tx_t *decoded, size_t tx_count,
-                tx_schedule_t *schedule) {
+                evm_state_t *state, tx_schedule_t *schedule) {
     memset(schedule, 0, sizeof(*schedule));
     schedule->total_txs = tx_count;
 
@@ -60,8 +75,8 @@ void tx_analyze(const prepared_tx_t *decoded, size_t tx_count,
 
         const transaction_t *tx = &decoded[i].tx;
 
-        /* Only simple transfers are candidates */
-        if (tx_classify(tx) != TX_CLASS_TRANSFER) {
+        /* Only independent txs (transfers + call-free contracts) are candidates */
+        if (tx_classify(tx, state) != TX_CLASS_INDEPENDENT) {
             ser_indices[ser_count++] = (uint16_t)i;
             continue;
         }

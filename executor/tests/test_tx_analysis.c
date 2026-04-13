@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
 
             /* Analyze */
             tx_schedule_t sched;
-            tx_analyze(decoded, body.tx_count, &sched);
+            tx_analyze(decoded, body.tx_count, NULL, &sched);
 
             total_txs += sched.total_txs;
             total_parallel += sched.parallel_txs;

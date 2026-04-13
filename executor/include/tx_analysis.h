@@ -3,6 +3,7 @@
 
 #include "transaction.h"
 #include "tx_pipeline.h"
+#include "evm_state.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -48,10 +49,11 @@ typedef struct {
  *
  * @param decoded    Array of decoded transactions (from tx_batch_decode)
  * @param tx_count   Number of transactions
+ * @param state      EVM state (for bytecode lookup, NULL = transfers only)
  * @param schedule   Output schedule (caller owns, must call tx_schedule_free)
  */
 void tx_analyze(const prepared_tx_t *decoded, size_t tx_count,
-                tx_schedule_t *schedule);
+                evm_state_t *state, tx_schedule_t *schedule);
 
 /**
  * Free schedule resources.

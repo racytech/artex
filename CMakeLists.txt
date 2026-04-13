@@ -179,6 +179,7 @@ set(BLOCK_EXECUTOR_SOURCES
     executor/src/tx_decoder.c
     executor/src/tx_pipeline.c
     executor/src/tx_analysis.c
+    executor/src/bytecode_scan.c
     executor/src/block_executor.c
     executor/src/dao_fork.c
 )
