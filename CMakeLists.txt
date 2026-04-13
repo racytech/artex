@@ -180,8 +180,6 @@ set(BLOCK_EXECUTOR_SOURCES
     executor/src/tx_pipeline.c
     executor/src/block_executor.c
     executor/src/dao_fork.c
-    executor/src/era1.c
-    executor/src/era.c
 )
 if(ENABLE_HISTORY)
     list(APPEND BLOCK_EXECUTOR_SOURCES executor/src/state_history.c)
@@ -192,6 +190,21 @@ target_include_directories(block_executor PUBLIC
     ${CMAKE_SOURCE_DIR}/state/include
 )
 target_link_libraries(block_executor evm mem_mpt common secp256k1 pthread)
+
+#==============================================================================
+# Libraries — Era Reader (era1/era archive file readers)
+#==============================================================================
+
+add_library(era_reader STATIC
+    era_reader/src/era1.c
+    era_reader/src/era.c
+)
+target_include_directories(era_reader PUBLIC
+    ${CMAKE_SOURCE_DIR}/era_reader/include
+    ${CMAKE_SOURCE_DIR}/executor/include
+    ${CMAKE_SOURCE_DIR}/state/include
+)
+target_link_libraries(era_reader common snappy)
 
 #==============================================================================
 # Libraries — Crypto utilities
@@ -554,20 +567,11 @@ if(CJSON_FOUND)
     target_include_directories(chain_replay PRIVATE
         ${CMAKE_SOURCE_DIR}/engine/include
         ${CJSON_INCLUDE_DIRS})
-    target_link_libraries(chain_replay sync engine ${CJSON_LIBRARIES})
+    target_link_libraries(chain_replay sync engine era_reader ${CJSON_LIBRARIES})
 
     # History query tool
     add_executable(history_query tools/history_query.c)
     target_link_libraries(history_query block_executor evm common)
-
-    # Artex Node — full execution client (era1 replay + CL sync)
-    add_executable(artex_node tools/artex_node.c)
-    target_include_directories(artex_node PRIVATE
-        ${CMAKE_SOURCE_DIR}/engine/include
-        ${CJSON_INCLUDE_DIRS}
-    )
-    target_compile_definitions(artex_node PRIVATE CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL})
-    target_link_libraries(artex_node sync engine ${CJSON_LIBRARIES})
 
     #==============================================================================
     # Integration Tests (Ethereum test vectors)
