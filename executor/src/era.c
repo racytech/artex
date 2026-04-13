@@ -91,14 +91,27 @@ bool era_open(era_t *era, const char *path) {
 
     /* Walk backwards: last 8 bytes = count */
     uint64_t count = read_le64(era->data + tail_off - 8);
+
+    /* Sanity check: count must fit within the file */
+    if (count == 0 || count > 100000) {
+        fprintf(stderr, "era_open: %s: invalid slot count %lu (corrupt index?)\n",
+                path, count);
+        munmap(era->data, era->file_size);
+        era->data = NULL;
+        return false;
+    }
+
     /* Index value size = 8 + count*8 + 8 */
     size_t idx_val_size = 8 + count * 8 + 8;
-    size_t idx_entry_start = tail_off - ENTRY_HEADER_SIZE - idx_val_size;
-
-    if (idx_entry_start < era->file_size) {
-        size_t val_start = idx_entry_start + ENTRY_HEADER_SIZE;
-        era->start_slot = read_le64(era->data + val_start);
+    if (idx_val_size + ENTRY_HEADER_SIZE > era->file_size) {
+        fprintf(stderr, "era_open: %s: index size exceeds file\n", path);
+        munmap(era->data, era->file_size);
+        era->data = NULL;
+        return false;
     }
+    size_t idx_entry_start = tail_off - ENTRY_HEADER_SIZE - idx_val_size;
+    size_t val_start = idx_entry_start + ENTRY_HEADER_SIZE;
+    era->start_slot = read_le64(era->data + val_start);
 
     return true;
 }

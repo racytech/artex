@@ -307,6 +307,7 @@ typedef struct {
     era_t      current;
     era_iter_t iter;
     int        current_idx;
+    uint64_t   last_block;  /* continuity check */
 } era_archive_t;
 
 static bool era_archive_open(era_archive_t *ar, const char *dir) {
@@ -351,8 +352,20 @@ static bool era_archive_next(era_archive_t *ar,
     while (1) {
         if (ar->current_idx >= 0) {
             uint64_t slot;
-            if (era_iter_next(&ar->iter, hdr, body, block_hash, &slot))
+            if (era_iter_next(&ar->iter, hdr, body, block_hash, &slot)) {
+                /* Continuity check: blocks must be sequential */
+                if (ar->last_block > 0 && hdr->number != ar->last_block + 1) {
+                    LOG_ERROR("Era block gap: expected %lu, got %lu (file: %s)",
+                              ar->last_block + 1, hdr->number,
+                              ar->paths[ar->current_idx]);
+                    LOG_ERROR("hint: re-download era file covering blocks %lu-%lu",
+                              ar->last_block + 1, hdr->number - 1);
+                    block_body_free(body);
+                    return false;
+                }
+                ar->last_block = hdr->number;
                 return true;
+            }
             era_close(&ar->current);
             ar->current_idx++;
         } else {
