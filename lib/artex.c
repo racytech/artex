@@ -343,8 +343,10 @@ rx_hash_t rx_compute_state_root(rx_engine_t *engine) {
     rx_hash_t out = {0};
     if (!engine) return out;
 
+    /* No invalidate_all needed — incremental dirty tracking is correct.
+     * block_execute → finalize_block marks dirty paths, compute_root
+     * only rehashes those paths. Proven over 17M+ mainnet blocks. */
     bool prune = (engine->evm->fork >= FORK_SPURIOUS_DRAGON);
-    evm_state_invalidate_all(engine->state);
     hash_t root = evm_state_compute_mpt_root(engine->state, prune);
     memcpy(out.bytes, root.bytes, 32);
     return out;

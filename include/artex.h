@@ -227,6 +227,25 @@ void rx_set_logger(rx_engine_t *engine, rx_log_fn fn, void *userdata);
 /** Returns version string, e.g. "0.1.0". */
 const char *rx_version(void);
 
+/* ========================================================================
+ * TODO: Block revert (chain tip reorg)
+ *
+ * rx_revert_block() — undo the last executed block.
+ *
+ * The undo data already exists: blk_orig_acct (pre-block nonce/balance/
+ * code_hash per account) and blk_orig_stor (pre-block storage values).
+ * These are captured on first-touch-per-block during execution.
+ *
+ * To implement:
+ *   1. Don't destroy blk_orig in reset_block — keep until commit/revert
+ *   2. rx_revert_block: walk blk_orig_acct, restore nonce/balance/flags;
+ *      walk blk_orig_stor, restore storage values; re-mark ART paths dirty
+ *   3. rx_commit_block: clear blk_orig (current reset_block behavior)
+ *   4. Only need depth=1 (last block) for chain tip reorg
+ *
+ * Not needed during catch-up — use checkpoint snapshots for error recovery.
+ * ======================================================================== */
+
 #ifdef __cplusplus
 }
 #endif

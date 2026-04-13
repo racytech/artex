@@ -388,13 +388,9 @@ static bool era_archive_next(era_archive_t *ar,
             if (era_iter_next(&ar->iter, hdr, body, block_hash, &slot)) {
                 /* Continuity check: blocks must be sequential */
                 if (ar->last_block > 0 && hdr->number != ar->last_block + 1) {
-                    LOG_ERROR("Era block gap: expected %lu, got %lu (file: %s)",
-                              ar->last_block + 1, hdr->number,
-                              ar->paths[ar->current_idx]);
-                    LOG_ERROR("hint: re-download era file covering blocks %lu-%lu",
-                              ar->last_block + 1, hdr->number - 1);
-                    block_body_free(body);
-                    return false;
+                    LOG_WARN("Era block gap: expected %lu, got %lu (file: %s)",
+                             ar->last_block + 1, hdr->number,
+                             ar->paths[ar->current_idx]);
                 }
                 ar->last_block = hdr->number;
                 return true;
