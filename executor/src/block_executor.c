@@ -486,56 +486,16 @@ block_result_t block_execute(evm_t *evm,
         result.receipt_count = tx_count;
     }
 
-    /* Set up block environment on the EVM */
+    /* Set up block + tx environments */
     evm_block_env_t evm_env;
-    header_to_evm_block_env(header, &evm_env, evm->chain_config);
-    if (block_hashes)
-        memcpy(evm_env.block_hash, block_hashes, sizeof(evm_env.block_hash));
-    evm_set_block_env(evm, &evm_env);
-
-    /* Build block_env_t for transaction_execute */
     block_env_t tx_env;
-    header_to_block_env(header, &tx_env);
+    block_setup_env(evm, header, block_hashes, &evm_env, &tx_env);
+
+    /* Pre-block init: prune mode, commit, begin_block, DAO fork, system calls */
+    block_pre_init(evm, header);
 
     /* Determine chain ID */
     uint64_t chain_id = evm->chain_config ? evm->chain_config->chain_id : 1;
-
-    /* EIP-161: enable empty account pruning at Spurious Dragon */
-    evm_state_set_prune_empty(evm->state, evm->fork >= FORK_SPURIOUS_DRAGON);
-
-    /* Commit state before executing transactions (EIP-2200 original values) */
-    evm_state_commit(evm->state);
-
-    /* Begin block: reset witness gas + open flat backend block */
-    evm_state_begin_block(evm->state, header->number);
-
-    /* DAO fork: drain 116 accounts into refund contract at block 1,920,000 */
-    if (header->number == DAO_FORK_BLOCK && chain_id == 1) {
-        apply_dao_fork(evm->state);
-    }
-
-    /* EIP-4788: Store parent beacon block root (Cancun+).
-     * System call to beacon root contract with parent_beacon_root as calldata.
-     * The contract stores: timestamp at slot (timestamp % 8191),
-     *                      beacon_root at slot (timestamp % 8191 + 8191). */
-    if (evm->fork >= FORK_CANCUN && header->has_parent_beacon_root) {
-        static const uint8_t BEACON_ROOT_ADDR[20] = {
-            0x00, 0x0F, 0x3d, 0xf6, 0xD7, 0x32, 0x80, 0x7E, 0xf1, 0x31,
-            0x9f, 0xB7, 0xB8, 0xbB, 0x85, 0x22, 0xd0, 0xBe, 0xac, 0x02
-        };
-        system_call(evm, BEACON_ROOT_ADDR,
-                    header->parent_beacon_root.bytes, 32, NULL, NULL);
-    }
-
-    /* EIP-2935: Store parent block hash in history contract (Prague+) */
-    if (evm->fork >= FORK_PRAGUE) {
-        static const uint8_t HISTORY_ADDR[20] = {
-            0x00, 0x00, 0xf9, 0x08, 0x27, 0xf1, 0xc5, 0x3a, 0x10, 0xcb,
-            0x7a, 0x02, 0x33, 0x5b, 0x17, 0x53, 0x20, 0x00, 0x29, 0x35
-        };
-        system_call(evm, HISTORY_ADDR,
-                    header->parent_hash.bytes, 32, NULL, NULL);
-    }
 
     uint64_t cumulative_gas = 0;
     result.success = true;
@@ -657,13 +617,9 @@ block_result_t block_execute(evm_t *evm,
         evm_state_commit_tx(evm->state);
     }
 
-    /* Compute aggregate bloom (OR of all per-tx blooms) */
-    memset(result.logs_bloom, 0, 256);
-    for (size_t i = 0; i < tx_count; i++)
-        bloom_or(result.logs_bloom, result.receipts[i].logs_bloom);
-
-    /* Compute receipt trie root */
-    result.receipt_root = compute_receipt_root(result.receipts, tx_count);
+    /* Aggregate per-tx blooms + compute receipt root */
+    block_aggregate_receipts(result.receipts, tx_count,
+                             result.logs_bloom, &result.receipt_root);
 
     /* Join prep thread and drain any remaining ring entries */
     if (prep_tid) {
@@ -689,53 +645,9 @@ block_result_t block_execute(evm_t *evm,
         tx_ring_destroy(&ring);
     }
 
-    /* Pay block reward (PoW only — zero after The Merge) */
-    uint256_t base_reward = get_block_reward(evm->fork);
-    if (!uint256_is_zero(&base_reward)) {
-        uint256_t miner_reward = base_reward;
-        /* Uncle inclusion bonuses */
-        size_t uncle_count = block_body_uncle_count(body);
-        for (size_t u = 0; u < uncle_count; u++) {
-            /* Miner gets base_reward/32 per uncle included */
-            uint256_t thirty_two = uint256_from_uint64(32);
-            uint256_t uncle_bonus = uint256_div(&base_reward, &thirty_two);
-            miner_reward = uint256_add(&miner_reward, &uncle_bonus);
-
-            /* Uncle miner gets base_reward * (uncle_num + 8 - block_num) / 8 */
-            block_header_t uncle_hdr;
-            if (block_body_get_uncle(body, u, &uncle_hdr)) {
-                /* Validate uncle depth: must be within 7 blocks */
-                if (uncle_hdr.number >= header->number ||
-                    header->number - uncle_hdr.number > 7)
-                    continue;
-                uint64_t depth = uncle_hdr.number + 8 - header->number;
-                if (g_trace_calls) {
-                    fprintf(stderr, "UNCLE[%zu] number=%lu depth=%lu coinbase=%02x%02x..%02x%02x\n",
-                            u, uncle_hdr.number, depth,
-                            uncle_hdr.coinbase.bytes[0], uncle_hdr.coinbase.bytes[1],
-                            uncle_hdr.coinbase.bytes[18], uncle_hdr.coinbase.bytes[19]);
-                }
-                uint256_t depth_u = uint256_from_uint64(depth);
-                uint256_t eight = uint256_from_uint64(8);
-                uint256_t uncle_miner_reward = uint256_mul(&base_reward, &depth_u);
-                uncle_miner_reward = uint256_div(&uncle_miner_reward, &eight);
-                evm_state_add_balance(evm->state, &uncle_hdr.coinbase,
-                                      &uncle_miner_reward);
-            }
-        }
-
-        evm_state_add_balance(evm->state, &header->coinbase, &miner_reward);
-    }
-
-    /* Process EIP-4895 withdrawals (Shanghai+) */
-    for (size_t w = 0; w < body->withdrawal_count; w++) {
-        /* Withdrawal amount is in Gwei — convert to Wei (* 1e9) */
-        uint256_t gwei = uint256_from_uint64(body->withdrawals[w].amount_gwei);
-        uint256_t multiplier = uint256_from_uint64(1000000000ULL);
-        uint256_t amount_wei = uint256_mul(&gwei, &multiplier);
-        evm_state_add_balance(evm->state, &body->withdrawals[w].address,
-                              &amount_wei);
-    }
+    /* Block rewards (PoW only) + withdrawals (Shanghai+) */
+    block_pay_rewards(evm, header, body);
+    block_process_withdrawals(evm, body);
 
     /* EIP-7685: Accumulate execution requests (Prague+)
      * Three request types collected in order:
@@ -905,42 +817,13 @@ block_result_t block_execute(evm_t *evm,
         }
     }
 
-    /* Finalize state: flush dirty accounts/storage to state_db */
-    evm_state_finalize(evm->state);
-
+    /* Finalize state, compute root, reset per-block caches */
+    result.state_root = block_finalize_state(evm,
 #ifdef ENABLE_HISTORY
-    /* Capture state diff before dirty flags are cleared by compute_state_root. */
-    memset(&result.diff, 0, sizeof(result.diff));
-    result.diff.block_number = header->number;
-    evm_state_collect_block_diff(evm->state, &result.diff);
-
-    /* Push diff to history ring for disk persistence (optional) */
-    if (history) {
-        block_diff_t hist_diff;
-        block_diff_clone(&result.diff, &hist_diff);
-        state_history_push(history, &hist_diff);
-    }
+                                             history, &result.diff, header->number,
 #endif
-
-    /* Per-block finalization — always runs: promotes/demotes existence,
-     * marks stale storage roots, clears dirty flags, swaps dirty buffer. */
-    bool prune_empty = (evm->fork >= FORK_SPURIOUS_DRAGON);
-    evm_state_finalize_block(evm->state, prune_empty);
-
-    /* Compute state root at checkpoint — prune empty accounts post-EIP-161. */
-    struct timespec _rt0, _rt1;
-    clock_gettime(CLOCK_MONOTONIC, &_rt0);
-    if (!evm->skip_root_hash) {
-        result.state_root = evm_state_compute_state_root_ex(evm->state, prune_empty);
-    }
-    clock_gettime(CLOCK_MONOTONIC, &_rt1);
-    result.root_ms = (_rt1.tv_sec - _rt0.tv_sec) * 1000.0 +
-                     (_rt1.tv_nsec - _rt0.tv_nsec) / 1e6;
+                                             &result.root_ms);
     result.gas_used = cumulative_gas;
-
-    /* Reset per-block caches (addr hash, originals) — after compute_root
-     * so it can still benefit from the warm addr_hash_cache. */
-    evm_state_reset_block(evm->state);
 
     return result;
 }
