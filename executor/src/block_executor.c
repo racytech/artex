@@ -506,50 +506,31 @@ block_result_t block_execute(evm_t *evm,
                 (unsigned long)header->difficulty.low, (unsigned long)header->difficulty.high);
     }
 
-    /* Launch prep thread to decode + ecrecover all txs ahead of execution */
-    tx_ring_t ring;
-    tx_ring_init(&ring);
-
-    tx_prep_ctx_t prep_ctx = {
-        .ring     = &ring,
-        .body     = body,
-        .tx_count = tx_count,
-        .chain_id = chain_id,
-        .cancel   = false,
-    };
-
-    pthread_t prep_tid = 0;
+    /* Batch-decode all transactions in parallel (RLP + ecrecover).
+     * Use 4 threads for blocks with 16+ txs, serial for small blocks. */
+    #define BATCH_DECODE_THREADS  4
+    #define BATCH_DECODE_THRESH  16
+    prepared_tx_t *decoded = NULL;
     if (tx_count > 0) {
-        pthread_create(&prep_tid, NULL, tx_prep_thread, &prep_ctx);
+        decoded = calloc(tx_count, sizeof(prepared_tx_t));
+        if (!decoded) { result.success = false; return result; }
+        int nthreads = (tx_count >= BATCH_DECODE_THRESH) ? BATCH_DECODE_THREADS : 1;
+        tx_batch_decode(body, tx_count, chain_id, decoded, nthreads);
     }
 
+    size_t last_tx = tx_count;  /* track how far we got for cleanup */
     for (size_t i = 0; i < tx_count; i++) {
-        /* Pop next prepared tx from ring buffer (spins until available) */
-        prepared_tx_t ptx;
-        if (!tx_ring_pop(&ring, &ptx, &prep_ctx.cancel)) {
-            fprintf(stderr, "block_execute: ring pop cancelled at tx %zu\n", i);
-            result.success = false;
-            if (result.first_failure < 0) result.first_failure = (int)i;
-            break;
-        }
-
-        /* Handle sentinel — prep thread finished early (shouldn't happen
-         * unless tx_count mismatches, but be safe) */
-        if (ptx.done) {
-            fprintf(stderr, "block_execute: unexpected sentinel at tx %zu\n", i);
-            result.success = false;
-            if (result.first_failure < 0) result.first_failure = (int)i;
-            break;
-        }
+        prepared_tx_t *ptx = &decoded[i];
 
         transaction_t tx;
-        if (!ptx.valid) {
-            fprintf(stderr, "block_execute: prep thread failed to decode tx %zu\n", i);
+        if (!ptx->valid) {
+            fprintf(stderr, "block_execute: failed to decode tx %zu\n", i);
             result.success = false;
             if (result.first_failure < 0) result.first_failure = (int)i;
+            last_tx = i;
             break;
         }
-        tx = ptx.tx;
+        tx = ptx->tx;
 
         /* Trace transaction details when debugging */
         if (g_trace_calls) {
@@ -621,28 +602,12 @@ block_result_t block_execute(evm_t *evm,
     block_aggregate_receipts(result.receipts, tx_count,
                              result.logs_bloom, &result.receipt_root);
 
-    /* Join prep thread and drain any remaining ring entries */
-    if (prep_tid) {
-        /* Signal cancel so prep thread stops if it's still working */
-        atomic_store_explicit(&prep_ctx.cancel, true, memory_order_relaxed);
-        pthread_mutex_lock(&ring.mtx);
-        pthread_cond_signal(&ring.not_full);
-        pthread_cond_signal(&ring.not_empty);
-        pthread_mutex_unlock(&ring.mtx);
-        pthread_join(prep_tid, NULL);
-
-        /* Drain remaining entries — after cancel the prep thread has exited
-         * and pushed a sentinel. Consume everything left in the ring. */
-        prepared_tx_t drain;
-        for (;;) {
-            size_t h = atomic_load_explicit(&ring.head, memory_order_acquire);
-            size_t t = atomic_load_explicit(&ring.tail, memory_order_relaxed);
-            if (h == t) break;  /* ring is empty */
-            tx_ring_pop(&ring, &drain, NULL);
-            if (drain.done) break;
-            if (drain.valid) tx_decoded_free(&drain.tx);
+    /* Free remaining decoded txs (if execution broke early) */
+    if (decoded) {
+        for (size_t j = last_tx; j < tx_count; j++) {
+            if (decoded[j].valid) tx_decoded_free(&decoded[j].tx);
         }
-        tx_ring_destroy(&ring);
+        free(decoded);
     }
 
     /* Block rewards (PoW only) + withdrawals (Shanghai+) */

@@ -224,6 +224,14 @@ target_link_libraries(artex block_executor evm state common ${CJSON_LIBRARIES})
 add_executable(test_artex lib/test_artex.c)
 target_link_libraries(test_artex artex)
 
+add_executable(bench_parallel_decode executor/tests/bench_parallel_decode.c)
+target_include_directories(bench_parallel_decode PRIVATE
+    ${CMAKE_SOURCE_DIR}/executor/include
+    ${CMAKE_SOURCE_DIR}/evm/include
+    ${CMAKE_SOURCE_DIR}/common/include
+)
+target_link_libraries(bench_parallel_decode block_executor evm state common secp256k1_wrap pthread)
+
 #==============================================================================
 # Libraries — Crypto utilities
 #==============================================================================

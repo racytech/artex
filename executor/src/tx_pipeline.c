@@ -148,3 +148,59 @@ void *tx_prep_thread(void *arg) {
 
     return NULL;
 }
+
+/* =========================================================================
+ * Batch parallel decode
+ * ========================================================================= */
+
+typedef struct {
+    const block_body_t *body;
+    prepared_tx_t      *out;
+    uint64_t            chain_id;
+    size_t              start;
+    size_t              end;
+} batch_worker_t;
+
+static void *batch_decode_worker(void *arg) {
+    batch_worker_t *w = (batch_worker_t *)arg;
+    for (size_t i = w->start; i < w->end; i++) {
+        prepared_tx_t *ptx = &w->out[i];
+        memset(ptx, 0, sizeof(*ptx));
+        const rlp_item_t *tx_item = block_body_tx(w->body, i);
+        if (tx_item && tx_decode_rlp(&ptx->tx, tx_item, w->chain_id))
+            ptx->valid = true;
+    }
+    return NULL;
+}
+
+void tx_batch_decode(const block_body_t *body, size_t tx_count,
+                     uint64_t chain_id, prepared_tx_t *out, int nthreads) {
+    if (tx_count == 0) return;
+    if (nthreads < 1) nthreads = 1;
+    if ((size_t)nthreads > tx_count) nthreads = (int)tx_count;
+
+    if (nthreads == 1) {
+        /* Serial fallback */
+        batch_worker_t w = { body, out, chain_id, 0, tx_count };
+        batch_decode_worker(&w);
+        return;
+    }
+
+    pthread_t tids[32];
+    batch_worker_t workers[32];
+    if (nthreads > 32) nthreads = 32;
+    size_t chunk = tx_count / nthreads;
+
+    for (int t = 0; t < nthreads; t++) {
+        workers[t] = (batch_worker_t){
+            .body = body,
+            .out = out,
+            .chain_id = chain_id,
+            .start = t * chunk,
+            .end = (t == nthreads - 1) ? tx_count : (t + 1) * chunk,
+        };
+        pthread_create(&tids[t], NULL, batch_decode_worker, &workers[t]);
+    }
+    for (int t = 0; t < nthreads; t++)
+        pthread_join(tids[t], NULL);
+}

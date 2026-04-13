@@ -95,6 +95,24 @@ bool tx_ring_pop(tx_ring_t *ring, prepared_tx_t *out,
  */
 void *tx_prep_thread(void *arg);
 
+/* ── Batch parallel decode ─────────────────────────────────────────────── */
+
+/**
+ * Decode all transactions in a block body in parallel.
+ *
+ * Splits tx_count across nthreads worker threads. Each thread decodes
+ * its chunk via tx_decode_rlp (RLP parse + secp256k1 ecrecover).
+ * Results are written to out[0..tx_count-1].
+ *
+ * @param body      Block body containing transactions
+ * @param tx_count  Number of transactions
+ * @param chain_id  Chain ID for EIP-155
+ * @param out       Output array (caller allocates tx_count entries)
+ * @param nthreads  Number of worker threads (clamped to tx_count)
+ */
+void tx_batch_decode(const block_body_t *body, size_t tx_count,
+                     uint64_t chain_id, prepared_tx_t *out, int nthreads);
+
 #ifdef __cplusplus
 }
 #endif
