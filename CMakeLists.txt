@@ -221,6 +221,9 @@ target_include_directories(artex PUBLIC
 )
 target_link_libraries(artex block_executor evm state common ${CJSON_LIBRARIES})
 
+add_executable(test_artex lib/test_artex.c)
+target_link_libraries(test_artex artex)
+
 #==============================================================================
 # Libraries — Crypto utilities
 #==============================================================================
