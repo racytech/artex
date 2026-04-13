@@ -6,6 +6,13 @@
  * Safe for FFI from any language (Rust, Go, Python, Zig, etc.).
  *
  * Prefix: rx_
+ *
+ * Minimal usage:
+ *   rx_engine_t *e = rx_engine_create(&config);
+ *   rx_engine_load_genesis(e, "genesis.json", NULL);
+ *   rx_execute_block_rlp(e, hdr, hdr_len, body, body_len, &hash, &result);
+ *   rx_hash_t root = rx_compute_state_root(e);
+ *   rx_engine_destroy(e);
  */
 
 #ifndef ARTEX_H
@@ -23,8 +30,8 @@ extern "C" {
  * Opaque handles
  * ======================================================================== */
 
-typedef struct rx_state   rx_state_t;    /* execution state (accounts, storage) */
-typedef struct rx_engine  rx_engine_t;   /* sync engine (state + block execution) */
+typedef struct rx_engine rx_engine_t;   /* execution engine (state + EVM) */
+typedef struct rx_state  rx_state_t;    /* state handle (for queries) */
 
 /* ========================================================================
  * Fixed-size types (plain bytes, no internal deps)
@@ -44,27 +51,20 @@ typedef enum {
 } rx_chain_id_t;
 
 typedef struct {
-    rx_chain_id_t  chain_id;
-    uint32_t       checkpoint_interval;  /* validate root every N blocks (0 = never) */
-    bool           validate_state_root;  /* compare root against header */
+    rx_chain_id_t chain_id;
 } rx_config_t;
 
 /* ========================================================================
- * Block execution types
+ * Block execution result
  * ======================================================================== */
 
-typedef enum {
-    RX_OK = 0,
-    RX_ERR_GAS_MISMATCH,
-    RX_ERR_ROOT_MISMATCH,
-    RX_ERR_INTERNAL,
-} rx_error_t;
-
 typedef struct {
-    bool        ok;
-    rx_error_t  error;
-    uint64_t    gas_used;
-    size_t      tx_count;
+    bool        ok;              /* true if execution succeeded */
+    uint64_t    gas_used;        /* total gas consumed */
+    size_t      tx_count;        /* transactions executed */
+    rx_hash_t   state_root;      /* post-execution state root */
+    rx_hash_t   receipt_root;    /* receipt trie root */
+    uint8_t     logs_bloom[256]; /* aggregate bloom filter */
 } rx_block_result_t;
 
 /* ========================================================================
@@ -81,10 +81,10 @@ void rx_engine_destroy(rx_engine_t *engine);
 bool rx_engine_load_genesis(rx_engine_t *engine, const char *path,
                             const rx_hash_t *genesis_hash);
 
-/** Resume from a saved state snapshot. Call instead of load_genesis. */
+/** Load state from a binary snapshot. Call instead of load_genesis. */
 bool rx_engine_load_state(rx_engine_t *engine, const char *path);
 
-/** Save current state to file. */
+/** Save current state to a binary snapshot. */
 bool rx_engine_save_state(rx_engine_t *engine, const char *path);
 
 /* ========================================================================
@@ -94,8 +94,15 @@ bool rx_engine_save_state(rx_engine_t *engine, const char *path);
 /**
  * Execute a block from RLP-encoded header + body.
  *
- * This is the primary entry point: hand it raw RLP bytes
- * from any source (p2p, database, file) and get back results.
+ * Decodes the RLP, executes all transactions, applies rewards
+ * and withdrawals, finalizes state. The state root in the result
+ * is computed automatically.
+ *
+ * block_hash: keccak256 of the RLP-encoded header. Used for the
+ *             BLOCKHASH opcode ring buffer.
+ *
+ * Returns false only on fatal/internal error (OOM, corrupt data).
+ * Check result->ok for execution success.
  */
 bool rx_execute_block_rlp(rx_engine_t *engine,
                           const uint8_t *header_rlp, size_t header_len,
@@ -103,56 +110,60 @@ bool rx_execute_block_rlp(rx_engine_t *engine,
                           const rx_hash_t *block_hash,
                           rx_block_result_t *result);
 
-/** Compute current state root (Merkle Patricia Trie). */
+/**
+ * Compute state root without executing a block.
+ *
+ * Use when you need the root outside of block execution,
+ * e.g. for validation at checkpoint boundaries.
+ */
 rx_hash_t rx_compute_state_root(rx_engine_t *engine);
 
 /* ========================================================================
- * State queries (read-only, no journaling)
+ * State queries
  * ======================================================================== */
 
-/** Get underlying state handle (for direct queries). */
+/** Get state handle for queries. Valid for lifetime of engine. */
 rx_state_t *rx_engine_get_state(rx_engine_t *engine);
 
-uint64_t    rx_get_nonce(rx_state_t *state, const rx_address_t *addr);
+/** Check if account exists in state. */
+bool rx_account_exists(rx_state_t *state, const rx_address_t *addr);
+
+/** Get account nonce. Returns 0 for non-existent accounts. */
+uint64_t rx_get_nonce(rx_state_t *state, const rx_address_t *addr);
+
+/** Get account balance (32 bytes, big-endian). */
 rx_uint256_t rx_get_balance(rx_state_t *state, const rx_address_t *addr);
-rx_hash_t   rx_get_code_hash(rx_state_t *state, const rx_address_t *addr);
-uint32_t    rx_get_code_size(rx_state_t *state, const rx_address_t *addr);
+
+/** Get code hash. Returns empty hash for EOAs. */
+rx_hash_t rx_get_code_hash(rx_state_t *state, const rx_address_t *addr);
+
+/** Get code size in bytes. Returns 0 for EOAs. */
+uint32_t rx_get_code_size(rx_state_t *state, const rx_address_t *addr);
 
 /**
  * Copy contract bytecode into caller buffer.
- * Returns actual length. If buf is NULL or buf_len too small,
- * returns required size without copying.
+ * Returns actual code length. If buf is NULL or buf_len is too small,
+ * returns the required size without copying.
  */
 uint32_t rx_get_code(rx_state_t *state, const rx_address_t *addr,
                      uint8_t *buf, uint32_t buf_len);
 
+/** Get storage value at key. Returns zero for unset slots. */
 rx_uint256_t rx_get_storage(rx_state_t *state, const rx_address_t *addr,
                             const rx_uint256_t *key);
-
-/** Check if account exists in state. */
-bool rx_account_exists(rx_state_t *state, const rx_address_t *addr);
 
 /* ========================================================================
  * Status
  * ======================================================================== */
 
-typedef struct {
-    uint64_t last_block;
-    uint64_t total_gas;
-    uint64_t blocks_executed;
-    uint32_t account_count;
-} rx_status_t;
-
-rx_status_t rx_get_status(const rx_engine_t *engine);
-
-/** Get last executed block number. */
+/** Get last executed block number. Returns 0 before first block. */
 uint64_t rx_get_block_number(const rx_engine_t *engine);
 
 /* ========================================================================
  * Version
  * ======================================================================== */
 
-/** Returns version string, e.g. "0.1.0" */
+/** Returns version string, e.g. "0.1.0". */
 const char *rx_version(void);
 
 #ifdef __cplusplus
