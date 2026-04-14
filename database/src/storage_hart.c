@@ -184,7 +184,7 @@ static bool ensure_mapped(storage_hart_pool_t *pool, uint64_t need) {
     while (new_size < total)
         new_size = new_size < INITIAL_MAP_SIZE ? INITIAL_MAP_SIZE : new_size + new_size / 2;
 
-    if (new_size >= 1024ULL * 1024 * 1024)
+    if (new_size >= 8ULL * 1024 * 1024 * 1024)
         fprintf(stderr, "POOL_GROW: %zuGB -> %zuGB\n",
                 pool->mapped / (1024*1024*1024), new_size / (1024*1024*1024));
 
@@ -436,7 +436,7 @@ static bool arena_ensure(storage_hart_pool_t *pool, storage_hart_t *sh,
     }
     if (new_cap < min_cap) new_cap = min_cap;
 
-    if (new_cap >= 512ULL * 1024 * 1024) {
+    if (new_cap >= 4ULL * 1024 * 1024 * 1024) {
         fprintf(stderr, "ARENA_GROW: %luMB -> %luMB (used=%luMB, needed=%u)\n",
                 (unsigned long)(sh->arena_cap / (1024*1024)),
                 (unsigned long)(new_cap / (1024*1024)),
