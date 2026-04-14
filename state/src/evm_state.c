@@ -254,6 +254,12 @@ bool evm_state_warm_slot(evm_state_t *es, const address_t *addr,
     return was;
 }
 
+bool evm_state_is_slot_warm(const evm_state_t *es, const address_t *addr,
+                             const uint256_t *key) {
+    if (!es) return false;
+    return state_is_storage_warm(es->st, addr, key);
+}
+
 /* =========================================================================
  * EIP-1153 transient storage
  * ========================================================================= */
