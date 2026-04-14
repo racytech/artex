@@ -245,6 +245,30 @@ if(CMAKE_POSITION_INDEPENDENT_CODE)
     )
 endif()
 
+# Install rules
+include(GNUInstallDirs)
+install(TARGETS artex
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+install(FILES include/artex.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+if(CMAKE_POSITION_INDEPENDENT_CODE)
+    install(TARGETS artex_shared
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
+endif()
+
+# pkg-config
+configure_file(
+    ${CMAKE_SOURCE_DIR}/artex.pc.in
+    ${CMAKE_BINARY_DIR}/artex.pc
+    @ONLY
+)
+install(FILES ${CMAKE_BINARY_DIR}/artex.pc
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+)
+
 add_executable(test_artex lib/test_artex.c)
 target_link_libraries(test_artex artex)
 

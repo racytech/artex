@@ -11,8 +11,19 @@
  *   rx_engine_t *e = rx_engine_create(&config);
  *   rx_engine_load_genesis(e, "genesis.json", NULL);
  *   rx_execute_block_rlp(e, hdr, hdr_len, body, body_len, &hash, &result);
+ *   rx_commit_block(e);
  *   rx_hash_t root = rx_compute_state_root(e);
  *   rx_engine_destroy(e);
+ *
+ * Thread safety:
+ *   - rx_engine_t is NOT thread-safe. All calls on the same engine
+ *     must be serialized by the caller.
+ *   - Multiple engines can be used concurrently from different threads
+ *     (each engine owns its own state).
+ *   - rx_state_t from rx_engine_get_state is valid only between block
+ *     executions — do not query state while a block is executing.
+ *   - rx_call is safe to call between blocks (it snapshots and reverts).
+ *   - rx_error_string and rx_version are safe to call from any thread.
  */
 
 #ifndef ARTEX_H
