@@ -294,6 +294,7 @@ RX_API bool rx_execute_block_rlp(rx_engine_t *engine,
                                  const uint8_t *header_rlp, size_t header_len,
                                  const uint8_t *body_rlp, size_t body_len,
                                  const rx_hash_t *block_hash,
+                                 bool compute_root,
                                  rx_block_result_t *result);
 
 /**
@@ -304,11 +305,17 @@ RX_API bool rx_execute_block_rlp(rx_engine_t *engine,
  *
  * block_hash: keccak256 of the RLP-encoded header. Used for the
  *             BLOCKHASH opcode ring buffer.
+ *
+ * compute_root: if true, compute state root after execution
+ *               (result->state_root is valid). If false, skip root
+ *               computation for speed (result->state_root is zero).
+ *               Use rx_compute_state_root at checkpoint boundaries.
  */
 RX_API bool rx_execute_block(rx_engine_t *engine,
                              const rx_block_header_t *header,
                              const rx_block_body_t *body,
                              const rx_hash_t *block_hash,
+                             bool compute_root,
                              rx_block_result_t *result);
 
 /**

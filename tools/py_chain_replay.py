@@ -153,6 +153,7 @@ def load_libartex(path):
         ctypes.POINTER(RxBlockHeader),
         ctypes.POINTER(RxBlockBody),
         ctypes.POINTER(RxHash),
+        ctypes.c_bool,
         ctypes.POINTER(RxBlockResult),
     ]
 
@@ -573,8 +574,10 @@ def main():
             hdr, body, block_hash = ep_to_header_body(ep)
 
             result = RxBlockResult()
+            want_root = args.checkpoint and (block_num % args.checkpoint == 0)
             ok = lib.rx_execute_block(engine, ctypes.byref(hdr), ctypes.byref(body),
-                                       ctypes.byref(block_hash), ctypes.byref(result))
+                                       ctypes.byref(block_hash), want_root,
+                                       ctypes.byref(result))
 
             if not ok:
                 msg = lib.rx_engine_last_error_msg(engine).decode()

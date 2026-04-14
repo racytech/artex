@@ -497,7 +497,10 @@ static bool execute_block_internal(rx_engine_t *engine,
                                    block_header_t *header,
                                    block_body_t *body,
                                    const rx_hash_t *block_hash,
+                                   bool compute_root,
                                    rx_block_result_t *result) {
+    engine->evm->skip_root_hash = !compute_root;
+
     block_result_t br = block_execute(engine->evm, header, body,
                                       engine->block_hashes
 #ifdef ENABLE_HISTORY
@@ -525,6 +528,7 @@ bool rx_execute_block_rlp(rx_engine_t *engine,
                           const uint8_t *header_rlp, size_t header_len,
                           const uint8_t *body_rlp, size_t body_len,
                           const rx_hash_t *block_hash,
+                          bool compute_root,
                           rx_block_result_t *result) {
     if (!engine || !header_rlp || !body_rlp || !result) {
         if (engine) engine_set_error(engine, RX_ERR_NULL_ARG, "required argument is NULL");
@@ -547,13 +551,14 @@ bool rx_execute_block_rlp(rx_engine_t *engine,
         return false;
     }
 
-    return execute_block_internal(engine, &header, &body, block_hash, result);
+    return execute_block_internal(engine, &header, &body, block_hash, compute_root, result);
 }
 
 bool rx_execute_block(rx_engine_t *engine,
                       const rx_block_header_t *header,
                       const rx_block_body_t *body,
                       const rx_hash_t *block_hash,
+                      bool compute_root,
                       rx_block_result_t *result) {
     if (!engine || !header || !body || !result) {
         if (engine) engine_set_error(engine, RX_ERR_NULL_ARG, "required argument is NULL");
@@ -571,7 +576,7 @@ bool rx_execute_block(rx_engine_t *engine,
         return false;
     }
 
-    return execute_block_internal(engine, &int_header, &int_body, block_hash, result);
+    return execute_block_internal(engine, &int_header, &int_body, block_hash, compute_root, result);
 }
 
 rx_hash_t rx_compute_state_root(rx_engine_t *engine) {
