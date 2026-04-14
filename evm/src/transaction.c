@@ -130,11 +130,17 @@ static void calculate_gas_pair(const transaction_t *tx, evm_fork_t fork,
  *     return output // denominator
  */
 static uint256_t fake_exponential(const uint256_t *factor, const uint256_t *numerator, const uint256_t *denominator) {
+    if (uint256_is_zero(denominator)) return UINT256_ZERO;
+
     uint256_t i = uint256_from_uint64(1);
     uint256_t output = UINT256_ZERO;
     uint256_t numerator_accum = uint256_mul(factor, denominator);
 
-    while (!uint256_is_zero(&numerator_accum)) {
+    /* Cap iterations to prevent runaway on adversarial inputs.
+     * For valid excess_blob_gas values, converges in <100 iterations.
+     * With 256-bit overflow on huge numerator/denominator ratios,
+     * the loop may never terminate without this guard. */
+    for (int iter = 0; iter < 4096 && !uint256_is_zero(&numerator_accum); iter++) {
         output = uint256_add(&output, &numerator_accum);
         // numerator_accum = (numerator_accum * numerator) / (denominator * i)
         uint256_t num_product = uint256_mul(&numerator_accum, numerator);
@@ -145,7 +151,6 @@ static uint256_t fake_exponential(const uint256_t *factor, const uint256_t *nume
         i = uint256_add(&i, &one);
     }
 
-    if (uint256_is_zero(denominator)) return UINT256_ZERO;
     return uint256_div(&output, denominator);
 }
 
