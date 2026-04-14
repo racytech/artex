@@ -352,8 +352,8 @@ bool test_runner_run_engine_test(test_runner_t *runner,
             goto cleanup;
         }
 
-        /* Snapshot state before execution (for reverting invalid blocks) */
-        uint32_t pre_block_snap = evm_state_snapshot(runner->state);
+        /* Keep undo log so we can revert invalid blocks */
+        runner->evm->keep_undo = true;
 
         /* Execute block */
         block_result_t block_result = block_execute(runner->evm, &hdr, &body, block_hashes
@@ -371,11 +371,10 @@ bool test_runner_run_engine_test(test_runner_t *runner,
         /* If block execution detected an invalidity, treat as rejection */
         if (block_result.deposit_layout_invalid && payload->validation_error != NULL) {
             if (runner->config.verbose) {
-                printf("    Expected error: %s (deposit layout invalid = correct rejection, diff groups=%u)\n",
-                       payload->validation_error, block_result.diff.group_count);
+                printf("    Expected error: %s (deposit layout invalid, reverting block)\n",
+                       payload->validation_error);
             }
-            block_diff_revert(runner->state, &block_result.diff);
-            evm_state_invalidate_all(runner->state);
+            evm_state_revert_block(runner->state);
             block_result_free(&block_result);
             block_body_free(&body);
             block_hashes[hdr.number % 256] = *(const hash_t *)payload->block_hash;
@@ -383,14 +382,13 @@ bool test_runner_run_engine_test(test_runner_t *runner,
         }
 
         /* If the payload expects a validation error (invalid block),
-         * revert state via undo diff. */
+         * revert state via undo log. */
         if (payload->validation_error != NULL) {
             if (runner->config.verbose) {
-                printf("    Expected error: %s (reverting via undo diff)\n",
+                printf("    Expected error: %s (reverting block)\n",
                        payload->validation_error);
             }
-            block_diff_revert(runner->state, &block_result.diff);
-            evm_state_invalidate_all(runner->state);
+            evm_state_revert_block(runner->state);
             block_result_free(&block_result);
             block_body_free(&body);
             block_hashes[hdr.number % 256] = computed_hash;

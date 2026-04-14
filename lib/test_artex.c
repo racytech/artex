@@ -398,6 +398,71 @@ static int test_block_hash_query(void) {
     return errors;
 }
 
+static int test_commit_revert(void) {
+    printf("\ntest_commit_revert:\n");
+    int errors = 0;
+
+    /* NULL engine */
+    if (rx_commit_block(NULL)) {
+        printf("  FAIL: commit NULL should fail\n"); errors++;
+    }
+    if (rx_revert_block(NULL)) {
+        printf("  FAIL: revert NULL should fail\n"); errors++;
+    }
+
+    /* Create engine + load genesis */
+    FILE *f = fopen(TEST_GENESIS, "w");
+    fprintf(f,
+        "{\n"
+        "  \"0x0000000000000000000000000000000000000001\": {\n"
+        "    \"balance\": \"0xde0b6b3a7640000\"\n"
+        "  }\n"
+        "}\n");
+    fclose(f);
+
+    rx_config_t config = { .chain_id = RX_CHAIN_MAINNET };
+    rx_engine_t *e = rx_engine_create(&config);
+    if (!e) { printf("  FAIL: create\n"); return 1; }
+    if (!rx_engine_load_genesis(e, TEST_GENESIS, NULL)) {
+        printf("  FAIL: load_genesis\n"); rx_engine_destroy(e); return 1;
+    }
+
+    /* Get balance before */
+    rx_address_t addr = {0};
+    addr.bytes[19] = 0x01;
+    rx_state_t *state = rx_engine_get_state(e);
+    rx_uint256_t bal_before = rx_get_balance(state, &addr);
+
+    /* Commit with no pending block — should succeed (no-op) */
+    if (!rx_commit_block(e)) {
+        printf("  FAIL: commit should succeed\n"); errors++;
+    }
+
+    /* Revert with no pending block — should succeed (no-op) */
+    if (!rx_revert_block(e)) {
+        printf("  FAIL: revert should succeed\n"); errors++;
+    }
+
+    /* Balance should be unchanged */
+    rx_uint256_t bal_after = rx_get_balance(state, &addr);
+    if (memcmp(bal_before.bytes, bal_after.bytes, 32) != 0) {
+        printf("  FAIL: balance changed after no-op commit/revert\n"); errors++;
+    }
+
+    /* State root should be consistent */
+    rx_hash_t root1 = rx_compute_state_root(e);
+    rx_hash_t root2 = rx_compute_state_root(e);
+    if (memcmp(root1.bytes, root2.bytes, 32) != 0) {
+        printf("  FAIL: state root not stable\n"); errors++;
+    }
+
+    rx_engine_destroy(e);
+    unlink(TEST_GENESIS);
+
+    if (errors == 0) printf("  OK\n");
+    return errors;
+}
+
 int main(void) {
     int errors = 0;
     errors += test_create_destroy();
@@ -406,6 +471,7 @@ int main(void) {
     errors += test_logger_callback();
     errors += test_error_codes();
     errors += test_block_hash_query();
+    errors += test_commit_revert();
 
     printf("\n=== %s (%d errors) ===\n", errors ? "FAIL" : "PASS", errors);
     return errors ? 1 : 0;
