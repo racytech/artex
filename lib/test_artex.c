@@ -297,12 +297,115 @@ static int test_logger_callback(void) {
     }
 }
 
+static int test_error_codes(void) {
+    printf("\ntest_error_codes:\n");
+    int errors = 0;
+
+    rx_config_t config = { .chain_id = RX_CHAIN_MAINNET };
+    rx_engine_t *e = rx_engine_create(&config);
+    if (!e) { printf("  FAIL: create\n"); return 1; }
+
+    /* Fresh engine — no error */
+    if (rx_engine_last_error(e) != RX_OK) {
+        printf("  FAIL: initial error should be RX_OK\n"); errors++;
+    }
+
+    /* Load bad path — should set FILE_IO error */
+    if (rx_engine_load_state(e, "/nonexistent/path.bin")) {
+        printf("  FAIL: load_state should fail\n"); errors++;
+    }
+    if (rx_engine_last_error(e) != RX_ERR_FILE_IO) {
+        printf("  FAIL: expected RX_ERR_FILE_IO, got %d\n", rx_engine_last_error(e));
+        errors++;
+    }
+    const char *msg = rx_engine_last_error_msg(e);
+    if (!msg || strlen(msg) == 0) {
+        printf("  FAIL: error message should not be empty\n"); errors++;
+    } else {
+        printf("  error msg: \"%s\"\n", msg);
+    }
+
+    /* Load genesis — clears error on success */
+    FILE *f = fopen(TEST_GENESIS, "w");
+    fprintf(f, "{ \"0x0000000000000000000000000000000000000001\": { \"balance\": \"0x1\" } }\n");
+    fclose(f);
+
+    if (!rx_engine_load_genesis(e, TEST_GENESIS, NULL)) {
+        printf("  FAIL: load_genesis\n"); errors++;
+    }
+    if (rx_engine_last_error(e) != RX_OK) {
+        printf("  FAIL: error should be cleared after success\n"); errors++;
+    }
+
+    /* Double genesis — should set ALREADY_INIT */
+    if (rx_engine_load_genesis(e, TEST_GENESIS, NULL)) {
+        printf("  FAIL: double genesis should fail\n"); errors++;
+    }
+    if (rx_engine_last_error(e) != RX_ERR_ALREADY_INIT) {
+        printf("  FAIL: expected RX_ERR_ALREADY_INIT, got %d\n", rx_engine_last_error(e));
+        errors++;
+    }
+
+    /* Error string */
+    const char *s = rx_error_string(RX_ERR_DECODE);
+    printf("  RX_ERR_DECODE = \"%s\"\n", s);
+    if (!s || strlen(s) == 0) {
+        printf("  FAIL: error string empty\n"); errors++;
+    }
+
+    /* NULL engine */
+    if (rx_engine_last_error(NULL) != RX_ERR_NULL_ARG) {
+        printf("  FAIL: NULL engine should return RX_ERR_NULL_ARG\n"); errors++;
+    }
+
+    rx_engine_destroy(e);
+    unlink(TEST_GENESIS);
+
+    if (errors == 0) printf("  OK\n");
+    return errors;
+}
+
+static int test_block_hash_query(void) {
+    printf("\ntest_block_hash_query:\n");
+    int errors = 0;
+
+    rx_config_t config = { .chain_id = RX_CHAIN_MAINNET };
+    rx_engine_t *e = rx_engine_create(&config);
+    if (!e) { printf("  FAIL: create\n"); return 1; }
+
+    /* No blocks executed — query should fail */
+    rx_hash_t out;
+    if (rx_get_block_hash(e, 1, &out)) {
+        printf("  FAIL: should fail with no blocks\n"); errors++;
+    }
+
+    /* Block 0 always returns false (genesis hash not queryable this way) */
+    if (rx_get_block_hash(e, 0, &out)) {
+        printf("  FAIL: block 0 should return false\n"); errors++;
+    }
+
+    /* NULL args */
+    if (rx_get_block_hash(NULL, 1, &out)) {
+        printf("  FAIL: NULL engine should fail\n"); errors++;
+    }
+    if (rx_get_block_hash(e, 1, NULL)) {
+        printf("  FAIL: NULL out should fail\n"); errors++;
+    }
+
+    rx_engine_destroy(e);
+
+    if (errors == 0) printf("  OK\n");
+    return errors;
+}
+
 int main(void) {
     int errors = 0;
     errors += test_create_destroy();
     errors += test_genesis_and_queries();
     errors += test_save_load();
     errors += test_logger_callback();
+    errors += test_error_codes();
+    errors += test_block_hash_query();
 
     printf("\n=== %s (%d errors) ===\n", errors ? "FAIL" : "PASS", errors);
     return errors ? 1 : 0;

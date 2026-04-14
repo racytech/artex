@@ -1702,6 +1702,105 @@ void state_reset_block(state_t *s) {
      * cached values never go stale. Persists across blocks. */
 }
 
+/* =========================================================================
+ * Revert block — restore pre-block state from undo log
+ * ========================================================================= */
+
+/* Callback: restore storage slot to its pre-block value */
+static bool revert_stor_cb(const uint8_t *key, size_t key_len,
+                            const void *value, size_t value_len,
+                            void *user_data) {
+    (void)key_len; (void)value_len;
+    state_t *s = (state_t *)user_data;
+
+    /* key = addr[20] + slot_be[32] */
+    const uint8_t *addr_bytes = key;
+    const uint8_t *slot_be = key + 20;
+    const uint256_t *old_value = (const uint256_t *)value;
+
+    account_t *a = find_account(s, addr_bytes);
+    if (!a) return true;
+
+    resource_t *r = get_resource(s, a);
+    if (!r || !s->stor_pool) return true;
+
+    /* Recompute slot hash (storage hart key = keccak256(slot_be)) */
+    hash_t slot_hash = hash_keccak256(slot_be, 32);
+
+    /* Restore original value */
+    if (uint256_is_zero(old_value))
+        storage_hart_del(s->stor_pool, &r->storage, slot_hash.bytes);
+    else {
+        uint8_t val_be[32];
+        uint256_to_bytes(old_value, val_be);
+        storage_hart_put(s->stor_pool, &r->storage, slot_hash.bytes, val_be);
+    }
+
+    /* Mark storage path dirty so next compute_root rehashes */
+    storage_hart_mark_dirty(s->stor_pool, &r->storage, slot_hash.bytes);
+
+    return true;
+}
+
+/* Callback: restore account nonce/balance/code_hash to pre-block values */
+static bool revert_acct_cb(const uint8_t *key, size_t key_len,
+                            const void *value, size_t value_len,
+                            void *user_data) {
+    (void)key_len; (void)value_len;
+    state_t *s = (state_t *)user_data;
+    const acct_snapshot_t *snap = (const acct_snapshot_t *)value;
+
+    account_t *a = find_account(s, key);
+    if (!a) return true;
+
+    /* Restore nonce and balance */
+    a->nonce = snap->nonce;
+    a->balance = snap->balance;
+
+    /* Restore existence flag */
+    if (snap->existed)
+        acct_set_flag(a, ACCT_EXISTED);
+    else
+        acct_clear_flag(a, ACCT_EXISTED);
+
+    /* Clear block-level flags */
+    acct_clear_flag(a, ACCT_DIRTY | ACCT_CREATED | ACCT_SELF_DESTRUCTED |
+                       ACCT_IN_BLK_DIRTY);
+
+    /* Mark ART path dirty for next root computation */
+    hash_t ah = addr_hash_cached(s, key);
+    hart_mark_path_dirty(&s->acct_index, ah.bytes);
+
+    return true;
+}
+
+bool state_revert_block(state_t *s) {
+    if (!s) return false;
+
+    /* Restore storage slots first (accounts reference storage) */
+    mem_art_foreach(&s->blk_orig_stor, revert_stor_cb, s);
+
+    /* Restore account fields */
+    mem_art_foreach(&s->blk_orig_acct, revert_acct_cb, s);
+
+    /* Clear undo log */
+    mem_art_destroy(&s->blk_orig_acct); mem_art_init(&s->blk_orig_acct);
+    mem_art_destroy(&s->blk_orig_stor); mem_art_init(&s->blk_orig_stor);
+
+    /* Clear dirty lists — state is back to pre-block */
+    dirty_clear(&s->blk_dirty);
+    dirty_clear(&s->last_dirty);
+    dirty_clear(&s->tx_dirty);
+    s->blk_dirty_cursor = 0;
+
+    /* Clear journal */
+    s->journal_len = 0;
+    mem_art_destroy(&s->originals);
+    mem_art_init(&s->originals);
+
+    return true;
+}
+
 uint32_t state_dead_count(const state_t *s) {
     if (!s) return 0;
     return s->dead_total + s->phantom_count + s->destructed_count + s->pruned_count;

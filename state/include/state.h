@@ -141,6 +141,15 @@ hash_t state_compute_root_ex(state_t *s, bool prune_empty, bool compute_hash);
 void   state_finalize_block(state_t *s, bool prune_empty);
 void   state_reset_block(state_t *s);
 
+/**
+ * Revert the last block's changes using the undo log (blk_orig_acct/blk_orig_stor).
+ * Restores account nonce/balance/flags and storage slots to their pre-block values.
+ * Clears the undo log afterward. Returns false if state is NULL.
+ *
+ * Must be called INSTEAD OF state_reset_block when rejecting a block.
+ */
+bool   state_revert_block(state_t *s);
+
 /* Force full recomputation on next compute_root — invalidates all cached
  * hashes in account index and all storage harts. Use at snapshot time. */
 void   state_invalidate_all(state_t *s);

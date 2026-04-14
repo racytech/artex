@@ -274,8 +274,12 @@ void evm_state_tstore(evm_state_t *es, const address_t *addr,
 
 /**
  * Standalone root computation — handles everything:
- * finalize pending dirty state, compute root, reset caches.
+ * finalize pending dirty state, compute root, reset block undo log.
  * Use for snapshot validation, final-root checks, etc.
+ *
+ * NOTE: This destroys undo data (blk_orig). If you need to support
+ * block revert, use evm_state_compute_root_only() + explicit
+ * evm_state_reset_block() / evm_state_revert_block().
  */
 hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     if (!es) return (hash_t){0};
@@ -283,6 +287,17 @@ hash_t evm_state_compute_mpt_root(evm_state_t *es, bool prune_empty) {
     hash_t root = state_compute_root(es->st, prune_empty);
     state_reset_block(es->st);
     return root;
+}
+
+/**
+ * Compute root WITHOUT destroying undo data.
+ * Caller must later call evm_state_reset_block() to clear blk_orig,
+ * or evm_state_revert_block() to undo the block's changes.
+ */
+hash_t evm_state_compute_root_only(evm_state_t *es, bool prune_empty) {
+    if (!es) return (hash_t){0};
+    state_finalize_block(es->st, prune_empty);
+    return state_compute_root(es->st, prune_empty);
 }
 
 /* Thin wrapper — requires finalize_block already called. */
@@ -309,6 +324,11 @@ void evm_state_finalize_block(evm_state_t *es, bool prune_empty) {
 
 void evm_state_reset_block(evm_state_t *es) {
     if (es) state_reset_block(es->st);
+}
+
+bool evm_state_revert_block(evm_state_t *es) {
+    if (!es) return false;
+    return state_revert_block(es->st);
 }
 
 /* =========================================================================

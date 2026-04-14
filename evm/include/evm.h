@@ -221,6 +221,9 @@ struct evm_t
     // Block executor: skip MPT root hash computation (still prunes empty accounts)
     bool skip_root_hash;
 
+    // Block executor: keep undo log (blk_orig) after finalize — for block revert
+    bool keep_undo;
+
     // Cached stack+memory for subcall reuse (avoids malloc/free per CALL)
     evm_stack_t  *cached_stacks[8];   // small freelist, depth rarely > 8
     evm_memory_t *cached_memories[8];

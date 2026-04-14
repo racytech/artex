@@ -223,6 +223,28 @@ target_include_directories(artex PUBLIC
 )
 target_link_libraries(artex block_executor evm state common ${CJSON_LIBRARIES})
 
+# Shared library (libartex.so / libartex.dylib)
+# Requires ALL dependencies (including third_party/secp256k1) built with -fPIC.
+# Build with: cmake -DCMAKE_POSITION_INDEPENDENT_CODE=ON ..
+if(CMAKE_POSITION_INDEPENDENT_CODE)
+    add_library(artex_shared SHARED lib/artex.c)
+    target_include_directories(artex_shared PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/executor/include
+        ${CMAKE_SOURCE_DIR}/evm/include
+        ${CMAKE_SOURCE_DIR}/state/include
+        ${CMAKE_SOURCE_DIR}/common/include
+        ${CJSON_INCLUDE_DIRS}
+    )
+    target_link_libraries(artex_shared block_executor evm state common ${CJSON_LIBRARIES})
+    target_compile_definitions(artex_shared PRIVATE RX_SHARED RX_BUILD)
+    set_target_properties(artex_shared PROPERTIES
+        OUTPUT_NAME artex
+        VERSION 0.1.0
+        SOVERSION 0
+    )
+endif()
+
 add_executable(test_artex lib/test_artex.c)
 target_link_libraries(test_artex artex)
 

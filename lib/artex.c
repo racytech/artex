@@ -43,6 +43,10 @@ struct rx_engine {
     /* Logger */
     rx_log_fn               log_fn;
     void                   *log_userdata;
+
+    /* Last error */
+    rx_error_t              last_error;
+    char                    last_error_msg[256];
 };
 
 /* rx_state_t is just evm_state_t behind an opaque pointer */
@@ -57,6 +61,52 @@ struct rx_state {
 static void engine_log(rx_engine_t *e, rx_log_level_t level, const char *msg) {
     if (e && e->log_fn)
         e->log_fn(level, msg, e->log_userdata);
+}
+
+static void engine_set_error(rx_engine_t *e, rx_error_t err, const char *msg) {
+    if (!e) return;
+    e->last_error = err;
+    if (msg)
+        snprintf(e->last_error_msg, sizeof(e->last_error_msg), "%s", msg);
+    else
+        e->last_error_msg[0] = '\0';
+}
+
+static void engine_clear_error(rx_engine_t *e) {
+    if (!e) return;
+    e->last_error = RX_OK;
+    e->last_error_msg[0] = '\0';
+}
+
+/* ========================================================================
+ * Error reporting
+ * ======================================================================== */
+
+const char *rx_error_string(rx_error_t err) {
+    switch (err) {
+        case RX_OK:               return "no error";
+        case RX_ERR_NULL_ARG:     return "required argument was NULL";
+        case RX_ERR_INVALID_CONFIG: return "invalid configuration";
+        case RX_ERR_OUT_OF_MEMORY:  return "out of memory";
+        case RX_ERR_ALREADY_INIT:   return "already initialized";
+        case RX_ERR_NOT_INIT:       return "not initialized";
+        case RX_ERR_FILE_IO:        return "file I/O error";
+        case RX_ERR_PARSE:          return "parse error";
+        case RX_ERR_DECODE:         return "decode error";
+        case RX_ERR_EXECUTION:      return "execution error";
+        case RX_ERR_BLOCK_NOT_FOUND: return "block not found in hash window";
+        default:                    return "unknown error";
+    }
+}
+
+rx_error_t rx_engine_last_error(const rx_engine_t *engine) {
+    if (!engine) return RX_ERR_NULL_ARG;
+    return engine->last_error;
+}
+
+const char *rx_engine_last_error_msg(const rx_engine_t *engine) {
+    if (!engine) return "";
+    return engine->last_error_msg;
 }
 
 /* ========================================================================
@@ -84,12 +134,14 @@ rx_engine_t *rx_engine_create(const rx_config_t *config) {
     e->state = evm_state_create(e->cs);
     if (!e->state) {
         if (e->cs) code_store_destroy(e->cs);
+        engine_set_error(e, RX_ERR_OUT_OF_MEMORY, "failed to create evm_state");
         free(e);
         return NULL;
     }
 
     e->evm = evm_create(e->state, e->chain_config);
     if (!e->evm) {
+        engine_set_error(e, RX_ERR_OUT_OF_MEMORY, "failed to create evm");
         evm_state_destroy(e->state);
         free(e);
         return NULL;
@@ -112,12 +164,19 @@ void rx_engine_destroy(rx_engine_t *engine) {
 
 bool rx_engine_load_genesis(rx_engine_t *engine, const char *path,
                             const rx_hash_t *genesis_hash) {
-    if (!engine || !path || engine->initialized) return false;
+    if (!engine || !path) {
+        if (engine) engine_set_error(engine, RX_ERR_NULL_ARG, "path is NULL");
+        return false;
+    }
+    if (engine->initialized) {
+        engine_set_error(engine, RX_ERR_ALREADY_INIT, "genesis or state already loaded");
+        return false;
+    }
+    engine_clear_error(engine);
 
-    /* Genesis loading requires cJSON — delegate to sync's loader.
-     * For now, use the state-level genesis loader directly. */
     FILE *f = fopen(path, "r");
     if (!f) {
+        engine_set_error(engine, RX_ERR_FILE_IO, "failed to open genesis file");
         engine_log(engine, RX_LOG_ERROR, "failed to open genesis file");
         return false;
     }
@@ -127,7 +186,11 @@ bool rx_engine_load_genesis(rx_engine_t *engine, const char *path,
     fseek(f, 0, SEEK_SET);
 
     char *json_str = malloc(fsize + 1);
-    if (!json_str) { fclose(f); return false; }
+    if (!json_str) {
+        fclose(f);
+        engine_set_error(engine, RX_ERR_OUT_OF_MEMORY, "malloc failed for genesis JSON");
+        return false;
+    }
     size_t nread = fread(json_str, 1, fsize, f);
     (void)nread;
     json_str[fsize] = '\0';
@@ -137,6 +200,7 @@ bool rx_engine_load_genesis(rx_engine_t *engine, const char *path,
     cJSON *root = cJSON_Parse(json_str);
     free(json_str);
     if (!root) {
+        engine_set_error(engine, RX_ERR_PARSE, "genesis JSON parse error");
         engine_log(engine, RX_LOG_ERROR, "genesis JSON parse error");
         return false;
     }
@@ -181,11 +245,16 @@ bool rx_engine_load_genesis(rx_engine_t *engine, const char *path,
  * ======================================================================== */
 
 bool rx_engine_load_state(rx_engine_t *engine, const char *path) {
-    if (!engine || !path) return false;
+    if (!engine || !path) {
+        if (engine) engine_set_error(engine, RX_ERR_NULL_ARG, "path is NULL");
+        return false;
+    }
+    engine_clear_error(engine);
 
     state_t *st = evm_state_get_state(engine->state);
     hash_t loaded_root;
     if (!state_load(st, path, &loaded_root)) {
+        engine_set_error(engine, RX_ERR_FILE_IO, "failed to load state snapshot");
         engine_log(engine, RX_LOG_ERROR, "failed to load state snapshot");
         return false;
     }
@@ -207,7 +276,11 @@ bool rx_engine_load_state(rx_engine_t *engine, const char *path) {
 }
 
 bool rx_engine_save_state(rx_engine_t *engine, const char *path) {
-    if (!engine || !path) return false;
+    if (!engine || !path) {
+        if (engine) engine_set_error(engine, RX_ERR_NULL_ARG, "path is NULL");
+        return false;
+    }
+    engine_clear_error(engine);
 
     state_t *st = evm_state_get_state(engine->state);
 
@@ -216,6 +289,7 @@ bool rx_engine_save_state(rx_engine_t *engine, const char *path) {
         engine->evm->fork >= FORK_SPURIOUS_DRAGON);
 
     if (!state_save(st, path, &root)) {
+        engine_set_error(engine, RX_ERR_FILE_IO, "failed to save state snapshot");
         engine_log(engine, RX_LOG_ERROR, "failed to save state snapshot");
         return false;
     }
@@ -241,14 +315,18 @@ bool rx_execute_block_rlp(rx_engine_t *engine,
                           const uint8_t *body_rlp, size_t body_len,
                           const rx_hash_t *block_hash,
                           rx_block_result_t *result) {
-    if (!engine || !header_rlp || !body_rlp || !result)
+    if (!engine || !header_rlp || !body_rlp || !result) {
+        if (engine) engine_set_error(engine, RX_ERR_NULL_ARG, "required argument is NULL");
         return false;
+    }
+    engine_clear_error(engine);
 
     memset(result, 0, sizeof(*result));
 
     /* Decode header */
     block_header_t header;
     if (!block_header_decode_rlp(&header, header_rlp, header_len)) {
+        engine_set_error(engine, RX_ERR_DECODE, "failed to decode block header RLP");
         engine_log(engine, RX_LOG_ERROR, "failed to decode block header RLP");
         return false;
     }
@@ -256,9 +334,13 @@ bool rx_execute_block_rlp(rx_engine_t *engine,
     /* Decode body */
     block_body_t body;
     if (!block_body_decode_rlp(&body, body_rlp, body_len)) {
+        engine_set_error(engine, RX_ERR_DECODE, "failed to decode block body RLP");
         engine_log(engine, RX_LOG_ERROR, "failed to decode block body RLP");
         return false;
     }
+
+    /* Keep undo log so caller can revert if needed */
+    engine->evm->keep_undo = true;
 
     /* Execute */
     block_result_t br = block_execute(engine->evm, &header, &body,
@@ -347,9 +429,39 @@ rx_hash_t rx_compute_state_root(rx_engine_t *engine) {
      * block_execute → finalize_block marks dirty paths, compute_root
      * only rehashes those paths. Proven over 17M+ mainnet blocks. */
     bool prune = (engine->evm->fork >= FORK_SPURIOUS_DRAGON);
-    hash_t root = evm_state_compute_mpt_root(engine->state, prune);
+    hash_t root = evm_state_compute_root_only(engine->state, prune);
     memcpy(out.bytes, root.bytes, 32);
     return out;
+}
+
+/* ========================================================================
+ * Block commit / revert
+ * ======================================================================== */
+
+bool rx_commit_block(rx_engine_t *engine) {
+    if (!engine) return false;
+    engine_clear_error(engine);
+    evm_state_reset_block(engine->state);
+    return true;
+}
+
+bool rx_revert_block(rx_engine_t *engine) {
+    if (!engine) return false;
+    engine_clear_error(engine);
+
+    if (!evm_state_revert_block(engine->state)) {
+        engine_set_error(engine, RX_ERR_EXECUTION, "block revert failed");
+        return false;
+    }
+
+    /* Roll back block number and hash ring entry */
+    if (engine->last_block > 0) {
+        uint64_t idx = engine->last_block % BLOCK_HASH_WINDOW;
+        memset(engine->block_hashes[idx].bytes, 0, 32);
+        engine->last_block--;
+    }
+
+    return true;
 }
 
 /* ========================================================================
@@ -437,6 +549,23 @@ void rx_set_logger(rx_engine_t *engine, rx_log_fn fn, void *userdata) {
     if (!engine) return;
     engine->log_fn = fn;
     engine->log_userdata = userdata;
+}
+
+/* ========================================================================
+ * Block hash query
+ * ======================================================================== */
+
+bool rx_get_block_hash(const rx_engine_t *engine, uint64_t block_number,
+                       rx_hash_t *out) {
+    if (!engine || !out) return false;
+    if (block_number == 0 || block_number > engine->last_block)
+        return false;
+    if (engine->last_block - block_number >= BLOCK_HASH_WINDOW)
+        return false;
+
+    uint64_t idx = block_number % BLOCK_HASH_WINDOW;
+    memcpy(out->bytes, engine->block_hashes[idx].bytes, 32);
+    return true;
 }
 
 /* ========================================================================

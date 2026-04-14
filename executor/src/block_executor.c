@@ -448,7 +448,10 @@ static hash_t block_finalize_state(evm_t *evm,
         *root_ms_out = (_rt1.tv_sec - _rt0.tv_sec) * 1000.0 +
                        (_rt1.tv_nsec - _rt0.tv_nsec) / 1e6;
 
-    evm_state_reset_block(evm->state);
+    /* Clear undo log unless caller wants to keep it for revert */
+    if (!evm->keep_undo)
+        evm_state_reset_block(evm->state);
+
     return root;
 }
 
