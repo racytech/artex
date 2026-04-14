@@ -515,8 +515,9 @@ def main():
 
     start_block = lib.rx_get_block_number(engine) + 1
 
-    # Populate block hash ring (last 256 block hashes for BLOCKHASH opcode)
-    if args.state and start_block > 1:
+    # Populate block hash ring if .hashes file doesn't exist
+    hashes_path = args.state + ".hashes" if args.state else None
+    if args.state and start_block > 1 and (not hashes_path or not os.path.exists(hashes_path)):
         hash_start = start_block - 1 - 255 if start_block > 256 else 0
         hash_count = 0
         print(f"Populating block hash ring ({hash_start}..{start_block-1})...")
@@ -528,6 +529,8 @@ def main():
             lib.rx_set_block_hash(engine, bn, ctypes.byref(bh))
             hash_count += 1
         print(f"  loaded {hash_count} block hashes")
+    elif hashes_path and os.path.exists(hashes_path):
+        print(f"Block hash ring loaded from {hashes_path}")
 
     print(f"Starting from block {start_block}")
     print(f"Era directory: {args.era_dir}")
@@ -642,6 +645,16 @@ def main():
 
     except KeyboardInterrupt:
         print(f"\nInterrupted at block {block_num}")
+
+    # Save state on exit
+    if blocks_ok > 0 and args.save_path:
+        bn = lib.rx_get_block_number(engine)
+        save_path = f"{args.save_path}_{bn}.bin"
+        print(f"Saving state to {save_path}...")
+        if lib.rx_engine_save_state(engine, save_path.encode()):
+            print(f"  saved ({bn} blocks)")
+        else:
+            print(f"  WARNING: save failed")
 
     # Summary
     t_total = time.time() - t_start
