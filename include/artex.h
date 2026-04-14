@@ -143,6 +143,68 @@ typedef struct {
 RX_API void rx_block_result_free(rx_block_result_t *result);
 
 /* ========================================================================
+ * Block header / body (for rx_execute_block)
+ * ======================================================================== */
+
+typedef struct {
+    rx_hash_t    parent_hash;
+    rx_hash_t    uncle_hash;
+    rx_address_t coinbase;
+    rx_hash_t    state_root;
+    rx_hash_t    tx_root;
+    rx_hash_t    receipt_root;
+    uint8_t      logs_bloom[256];
+    rx_uint256_t difficulty;
+    uint64_t     number;
+    uint64_t     gas_limit;
+    uint64_t     gas_used;
+    uint64_t     timestamp;
+    uint8_t      extra_data[32];
+    size_t       extra_data_len;
+    rx_hash_t    mix_hash;          /* prev_randao post-merge */
+    uint64_t     nonce;
+
+    /* EIP-1559 (London+) */
+    bool         has_base_fee;
+    rx_uint256_t base_fee;
+
+    /* Shanghai+ */
+    bool         has_withdrawals_root;
+    rx_hash_t    withdrawals_root;
+
+    /* Cancun+ */
+    bool         has_blob_gas;
+    uint64_t     blob_gas_used;
+    uint64_t     excess_blob_gas;
+    bool         has_parent_beacon_root;
+    rx_hash_t    parent_beacon_root;
+
+    /* Prague+ (EIP-7685) */
+    bool         has_requests_hash;
+    rx_hash_t    requests_hash;
+} rx_block_header_t;
+
+typedef struct {
+    uint64_t     index;
+    uint64_t     validator_index;
+    rx_address_t address;
+    uint64_t     amount_gwei;       /* in Gwei (multiply by 1e9 for Wei) */
+} rx_withdrawal_t;
+
+typedef struct {
+    /** Raw transaction bytes. Each entry is a single transaction:
+     *  - Legacy: RLP-encoded transaction list
+     *  - Typed (EIP-2718): type_byte || RLP_payload */
+    const uint8_t **transactions;   /* array of tx byte pointers */
+    size_t         *tx_lengths;     /* length of each tx */
+    size_t          tx_count;
+
+    /** EIP-4895 withdrawals (Shanghai+). NULL if none. */
+    rx_withdrawal_t *withdrawals;
+    size_t           withdrawal_count;
+} rx_block_body_t;
+
+/* ========================================================================
  * Engine lifecycle
  * ======================================================================== */
 
@@ -190,6 +252,21 @@ RX_API bool rx_execute_block_rlp(rx_engine_t *engine,
                                  const uint8_t *body_rlp, size_t body_len,
                                  const rx_hash_t *block_hash,
                                  rx_block_result_t *result);
+
+/**
+ * Execute a block from decoded header + body structs.
+ *
+ * Same as rx_execute_block_rlp but skips RLP decode — use when the
+ * caller already has parsed block data (e.g. from their own p2p layer).
+ *
+ * block_hash: keccak256 of the RLP-encoded header. Used for the
+ *             BLOCKHASH opcode ring buffer.
+ */
+RX_API bool rx_execute_block(rx_engine_t *engine,
+                             const rx_block_header_t *header,
+                             const rx_block_body_t *body,
+                             const rx_hash_t *block_hash,
+                             rx_block_result_t *result);
 
 /**
  * Compute state root without executing a block.
@@ -311,10 +388,6 @@ RX_API bool rx_revert_block(rx_engine_t *engine);
 
 /* ========================================================================
  * TODO: Future API additions
- *
- * rx_execute_block() — execute from decoded header + body structs.
- *   Avoids RLP encode→decode overhead when caller already has parsed
- *   blocks (e.g. from their own p2p layer or database).
  *
  * rx_engine_load_genesis_alloc() — load genesis from in-memory
  *   address/balance array instead of requiring a JSON file on disk.

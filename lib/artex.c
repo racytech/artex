@@ -307,71 +307,23 @@ bool rx_engine_save_state(rx_engine_t *engine, const char *path) {
 }
 
 /* ========================================================================
- * Block execution
+ * Block execution — helpers
  * ======================================================================== */
 
-bool rx_execute_block_rlp(rx_engine_t *engine,
-                          const uint8_t *header_rlp, size_t header_len,
-                          const uint8_t *body_rlp, size_t body_len,
-                          const rx_hash_t *block_hash,
-                          rx_block_result_t *result) {
-    if (!engine || !header_rlp || !body_rlp || !result) {
-        if (engine) engine_set_error(engine, RX_ERR_NULL_ARG, "required argument is NULL");
-        return false;
-    }
-    engine_clear_error(engine);
+/** Convert internal block_result_t → public rx_block_result_t. */
+static void fill_block_result(rx_block_result_t *result, const block_result_t *br) {
+    result->ok = br->success;
+    result->gas_used = br->gas_used;
+    result->tx_count = br->tx_count;
+    memcpy(result->state_root.bytes, br->state_root.bytes, 32);
+    memcpy(result->receipt_root.bytes, br->receipt_root.bytes, 32);
+    memcpy(result->logs_bloom, br->logs_bloom, 256);
 
-    memset(result, 0, sizeof(*result));
-
-    /* Decode header */
-    block_header_t header;
-    if (!block_header_decode_rlp(&header, header_rlp, header_len)) {
-        engine_set_error(engine, RX_ERR_DECODE, "failed to decode block header RLP");
-        engine_log(engine, RX_LOG_ERROR, "failed to decode block header RLP");
-        return false;
-    }
-
-    /* Decode body */
-    block_body_t body;
-    if (!block_body_decode_rlp(&body, body_rlp, body_len)) {
-        engine_set_error(engine, RX_ERR_DECODE, "failed to decode block body RLP");
-        engine_log(engine, RX_LOG_ERROR, "failed to decode block body RLP");
-        return false;
-    }
-
-    /* Keep undo log so caller can revert if needed */
-    engine->evm->keep_undo = true;
-
-    /* Execute */
-    block_result_t br = block_execute(engine->evm, &header, &body,
-                                      engine->block_hashes
-#ifdef ENABLE_HISTORY
-                                      , NULL
-#endif
-                                      );
-
-    /* Store block hash in ring */
-    if (block_hash) {
-        hash_t bh;
-        memcpy(bh.bytes, block_hash->bytes, 32);
-        engine->block_hashes[header.number % BLOCK_HASH_WINDOW] = bh;
-    }
-    engine->last_block = header.number;
-
-    /* Fill public result */
-    result->ok = br.success;
-    result->gas_used = br.gas_used;
-    result->tx_count = br.tx_count;
-    memcpy(result->state_root.bytes, br.state_root.bytes, 32);
-    memcpy(result->receipt_root.bytes, br.receipt_root.bytes, 32);
-    memcpy(result->logs_bloom, br.logs_bloom, 256);
-
-    /* Convert receipts */
-    if (br.receipt_count > 0 && br.receipts) {
-        result->receipts = calloc(br.receipt_count, sizeof(rx_receipt_t));
+    if (br->receipt_count > 0 && br->receipts) {
+        result->receipts = calloc(br->receipt_count, sizeof(rx_receipt_t));
         if (result->receipts) {
-            for (size_t i = 0; i < br.receipt_count; i++) {
-                tx_receipt_t *src = &br.receipts[i];
+            for (size_t i = 0; i < br->receipt_count; i++) {
+                tx_receipt_t *src = &br->receipts[i];
                 rx_receipt_t *dst = &result->receipts[i];
 
                 dst->status = src->status_code;
@@ -383,7 +335,6 @@ bool rx_execute_block_rlp(rx_engine_t *engine,
                 if (src->contract_created)
                     memcpy(dst->contract_addr.bytes, src->contract_addr.bytes, 20);
 
-                /* Move logs (transfer ownership) */
                 if (src->log_count > 0 && src->logs) {
                     dst->logs = calloc(src->log_count, sizeof(rx_log_t));
                     dst->log_count = src->log_count;
@@ -413,12 +364,176 @@ bool rx_execute_block_rlp(rx_engine_t *engine,
             }
         }
     }
+}
 
-    /* Free internal result (logs were copied, not moved) */
-    block_result_free(&br);
-    block_body_free(&body);
+/** Convert public rx_block_header_t → internal block_header_t. */
+static void convert_header(block_header_t *dst, const rx_block_header_t *src) {
+    memcpy(dst->parent_hash.bytes, src->parent_hash.bytes, 32);
+    memcpy(dst->uncle_hash.bytes, src->uncle_hash.bytes, 32);
+    memcpy(dst->coinbase.bytes, src->coinbase.bytes, 20);
+    memcpy(dst->state_root.bytes, src->state_root.bytes, 32);
+    memcpy(dst->tx_root.bytes, src->tx_root.bytes, 32);
+    memcpy(dst->receipt_root.bytes, src->receipt_root.bytes, 32);
+    memcpy(dst->logs_bloom, src->logs_bloom, 256);
+    dst->difficulty = uint256_from_bytes(src->difficulty.bytes, 32);
+    dst->number = src->number;
+    dst->gas_limit = src->gas_limit;
+    dst->gas_used = src->gas_used;
+    dst->timestamp = src->timestamp;
+    memcpy(dst->extra_data, src->extra_data, 32);
+    dst->extra_data_len = src->extra_data_len;
+    memcpy(dst->mix_hash.bytes, src->mix_hash.bytes, 32);
+    dst->nonce = src->nonce;
+    dst->has_base_fee = src->has_base_fee;
+    if (src->has_base_fee)
+        dst->base_fee = uint256_from_bytes(src->base_fee.bytes, 32);
+    dst->has_withdrawals_root = src->has_withdrawals_root;
+    if (src->has_withdrawals_root)
+        memcpy(dst->withdrawals_root.bytes, src->withdrawals_root.bytes, 32);
+    dst->has_blob_gas = src->has_blob_gas;
+    dst->blob_gas_used = src->blob_gas_used;
+    dst->excess_blob_gas = src->excess_blob_gas;
+    dst->has_parent_beacon_root = src->has_parent_beacon_root;
+    if (src->has_parent_beacon_root)
+        memcpy(dst->parent_beacon_root.bytes, src->parent_beacon_root.bytes, 32);
+    dst->has_requests_hash = src->has_requests_hash;
+    if (src->has_requests_hash)
+        memcpy(dst->requests_hash.bytes, src->requests_hash.bytes, 32);
+}
+
+/** Build internal block_body_t from public rx_block_body_t. */
+static bool convert_body(block_body_t *dst, const rx_block_body_t *src) {
+    memset(dst, 0, sizeof(*dst));
+
+    /* Build RLP transaction list from raw tx bytes */
+    rlp_item_t *root = rlp_list_new();
+    rlp_item_t *tx_list = rlp_list_new();
+
+    for (size_t i = 0; i < src->tx_count; i++) {
+        const uint8_t *raw = src->transactions[i];
+        size_t len = src->tx_lengths[i];
+
+        if (len > 0 && raw[0] >= 0xc0) {
+            /* Legacy: raw bytes are RLP-encoded list */
+            rlp_item_t *decoded = rlp_decode(raw, len);
+            if (decoded)
+                rlp_list_append(tx_list, decoded);
+        } else {
+            /* Typed tx (EIP-2718): type || RLP_payload */
+            rlp_list_append(tx_list, rlp_string(raw, len));
+        }
+    }
+
+    rlp_list_append(root, tx_list);
+    rlp_list_append(root, rlp_list_new()); /* empty uncle list */
+
+    dst->_rlp = root;
+    dst->_tx_list_idx = 0;
+    dst->tx_count = src->tx_count;
+
+    /* Convert withdrawals */
+    if (src->withdrawal_count > 0 && src->withdrawals) {
+        dst->withdrawals = calloc(src->withdrawal_count, sizeof(withdrawal_t));
+        if (!dst->withdrawals) return false;
+        dst->withdrawal_count = src->withdrawal_count;
+        for (size_t i = 0; i < src->withdrawal_count; i++) {
+            dst->withdrawals[i].index = src->withdrawals[i].index;
+            dst->withdrawals[i].validator_index = src->withdrawals[i].validator_index;
+            memcpy(dst->withdrawals[i].address.bytes,
+                   src->withdrawals[i].address.bytes, 20);
+            dst->withdrawals[i].amount_gwei = src->withdrawals[i].amount_gwei;
+        }
+    }
 
     return true;
+}
+
+/* ========================================================================
+ * Block execution
+ * ======================================================================== */
+
+/** Shared execution logic: run block_execute, fill result, update ring. */
+static bool execute_block_internal(rx_engine_t *engine,
+                                   block_header_t *header,
+                                   block_body_t *body,
+                                   const rx_hash_t *block_hash,
+                                   rx_block_result_t *result) {
+    engine->evm->keep_undo = true;
+
+    block_result_t br = block_execute(engine->evm, header, body,
+                                      engine->block_hashes
+#ifdef ENABLE_HISTORY
+                                      , NULL
+#endif
+                                      );
+
+    /* Store block hash in ring */
+    if (block_hash) {
+        hash_t bh;
+        memcpy(bh.bytes, block_hash->bytes, 32);
+        engine->block_hashes[header->number % BLOCK_HASH_WINDOW] = bh;
+    }
+    engine->last_block = header->number;
+
+    fill_block_result(result, &br);
+
+    block_result_free(&br);
+    block_body_free(body);
+
+    return true;
+}
+
+bool rx_execute_block_rlp(rx_engine_t *engine,
+                          const uint8_t *header_rlp, size_t header_len,
+                          const uint8_t *body_rlp, size_t body_len,
+                          const rx_hash_t *block_hash,
+                          rx_block_result_t *result) {
+    if (!engine || !header_rlp || !body_rlp || !result) {
+        if (engine) engine_set_error(engine, RX_ERR_NULL_ARG, "required argument is NULL");
+        return false;
+    }
+    engine_clear_error(engine);
+    memset(result, 0, sizeof(*result));
+
+    block_header_t header;
+    if (!block_header_decode_rlp(&header, header_rlp, header_len)) {
+        engine_set_error(engine, RX_ERR_DECODE, "failed to decode block header RLP");
+        engine_log(engine, RX_LOG_ERROR, "failed to decode block header RLP");
+        return false;
+    }
+
+    block_body_t body;
+    if (!block_body_decode_rlp(&body, body_rlp, body_len)) {
+        engine_set_error(engine, RX_ERR_DECODE, "failed to decode block body RLP");
+        engine_log(engine, RX_LOG_ERROR, "failed to decode block body RLP");
+        return false;
+    }
+
+    return execute_block_internal(engine, &header, &body, block_hash, result);
+}
+
+bool rx_execute_block(rx_engine_t *engine,
+                      const rx_block_header_t *header,
+                      const rx_block_body_t *body,
+                      const rx_hash_t *block_hash,
+                      rx_block_result_t *result) {
+    if (!engine || !header || !body || !result) {
+        if (engine) engine_set_error(engine, RX_ERR_NULL_ARG, "required argument is NULL");
+        return false;
+    }
+    engine_clear_error(engine);
+    memset(result, 0, sizeof(*result));
+
+    block_header_t int_header;
+    convert_header(&int_header, header);
+
+    block_body_t int_body;
+    if (!convert_body(&int_body, body)) {
+        engine_set_error(engine, RX_ERR_OUT_OF_MEMORY, "failed to build block body");
+        return false;
+    }
+
+    return execute_block_internal(engine, &int_header, &int_body, block_hash, result);
 }
 
 rx_hash_t rx_compute_state_root(rx_engine_t *engine) {
