@@ -205,6 +205,27 @@ typedef struct {
 } rx_block_body_t;
 
 /* ========================================================================
+ * Genesis allocation (for rx_engine_load_genesis_alloc)
+ * ======================================================================== */
+
+/** Single storage slot: key → value (both 32-byte big-endian). */
+typedef struct {
+    rx_uint256_t key;
+    rx_uint256_t value;
+} rx_storage_entry_t;
+
+/** Genesis account: address + optional balance, nonce, code, storage. */
+typedef struct {
+    rx_address_t         address;
+    rx_uint256_t         balance;         /* big-endian, zero = no balance */
+    uint64_t             nonce;           /* 0 = default */
+    const uint8_t       *code;            /* contract bytecode, NULL = EOA */
+    uint32_t             code_len;
+    rx_storage_entry_t  *storage;         /* storage slots, NULL = none */
+    size_t               storage_count;
+} rx_genesis_account_t;
+
+/* ========================================================================
  * Engine lifecycle
  * ======================================================================== */
 
@@ -217,6 +238,17 @@ RX_API void rx_engine_destroy(rx_engine_t *engine);
 /** Load genesis state from JSON file. Call before first block. */
 RX_API bool rx_engine_load_genesis(rx_engine_t *engine, const char *path,
                                    const rx_hash_t *genesis_hash);
+
+/**
+ * Load genesis state from in-memory account array.
+ *
+ * Same as rx_engine_load_genesis but takes structured data instead of
+ * a JSON file. Useful for programmatic genesis construction.
+ */
+RX_API bool rx_engine_load_genesis_alloc(rx_engine_t *engine,
+                                         const rx_genesis_account_t *accounts,
+                                         size_t count,
+                                         const rx_hash_t *genesis_hash);
 
 /**
  * Load state from a binary snapshot. Call instead of load_genesis.
@@ -388,10 +420,6 @@ RX_API bool rx_revert_block(rx_engine_t *engine);
 
 /* ========================================================================
  * TODO: Future API additions
- *
- * rx_engine_load_genesis_alloc() — load genesis from in-memory
- *   address/balance array instead of requiring a JSON file on disk.
- *   Useful for programmatic genesis construction in tests/tools.
  *
  * rx_call() — read-only message execution against current state
  *   without committing (eth_call equivalent). For transaction

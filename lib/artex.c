@@ -162,6 +162,19 @@ void rx_engine_destroy(rx_engine_t *engine) {
  * Genesis
  * ======================================================================== */
 
+/** Finalize genesis: commit state, compute root, store genesis hash. */
+static void genesis_finalize(rx_engine_t *engine, const rx_hash_t *genesis_hash) {
+    evm_state_begin_block(engine->state, 0);
+    evm_state_commit(engine->state);
+    evm_state_finalize(engine->state);
+    evm_state_compute_mpt_root(engine->state, false);
+
+    if (genesis_hash)
+        memcpy(engine->block_hashes[0].bytes, genesis_hash->bytes, 32);
+
+    engine->initialized = true;
+}
+
 bool rx_engine_load_genesis(rx_engine_t *engine, const char *path,
                             const rx_hash_t *genesis_hash) {
     if (!engine || !path) {
@@ -196,7 +209,6 @@ bool rx_engine_load_genesis(rx_engine_t *engine, const char *path,
     json_str[fsize] = '\0';
     fclose(f);
 
-    /* Parse JSON and load accounts */
     cJSON *root = cJSON_Parse(json_str);
     free(json_str);
     if (!root) {
@@ -223,20 +235,54 @@ bool rx_engine_load_genesis(rx_engine_t *engine, const char *path,
             evm_state_create_account(engine->state, &addr);
     }
     cJSON_Delete(root);
-    bool ok = true;
 
-    if (!ok) return false;
+    genesis_finalize(engine, genesis_hash);
+    return true;
+}
 
-    /* Commit genesis state */
-    evm_state_begin_block(engine->state, 0);
-    evm_state_commit(engine->state);
-    evm_state_finalize(engine->state);
-    evm_state_compute_mpt_root(engine->state, false);
+bool rx_engine_load_genesis_alloc(rx_engine_t *engine,
+                                   const rx_genesis_account_t *accounts,
+                                   size_t count,
+                                   const rx_hash_t *genesis_hash) {
+    if (!engine) return false;
+    if (!accounts && count > 0) {
+        engine_set_error(engine, RX_ERR_NULL_ARG, "accounts is NULL");
+        return false;
+    }
+    if (engine->initialized) {
+        engine_set_error(engine, RX_ERR_ALREADY_INIT, "genesis or state already loaded");
+        return false;
+    }
+    engine_clear_error(engine);
 
-    if (genesis_hash)
-        memcpy(engine->block_hashes[0].bytes, genesis_hash->bytes, 32);
+    for (size_t i = 0; i < count; i++) {
+        const rx_genesis_account_t *ga = &accounts[i];
+        const address_t *addr = (const address_t *)&ga->address;
 
-    engine->initialized = true;
+        /* Balance */
+        uint256_t balance = uint256_from_bytes(ga->balance.bytes, 32);
+        if (!uint256_is_zero(&balance))
+            evm_state_add_balance(engine->state, addr, &balance);
+        else
+            evm_state_create_account(engine->state, addr);
+
+        /* Nonce */
+        if (ga->nonce > 0)
+            evm_state_set_nonce(engine->state, addr, ga->nonce);
+
+        /* Code */
+        if (ga->code && ga->code_len > 0)
+            evm_state_set_code(engine->state, addr, ga->code, ga->code_len);
+
+        /* Storage */
+        for (size_t s = 0; s < ga->storage_count; s++) {
+            uint256_t key = uint256_from_bytes(ga->storage[s].key.bytes, 32);
+            uint256_t val = uint256_from_bytes(ga->storage[s].value.bytes, 32);
+            evm_state_set_storage(engine->state, addr, &key, &val);
+        }
+    }
+
+    genesis_finalize(engine, genesis_hash);
     return true;
 }
 

@@ -463,6 +463,104 @@ static int test_commit_revert(void) {
     return errors;
 }
 
+static int test_genesis_alloc(void) {
+    printf("\ntest_genesis_alloc:\n");
+    int errors = 0;
+
+    rx_config_t config = { .chain_id = RX_CHAIN_MAINNET };
+    rx_engine_t *e = rx_engine_create(&config);
+    if (!e) { printf("  FAIL: create\n"); return 1; }
+
+    /* Build genesis alloc: 2 accounts */
+    rx_genesis_account_t accounts[2];
+    memset(accounts, 0, sizeof(accounts));
+
+    /* Account 0: address 0x01, balance 1 ETH */
+    accounts[0].address.bytes[19] = 0x01;
+    /* 1 ETH = 0xde0b6b3a7640000 in big-endian */
+    accounts[0].balance.bytes[24] = 0x0d;
+    accounts[0].balance.bytes[25] = 0xe0;
+    accounts[0].balance.bytes[26] = 0xb6;
+    accounts[0].balance.bytes[27] = 0xb3;
+    accounts[0].balance.bytes[28] = 0xa7;
+    accounts[0].balance.bytes[29] = 0x64;
+    accounts[0].balance.bytes[30] = 0x00;
+    accounts[0].balance.bytes[31] = 0x00;
+
+    /* Account 1: address 0x02, balance 2 ETH, nonce 5 */
+    accounts[1].address.bytes[19] = 0x02;
+    accounts[1].balance.bytes[24] = 0x1b;
+    accounts[1].balance.bytes[25] = 0xc1;
+    accounts[1].balance.bytes[26] = 0x6d;
+    accounts[1].balance.bytes[27] = 0x67;
+    accounts[1].balance.bytes[28] = 0x4e;
+    accounts[1].balance.bytes[29] = 0xc8;
+    accounts[1].balance.bytes[30] = 0x00;
+    accounts[1].balance.bytes[31] = 0x00;
+    accounts[1].nonce = 5;
+
+    if (!rx_engine_load_genesis_alloc(e, accounts, 2, NULL)) {
+        printf("  FAIL: load_genesis_alloc\n");
+        rx_engine_destroy(e);
+        return 1;
+    }
+
+    /* Query state */
+    rx_state_t *state = rx_engine_get_state(e);
+
+    /* Check account 0 */
+    rx_address_t addr1 = {0};
+    addr1.bytes[19] = 0x01;
+    if (!rx_account_exists(state, &addr1)) {
+        printf("  FAIL: addr1 should exist\n"); errors++;
+    }
+    rx_uint256_t bal1 = rx_get_balance(state, &addr1);
+    uint64_t bal1_lo = 0;
+    for (int i = 24; i < 32; i++)
+        bal1_lo = (bal1_lo << 8) | bal1.bytes[i];
+    if (bal1_lo != 0xde0b6b3a7640000UL) {
+        printf("  FAIL: addr1 balance %lu != %lu\n", bal1_lo, 0xde0b6b3a7640000UL);
+        errors++;
+    }
+
+    /* Check account 1 nonce */
+    rx_address_t addr2 = {0};
+    addr2.bytes[19] = 0x02;
+    if (rx_get_nonce(state, &addr2) != 5) {
+        printf("  FAIL: addr2 nonce should be 5, got %lu\n",
+               rx_get_nonce(state, &addr2));
+        errors++;
+    }
+
+    /* State root should match JSON-based genesis with same data */
+    rx_hash_t root = rx_compute_state_root(e);
+    bool root_zero = true;
+    for (int i = 0; i < 32; i++) if (root.bytes[i] != 0) { root_zero = false; break; }
+    if (root_zero) {
+        printf("  FAIL: state root is all zeros\n"); errors++;
+    }
+
+    /* Can't load genesis twice */
+    if (rx_engine_load_genesis_alloc(e, accounts, 2, NULL)) {
+        printf("  FAIL: double genesis should fail\n"); errors++;
+    }
+    if (rx_engine_last_error(e) != RX_ERR_ALREADY_INIT) {
+        printf("  FAIL: expected ALREADY_INIT\n"); errors++;
+    }
+
+    /* NULL accounts with count=0 is valid (empty genesis) */
+    rx_engine_t *e2 = rx_engine_create(&config);
+    if (!rx_engine_load_genesis_alloc(e2, NULL, 0, NULL)) {
+        printf("  FAIL: empty genesis should succeed\n"); errors++;
+    }
+    rx_engine_destroy(e2);
+
+    rx_engine_destroy(e);
+
+    if (errors == 0) printf("  OK\n");
+    return errors;
+}
+
 int main(void) {
     int errors = 0;
     errors += test_create_destroy();
@@ -472,6 +570,7 @@ int main(void) {
     errors += test_error_codes();
     errors += test_block_hash_query();
     errors += test_commit_revert();
+    errors += test_genesis_alloc();
 
     printf("\n=== %s (%d errors) ===\n", errors ? "FAIL" : "PASS", errors);
     return errors ? 1 : 0;
