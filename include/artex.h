@@ -371,6 +371,16 @@ RX_API rx_uint256_t rx_get_storage(rx_state_t *state, const rx_address_t *addr,
 RX_API bool rx_get_block_hash(const rx_engine_t *engine, uint64_t block_number,
                               rx_hash_t *out);
 
+/**
+ * Set a block hash in the 256-entry ring buffer.
+ *
+ * Normally not needed — rx_engine_load_state loads hashes from the
+ * .hashes file automatically. Use this only when the .hashes file
+ * is missing (e.g. snapshot from external tools) or to override entries.
+ */
+RX_API void rx_set_block_hash(rx_engine_t *engine, uint64_t block_number,
+                              const rx_hash_t *hash);
+
 /* ========================================================================
  * Status
  * ======================================================================== */

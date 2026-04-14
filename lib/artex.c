@@ -125,7 +125,7 @@ rx_engine_t *rx_engine_create(const rx_config_t *config) {
     /* Open code store if data_dir provided */
     if (config->data_dir) {
         char cs_path[1024];
-        snprintf(cs_path, sizeof(cs_path), "%s/code_store", config->data_dir);
+        snprintf(cs_path, sizeof(cs_path), "%s/chain_replay_code", config->data_dir);
         e->cs = code_store_open(cs_path);
         if (!e->cs)
             e->cs = code_store_create(cs_path, 500000);
@@ -458,16 +458,10 @@ static bool convert_body(block_body_t *dst, const rx_block_body_t *src) {
     for (size_t i = 0; i < src->tx_count; i++) {
         const uint8_t *raw = src->transactions[i];
         size_t len = src->tx_lengths[i];
-
-        if (len > 0 && raw[0] >= 0xc0) {
-            /* Legacy: raw bytes are RLP-encoded list */
-            rlp_item_t *decoded = rlp_decode(raw, len);
-            if (decoded)
-                rlp_list_append(tx_list, decoded);
-        } else {
-            /* Typed tx (EIP-2718): type || RLP_payload */
-            rlp_list_append(tx_list, rlp_string(raw, len));
-        }
+        /* Wrap all transactions as RLP strings — tx_decode_rlp handles
+         * both legacy (byte[0] >= 0xc0) and typed (byte[0] < 0x80)
+         * when presented as RLP_TYPE_STRING. */
+        rlp_list_append(tx_list, rlp_string(raw, len));
     }
 
     rlp_list_append(root, tx_list);
@@ -504,8 +498,6 @@ static bool execute_block_internal(rx_engine_t *engine,
                                    block_body_t *body,
                                    const rx_hash_t *block_hash,
                                    rx_block_result_t *result) {
-    engine->evm->keep_undo = true;
-
     block_result_t br = block_execute(engine->evm, header, body,
                                       engine->block_hashes
 #ifdef ENABLE_HISTORY
@@ -727,6 +719,13 @@ bool rx_get_block_hash(const rx_engine_t *engine, uint64_t block_number,
     uint64_t idx = block_number % BLOCK_HASH_WINDOW;
     memcpy(out->bytes, engine->block_hashes[idx].bytes, 32);
     return true;
+}
+
+void rx_set_block_hash(rx_engine_t *engine, uint64_t block_number,
+                       const rx_hash_t *hash) {
+    if (!engine || !hash) return;
+    uint64_t idx = block_number % BLOCK_HASH_WINDOW;
+    memcpy(engine->block_hashes[idx].bytes, hash->bytes, 32);
 }
 
 /* ========================================================================
