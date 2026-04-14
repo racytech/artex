@@ -730,6 +730,97 @@ bool rx_get_block_hash(const rx_engine_t *engine, uint64_t block_number,
 }
 
 /* ========================================================================
+ * Message call (eth_call)
+ * ======================================================================== */
+
+void rx_call_result_free(rx_call_result_t *result) {
+    if (!result) return;
+    free(result->output);
+    result->output = NULL;
+    result->output_len = 0;
+}
+
+bool rx_call(rx_engine_t *engine,
+             const rx_call_msg_t *msg,
+             rx_call_result_t *result) {
+    if (!engine || !msg || !result) {
+        if (engine) engine_set_error(engine, RX_ERR_NULL_ARG, "required argument is NULL");
+        return false;
+    }
+    engine_clear_error(engine);
+    memset(result, 0, sizeof(*result));
+
+    uint64_t gas = msg->gas;
+    if (gas == 0) gas = 30000000; /* default: 30M gas */
+
+    /* Snapshot state — we'll revert after execution */
+    uint32_t snap = evm_state_snapshot(engine->state);
+
+    /* Set up block environment from current engine state */
+    evm_block_env_t block_env;
+    memset(&block_env, 0, sizeof(block_env));
+    block_env.number = engine->last_block;
+    block_env.gas_limit = gas;
+    block_env.chain_id = uint256_from_uint64(1); /* mainnet */
+    memcpy(block_env.block_hash, engine->block_hashes, sizeof(block_env.block_hash));
+    evm_set_block_env(engine->evm, &block_env);
+
+    /* Set up tx context */
+    evm_tx_context_t tx_ctx;
+    memset(&tx_ctx, 0, sizeof(tx_ctx));
+    memcpy(tx_ctx.origin.bytes, msg->from.bytes, 20);
+    evm_set_tx_context(engine->evm, &tx_ctx);
+
+    /* Determine fork for current block */
+    engine->evm->fork = fork_get_active(engine->last_block, 0,
+                                         engine->chain_config);
+
+    /* Build EVM message */
+    evm_message_t evm_msg;
+    memset(&evm_msg, 0, sizeof(evm_msg));
+    evm_msg.kind = EVM_CALL;
+    memcpy(evm_msg.caller.bytes, msg->from.bytes, 20);
+    memcpy(evm_msg.recipient.bytes, msg->to.bytes, 20);
+    memcpy(evm_msg.code_addr.bytes, msg->to.bytes, 20);
+    evm_msg.value = uint256_from_bytes(msg->value.bytes, 32);
+    evm_msg.input_data = msg->data;
+    evm_msg.input_size = msg->data_len;
+    evm_msg.gas = gas;
+    evm_msg.depth = 0;
+    evm_msg.is_static = false;
+
+    /* Execute */
+    evm_result_t evm_result;
+    bool ok = evm_execute(engine->evm, &evm_msg, &evm_result);
+
+    if (!ok) {
+        evm_state_revert(engine->state, snap);
+        engine_set_error(engine, RX_ERR_EXECUTION, "evm_execute internal error");
+        return false;
+    }
+
+    /* Fill result */
+    result->success = (evm_result.status == EVM_SUCCESS);
+    result->gas_used = gas - evm_result.gas_left;
+
+    /* Copy output data (take ownership) */
+    if (evm_result.output_data && evm_result.output_size > 0) {
+        result->output = malloc(evm_result.output_size);
+        if (result->output) {
+            memcpy(result->output, evm_result.output_data, evm_result.output_size);
+            result->output_len = evm_result.output_size;
+        }
+    }
+
+    evm_result_free(&evm_result);
+
+    /* Revert all state changes */
+    evm_state_revert(engine->state, snap);
+
+    return true;
+}
+
+/* ========================================================================
  * Result cleanup
  * ======================================================================== */
 

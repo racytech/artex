@@ -561,6 +561,95 @@ static int test_genesis_alloc(void) {
     return errors;
 }
 
+static int test_call(void) {
+    printf("\ntest_call:\n");
+    int errors = 0;
+
+    rx_config_t config = { .chain_id = RX_CHAIN_MAINNET };
+    rx_engine_t *e = rx_engine_create(&config);
+    if (!e) { printf("  FAIL: create\n"); return 1; }
+
+    /* Deploy a contract that returns 0x42 when called:
+     * PUSH1 0x42   (60 42)
+     * PUSH1 0x00   (60 00)
+     * MSTORE       (52)
+     * PUSH1 0x20   (60 20)
+     * PUSH1 0x00   (60 00)
+     * RETURN       (f3)
+     * = 604260005260206000f3 (10 bytes)
+     */
+    uint8_t code[] = { 0x60, 0x42, 0x60, 0x00, 0x52,
+                       0x60, 0x20, 0x60, 0x00, 0xf3 };
+
+    rx_genesis_account_t accounts[2];
+    memset(accounts, 0, sizeof(accounts));
+
+    /* Contract at 0xCC..CC */
+    memset(accounts[0].address.bytes, 0xCC, 20);
+    accounts[0].code = code;
+    accounts[0].code_len = sizeof(code);
+
+    /* Caller at 0xAA..AA with some balance */
+    memset(accounts[1].address.bytes, 0xAA, 20);
+    accounts[1].balance.bytes[31] = 0x01; /* 1 wei */
+
+    if (!rx_engine_load_genesis_alloc(e, accounts, 2, NULL)) {
+        printf("  FAIL: genesis alloc\n");
+        rx_engine_destroy(e);
+        return 1;
+    }
+
+    /* Call the contract */
+    rx_call_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    memset(msg.from.bytes, 0xAA, 20);
+    memset(msg.to.bytes, 0xCC, 20);
+    msg.gas = 100000;
+
+    rx_call_result_t result;
+    if (!rx_call(e, &msg, &result)) {
+        printf("  FAIL: rx_call returned false: %s\n",
+               rx_engine_last_error_msg(e));
+        errors++;
+    } else {
+        printf("  success=%d gas_used=%lu output_len=%zu\n",
+               result.success, result.gas_used, result.output_len);
+
+        if (!result.success) {
+            printf("  FAIL: call should succeed\n"); errors++;
+        }
+
+        /* Output should be 32 bytes with 0x42 at position 31 */
+        if (result.output_len != 32) {
+            printf("  FAIL: expected 32 bytes output, got %zu\n",
+                   result.output_len); errors++;
+        } else if (result.output[31] != 0x42) {
+            printf("  FAIL: expected 0x42 at byte 31, got 0x%02x\n",
+                   result.output[31]); errors++;
+        }
+
+        rx_call_result_free(&result);
+    }
+
+    /* Verify state is unchanged after call */
+    rx_state_t *state = rx_engine_get_state(e);
+    rx_address_t contract_addr;
+    memset(contract_addr.bytes, 0xCC, 20);
+    if (!rx_account_exists(state, &contract_addr)) {
+        printf("  FAIL: contract should still exist\n"); errors++;
+    }
+
+    /* NULL args */
+    if (rx_call(NULL, &msg, &result)) {
+        printf("  FAIL: NULL engine should fail\n"); errors++;
+    }
+
+    rx_engine_destroy(e);
+
+    if (errors == 0) printf("  OK\n");
+    return errors;
+}
+
 int main(void) {
     int errors = 0;
     errors += test_create_destroy();
@@ -571,6 +660,7 @@ int main(void) {
     errors += test_block_hash_query();
     errors += test_commit_revert();
     errors += test_genesis_alloc();
+    errors += test_call();
 
     printf("\n=== %s (%d errors) ===\n", errors ? "FAIL" : "PASS", errors);
     return errors ? 1 : 0;

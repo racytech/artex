@@ -419,12 +419,43 @@ RX_API bool rx_commit_block(rx_engine_t *engine);
 RX_API bool rx_revert_block(rx_engine_t *engine);
 
 /* ========================================================================
- * TODO: Future API additions
- *
- * rx_call() — read-only message execution against current state
- *   without committing (eth_call equivalent). For transaction
- *   simulation, gas estimation, and view function calls.
+ * Message call (eth_call equivalent)
  * ======================================================================== */
+
+/** Message call input. */
+typedef struct {
+    rx_address_t from;          /* caller (tx.origin + msg.sender) */
+    rx_address_t to;            /* target contract (zero = create) */
+    rx_uint256_t value;         /* wei to transfer (big-endian) */
+    const uint8_t *data;        /* calldata, NULL = empty */
+    size_t        data_len;
+    uint64_t      gas;          /* gas limit (0 = use block gas limit) */
+} rx_call_msg_t;
+
+/** Message call result. */
+typedef struct {
+    bool      success;          /* true = EVM_SUCCESS, false = revert/error */
+    uint64_t  gas_used;         /* gas consumed */
+    uint8_t  *output;           /* return data (caller must free) */
+    size_t    output_len;
+} rx_call_result_t;
+
+/** Free output data inside a call result. */
+RX_API void rx_call_result_free(rx_call_result_t *result);
+
+/**
+ * Execute a read-only message call against current state (eth_call).
+ *
+ * Snapshots state before execution and reverts afterward — no state
+ * changes are committed. Use for transaction simulation, gas estimation,
+ * and view function calls.
+ *
+ * The block context uses the last executed block's parameters.
+ * Returns false only on fatal/internal error.
+ */
+RX_API bool rx_call(rx_engine_t *engine,
+                    const rx_call_msg_t *msg,
+                    rx_call_result_t *result);
 
 #ifdef __cplusplus
 }
