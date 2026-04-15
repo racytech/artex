@@ -40,7 +40,7 @@
 #define TYPE_VERSION              0x3265
 #define TYPE_COMPRESSED_BLOCK     0x0001
 #define ENTRY_HEADER_SIZE         8
-#define MAX_DECOMPRESSED_SIZE     (2 * 1024 * 1024)
+#define MAX_DECOMPRESSED_SIZE     (8 * 1024 * 1024)
 
 /* =========================================================================
  * Helpers
