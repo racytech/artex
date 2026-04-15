@@ -42,9 +42,19 @@
 #define NODE48_EMPTY     255
 #define SH_REF_NULL      0
 
-#define NUM_SIZE_CLASSES  33  /* max 2^32 = 4GB per arena (whale contracts) */
+/* Pool allocator: two-tier freelists.
+ * Small (<PAGE_SIZE): power-of-2 rounding, freelist reuse only (sub-page).
+ * Large (>=PAGE_SIZE): page-count rounding, MADV_DONTNEED + freelist reuse. */
 #define INITIAL_MAP_SIZE  (64ULL * 1024)
-#define MAX_HDR_FREE      200
+#define FL_INITIAL_CAP    32   /* initial capacity per freelist bucket */
+
+/* Small-alloc classes: log2 index 8..11 → sizes 256, 512, 1024, 2048 */
+#define FL_SMALL_MIN_CLASS  8
+#define FL_SMALL_MAX_CLASS  11
+#define FL_SMALL_COUNT      12  /* array size: indices 0..11 */
+
+/* Page-count classes: 1..64 pages (4KB..256KB) */
+#define MAX_PAGE_CLASS      64
 
 #define INITIAL_ARENA_CAP 256
 #define SENTINEL_SIZE     64   /* first 64 bytes reserved as sentinel */
@@ -99,45 +109,10 @@ typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint32_t version;
     uint64_t data_size;
-    uint64_t free_total_bytes;
-    uint32_t free_counts[NUM_SIZE_CLASSES];
-    uint8_t  free_data[3940];
+    uint8_t  _reserved[PAGE_SIZE - 16];
 } shrt_header_t;
 
 _Static_assert(sizeof(shrt_header_t) <= PAGE_SIZE, "header must fit in one page");
-
-/* =========================================================================
- * In-memory free list (pool-level, one per size class)
- * ========================================================================= */
-
-typedef struct {
-    uint64_t *offsets;
-    uint32_t  count;
-    uint32_t  capacity;
-} free_list_t;
-
-static void fl_push(free_list_t *fl, uint64_t offset) {
-    if (fl->count >= fl->capacity) {
-        uint32_t nc = fl->capacity ? fl->capacity * 2 : 64;
-        uint64_t *no = realloc(fl->offsets, nc * sizeof(uint64_t));
-        if (!no) return;
-        fl->offsets = no;
-        fl->capacity = nc;
-    }
-    fl->offsets[fl->count++] = offset;
-}
-
-static bool fl_pop(free_list_t *fl, uint64_t *out) {
-    if (fl->count == 0) return false;
-    *out = fl->offsets[--fl->count];
-    return true;
-}
-
-static void fl_destroy(free_list_t *fl) {
-    free(fl->offsets);
-    fl->offsets = NULL;
-    fl->count = fl->capacity = 0;
-}
 
 /* =========================================================================
  * Pool struct
@@ -148,29 +123,20 @@ struct storage_hart_pool {
     uint8_t  *base;
     size_t    mapped;
     uint64_t  data_size;
+    uint64_t  free_total_bytes;
 
-    free_list_t free_lists[NUM_SIZE_CLASSES];
-    uint64_t    free_total_bytes;
+    /* Small freelists: indexed by log2(cap), covers 256..2048 bytes */
+    uint64_t *fl_small[FL_SMALL_COUNT];
+    uint32_t  fl_small_cnt[FL_SMALL_COUNT];
+    uint32_t  fl_small_cap[FL_SMALL_COUNT];
+
+    /* Page-count freelists: indexed by npages, covers 1..64 pages */
+    uint64_t *fl_pages[MAX_PAGE_CLASS + 1];
+    uint32_t  fl_pages_cnt[MAX_PAGE_CLASS + 1];
+    uint32_t  fl_pages_cap[MAX_PAGE_CLASS + 1];
 
     char     *path;
 };
-
-/* =========================================================================
- * Size class helpers (pool-level, power-of-2 bytes)
- * ========================================================================= */
-
-static int size_class_for_bytes(uint64_t bytes) {
-    if (bytes <= 1) return 0;
-    int cls = 0;
-    uint64_t n = bytes - 1;
-    while (n > 0) { cls++; n >>= 1; }
-    if (cls >= NUM_SIZE_CLASSES) cls = NUM_SIZE_CLASSES - 1;
-    return cls;
-}
-
-static uint64_t class_bytes(int cls) {
-    return 1ULL << cls;
-}
 
 /* =========================================================================
  * mmap management
@@ -181,12 +147,15 @@ static bool ensure_mapped(storage_hart_pool_t *pool, uint64_t need) {
     if (total <= pool->mapped) return true;
 
     size_t new_size = pool->mapped;
-    while (new_size < total)
-        new_size = new_size < INITIAL_MAP_SIZE ? INITIAL_MAP_SIZE : new_size + new_size / 2;
+    #define POOL_GROW_STEP (512ULL * 1024 * 1024)  /* always +512MB */
+    while (new_size < total) {
+        if (new_size < INITIAL_MAP_SIZE)
+            new_size = INITIAL_MAP_SIZE;
+        else
+            new_size += POOL_GROW_STEP;
+    }
 
-    if (new_size >= 8ULL * 1024 * 1024 * 1024)
-        fprintf(stderr, "POOL_GROW: %zuGB -> %zuGB\n",
-                pool->mapped / (1024*1024*1024), new_size / (1024*1024*1024));
+    (void)0; /* POOL_GROW/ARENA_GROW debug prints removed */
 
     if (ftruncate(pool->fd, (off_t)new_size) != 0) {
         fprintf(stderr, "storage_hart: ftruncate failed size=%zu: %m\n", new_size);
@@ -211,42 +180,123 @@ static bool ensure_mapped(storage_hart_pool_t *pool, uint64_t need) {
 }
 
 /* =========================================================================
- * Pool-level allocator
+ * Pool-level allocator — two-tier: small (power-of-2) + paged
  * ========================================================================= */
 
+/** Round up to next power of 2 (for values > 0). */
+static uint64_t next_pow2(uint64_t v) {
+    v--;
+    v |= v >> 1; v |= v >> 2; v |= v >> 4;
+    v |= v >> 8; v |= v >> 16; v |= v >> 32;
+    return v + 1;
+}
+
+/** Integer log2 for powers of 2. */
+static int ilog2(uint64_t v) {
+    int r = 0;
+    while (v > 1) { v >>= 1; r++; }
+    return r;
+}
+
+/* --- generic freelist push/pop on parallel arrays --- */
+
+static void fl_push(uint64_t **arr, uint32_t *cnt, uint32_t *cap,
+                     uint32_t idx, uint64_t offset) {
+    if (cnt[idx] >= cap[idx]) {
+        uint32_t nc = cap[idx] ? cap[idx] * 2 : FL_INITIAL_CAP;
+        uint64_t *buf = realloc(arr[idx], nc * sizeof(uint64_t));
+        if (!buf) return;
+        arr[idx] = buf;
+        cap[idx] = nc;
+    }
+    arr[idx][cnt[idx]++] = offset;
+}
+
+static uint64_t fl_pop(uint64_t **arr, uint32_t *cnt, uint32_t idx) {
+    if (cnt[idx] == 0) return 0;
+    return arr[idx][--cnt[idx]];
+}
+
+/** Allocate bytes from the pool. Tries freelist first, then bumps. */
 static uint64_t pool_alloc(storage_hart_pool_t *pool, uint64_t bytes, uint64_t *out_cap) {
     if (bytes == 0) return 0;
-    int cls = size_class_for_bytes(bytes);
-    uint64_t cap = class_bytes(cls);
-    if (out_cap) *out_cap = cap;
 
+    uint64_t cap;
     uint64_t offset;
-    if (fl_pop(&pool->free_lists[cls], &offset)) {
-        pool->free_total_bytes -= cap;
-        return offset;
+
+    if (bytes < PAGE_SIZE) {
+        /* Small tier: power-of-2 rounding */
+        cap = next_pow2(bytes);
+        if (cap < 256) cap = 256;  /* minimum allocation = INITIAL_ARENA_CAP */
+        int cls = ilog2(cap);
+
+        if (out_cap) *out_cap = cap;
+
+        /* Try freelist */
+        if (cls >= FL_SMALL_MIN_CLASS && cls <= FL_SMALL_MAX_CLASS) {
+            offset = fl_pop(pool->fl_small, pool->fl_small_cnt, (uint32_t)cls);
+            if (offset != 0) {
+                pool->free_total_bytes -= cap;
+                return offset;
+            }
+        }
+    } else {
+        /* Page tier: round to page boundary */
+        cap = (bytes + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+        uint32_t npages = (uint32_t)(cap / PAGE_SIZE);
+
+        if (out_cap) *out_cap = cap;
+
+        /* Try freelist */
+        if (npages <= MAX_PAGE_CLASS) {
+            offset = fl_pop(pool->fl_pages, pool->fl_pages_cnt, npages);
+            if (offset != 0) {
+                pool->free_total_bytes -= cap;
+                return offset;
+            }
+        }
     }
 
+    /* Bump allocate */
     offset = pool->data_size;
     pool->data_size += cap;
-    if (!ensure_mapped(pool, pool->data_size))
+    if (!ensure_mapped(pool, pool->data_size)) {
+        pool->data_size -= cap;
         return 0;
+    }
     return offset;
 }
 
+/** Free a region: reclaim tail, or push to freelist (+ MADV_DONTNEED for paged). */
 static void pool_free(storage_hart_pool_t *pool, uint64_t offset, uint64_t cap) {
     if (offset == 0 || cap == 0) return;
-    int cls = size_class_for_bytes(cap);
-    if (class_bytes(cls) != cap) return;
-    fl_push(&pool->free_lists[cls], offset);
-    pool->free_total_bytes += cap;
 
-    /* Release physical pages back to OS — the virtual range stays valid
-     * and will fault in fresh zero pages if reused by pool_alloc. */
-    uint8_t *ptr = pool->base + PAGE_SIZE + offset;
-    uint64_t aligned_start = ((uintptr_t)ptr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    uint64_t aligned_end = ((uintptr_t)ptr + cap) & ~(PAGE_SIZE - 1);
-    if (aligned_end > aligned_start)
-        madvise((void *)aligned_start, aligned_end - aligned_start, MADV_DONTNEED);
+    /* Tail reclaim: if this block is at the end, shrink data_size */
+    if (offset + cap == pool->data_size) {
+        pool->data_size -= cap;
+        return;
+    }
+
+    if (cap < PAGE_SIZE) {
+        /* Small tier: freelist only, no MADV_DONTNEED (sub-page) */
+        int cls = ilog2(cap);
+        if (cls >= FL_SMALL_MIN_CLASS && cls <= FL_SMALL_MAX_CLASS) {
+            fl_push(pool->fl_small, pool->fl_small_cnt, pool->fl_small_cap,
+                    (uint32_t)cls, offset);
+            pool->free_total_bytes += cap;
+        }
+    } else {
+        /* Page tier: release physical pages + freelist */
+        uint8_t *ptr = pool->base + PAGE_SIZE + offset;
+        madvise(ptr, cap, MADV_DONTNEED);
+
+        uint32_t npages = (uint32_t)(cap / PAGE_SIZE);
+        if (npages > 0 && npages <= MAX_PAGE_CLASS) {
+            fl_push(pool->fl_pages, pool->fl_pages_cnt, pool->fl_pages_cap,
+                    npages, offset);
+            pool->free_total_bytes += cap;
+        }
+    }
 }
 
 /* =========================================================================
@@ -259,22 +309,6 @@ static void write_header(storage_hart_pool_t *pool) {
     hdr->magic = SHRT_MAGIC;
     hdr->version = SHRT_VERSION;
     hdr->data_size = pool->data_size;
-    hdr->free_total_bytes = pool->free_total_bytes;
-
-    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
-        hdr->free_counts[i] = pool->free_lists[i].count;
-
-    size_t pos = 0;
-    size_t max = sizeof(hdr->free_data);
-    for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
-        uint32_t n = pool->free_lists[i].count;
-        if (n > MAX_HDR_FREE) n = MAX_HDR_FREE;
-        size_t need = n * sizeof(uint64_t);
-        if (pos + need > max) { hdr->free_counts[i] = 0; continue; }
-        memcpy(hdr->free_data + pos, pool->free_lists[i].offsets, need);
-        hdr->free_counts[i] = n;
-        pos += need;
-    }
 }
 
 static bool read_header(storage_hart_pool_t *pool) {
@@ -285,20 +319,6 @@ static bool read_header(storage_hart_pool_t *pool) {
 
     pool->data_size = hdr->data_size;
     if (pool->data_size < SENTINEL_SIZE) pool->data_size = SENTINEL_SIZE;
-    pool->free_total_bytes = hdr->free_total_bytes;
-
-    size_t pos = 0;
-    for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
-        uint32_t n = hdr->free_counts[i];
-        size_t need = n * sizeof(uint64_t);
-        if (pos + need > sizeof(hdr->free_data)) n = 0;
-        for (uint32_t j = 0; j < n; j++) {
-            uint64_t off;
-            memcpy(&off, hdr->free_data + pos + j * sizeof(uint64_t), sizeof(off));
-            fl_push(&pool->free_lists[i], off);
-        }
-        pos += n * sizeof(uint64_t);
-    }
     return true;
 }
 
@@ -377,8 +397,10 @@ void storage_hart_pool_destroy(storage_hart_pool_t *pool) {
     if (pool->base && pool->base != MAP_FAILED)
         munmap(pool->base, pool->mapped);
     if (pool->fd >= 0) close(pool->fd);
-    for (int i = 0; i < NUM_SIZE_CLASSES; i++)
-        fl_destroy(&pool->free_lists[i]);
+    for (int i = 0; i < FL_SMALL_COUNT; i++)
+        free(pool->fl_small[i]);
+    for (int i = 0; i <= MAX_PAGE_CLASS; i++)
+        free(pool->fl_pages[i]);
     free(pool->path);
     free(pool);
 }
@@ -436,18 +458,34 @@ static bool arena_ensure(storage_hart_pool_t *pool, storage_hart_t *sh,
     }
     if (new_cap < min_cap) new_cap = min_cap;
 
-    if (new_cap >= 4ULL * 1024 * 1024 * 1024) {
-        fprintf(stderr, "ARENA_GROW: %luMB -> %luMB (used=%luMB, needed=%u)\n",
-                (unsigned long)(sh->arena_cap / (1024*1024)),
-                (unsigned long)(new_cap / (1024*1024)),
-                (unsigned long)(sh->arena_used / (1024*1024)), needed);
+    /* Compute the rounded cap the same way pool_alloc would */
+    uint64_t new_pool_cap;
+    if (new_cap < PAGE_SIZE) {
+        new_pool_cap = next_pow2(new_cap);
+        if (new_pool_cap < 256) new_pool_cap = 256;
+    } else {
+        new_pool_cap = (new_cap + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     }
 
+    /* Fast path: extend in-place if this arena is at the tail of the pool */
+    if (sh->arena_offset != 0 &&
+        sh->arena_offset + sh->arena_cap == pool->data_size) {
+        uint64_t extra = new_pool_cap - sh->arena_cap;
+        pool->data_size += extra;
+        if (!ensure_mapped(pool, pool->data_size)) {
+            pool->data_size -= extra;
+            /* fall through to relocate path */
+        } else {
+            sh->arena_cap = new_pool_cap;
+            return true;  /* no copy, no hole */
+        }
+    }
+
+    /* Slow path: allocate new region, copy, free old */
     uint64_t pool_cap;
     uint64_t new_offset = pool_alloc(pool, new_cap, &pool_cap);
     if (new_offset == 0) return false;
 
-    /* Copy old data — use offsets not pointers since pool_alloc may mremap */
     if (sh->arena_offset != 0 && sh->arena_used > 0) {
         uint64_t old_offset = sh->arena_offset;
         uint64_t old_used = sh->arena_used;

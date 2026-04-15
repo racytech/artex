@@ -660,9 +660,9 @@ if(CJSON_FOUND)
         ${CJSON_INCLUDE_DIRS})
     target_link_libraries(chain_replay sync engine era_reader ${CJSON_LIBRARIES})
 
-    # History query tool
-    add_executable(history_query tools/history_query.c)
-    target_link_libraries(history_query block_executor evm common)
+    # History query tool — disabled: state_history module not yet implemented
+    # add_executable(history_query tools/history_query.c)
+    # target_link_libraries(history_query block_executor evm common)
 
     #==============================================================================
     # Integration Tests (Ethereum test vectors)
