@@ -179,7 +179,7 @@ sync_t *sync_create(const sync_config_t *config) {
     if (s->config.code_store_path) {
         s->cs = code_store_open(s->config.code_store_path);
         if (!s->cs)
-            s->cs = code_store_create(s->config.code_store_path, 500000);
+            s->cs = code_store_create(s->config.code_store_path, 3000000);
         if (!s->cs)
             fprintf(stderr, "WARNING: failed to open/create code store at '%s'\n"
                     "  hint: check disk space and file permissions\n",
