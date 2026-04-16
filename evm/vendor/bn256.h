@@ -14,7 +14,7 @@
 #ifndef BN256_H
 #define BN256_H
 
-#include "mini-gmp.h"
+#include "gmp.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>

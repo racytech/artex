@@ -14,7 +14,7 @@
 #include <secp256k1_recovery.h>
 #include "keccak256.h"
 #include "bn256.h"
-#include "mini-gmp.h"
+#include "gmp.h"
 #include "blst.h"
 
 // Helper: compute keccak256 of data into out (32 bytes)

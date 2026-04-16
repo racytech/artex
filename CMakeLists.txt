@@ -29,6 +29,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -g -msse4.2")
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -O0 -DDEBUG")
 set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG -flto=2 -march=native")
 
+
 # Include directories
 include_directories(
     ${CMAKE_SOURCE_DIR}/database/include
@@ -150,15 +151,16 @@ add_library(evm STATIC
     evm/src/fork.c
     evm/src/transaction.c
     evm/src/precompile.c
-    evm/vendor/mini-gmp.c
     evm/vendor/bn256.c
 )
 target_include_directories(evm PUBLIC
     ${CMAKE_SOURCE_DIR}/evm/include
     ${CMAKE_SOURCE_DIR}/evm/vendor
     ${CMAKE_SOURCE_DIR}/state/include
+    ${CMAKE_SOURCE_DIR}/third_party/gmp/include
 )
-target_link_libraries(evm state art_database common ssl crypto secp256k1 blst code_store)
+target_link_libraries(evm state art_database common ssl crypto secp256k1 blst code_store
+    ${CMAKE_SOURCE_DIR}/third_party/gmp/lib/libgmp.a)
 if(ENABLE_EVM_TRACE)
     target_compile_definitions(evm PUBLIC ENABLE_EVM_TRACE=1)
 endif()
@@ -663,6 +665,11 @@ if(CJSON_FOUND)
     # History query tool — disabled: state_history module not yet implemented
     # add_executable(history_query tools/history_query.c)
     # target_link_libraries(history_query block_executor evm common)
+
+    # Rebuild code_store index with proper sizing
+    add_executable(rebuild_code_idx tools/rebuild_code_idx.c)
+    target_include_directories(rebuild_code_idx PRIVATE ${CMAKE_SOURCE_DIR}/database/include)
+    target_link_libraries(rebuild_code_idx disk_table)
 
     #==============================================================================
     # Integration Tests (Ethereum test vectors)
