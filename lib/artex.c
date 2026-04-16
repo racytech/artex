@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/resource.h>
+#include <stdio.h>
 
 /* ========================================================================
  * Internal engine struct
@@ -113,9 +115,23 @@ const char *rx_engine_last_error_msg(const rx_engine_t *engine) {
  * Engine lifecycle
  * ======================================================================== */
 
+/** Minimum stack size for EVM execution (1024-deep call chains). */
+#define RX_MIN_STACK_SIZE (32UL * 1024 * 1024)
+
 rx_engine_t *rx_engine_create(const rx_config_t *config) {
     if (!config) return NULL;
     if (config->chain_id != RX_CHAIN_MAINNET) return NULL;
+
+    /* Warn if thread stack is too small for deep EVM call chains */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur < RX_MIN_STACK_SIZE) {
+        fprintf(stderr,
+            "WARNING: thread stack size is %luMB, recommend >= %luMB\n"
+            "  EVM supports 1024-deep call stacks which require ~32MB of C stack.\n"
+            "  Set with: ulimit -s 32768  (or setrlimit/pthread_attr_setstacksize)\n",
+            (unsigned long)(rl.rlim_cur / (1024 * 1024)),
+            (unsigned long)(RX_MIN_STACK_SIZE / (1024 * 1024)));
+    }
 
     rx_engine_t *e = calloc(1, sizeof(rx_engine_t));
     if (!e) return NULL;
@@ -128,7 +144,7 @@ rx_engine_t *rx_engine_create(const rx_config_t *config) {
         snprintf(cs_path, sizeof(cs_path), "%s/chain_replay_code", config->data_dir);
         e->cs = code_store_open(cs_path);
         if (!e->cs)
-            e->cs = code_store_create(cs_path, 500000);
+            e->cs = code_store_create(cs_path, 3000000);
     }
 
     e->state = evm_state_create(e->cs);

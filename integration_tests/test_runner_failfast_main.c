@@ -16,6 +16,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <limits.h>
+#include <sys/resource.h>
 #include <cjson/cJSON.h>
 
 #ifndef PATH_MAX
@@ -356,6 +357,13 @@ static bool run_directory_failfast(test_runner_t *runner,
 }
 
 int main(int argc, char **argv) {
+    /* EVM allows 1024-deep call stacks. Increase stack to 32MB for deep recursion. */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur < 32UL * 1024 * 1024) {
+        rl.rlim_cur = 32UL * 1024 * 1024;
+        setrlimit(RLIMIT_STACK, &rl);
+    }
+
     test_runner_config_t config = {
         .verbose = false,
         .stop_on_fail = true,  // Always true for fail-fast

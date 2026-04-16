@@ -11,6 +11,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 
 static void print_usage(const char *program) {
     printf("Usage: %s [options] <file_or_directory>...\n\n", program);
@@ -27,6 +28,13 @@ static void print_usage(const char *program) {
 }
 
 int main(int argc, char **argv) {
+    /* EVM allows 1024-deep call stacks. Increase stack to 32MB for deep recursion. */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur < 32UL * 1024 * 1024) {
+        rl.rlim_cur = 32UL * 1024 * 1024;
+        setrlimit(RLIMIT_STACK, &rl);
+    }
+
     test_runner_config_t config = {
         .verbose = false,
         .stop_on_fail = false,

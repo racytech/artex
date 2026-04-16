@@ -240,7 +240,13 @@ typedef struct {
  * Engine lifecycle
  * ======================================================================== */
 
-/** Create execution engine. Returns NULL on failure (check rx_engine_last_error). */
+/**
+ * Create execution engine. Returns NULL on failure (check rx_engine_last_error).
+ *
+ * NOTE: EVM supports 1024-deep call stacks. The calling thread must have at
+ * least 32MB of stack space. If the stack is too small, a warning is printed
+ * to stderr. Set with: ulimit -s 32768, setrlimit(), or pthread_attr_setstacksize().
+ */
 RX_API rx_engine_t *rx_engine_create(const rx_config_t *config);
 
 /** Destroy engine and free all resources. */

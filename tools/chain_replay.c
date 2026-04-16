@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <pthread.h>
 #include "evm_tracer.h"
 #include "logger.h"
@@ -633,6 +634,13 @@ static void prefetch_stop(block_prefetch_t *pf) {
  * ========================================================================= */
 
 int main(int argc, char **argv) {
+    /* EVM allows 1024-deep call stacks. Increase stack to 32MB for deep recursion. */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur < 32UL * 1024 * 1024) {
+        rl.rlim_cur = 32UL * 1024 * 1024;
+        setrlimit(RLIMIT_STACK, &rl);
+    }
+
     /* Parse flags */
     bool force_clean = false;
     bool follow_mode = false;
@@ -846,6 +854,18 @@ int main(int argc, char **argv) {
         hash_to_hex(&loaded_root, root_hex);
         LOG_INFO("Loaded state: %u accounts at block %lu from %s (root: %s)",
                  ss.account_count, loaded_block, load_state_path, root_hex);
+
+        /* Recompute MPT root from scratch to verify snapshot integrity */
+        LOG_INFO("Recomputing MPT root (invalidate_all + compute_root)...");
+        evm_state_invalidate_all(es);
+        hash_t recomputed = evm_state_compute_mpt_root(es, loaded_block >= 1050000);
+        char recomp_hex[67];
+        hash_to_hex(&recomputed, recomp_hex);
+        if (memcmp(loaded_root.bytes, recomputed.bytes, 32) == 0) {
+            LOG_INFO("Root verified: %s", recomp_hex);
+        } else {
+            LOG_WARN("Root mismatch! loaded=%s recomputed=%s", root_hex, recomp_hex);
+        }
 
         /* Populate block hash ring from era1 or era files.
          * Post-merge blocks are in era files, not era1. */
@@ -1066,8 +1086,28 @@ int main(int argc, char **argv) {
         if (bn == dump_prestate_block) {
             evm_state_t *pre_es = sync_get_state(sync);
             state_t *pre_st = evm_state_get_state(pre_es);
-            char prestate_tmp[256];
-            snprintf(prestate_tmp, sizeof(prestate_tmp), "/tmp/artex_prestate_%lu.bin", bn);
+
+            /* Create output directory: known_issues/block_<N>/ */
+            char prestate_dir[256];
+            if (dump_prestate_path) {
+                /* User specified path — use its directory for temp file */
+                const char *sl = strrchr(dump_prestate_path, '/');
+                if (sl) {
+                    snprintf(prestate_dir, sizeof(prestate_dir), "%.*s",
+                             (int)(sl - dump_prestate_path), dump_prestate_path);
+                } else {
+                    snprintf(prestate_dir, sizeof(prestate_dir), ".");
+                }
+            } else {
+                snprintf(prestate_dir, sizeof(prestate_dir),
+                         "known_issues/block_%lu", bn);
+                mkdir("known_issues", 0755);
+                mkdir(prestate_dir, 0755);
+            }
+
+            char prestate_tmp[512];
+            snprintf(prestate_tmp, sizeof(prestate_tmp),
+                     "%s/prestate_%lu.bin", prestate_dir, bn);
             fprintf(stderr, "dump-prestate: saving pre-state to %s...\n", prestate_tmp);
             if (!state_save(pre_st, prestate_tmp, NULL)) {
                 LOG_ERROR("Failed to save pre-state for dump-prestate");
@@ -1141,8 +1181,19 @@ int main(int argc, char **argv) {
             fprintf(stderr, "dump-prestate: %zu storage keys\n", total_slots);
 
             /* Load pre-execution state from saved binary */
-            char prestate_tmp[256];
-            snprintf(prestate_tmp, sizeof(prestate_tmp), "/tmp/artex_prestate_%lu.bin", bn);
+            char prestate_tmp[512];
+            if (dump_prestate_path) {
+                const char *sl = strrchr(dump_prestate_path, '/');
+                if (sl) {
+                    snprintf(prestate_tmp, sizeof(prestate_tmp), "%.*s/prestate_%lu.bin",
+                             (int)(sl - dump_prestate_path), dump_prestate_path, bn);
+                } else {
+                    snprintf(prestate_tmp, sizeof(prestate_tmp), "prestate_%lu.bin", bn);
+                }
+            } else {
+                snprintf(prestate_tmp, sizeof(prestate_tmp),
+                         "known_issues/block_%lu/prestate_%lu.bin", bn, bn);
+            }
             evm_state_t *pre = evm_state_create(NULL);
             if (!pre) {
                 fprintf(stderr, "Failed to create pre-state for dump\n");
@@ -1162,9 +1213,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "dump-prestate: loaded pre-state from %s\n", prestate_tmp);
 
             /* Build output path */
-            char default_path[256];
+            char default_path[512];
             if (!dump_prestate_path) {
-                snprintf(default_path, sizeof(default_path), "alloc_%lu.json", bn);
+                snprintf(default_path, sizeof(default_path),
+                         "known_issues/block_%lu/alloc.json", bn);
                 dump_prestate_path = default_path;
             }
 
