@@ -67,8 +67,8 @@ static const chain_config_t mainnet_config = {
         .paris = 15537394,      // The Merge (TTD-based, approx block)
         .shanghai = 1681338455, // Timestamp: April 12, 2023
         .cancun = 1710338135,   // Timestamp: March 13, 2024
-        .prague = UINT64_MAX,
-        .osaka = UINT64_MAX,
+        .prague = 1746612311,   // Timestamp: May 7, 2025 (Pectra)
+        .osaka = 1764798551,    // Timestamp: Dec 3, 2025 (Fusaka)
         .verkle = UINT64_MAX,
     }};
 
