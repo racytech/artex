@@ -145,11 +145,6 @@ struct storage_hart_pool {
 
 /* =========================================================================
  * mmap management
- *
- * TODO: The +512MB grow step is aggressive. Consider:
- *   - Linear +64MB or +128MB for smaller total footprint
- *   - Pre-alloc based on snapshot size (pool was ~131GB at block 20M)
- *   - Splitting larger free regions to serve smaller requests
  * ========================================================================= */
 
 static bool ensure_mapped(storage_hart_pool_t *pool, uint64_t need) {

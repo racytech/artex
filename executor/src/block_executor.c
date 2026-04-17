@@ -268,7 +268,8 @@ static void system_call(evm_t *evm, const uint8_t addr_bytes[20],
     evm_result_free(&result);
 
     /* Commit system call state changes (reset access lists, commit originals).
-     * NOTE: witness gas is NOT reset here — it persists per-block (EIP-4762). */
+     * NOTE: geth's Prepare() creates a fresh access list before each tx anyway,
+     * so system call warmth does NOT persist into user transactions. */
     evm_state_commit_tx(evm->state);
 }
 

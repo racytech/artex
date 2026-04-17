@@ -69,18 +69,18 @@ typedef struct {
  * ========================================================================= */
 
 static void *vec_alloc(size_t bytes) {
-    void *p = calloc(1, bytes);
-    return p;
+    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return (p == MAP_FAILED) ? NULL : p;
 }
 
 static void *vec_grow(void *old, size_t old_bytes, size_t new_bytes) {
-    (void)old_bytes;
-    return realloc(old, new_bytes);
+    void *p = mremap(old, old_bytes, new_bytes, MREMAP_MAYMOVE);
+    return (p == MAP_FAILED) ? NULL : p;
 }
 
 static void vec_free(void *p, size_t bytes) {
-    (void)bytes;
-    free(p);
+    if (p) munmap(p, bytes);
 }
 
 /* =========================================================================
