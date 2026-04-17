@@ -407,6 +407,19 @@ bool era_iter_next(era_iter_t *it,
 
         /* Parse into header + body */
         bool ok = parse_execution_payload(ep, ep_len, hdr, body, block_hash);
+
+        /* Extract parent_beacon_block_root from BeaconBlock (Deneb+, EIP-4788).
+         * BeaconBlock layout: slot(8) + proposer(8) + parent_root(32) + ...
+         * parent_root is at offset 16 within the BeaconBlock.
+         * Must be done after parse_execution_payload (which memsets hdr). */
+        if (ok && hdr->has_blob_gas) {  /* has_blob_gas == is_deneb */
+            uint32_t bb_msg_off = read_le32(ssz);
+            if (bb_msg_off + 48 <= ssz_len) {
+                hdr->has_parent_beacon_root = true;
+                memcpy(hdr->parent_beacon_root.bytes, ssz + bb_msg_off + 16, 32);
+            }
+        }
+
         free(ssz);
 
         if (!ok) continue;
