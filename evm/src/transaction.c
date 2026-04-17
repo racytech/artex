@@ -589,8 +589,10 @@ bool transaction_execute(
         }
     }
 
-    // EIP-7702: If tx destination has a delegation designator, warm the target
-    if (tx->type == TX_TYPE_EIP7702 && !tx->is_create) {
+    // EIP-7702: If tx destination has a delegation designator, warm the target.
+    // Applies to ALL tx types (not just type 4) — any tx calling a delegated
+    // EOA gets the delegation target warmed. Matches geth's convenience warming.
+    if (evm->fork >= FORK_PRAGUE && !tx->is_create) {
         address_t delegate_target;
         if (evm_resolve_delegation(state, &tx->to, &delegate_target)) {
             evm_mark_address_warm(evm, &delegate_target);
