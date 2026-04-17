@@ -593,7 +593,10 @@ static hart_ref_t delete_recursive(hart_t *t, hart_ref_t ref,
         void *node = ref_ptr(t, ref);
         if (node_type(node) == NODE_4) {
             node4_t *n4 = (node4_t *)node;
-            if (n4->num_children == 0) return HART_REF_NULL;
+            if (n4->num_children == 0) {
+                arena_free(t, ref, NODE_4);
+                return HART_REF_NULL;
+            }
             if (n4->num_children == 1 && HART_IS_LEAF(n4->children[0]))
                 return n4->children[0];
         }
