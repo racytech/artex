@@ -281,6 +281,13 @@ target_include_directories(test_hart_parallel PRIVATE
 )
 target_link_libraries(test_hart_parallel hashed_art mem_mpt common pthread)
 
+add_executable(test_pool_alloc database/tests/test_pool_alloc.c)
+target_include_directories(test_pool_alloc PRIVATE
+    ${CMAKE_SOURCE_DIR}/database/include
+    ${CMAKE_SOURCE_DIR}/common/include
+)
+target_link_libraries(test_pool_alloc storage_hart common)
+
 add_executable(test_tx_analysis executor/tests/test_tx_analysis.c)
 target_include_directories(test_tx_analysis PRIVATE
     ${CMAKE_SOURCE_DIR}/executor/include
@@ -670,6 +677,14 @@ if(CJSON_FOUND)
     add_executable(rebuild_code_idx tools/rebuild_code_idx.c)
     target_include_directories(rebuild_code_idx PRIVATE ${CMAKE_SOURCE_DIR}/database/include)
     target_link_libraries(rebuild_code_idx disk_table)
+
+    # Era file parsing verification tool
+    add_executable(test_era_parse tools/test_era_parse.c)
+    target_include_directories(test_era_parse PRIVATE
+        ${CMAKE_SOURCE_DIR}/era_reader/include
+        ${CMAKE_SOURCE_DIR}/executor/include
+        ${CMAKE_SOURCE_DIR}/common/include)
+    target_link_libraries(test_era_parse era_reader block_executor evm common)
 
     #==============================================================================
     # Integration Tests (Ethereum test vectors)
