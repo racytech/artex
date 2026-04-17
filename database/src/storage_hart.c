@@ -53,8 +53,8 @@
 #define FL_SMALL_MAX_CLASS  11
 #define FL_SMALL_COUNT      12  /* array size: indices 0..11 */
 
-/* Page-count classes: 1..64 pages (4KB..256KB) */
-#define MAX_PAGE_CLASS      64
+/* Page-count classes: 1..16384 pages (4KB..64MB) — covers whale contract arenas */
+#define MAX_PAGE_CLASS      16384
 
 #define INITIAL_ARENA_CAP 256
 #define SENTINEL_SIZE     64   /* first 64 bytes reserved as sentinel */
@@ -130,16 +130,26 @@ struct storage_hart_pool {
     uint32_t  fl_small_cnt[FL_SMALL_COUNT];
     uint32_t  fl_small_cap[FL_SMALL_COUNT];
 
-    /* Page-count freelists: indexed by npages, covers 1..64 pages */
+    /* Page-count freelists: indexed by npages, covers 1..16384 pages */
     uint64_t *fl_pages[MAX_PAGE_CLASS + 1];
     uint32_t  fl_pages_cnt[MAX_PAGE_CLASS + 1];
     uint32_t  fl_pages_cap[MAX_PAGE_CLASS + 1];
+
+    /* Oversized freelist: (offset, npages) pairs for regions > MAX_PAGE_CLASS */
+    struct { uint64_t offset; uint32_t npages; } *fl_big;
+    uint32_t  fl_big_cnt;
+    uint32_t  fl_big_cap;
 
     char     *path;
 };
 
 /* =========================================================================
  * mmap management
+ *
+ * TODO: The +512MB grow step is aggressive. Consider:
+ *   - Linear +64MB or +128MB for smaller total footprint
+ *   - Pre-alloc based on snapshot size (pool was ~131GB at block 20M)
+ *   - Splitting larger free regions to serve smaller requests
  * ========================================================================= */
 
 static bool ensure_mapped(storage_hart_pool_t *pool, uint64_t need) {
@@ -147,7 +157,7 @@ static bool ensure_mapped(storage_hart_pool_t *pool, uint64_t need) {
     if (total <= pool->mapped) return true;
 
     size_t new_size = pool->mapped;
-    #define POOL_GROW_STEP (512ULL * 1024 * 1024)  /* always +512MB */
+    #define POOL_GROW_STEP (64ULL * 1024 * 1024)  /* +64MB per grow */
     while (new_size < total) {
         if (new_size < INITIAL_MAP_SIZE)
             new_size = INITIAL_MAP_SIZE;
@@ -247,13 +257,78 @@ static uint64_t pool_alloc(storage_hart_pool_t *pool, uint64_t bytes, uint64_t *
 
         if (out_cap) *out_cap = cap;
 
-        /* Try freelist */
+        /* Try freelist: exact match first */
         if (npages <= MAX_PAGE_CLASS) {
             offset = fl_pop(pool->fl_pages, pool->fl_pages_cnt, npages);
             if (offset != 0) {
                 pool->free_total_bytes -= cap;
                 return offset;
             }
+
+            /* Split: find smallest larger free region */
+            for (uint32_t lg = npages + 1; lg <= MAX_PAGE_CLASS; lg++) {
+                offset = fl_pop(pool->fl_pages, pool->fl_pages_cnt, lg);
+                if (offset != 0) {
+                    uint32_t rem = lg - npages;
+                    uint64_t rem_off = offset + (uint64_t)npages * PAGE_SIZE;
+                    fl_push(pool->fl_pages, pool->fl_pages_cnt, pool->fl_pages_cap,
+                            rem, rem_off);
+                    pool->free_total_bytes -= cap;
+                    return offset;
+                }
+            }
+        }
+    }
+
+    /* Try oversized freelist: best-fit scan, split remainder */
+    if (cap >= PAGE_SIZE) {
+        uint32_t npages_needed = (uint32_t)(cap / PAGE_SIZE);
+        uint32_t best = UINT32_MAX;
+        uint32_t best_idx = 0;
+        for (uint32_t i = 0; i < pool->fl_big_cnt; i++) {
+            uint32_t np = pool->fl_big[i].npages;
+            if (np >= npages_needed && np < best) {
+                best = np;
+                best_idx = i;
+                if (np == npages_needed) break;  /* exact match */
+            }
+        }
+        if (best != UINT32_MAX) {
+            offset = pool->fl_big[best_idx].offset;
+            uint32_t got = pool->fl_big[best_idx].npages;
+
+            /* Remove from oversized list (swap with last) */
+            pool->fl_big[best_idx] = pool->fl_big[--pool->fl_big_cnt];
+
+            /* Put remainder back */
+            if (got > npages_needed) {
+                uint32_t rem = got - npages_needed;
+                uint64_t rem_off = offset + (uint64_t)npages_needed * PAGE_SIZE;
+                /* Remainder fits in page-tier? */
+                if (rem <= MAX_PAGE_CLASS) {
+                    fl_push(pool->fl_pages, pool->fl_pages_cnt, pool->fl_pages_cap,
+                            rem, rem_off);
+                } else {
+                    /* Put back in oversized list — grow if needed */
+                    if (pool->fl_big_cnt >= pool->fl_big_cap) {
+                        uint32_t nc = pool->fl_big_cap ? pool->fl_big_cap * 2 : 32;
+                        void *nb = realloc(pool->fl_big, nc * sizeof(pool->fl_big[0]));
+                        if (nb) { pool->fl_big = nb; pool->fl_big_cap = nc; }
+                    }
+                    if (pool->fl_big_cnt < pool->fl_big_cap) {
+                        pool->fl_big[pool->fl_big_cnt].offset = rem_off;
+                        pool->fl_big[pool->fl_big_cnt].npages = rem;
+                        pool->fl_big_cnt++;
+                    } else {
+                        /* Realloc failed — just MADV_DONTNEED the remainder.
+                         * Virtual space is lost but physical pages are freed. */
+                        madvise(pool->base + PAGE_SIZE + rem_off,
+                                (uint64_t)rem * PAGE_SIZE, MADV_DONTNEED);
+                    }
+                }
+            }
+            pool->free_total_bytes -= cap;
+            return offset;
         }
     }
 
@@ -295,6 +370,19 @@ static void pool_free(storage_hart_pool_t *pool, uint64_t offset, uint64_t cap) 
             fl_push(pool->fl_pages, pool->fl_pages_cnt, pool->fl_pages_cap,
                     npages, offset);
             pool->free_total_bytes += cap;
+        } else if (npages > MAX_PAGE_CLASS) {
+            /* Oversized: track for reuse */
+            if (pool->fl_big_cnt >= pool->fl_big_cap) {
+                uint32_t nc = pool->fl_big_cap ? pool->fl_big_cap * 2 : 32;
+                void *nb = realloc(pool->fl_big, nc * sizeof(pool->fl_big[0]));
+                if (nb) { pool->fl_big = nb; pool->fl_big_cap = nc; }
+            }
+            if (pool->fl_big_cnt < pool->fl_big_cap) {
+                pool->fl_big[pool->fl_big_cnt].offset = offset;
+                pool->fl_big[pool->fl_big_cnt].npages = npages;
+                pool->fl_big_cnt++;
+                pool->free_total_bytes += cap;
+            }
         }
     }
 }
@@ -401,6 +489,7 @@ void storage_hart_pool_destroy(storage_hart_pool_t *pool) {
         free(pool->fl_small[i]);
     for (int i = 0; i <= MAX_PAGE_CLASS; i++)
         free(pool->fl_pages[i]);
+    free(pool->fl_big);
     free(pool->path);
     free(pool);
 }
@@ -1064,7 +1153,10 @@ static sh_ref_t sh_delete_recursive(storage_hart_pool_t *pool,
         void *node = sh_ref_ptr(pool, sh, ref);
         if (sh_node_type(node) == NODE_4) {
             sh_node4_t *n4 = (sh_node4_t *)node;
-            if (n4->num_children == 0) return SH_REF_NULL;
+            if (n4->num_children == 0) {
+                arena_free(pool, sh, ref, NODE_4);
+                return SH_REF_NULL;
+            }
             if (n4->num_children == 1 && SH_IS_LEAF(n4->children[0]))
                 return n4->children[0];
         }
