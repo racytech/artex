@@ -19,6 +19,7 @@
 #include "uint256.h"
 #include "address.h"
 #include "code_store.h"
+#include "storage_hart.h"
 
 #include <cjson/cJSON.h>
 #include <stdlib.h>
@@ -713,6 +714,41 @@ rx_uint256_t rx_get_storage(rx_state_t *state, const rx_address_t *addr,
 uint64_t rx_get_block_number(const rx_engine_t *engine) {
     if (!engine) return 0;
     return engine->last_block;
+}
+
+rx_stats_t rx_get_stats(const rx_engine_t *engine) {
+    rx_stats_t st = {0};
+    if (!engine || !engine->state) return st;
+
+    /* State stats */
+    state_t *s = evm_state_get_state(engine->state);
+    state_stats_t ss = state_get_stats(s);
+    st.account_count     = ss.account_count;
+    st.account_live      = ss.account_live;
+    st.resource_count    = ss.storage_account_count;
+    st.acct_vec_bytes    = ss.acct_vec_bytes;
+    st.res_vec_bytes     = ss.res_vec_bytes;
+    st.acct_index_bytes  = ss.acct_arena_bytes;
+    st.total_tracked     = ss.total_tracked;
+
+    /* Storage pool stats */
+    storage_hart_pool_t *pool = state_get_storage_pool(s);
+    if (pool) {
+        storage_hart_pool_stats_t ps = storage_hart_pool_stats(pool);
+        st.pool_data_size  = ps.data_size;
+        st.pool_free_bytes = ps.free_bytes;
+        st.pool_file_size  = ps.file_size;
+    }
+
+    /* Code store stats */
+    evm_state_stats_t es = evm_state_get_stats(engine->state);
+    st.code_count        = es.code_count;
+    st.code_cache_hits   = es.code_cache_hits;
+    st.code_cache_misses = es.code_cache_misses;
+    st.exec_ms           = es.exec_ms;
+    st.root_ms           = es.root_stor_ms + es.root_acct_ms;
+
+    return st;
 }
 
 /* ========================================================================

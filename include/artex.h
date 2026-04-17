@@ -402,6 +402,40 @@ RX_API void rx_set_block_hash(rx_engine_t *engine, uint64_t block_number,
 RX_API uint64_t rx_get_block_number(const rx_engine_t *engine);
 
 /* ========================================================================
+ * Engine Statistics
+ * ======================================================================== */
+
+typedef struct {
+    /* State counts */
+    uint32_t account_count;         /* total account slots (incl. dead) */
+    uint32_t account_live;          /* live accounts */
+    uint32_t resource_count;        /* accounts with code/storage */
+
+    /* Memory breakdown (bytes) */
+    uint64_t acct_vec_bytes;        /* account vector */
+    uint64_t res_vec_bytes;         /* resource vector */
+    uint64_t acct_index_bytes;      /* account index (hart arena) */
+    uint64_t total_tracked;         /* sum of above */
+
+    /* Storage pool */
+    uint64_t pool_data_size;        /* pool virtual high-water (bytes) */
+    uint64_t pool_free_bytes;       /* bytes on pool freelists */
+    uint64_t pool_file_size;        /* backing file size (bytes) */
+
+    /* Code store */
+    uint64_t code_count;            /* unique contracts stored */
+    uint64_t code_cache_hits;
+    uint64_t code_cache_misses;
+
+    /* Block execution timing (ms, current window) */
+    double   exec_ms;
+    double   root_ms;
+} rx_stats_t;
+
+/** Get engine statistics. */
+RX_API rx_stats_t rx_get_stats(const rx_engine_t *engine);
+
+/* ========================================================================
  * Logging
  * ======================================================================== */
 

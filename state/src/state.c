@@ -1420,6 +1420,10 @@ void state_clear_prestate_dirty(state_t *s) {
  * Stats
  * ========================================================================= */
 
+storage_hart_pool_t *state_get_storage_pool(const state_t *s) {
+    return s ? s->stor_pool : NULL;
+}
+
 state_stats_t state_get_stats(const state_t *s) {
     state_stats_t st = {0};
     if (!s) return st;

@@ -184,6 +184,9 @@ void state_set_storage_raw(state_t *s, const address_t *addr,
 struct block_diff_t;
 void     state_collect_block_diff(state_t *s, struct block_diff_t *out);
 
+/** Get storage pool handle (for stats). */
+storage_hart_pool_t *state_get_storage_pool(const state_t *s);
+
 /* =========================================================================
  * Stats
  * ========================================================================= */
