@@ -206,4 +206,12 @@ typedef struct {
 
 state_stats_t state_get_stats(const state_t *s);
 
+/* Pre-block value queries (requires keep_undo=true during block execution).
+ * Returns pre-block values for modified accounts/slots, or current values
+ * for accounts that weren't modified. */
+bool state_get_preblock_account(const state_t *s, const address_t *addr,
+                                uint64_t *nonce, uint256_t *balance);
+uint256_t state_get_preblock_storage(const state_t *s, const address_t *addr,
+                                      const uint256_t *key);
+
 #endif /* STATE_H */

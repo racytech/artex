@@ -575,3 +575,7 @@ void sync_truncate_history(sync_t *sync, uint64_t last_block) {
 evm_state_t *sync_get_state(const sync_t *sync) {
     return sync ? sync->state : NULL;
 }
+
+struct evm *sync_get_evm(const sync_t *sync) {
+    return sync ? sync->evm : NULL;
+}

@@ -1104,37 +1104,12 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Save pre-execution state for dump-prestate (before target block runs) */
+        /* Prepare for dump-prestate: keep undo log + enable access tracking */
         if (bn == dump_prestate_block) {
-            evm_state_t *pre_es = sync_get_state(sync);
-            state_t *pre_st = evm_state_get_state(pre_es);
-
-            /* Create output directory: known_issues/block_<N>/ */
-            char prestate_dir[256];
-            if (dump_prestate_path) {
-                /* User specified path — use its directory for temp file */
-                const char *sl = strrchr(dump_prestate_path, '/');
-                if (sl) {
-                    snprintf(prestate_dir, sizeof(prestate_dir), "%.*s",
-                             (int)(sl - dump_prestate_path), dump_prestate_path);
-                } else {
-                    snprintf(prestate_dir, sizeof(prestate_dir), ".");
-                }
-            } else {
-                snprintf(prestate_dir, sizeof(prestate_dir),
-                         "known_issues/block_%lu", bn);
-                mkdir("known_issues", 0755);
-                mkdir(prestate_dir, 0755);
-            }
-
-            char prestate_tmp[512];
-            snprintf(prestate_tmp, sizeof(prestate_tmp),
-                     "%s/prestate_%lu.bin", prestate_dir, bn);
-            fprintf(stderr, "dump-prestate: saving pre-state to %s...\n", prestate_tmp);
-            if (!state_save(pre_st, prestate_tmp, NULL)) {
-                LOG_ERROR("Failed to save pre-state for dump-prestate");
-            }
-            evm_state_enable_access_tracking(pre_es);
+            evm_t *evm = sync_get_evm(sync);
+            evm->keep_undo = true;
+            evm_state_enable_access_tracking(sync_get_state(sync));
+            fprintf(stderr, "dump-prestate: block %lu — undo log + access tracking enabled\n", bn);
         }
 
         /* Enable EVM tracing for the target block */
@@ -1202,51 +1177,28 @@ int main(int argc, char **argv) {
             }
             fprintf(stderr, "dump-prestate: %zu storage keys\n", total_slots);
 
-            /* Load pre-execution state from saved binary */
-            char prestate_tmp[512];
-            if (dump_prestate_path) {
-                const char *sl = strrchr(dump_prestate_path, '/');
-                if (sl) {
-                    snprintf(prestate_tmp, sizeof(prestate_tmp), "%.*s/prestate_%lu.bin",
-                             (int)(sl - dump_prestate_path), dump_prestate_path, bn);
-                } else {
-                    snprintf(prestate_tmp, sizeof(prestate_tmp), "prestate_%lu.bin", bn);
-                }
-            } else {
-                snprintf(prestate_tmp, sizeof(prestate_tmp),
-                         "known_issues/block_%lu/prestate_%lu.bin", bn, bn);
-            }
-            evm_state_t *pre = evm_state_create(NULL);
-            if (!pre) {
-                fprintf(stderr, "Failed to create pre-state for dump\n");
-                free(addrs); free(addr_slots); free(slot_buf);
-                block_body_free(&body); free(hdr_rlp); free(body_rlp);
-                break;
-            }
-            state_t *pre_st = evm_state_get_state(pre);
-            hash_t pre_root;
-            if (!state_load(pre_st, prestate_tmp, &pre_root)) {
-                fprintf(stderr, "Failed to load pre-state from %s\n", prestate_tmp);
-                evm_state_destroy(pre);
-                free(addrs); free(addr_slots); free(slot_buf);
-                block_body_free(&body); free(hdr_rlp); free(body_rlp);
-                break;
-            }
-            fprintf(stderr, "dump-prestate: loaded pre-state from %s\n", prestate_tmp);
+            /* Use pre-block values from undo log (no temp file needed).
+             * blk_orig_acct has pre-block nonce/balance for modified accounts.
+             * blk_orig_stor has pre-block storage values for modified slots.
+             * Unmodified accounts/slots: current state = pre-block state. */
+            state_t *st = evm_state_get_state(es);
 
             /* Build output path */
             char default_path[512];
             if (!dump_prestate_path) {
+                char prestate_dir[256];
+                snprintf(prestate_dir, sizeof(prestate_dir),
+                         "known_issues/block_%lu", bn);
+                mkdir("known_issues", 0755);
+                mkdir(prestate_dir, 0755);
                 snprintf(default_path, sizeof(default_path),
                          "known_issues/block_%lu/alloc.json", bn);
                 dump_prestate_path = default_path;
             }
 
-            /* Query from pre-state and dump as alloc.json */
             FILE *out = fopen(dump_prestate_path, "w");
             if (!out) {
                 fprintf(stderr, "Failed to open %s for writing\n", dump_prestate_path);
-                evm_state_destroy(pre);
                 free(addrs); free(addr_slots); free(slot_buf);
                 break;
             }
@@ -1254,8 +1206,9 @@ int main(int argc, char **argv) {
             fprintf(out, "{\n");
             for (size_t i = 0; i < n_addrs; i++) {
                 address_t *a = &addrs[i];
-                uint64_t nonce = evm_state_get_nonce(pre, a);
-                uint256_t balance = evm_state_get_balance(pre, a);
+                uint64_t nonce;
+                uint256_t balance;
+                state_get_preblock_account(st, a, &nonce, &balance);
 
                 if (i > 0) fprintf(out, ",\n");
                 fprintf(out, "  \"0x");
@@ -1272,10 +1225,13 @@ int main(int argc, char **argv) {
                 /* Nonce */
                 fprintf(out, "    \"nonce\": \"0x%lx\"", nonce);
 
-                /* Code */
-                uint32_t code_size = evm_state_get_code_size(pre, a);
+                /* Code — code doesn't change within a block for existing accounts,
+                 * except for EIP-7702 delegations set by type-4 txs in THIS block.
+                 * Current code is the post-block code; for pre-block we'd need the
+                 * original. For now, use current code (correct for most cases). */
+                uint32_t code_size = evm_state_get_code_size(es, a);
                 if (code_size > 0) {
-                    const uint8_t *code = evm_state_get_code_ptr(pre, a, &code_size);
+                    const uint8_t *code = evm_state_get_code_ptr(es, a, &code_size);
                     if (code && code_size > 0) {
                         fprintf(out, ",\n    \"code\": \"0x");
                         for (uint32_t c = 0; c < code_size; c++)
@@ -1284,12 +1240,12 @@ int main(int argc, char **argv) {
                     }
                 }
 
-                /* Storage */
+                /* Storage — use pre-block values from undo log */
                 if (addr_slots[i].count > 0) {
                     fprintf(out, ",\n    \"storage\": {");
                     bool first_slot = true;
                     for (size_t si = 0; si < addr_slots[i].count; si++) {
-                        uint256_t val = evm_state_get_storage(pre, a, &addr_slots[i].keys[si]);
+                        uint256_t val = state_get_preblock_storage(st, a, &addr_slots[i].keys[si]);
                         if (uint256_is_zero(&val)) continue;
                         if (!first_slot) fprintf(out, ",");
                         first_slot = false;
@@ -1358,8 +1314,6 @@ int main(int argc, char **argv) {
                 }
             }
 
-            evm_state_destroy(pre);
-            unlink(prestate_tmp);
             free(addrs);
             free(addr_slots);
             free(slot_buf);

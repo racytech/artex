@@ -175,6 +175,9 @@ void sync_set_live_mode(sync_t *sync, bool live);
 /** Get the EVM state instance owned by the sync engine. */
 struct evm_state *sync_get_state(const sync_t *sync);
 
+/** Get the EVM instance owned by the sync engine. */
+struct evm *sync_get_evm(const sync_t *sync);
+
 // ============================================================================
 // Query
 // ============================================================================

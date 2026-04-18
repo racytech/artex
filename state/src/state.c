@@ -1494,6 +1494,46 @@ void state_invalidate_all(state_t *s) {
     }
 }
 
+/* =========================================================================
+ * Pre-block value queries (for dump-prestate without temp file)
+ *
+ * After block execution with keep_undo=true, blk_orig_acct/blk_orig_stor
+ * contain pre-block values for modified accounts/slots.
+ * For unmodified accounts, the current state IS the pre-block state.
+ * ========================================================================= */
+
+bool state_get_preblock_account(const state_t *s, const address_t *addr,
+                                uint64_t *nonce, uint256_t *balance) {
+    if (!s || !addr) return false;
+    const acct_snapshot_t *snap = (const acct_snapshot_t *)
+        mem_art_get(&((state_t *)s)->blk_orig_acct, addr->bytes, 20, NULL);
+    if (snap) {
+        if (nonce) *nonce = snap->nonce;
+        if (balance) *balance = snap->balance;
+        return true;
+    }
+    /* Not modified this block — current state is pre-block state */
+    const account_t *a = find_account(s, addr->bytes);
+    if (!a) { if (nonce) *nonce = 0; if (balance) *balance = UINT256_ZERO; return false; }
+    if (nonce) *nonce = a->nonce;
+    if (balance) *balance = a->balance;
+    return true;
+}
+
+uint256_t state_get_preblock_storage(const state_t *s, const address_t *addr,
+                                      const uint256_t *key) {
+    if (!s || !addr || !key) return UINT256_ZERO;
+    uint8_t skey[SLOT_KEY_SIZE];
+    make_slot_key(addr, key, skey);
+    size_t vlen = 0;
+    const uint256_t *orig = (const uint256_t *)
+        mem_art_get(&((state_t *)s)->blk_orig_stor, skey, SLOT_KEY_SIZE, &vlen);
+    if (orig && vlen == sizeof(uint256_t))
+        return *orig;
+    /* Not modified this block — current state is pre-block state */
+    return state_get_storage((state_t *)s, addr, key);
+}
+
 /**
  * Compute Merkle root. Requires state_finalize_block() was called for
  * every block since the last root computation.
