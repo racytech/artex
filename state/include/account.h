@@ -33,10 +33,21 @@
  * account_t — compact, every account (80 bytes)
  * ========================================================================= */
 
+/* TODO(perf): reuse last_access_block's 8B slot for an inline storage hart
+ * root ref. last_access_block is dead — only written (state.c:460, 490) for
+ * an eviction scheme that was removed (OS swap handles cold pages now).
+ * Repurposing it saves one indirection on SLOAD:
+ *   before: accounts[] → resources[resource_idx] → r.storage.root_ref
+ *   after:  accounts[] → a.storage_root_ref
+ * Combined with per-account slabs in storage_hart pool (see
+ * docs/storage_hart_pool_design.md), turns a cold SLOAD from ~3 page faults
+ * into ~1. Zero size cost — account_t stays 80B. Requires keeping
+ * a.storage_root_ref and r.storage.root_ref in sync — single write site, add
+ * invariant assert. */
 typedef struct {
     uint256_t balance;          /* 32 bytes — 16-byte aligned, first */
     uint64_t  nonce;            /*  8 bytes */
-    uint64_t  last_access_block;/*  8 bytes */
+    uint64_t  last_access_block;/*  8 bytes — DEAD, see TODO above */
     address_t addr;             /* 20 bytes */
     uint16_t  flags;            /*  2 bytes */
     uint32_t  resource_idx;     /*  4 bytes — index into resource_t[], 0=none */

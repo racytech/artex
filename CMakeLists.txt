@@ -400,6 +400,12 @@ add_library(storage_hart STATIC database/src/storage_hart.c)
 target_include_directories(storage_hart PUBLIC ${CMAKE_SOURCE_DIR}/database/include ${CMAKE_SOURCE_DIR}/common/include)
 target_link_libraries(storage_hart common)
 
+add_library(hart_pool STATIC database/src/hart_pool.c)
+target_include_directories(hart_pool PUBLIC ${CMAKE_SOURCE_DIR}/database/include)
+
+add_executable(test_hart_pool database/tests/test_hart_pool.c)
+target_link_libraries(test_hart_pool hart_pool)
+
 add_executable(test_hashed_art database/tests/test_hashed_art.c)
 target_link_libraries(test_hashed_art hashed_art mem_mpt common)
 
