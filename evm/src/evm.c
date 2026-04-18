@@ -212,9 +212,15 @@ void evm_set_block_env(evm_t *evm, const evm_block_env_t *block)
     // Recompute fork based on new block number/timestamp
     evm->fork = fork_get_active(block->number, block->timestamp, evm->chain_config);
 
-    // EIP-4844: compute blob base fee from excess blob gas
+    // EIP-4844: compute blob base fee from excess blob gas (BPO-aware)
     if (evm->fork >= FORK_CANCUN) {
-        evm->block.blob_base_fee = calc_blob_gas_price(&block->excess_blob_gas, evm->fork);
+        const blob_config_t *bcfg = blob_config_active(block->timestamp, evm->chain_config);
+        if (bcfg) {
+            evm->block.blob_base_fee = calc_blob_gas_price_ex(&block->excess_blob_gas,
+                                                               bcfg->update_fraction);
+        } else {
+            evm->block.blob_base_fee = calc_blob_gas_price(&block->excess_blob_gas, evm->fork);
+        }
     }
 }
 

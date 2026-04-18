@@ -90,6 +90,19 @@ extern "C"
     } fork_schedule_t;
 
     /**
+     * Blob parameter override (BPO) — sub-fork blob config.
+     * Fusaka introduces progressive blob count increases via BPO timestamps.
+     */
+    typedef struct {
+        uint64_t target;           // target blobs per block
+        uint64_t max;              // max blobs per block
+        uint64_t update_fraction;  // blob base fee update fraction
+        uint64_t timestamp;        // activation timestamp (UINT64_MAX = disabled)
+    } blob_config_t;
+
+    #define MAX_BPO_ENTRIES 4
+
+    /**
      * Chain-specific configuration
      */
     typedef struct
@@ -97,6 +110,12 @@ extern "C"
         uint64_t chain_id;           // Chain ID (1 for mainnet)
         fork_schedule_t fork_blocks; // Fork activation blocks
         const char *name;            // Chain name (e.g., "mainnet")
+
+        /* Blob parameter schedule (Cancun base + BPO overrides) */
+        blob_config_t blob_cancun;   // Cancun defaults
+        blob_config_t blob_prague;   // Prague defaults
+        blob_config_t blob_bpo[MAX_BPO_ENTRIES]; // BPO overrides (Fusaka+)
+        int blob_bpo_count;
     } chain_config_t;
 
     //==============================================================================
@@ -135,6 +154,12 @@ extern "C"
      * @return Block number when fork activates, UINT64_MAX if never
      */
     uint64_t fork_get_activation_block(const chain_config_t *config, evm_fork_t fork);
+
+    /**
+     * Get active blob config for a given timestamp and chain config.
+     * Returns the BPO override if active, otherwise Prague/Cancun defaults.
+     */
+    const blob_config_t *blob_config_active(uint64_t timestamp, const chain_config_t *config);
 
     //==============================================================================
     // Predefined Chain Configurations

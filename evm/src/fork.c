@@ -70,7 +70,15 @@ static const chain_config_t mainnet_config = {
         .prague = 1746612311,   // Timestamp: May 7, 2025 (Pectra)
         .osaka = 1764798551,    // Timestamp: Dec 3, 2025 (Fusaka)
         .verkle = UINT64_MAX,
-    }};
+    },
+    .blob_cancun = { .target = 3, .max = 6, .update_fraction = 3338477, .timestamp = 0 },
+    .blob_prague = { .target = 6, .max = 9, .update_fraction = 5007716, .timestamp = 0 },
+    .blob_bpo = {
+        { .target = 10, .max = 15, .update_fraction = 8346193,  .timestamp = 1765290071 }, // BPO1
+        { .target = 14, .max = 21, .update_fraction = 11684671, .timestamp = 1767747671 }, // BPO2
+    },
+    .blob_bpo_count = 2,
+};
 
 const chain_config_t *chain_config_mainnet(void)
 {
@@ -214,6 +222,11 @@ chain_config_t *chain_config_create(uint64_t chain_id, const char *name)
     config->fork_blocks.prague = UINT64_MAX;
     config->fork_blocks.osaka = UINT64_MAX;
     config->fork_blocks.verkle = UINT64_MAX;
+
+    /* Initialize blob configs with defaults (no BPO overrides for test chains) */
+    config->blob_cancun = (blob_config_t){ .target = 3, .max = 6, .update_fraction = 3338477, .timestamp = 0 };
+    config->blob_prague = (blob_config_t){ .target = 6, .max = 9, .update_fraction = 5007716, .timestamp = 0 };
+    config->blob_bpo_count = 0;
 
     return config;
 }
@@ -411,4 +424,28 @@ bool fork_has_mcopy(evm_fork_t fork)
 bool fork_has_access_lists(evm_fork_t fork)
 {
     return fork >= FORK_BERLIN;
+}
+
+const blob_config_t *blob_config_active(uint64_t timestamp, const chain_config_t *config) {
+    if (!config) return NULL;
+
+    /* Check BPO overrides in reverse order (latest first) */
+    for (int i = config->blob_bpo_count - 1; i >= 0; i--) {
+        if (config->blob_bpo[i].timestamp != UINT64_MAX &&
+            config->blob_bpo[i].update_fraction != 0 &&
+            timestamp >= config->blob_bpo[i].timestamp) {
+            return &config->blob_bpo[i];
+        }
+    }
+
+    /* Fall back to Prague or Cancun defaults (only if initialized) */
+    if (config->blob_prague.update_fraction != 0 &&
+        config->fork_blocks.prague != UINT64_MAX &&
+        timestamp >= config->fork_blocks.prague)
+        return &config->blob_prague;
+
+    if (config->blob_cancun.update_fraction != 0)
+        return &config->blob_cancun;
+
+    return NULL; /* no blob config — caller uses fork-based defaults */
 }

@@ -197,6 +197,8 @@ uint256_t transaction_effective_gas_price(
  * @return Blob base fee
  */
 uint256_t calc_blob_gas_price(const uint256_t *excess_blob_gas, evm_fork_t fork);
+uint256_t calc_blob_gas_price_ex(const uint256_t *excess_blob_gas,
+                                  uint64_t update_fraction);
 
 /**
  * Free transaction result resources
