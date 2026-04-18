@@ -288,6 +288,13 @@ target_include_directories(bench_hart_scale PRIVATE
 )
 target_link_libraries(bench_hart_scale hashed_art common)
 
+add_executable(bench_storage_hart_scale database/tests/bench_storage_hart_scale.c)
+target_include_directories(bench_storage_hart_scale PRIVATE
+    ${CMAKE_SOURCE_DIR}/database/include
+    ${CMAKE_SOURCE_DIR}/common/include
+)
+target_link_libraries(bench_storage_hart_scale storage_hart common)
+
 add_executable(test_pool_alloc database/tests/test_pool_alloc.c)
 target_include_directories(test_pool_alloc PRIVATE
     ${CMAKE_SOURCE_DIR}/database/include
