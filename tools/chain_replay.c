@@ -1028,8 +1028,9 @@ int main(int argc, char **argv) {
             LOG_INFO("No more blocks at %lu (era1 + era exhausted)", bn);
 
             /* Save state snapshot before exiting */
-            uint64_t last_block = bn - 1;
-            if (last_block > 0) {
+            sync_status_t exit_st = sync_get_status(sync);
+            uint64_t last_block = exit_st.last_block;
+            if (last_block > 0 && exit_st.blocks_fail == 0) {
                 char save_path[512];
                 snprintf(save_path, sizeof(save_path), "%s/state_%lu.bin",
                          data_dir, last_block);
