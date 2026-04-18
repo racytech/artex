@@ -281,6 +281,13 @@ target_include_directories(test_hart_parallel PRIVATE
 )
 target_link_libraries(test_hart_parallel hashed_art mem_mpt common pthread)
 
+add_executable(bench_hart_scale database/tests/bench_hart_scale.c)
+target_include_directories(bench_hart_scale PRIVATE
+    ${CMAKE_SOURCE_DIR}/database/include
+    ${CMAKE_SOURCE_DIR}/common/include
+)
+target_link_libraries(bench_hart_scale hashed_art common)
+
 add_executable(test_pool_alloc database/tests/test_pool_alloc.c)
 target_include_directories(test_pool_alloc PRIVATE
     ${CMAKE_SOURCE_DIR}/database/include

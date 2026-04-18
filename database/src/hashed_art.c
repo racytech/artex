@@ -9,10 +9,12 @@
  *   - MPT root hash computed directly — no separate art_mpt + cache
  */
 
+#define _GNU_SOURCE  /* mremap */
 #include "hashed_art.h"
 #include "hash.h"
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <immintrin.h>
 
 /* =========================================================================
@@ -108,8 +110,8 @@ static hart_ref_t arena_alloc(hart_t *t, size_t bytes, bool is_leaf) {
     if (aligned + bytes > t->arena_cap) {
         size_t nc = t->arena_cap ? t->arena_cap + t->arena_cap / 2 : 4096;
         while (aligned + bytes > nc) nc = nc + nc / 2;
-        uint8_t *na = realloc(t->arena, nc);
-        if (!na) return HART_REF_NULL;
+        uint8_t *na = mremap(t->arena, t->arena_cap, nc, MREMAP_MAYMOVE);
+        if (na == MAP_FAILED) return HART_REF_NULL;
         t->arena = na;
         t->arena_cap = nc;
     }
@@ -1122,9 +1124,10 @@ bool hart_init(hart_t *t, uint16_t value_size) {
 bool hart_init_cap(hart_t *t, uint16_t value_size, size_t initial_cap) {
     memset(t, 0, sizeof(*t));
     t->value_size = value_size;
-    if (initial_cap < 256) initial_cap = 256;
-    t->arena = malloc(initial_cap);
-    if (!t->arena) return false;
+    if (initial_cap < 4096) initial_cap = 4096;  /* minimum 1 page */
+    t->arena = mmap(NULL, initial_cap, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (t->arena == MAP_FAILED) { t->arena = NULL; return false; }
     t->arena_cap = initial_cap;
     t->arena_used = 16;
     return true;
@@ -1132,12 +1135,12 @@ bool hart_init_cap(hart_t *t, uint16_t value_size, size_t initial_cap) {
 
 size_t hart_trim(hart_t *t) {
     if (!t || !t->arena || t->arena_used >= t->arena_cap) return 0;
-    /* Don't shrink below 256 or below used+25% headroom */
+    /* Don't shrink below 4096 or below used+25% headroom */
     size_t target = t->arena_used + t->arena_used / 4;
-    if (target < 256) target = 256;
+    if (target < 4096) target = 4096;
     if (target >= t->arena_cap) return 0;
-    uint8_t *na = realloc(t->arena, target);
-    if (!na) return 0;
+    uint8_t *na = mremap(t->arena, t->arena_cap, target, MREMAP_MAYMOVE);
+    if (na == MAP_FAILED) return 0;
     size_t freed = t->arena_cap - target;
     t->arena = na;
     t->arena_cap = target;
@@ -1146,7 +1149,8 @@ size_t hart_trim(hart_t *t) {
 
 void hart_destroy(hart_t *t) {
     if (!t) return;
-    free(t->arena);
+    if (t->arena && t->arena_cap > 0)
+        munmap(t->arena, t->arena_cap);
     memset(t, 0, sizeof(*t));
 }
 
