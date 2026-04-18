@@ -1026,6 +1026,27 @@ int main(int argc, char **argv) {
         prefetched_block_t blk;
         if (!prefetch_get(&prefetch, &blk)) {
             LOG_INFO("No more blocks at %lu (era1 + era exhausted)", bn);
+
+            /* Save state snapshot before exiting */
+            uint64_t last_block = bn - 1;
+            if (last_block > 0) {
+                char save_path[512];
+                snprintf(save_path, sizeof(save_path), "%s/state_%lu.bin",
+                         data_dir, last_block);
+                LOG_INFO("Saving state snapshot to %s ...", save_path);
+                evm_state_t *es = sync_get_state(sync);
+                state_t *st = evm_state_get_state(es);
+                bool prune = (last_block >= 2675000);
+                evm_state_invalidate_all(es);
+                hash_t root = evm_state_compute_mpt_root(es, prune);
+                if (state_save(st, save_path, &root)) {
+                    char hex[67];
+                    hash_to_hex(&root, hex);
+                    LOG_INFO("State saved: block %lu, root %s", last_block, hex);
+                } else {
+                    LOG_ERROR("Failed to save state to %s", save_path);
+                }
+            }
             break;
         }
 
