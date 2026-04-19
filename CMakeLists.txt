@@ -138,7 +138,7 @@ target_include_directories(state PUBLIC
     ${CMAKE_SOURCE_DIR}/database/include
     ${CMAKE_SOURCE_DIR}/evm/include
 )
-target_link_libraries(state art_database hashed_art storage_hart code_store common)
+target_link_libraries(state art_database hashed_art storage_hart2 hart_pool code_store common)
 
 # EVM (Ethereum Virtual Machine)
 add_library(evm STATIC
@@ -405,6 +405,13 @@ target_include_directories(hart_pool PUBLIC ${CMAKE_SOURCE_DIR}/database/include
 
 add_executable(test_hart_pool database/tests/test_hart_pool.c)
 target_link_libraries(test_hart_pool hart_pool)
+
+add_library(storage_hart2 STATIC database/src/storage_hart2.c)
+target_include_directories(storage_hart2 PUBLIC
+    ${CMAKE_SOURCE_DIR}/database/include
+    ${CMAKE_SOURCE_DIR}/common/include
+)
+target_link_libraries(storage_hart2 hart_pool common)
 
 add_executable(test_hashed_art database/tests/test_hashed_art.c)
 target_link_libraries(test_hashed_art hashed_art mem_mpt common)

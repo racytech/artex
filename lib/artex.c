@@ -19,7 +19,7 @@
 #include "uint256.h"
 #include "address.h"
 #include "code_store.h"
-#include "storage_hart.h"
+#include "storage_hart2.h"
 
 #include <cjson/cJSON.h>
 #include <stdlib.h>
@@ -732,12 +732,12 @@ rx_stats_t rx_get_stats(const rx_engine_t *engine) {
     st.total_tracked     = ss.total_tracked;
 
     /* Storage pool stats */
-    storage_hart_pool_t *pool = state_get_storage_pool(s);
+    hart_pool_t *pool = state_get_storage_pool(s);
     if (pool) {
-        storage_hart_pool_stats_t ps = storage_hart_pool_stats(pool);
-        st.pool_data_size  = ps.data_size;
+        hart_pool_stats_t ps = hart_pool_stats(pool);
+        st.pool_data_size  = ps.used;
         st.pool_free_bytes = ps.free_bytes;
-        st.pool_file_size  = ps.file_size;
+        st.pool_file_size  = ps.mapped;  /* anonymous — mapped virtual bytes */
     }
 
     /* Code store stats */

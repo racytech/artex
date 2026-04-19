@@ -14,7 +14,7 @@
 #include "uint256.h"
 #include "hash.h"
 #include "address.h"
-#include "storage_hart.h"
+#include "storage_hart2.h"
 #include <stdint.h>
 
 /* =========================================================================

@@ -10,7 +10,7 @@
 #include "state.h"
 #include "code_store.h"
 #include "hashed_art.h"
-#include "storage_hart.h"
+#include "storage_hart2.h"
 #include "keccak256.h"
 #include "logger.h"
 
@@ -315,9 +315,8 @@ struct state {
     uint8_t *stor_dirty_bits;
     uint32_t stor_dirty_cap;     /* capacity in bits (>= res_capacity) */
 
-    /* Storage pool — mmap-backed per-account ART trie */
-    storage_hart_pool_t *stor_pool;
-    char                 stor_pool_path[512];
+    /* Storage pool — hart_pool slab allocator (MAP_ANONYMOUS) */
+    hart_pool_t *stor_pool;
 
     /* dump-prestate support: preserved dirty list + slot key tracking */
     dirty_vec_t last_dirty;       /* blk_dirty from last compute_root (addr[20]) */
@@ -624,11 +623,8 @@ state_t *state_create(code_store_t *cs) {
     s->stor_dirty_bits = calloc((1024 + 7) / 8, 1);
     if (!s->stor_dirty_bits) { vec_free(s->resources, 1024 * sizeof(resource_t)); free(s->journal); vec_free(s->accounts, ACCT_INIT_CAP * sizeof(account_t)); free(s); return NULL; }
 
-    /* Default storage pool on tmpfs — replaced by state_set_storage_path if called */
-    char tmp[64];
-    snprintf(tmp, sizeof(tmp), "/dev/shm/artex_stor_%d.dat", (int)getpid());
-    s->stor_pool = storage_hart_pool_create(tmp);
-    snprintf(s->stor_pool_path, sizeof(s->stor_pool_path), "%s", tmp);
+    /* Storage pool — anonymous mmap, slabs per account. No file. */
+    s->stor_pool = hart_pool_create();
 
     return s;
 }
@@ -676,11 +672,7 @@ void state_destroy(state_t *s) {
     dirty_free(&s->accessed_slots);
 
     if (s->stor_pool) {
-        storage_hart_pool_sync(s->stor_pool);
-        storage_hart_pool_destroy(s->stor_pool);
-        /* Remove temp pool file if it's on /dev/shm */
-        if (strncmp(s->stor_pool_path, "/dev/shm/", 9) == 0)
-            unlink(s->stor_pool_path);
+        hart_pool_destroy(s->stor_pool);
     }
     free(s);
 }
@@ -1454,7 +1446,7 @@ void state_clear_prestate_dirty(state_t *s) {
  * Stats
  * ========================================================================= */
 
-storage_hart_pool_t *state_get_storage_pool(const state_t *s) {
+hart_pool_t *state_get_storage_pool(const state_t *s) {
     return s ? s->stor_pool : NULL;
 }
 
@@ -2198,16 +2190,10 @@ void state_compact(state_t *s) {
  * ========================================================================= */
 
 void state_set_storage_path(state_t *s, const char *dir) {
-    if (!s || !dir) return;
-    if (s->stor_pool) {
-        storage_hart_pool_destroy(s->stor_pool);
-        s->stor_pool = NULL;
-    }
-    snprintf(s->stor_pool_path, sizeof(s->stor_pool_path),
-             "%s/storage_pool.dat", dir);
-    s->stor_pool = storage_hart_pool_open(s->stor_pool_path);
-    if (!s->stor_pool)
-        s->stor_pool = storage_hart_pool_create(s->stor_pool_path);
+    /* hart_pool is MAP_ANONYMOUS — no backing file, no path needed.
+     * Kept as a no-op for API compatibility; the `dir` argument is now
+     * only informational. */
+    (void)s; (void)dir;
 }
 
 /* =========================================================================
@@ -2410,7 +2396,7 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
             fprintf(stderr, "  state_load: %u/%u accounts...\n", i + 1, acct_count);
     }
 
-    if (s->stor_pool) storage_hart_pool_sync(s->stor_pool);
+    /* hart_pool is MAP_ANONYMOUS — nothing to sync to disk. */
 
     /* Grow bitmap to cover all loaded resources, then mark dirty —
      * storage roots need recomputation from storage harts at next compute_root */

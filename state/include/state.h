@@ -185,7 +185,7 @@ struct block_diff_t;
 void     state_collect_block_diff(state_t *s, struct block_diff_t *out);
 
 /** Get storage pool handle (for stats). */
-storage_hart_pool_t *state_get_storage_pool(const state_t *s);
+hart_pool_t *state_get_storage_pool(const state_t *s);
 
 /* =========================================================================
  * Stats
