@@ -108,8 +108,25 @@ static hart_ref_t arena_alloc(hart_t *t, size_t bytes, bool is_leaf) {
 
     size_t aligned = (t->arena_used + 15) & ~(size_t)15;
     if (aligned + bytes > t->arena_cap) {
-        size_t nc = t->arena_cap ? t->arena_cap + t->arena_cap / 2 : 4096;
-        while (aligned + bytes > nc) nc = nc + nc / 2;
+        /* Grow: 1.5x while small, cap at +4 GB once large. Prevents
+         * multi-GB spikes at mainnet scale (the ~28 → 42 GB 1.5x jump
+         * that would stall execution during memory pressure). */
+        #define HART_ARENA_LINEAR_STEP (4ULL << 30)
+        size_t nc;
+        if (t->arena_cap == 0) {
+            nc = 4096;
+        } else {
+            size_t delta_exp = t->arena_cap / 2;
+            size_t delta = delta_exp < HART_ARENA_LINEAR_STEP
+                           ? delta_exp : HART_ARENA_LINEAR_STEP;
+            nc = t->arena_cap + delta;
+        }
+        while (aligned + bytes > nc) {
+            size_t delta_exp = nc / 2;
+            size_t delta = delta_exp < HART_ARENA_LINEAR_STEP
+                           ? delta_exp : HART_ARENA_LINEAR_STEP;
+            nc += delta;
+        }
         uint8_t *na = mremap(t->arena, t->arena_cap, nc, MREMAP_MAYMOVE);
         if (na == MAP_FAILED) return HART_REF_NULL;
         t->arena = na;

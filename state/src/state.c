@@ -94,6 +94,17 @@ static void vec_free(void *p, size_t bytes) {
     if (p) munmap(p, bytes);
 }
 
+/* Capped-exponential grow delta: use 1.5x while small, cap at +4 GB worth
+ * of items once the vector is large. Prevents 10+ GB spikes under memory
+ * pressure (the 26→40 GB jump observed in v1 at mainnet scale). */
+#define STATE_VEC_LINEAR_STEP (4ULL << 30)  /* 4 GB */
+
+static inline uint32_t vec_grow_delta(uint32_t cur_cap, size_t item_size) {
+    uint32_t delta_exp = cur_cap / 2;  /* 1.5x delta */
+    uint32_t delta_max = (uint32_t)(STATE_VEC_LINEAR_STEP / item_size);
+    return delta_exp < delta_max ? delta_exp : delta_max;
+}
+
 /* =========================================================================
  * RLP helpers (for account trie encoding)
  * ========================================================================= */
@@ -426,7 +437,7 @@ static resource_t *ensure_resource(state_t *s, account_t *a) {
         ridx = s->res_free[--s->res_free_count];
     } else {
         if (s->res_count >= s->res_capacity) {
-            uint32_t nc = s->res_capacity + s->res_capacity / 2;  /* 1.5x growth */
+            uint32_t nc = s->res_capacity + vec_grow_delta(s->res_capacity, sizeof(resource_t));
             if (nc < 1024) nc = 1024;
             size_t old_bytes = (size_t)s->res_capacity * sizeof(resource_t);
             size_t new_bytes = (size_t)nc * sizeof(resource_t);
@@ -466,7 +477,7 @@ static account_t *ensure_account_h(state_t *s, const address_t *addr,
         idx = s->acct_free[--s->acct_free_count];
     } else {
         if (s->count >= s->capacity) {
-            uint32_t nc = s->capacity + s->capacity / 2;  /* 1.5x growth */
+            uint32_t nc = s->capacity + vec_grow_delta(s->capacity, sizeof(account_t));
             if (nc < ACCT_INIT_CAP) nc = ACCT_INIT_CAP;
             size_t old_bytes = (size_t)s->capacity * sizeof(account_t);
             size_t new_bytes = (size_t)nc * sizeof(account_t);
@@ -2327,7 +2338,7 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
 
         /* Grow accounts vector if needed */
         if (s->count >= s->capacity) {
-            uint32_t nc = s->capacity + s->capacity / 2;
+            uint32_t nc = s->capacity + vec_grow_delta(s->capacity, sizeof(account_t));
             size_t old_bytes = (size_t)s->capacity * sizeof(account_t);
             size_t new_bytes = (size_t)nc * sizeof(account_t);
             account_t *na = vec_grow(s->accounts, old_bytes, new_bytes);
@@ -2356,7 +2367,7 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
         if (has_code || has_stor) {
             /* Allocate resource */
             if (s->res_count >= s->res_capacity) {
-                uint32_t nc = s->res_capacity + s->res_capacity / 2;
+                uint32_t nc = s->res_capacity + vec_grow_delta(s->res_capacity, sizeof(resource_t));
                 size_t old_bytes = (size_t)s->res_capacity * sizeof(resource_t);
                 size_t new_bytes = (size_t)nc * sizeof(resource_t);
                 resource_t *nr = vec_grow(s->resources, old_bytes, new_bytes);
