@@ -2232,6 +2232,19 @@ static bool read_all(FILE *f, void *buf, size_t n) {
     return fread(buf, 1, n, f) == n;
 }
 
+/* TODO(api): persist the last-256-block-hash ring here (BLOCK_HASH_WINDOW).
+ * Currently the ring lives at the engine/sync layer (lib/artex.c,
+ * sync/src/sync.c) and is written to a separate <path>.hashes sidecar
+ * when rx_engine_save_state is called — but chain_replay's state_save
+ * path writes only this file, not the sidecar. As a result, snapshots
+ * produced by chain_replay need tools/make_hashes.py to regenerate the
+ * .hashes file from era data before rx_engine_load_state can use them
+ * correctly (otherwise BLOCKHASH returns zero for the last 256 blocks).
+ *
+ * Folding the ring into the main snapshot would remove the sidecar
+ * entirely: either extend the ART1 header to carry 256 hashes, or append
+ * them after the account/storage payload with a trailing magic.
+ * Matching change goes in state_load below. */
 bool state_save(const state_t *s, const char *path, const hash_t *state_root) {
     if (!s || !path) return false;
     FILE *f = fopen(path, "wb");
@@ -2291,6 +2304,8 @@ fail:
     return false;
 }
 
+/* TODO(api): read block-hash ring here once state_save writes it.
+ * See the TODO on state_save above. */
 bool state_load(state_t *s, const char *path, hash_t *out_root) {
     if (!s || !path) return false;
     FILE *f = fopen(path, "rb");

@@ -324,14 +324,59 @@ bool rx_engine_load_state(rx_engine_t *engine, const char *path) {
 
     engine->last_block = state_get_block(st);
 
-    /* Load block hash ring from .hashes file if present */
+    /* Verify snapshot integrity: recompute the MPT root from the loaded
+     * state and compare against the root stored in the file header.
+     * Catches corruption, bit rot, truncation, and any save/load bug
+     * at load time rather than during later execution. Cost is one
+     * full MPT walk (seconds to tens of seconds for mainnet-scale
+     * state), done once. */
+    fprintf(stderr, "recomputing state root on state load (block %lu)...\n",
+            engine->last_block);
+    evm_state_invalidate_all(engine->state);
+    bool prune = (engine->last_block >= 2675000); /* post-EIP-161 */
+    hash_t recomputed = evm_state_compute_mpt_root(engine->state, prune);
+    if (memcmp(recomputed.bytes, loaded_root.bytes, 32) != 0) {
+        char got[67], exp[67];
+        hash_to_hex(&recomputed, got);
+        hash_to_hex(&loaded_root, exp);
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "root mismatch at block %lu: computed %s vs header %s",
+                 engine->last_block, got, exp);
+        engine_set_error(engine, RX_ERR_PARSE, msg);
+        engine_log(engine, RX_LOG_ERROR, msg);
+        return false;
+    }
+
+    /* Load block hash ring from the mandatory .hashes sidecar.
+     * A snapshot without .hashes cannot safely execute new blocks —
+     * the BLOCKHASH opcode would return zero for anything in the
+     * last-256 window and silently corrupt any contract that depends
+     * on it. We refuse to load rather than set a trap. Generate with
+     * tools/make_hashes.py if the file is missing. */
     char hashes_path[1024];
     snprintf(hashes_path, sizeof(hashes_path), "%s.hashes", path);
     FILE *hf = fopen(hashes_path, "rb");
-    if (hf) {
-        size_t nr = fread(engine->block_hashes, 32, BLOCK_HASH_WINDOW, hf);
-        (void)nr;
-        fclose(hf);
+    if (!hf) {
+        char msg[1280];
+        snprintf(msg, sizeof(msg),
+                 "missing %s — a .hashes sidecar is required "
+                 "(use tools/make_hashes.py to generate one from era files)",
+                 hashes_path);
+        engine_set_error(engine, RX_ERR_FILE_IO, msg);
+        engine_log(engine, RX_LOG_ERROR, msg);
+        return false;
+    }
+    size_t nr = fread(engine->block_hashes, 32, BLOCK_HASH_WINDOW, hf);
+    fclose(hf);
+    if (nr != BLOCK_HASH_WINDOW) {
+        char msg[1280];
+        snprintf(msg, sizeof(msg),
+                 "short read on %s: got %zu/%u hashes (file corrupted?)",
+                 hashes_path, nr, BLOCK_HASH_WINDOW);
+        engine_set_error(engine, RX_ERR_FILE_IO, msg);
+        engine_log(engine, RX_LOG_ERROR, msg);
+        return false;
     }
 
     engine->initialized = true;
