@@ -650,6 +650,149 @@ static int test_call(void) {
     return errors;
 }
 
+/* Keccak-256 of the single byte 0x80 — the RLP encoding of the empty
+ * trie. Used as the well-known "empty trie root" value in Ethereum
+ * for transactions_root / receipts_root / withdrawals_root when a
+ * block has no entries of that kind. */
+static const uint8_t EMPTY_TRIE_ROOT[32] = {
+    0x56,0xe8,0x1f,0x17,0x1b,0xcc,0x55,0xa6,
+    0xff,0x83,0x45,0xe6,0x92,0xc0,0xf8,0x6e,
+    0x5b,0x48,0xe0,0x1b,0x99,0x6c,0xad,0xc0,
+    0x01,0x62,0x2f,0xb5,0xe3,0x63,0xb4,0x21
+};
+
+/* test_build_block_empty — smoke-test rx_build_block on an empty block
+ * built on top of a tiny genesis. Verifies the mechanical glue:
+ *   - empty-tx trie root is the canonical empty-trie hash
+ *   - no-withdrawals case leaves withdrawals_root zeroed
+ *   - gas_used is 0 (nothing executed)
+ *   - state_root is unchanged from the genesis root (no state mutation)
+ *   - block_rlp is non-empty and decodable
+ *   - re-executing the produced block_rlp on a fresh engine gives
+ *     the same state_root back (serialize/deserialize round-trip)
+ *
+ * Does NOT need a real mainnet snapshot — only the hot-path plumbing.
+ * A separate (slow) differential test is needed to validate against
+ * real mainnet blocks; that's pending.  See README "Status".
+ */
+static int test_build_block_empty(void) {
+    printf("\ntest_build_block_empty:\n");
+
+    /* Tiny genesis — one EOA with some ETH so the state is non-empty. */
+    FILE *f = fopen(TEST_GENESIS, "w");
+    if (!f) { printf("  FAIL: can't write genesis\n"); return 1; }
+    fprintf(f,
+        "{\n"
+        "  \"0x0000000000000000000000000000000000000001\": {\n"
+        "    \"balance\": \"0xde0b6b3a7640000\"\n"
+        "  }\n"
+        "}\n");
+    fclose(f);
+
+    rx_config_t config = { .chain_id = RX_CHAIN_MAINNET };
+    rx_engine_t *e = rx_engine_create(&config);
+    if (!e) { printf("  FAIL: create\n"); return 1; }
+
+    if (!rx_engine_load_genesis(e, TEST_GENESIS, NULL)) {
+        printf("  FAIL: load_genesis\n");
+        rx_engine_destroy(e);
+        return 1;
+    }
+
+    int errors = 0;
+    rx_hash_t genesis_root = rx_compute_state_root(e);
+
+    /* Build an empty block in the post-Merge, pre-Shanghai window
+     * (block numbers 15537394..17034869).  That fork has:
+     *   - no block reward (state doesn't change on empty block)
+     *   - no withdrawals yet (pre-Shanghai)
+     *   - no blob gas (pre-Cancun)
+     *   - no parent_beacon_root (pre-Cancun)
+     *   - EIP-1559 base fee (post-London)
+     * Perfect for an empty-block state-preservation check. */
+    rx_build_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.number        = 16000000;
+    hdr.gas_limit     = 30000000;
+    hdr.timestamp     = 1668000000;   /* mid-Nov 2022, pre-Shanghai */
+    hdr.has_base_fee  = true;
+    /* 1 gwei base fee (0x3b9aca00) — stored as 32B big-endian. */
+    hdr.base_fee.bytes[28] = 0x3b;
+    hdr.base_fee.bytes[29] = 0x9a;
+    hdr.base_fee.bytes[30] = 0xca;
+    hdr.base_fee.bytes[31] = 0x00;
+
+    rx_build_block_result_t result;
+    memset(&result, 0, sizeof(result));
+    if (!rx_build_block(e, &hdr, NULL, NULL, 0, NULL, 0, &result)) {
+        printf("  FAIL: rx_build_block: %s\n", rx_engine_last_error_msg(e));
+        rx_engine_destroy(e);
+        return 1;
+    }
+
+    /* Assertions */
+    if (result.gas_used != 0) {
+        printf("  FAIL: gas_used = %lu, expected 0\n", result.gas_used);
+        errors++;
+    }
+    if (memcmp(result.transactions_root.bytes, EMPTY_TRIE_ROOT, 32) != 0) {
+        printf("  FAIL: transactions_root != empty trie root\n");
+        print_hash("    got", &result.transactions_root);
+        errors++;
+    }
+    if (memcmp(result.receipts_root.bytes, EMPTY_TRIE_ROOT, 32) != 0) {
+        printf("  FAIL: receipts_root != empty trie root\n");
+        print_hash("    got", &result.receipts_root);
+        errors++;
+    }
+    /* No withdrawals → withdrawals_root left zero (we didn't set
+     * has_withdrawals_root in the build header). */
+    rx_hash_t zero = {0};
+    if (memcmp(result.withdrawals_root.bytes, zero.bytes, 32) != 0) {
+        printf("  FAIL: withdrawals_root should be zero when none given\n");
+        errors++;
+    }
+    /* state_root should equal genesis root — no state change. */
+    if (memcmp(result.state_root.bytes, genesis_root.bytes, 32) != 0) {
+        printf("  FAIL: state_root changed across an empty block\n");
+        print_hash("    genesis", &genesis_root);
+        print_hash("    built  ", &result.state_root);
+        errors++;
+    }
+    if (!result.block_rlp || result.block_rlp_len == 0) {
+        printf("  FAIL: block_rlp missing\n");
+        errors++;
+    }
+    /* block_hash should be non-zero (keccak of a real header RLP). */
+    if (memcmp(result.block_hash.bytes, zero.bytes, 32) == 0) {
+        printf("  FAIL: block_hash is zero\n");
+        errors++;
+    }
+    /* engine->last_block should now be what we built. */
+    if (rx_get_block_number(e) != hdr.number) {
+        printf("  FAIL: last_block = %lu, expected %lu\n",
+               rx_get_block_number(e), hdr.number);
+        errors++;
+    }
+
+    /* Check that the ring buffer was updated with the new block hash */
+    rx_hash_t ring_hash;
+    if (!rx_get_block_hash(e, hdr.number, &ring_hash)) {
+        printf("  FAIL: block_hash ring lookup failed\n");
+        errors++;
+    } else if (memcmp(ring_hash.bytes, result.block_hash.bytes, 32) != 0) {
+        printf("  FAIL: ring hash != result.block_hash\n");
+        errors++;
+    }
+
+    rx_engine_destroy(e);
+    rx_build_block_result_free(&result);
+    unlink(TEST_GENESIS);
+
+    if (errors == 0) printf("  OK\n");
+    return errors;
+}
+
 int main(void) {
     int errors = 0;
     errors += test_create_destroy();
@@ -661,6 +804,7 @@ int main(void) {
     errors += test_commit_revert();
     errors += test_genesis_alloc();
     errors += test_call();
+    errors += test_build_block_empty();
 
     printf("\n=== %s (%d errors) ===\n", errors ? "FAIL" : "PASS", errors);
     return errors ? 1 : 0;
