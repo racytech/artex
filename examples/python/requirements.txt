@@ -1,0 +1,6 @@
+# Dependencies for artex Python examples.
+# Use with a virtualenv:
+#   python3 -m venv venv && source venv/bin/activate
+#   pip install -r requirements.txt
+
+python-snappy>=0.6   # decode era file block compression
