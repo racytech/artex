@@ -272,7 +272,7 @@ install(FILES ${CMAKE_BINARY_DIR}/artex.pc
 )
 
 add_executable(test_artex lib/test_artex.c)
-target_link_libraries(test_artex artex)
+target_link_libraries(test_artex artex ${CJSON_LIBRARIES})
 
 add_executable(test_hart_parallel database/tests/test_hart_parallel.c)
 target_include_directories(test_hart_parallel PRIVATE
