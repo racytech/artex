@@ -333,6 +333,103 @@ RX_API bool rx_execute_block(rx_engine_t *engine,
 RX_API rx_hash_t rx_compute_state_root(rx_engine_t *engine);
 
 /* ========================================================================
+ * Block production
+ *
+ * The library executes blocks — it does NOT select or order transactions.
+ * Callers bring a pool, pick txs, choose ordering; the library turns that
+ * plus a header template into a fully assembled block: computes tx_root,
+ * withdrawals_root, runs execution to fill state_root / receipts_root /
+ * logs_bloom / gas_used, finalizes the header RLP, and hashes it.
+ *
+ * Protocol-formula fields (base_fee, excess_blob_gas, etc.) are the
+ * caller's responsibility — they depend on parent-block context the
+ * caller already has. Pass them explicitly in rx_build_header_t.
+ * ======================================================================== */
+
+/** Header fields the caller supplies when building a block. Only fields
+ * the caller is allowed to choose or derive from parent context are here;
+ * the library fills state_root, tx_root, receipts_root, withdrawals_root,
+ * logs_bloom, and gas_used. */
+typedef struct {
+    rx_hash_t    parent_hash;       /* hash of block number-1 */
+    rx_address_t coinbase;          /* fee recipient */
+    uint64_t     number;            /* must equal engine->last_block + 1 */
+    uint64_t     gas_limit;         /* per EIP-1559/EIP-7825 constraints */
+    uint64_t     timestamp;         /* must be > parent.timestamp */
+    uint8_t      extra_data[32];
+    size_t       extra_data_len;
+    rx_hash_t    prev_randao;       /* mix_hash post-merge */
+
+    /* London+ — required post-London */
+    bool         has_base_fee;
+    rx_uint256_t base_fee;
+
+    /* Cancun+ — required post-Cancun */
+    bool         has_blob_gas;
+    uint64_t     blob_gas_used;
+    uint64_t     excess_blob_gas;
+    bool         has_parent_beacon_root;
+    rx_hash_t    parent_beacon_root;
+
+    /* Prague+ (EIP-7685) */
+    bool         has_requests_hash;
+    rx_hash_t    requests_hash;
+} rx_build_header_t;
+
+/** Result of a successful rx_build_block. Caller frees with
+ * rx_build_block_result_free. */
+typedef struct {
+    rx_hash_t    block_hash;         /* keccak256 of final encoded header */
+    rx_hash_t    state_root;
+    rx_hash_t    transactions_root;
+    rx_hash_t    receipts_root;
+    rx_hash_t    withdrawals_root;   /* zero if no withdrawals */
+    uint8_t      logs_bloom[256];
+    uint64_t     gas_used;
+    rx_receipt_t *receipts;          /* one per tx */
+    size_t       receipt_count;
+
+    /** Full block RLP = RLP([header, txs, uncles=[], withdrawals?]).
+     *  Ready to persist, broadcast, or feed back into rx_execute_block_rlp. */
+    uint8_t     *block_rlp;
+    size_t       block_rlp_len;
+} rx_build_block_result_t;
+
+/**
+ * Assemble and execute a block.
+ *
+ * Steps performed internally:
+ *   1. Compute transactions_root from the caller's tx list.
+ *   2. Compute withdrawals_root if any withdrawals are present.
+ *   3. Execute the block (all txs + withdrawals) with compute_root=true.
+ *   4. Fill state_root, receipts_root, logs_bloom, gas_used into the header.
+ *   5. RLP-encode the final header and hash it to produce block_hash.
+ *   6. Register block_hash in the BLOCKHASH ring buffer.
+ *   7. Serialize the full block RLP for the caller.
+ *
+ * After a successful call the state has been committed (as if
+ * rx_commit_block was called). To roll back, use rx_revert_block
+ * BEFORE calling rx_build_block again.
+ *
+ * Returns false on any error (execution failure, invalid input, OOM).
+ * On failure the engine's last_error is set and the state is reverted.
+ *
+ * Each transaction is raw bytes: legacy = RLP list, typed (EIP-2718) =
+ * type_byte || RLP(payload). The library handles both transparently.
+ */
+RX_API bool rx_build_block(rx_engine_t *engine,
+                           const rx_build_header_t *header_fields,
+                           const uint8_t *const *txs,
+                           const size_t *tx_lengths,
+                           size_t tx_count,
+                           const rx_withdrawal_t *withdrawals,
+                           size_t withdrawal_count,
+                           rx_build_block_result_t *result);
+
+/** Free receipts and block_rlp in a build-block result. */
+RX_API void rx_build_block_result_free(rx_build_block_result_t *result);
+
+/* ========================================================================
  * State queries
  * ======================================================================== */
 

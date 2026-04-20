@@ -655,6 +655,261 @@ rx_hash_t rx_compute_state_root(rx_engine_t *engine) {
 }
 
 /* ========================================================================
+ * Block production
+ * ======================================================================== */
+
+/** Convert public rx_build_header_t → internal block_header_t.
+ *  Leaves tx_root / state_root / receipts_root / withdrawals_root /
+ *  logs_bloom / gas_used zero — the build pipeline fills them. */
+static void fill_header_from_build(block_header_t *dst,
+                                   const rx_build_header_t *src) {
+    memset(dst, 0, sizeof(*dst));
+    memcpy(dst->parent_hash.bytes, src->parent_hash.bytes, 32);
+    /* uncle_hash is EMPTY_UNCLE_HASH = keccak256(rlp([])) post-merge.
+     * block_header_encode_rlp will still include whatever we set,
+     * so use the canonical empty-list hash: */
+    const uint8_t EMPTY_UNCLE[32] = {
+        0x1d,0xcc,0x4d,0xe8,0xde,0xc7,0x5d,0x7a,0xab,0x85,0xb5,0x67,
+        0xb6,0xcc,0xd4,0x1a,0xd3,0x12,0x45,0x1b,0x94,0x8a,0x74,0x13,
+        0xf0,0xa1,0x42,0xfd,0x40,0xd4,0x93,0x47
+    };
+    memcpy(dst->uncle_hash.bytes, EMPTY_UNCLE, 32);
+    memcpy(dst->coinbase.bytes, src->coinbase.bytes, 20);
+    dst->number = src->number;
+    dst->gas_limit = src->gas_limit;
+    dst->timestamp = src->timestamp;
+    memcpy(dst->extra_data, src->extra_data, 32);
+    dst->extra_data_len = src->extra_data_len;
+    memcpy(dst->mix_hash.bytes, src->prev_randao.bytes, 32);
+    dst->nonce = 0;
+    dst->difficulty = UINT256_ZERO;
+
+    dst->has_base_fee = src->has_base_fee;
+    if (src->has_base_fee)
+        dst->base_fee = uint256_from_bytes(src->base_fee.bytes, 32);
+
+    dst->has_blob_gas = src->has_blob_gas;
+    dst->blob_gas_used = src->blob_gas_used;
+    dst->excess_blob_gas = src->excess_blob_gas;
+
+    dst->has_parent_beacon_root = src->has_parent_beacon_root;
+    if (src->has_parent_beacon_root)
+        memcpy(dst->parent_beacon_root.bytes,
+               src->parent_beacon_root.bytes, 32);
+
+    dst->has_requests_hash = src->has_requests_hash;
+    if (src->has_requests_hash)
+        memcpy(dst->requests_hash.bytes, src->requests_hash.bytes, 32);
+}
+
+/** Build the RLP encoding of a withdrawal: [index, validator_index, addr, amount]. */
+static rlp_item_t *encode_withdrawal_rlp(const rx_withdrawal_t *w) {
+    rlp_item_t *item = rlp_list_new();
+    if (!item) return NULL;
+    rlp_list_append(item, rlp_uint64(w->index));
+    rlp_list_append(item, rlp_uint64(w->validator_index));
+    rlp_list_append(item, rlp_string(w->address.bytes, 20));
+    rlp_list_append(item, rlp_uint64(w->amount_gwei));
+    return item;
+}
+
+/** Assemble the full block RLP: [header, txs, uncles=[], withdrawals?]. */
+static bytes_t assemble_block_rlp(const bytes_t *header_rlp,
+                                  const uint8_t *const *txs,
+                                  const size_t *tx_lengths, size_t tx_count,
+                                  const rx_withdrawal_t *withdrawals,
+                                  size_t withdrawal_count,
+                                  bool include_withdrawals) {
+    bytes_t out = { .data = NULL, .len = 0, .capacity = 0 };
+
+    rlp_item_t *block = rlp_list_new();
+    if (!block) return out;
+
+    /* Header — decode pre-encoded header RLP into an item to include.
+     * rlp_decode on a header returns an RLP_TYPE_LIST item; we nest it. */
+    rlp_item_t *hdr_item = rlp_decode(header_rlp->data, header_rlp->len);
+    if (!hdr_item) { rlp_item_free(block); return out; }
+    rlp_list_append(block, hdr_item);
+
+    /* Transactions */
+    rlp_item_t *tx_list = rlp_list_new();
+    for (size_t i = 0; i < tx_count; i++)
+        rlp_list_append(tx_list, rlp_string(txs[i], tx_lengths[i]));
+    rlp_list_append(block, tx_list);
+
+    /* Uncles — always empty post-merge */
+    rlp_list_append(block, rlp_list_new());
+
+    /* Withdrawals (Shanghai+) */
+    if (include_withdrawals) {
+        rlp_item_t *wd_list = rlp_list_new();
+        for (size_t i = 0; i < withdrawal_count; i++) {
+            rlp_item_t *w = encode_withdrawal_rlp(&withdrawals[i]);
+            if (w) rlp_list_append(wd_list, w);
+        }
+        rlp_list_append(block, wd_list);
+    }
+
+    out = rlp_encode(block);
+    rlp_item_free(block);
+    return out;
+}
+
+bool rx_build_block(rx_engine_t *engine,
+                    const rx_build_header_t *header_fields,
+                    const uint8_t *const *txs,
+                    const size_t *tx_lengths,
+                    size_t tx_count,
+                    const rx_withdrawal_t *withdrawals,
+                    size_t withdrawal_count,
+                    rx_build_block_result_t *out) {
+    if (!engine || !header_fields || !out ||
+        (tx_count > 0 && (!txs || !tx_lengths)) ||
+        (withdrawal_count > 0 && !withdrawals)) {
+        if (engine) engine_set_error(engine, RX_ERR_NULL_ARG,
+                                     "required argument is NULL");
+        return false;
+    }
+    engine_clear_error(engine);
+    memset(out, 0, sizeof(*out));
+
+    /* 1. Build internal header from caller fields (roots still zero). */
+    block_header_t hdr;
+    fill_header_from_build(&hdr, header_fields);
+
+    /* 2. Build internal body from raw tx bytes + withdrawals.
+     *    Same pattern as convert_body in rx_execute_block. */
+    block_body_t body;
+    memset(&body, 0, sizeof(body));
+    rlp_item_t *root = rlp_list_new();
+    rlp_item_t *tx_list = rlp_list_new();
+    for (size_t i = 0; i < tx_count; i++)
+        rlp_list_append(tx_list, rlp_string(txs[i], tx_lengths[i]));
+    rlp_list_append(root, tx_list);
+    rlp_list_append(root, rlp_list_new()); /* empty uncles */
+    body._rlp = root;
+    body._tx_list_idx = 0;
+    body.tx_count = tx_count;
+
+    if (withdrawal_count > 0) {
+        body.withdrawals = calloc(withdrawal_count, sizeof(withdrawal_t));
+        if (!body.withdrawals) {
+            block_body_free(&body);
+            engine_set_error(engine, RX_ERR_OUT_OF_MEMORY, "alloc failed");
+            return false;
+        }
+        body.withdrawal_count = withdrawal_count;
+        for (size_t i = 0; i < withdrawal_count; i++) {
+            body.withdrawals[i].index = withdrawals[i].index;
+            body.withdrawals[i].validator_index = withdrawals[i].validator_index;
+            memcpy(body.withdrawals[i].address.bytes,
+                   withdrawals[i].address.bytes, 20);
+            body.withdrawals[i].amount_gwei = withdrawals[i].amount_gwei;
+        }
+    }
+
+    /* 3. Compute tx_root + withdrawals_root (filled before execute). */
+    hdr.tx_root = block_compute_tx_root(&body);
+    if (withdrawal_count > 0) {
+        hdr.withdrawals_root = block_compute_withdrawals_root(
+            body.withdrawals, body.withdrawal_count);
+        hdr.has_withdrawals_root = true;
+    } else {
+        /* Capella+ blocks still carry an empty withdrawals_root (empty trie).
+         * Only set has_withdrawals_root if the caller's header fields say so. */
+    }
+
+    /* 4. Execute: block_execute fills state_root, receipt_root, logs_bloom,
+     *    gas_used in its returned block_result_t. */
+    engine->evm->skip_root_hash = false;
+    block_result_t br = block_execute(engine->evm, &hdr, &body,
+                                      engine->block_hashes
+#ifdef ENABLE_HISTORY
+                                      , NULL
+#endif
+                                      );
+    if (!br.success) {
+        engine_set_error(engine, RX_ERR_EXECUTION, "block execution failed");
+        block_result_free(&br);
+        block_body_free(&body);
+        return false;
+    }
+
+    /* 5. Finalize header with execution results. */
+    hdr.state_root = br.state_root;
+    hdr.receipt_root = br.receipt_root;
+    memcpy(hdr.logs_bloom, br.logs_bloom, 256);
+    hdr.gas_used = br.gas_used;
+
+    /* 6. RLP-encode the final header and hash it. */
+    bytes_t header_rlp = block_header_encode_rlp(&hdr);
+    if (!header_rlp.data) {
+        engine_set_error(engine, RX_ERR_EXECUTION, "header RLP encode failed");
+        block_result_free(&br);
+        block_body_free(&body);
+        return false;
+    }
+    hash_t block_hash = hash_keccak256(header_rlp.data, header_rlp.len);
+
+    /* 7. Register block hash in ring so future BLOCKHASH(N) works. */
+    engine->block_hashes[hdr.number % BLOCK_HASH_WINDOW] = block_hash;
+    engine->last_block = hdr.number;
+
+    /* 8. Assemble the full block RLP. */
+    bytes_t block_rlp = assemble_block_rlp(&header_rlp, txs, tx_lengths,
+                                           tx_count, withdrawals,
+                                           withdrawal_count,
+                                           hdr.has_withdrawals_root);
+
+    /* 9. Fill the caller's result struct. */
+    memcpy(out->block_hash.bytes, block_hash.bytes, 32);
+    memcpy(out->state_root.bytes, hdr.state_root.bytes, 32);
+    memcpy(out->transactions_root.bytes, hdr.tx_root.bytes, 32);
+    memcpy(out->receipts_root.bytes, hdr.receipt_root.bytes, 32);
+    if (hdr.has_withdrawals_root)
+        memcpy(out->withdrawals_root.bytes, hdr.withdrawals_root.bytes, 32);
+    memcpy(out->logs_bloom, hdr.logs_bloom, 256);
+    out->gas_used = hdr.gas_used;
+
+    out->block_rlp = block_rlp.data;    /* transferred ownership */
+    out->block_rlp_len = block_rlp.len;
+
+    /* Copy receipts via the existing helper into a small rx_block_result_t,
+     * then move them into the build-block result. */
+    rx_block_result_t tmp = {0};
+    fill_block_result(&tmp, &br);
+    out->receipts = tmp.receipts;
+    out->receipt_count = tmp.tx_count;
+    /* tmp.receipts is now owned by `out` — clear tmp so it doesn't double-free. */
+    tmp.receipts = NULL;
+
+    free(header_rlp.data);
+    block_result_free(&br);
+    block_body_free(&body);
+    return true;
+}
+
+void rx_build_block_result_free(rx_build_block_result_t *r) {
+    if (!r) return;
+    if (r->receipts) {
+        /* Each receipt may have a logs array that holds topic arrays and data. */
+        for (size_t i = 0; i < r->receipt_count; i++) {
+            rx_receipt_t *rc = &r->receipts[i];
+            if (rc->logs) {
+                for (size_t j = 0; j < rc->log_count; j++) {
+                    free(rc->logs[j].topics);
+                    free(rc->logs[j].data);
+                }
+                free(rc->logs);
+            }
+        }
+        free(r->receipts);
+    }
+    free(r->block_rlp);
+    memset(r, 0, sizeof(*r));
+}
+
+/* ========================================================================
  * Block commit / revert
  * ======================================================================== */
 
