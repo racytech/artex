@@ -1381,17 +1381,10 @@ int main(int argc, char **argv) {
             clock_gettime(CLOCK_MONOTONIC, &t_window);
         }
 
-        /* Write .meta after ensuring all data is on disk.
-         * Wait for background flush to complete first, so the .dat file
-         * is consistent with the recorded block number. */
-        if (result.ok && validate_every > 0 &&
-            bn % validate_every == 0) {
-            sync_ensure_flushed(sync);
-            bool pe = (bn >= 2675000);
-            char mp[512];
-            snprintf(mp, sizeof(mp), "%s.meta", mpt_path);
-            meta_write(mp, bn, header.state_root.bytes, pe);
-        }
+        /* .meta writes DISABLED — storage_hart2 uses state_save/load
+         * snapshots; state_reconstruct/mpt_store pipeline is no longer
+         * used, so the .meta file (last-good-checkpoint pointer) is
+         * dead weight. */
 
         /* SIGINT: exit after validated checkpoint */
         if (g_shutdown_pending && result.ok &&
@@ -1516,13 +1509,10 @@ int main(int argc, char **argv) {
 #endif
             }
 
-            /* Ensure flush before writing .meta */
-            sync_ensure_flushed(sync);
-            /* Write .meta so state_reconstruct can rebuild to last good checkpoint */
-            {
+            /* .meta write DISABLED — see note at per-block write site above. */
+            if (0) {
                 uint64_t safe_block = ((bn - 1) / CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL;
                 bool pe = (safe_block >= 2675000);
-                /* Read the expected root for the safe block from era1 */
                 uint8_t safe_root[32] = {0};
                 if (archive_ensure(&archive, safe_block, false, era1_dir)) {
                     uint8_t *sr_hdr = NULL; size_t sr_hlen = 0;
@@ -1607,8 +1597,13 @@ int main(int argc, char **argv) {
     }
 
     /* --no-validate: compute and verify root at the last processed block.
-     * Skip if no blocks were actually executed (e.g. loaded snapshot at Paris). */
-    if (no_validate && sync_get_status(sync).blocks_ok > 0) {
+     * Skip if no blocks were actually executed (e.g. loaded snapshot at Paris).
+     *
+     * DISABLED: skip the final root+save. Era-exhaustion path (line ~1030)
+     * already computes root and saves when the replay naturally finishes,
+     * which is the case we actually care about. This block otherwise runs
+     * on every Ctrl-C exit and costs ~15+ minutes at 24M-scale. */
+    if (false && no_validate && sync_get_status(sync).blocks_ok > 0) {
         sync_status_t fst = sync_get_status(sync);
         uint64_t last = fst.last_block;
         if (last > 0) {
@@ -1741,25 +1736,7 @@ int main(int argc, char **argv) {
     sync_ensure_flushed(sync);
     sync_destroy(sync);
 
-    /* Write .meta AFTER all data is on disk (sync_destroy msyncs mmap pages) */
-    if (st.blocks_fail == 0 && st.last_block > 0) {
-        bool pe = (st.last_block >= 2675000);
-        uint8_t root[32] = {0};
-        if (archive_ensure(&archive, st.last_block, false, era1_dir)) {
-            uint8_t *h_rlp = NULL; size_t h_len = 0;
-            uint8_t *b_rlp = NULL; size_t b_len = 0;
-            if (era1_read_block(&archive.current, st.last_block,
-                                 &h_rlp, &h_len, &b_rlp, &b_len)) {
-                block_header_t hdr;
-                if (block_header_decode_rlp(&hdr, h_rlp, h_len))
-                    memcpy(root, hdr.state_root.bytes, 32);
-                free(h_rlp); free(b_rlp);
-            }
-        }
-        char mp[512];
-        snprintf(mp, sizeof(mp), "%s.meta", mpt_path);
-        meta_write(mp, st.last_block, root, pe);
-    }
+    /* .meta write DISABLED — storage_hart2 snapshots replace this. */
     archive_close(&archive);
 
     return st.blocks_fail > 0 ? 1 : 0;
