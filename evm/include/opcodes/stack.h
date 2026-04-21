@@ -75,4 +75,9 @@
 #define OP_SWAP15 0x9e
 #define OP_SWAP16 0x9f
 
+/* EIP-8024 (Amsterdam+): extended stack manipulation with 1-byte immediate. */
+#define OP_DUPN     0xe6
+#define OP_SWAPN    0xe7
+#define OP_EXCHANGE 0xe8
+
 #endif /* ART_EVM_OPCODES_STACK_H */

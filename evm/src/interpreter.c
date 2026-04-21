@@ -422,22 +422,22 @@ evm_result_t evm_interpret(evm_t *evm)
         &&op_invalid,
         &&op_invalid,
         &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
-        &&op_invalid,
+        &&op_invalid,        /* 0xe0 */
+        &&op_invalid,        /* 0xe1 */
+        &&op_invalid,        /* 0xe2 */
+        &&op_invalid,        /* 0xe3 */
+        &&op_invalid,        /* 0xe4 */
+        &&op_invalid,        /* 0xe5 */
+        &&op_dupn,           /* 0xe6 DUPN     (EIP-8024, Amsterdam+) */
+        &&op_swapn,          /* 0xe7 SWAPN    (EIP-8024, Amsterdam+) */
+        &&op_exchange,       /* 0xe8 EXCHANGE (EIP-8024, Amsterdam+) */
+        &&op_invalid,        /* 0xe9 */
+        &&op_invalid,        /* 0xea */
+        &&op_invalid,        /* 0xeb */
+        &&op_invalid,        /* 0xec */
+        &&op_invalid,        /* 0xed */
+        &&op_invalid,        /* 0xee */
+        &&op_invalid,        /* 0xef */
 
         // 0xf0-0xff: System Operations
         &&op_create,
@@ -1238,6 +1238,88 @@ op_swap15: INLINE_SWAP(15)
 op_swap16: INLINE_SWAP(16)
 
 #undef INLINE_SWAP
+
+    //==========================================================================
+    // 0xe6-0xe8: DUPN / SWAPN / EXCHANGE (EIP-8024, Amsterdam+)
+    //
+    // decode_single(x) for DUPN/SWAPN:
+    //   valid x: 0..90 or 128..255;   n = (x + 145) mod 256, so n in [17, 235].
+    // decode_pair(x) for EXCHANGE:
+    //   valid x: 0..81 or 128..255;   k = x ^ 143; q,r = divmod(k, 16);
+    //   if q<r: (n,m) = (q+1, r+1) else (r+1, 29-q). n in [1,14], n<m<=30-n.
+    //==========================================================================
+
+op_dupn:
+    if (evm->fork < FORK_AMSTERDAM) { status = EVM_INVALID_OPCODE; goto error; }
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->pc + 1 >= evm->code_size, 0)) {
+        status = EVM_INVALID_OPCODE; goto error;
+    }
+    {
+        uint8_t x = evm->code[evm->pc + 1];
+        if (x > 90 && x < 128) { status = EVM_INVALID_OPCODE; goto error; }
+        size_t n = (size_t)((x + 145) & 0xff);
+        if (__builtin_expect(evm->stack->size < n ||
+            evm->stack->size >= EVM_STACK_MAX_DEPTH, 0)) {
+            status = (evm->stack->size >= EVM_STACK_MAX_DEPTH) ?
+                EVM_STACK_OVERFLOW : EVM_STACK_UNDERFLOW;
+            goto error;
+        }
+        evm->stack->items[evm->stack->size] =
+            evm->stack->items[evm->stack->size - n];
+        evm->stack->size++;
+    }
+    evm->pc += 2;
+    DISPATCH();
+
+op_swapn:
+    if (evm->fork < FORK_AMSTERDAM) { status = EVM_INVALID_OPCODE; goto error; }
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->pc + 1 >= evm->code_size, 0)) {
+        status = EVM_INVALID_OPCODE; goto error;
+    }
+    {
+        uint8_t x = evm->code[evm->pc + 1];
+        if (x > 90 && x < 128) { status = EVM_INVALID_OPCODE; goto error; }
+        size_t n = (size_t)((x + 145) & 0xff);
+        /* SWAPN swaps top with (n+1)'th item → index top - n. */
+        if (__builtin_expect(evm->stack->size < n + 1, 0)) {
+            status = EVM_STACK_UNDERFLOW; goto error;
+        }
+        size_t top_idx = evm->stack->size - 1;
+        uint256_t tmp = evm->stack->items[top_idx];
+        evm->stack->items[top_idx]       = evm->stack->items[top_idx - n];
+        evm->stack->items[top_idx - n]   = tmp;
+    }
+    evm->pc += 2;
+    DISPATCH();
+
+op_exchange:
+    if (evm->fork < FORK_AMSTERDAM) { status = EVM_INVALID_OPCODE; goto error; }
+    if (!evm_use_gas(evm, GAS_VERY_LOW)) goto done_oog;
+    if (__builtin_expect(evm->pc + 1 >= evm->code_size, 0)) {
+        status = EVM_INVALID_OPCODE; goto error;
+    }
+    {
+        uint8_t x = evm->code[evm->pc + 1];
+        if (x > 81 && x < 128) { status = EVM_INVALID_OPCODE; goto error; }
+        uint8_t k = (uint8_t)(x ^ 143);
+        uint8_t q = k >> 4;
+        uint8_t r = k & 0xf;
+        uint8_t nn, mm;
+        if (q < r) { nn = (uint8_t)(q + 1); mm = (uint8_t)(r + 1); }
+        else       { nn = (uint8_t)(r + 1); mm = (uint8_t)(29 - q); }
+        /* EXCHANGE swaps (n+1)'th with (m+1)'th stack items. */
+        if (__builtin_expect(evm->stack->size < (size_t)(mm + 1), 0)) {
+            status = EVM_STACK_UNDERFLOW; goto error;
+        }
+        size_t top_idx = evm->stack->size - 1;
+        uint256_t tmp = evm->stack->items[top_idx - nn];
+        evm->stack->items[top_idx - nn] = evm->stack->items[top_idx - mm];
+        evm->stack->items[top_idx - mm] = tmp;
+    }
+    evm->pc += 2;
+    DISPATCH();
 
     //==========================================================================
     // 0xa0-0xaf: Log Operations
