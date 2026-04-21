@@ -486,11 +486,27 @@ hash_t block_compute_tx_root(const block_body_t *body) {
         keys[i] = rlp_encode_uint64_direct(i);
         if (!keys[i].data) goto cleanup;
 
-        /* Value: RLP-encoded transaction */
+        /* Value: the raw wire bytes of the transaction.
+         *   Legacy (pre-Berlin): stored as RLP_TYPE_LIST — rlp_encode
+         *     serializes the list, producing the canonical legacy tx bytes.
+         *   Typed (EIP-2718: 0x01/0x02/0x03/0x04): stored as RLP_TYPE_STRING
+         *     wrapping the raw `type_byte || rlp(inner)` bytes — the MPT
+         *     value is those raw bytes, NOT rlp_encode(item) which would
+         *     double-wrap them in another RLP string header. */
         const rlp_item_t *tx = block_body_tx(body, i);
         if (!tx) goto cleanup;
-        values[i] = rlp_encode(tx);
-        if (!values[i].data) goto cleanup;
+
+        if (rlp_get_type(tx) == RLP_TYPE_STRING) {
+            const bytes_t *raw = rlp_get_string(tx);
+            if (!raw || !raw->data) goto cleanup;
+            values[i].data = malloc(raw->len);
+            if (!values[i].data) goto cleanup;
+            memcpy(values[i].data, raw->data, raw->len);
+            values[i].len = raw->len;
+        } else {
+            values[i] = rlp_encode(tx);
+            if (!values[i].data) goto cleanup;
+        }
 
         entries[i].key       = keys[i].data;
         entries[i].key_len   = keys[i].len;
