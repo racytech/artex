@@ -212,9 +212,6 @@ python3 -m venv venv && source venv/bin/activate
 pip install -r examples/python/requirements.txt
 ```
 
-Fedora / RHEL package names, test-fixture setup, and troubleshooting
-live in [`examples/python/README.md`](examples/python/README.md).
-
 ### Python — query a loaded state
 
 ```python
