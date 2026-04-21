@@ -539,8 +539,13 @@ block_result_t block_execute(evm_t *evm,
         /* EIP-7825 (Osaka+): per-transaction gas limit cap.
          * Any tx with gas_limit > 2^24 (16,777,216) makes the whole
          * block invalid — break, cleanup handles the remaining
-         * decoded txs including this one via the last_tx index. */
-        if (evm->fork >= FORK_OSAKA && tx.gas_limit > (1UL << 24)) {
+         * decoded txs including this one via the last_tx index.
+         *
+         * EIP-7594 (Osaka+, PeerDAS): 6-blob-per-tx cap. Same
+         * semantics: whole block rejected on violation. */
+        if (evm->fork >= FORK_OSAKA &&
+            (tx.gas_limit > (1UL << 24) ||
+             tx.blob_versioned_hashes_count > 6)) {
             result.success = false;
             if (result.first_failure < 0) result.first_failure = (int)i;
             last_tx = i;

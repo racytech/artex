@@ -287,6 +287,13 @@ bool transaction_execute(
     if (tx_fork >= FORK_OSAKA && tx->gas_limit > (1UL << 24)) {
         return false;
     }
+
+    // EIP-7594 (Osaka+, PeerDAS): cap of 6 blobs per transaction.
+    // Applies to EIP-4844 blob-carrying transactions only — non-blob
+    // txs have blob_versioned_hashes_count == 0 and pass trivially.
+    if (tx_fork >= FORK_OSAKA && tx->blob_versioned_hashes_count > 6) {
+        return false;
+    }
     uint256_t block_difficulty = env->difficulty;
     if (tx_fork >= FORK_PARIS) {
         block_difficulty = uint256_from_bytes(env->prev_randao.bytes, 32);
