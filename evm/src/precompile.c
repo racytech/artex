@@ -1558,6 +1558,25 @@ static evm_status_t precompile_p256verify(const uint8_t *input, size_t input_siz
         goto cleanup;
     }
 
+    // EIP-7951: public-key coordinate bounds. Both qx and qy must
+    // satisfy 0 <= q < p. Without this explicit check, OpenSSL's
+    // EC_POINT_set_affine_coordinates_GFp may silently accept or
+    // reduce out-of-range coordinates, leading to non-deterministic
+    // verification results across implementations (the security bug
+    // RIP-7212 had and EIP-7951 now fixes).
+    BIGNUM *p_field = BN_new();
+    if (!p_field ||
+        !EC_GROUP_get_curve_GFp(group, p_field, NULL, NULL, NULL) ||
+        BN_cmp(x, p_field) >= 0 ||
+        BN_cmp(y, p_field) >= 0)
+    {
+        BN_free(p_field);
+        BN_free(order);
+        EC_GROUP_free(group);
+        goto cleanup;
+    }
+    BN_free(p_field);
+
     // Construct the public key point
     EC_POINT *pub_point = EC_POINT_new(group);
     if (!pub_point ||
