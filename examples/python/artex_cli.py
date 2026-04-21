@@ -69,25 +69,17 @@ def fmt_wei(wei: int) -> str:
 class ArtexShell(cmd.Cmd):
     intro = (
         "\n  artex interactive CLI — type 'help' or '?' for commands, 'quit' to exit.\n"
-        "  load a snapshot or genesis first, then query / execute / save.\n"
+        "  no state is loaded on startup — run 'load-state <path>' or 'load-genesis <path>' first.\n"
     )
     prompt = "artex> "
 
     def __init__(
         self,
-        initial_state: str | None = None,
         data_dir: str | None = None,
     ):
         super().__init__()
-        # If --data-dir not given but --state is, infer data_dir from the
-        # snapshot's directory (so chain_replay_code.{dat,idx} alongside it
-        # are picked up automatically — standard snapshot-package layout).
-        if data_dir is None and initial_state:
-            data_dir = os.path.dirname(os.path.abspath(os.path.expanduser(initial_state)))
-
         self.data_dir = data_dir
         self.engine = Engine(Config(data_dir=data_dir))
-        self.initial_state = initial_state
         print(f"libartex version: {version()}")
         if data_dir:
             print(f"data dir: {data_dir}")
@@ -101,10 +93,6 @@ class ArtexShell(cmd.Cmd):
             self.engine.close()
         except Exception:
             pass
-
-    def preloop(self):
-        if self.initial_state:
-            self._safe("load-state " + self.initial_state, self.do_load_state)
 
     # ------------------------------------------------------------------
     # Error wrapper: show errors, never bubble to Cmd
@@ -304,12 +292,25 @@ class ArtexShell(cmd.Cmd):
         # if load_state succeeded, the ring is already correct.
 
         blocks = 0
+        txs_total = 0
         gas_total = 0
         t0 = time.time()
         t_window = t0
         window_blocks = 0
+        window_txs = 0
         window_gas = 0
         validated = 0
+
+        # Track the last committed block so we can always validate the
+        # final state root before returning, even when the final block
+        # didn't fall on a validation interval (era files exhausted,
+        # Ctrl-C, etc.). `last_validated` flips to True in the loop for
+        # blocks already checked — we skip the post-loop check in that
+        # case to avoid re-computing the root twice.
+        last_bn = None
+        last_expected_root = None
+        last_validated = False
+        failed_mid_block = False
 
         try:
             for b in iter_era_blocks(opts.era_dir, start_block):
@@ -337,6 +338,7 @@ class ArtexShell(cmd.Cmd):
                     print(f"  ✗ gas mismatch at {bn}: "
                           f"expected {header.gas_used} got {result.gas_used}")
                     self.engine.revert_block()
+                    failed_mid_block = True
                     break
 
                 if validate:
@@ -346,35 +348,67 @@ class ArtexShell(cmd.Cmd):
                         print(f"    expected: 0x{expected.hex()}")
                         print(f"    got:      0x{result.state_root.hex()}")
                         self.engine.revert_block()
+                        failed_mid_block = True
                         break
+                    print(f"  ✓ root @ {bn}: 0x{result.state_root.hex()}")
                     validated += 1
+                    last_validated = True
+                else:
+                    last_validated = False
 
                 self.engine.commit_block()
                 blocks += 1
+                txs_total += result.tx_count
                 gas_total += header.gas_used
                 window_blocks += 1
+                window_txs += result.tx_count
                 window_gas += header.gas_used
+                last_bn = bn
+                last_expected_root = bytes(header.state_root.bytes)
 
                 now = time.time()
                 if now - t_window >= 5.0:
                     dt = now - t_window
                     bps = window_blocks / dt if dt else 0
+                    tps = window_txs / dt if dt else 0
                     mgps = window_gas / dt / 1e6 if dt else 0
                     print(f"  block {bn}  |  {bps:6.1f} blk/s  |  "
-                          f"{mgps:6.0f} Mgas/s  |  interval={interval}  |  validated={validated}")
+                          f"{tps:6.0f} tps  |  "
+                          f"{mgps:6.0f} Mgas/s  |  {window_txs:6d} txs"
+                          f"  |  interval={interval}  |  validated={validated}")
                     t_window = now
                     window_blocks = 0
+                    window_txs = 0
                     window_gas = 0
         except KeyboardInterrupt:
             print("\n  interrupted")
 
+        # Always validate the final committed block's root when the
+        # replay ends cleanly — catches drift that an interval-only
+        # schedule would miss when era files run out between checks.
+        if (not failed_mid_block
+                and last_bn is not None
+                and not last_validated):
+            print(f"  validating final root at block {last_bn} ...")
+            computed = self.engine.state_root()
+            if computed != last_expected_root:
+                print(f"  ✗ final root mismatch at {last_bn}")
+                print(f"    expected: 0x{last_expected_root.hex()}")
+                print(f"    got:      0x{computed.hex()}")
+            else:
+                print(f"  ✓ root @ {last_bn}: 0x{computed.hex()}")
+                validated += 1
+
         dt = time.time() - t0
         print()
         print(f"  blocks    : {blocks}")
+        print(f"  txs       : {txs_total:,}")
         print(f"  total gas : {gas_total:,}")
         print(f"  time      : {dt:.1f}s")
         if dt > 0:
-            print(f"  avg       : {blocks/dt:.1f} blk/s, {gas_total/dt/1e6:.0f} Mgas/s")
+            print(f"  avg       : {blocks/dt:.1f} blk/s, "
+                  f"{txs_total/dt:.0f} tps, "
+                  f"{gas_total/dt/1e6:.0f} Mgas/s")
         print(f"  validated : {validated}")
 
     # ------------------------------------------------------------------
@@ -392,42 +426,14 @@ class ArtexShell(cmd.Cmd):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument(
-        "--state", required=True,
-        help="path to the state snapshot .bin. The directory containing it "
-             "must also hold chain_replay_code.{dat,idx} and the "
-             "<snapshot>.hashes sidecar.",
-    )
-    ap.add_argument(
         "--data-dir",
-        help="override the directory holding chain_replay_code.{dat,idx}. "
-             "Defaults to the --state file's directory.",
+        help="directory holding chain_replay_code.{dat,idx}. "
+             "If unset, defaults to the directory of whichever snapshot "
+             "you pass to 'load-state' later.",
     )
     args = ap.parse_args()
 
-    # Validate the snapshot package upfront so the user gets a clear error
-    # before the engine starts a 90 s load.
-    state_path = os.path.abspath(os.path.expanduser(args.state))
-    data_dir = args.data_dir or os.path.dirname(state_path)
-
-    required = [
-        (state_path, "state snapshot"),
-        (state_path + ".hashes",
-         "block-hash sidecar (run tools/make_hashes.py if missing)"),
-        (os.path.join(data_dir, "chain_replay_code.dat"), "code store data"),
-        (os.path.join(data_dir, "chain_replay_code.idx"), "code store index"),
-    ]
-    missing = [(p, label) for p, label in required if not os.path.isfile(p)]
-    if missing:
-        print("ERROR: snapshot package is incomplete — missing files:")
-        for p, label in missing:
-            print(f"  - {p}")
-            print(f"      ({label})")
-        print()
-        print("All four files must live in the same directory. See the"
-              " README under 'Snapshot files' for details.")
-        return 1
-
-    sh = ArtexShell(initial_state=state_path, data_dir=data_dir)
+    sh = ArtexShell(data_dir=args.data_dir)
     try:
         sh.cmdloop()
     except KeyboardInterrupt:
