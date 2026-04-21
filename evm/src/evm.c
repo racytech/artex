@@ -381,6 +381,57 @@ void evm_logs_clear(evm_t *evm)
     evm->log_cap = 0;
 }
 
+void evm_log_emit_transfer(evm_t *evm,
+                           const address_t *from,
+                           const address_t *to,
+                           const uint256_t *value)
+{
+    if (!evm || !from || !to || !value) return;
+    if (evm->fork < FORK_AMSTERDAM) return;
+    if (uint256_is_zero(value)) return;
+    if (memcmp(from->bytes, to->bytes, 20) == 0) return;
+
+    if (evm->log_count >= evm->log_cap) {
+        size_t new_cap = evm->log_cap ? evm->log_cap * 2 : 8;
+        evm_log_t *new_logs = realloc(evm->logs, new_cap * sizeof(evm_log_t));
+        if (!new_logs) return;
+        evm->logs = new_logs;
+        evm->log_cap = new_cap;
+    }
+
+    evm_log_t *log = &evm->logs[evm->log_count];
+
+    /* SYSTEM_ADDRESS = 0xfffffffffffffffffffffffffffffffffffffffe */
+    memset(log->address.bytes, 0xff, 20);
+    log->address.bytes[19] = 0xfe;
+
+    /* topics[0] = keccak256("Transfer(address,address,uint256)") */
+    static const uint8_t TRANSFER_SIG[32] = {
+        0xdd,0xf2,0x52,0xad,0x1b,0xe2,0xc8,0x9b,
+        0x69,0xc2,0xb0,0x68,0xfc,0x37,0x8d,0xaa,
+        0x95,0x2b,0xa7,0xf1,0x63,0xc4,0xa1,0x16,
+        0x28,0xf5,0x5a,0x4d,0xf5,0x23,0xb3,0xef
+    };
+    memcpy(log->topics[0].bytes, TRANSFER_SIG, 32);
+
+    /* topics[1] = from (zero-pad left 12 bytes) */
+    memset(log->topics[1].bytes, 0, 12);
+    memcpy(log->topics[1].bytes + 12, from->bytes, 20);
+
+    /* topics[2] = to (zero-pad left 12 bytes) */
+    memset(log->topics[2].bytes, 0, 12);
+    memcpy(log->topics[2].bytes + 12, to->bytes, 20);
+
+    log->topic_count = 3;
+
+    log->data = malloc(32);
+    if (!log->data) return;
+    log->data_len = 32;
+    uint256_to_bytes(value, log->data);
+
+    evm->log_count++;
+}
+
 //==============================================================================
 // Message Helpers
 //==============================================================================
@@ -528,6 +579,8 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
                     evm_state_sub_balance(evm->state, &msg->caller, &msg->value);
                     evm_state_add_balance(evm->state, &msg->recipient, &msg->value);
                 }
+                /* EIP-7708 (Amsterdam+): helper no-ops on zero-value or self-call */
+                evm_log_emit_transfer(evm, &msg->caller, &msg->recipient, &msg->value);
 
                 uint64_t gas_remaining = evm->gas_left;
                 evm_restore_context(evm, &saved_context);
@@ -662,6 +715,9 @@ bool evm_execute(evm_t *evm, const evm_message_t *msg, evm_result_t *result)
             evm_state_sub_balance(evm->state, &msg->caller, &msg->value);
             evm_state_add_balance(evm->state, &msg->recipient, &msg->value);
         }
+        /* EIP-7708 (Amsterdam+): CALL emits a transfer log; CALLCODE self-sends
+         * and STATICCALL carries no value, both no-op via helper checks. */
+        evm_log_emit_transfer(evm, &msg->caller, &msg->recipient, &msg->value);
     }
 
     // Handle contract creation

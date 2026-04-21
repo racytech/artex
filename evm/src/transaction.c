@@ -710,6 +710,10 @@ bool transaction_execute(
             }
         }
         evm_state_add_balance(state, &recipient, &tx->value);
+
+        /* EIP-7708 (Amsterdam+): emit ETH transfer log before EVM execution
+         * so it precedes any user LOGs. No-ops when value==0 or same account. */
+        evm_log_emit_transfer(evm, &tx->sender, &recipient, &tx->value);
     }
 
     // Gas available for EVM execution

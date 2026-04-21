@@ -440,6 +440,23 @@ static inline void evm_logs_truncate(evm_t *evm, size_t logs_before) {
     evm->log_count = logs_before;
 }
 
+/**
+ * EIP-7708 (Amsterdam+): emit an ETH-transfer pseudo-log.
+ *
+ * Appends a log to the accumulator matching the ERC-20 Transfer event:
+ *   address    = 0xfffffffffffffffffffffffffffffffffffffffe
+ *   topics[0]  = keccak256("Transfer(address,address,uint256)")
+ *   topics[1]  = from (zero-padded to 32 bytes)
+ *   topics[2]  = to   (zero-padded to 32 bytes)
+ *   data       = value (32-byte big-endian)
+ *
+ * No-op when fork < FORK_AMSTERDAM, value == 0, or from == to.
+ */
+void evm_log_emit_transfer(evm_t *evm,
+                           const address_t *from,
+                           const address_t *to,
+                           const uint256_t *value);
+
 //==============================================================================
 // Message Helpers
 //==============================================================================

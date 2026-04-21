@@ -238,6 +238,11 @@ static evm_status_t execute_create(evm_t *evm,
         evm_state_add_balance(evm->state, contract_addr, value);
     }
 
+    /* EIP-7708 (Amsterdam+): CREATE/CREATE2 value transfer to the created
+     * account emits a log. Emitted before init code execution so it precedes
+     * any user LOGs; reverted with the frame if init code fails. */
+    evm_log_emit_transfer(evm, &evm->msg.recipient, contract_addr, value);
+
     //==========================================================================
     // Execute Init Code (or skip if no init code)
     //==========================================================================

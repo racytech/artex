@@ -414,6 +414,10 @@ static evm_status_t op_selfdestruct(evm_t *evm)
     evm_state_add_balance(evm->state, &beneficiary_addr, &balance);
     evm_state_sub_balance(evm->state, &evm->msg.recipient, &balance);
 
+    /* EIP-7708 (Amsterdam+): emit transfer log. Helper no-ops when balance==0
+     * or beneficiary == self. */
+    evm_log_emit_transfer(evm, &evm->msg.recipient, &beneficiary_addr, &balance);
+
     if (do_delete)
     {
         // Account will be destroyed: zero balance (burns ether on self-send)
