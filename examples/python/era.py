@@ -31,9 +31,14 @@ import os
 import struct
 from dataclasses import dataclass
 
+import hashlib
+
 import snappy
 
-from artex import RxAddress, RxBlockBody, RxBlockHeader, RxHash, RxUint256, RxWithdrawal
+from artex import (
+    RxAddress, RxBlockBody, RxBlockHeader, RxBuildHeader, RxHash,
+    RxUint256, RxWithdrawal,
+)
 
 
 @dataclass
@@ -43,10 +48,14 @@ class EraBlock:
     `parent_beacon_root` is non-None for Deneb+ blocks (EIP-4788); it
     lives in the BeaconBlock header (NOT the ExecutionPayload) at
     offset 16 within the BeaconBlock (= slot(8) + proposer(8)).
+
+    `requests_hash` is non-None for Electra/Prague+ blocks (EIP-7685);
+    computed from the BeaconBlockBody.execution_requests field.
     """
     number: int
     ep: bytes
-    parent_beacon_root: bytes | None = None  # 32 B if Deneb+
+    parent_beacon_root: bytes | None = None   # 32 B if Deneb+
+    requests_hash: bytes | None = None        # 32 B if Electra/Prague+
 
 
 # =============================================================================
@@ -269,21 +278,207 @@ def iter_era_blocks(era_dir: str, start_block: int = 0):
                             #   slot(8) + proposer(8) + parent_root(32) ...
                             # parent_beacon_root is at offset 16 relative to BB.
                             pbr = None
+                            rh = None
                             extra_data_off = _le32(ep, EP_EXTRA_DATA_OFF)
                             is_deneb = (extra_data_off >= 528)
                             if is_deneb:
                                 bb_off = _le32(ssz, 0)
                                 if bb_off + 48 <= len(ssz):
                                     pbr = bytes(ssz[bb_off + 16:bb_off + 48])
+                                # Electra+ (EIP-7685): BeaconBlockBody has
+                                # execution_requests as its last variable
+                                # field. Compute requests_hash per spec.
+                                rh = _compute_requests_hash(ssz, bb_off)
                             yield EraBlock(
                                 number=bn,
                                 ep=ep,
                                 parent_beacon_root=pbr,
+                                requests_hash=rh,
                             )
                 except Exception:
                     pass
 
             pos = value_start + elen
+
+
+def _compute_requests_hash(ssz: bytes, bb_off: int) -> bytes | None:
+    """EIP-7685 requests_hash from a Prague+ BeaconBlockBody.
+
+    Layout within BeaconBlockBody (Electra/Prague):
+      randao_reveal(96) + eth1_data(72) + graffiti(32)
+      + 5 × variable-offset(4)       → bytes 200..220
+      + sync_aggregate(160)          → bytes 220..380
+      + execution_payload_offset(4)  → bytes 380..384
+      + bls_to_execution_changes_off(4)  → 384..388  [Capella+]
+      + blob_kzg_commitments_off(4)      → 388..392  [Deneb+]
+      + execution_requests_off(4)        → 392..396  [Electra+]
+
+    execution_requests is an SSZ Container of three lists (deposits,
+    withdrawals, consolidations). EIP-7685 hashes each type's raw bytes:
+
+        requests_hash = sha256(sha256(r0) || sha256(r1) || sha256(r2))
+
+    where r_i = type_byte || concatenated_request_data_of_type_i.
+
+    Returns None if the beacon body is pre-Electra (no execution_requests
+    field), or on any parse error.
+    """
+    # BeaconBlockBody starts at ssz[bb_off + 80 (body_offset within BB)]
+    bb_body_off_loc = bb_off + 80
+    if bb_body_off_loc + 4 > len(ssz):
+        return None
+    body_rel = _le32(ssz, bb_body_off_loc)
+    body_start = bb_off + body_rel
+    if body_start + 396 > len(ssz):
+        # Pre-Electra body fixed part is smaller than 396
+        return None
+
+    # proposer_slashings offset = fixed-part size of the body.
+    body_fixed = _le32(ssz, body_start + 200)
+    if body_fixed < 396:
+        return None  # body layout doesn't include execution_requests
+
+    exec_requests_off = _le32(ssz, body_start + 392)
+    # Execution requests region extends to end of body; we need the upper
+    # bound. The body ends where the next outer structure begins. We use
+    # len(ssz) as a conservative upper bound (no siblings after body in
+    # SignedBeaconBlock — the signature is BEFORE the message pointer).
+    body_end = len(ssz) - bb_off
+    if exec_requests_off >= body_end:
+        return None
+
+    er_start = body_start + exec_requests_off
+    er_end = bb_off + body_end  # bb_off + body_end = len(ssz) for our case
+    er_bytes = ssz[er_start:er_end]
+
+    # ExecutionRequests SSZ Container with three lists. Fixed part is
+    # 3 × offset(4) = 12 bytes, followed by the three list blobs.
+    if len(er_bytes) < 12:
+        return None
+    off0 = _le32(er_bytes, 0)
+    off1 = _le32(er_bytes, 4)
+    off2 = _le32(er_bytes, 8)
+    if not (12 <= off0 <= off1 <= off2 <= len(er_bytes)):
+        return None
+
+    deposits       = er_bytes[off0:off1]
+    withdrawals_r  = er_bytes[off1:off2]
+    consolidations = er_bytes[off2:]
+
+    # Per EIP-7685, each request r = type_byte || data; the outer hash
+    # SKIPS types with empty data (len(r) == 1). We only append the
+    # sha256 of r when there's payload after the type byte.
+    m = hashlib.sha256()
+    for type_byte, data in ((0x00, deposits),
+                            (0x01, withdrawals_r),
+                            (0x02, consolidations)):
+        if len(data) == 0:
+            continue
+        m.update(hashlib.sha256(bytes([type_byte]) + data).digest())
+    return m.digest()
+
+
+def ep_to_build_header(block: "EraBlock") -> RxBuildHeader:
+    """Populate an RxBuildHeader from an EraBlock's ExecutionPayload +
+    per-block metadata. Includes all fork-gated fields (base_fee,
+    blob_gas, parent_beacon_root, requests_hash) where applicable."""
+    ep = block.ep
+    hdr = RxBuildHeader()
+    ctypes.memset(ctypes.addressof(hdr), 0, ctypes.sizeof(hdr))
+
+    ctypes.memmove(hdr.parent_hash.bytes, ep[EP_PARENT_HASH:EP_PARENT_HASH + 32], 32)
+    ctypes.memmove(hdr.coinbase.bytes, ep[EP_FEE_RECIPIENT:EP_FEE_RECIPIENT + 20], 20)
+    hdr.number    = _le64(ep, EP_BLOCK_NUMBER)
+    hdr.gas_limit = _le64(ep, EP_GAS_LIMIT)
+    hdr.timestamp = _le64(ep, EP_TIMESTAMP)
+
+    extra_data_off = _le32(ep, EP_EXTRA_DATA_OFF)
+    tx_off = _le32(ep, 504)
+    ed_end = tx_off if tx_off > extra_data_off else len(ep)
+    ed_len = min(ed_end - extra_data_off, 32)
+    if ed_len > 0 and extra_data_off + ed_len <= len(ep):
+        ctypes.memmove(hdr.extra_data, ep[extra_data_off:extra_data_off + ed_len], ed_len)
+        hdr.extra_data_len = ed_len
+
+    ctypes.memmove(hdr.prev_randao.bytes, ep[EP_PREV_RANDAO:EP_PREV_RANDAO + 32], 32)
+
+    # Base fee (always present post-merge, stored LE in EP, BE in rx_uint256_t)
+    base_fee_le = _le256(ep, EP_BASE_FEE)
+    hdr.has_base_fee = True
+    hdr.base_fee.bytes[:] = base_fee_le.to_bytes(32, 'big')
+
+    is_deneb = (extra_data_off >= 528)
+    if is_deneb:
+        hdr.has_blob_gas = True
+        hdr.blob_gas_used = _le64(ep, 512)
+        hdr.excess_blob_gas = _le64(ep, 520)
+
+    if block.parent_beacon_root is not None:
+        if len(block.parent_beacon_root) != 32:
+            raise ValueError("parent_beacon_root must be 32 bytes")
+        hdr.has_parent_beacon_root = True
+        ctypes.memmove(hdr.parent_beacon_root.bytes, block.parent_beacon_root, 32)
+
+    if block.requests_hash is not None:
+        if len(block.requests_hash) != 32:
+            raise ValueError("requests_hash must be 32 bytes")
+        hdr.has_requests_hash = True
+        ctypes.memmove(hdr.requests_hash.bytes, block.requests_hash, 32)
+
+    return hdr
+
+
+def ep_extract_txs(ep: bytes) -> list[bytes]:
+    """Return each transaction's raw bytes from the EP tx list."""
+    extra_data_off = _le32(ep, EP_EXTRA_DATA_OFF)
+    tx_off = _le32(ep, 504)
+    is_deneb = (extra_data_off >= 528)
+    is_capella = (not is_deneb and extra_data_off >= 512)
+    wd_off = 0
+    if is_capella or is_deneb:
+        wd_off = _le32(ep, 508)
+
+    txs = []
+    if 0 < tx_off < len(ep):
+        tx_end = wd_off if wd_off > tx_off else len(ep)
+        tx_region = tx_end - tx_off
+        if tx_region >= 4:
+            first_off = _le32(ep, tx_off)
+            tx_count = first_off // 4
+            if 0 < tx_count < 100_000 and first_off <= tx_region:
+                for t in range(tx_count):
+                    t_start = _le32(ep, tx_off + t * 4)
+                    t_end = (_le32(ep, tx_off + (t + 1) * 4)
+                             if t + 1 < tx_count else tx_region)
+                    if t_start < tx_region and t_end <= tx_region and t_end > t_start:
+                        txs.append(bytes(ep[tx_off + t_start:tx_off + t_end]))
+    return txs
+
+
+def ep_extract_withdrawals(ep: bytes) -> list[RxWithdrawal]:
+    """Return RxWithdrawal structs for each Shanghai+ withdrawal in EP."""
+    extra_data_off = _le32(ep, EP_EXTRA_DATA_OFF)
+    is_deneb = (extra_data_off >= 528)
+    is_capella = (not is_deneb and extra_data_off >= 512)
+    if not (is_capella or is_deneb):
+        return []
+
+    wd_off = _le32(ep, 508)
+    if not (0 < wd_off < len(ep)):
+        return []
+
+    wd_region = len(ep) - wd_off
+    wd_count = wd_region // 44
+    out = []
+    for w in range(wd_count):
+        wb = ep[wd_off + w * 44:]
+        wd = RxWithdrawal()
+        wd.index = _le64(wb, 0)
+        wd.validator_index = _le64(wb, 8)
+        ctypes.memmove(wd.address.bytes, wb[16:36], 20)
+        wd.amount_gwei = _le64(wb, 36)
+        out.append(wd)
+    return out
 
 
 def ep_to_header_body(ep: bytes, parent_beacon_root: bytes | None = None):
@@ -410,4 +605,9 @@ def ep_to_header_body(ep: bytes, parent_beacon_root: bytes | None = None):
     return hdr, body, block_hash
 
 
-__all__ = ["iter_era_blocks", "ep_to_header_body", "EraBlock", "EP_BLOCK_HASH"]
+__all__ = [
+    "iter_era_blocks", "ep_to_header_body", "EraBlock",
+    "ep_to_build_header", "ep_extract_txs", "ep_extract_withdrawals",
+    "EP_BLOCK_HASH", "EP_STATE_ROOT", "EP_RECEIPTS_ROOT",
+    "EP_LOGS_BLOOM", "EP_GAS_USED",
+]

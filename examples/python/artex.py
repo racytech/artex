@@ -158,6 +158,45 @@ class RxBlockBody(ctypes.Structure):
     ]
 
 
+class RxBuildHeader(ctypes.Structure):
+    """Caller-supplied header fields for rx_build_block (see artex.h)."""
+    _fields_ = [
+        ("parent_hash", RxHash),
+        ("coinbase", RxAddress),
+        ("number", ctypes.c_uint64),
+        ("gas_limit", ctypes.c_uint64),
+        ("timestamp", ctypes.c_uint64),
+        ("extra_data", ctypes.c_uint8 * 32),
+        ("extra_data_len", ctypes.c_size_t),
+        ("prev_randao", RxHash),
+        ("has_base_fee", ctypes.c_bool),
+        ("base_fee", RxUint256),
+        ("has_blob_gas", ctypes.c_bool),
+        ("blob_gas_used", ctypes.c_uint64),
+        ("excess_blob_gas", ctypes.c_uint64),
+        ("has_parent_beacon_root", ctypes.c_bool),
+        ("parent_beacon_root", RxHash),
+        ("has_requests_hash", ctypes.c_bool),
+        ("requests_hash", RxHash),
+    ]
+
+
+class RxBuildBlockResult(ctypes.Structure):
+    _fields_ = [
+        ("block_hash", RxHash),
+        ("state_root", RxHash),
+        ("transactions_root", RxHash),
+        ("receipts_root", RxHash),
+        ("withdrawals_root", RxHash),
+        ("logs_bloom", ctypes.c_uint8 * 256),
+        ("gas_used", ctypes.c_uint64),
+        ("receipts", ctypes.POINTER(RxReceipt)),
+        ("receipt_count", ctypes.c_size_t),
+        ("block_rlp", ctypes.POINTER(ctypes.c_uint8)),
+        ("block_rlp_len", ctypes.c_size_t),
+    ]
+
+
 # =============================================================================
 # Error handling
 # =============================================================================
@@ -246,6 +285,21 @@ def _lib() -> ctypes.CDLL:
         ctypes.c_bool,
         ctypes.POINTER(RxBlockResult),
     ]
+
+    lib.rx_build_block.restype = ctypes.c_bool
+    lib.rx_build_block.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(RxBuildHeader),
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.POINTER(RxWithdrawal),
+        ctypes.c_size_t,
+        ctypes.POINTER(RxBuildBlockResult),
+    ]
+
+    lib.rx_build_block_result_free.restype = None
+    lib.rx_build_block_result_free.argtypes = [ctypes.POINTER(RxBuildBlockResult)]
 
     lib.rx_commit_block.restype = ctypes.c_bool
     lib.rx_commit_block.argtypes = [ctypes.c_void_p]
@@ -363,6 +417,51 @@ class BlockResult:
             receipt_root=bytes(r.receipt_root.bytes),
             logs_bloom=bytes(r.logs_bloom),
         )
+
+
+@dataclass
+class BuildBlockResult:
+    """Pythonic view of an rx_build_block_result_t.
+
+    Receipts are not exposed at this layer (same as BlockResult). If you
+    need them, access self._raw.receipts / receipt_count and read via
+    ctypes. Call self.free() when done to release block_rlp + receipts
+    held by the C side.
+    """
+    block_hash: bytes
+    state_root: bytes
+    transactions_root: bytes
+    receipts_root: bytes
+    withdrawals_root: bytes    # zero if no withdrawals
+    logs_bloom: bytes          # 256 B
+    gas_used: int
+    block_rlp: bytes
+    _raw: RxBuildBlockResult   # keeps C-side allocations alive
+
+    @classmethod
+    def _from_rx(cls, r: RxBuildBlockResult, lib) -> "BuildBlockResult":
+        # Copy block_rlp bytes into a Python-owned bytes object so that
+        # _raw can be freed independently.
+        rlp_bytes = ctypes.string_at(r.block_rlp, r.block_rlp_len) if r.block_rlp else b""
+        obj = cls(
+            block_hash=bytes(r.block_hash.bytes),
+            state_root=bytes(r.state_root.bytes),
+            transactions_root=bytes(r.transactions_root.bytes),
+            receipts_root=bytes(r.receipts_root.bytes),
+            withdrawals_root=bytes(r.withdrawals_root.bytes),
+            logs_bloom=bytes(r.logs_bloom),
+            gas_used=int(r.gas_used),
+            block_rlp=rlp_bytes,
+            _raw=r,
+        )
+        obj._lib = lib
+        return obj
+
+    def free(self) -> None:
+        """Release the underlying C allocations (block_rlp + receipts)."""
+        if getattr(self, "_raw", None) is not None:
+            self._lib.rx_build_block_result_free(ctypes.byref(self._raw))
+            self._raw = None
 
 
 class Engine:
@@ -503,6 +602,69 @@ class Engine:
         self._lib.rx_block_result_free(ctypes.byref(result))
         return py_result
 
+    def build_block(
+        self,
+        header: RxBuildHeader,
+        txs: list[bytes] | None = None,
+        withdrawals: list[RxWithdrawal] | None = None,
+    ) -> BuildBlockResult:
+        """Assemble and execute a block via rx_build_block.
+
+        `header` is a fully-populated RxBuildHeader struct. `txs` is a list
+        of raw tx bytes (legacy = RLP list, typed = type_byte||payload).
+        `withdrawals` is an optional list of pre-built RxWithdrawal structs.
+
+        Returns a BuildBlockResult. Caller must call result.free() when
+        done to release block_rlp + receipts allocated C-side.
+
+        No auto-commit: after a successful call, invoke self.commit_block()
+        to finalize, or self.revert_block() to discard.
+        """
+        txs = txs or []
+        withdrawals = withdrawals or []
+
+        # Build tx pointer + length arrays (ctypes must hold refs so the
+        # underlying bytes aren't GC'd before the C call completes).
+        tx_bufs = []
+        tx_ptrs = None
+        tx_lens = None
+        tx_ptrs_ptr = ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8))()
+        tx_lens_ptr = ctypes.POINTER(ctypes.c_size_t)()
+        if txs:
+            TxPtrArray = (ctypes.POINTER(ctypes.c_uint8) * len(txs))
+            LenArray = (ctypes.c_size_t * len(txs))
+            tx_ptrs = TxPtrArray()
+            tx_lens = LenArray()
+            for i, raw in enumerate(txs):
+                buf = (ctypes.c_uint8 * len(raw))(*raw)
+                tx_bufs.append(buf)
+                tx_ptrs[i] = ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8))
+                tx_lens[i] = len(raw)
+            tx_ptrs_ptr = ctypes.cast(
+                tx_ptrs, ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)))
+            tx_lens_ptr = ctypes.cast(tx_lens, ctypes.POINTER(ctypes.c_size_t))
+
+        wd_ptr = ctypes.POINTER(RxWithdrawal)()
+        wd_arr = None
+        if withdrawals:
+            WdArray = (RxWithdrawal * len(withdrawals))
+            wd_arr = WdArray(*withdrawals)
+            wd_ptr = ctypes.cast(wd_arr, ctypes.POINTER(RxWithdrawal))
+
+        result = RxBuildBlockResult()
+        ok = self._lib.rx_build_block(
+            self._p,
+            ctypes.byref(header),
+            tx_ptrs_ptr, tx_lens_ptr, len(txs),
+            wd_ptr, len(withdrawals),
+            ctypes.byref(result),
+        )
+        # keep refs alive through call
+        del tx_bufs, tx_ptrs, tx_lens, wd_arr
+        if not ok:
+            self._raise_last("rx_build_block failed")
+        return BuildBlockResult._from_rx(result, self._lib)
+
     def commit_block(self) -> None:
         if not self._lib.rx_commit_block(self._p):
             self._raise_last("rx_commit_block failed")
@@ -560,12 +722,17 @@ def adaptive_interval(current: int, tip: int) -> int:
     """Pick validation cadence based on distance from tip.
     Far from tip → validate rarely (bulk sync throughput).
     Near tip → validate often (catch errors early).
+
+    The every-1 floor kicks in only in the final 15 blocks — by
+    then the extra root computations cost a handful of seconds
+    total, and the payoff is pinpointing exactly which block
+    broke if the final stretch diverges.
     """
     behind = tip - current
-    if behind > 100_000: return 1024
-    if behind > 10_000:  return 256
-    if behind > 1_000:   return 64
-    if behind > 100:     return 16
+    if behind > 10_000: return 1024
+    if behind > 1_000:  return 256
+    if behind > 100:    return 64
+    if behind > 15:     return 16
     return 1
 
 
@@ -580,9 +747,11 @@ def version() -> str:
 
 
 __all__ = [
-    "Config", "Engine", "BlockResult", "ArtexError", "RxError",
+    "Config", "Engine", "BlockResult", "BuildBlockResult",
+    "ArtexError", "RxError",
     "adaptive_interval", "version",
     # low-level re-exports
     "RxHash", "RxAddress", "RxUint256", "RxConfig", "RxReceipt", "RxBlockResult",
     "RxBlockHeader", "RxBlockBody", "RxWithdrawal",
+    "RxBuildHeader", "RxBuildBlockResult",
 ]
