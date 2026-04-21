@@ -127,6 +127,7 @@ __archive/
 integration_tests/fixtures/
 integration_tests/fixtures_2/
 integration_tests/fixtures_3/
+integration_tests/fixtures_bal/
 
 # Block data
 data/era1/

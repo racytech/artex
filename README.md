@@ -399,6 +399,49 @@ python3 tools/make_hashes.py \
 Wall time: hours to days depending on target block. Option A is
 much faster if the published block height works for your use case.
 
+## Running EELS tests
+
+`test_runner_batch` drives the library against the Ethereum Execution
+Layer Specification (EELS) test fixtures.
+
+Build it:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target test_runner_batch -j
+```
+
+Fetch the latest EELS fixture pack from
+<https://github.com/ethereum/execution-spec-tests/releases> (the
+`fixtures_stable.tar.gz` asset is the usual target) and extract into
+`integration_tests/fixtures/`. The expected layout is:
+
+```
+integration_tests/fixtures/
+├── state_tests/
+├── blockchain_tests/
+└── blockchain_tests_engine/
+```
+
+Run a suite by pointing the binary at any directory of fixtures:
+
+```bash
+./build/test_runner_batch integration_tests/fixtures/state_tests/
+./build/test_runner_batch integration_tests/fixtures/blockchain_tests/
+./build/test_runner_batch integration_tests/fixtures/blockchain_tests_engine/
+```
+
+Useful flags:
+
+| flag | effect |
+|---|---|
+| `-v` | print per-test output, not just the roll-up |
+| `-s` | stop on first failure |
+| `-f <fork>` | restrict to one fork (e.g. `-f Cancun`); can be repeated |
+| `-t <ms>` | per-test timeout (default 30 s) |
+
+Each run prints a summary: `Passed: N  Failed: M  Errors: K  Skipped: L`.
+
 ## License
 
 TBD
