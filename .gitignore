@@ -161,7 +161,13 @@ known_issues/
 # Old checklist
 todo-checklist-old.md
 
-.claude/
+# Claude Code — ignore transient session state, track shareable config
+.claude/*
+!.claude/settings.json
+!.claude/agents/
+!.claude/commands/
+!.claude/hooks/
+
 eip-*.md
 
 save*
