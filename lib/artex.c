@@ -327,12 +327,15 @@ bool rx_engine_load_state(rx_engine_t *engine, const char *path) {
     /* Verify snapshot integrity: recompute the MPT root from the loaded
      * state and compare against the root stored in the file header.
      * Catches corruption, bit rot, truncation, and any save/load bug
-     * at load time rather than during later execution. Cost is one
-     * full MPT walk (seconds to tens of seconds for mainnet-scale
-     * state), done once. */
+     * at load time rather than during later execution.
+     *
+     * No explicit `invalidate_all` here — every node was just created
+     * by `state_load` and is born dirty (see hashed_art.c node
+     * allocation), and the cached `hash[32]` field is uninitialized
+     * out of the pool. `compute_mpt_root` therefore recomputes every
+     * node from scratch in a single traversal. */
     fprintf(stderr, "recomputing state root on state load (block %lu)...\n",
             engine->last_block);
-    evm_state_invalidate_all(engine->state);
     bool prune = (engine->last_block >= 2675000); /* post-EIP-161 */
     hash_t recomputed = evm_state_compute_mpt_root(engine->state, prune);
     if (memcmp(recomputed.bytes, loaded_root.bytes, 32) != 0) {
@@ -392,7 +395,12 @@ bool rx_engine_save_state(rx_engine_t *engine, const char *path) {
 
     state_t *st = evm_state_get_state(engine->state);
 
-    /* Compute current root for the snapshot header */
+    /* Compute current root for the snapshot header.
+     *
+     * Uses cached hashes for clean subtrees. Callers who suspect
+     * cached-hash drift (e.g. after a long no-validation replay
+     * window) should invoke rx_invalidate_state_cache() beforehand
+     * to force a full recompute. */
     hash_t root = evm_state_compute_mpt_root(engine->state,
         engine->evm->fork >= FORK_SPURIOUS_DRAGON);
 
@@ -652,6 +660,11 @@ rx_hash_t rx_compute_state_root(rx_engine_t *engine) {
     hash_t root = evm_state_compute_root_only(engine->state, prune);
     memcpy(out.bytes, root.bytes, 32);
     return out;
+}
+
+void rx_invalidate_state_cache(rx_engine_t *engine) {
+    if (!engine) return;
+    evm_state_invalidate_all(engine->state);
 }
 
 /* ========================================================================

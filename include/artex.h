@@ -327,10 +327,65 @@ RX_API bool rx_execute_block(rx_engine_t *engine,
 /**
  * Compute state root without executing a block.
  *
+ * Uses cached MPT hashes for clean subtrees and only rehashes the
+ * dirty paths touched since the last root computation. Cheap when
+ * called regularly (e.g. every block at chain tip, every 256–1024
+ * blocks during bulk replay).
+ *
  * Use when you need the root outside of block execution,
  * e.g. for validation at checkpoint boundaries.
  */
 RX_API rx_hash_t rx_compute_state_root(rx_engine_t *engine);
+
+/**
+ * Mark every cached MPT hash dirty.
+ *
+ * The next call to rx_compute_state_root will walk the entire
+ * account index and every per-account storage trie, recomputing
+ * every node's hash from scratch. Cost is one full state walk —
+ * tens of seconds to a few minutes on mainnet-scale state.
+ *
+ * Most callers don't need this. The incremental hash cache is
+ * correct by construction (every state mutation marks its path
+ * dirty before the next root computation runs). Reach for it only
+ * in defensive scenarios: after a long no-validation replay
+ * window (≫1024 blocks without a checkpoint), or before a
+ * `rx_engine_save_state` if you want to guarantee the snapshot's
+ * header root is recomputed from scratch rather than from the
+ * cached values.
+ *
+ * Recommended cadence is to validate often enough that you never
+ * need this — every block at chain tip, no coarser than every
+ * 1024 blocks during bulk replay (matches the `--adaptive` flag's
+ * loosest interval).
+ */
+RX_API void rx_invalidate_state_cache(rx_engine_t *engine);
+
+/* TODO: collapse rx_invalidate_state_cache + rx_compute_state_root
+ * into a single rx_compute_state_root_full(engine) entry point.
+ *
+ * Today the "force a from-scratch recompute" pattern is two separate
+ * calls, which means two full traversals of the trie:
+ *   1. invalidate_all walks every node and flips its dirty bit
+ *   2. compute_state_root walks every node again, sees them all
+ *      dirty, computes hashes, clears dirty bits
+ *
+ * Both walks are bound by the same memory-access pattern over the
+ * same set of nodes; the per-node work for invalidate (one byte
+ * write) is much cheaper than for compute (encode + keccak), but the
+ * walk itself dominates either way. Measured: each walk costs
+ * ~15 min on mainnet-scale state.
+ *
+ * A unified entry point would skip the dirty-bit gate inside the
+ * recursive helper, recompute every node in a single traversal, and
+ * cut the "force full recompute" cost roughly in half. The internal
+ * hashing helper already does the right work per node — only the
+ * gating predicate needs to change.
+ *
+ * Once that lands, rx_invalidate_state_cache can be deleted: its
+ * only purpose was to set up for the next compute_state_root call,
+ * which the unified function would absorb.
+ */
 
 /* ========================================================================
  * Block production
