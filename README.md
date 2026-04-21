@@ -162,6 +162,12 @@ if the current `RLIMIT_STACK` is smaller — run `ulimit -s 32768`
 - **Platforms.** Linux x86_64 only today. The pool relies on
   `MAP_ANONYMOUS | MAP_PRIVATE` + `mremap` for in-place growth and on
   a POSIX threading model. No macOS, Windows, or ARM64 builds.
+- **Forks.** Supports Frontier through **Osaka** (the current
+  Ethereum mainnet fork). Amsterdam and later are not yet
+  implemented; EELS fixtures that target those forks are marked
+  *skipped* by the test runner rather than attempted. Amsterdam
+  work (including EIP-7928 Block Access Lists) tracks on its own
+  branch.
 
 ## Quick start
 
