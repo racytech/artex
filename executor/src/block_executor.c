@@ -536,6 +536,17 @@ block_result_t block_execute(evm_t *evm,
         }
         tx = ptx->tx;
 
+        /* EIP-7825 (Osaka+): per-transaction gas limit cap.
+         * Any tx with gas_limit > 2^24 (16,777,216) makes the whole
+         * block invalid — break, cleanup handles the remaining
+         * decoded txs including this one via the last_tx index. */
+        if (evm->fork >= FORK_OSAKA && tx.gas_limit > (1UL << 24)) {
+            result.success = false;
+            if (result.first_failure < 0) result.first_failure = (int)i;
+            last_tx = i;
+            break;
+        }
+
         /* Trace transaction details when debugging */
         if (g_trace_calls) {
             fprintf(stderr, "TX[%zu] sender=%02x%02x..%02x%02x to=%02x%02x..%02x%02x "

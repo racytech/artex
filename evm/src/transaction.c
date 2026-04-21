@@ -279,6 +279,14 @@ bool transaction_execute(
     // We must check the fork level, NOT whether mix_hash is non-zero,
     // because pre-merge PoW blocks have non-zero mix_hash (the PoW solution).
     evm_fork_t tx_fork = fork_get_active(env->block_number, env->timestamp, evm->chain_config);
+
+    // EIP-7825 (Osaka+): per-transaction gas limit cap of 2^24.
+    // Reject tx before any state changes; state_test runners check
+    // the return value, block_executor breaks the block loop
+    // separately so an Osaka block containing such a tx is invalid.
+    if (tx_fork >= FORK_OSAKA && tx->gas_limit > (1UL << 24)) {
+        return false;
+    }
     uint256_t block_difficulty = env->difficulty;
     if (tx_fork >= FORK_PARIS) {
         block_difficulty = uint256_from_bytes(env->prev_randao.bytes, 32);
