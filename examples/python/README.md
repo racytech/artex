@@ -8,6 +8,7 @@ execute blocks from era files, and compute state roots.
 |---|---|
 | `artex_cli.py` | Interactive REPL. The main example. |
 | `example_query.py` | One-shot snapshot query (scriptable). |
+| `example_roundtrip.py` | Differential test: rebuild a canonical mainnet block via `rx_build_block` and diff every header field against what the block itself claims. |
 | `artex.py` | High-level `Engine` wrapper (imported by the examples). |
 | `era.py` | Post-merge era file reader. |
 
@@ -20,19 +21,6 @@ execute blocks from era files, and compute state roots.
 ```bash
 sudo apt install build-essential cmake pkg-config \
     libcjson-dev libssl-dev libsnappy-dev
-```
-
-On Fedora/RHEL:
-
-```bash
-sudo dnf install gcc cmake pkgconf-pkg-config \
-    cjson-devel openssl-devel snappy-devel
-```
-
-On macOS (Homebrew):
-
-```bash
-brew install cmake cjson openssl snappy
 ```
 
 The rest of the native deps are bundled as pre-built static libraries in
@@ -115,27 +103,31 @@ Or use the helper script:
 
 ## Running the interactive CLI
 
-The CLI requires a state snapshot path on startup (`--state`). The
-directory containing the snapshot must also hold the three sidecar
-files (`.hashes`, `chain_replay_code.dat`, `chain_replay_code.idx`).
-The CLI validates them upfront and refuses to launch with a clear
-error if anything is missing.
+The CLI starts with no state loaded — you choose between `load-state`
+(snapshot package) or `load-genesis` (genesis JSON) once inside the
+REPL. For snapshot loads, the directory holding the `.bin` must also
+contain the three sidecar files (`.hashes`, `chain_replay_code.dat`,
+`chain_replay_code.idx`); the CLI infers `data_dir` from the snapshot
+path on the fly.
 
 ```bash
-python3 artex_cli.py --state /path/to/state_24864361.bin
+python3 artex_cli.py                              # REPL starts empty
+python3 artex_cli.py --data-dir /path/to          # optional: pin data_dir upfront
 ```
 
-Session (state is loaded automatically at startup):
+Session:
 
 ```
 libartex version: 0.1.0
-data dir: /path/to
+
+  artex interactive CLI — type 'help' or '?' for commands, 'quit' to exit.
+  no state is loaded on startup — run 'load-state <path>' or 'load-genesis <path>' first.
+
+artex> load-state /path/to/state_24864361.bin
+  data dir set to: /path/to
   loading /path/to/state_24864361.bin ...
 recomputing state root on state load (block 24864361)...
   loaded state at block 24864361 (95.3s)
-
-artex> version
-libartex 0.1.0
 
 artex> block
 24864361
@@ -186,11 +178,14 @@ artex> quit
 
   | distance to `--to` | interval |
   |---|---|
-  | > 100,000 | every 1024 blocks |
-  | > 10,000  | every 256 |
-  | > 1,000   | every 64 |
-  | > 100     | every 16 |
-  | ≤ 100     | every 1 |
+  | > 10,000 | every 1024 blocks |
+  | > 1,000  | every 256 |
+  | > 100    | every 64 |
+  | > 15     | every 16 |
+  | ≤ 15     | every 1 |
+
+  Coarse during bulk replay, tight in the final 15 blocks — so a
+  divergence near the target is pinpointed to the exact block.
 
 ## Running the scriptable query
 
