@@ -33,22 +33,7 @@ digest. No separate flat store, no separate MPT, no double writes —
 one walk covers lookup, and one walk (over just the changed parts)
 covers root computation.
 
-### Why hashed keys
-
-Feeding keys through keccak-256 before insert turns every key into a
-uniformly-distributed 32-byte string. Two consequences:
-
-- ART's adaptive node layouts always land in their sweet spot — no
-  pathological long chains from sequential key patterns (nonce-like
-  slot indices, sequential contract addresses, and similar).
-- We drop the **path compression** (prefix storage inside internal
-  nodes) that textbook ART uses to collapse single-child chains:
-  hashed keys essentially never share a prefix past the first byte
-  or two, so the bookkeeping would cost more than it saves. Our
-  nodes carry no `prefix[]` field; lookup is one byte → one branch
-  → one step.
-
-### What else ART buys
+### What ART gives us
 
 - **Adaptive node layouts (4 / 16 / 48 / 256 children).** The trie
   switches between compact and dense node types as fan-out grows, so
@@ -62,19 +47,14 @@ uniformly-distributed 32-byte string. Two consequences:
   a handful of cache lines, and nodes are allocated out of the same
   pool, so walking the trie has better locality than node-per-malloc
   trees.
+- **No path compression.** Textbook ART stores shared-prefix bytes
+  inside internal nodes to collapse single-child chains. Hashed keys
+  essentially never share prefixes past the first byte or two, so
+  we skip the bookkeeping — nodes carry no `prefix[]` field, and
+  lookup is one byte → one branch → one step.
 - **No compaction, no rebalancing, no write amplification.** Inserts
   and deletes mutate one or two nodes and are done. Nothing like an
   LSM-tree merge pass or B-tree split cascade.
-
-### Implementation choices on top
-
-- **Slab-chained pool allocation.** All ART nodes live in a single
-  anonymous mmap pool, sliced into per-account slab chains that
-  never get moved on grow. No memcpy storms when a contract's
-  storage expands, no reallocation tails, bounded fragmentation.
-- **Fully in-memory on the hot path.** No explicit buffer pool, no
-  I/O in the read/write path. The shared pool is one `MAP_PRIVATE`
-  mmap; Linux pages cold accounts out transparently via swap.
 
 ### Tradeoffs
 
@@ -147,30 +127,35 @@ breakdown for this 49,017-block window:
 | Forward replay (per-block gas, per-256 root) | **~70 min** | 49,017 blocks. |
 | **Total** | **~105 min** | From engine construction to a state caught up to block 24,913,378. |
 
-Scaled linearly, closing a larger gap is roughly `35 min +
-N_blocks / 13.3 s`. The load cost is paid once per process; keeping
-the engine alive and executing blocks in a loop avoids it on every
-subsequent block.
+The `state_load` + full root re-verification cost is paid once per
+process. Keep the engine alive across your workload and subsequent
+block executions run at steady-state throughput without paying it
+again.
 
 Step-by-step to reproduce the run on your own machine — prereq
 checklist, exact commands, expected output, and useful variations —
 is in [`examples/python/replay_walkthrough.md`](examples/python/replay_walkthrough.md).
 
-### Major-fault profile
+### Swap behavior
 
-Ballpark fault rates during a bulk replay (measured on an earlier
-pool design; the current `hart_pool` / `storage_hart2` layout may
-shift the steady-state numbers but the shape is the same):
+On a machine where state doesn't fit entirely in RAM, the first few
+minutes of replay produce heavy page-fault activity as the hot
+working set gets pulled into memory. Rates settle down once the
+working set is resident. More RAM and faster NVMe both shorten this
+warm-up; tmpfs-backed runs skip it entirely.
 
-- First ~30 seconds: 20k–34k major faults/s as the hot working set
-  gets pulled back into RAM from swap
-- Settling to ~1,500/s after ~5 minutes
-- Steady state (warm hot set): ~700/s average, with bursts to
-  ~3,500/s when a block touches a dormant contract
+### Library footprint
 
-These rates depend heavily on the swap device. With tmpfs or enough
-RAM to hold the whole state, you'd see close to zero major faults
-and the throughput numbers above would move up.
+`libartex.so` is ~4.7 MB with debug info retained, or ~2.1 MB after
+`strip`. Runtime dynamic deps are just `libcjson`, `libssl`, and
+`libc` — all system packages on Linux. GMP, libsecp256k1, and blst
+are compiled in as static archives; nothing from `third_party/`
+travels alongside.
+
+Note: the calling thread must have at least **~32 MB of stack** for
+worst-case EVM depth (1024 nested CALLs). `rx_engine_create` fails
+if the current `RLIMIT_STACK` is smaller — run `ulimit -s 32768`
+(or `resource.setrlimit` in Python) first.
 
 ### Scope and limitations
 
