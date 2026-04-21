@@ -244,8 +244,10 @@ typedef struct {
  * Create execution engine. Returns NULL on failure (check rx_engine_last_error).
  *
  * NOTE: EVM supports 1024-deep call stacks. The calling thread must have at
- * least 32MB of stack space. If the stack is too small, a warning is printed
- * to stderr. Set with: ulimit -s 32768, setrlimit(), or pthread_attr_setstacksize().
+ * least 32MB of stack space or this function will fail. Set before calling
+ * via: `ulimit -s 32768`, `setrlimit(RLIMIT_STACK, …)`, or
+ * `pthread_attr_setstacksize()`. In Python:
+ * `resource.setrlimit(resource.RLIMIT_STACK, (32 << 20, hard))`.
  */
 RX_API rx_engine_t *rx_engine_create(const rx_config_t *config);
 

@@ -464,11 +464,35 @@ class BuildBlockResult:
             self._raw = None
 
 
+# libartex requires >= 32 MB stack for worst-case EVM call depth
+# (1024 nested CALL opcodes). Linux re-checks RLIMIT_STACK at
+# stack-growth-fault time, so raising the soft limit at runtime
+# extends the allowed growth for the already-running Python thread.
+_REQUIRED_STACK = 32 * 1024 * 1024
+
+
+def _ensure_stack_size() -> None:
+    """Raise RLIMIT_STACK to at least 32 MB if possible. Best effort:
+    if the hard limit forbids it (needs root) this stays silent and
+    lets rx_engine_create produce its own actionable error."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+        if soft >= _REQUIRED_STACK:
+            return
+        new_hard = hard if hard == resource.RLIM_INFINITY or hard >= _REQUIRED_STACK \
+                        else _REQUIRED_STACK
+        resource.setrlimit(resource.RLIMIT_STACK, (_REQUIRED_STACK, new_hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
 class Engine:
     """High-level wrapper around rx_engine_t. Use as a context manager
     to guarantee cleanup, or call close() explicitly."""
 
     def __init__(self, config: Config | None = None):
+        _ensure_stack_size()
         lib = _lib()
         rx_cfg = (config or Config())._to_rx()
         self._lib = lib
@@ -476,7 +500,9 @@ class Engine:
         if not self._p:
             raise ArtexError(
                 RxError.OUT_OF_MEMORY,
-                "rx_engine_create returned NULL",
+                "rx_engine_create returned NULL — see stderr "
+                "(likely RLIMIT_STACK < 32 MB; run "
+                "`ulimit -s 32768` before python)",
             )
         self._state_p = lib.rx_engine_get_state(self._p)
 

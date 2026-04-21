@@ -123,15 +123,21 @@ rx_engine_t *rx_engine_create(const rx_config_t *config) {
     if (!config) return NULL;
     if (config->chain_id != RX_CHAIN_MAINNET) return NULL;
 
-    /* Warn if thread stack is too small for deep EVM call chains */
+    /* Fail fast if the calling thread's stack is too small for
+     * worst-case EVM depth (1024 nested CALL opcodes ≈ 32 MB).
+     * A warning here used to be easy to miss and left users
+     * walking toward a stack overflow 1000 blocks in. */
     struct rlimit rl;
     if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur < RX_MIN_STACK_SIZE) {
         fprintf(stderr,
-            "WARNING: thread stack size is %luMB, recommend >= %luMB\n"
-            "  EVM supports 1024-deep call stacks which require ~32MB of C stack.\n"
-            "  Set with: ulimit -s 32768  (or setrlimit/pthread_attr_setstacksize)\n",
+            "ERROR: thread stack size is %luMB, need >= %luMB\n"
+            "  EVM supports 1024-deep call chains which require ~32MB of C stack.\n"
+            "  Fix: ulimit -s 32768   (shell)\n"
+            "   or: resource.setrlimit(resource.RLIMIT_STACK, (32<<20, hard))   (Python)\n"
+            "   or: setrlimit()/pthread_attr_setstacksize()   (C/cgo)\n",
             (unsigned long)(rl.rlim_cur / (1024 * 1024)),
             (unsigned long)(RX_MIN_STACK_SIZE / (1024 * 1024)));
+        return NULL;
     }
 
     rx_engine_t *e = calloc(1, sizeof(rx_engine_t));
