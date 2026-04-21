@@ -192,6 +192,21 @@ bool test_runner_run_blockchain_test(test_runner_t *runner,
             goto cleanup;
         }
 
+        /* EIP-7934 (Osaka+): reject blocks whose RLP encoding exceeds 8 MiB. */
+        {
+            evm_fork_t blk_fork = fork_get_active(hdr.number, hdr.timestamp, fork_config);
+            if (blk_fork >= FORK_OSAKA && block->rlp_len > MAX_RLP_BLOCK_SIZE_OSAKA) {
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                         "Block %zu RLP size %zu exceeds EIP-7934 cap %u",
+                         block_idx, block->rlp_len,
+                         (unsigned)MAX_RLP_BLOCK_SIZE_OSAKA);
+                test_result_add_failure(result, "block_rlp_size_limit", NULL, NULL, msg);
+                block_body_free(&body);
+                goto cleanup;
+            }
+        }
+
         // Debug: print coinbase from decoded header
         if (runner->config.verbose) {
             char cb[43];

@@ -13,6 +13,11 @@
 extern "C" {
 #endif
 
+/* EIP-7934 (Osaka+): protocol-level cap on RLP-encoded execution block size.
+ * MAX_BLOCK_SIZE = 10 MiB; SAFETY_MARGIN = 2 MiB reserved for beacon block.
+ * MAX_RLP_BLOCK_SIZE = 8 MiB — any block whose RLP exceeds this is invalid. */
+#define MAX_RLP_BLOCK_SIZE_OSAKA  (8u * 1024u * 1024u)
+
 /**
  * Ethereum block header — decoded from RLP.
  *

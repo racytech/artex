@@ -49,8 +49,8 @@ extern "C"
         FORK_SHANGHAI,          // EIP-3651, EIP-3855, EIP-3860, EIP-4895
         FORK_CANCUN,            // EIP-1153, EIP-4844, EIP-5656, EIP-6780, EIP-7516
         FORK_PRAGUE,            // EIP-7623, EIP-7702, EIP-2935, EIP-7685
-        FORK_OSAKA,             // EIP-7951, EIP-7825, EIP-7594 (Fusaka)
-        FORK_AMSTERDAM,         // EIP-7928 Block Access Lists, EIP-7934 (2026)
+        FORK_OSAKA,             // EIP-7951, EIP-7825, EIP-7594, EIP-7934 (Fusaka)
+        FORK_AMSTERDAM,         // EIP-7928, EIP-8037, EIP-8024, EIP-7708, EIP-7939 (2026)
         FORK_VERKLE,            // Verkle tree state (EIP-4762, EIP-6800, EIP-7709)
         FORK_LATEST             // Always points to the latest fork
     } evm_fork_t;
