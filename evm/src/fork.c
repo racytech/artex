@@ -30,6 +30,7 @@ static const char *fork_names[] = {
     [FORK_CANCUN] = "Cancun",
     [FORK_PRAGUE] = "Prague",
     [FORK_OSAKA] = "Osaka",
+    [FORK_AMSTERDAM] = "Amsterdam",
     [FORK_VERKLE] = "Verkle",
     [FORK_LATEST] = "Latest",
 };
@@ -69,6 +70,7 @@ static const chain_config_t mainnet_config = {
         .cancun = 1710338135,   // Timestamp: March 13, 2024
         .prague = 1746612311,   // Timestamp: May 7, 2025 (Pectra)
         .osaka = 1764798551,    // Timestamp: Dec 3, 2025 (Fusaka)
+        .amsterdam = UINT64_MAX, // not yet scheduled on mainnet
         .verkle = UINT64_MAX,
     },
     .blob_cancun = { .target = 3, .max = 6, .update_fraction = 3338477, .timestamp = 0 },
@@ -111,6 +113,7 @@ static const chain_config_t sepolia_config = {
         .cancun = 1706655072,   // Timestamp: Jan 30, 2024
         .prague = UINT64_MAX,
         .osaka = UINT64_MAX,
+        .amsterdam = UINT64_MAX,
         .verkle = UINT64_MAX,
     }};
 
@@ -145,6 +148,7 @@ static const chain_config_t goerli_config = {
         .cancun = 1705473120,   // Timestamp: Jan 17, 2024
         .prague = UINT64_MAX,
         .osaka = UINT64_MAX,
+        .amsterdam = UINT64_MAX,
         .verkle = UINT64_MAX,
     }};
 
@@ -179,6 +183,7 @@ static const chain_config_t holesky_config = {
         .cancun = 1707305664,   // Timestamp: Feb 7, 2024
         .prague = UINT64_MAX,
         .osaka = UINT64_MAX,
+        .amsterdam = UINT64_MAX,
         .verkle = UINT64_MAX,
     }};
 
@@ -221,6 +226,7 @@ chain_config_t *chain_config_create(uint64_t chain_id, const char *name)
     config->fork_blocks.cancun = UINT64_MAX;
     config->fork_blocks.prague = UINT64_MAX;
     config->fork_blocks.osaka = UINT64_MAX;
+    config->fork_blocks.amsterdam = UINT64_MAX;
     config->fork_blocks.verkle = UINT64_MAX;
 
     /* Initialize blob configs with defaults (no BPO overrides for test chains) */
@@ -257,6 +263,8 @@ evm_fork_t fork_get_active(uint64_t block_number, uint64_t timestamp, const chai
     // UINT64_MAX means "not activated" — never match, even if block timestamp equals UINT64_MAX
     if (forks->verkle != UINT64_MAX && timestamp >= forks->verkle)
         return FORK_VERKLE;
+    if (forks->amsterdam != UINT64_MAX && timestamp >= forks->amsterdam)
+        return FORK_AMSTERDAM;
     if (forks->osaka != UINT64_MAX && timestamp >= forks->osaka)
         return FORK_OSAKA;
     if (forks->prague != UINT64_MAX && timestamp >= forks->prague)
@@ -350,6 +358,8 @@ uint64_t fork_get_activation_block(const chain_config_t *config, evm_fork_t fork
         return forks->prague;
     case FORK_OSAKA:
         return forks->osaka;
+    case FORK_AMSTERDAM:
+        return forks->amsterdam;
     case FORK_VERKLE:
         return forks->verkle;
     default:

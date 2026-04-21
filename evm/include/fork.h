@@ -9,7 +9,7 @@
  *   Frontier (2015) → Homestead → Tangerine Whistle → Spurious Dragon
  *   → Byzantium → Constantinople → Petersburg → Istanbul → Muir Glacier
  *   → Berlin → London → Arrow Glacier → Gray Glacier → Paris (The Merge)
- *   → Shanghai → Cancun
+ *   → Shanghai → Cancun → Prague → Osaka → Amsterdam
  */
 
 #ifndef ART_EVM_FORK_H
@@ -49,7 +49,8 @@ extern "C"
         FORK_SHANGHAI,          // EIP-3651, EIP-3855, EIP-3860, EIP-4895
         FORK_CANCUN,            // EIP-1153, EIP-4844, EIP-5656, EIP-6780, EIP-7516
         FORK_PRAGUE,            // EIP-7623, EIP-7702, EIP-2935, EIP-7685
-        FORK_OSAKA,             // Future
+        FORK_OSAKA,             // EIP-7951, EIP-7825, EIP-7594 (Fusaka)
+        FORK_AMSTERDAM,         // EIP-7928 Block Access Lists, EIP-7934 (2026)
         FORK_VERKLE,            // Verkle tree state (EIP-4762, EIP-6800, EIP-7709)
         FORK_LATEST             // Always points to the latest fork
     } evm_fork_t;
@@ -62,7 +63,7 @@ extern "C"
      * Fork activation schedule for a specific chain.
      *
      * Pre-merge fields (frontier through paris): block numbers.
-     * Post-merge fields (shanghai through osaka): timestamps.
+     * Post-merge fields (shanghai through amsterdam): timestamps.
      */
     typedef struct
     {
@@ -86,6 +87,7 @@ extern "C"
         uint64_t cancun;
         uint64_t prague;
         uint64_t osaka;
+        uint64_t amsterdam;
         uint64_t verkle;
     } fork_schedule_t;
 

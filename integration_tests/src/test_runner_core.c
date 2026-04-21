@@ -49,6 +49,7 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
     test_config.fork_blocks.cancun = UINT64_MAX;
     test_config.fork_blocks.prague = UINT64_MAX;
     test_config.fork_blocks.osaka = UINT64_MAX;
+    test_config.fork_blocks.amsterdam = UINT64_MAX;
     test_config.fork_blocks.verkle = UINT64_MAX;
 
     // Enable forks cumulatively up to the target fork.
@@ -237,6 +238,25 @@ chain_config_t *create_test_chain_config(const char *fork_name) {
         test_config.fork_blocks.cancun = 0;
         test_config.fork_blocks.prague = 0;
         test_config.fork_blocks.osaka = 0;
+    } else if (strcmp(fork_name, "Amsterdam") == 0) {
+        test_config.fork_blocks.homestead = 0;
+        test_config.fork_blocks.tangerine_whistle = 0;
+        test_config.fork_blocks.spurious_dragon = 0;
+        test_config.fork_blocks.byzantium = 0;
+        test_config.fork_blocks.constantinople = 0;
+        test_config.fork_blocks.petersburg = 0;
+        test_config.fork_blocks.istanbul = 0;
+        test_config.fork_blocks.muir_glacier = 0;
+        test_config.fork_blocks.berlin = 0;
+        test_config.fork_blocks.london = 0;
+        test_config.fork_blocks.arrow_glacier = 0;
+        test_config.fork_blocks.gray_glacier = 0;
+        test_config.fork_blocks.paris = 0;
+        test_config.fork_blocks.shanghai = 0;
+        test_config.fork_blocks.cancun = 0;
+        test_config.fork_blocks.prague = 0;
+        test_config.fork_blocks.osaka = 0;
+        test_config.fork_blocks.amsterdam = 0;
     } else if (strcmp(fork_name, "Verkle") == 0) {
         test_config.fork_blocks.homestead = 0;
         test_config.fork_blocks.tangerine_whistle = 0;
