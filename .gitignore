@@ -164,7 +164,7 @@ todo-checklist-old.md
 .claude/
 eip-*.md
 
-save
+save*
 
 # External binaries
 lighthouse*/
