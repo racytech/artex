@@ -176,11 +176,23 @@ Python and C.
 Ubuntu / Debian:
 
 ```bash
-sudo apt install build-essential cmake pkg-config \
+sudo apt install build-essential cmake pkg-config perl \
     libcjson-dev libssl-dev libsnappy-dev
 ```
 
-Build the shared library from the repo root:
+First-time setup — fetches the two submodules (`blst`, `secp256k1`)
+and builds their static archives:
+
+```bash
+./setup.sh
+```
+
+Idempotent: safe to rerun after a `git pull`; skips anything that's
+already built. `gmp` is vendored directly in the repo so it doesn't
+need a build step. Pass `--force` to rebuild the submodules from
+scratch if you ever need to.
+
+Then build `libartex.so` itself:
 
 ```bash
 cmake -B build \
