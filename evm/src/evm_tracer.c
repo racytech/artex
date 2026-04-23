@@ -84,7 +84,28 @@ static const char *opcode_name(uint8_t op) {
 
 /* ---- Global state ---- */
 
-evm_tracer_t g_evm_tracer = { .out = NULL, .enabled = false };
+evm_tracer_t g_evm_tracer = {
+    .out = NULL,
+    .enabled = false,
+    .dump_memory = false,
+    .dump_storage = false,
+};
+
+/* Per-thread storage map — flat array of (addr, key, value) entries.
+ * Grown on demand, reused across transactions via on_tx_start which
+ * just resets the count. Linear scan on update — for typical tx
+ * working sets (<200 distinct slots) this is faster than a hash table
+ * due to cache behavior. Cleared when tracer is disabled is not
+ * necessary (a new tx_start resets state anyway). */
+typedef struct {
+    uint8_t addr[20];
+    uint8_t key[32];
+    uint8_t value[32];
+} storage_entry_t;
+
+static __thread storage_entry_t *g_storage_map = NULL;
+static __thread size_t           g_storage_map_count = 0;
+static __thread size_t           g_storage_map_cap = 0;
 
 /* Per-thread pending trace (single-threaded EVM, so global is fine). */
 /* One per call depth, max 1024+1. We only allocate one and reuse since
@@ -119,9 +140,67 @@ static void emit_pending(uint64_t gas_now, const char *error) {
     uint64_t gas_cost = (pending.gas >= gas_now) ? (pending.gas - gas_now) : 0;
 
     fprintf(f, "{\"pc\":%" PRIu64 ",\"op\":%u,\"gas\":\"0x%" PRIx64 "\","
-               "\"gasCost\":\"0x%" PRIx64 "\",\"memSize\":%zu,"
-               "\"stack\":[",
+               "\"gasCost\":\"0x%" PRIx64 "\",\"memSize\":%zu",
             pending.pc, pending.op, pending.gas, gas_cost, pending.mem_size);
+
+    /* Optional "memory" field — only emitted when dump_memory is on.
+     * Per EIP-3155: Array of Hex-Strings, one entry per 32-byte word
+     * of EVM memory. EVM memory is always word-aligned so the word
+     * count == memory_len / 32. */
+    if (g_evm_tracer.dump_memory) {
+        fprintf(f, ",\"memory\":[");
+        size_t n_words = pending.memory_len / 32;
+        for (size_t w = 0; w < n_words; w++) {
+            if (w > 0) fputc(',', f);
+            fprintf(f, "\"0x");
+            for (int b = 0; b < 32; b++)
+                fprintf(f, "%02x", pending.memory_buf[w * 32 + b]);
+            fprintf(f, "\"");
+        }
+        /* Safety: if memory_len isn't a multiple of 32 for some
+         * unexpected reason, emit a padded final word. */
+        size_t tail = pending.memory_len % 32;
+        if (tail != 0) {
+            if (n_words > 0) fputc(',', f);
+            fprintf(f, "\"0x");
+            for (size_t b = 0; b < tail; b++)
+                fprintf(f, "%02x", pending.memory_buf[n_words * 32 + b]);
+            for (size_t b = tail; b < 32; b++)
+                fprintf(f, "00");
+            fprintf(f, "\"");
+        }
+        fprintf(f, "]");
+    }
+
+    /* EIP-3155 requires returnData. Emit empty "0x" when no return
+     * data has been set yet (before any sub-call completes). */
+    fprintf(f, ",\"returnData\":\"0x");
+    for (size_t i = 0; i < pending.return_data_len; i++)
+        fprintf(f, "%02x", pending.return_data_buf[i]);
+    fprintf(f, "\"");
+
+    /* Optional "storage" field — touched slots in current tx filtered
+     * to the currently-executing contract. */
+    if (g_evm_tracer.dump_storage) {
+        fprintf(f, ",\"storage\":{");
+        bool first = true;
+        for (size_t i = 0; i < g_storage_map_count; i++) {
+            if (memcmp(g_storage_map[i].addr,
+                       pending.current_addr, 20) != 0) continue;
+            if (!first) fputc(',', f);
+            first = false;
+            fprintf(f, "\"0x");
+            for (int b = 0; b < 32; b++)
+                fprintf(f, "%02x", g_storage_map[i].key[b]);
+            fprintf(f, "\":\"0x");
+            for (int b = 0; b < 32; b++)
+                fprintf(f, "%02x", g_storage_map[i].value[b]);
+            fprintf(f, "\"");
+        }
+        fprintf(f, "}");
+    }
+
+    fprintf(f, ",\"stack\":[");
 
     /* Stack (bottom to top) */
     for (int i = 0; i < pending.stack_count; i++) {
@@ -131,8 +210,8 @@ static void emit_pending(uint64_t gas_now, const char *error) {
         fprintf(f, "\"%s\"", hex);
     }
 
-    fprintf(f, "],\"depth\":%d,\"refund\":%" PRId64,
-            pending.depth, pending.refund);
+    fprintf(f, "],\"depth\":%d,\"refund\":\"0x%" PRIx64 "\"",
+            pending.depth, (uint64_t)pending.refund);
 
     if (error) {
         fprintf(f, ",\"opName\":\"%s\",\"error\":\"%s\"}\n",
@@ -152,6 +231,54 @@ static void capture_state(evm_t *evm) {
     pending.depth = evm->msg.depth + 1;  /* 1-based like geth */
     pending.refund = evm->gas_refund;
     pending.mem_size = evm_memory_size(evm->memory);
+
+    /* Memory snapshot — only when dump_memory is enabled. Grow the
+     * per-thread buffer as needed; it's reused across ops and lives
+     * for the process lifetime. */
+    if (g_evm_tracer.dump_memory && pending.mem_size > 0) {
+        if (pending.mem_size > pending.memory_buf_cap) {
+            uint8_t *nb = realloc(pending.memory_buf, pending.mem_size);
+            if (nb) {
+                pending.memory_buf = nb;
+                pending.memory_buf_cap = pending.mem_size;
+            } else {
+                pending.memory_len = 0;
+                goto stack_capture;
+            }
+        }
+        const uint8_t *src = evm_memory_get_ptr(evm->memory, 0);
+        if (src) {
+            memcpy(pending.memory_buf, src, pending.mem_size);
+            pending.memory_len = pending.mem_size;
+        } else {
+            pending.memory_len = 0;
+        }
+    } else {
+        pending.memory_len = 0;
+    }
+
+    /* Capture current contract address (used by storage dump filter). */
+    memcpy(pending.current_addr, evm->msg.recipient.bytes, 20);
+
+    /* Return data snapshot — always captured because EIP-3155
+     * requires the field. Lazy-grown reused buffer. */
+    if (evm->return_data_size > 0) {
+        if (evm->return_data_size > pending.return_data_buf_cap) {
+            uint8_t *nb = realloc(pending.return_data_buf, evm->return_data_size);
+            if (nb) {
+                pending.return_data_buf = nb;
+                pending.return_data_buf_cap = evm->return_data_size;
+            } else {
+                pending.return_data_len = 0;
+                goto stack_capture;
+            }
+        }
+        memcpy(pending.return_data_buf, evm->return_data, evm->return_data_size);
+        pending.return_data_len = evm->return_data_size;
+    } else {
+        pending.return_data_len = 0;
+    }
+stack_capture:
 
     /* Snapshot stack (bottom to top) */
     size_t sz = evm_stack_size(evm->stack);
@@ -175,6 +302,56 @@ void evm_tracer_init(FILE *out) {
     g_evm_tracer.out = out;
     g_evm_tracer.enabled = (out != NULL);
     pending.active = false;
+}
+
+void evm_tracer_set_dump_memory(bool enabled) {
+    g_evm_tracer.dump_memory = enabled;
+}
+
+void evm_tracer_set_dump_storage(bool enabled) {
+    g_evm_tracer.dump_storage = enabled;
+}
+
+void evm_tracer_on_tx_start(void) {
+    g_storage_map_count = 0;
+}
+
+static void storage_upsert(const uint8_t addr[20],
+                           const uint8_t key[32],
+                           const uint8_t value[32]) {
+    /* Find existing entry for this (addr, key) — linear scan. */
+    for (size_t i = 0; i < g_storage_map_count; i++) {
+        if (memcmp(g_storage_map[i].addr, addr, 20) == 0 &&
+            memcmp(g_storage_map[i].key, key, 32) == 0) {
+            memcpy(g_storage_map[i].value, value, 32);
+            return;
+        }
+    }
+    /* Append. Grow the buffer if needed. */
+    if (g_storage_map_count >= g_storage_map_cap) {
+        size_t new_cap = g_storage_map_cap ? g_storage_map_cap * 2 : 64;
+        storage_entry_t *nb = realloc(g_storage_map,
+                                      new_cap * sizeof(storage_entry_t));
+        if (!nb) return;  /* best effort — drop the entry on OOM */
+        g_storage_map = nb;
+        g_storage_map_cap = new_cap;
+    }
+    storage_entry_t *e = &g_storage_map[g_storage_map_count++];
+    memcpy(e->addr, addr, 20);
+    memcpy(e->key,  key,  32);
+    memcpy(e->value, value, 32);
+}
+
+void evm_tracer_on_sload(const uint8_t addr[20], const uint8_t key[32],
+                          const uint8_t value[32]) {
+    if (!g_evm_tracer.enabled || !g_evm_tracer.dump_storage) return;
+    storage_upsert(addr, key, value);
+}
+
+void evm_tracer_on_sstore(const uint8_t addr[20], const uint8_t key[32],
+                           const uint8_t value[32]) {
+    if (!g_evm_tracer.enabled || !g_evm_tracer.dump_storage) return;
+    storage_upsert(addr, key, value);
 }
 
 void evm_tracer_on_dispatch(evm_t *evm) {
@@ -201,8 +378,36 @@ void evm_tracer_on_implicit_stop(evm_t *evm) {
     size_t mem_size = evm_memory_size(evm->memory);
 
     fprintf(f, "{\"pc\":%" PRIu64 ",\"op\":0,\"gas\":\"0x%" PRIx64 "\","
-               "\"gasCost\":\"0x0\",\"memSize\":%zu,\"stack\":[",
+               "\"gasCost\":\"0x0\",\"memSize\":%zu",
             evm->pc, evm->gas_left, mem_size);
+
+    if (g_evm_tracer.dump_memory) {
+        fprintf(f, ",\"memory\":[");
+        const uint8_t *src = (mem_size > 0) ? evm_memory_get_ptr(evm->memory, 0) : NULL;
+        size_t n_words = mem_size / 32;
+        for (size_t w = 0; w < n_words; w++) {
+            if (w > 0) fputc(',', f);
+            fprintf(f, "\"0x");
+            if (src) {
+                for (int b = 0; b < 32; b++)
+                    fprintf(f, "%02x", src[w * 32 + b]);
+            } else {
+                for (int b = 0; b < 32; b++) fprintf(f, "00");
+            }
+            fprintf(f, "\"");
+        }
+        fprintf(f, "]");
+    }
+
+    /* EIP-3155 requires returnData on every line. */
+    fprintf(f, ",\"returnData\":\"0x");
+    if (evm->return_data && evm->return_data_size > 0) {
+        for (size_t i = 0; i < evm->return_data_size; i++)
+            fprintf(f, "%02x", evm->return_data[i]);
+    }
+    fprintf(f, "\"");
+
+    fprintf(f, ",\"stack\":[");
 
     /* Stack snapshot (bottom to top) */
     size_t sz = evm_stack_size(evm->stack);
@@ -217,8 +422,8 @@ void evm_tracer_on_implicit_stop(evm_t *evm) {
         fprintf(f, "\"%s\"", hex);
     }
 
-    fprintf(f, "],\"depth\":%d,\"refund\":%" PRId64 ",\"opName\":\"STOP\"}\n",
-            depth, evm->gas_refund);
+    fprintf(f, "],\"depth\":%d,\"refund\":\"0x%" PRIx64 "\",\"opName\":\"STOP\"}\n",
+            depth, (uint64_t)evm->gas_refund);
 }
 
 void evm_tracer_on_return(const uint8_t *output, size_t output_len,

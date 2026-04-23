@@ -634,12 +634,13 @@ int main(int argc, char **argv) {
     /* Parse flags */
     bool force_clean = false;
     bool follow_mode = false;
-    bool resume_mode = false;
 #ifdef ENABLE_EVM_TRACE
     uint64_t trace_block = UINT64_MAX;  /* UINT64_MAX = no tracing */
     const char *trace_out_path = NULL;  /* NULL → default data/trace/block_<N>.jsonl;
                                          * "-"  → stderr (legacy behavior) */
     FILE *trace_fp = NULL;              /* open across enable/disable blocks */
+    bool trace_memory = false;          /* --trace-memory: include per-op memory */
+    bool trace_storage = false;         /* --trace-storage: include per-op storage dump */
 #endif
     uint64_t dump_prestate_block = UINT64_MAX;
     const char *dump_prestate_path = NULL;
@@ -650,6 +651,7 @@ int main(int argc, char **argv) {
     uint64_t snapshot_every = 0;  /* 0 = disabled */
 #ifdef ENABLE_HISTORY
     bool no_history = false;
+    uint64_t replay_history_to_block = 0;  /* 0 = no replay */
 #endif
     uint32_t validate_every = CHECKPOINT_INTERVAL;
     /* Default data dir: ~/.artex */
@@ -673,10 +675,10 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[1 + arg_offset], "--no-history") == 0) {
             no_history = true;
             arg_offset++;
+        } else if (strcmp(argv[1 + arg_offset], "--replay-history-to") == 0 && arg_offset + 2 < argc) {
+            replay_history_to_block = (uint64_t)atoll(argv[2 + arg_offset]);
+            arg_offset += 2;
 #endif
-        } else if (strcmp(argv[1 + arg_offset], "--resume") == 0) {
-            resume_mode = true;
-            arg_offset++;
         } else if (strcmp(argv[1 + arg_offset], "--validate-every") == 0 && arg_offset + 2 < argc) {
             validate_every = (uint32_t)atoi(argv[2 + arg_offset]);
             if (validate_every == 0) validate_every = 1;
@@ -688,6 +690,12 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[1 + arg_offset], "--trace-out") == 0 && arg_offset + 2 < argc) {
             trace_out_path = argv[2 + arg_offset];
             arg_offset += 2;
+        } else if (strcmp(argv[1 + arg_offset], "--trace-memory") == 0) {
+            trace_memory = true;
+            arg_offset++;
+        } else if (strcmp(argv[1 + arg_offset], "--trace-storage") == 0) {
+            trace_storage = true;
+            arg_offset++;
 #endif
         } else if (strcmp(argv[1 + arg_offset], "--no-validate") == 0) {
             no_validate = true;
@@ -722,11 +730,18 @@ int main(int argc, char **argv) {
             "  --clean               Delete existing state files, start from genesis\n"
             "  --follow              Wait for new era1 files instead of stopping\n"
             "  --data-dir DIR        Set data directory for all state files (default: ~/.artex)\n"
-            "  --resume              Resume from existing MPT state (reads .meta)\n"
             "  --no-history          Disable per-block state diff history\n"
+            "  --replay-history-to N Fast-forward state via history diffs from\n"
+            "                        loaded block+1 to N, then continue normal\n"
+            "                        execute from N+1. Requires history already\n"
+            "                        persisted covering the range.\n"
             "  --trace-block N       Enable EIP-3155 EVM trace for block N\n"
             "                        (default output: data/trace/block_<N>.jsonl)\n"
             "  --trace-out PATH      Override trace output file. '-' for stderr.\n"
+            "  --trace-memory        Include per-op memory dump (array of\n"
+            "                        32-byte words) — big; off by default\n"
+            "  --trace-storage       Include per-op storage dump (touched slots)\n"
+            "                        — inflates trace size 5-10x; off by default\n"
             "  --no-validate         Skip all root validation, compute once at end\n"
             "  --snapshot-every N    Auto-save state every N blocks (e.g. 1000000)\n"
             "  --save-state N [P]    Save full state after block N to binary file P\n"
@@ -889,48 +904,93 @@ int main(int argc, char **argv) {
             sync_resume(sync, loaded_block, hashes, hash_count);
             free(hashes);
         }
-    } else if (resume_mode) {
-        /* Read .meta to find last good block */
-        char meta_path[512];
-        snprintf(meta_path, sizeof(meta_path), "%s.meta", mpt_path);
-        reconstruct_meta_t meta;
-        FILE *mf = fopen(meta_path, "rb");
-        if (!mf || fread(&meta, sizeof(meta), 1, mf) != 1 ||
-            meta.magic != META_MAGIC) {
-            if (mf) fclose(mf);
-            LOG_ERR("No valid .meta file at %s — cannot resume", meta_path);
+
+        /* --replay-history-to: fast-forward state by applying persisted
+         * per-block diffs, then re-seed the hash ring to the new anchor
+         * so normal execute can pick up from there. */
+#ifdef ENABLE_HISTORY
+        if (replay_history_to_block > 0) {
+            if (replay_history_to_block <= loaded_block) {
+                LOG_ERROR("--replay-history-to %lu must be > loaded block %lu",
+                          replay_history_to_block, loaded_block);
+                sync_destroy(sync);
+                archive_close(&archive);
+                return 1;
+            }
+            LOG_INFO("Replaying history diffs: %lu -> %lu (%lu blocks)...",
+                     loaded_block + 1, replay_history_to_block,
+                     replay_history_to_block - loaded_block);
+            struct timespec t_rep0, t_rep1;
+            clock_gettime(CLOCK_MONOTONIC, &t_rep0);
+            uint64_t applied = sync_replay_history(sync, replay_history_to_block);
+            clock_gettime(CLOCK_MONOTONIC, &t_rep1);
+            uint64_t want = replay_history_to_block - loaded_block;
+            double rep_sec = (t_rep1.tv_sec - t_rep0.tv_sec) +
+                             (t_rep1.tv_nsec - t_rep0.tv_nsec) / 1e9;
+            if (applied != want) {
+                LOG_ERROR("history replay incomplete: applied %lu/%lu blocks",
+                          applied, want);
+                sync_destroy(sync);
+                archive_close(&archive);
+                return 1;
+            }
+            LOG_INFO("Replay complete in %.1fs (%.1f blk/s)",
+                     rep_sec, rep_sec > 0 ? applied / rep_sec : 0.0);
+
+            /* Re-seed the block hash ring for the new anchor. */
+            uint64_t new_anchor = replay_history_to_block;
+            uint64_t hash_start2 = new_anchor >= 256 ? new_anchor - 255 : 0;
+            size_t hash_count2 = (size_t)(new_anchor - hash_start2 + 1);
+            hash_t *hashes2 = calloc(hash_count2, sizeof(hash_t));
+            if (hashes2) {
+                if (new_anchor < PARIS_BLOCK) {
+                    for (uint64_t i = 0; i < hash_count2; i++) {
+                        uint64_t hbn = hash_start2 + i;
+                        if (archive_ensure(&archive, hbn, false, era1_dir)) {
+                            uint8_t *h_rlp = NULL; size_t h_len = 0;
+                            uint8_t *b_rlp = NULL; size_t b_len = 0;
+                            if (era1_read_block(&archive.current, hbn,
+                                                 &h_rlp, &h_len, &b_rlp, &b_len)) {
+                                hashes2[i] = hash_keccak256(h_rlp, h_len);
+                                free(h_rlp); free(b_rlp);
+                            }
+                        }
+                    }
+                } else if (era_dir) {
+                    era_archive_t hash_ar;
+                    if (era_archive_open(&hash_ar, era_dir)) {
+                        era_archive_skip_to(&hash_ar, hash_start2);
+                        block_header_t hdr;
+                        block_body_t body;
+                        uint8_t blk_hash[32];
+                        while (era_archive_next(&hash_ar, &hdr, &body, blk_hash)) {
+                            if (hdr.number >= hash_start2) {
+                                if (hdr.number <= new_anchor) {
+                                    size_t idx = (size_t)(hdr.number - hash_start2);
+                                    memcpy(hashes2[idx].bytes, blk_hash, 32);
+                                }
+                                block_body_free(&body);
+                                if (hdr.number >= new_anchor) break;
+                                continue;
+                            }
+                            block_body_free(&body);
+                        }
+                        era_archive_close(&hash_ar);
+                    }
+                }
+                sync_reseed_block_hashes(sync, new_anchor, hashes2, hash_count2);
+                free(hashes2);
+            }
+            start_block = new_anchor + 1;
+        }
+#else
+        if (replay_history_to_block > 0) {
+            LOG_ERROR("--replay-history-to requires ENABLE_HISTORY build flag");
             sync_destroy(sync);
             archive_close(&archive);
             return 1;
         }
-        fclose(mf);
-
-        LOG_INFO("Resuming from block %lu", meta.last_block);
-        start_block = meta.last_block + 1;
-
-        /* Truncate history to last good block (removes stale/buggy diffs) */
-        sync_truncate_history(sync, meta.last_block);
-
-        /* Populate block hash ring from era1 (last 256 blocks) */
-        uint64_t hash_start = meta.last_block >= 256 ? meta.last_block - 255 : 0;
-        size_t hash_count = (size_t)(meta.last_block - hash_start + 1);
-        hash_t *hashes = calloc(hash_count, sizeof(hash_t));
-        if (hashes) {
-            for (uint64_t i = 0; i < hash_count; i++) {
-                uint64_t hbn = hash_start + i;
-                if (archive_ensure(&archive, hbn, false, era1_dir)) {
-                    uint8_t *h_rlp = NULL; size_t h_len = 0;
-                    uint8_t *b_rlp = NULL; size_t b_len = 0;
-                    if (era1_read_block(&archive.current, hbn,
-                                         &h_rlp, &h_len, &b_rlp, &b_len)) {
-                        hashes[i] = hash_keccak256(h_rlp, h_len);
-                        free(h_rlp); free(b_rlp);
-                    }
-                }
-            }
-            sync_resume(sync, meta.last_block, hashes, hash_count);
-            free(hashes);
-        }
+#endif
     } else {
         /* Read genesis block hash from era1 */
         hash_t gen_hash = {0};
@@ -1120,8 +1180,12 @@ int main(int argc, char **argv) {
                 }
             }
             evm_tracer_init(out);
-            fprintf(stderr, "=== EVM TRACE: block %lu → %s ===\n",
-                    bn, resolved_path);
+            evm_tracer_set_dump_memory(trace_memory);
+            evm_tracer_set_dump_storage(trace_storage);
+            fprintf(stderr, "=== EVM TRACE: block %lu → %s%s%s ===\n",
+                    bn, resolved_path,
+                    trace_memory  ? " (+memory)" : "",
+                    trace_storage ? " (+storage)" : "");
         }
 #endif
 

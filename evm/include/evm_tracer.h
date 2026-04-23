@@ -43,6 +43,19 @@ typedef struct {
     /* Stack snapshot (bottom-to-top order, matching geth output) */
     uint8_t  stack[TRACE_MAX_STACK][32]; /* uint256 as 32 big-endian bytes */
     int      stack_count;
+    /* Memory snapshot (populated only when g_evm_tracer.dump_memory
+     * is on). memory_buf is lazily grown to hold the largest memory
+     * seen in this tracer session and lives for tracer lifetime. */
+    uint8_t *memory_buf;
+    size_t   memory_buf_cap;
+    size_t   memory_len;
+    /* Current contract (20-byte address) — used to filter the
+     * storage map on emit. Captured from evm->msg.recipient. */
+    uint8_t  current_addr[20];
+    /* Return data snapshot (populated only when dump_return_data). */
+    uint8_t *return_data_buf;
+    size_t   return_data_buf_cap;
+    size_t   return_data_len;
 } evm_trace_pending_t;
 
 /**
@@ -50,8 +63,10 @@ typedef struct {
  * trace fields that would affect every non-trace build.
  */
 typedef struct {
-    FILE    *out;       /* output stream (stderr, or a file) */
-    bool     enabled;   /* master switch (can be toggled at runtime) */
+    FILE    *out;         /* output stream (stderr, or a file) */
+    bool     enabled;     /* master switch (can be toggled at runtime) */
+    bool     dump_memory; /* emit "memory":[...] per op (opt-in, big) */
+    bool     dump_storage;/* emit "storage":{...} per op (opt-in, big) */
 } evm_tracer_t;
 
 extern evm_tracer_t g_evm_tracer;
@@ -61,6 +76,36 @@ extern evm_tracer_t g_evm_tracer;
  * @param out   Output stream (e.g. stderr, or fopen'd file)
  */
 void evm_tracer_init(FILE *out);
+
+/**
+ * Toggle per-opcode memory dumps. Off by default (matches geth's
+ * default EIP-3155 output). When on, each trace line includes a
+ * "memory":"0x<hex>" field with the full EVM memory at the point of
+ * the opcode. Inflates trace size significantly for memory-heavy
+ * blocks — off for normal tracing, on for deep debugging.
+ */
+void evm_tracer_set_dump_memory(bool enabled);
+
+/**
+ * Toggle per-opcode storage dumps. When on, each trace line includes
+ * "storage":{"0xkey":"0xvalue",...} of storage slots touched via
+ * SLOAD / SSTORE during the current transaction in the current
+ * contract. The map is reset per transaction via
+ * evm_tracer_on_tx_start() and populated via evm_tracer_on_sload /
+ * evm_tracer_on_sstore. Expensive: can grow the trace 5-10x.
+ */
+void evm_tracer_set_dump_storage(bool enabled);
+
+/**
+ * Hooks for storage dump bookkeeping. No-ops when storage dump is off
+ * or tracer is disabled. addr is the 20-byte contract address of
+ * the current execution frame.
+ */
+void evm_tracer_on_tx_start(void);
+void evm_tracer_on_sload(const uint8_t addr[20], const uint8_t key[32],
+                          const uint8_t value[32]);
+void evm_tracer_on_sstore(const uint8_t addr[20], const uint8_t key[32],
+                           const uint8_t value[32]);
 
 /**
  * Capture pre-execution state of the current opcode and emit the PREVIOUS

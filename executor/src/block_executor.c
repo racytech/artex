@@ -12,6 +12,7 @@
 #include "rlp.h"
 #include "hash.h"
 #include "evm_state.h"
+#include "evm_tracer.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -441,7 +442,16 @@ static hash_t block_finalize_state(evm_t *evm,
     struct timespec _rt0, _rt1;
     clock_gettime(CLOCK_MONOTONIC, &_rt0);
     hash_t root = {0};
-    if (!evm->skip_root_hash)
+    /* Force root computation when the tracer is active — otherwise
+     * the EIP-3155 tx-summary line for the last tx would carry a
+     * zero stateRoot under --no-validate, which defeats the point
+     * of tracing. One extra compute_root per traced block is cheap
+     * relative to trace generation itself. */
+    bool force_root_for_trace = false;
+#ifdef ENABLE_EVM_TRACE
+    force_root_for_trace = g_evm_tracer.enabled;
+#endif
+    if (!evm->skip_root_hash || force_root_for_trace)
         root = evm_state_compute_state_root_ex(evm->state, prune_empty);
     clock_gettime(CLOCK_MONOTONIC, &_rt1);
 
@@ -523,6 +533,19 @@ block_result_t block_execute(evm_t *evm,
     }
 
     size_t last_tx = tx_count;  /* track how far we got for cleanup */
+
+#ifdef ENABLE_EVM_TRACE
+    /* Per-EIP-3155: emit a summary line after each tx. stateRoot is left
+     * empty for intermediate txs and carries the block's computed state
+     * root on the final tx. The last tx's summary is stashed here and
+     * flushed after block_finalize_state returns the root. */
+    uint8_t *trace_last_output = NULL;
+    size_t   trace_last_output_len = 0;
+    uint64_t trace_last_gas_used = 0;
+    bool     trace_last_pass = false;
+    bool     trace_have_last = false;
+#endif
+
     for (size_t i = 0; i < tx_count; i++) {
         prepared_tx_t *ptx = &decoded[i];
 
@@ -570,9 +593,44 @@ block_result_t block_execute(evm_t *evm,
         else
             result.call_count++;
 
+        /* Tell the tracer a new tx is starting — clears the per-tx
+         * storage map used by --trace-storage. No-op when tracer is
+         * off. */
+#ifdef ENABLE_EVM_TRACE
+        evm_tracer_on_tx_start();
+#endif
+
         /* Execute transaction */
         transaction_result_t tx_result;
         bool ok = transaction_execute(evm, &tx, &tx_env, &tx_result);
+
+#ifdef ENABLE_EVM_TRACE
+        /* EIP-3155 per-tx summary. Intermediate txs emit now with empty
+         * stateRoot; the last tx is stashed for post-finalize emit with
+         * the block's computed state root. Must run BEFORE the
+         * transaction_result_free path below, which frees output_data. */
+        if (g_evm_tracer.enabled && g_evm_tracer.out) {
+            bool tx_pass = ok && tx_result.status == EVM_SUCCESS;
+            if (i == tx_count - 1) {
+                if (tx_result.output_data && tx_result.output_size > 0) {
+                    trace_last_output = malloc(tx_result.output_size);
+                    if (trace_last_output) {
+                        memcpy(trace_last_output, tx_result.output_data,
+                               tx_result.output_size);
+                        trace_last_output_len = tx_result.output_size;
+                    }
+                }
+                trace_last_gas_used = tx_result.gas_used;
+                trace_last_pass = tx_pass;
+                trace_have_last = true;
+            } else {
+                evm_tracer_tx_summary(NULL,
+                                      tx_result.output_data,
+                                      tx_result.output_size,
+                                      tx_result.gas_used, tx_pass);
+            }
+        }
+#endif
 
         /* Fill receipt */
         result.receipts[i].success = ok;
@@ -809,6 +867,16 @@ block_result_t block_execute(evm_t *evm,
 #endif
                                              &result.root_ms);
     result.gas_used = cumulative_gas;
+
+#ifdef ENABLE_EVM_TRACE
+    /* Emit the stashed last-tx summary with the just-computed stateRoot. */
+    if (trace_have_last && g_evm_tracer.enabled && g_evm_tracer.out) {
+        evm_tracer_tx_summary(result.state_root.bytes,
+                              trace_last_output, trace_last_output_len,
+                              trace_last_gas_used, trace_last_pass);
+    }
+    free(trace_last_output);
+#endif
 
     return result;
 }

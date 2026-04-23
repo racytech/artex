@@ -572,6 +572,47 @@ void sync_truncate_history(sync_t *sync, uint64_t last_block) {
 #endif
 }
 
+void sync_reseed_block_hashes(sync_t *sync, uint64_t last_block,
+                              const hash_t *block_hashes, size_t count) {
+    if (!sync || !block_hashes || count == 0) return;
+    for (size_t i = 0; i < count; i++) {
+        uint64_t bn = last_block - count + 1 + i;
+        sync->block_hashes[bn % BLOCK_HASH_WINDOW] = block_hashes[i];
+    }
+}
+
+uint64_t sync_replay_history(sync_t *sync, uint64_t target_block) {
+#ifdef ENABLE_HISTORY
+    if (!sync || !sync->history) return 0;
+    if (target_block <= sync->last_block) return 0;
+
+    uint64_t first = sync->last_block + 1;
+    uint64_t want  = target_block - first + 1;
+
+    /* EIP-161 pruning must be on for commit_tx (inside apply_diff) to prune
+     * empty accounts — matches the library's rx_engine_replay_history_to
+     * gating. Mainnet activated EIP-161 at block 2,675,000. */
+    evm_state_set_prune_empty(sync->state, sync->last_block >= 2675000);
+
+    uint64_t got = state_history_replay(sync->history, sync->state,
+                                        first, target_block);
+    if (got != want) return got;
+
+    /* Defensive reset of per-block undo log after replay — mirrors the
+     * library API path. See rx_engine_replay_history_to for the full
+     * rationale (corruption pattern where blk_orig_* leaked into the
+     * first post-replay block's captured diff). */
+    state_t *st = evm_state_get_state(sync->state);
+    if (st) state_reset_block(st);
+
+    sync->last_block = target_block;
+    return got;
+#else
+    (void)sync; (void)target_block;
+    return 0;
+#endif
+}
+
 evm_state_t *sync_get_state(const sync_t *sync) {
     return sync ? sync->state : NULL;
 }

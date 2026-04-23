@@ -6,9 +6,29 @@
 #include "evm_state.h"
 #include "opcodes/storage.h"
 #include "evm_stack.h"
+#include "evm_tracer.h"
 #include "gas.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
+
+/* Little helper used in both SLOAD paths + SSTORE to feed the tracer
+ * without changing control flow. No-op when tracer is off. */
+static inline void trace_storage_access(const uint8_t addr[20],
+                                        const uint256_t *key_u,
+                                        const uint256_t *val_u,
+                                        bool is_sstore) {
+#ifdef ENABLE_EVM_TRACE
+    if (!g_evm_tracer.enabled || !g_evm_tracer.dump_storage) return;
+    uint8_t kbe[32], vbe[32];
+    uint256_to_bytes(key_u, kbe);
+    uint256_to_bytes(val_u, vbe);
+    if (is_sstore) evm_tracer_on_sstore(addr, kbe, vbe);
+    else           evm_tracer_on_sload(addr, kbe, vbe);
+#else
+    (void)addr; (void)key_u; (void)val_u; (void)is_sstore;
+#endif
+}
 // g_trace_calls declared in interpreter.c (unity build)
 
 //==============================================================================
@@ -171,6 +191,8 @@ static evm_status_t op_sload(evm_t *evm)
         if (!evm_use_gas(evm, gas_cost))
             return EVM_OUT_OF_GAS;
 
+        trace_storage_access(evm->msg.recipient.bytes, &key, &value, false);
+
         if (g_trace_calls) {
             char addr_hex[41];
             for (int i = 0; i < 20; i++) sprintf(addr_hex + i*2, "%02x", evm->msg.recipient.bytes[i]);
@@ -208,6 +230,8 @@ static evm_status_t op_sload(evm_t *evm)
 
     // Load value from storage using current contract address
     uint256_t value = evm_state_get_storage(evm->state, &evm->msg.recipient, &key);
+
+    trace_storage_access(evm->msg.recipient.bytes, &key, &value, false);
 
     if (g_trace_calls) {
         char addr_hex[41];
@@ -292,6 +316,8 @@ static evm_status_t op_sstore(evm_t *evm)
 
     // Store value to storage using current contract address
     evm_state_set_storage(evm->state, &evm->msg.recipient, &key, &value);
+
+    trace_storage_access(evm->msg.recipient.bytes, &key, &value, true);
 
     return EVM_SUCCESS;
 }

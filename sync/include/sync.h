@@ -206,4 +206,28 @@ sync_history_stats_t sync_get_history_stats(const sync_t *sync);
 /** Truncate state history to keep only blocks up to last_block. */
 void sync_truncate_history(sync_t *sync, uint64_t last_block);
 
+/**
+ * Forward-apply diffs from the history log to bring state from
+ * current_block+1 through target_block. Skips the EVM interpreter
+ * entirely — much faster than sync_execute_block for blocks whose
+ * diffs are already persisted. Does NOT update the block hash ring;
+ * caller is responsible for seeding it separately (typically from era
+ * files) if subsequent blocks need BLOCKHASH to resolve correctly.
+ *
+ * Returns number of blocks actually applied. 0 if history disabled,
+ * target_block <= current_block, or the range extends past the
+ * history tail.
+ */
+uint64_t sync_replay_history(sync_t *sync, uint64_t target_block);
+
+/**
+ * Re-seed the block hash ring after state has been brought to a new
+ * anchor block via sync_replay_history (or any other path that
+ * advances state without going through sync_execute_block). Writes
+ * block_hashes[i] into the ring at position (last_block - count + 1 + i).
+ * Safe to call after sync_resume.
+ */
+void sync_reseed_block_hashes(sync_t *sync, uint64_t last_block,
+                              const hash_t *block_hashes, size_t count);
+
 #endif /* SYNC_H */
