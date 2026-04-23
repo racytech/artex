@@ -12,9 +12,10 @@ When the engine is built and started with history enabled, every
 committed block's state diff (account fields, storage slot writes,
 destructed-account markers) is appended to a disk-backed log as
 execute runs. After an unclean shutdown you don't need to re-run
-EVM bytecode for the blocks you already processed — a fast forward
-apply of the diffs reconstructs state at roughly **100 blocks per
-second** on the reference hardware.
+EVM bytecode for the blocks you already processed — replay skips
+the EVM entirely and just applies the recorded state updates, so
+diffs reconstruct state at roughly **140 blocks per second** on the
+reference hardware (49 k-block window in ~5 min).
 
 The diff log is separate from, and complementary to, full-state
 snapshots:
@@ -71,13 +72,13 @@ artex> root
   0xc6022854cc3540f3b036a96b19bed69b0547e1a84e71d21d1dc8d9b62e0c4dca
 ```
 
-`load-state` no longer computes the state root automatically — it
-just streams the snapshot into memory. Call `root` explicitly once
-afterwards to materialize the cached MPT hashes and sanity-check
-that the snapshot decoded cleanly. Compare against the canonical
-state root for the snapshot's block on etherscan. From this point
-forward all cached hashes are warm, so subsequent incremental
-`root` calls after execute are cheap.
+Note: the first `root` after `load-state` is **expensive** — every
+trie node is marked dirty by the loader, so this first call walks
+the entire account + storage tries and re-hashes everything from
+scratch (~30–35 min on the mainnet ~24.8 M snapshot, CPU-bound on
+keccak). Subsequent calls are incremental — they only re-hash dirty
+subtrees — and finish in seconds between checkpoints. This up-front
+cost also verifies the snapshot's integrity against the header root.
 
 ```
 artex> execute data/era --to 24913378 --adaptive
@@ -87,9 +88,9 @@ INFO  [history] history: blk 24865617 (+256)  144865 accts  196687 slots  12627 
   ...
 ```
 
-Execute runs the same as before. The new `INFO [history]` lines
-appear every 256 blocks summarizing what was appended. The log file
-grows in the background; execute never blocks on I/O.
+`INFO [history]` lines appear every 256 blocks summarizing what was
+appended. The log file grows in the background; execute never blocks
+on I/O.
 
 ### 2. Simulate a crash
 
@@ -112,11 +113,6 @@ artex> load-state ~/.artex/state_24864361.bin
   ...
   loaded state at block 24864361
 
-artex> root
-  0xc6022854cc3540f3b036a96b19bed69b0547e1a84e71d21d1dc8d9b62e0c4dca
-  # Verifies the snapshot was loaded cleanly. Compare to etherscan
-  # for the snapshot's block.
-
 artex> history_range
   first : 24864362
   last  : 24876800
@@ -131,17 +127,33 @@ INFO  [history] apply_diff #500 block=24864861 groups=1118  ...
 INFO  [history] history: replay complete — 12439 blocks applied (24864362..24876800)
   done: now at block 24876800 in 146.4s (84.9 blk/s)
 
+artex> seed_hashes data/era
+  # refreshes the 256-entry block-hash ring to the replay endpoint
+  # so BLOCKHASH resolves correctly for subsequent execute.
+
 artex> root_full
   0x925b43e100fcd487df408cdd9800b81d57e041ffc6c6267e441474f228b31455
 ```
 
-Use `root_full` (not `root`) after `replay_history`: the fast replay
-path marks dirty paths but doesn't attempt any hash invalidation of
-its own, so a full recomputation from scratch is the safe confirmation
-that replay matched the canonical chain. The root above is
-bit-identical to the canonical state root at block 24876800 —
-verifiable on etherscan. State is fully reconstructed and you can
-`execute` forward from here; new diffs append to the same log.
+The ordering matters:
+
+1. `replay_history` brings the state to the target block.
+2. `seed_hashes` reads the last 256 header hashes from era files and
+   writes them into the engine's block-hash ring — mandatory before
+   any `execute` that follows, since the ring after `load_state`
+   still holds snapshot-era hashes and `BLOCKHASH` in the next block
+   would otherwise return stale values.
+3. `root_full` does a from-scratch recomputation of the MPT and
+   returns the state root at the replay endpoint. Compare against
+   the canonical state root from any trusted source (block explorer,
+   another full node) for that block; a match proves the state
+   reconstructed exactly. `root_full` (not `root`)
+   is used here because the fast replay path marks dirty paths but
+   skips hash invalidation of its own, so the full recomputation is
+   the clean confirmation.
+
+Once those three have run, state is fully reconstructed and `execute`
+can continue from the next block; new diffs append to the same log.
 
 ## Useful commands
 
@@ -172,16 +184,41 @@ Target must be in `[first..last]` as reported by `history_range`.
 
 ### `root_full`
 
-Computes the full MPT state root at the current block over every
-account. Useful right after `replay_history` to confirm replay
-matched the canonical chain:
+Computes the full MPT state root at the current block. Invalidates
+all cached node hashes first, then walks the entire account +
+storage tries and re-hashes every node. Useful right after
+`replay_history` to confirm replay matched the canonical chain:
 
 ```
 artex> root_full
   0x925b43e100fcd487df408cdd9800b81d57e041ffc6c6267e441474f228b31455
 ```
 
-Compare to etherscan's `stateRoot` for the same block.
+Compare to the `stateRoot` reported by a trusted source (block
+explorer or another full node) for the same block.
+
+**Expensive.** Because it ignores any cached hashes, `root_full`
+costs roughly the same as the first `root` call after `load-state`
+— ~30–35 min on the mainnet ~24.8 M snapshot, CPU-bound on keccak.
+Use it sparingly: once to confirm replay, not for every checkpoint.
+For regular checkpoint-style verification during `execute`, prefer
+the incremental `root` command, which only re-hashes subtrees that
+changed since the last call.
+
+### `seed_hashes <era-dir>`
+
+Reads the last 256 block-header hashes from era files and writes them
+into the engine's block-hash ring. Mandatory before `execute` that
+follows a `replay_history`: `load_state` populates the ring from the
+snapshot's `.hashes` sidecar, `replay_history` advances state past
+that anchor without touching the ring, and the first executed block
+would otherwise see stale `BLOCKHASH` values for any block in the
+last-256 window. `seed_hashes` closes that gap.
+
+```
+artex> seed_hashes data/era
+  seeded 256 block hashes ending at block 24876800
+```
 
 ### `truncate_history <last-block>`
 
@@ -200,9 +237,8 @@ artex> truncate_history 24880000
 
 - **Roll back before a reorg.** Future execute from here overwrites
   the discarded range.
-- **Rewrite a known-bad range.** If a diff for some block was produced
-  by a buggy engine version, truncate back and re-`execute` to
-  re-record.
+- **Rewrite a known-bad range.** If a diff needs to be regenerated,
+  truncate back to the last good block and re-`execute` to re-record.
 
 Does not modify in-memory state — you're responsible for bringing
 state and history into agreement (usually `load_state` + fresh
@@ -226,28 +262,9 @@ What survives a hard kill in each layer:
   layout — useful defense if e.g. you forgot to `replay_history` up
   to the tail before starting a fresh `execute`.
 
-## Replay vs execute — why it's faster
-
-For a given block, applying a pre-computed diff is cheaper than
-running EVM:
-
-| Per storage slot write | execute (EVM opcode) | replay (apply_diff) |
-|---|---|---|
-| Pre-op gas calc lookup | 1 ART read (current + original) | — |
-| Journal entry with old value | 1 ART read | — |
-| Storage write | 1 ART write | 1 ART write |
-| Warm-address / originals tracking | 3 mem_art inserts | — |
-
-Roughly **5–10× fewer state ops per net change**. That's why a
-12,000-block window replays in ~3 minutes where the same window
-executes in ~15 minutes. The tradeoff: replay needs a pre-recorded
-diff log. It's the right tool for catching up after a crash, not
-for first-time sync.
-
 ## Full recovery example
 
-End-to-end commands used during this project's own stress test, with
-real observed timings:
+End-to-end commands used during this project's own stress test:
 
 ```
 # (1) Prepare: build with history on, arrange files.
@@ -280,10 +297,6 @@ python3 examples/python/artex_cli.py \
 artex> load-state ~/snapshot/state_24864361.bin
   loaded state at block 24864361
 
-artex> root
-  0xc602...4dca
-  # verify snapshot decoded cleanly — matches canonical at 24864361
-
 artex> history_range
   first : 24864362
   last  : 24876800            # last durable block before kill
@@ -293,17 +306,17 @@ artex> replay_history 24876800
   replaying 12439 diffs from 24864362 to 24876800 ...
   done: now at block 24876800 in 146.4s (84.9 blk/s)
 
+artex> seed_hashes data/era
+  # refresh block-hash ring for the new anchor block
+
 artex> root_full
   0x925b43e100fcd487df408cdd9800b81d57e041ffc6c6267e441474f228b31455
-  # matches etherscan canonical at block 24876800 — state is correct
+  # matches canonical at block 24876800 — state is correct
 
 artex> execute data/era --to 24913378 --adaptive
   replaying from 24876801 → 24913378 (adaptive validation)
   # execute continues, appending to the same history
 ```
 
-Total recovery cost: **~35 min snapshot load + ~3 min replay** to get
-state to the tail of a 12 k-block execute run. Vs re-executing those
-12 k blocks from the snapshot: ~15+ min on top of the snapshot load.
-Replay savings scale with window size — the longer the execute run
-you lost, the bigger the win from replay-based recovery.
+Total recovery cost for a 49 k-block window: **~30 min snapshot
+load + ~5 min replay + ~35 min full root re-verification.**
