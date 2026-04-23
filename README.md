@@ -138,6 +138,16 @@ working set gets pulled into memory. Rates settle down once the
 working set is resident. More RAM and faster NVMe both shorten this
 warm-up; tmpfs-backed runs skip it entirely.
 
+### Durability
+
+State lives in memory for speed, but the engine has a full story for
+surviving restarts and crashes without re-executing every block after
+the snapshot. Persistence is split across three independent layers —
+full-state snapshots, an append-only per-block diff log, and a
+disk-backed code store — and recovery is just "load the nearest
+snapshot, then replay forward." More on this in
+[examples/python/history_replay.md](examples/python/history_replay.md).
+
 ### Library footprint
 
 `libartex.so` is ~4.7 MB with debug info retained, or ~2.1 MB after
@@ -162,16 +172,6 @@ if the current `RLIMIT_STACK` is smaller — run `ulimit -s 32768`
   *skipped* by the test runner rather than attempted. Amsterdam
   work (including EIP-7928 Block Access Lists) tracks on its own
   branch.
-
-### Durability
-
-State lives in memory for speed, but the engine has a full story for
-surviving restarts and crashes without re-executing every block after
-the snapshot. Persistence is split across three independent layers —
-full-state snapshots, an append-only per-block diff log, and a
-disk-backed code store — and recovery is just "load the nearest
-snapshot, then replay forward." More on this in
-[examples/python/history_replay.md](examples/python/history_replay.md).
 
 ## Quick start
 
