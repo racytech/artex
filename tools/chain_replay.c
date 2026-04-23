@@ -637,6 +637,9 @@ int main(int argc, char **argv) {
     bool resume_mode = false;
 #ifdef ENABLE_EVM_TRACE
     uint64_t trace_block = UINT64_MAX;  /* UINT64_MAX = no tracing */
+    const char *trace_out_path = NULL;  /* NULL → default data/trace/block_<N>.jsonl;
+                                         * "-"  → stderr (legacy behavior) */
+    FILE *trace_fp = NULL;              /* open across enable/disable blocks */
 #endif
     uint64_t dump_prestate_block = UINT64_MAX;
     const char *dump_prestate_path = NULL;
@@ -682,6 +685,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[1 + arg_offset], "--trace-block") == 0 && arg_offset + 2 < argc) {
             trace_block = (uint64_t)atoll(argv[2 + arg_offset]);
             arg_offset += 2;
+        } else if (strcmp(argv[1 + arg_offset], "--trace-out") == 0 && arg_offset + 2 < argc) {
+            trace_out_path = argv[2 + arg_offset];
+            arg_offset += 2;
 #endif
         } else if (strcmp(argv[1 + arg_offset], "--no-validate") == 0) {
             no_validate = true;
@@ -718,7 +724,9 @@ int main(int argc, char **argv) {
             "  --data-dir DIR        Set data directory for all state files (default: ~/.artex)\n"
             "  --resume              Resume from existing MPT state (reads .meta)\n"
             "  --no-history          Disable per-block state diff history\n"
-            "  --trace-block N       Enable EIP-3155 EVM trace for block N (to stderr)\n"
+            "  --trace-block N       Enable EIP-3155 EVM trace for block N\n"
+            "                        (default output: data/trace/block_<N>.jsonl)\n"
+            "  --trace-out PATH      Override trace output file. '-' for stderr.\n"
             "  --no-validate         Skip all root validation, compute once at end\n"
             "  --snapshot-every N    Auto-save state every N blocks (e.g. 1000000)\n"
             "  --save-state N [P]    Save full state after block N to binary file P\n"
@@ -1079,11 +1087,41 @@ int main(int argc, char **argv) {
             fprintf(stderr, "dump-prestate: block %lu — undo log + access tracking enabled\n", bn);
         }
 
-        /* Enable EVM tracing for the target block */
+        /* Enable EVM tracing for the target block. Trace output goes to a
+         * dedicated .jsonl file by default so it's parseable as strict JSON
+         * Lines; banners only appear on stderr. Override with --trace-out or
+         * --trace-out - (stderr). */
 #ifdef ENABLE_EVM_TRACE
         if (bn == trace_block) {
-            evm_tracer_init(stderr);
-            fprintf(stderr, "=== EVM TRACE: block %lu ===\n", bn);
+            FILE *out;
+            char default_path[512];
+            const char *resolved_path;
+            if (trace_out_path && strcmp(trace_out_path, "-") == 0) {
+                out = stderr;
+                resolved_path = "stderr";
+            } else {
+                if (trace_out_path) {
+                    resolved_path = trace_out_path;
+                } else {
+                    mkdir("data", 0755);
+                    mkdir("data/trace", 0755);
+                    snprintf(default_path, sizeof(default_path),
+                             "data/trace/block_%lu.jsonl", bn);
+                    resolved_path = default_path;
+                }
+                out = fopen(resolved_path, "w");
+                if (!out) {
+                    LOG_ERROR("failed to open %s for trace output; "
+                              "falling back to stderr", resolved_path);
+                    out = stderr;
+                    resolved_path = "stderr";
+                } else {
+                    trace_fp = out;
+                }
+            }
+            evm_tracer_init(out);
+            fprintf(stderr, "=== EVM TRACE: block %lu → %s ===\n",
+                    bn, resolved_path);
         }
 #endif
 
@@ -1103,6 +1141,10 @@ int main(int argc, char **argv) {
 #ifdef ENABLE_EVM_TRACE
         if (bn == trace_block) {
             g_evm_tracer.enabled = false;
+            if (trace_fp && trace_fp != stderr) {
+                fclose(trace_fp);
+                trace_fp = NULL;
+            }
             fprintf(stderr, "=== END EVM TRACE: block %lu ===\n", bn);
         }
 #endif

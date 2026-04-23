@@ -182,6 +182,9 @@ download_era.sh
 # Era data files
 data/era/
 
+# EIP-3155 traces produced by chain_replay --trace-block
+data/trace/
+
 # gmp install byproducts (we only ship gmp.h + libgmp.a from third_party/gmp)
 third_party/gmp/lib/pkgconfig/
 third_party/gmp/share/
