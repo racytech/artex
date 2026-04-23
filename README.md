@@ -56,12 +56,6 @@ covers root computation.
   and deletes mutate one or two nodes and are done. Nothing like an
   LSM-tree merge pass or B-tree split cascade.
 
-### Tradeoffs
-
-- **No on-disk durability story.** After a crash, recovery follows
-  the same path as a cold start — load the most recent snapshot,
-  then replay forward from there.
-
 ## Performance
 
 These are measurements from an actual mainnet replay on one
@@ -168,6 +162,16 @@ if the current `RLIMIT_STACK` is smaller — run `ulimit -s 32768`
   *skipped* by the test runner rather than attempted. Amsterdam
   work (including EIP-7928 Block Access Lists) tracks on its own
   branch.
+
+### Durability
+
+State lives in memory for speed, but the engine has a full story for
+surviving restarts and crashes without re-executing every block after
+the snapshot. Persistence is split across three independent layers —
+full-state snapshots, an append-only per-block diff log, and a
+disk-backed code store — and recovery is just "load the nearest
+snapshot, then replay forward." More on this in
+[examples/python/history_replay.md](examples/python/history_replay.md).
 
 ## Quick start
 

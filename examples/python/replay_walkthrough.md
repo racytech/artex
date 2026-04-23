@@ -76,9 +76,10 @@ libartex version: 0.1.0
 artex> load-state ~/.artex/state_24864361.bin
   data dir set to: /home/<you>/.artex
   loading ~/.artex/state_24864361.bin ...
-recomputing state root on state load (block 24864361)...
-  storage roots: 75330482 computed (8 threads)
   loaded state at block 24864361 (2100.0s)
+
+artex> root
+  0xc6022854cc3540f3b036a96b19bed69b0547e1a84e71d21d1dc8d9b62e0c4dca
 
 artex> execute data/era --to 24913378 --adaptive
   replaying from 24864362 → 24913378 (adaptive validation)
