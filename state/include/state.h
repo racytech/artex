@@ -59,6 +59,17 @@ bool state_sub_balance(state_t *s, const address_t *addr, const uint256_t *amoun
 
 void state_set_code(state_t *s, const address_t *addr,
                     const uint8_t *code, uint32_t len);
+/**
+ * Set an account's code_hash directly without providing the bytecode.
+ * Used by history replay: the diff only carries the hash (bytes live in
+ * the separate code_store). Updates r->code_hash, sets/clears
+ * ACCT_HAS_CODE based on whether the hash equals EMPTY_CODE_HASH, marks
+ * the account dirty. Does NOT write to code_store — caller is responsible
+ * for populating code_store separately if actual execution is needed
+ * afterward.
+ */
+void state_set_code_hash(state_t *s, const address_t *addr,
+                         const hash_t *code_hash);
 const uint8_t *state_get_code(state_t *s, const address_t *addr, uint32_t *out_len);
 const uint8_t *state_get_jumpdest_bitmap(state_t *s, const address_t *addr);
 uint32_t state_get_code_size(state_t *s, const address_t *addr);
@@ -108,6 +119,7 @@ void state_commit_block(state_t *s);
 /* Set current block number (for LRU tracking) */
 void state_begin_block(state_t *s, uint64_t block_number);
 uint64_t state_get_block(const state_t *s);
+bool     state_get_prune_empty(const state_t *s);
 
 /* EIP-161: enable empty account pruning post-Spurious Dragon */
 void state_set_prune_empty(state_t *s, bool enabled);
@@ -183,6 +195,21 @@ void state_set_storage_raw(state_t *s, const address_t *addr,
 /* Block diff collection for history/undo log (requires ENABLE_HISTORY) */
 struct block_diff_t;
 void     state_collect_block_diff(state_t *s, struct block_diff_t *out);
+
+/**
+ * Fast forward-apply of a block diff — the replay equivalent of executing
+ * the block. Skips journal, per-tx warm tracking, blk_orig_*, originals,
+ * and the storage_read-before-write that state_set_storage does for the
+ * journal entry. Writes directly into accounts/resources/storage_hart,
+ * marks acct_index paths dirty and storage-dirty bits for root
+ * recomputation, and handles DESTRUCTED groups by removing the account
+ * from acct_index.
+ *
+ * Caller should NOT call state_commit_tx / state_finalize_block /
+ * state_reset_block afterward — this function is a complete per-block
+ * replay step on its own.
+ */
+void     state_apply_diff_fast(state_t *s, const struct block_diff_t *diff);
 
 /** Get storage pool handle (for stats). */
 hart_pool_t *state_get_storage_pool(const state_t *s);

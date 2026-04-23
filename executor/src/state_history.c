@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include <malloc.h>
 
 /* =========================================================================
  * CRC-32C (Castagnoli) — hardware-accelerated via SSE4.2
@@ -362,10 +363,56 @@ static void *consumer_thread(void *arg) {
     uint64_t interval_bytes = 0;
     uint64_t interval_created = 0;
 
+    /* Aggregate drop counter: consecutive non-contiguous blocks that were
+     * dropped. Emit the first drop as a WARN, then a summary every 100
+     * drops, and a final summary when a contiguous block finally lands.
+     * Prevents log spam while keeping silent data loss loud enough to
+     * notice. */
+    uint64_t drop_run_count = 0;
+    uint64_t drop_run_first = 0;
+    uint64_t drop_run_last = 0;
+
     while (!atomic_load_explicit(&sh->stop, memory_order_relaxed)) {
         block_diff_t diff;
         if (!diff_ring_pop(&sh->ring, &diff, &sh->stop))
             break;
+
+        /* Contiguity guard: the positional .idx layout assumes every entry
+         * N on disk corresponds to block (first_block + N). A non-contiguous
+         * write would silently corrupt all subsequent lookups. Refuse and
+         * keep the log in a consistent state. */
+        if (sh->block_count > 0) {
+            uint64_t expected = sh->first_block + sh->block_count;
+            if (diff.block_number != expected) {
+                if (drop_run_count == 0) {
+                    drop_run_first = diff.block_number;
+                    LOG_HIST_WARN(
+                        "history: non-contiguous block %lu (expected %lu); "
+                        "dropping — state is ahead of history tail, "
+                        "use truncate to rewind or continue past tail",
+                        diff.block_number, expected);
+                } else if ((drop_run_count % 100) == 0) {
+                    LOG_HIST_WARN(
+                        "history: dropped %lu blocks so far (%lu..%lu); still expecting %lu",
+                        drop_run_count, drop_run_first, drop_run_last, expected);
+                }
+                drop_run_last = diff.block_number;
+                drop_run_count++;
+                block_diff_free(&diff);
+                continue;
+            }
+        }
+
+        /* Contiguous block landed — if we had a drop run, summarize it
+         * now so the user sees the total silent loss. */
+        if (drop_run_count > 0) {
+            LOG_HIST_WARN(
+                "history: resumed contiguous writes at block %lu "
+                "after dropping %lu blocks (%lu..%lu)",
+                diff.block_number, drop_run_count,
+                drop_run_first, drop_run_last);
+            drop_run_count = 0;
+        }
 
         uint8_t *buf;
         size_t buf_len = serialize_diff(&diff, &buf);
@@ -391,8 +438,16 @@ static void *consumer_thread(void *arg) {
         off_t idx_pos = (off_t)(IDX_HEADER_SIZE + sh->block_count * IDX_ENTRY_SIZE);
         pwrite(sh->idx_fd, idx_entry, IDX_ENTRY_SIZE, idx_pos);
 
-        if (sh->block_count == 0)
+        if (sh->block_count == 0) {
             sh->first_block = diff.block_number;
+            /* Persist to idx header so hard kills don't leave a stale 0.
+             * Header layout: magic(4) + version(4) + first_block(8); write
+             * only the 8-byte first_block field at offset 8 so we don't
+             * race with anything reading the magic/version. */
+            uint8_t hdr_fb[8];
+            write_u64(hdr_fb, diff.block_number);
+            pwrite(sh->idx_fd, hdr_fb, 8, 8);
+        }
         sh->block_count++;
 
         /* Accumulate stats for periodic log */
@@ -433,6 +488,21 @@ static void *consumer_thread(void *arg) {
         block_diff_t diff;
         diff_ring_pop(&sh->ring, &diff, NULL);
 
+        /* Contiguity guard (drain path) — same invariant as the main loop.
+         * WARN not ERROR: dropping a duplicate block is expected behavior,
+         * not a fault. Ring is empty after drain so no aggregation needed. */
+        if (sh->block_count > 0) {
+            uint64_t expected = sh->first_block + sh->block_count;
+            if (diff.block_number != expected) {
+                LOG_HIST_WARN(
+                    "history: non-contiguous block %lu (expected %lu); "
+                    "dropping drain write",
+                    diff.block_number, expected);
+                block_diff_free(&diff);
+                continue;
+            }
+        }
+
         uint8_t *buf;
         size_t buf_len = serialize_diff(&diff, &buf);
         if (buf_len > 0) {
@@ -453,8 +523,12 @@ static void *consumer_thread(void *arg) {
             off_t idx_pos = (off_t)(IDX_HEADER_SIZE + sh->block_count * IDX_ENTRY_SIZE);
             pwrite(sh->idx_fd, idx_entry, IDX_ENTRY_SIZE, idx_pos);
 
-            if (sh->block_count == 0)
+            if (sh->block_count == 0) {
                 sh->first_block = diff.block_number;
+                uint8_t hdr_fb[8];
+                write_u64(hdr_fb, diff.block_number);
+                pwrite(sh->idx_fd, hdr_fb, 8, 8);
+            }
             sh->block_count++;
         }
         block_diff_free(&diff);
@@ -567,6 +641,30 @@ state_history_t *state_history_create(const char *dir_path) {
             write_u64(hdr + 8, 0);
             pwrite(sh->idx_fd, hdr, IDX_HEADER_SIZE, 0);
             ftruncate(sh->idx_fd, IDX_HEADER_SIZE);
+        } else {
+            /* Recover first_block from idx[0]'s block_number. The header's
+             * field is only updated on first write / graceful shutdown;
+             * a hard kill before the first-write header pwrite (pre-fix)
+             * or any other path that leaves the header stale would report
+             * first_block=0. The data itself is authoritative — each idx
+             * entry stores its block_number, so entry 0 is the ground
+             * truth. If it disagrees with the header, fix the header
+             * in place so future opens are clean. */
+            uint8_t ie0[IDX_ENTRY_SIZE];
+            if (pread(sh->idx_fd, ie0, IDX_ENTRY_SIZE,
+                      (off_t)IDX_HEADER_SIZE) == IDX_ENTRY_SIZE) {
+                uint64_t real_first = read_u64(ie0);
+                if (real_first != sh->first_block) {
+                    LOG_HIST_INFO(
+                        "history: header first_block=%lu disagrees with idx[0]=%lu; "
+                        "using idx[0] and rewriting header",
+                        sh->first_block, real_first);
+                    sh->first_block = real_first;
+                    uint8_t hdr_fb[8];
+                    write_u64(hdr_fb, real_first);
+                    pwrite(sh->idx_fd, hdr_fb, 8, 8);
+                }
+            }
         }
     } else {
         memset(hdr, 0, IDX_HEADER_SIZE);
@@ -794,45 +892,57 @@ void state_history_truncate(state_history_t *sh, uint64_t last_block) {
  * Forward reconstruction: apply_diff + replay
  * ========================================================================= */
 
+/* Sample VmSize / VmRSS from /proc/self/statm (values in pages). Cheap — one
+ * small file read. Only called every 500 applies to track replay memory. */
+static void sample_mem_pages(size_t *vm_pages, size_t *rss_pages) {
+    *vm_pages = 0; *rss_pages = 0;
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f) return;
+    if (fscanf(f, "%zu %zu", vm_pages, rss_pages) != 2) {
+        *vm_pages = 0; *rss_pages = 0;
+    }
+    fclose(f);
+}
+
 void state_history_apply_diff(evm_state_t *es, const block_diff_t *diff) {
     if (!es || !diff) return;
+    state_t *st = evm_state_get_state(es);
+    if (!st) return;
 
-    for (uint32_t i = 0; i < diff->group_count; i++) {
-        const addr_diff_t *g = &diff->groups[i];
+    /* Periodic progress + memory snapshot. Fires on the first apply and
+     * every 500th after. Cheap — two /proc reads + one mallinfo2 — and
+     * invaluable for spotting replay stalls, unexpected memory growth,
+     * or glibc arena bloat without rebuilding with diagnostics. */
+    static uint64_t apply_count = 0;
+    apply_count++;
+    bool trace = (apply_count == 1 || apply_count % 500 == 0);
 
-        /* Don't skip any entry — even CREATED+empty entries need processing
-         * since they represent accounts that must exist in the trie pre-EIP-161. */
-
-        if (g->flags & ACCT_DIFF_DESTRUCTED) {
-            /* Zero the account: set nonce/balance to 0, code_hash to empty */
-            evm_state_set_nonce(es, &g->addr, 0);
-            uint256_t zero = UINT256_ZERO_INIT;
-            evm_state_set_balance(es, &g->addr, &zero);
-            /* Storage slots from the diff will set the final values below */
-        }
-
-        if (g->field_mask & FIELD_NONCE)
-            evm_state_set_nonce(es, &g->addr, g->nonce);
-
-        if (g->field_mask & FIELD_BALANCE)
-            evm_state_set_balance(es, &g->addr, &g->balance);
-
-        if (g->field_mask & FIELD_CODE_HASH) {
-            /* Code hash is set via code — but during reconstruction from
-             * history alone, we don't have the actual bytecode. We store
-             * the code_hash directly. The code_store must be intact for
-             * actual EVM execution after reconstruction. */
-            evm_state_set_code_hash(es, &g->addr, &g->code_hash);
-        }
-
-        for (uint16_t j = 0; j < g->slot_count; j++) {
-            evm_state_set_storage(es, &g->addr,
-                                   &g->slots[j].slot, &g->slots[j].value);
-        }
+    size_t vm0 = 0, rss0 = 0, vm1 = 0, rss1 = 0;
+    if (trace) {
+        sample_mem_pages(&vm0, &rss0);
+        LOG_HIST_INFO(
+            "apply_diff #%lu block=%lu groups=%u  [vm=%.1fG rss=%.1fG]",
+            apply_count, diff->block_number, diff->group_count,
+            vm0 * 4096.0 / 1073741824.0,
+            rss0 * 4096.0 / 1073741824.0);
     }
 
-    /* Note: caller decides when to commit/finalize.
-     * For bulk reconstruction, skip per-block commit for performance. */
+    state_apply_diff_fast(st, diff);
+
+    if (trace) {
+        sample_mem_pages(&vm1, &rss1);
+        struct mallinfo2 mi = mallinfo2();
+        LOG_HIST_INFO(
+            "  after_apply: vm=%.2fG (%+.2fG) rss=%.2fG (%+.2fG) "
+            "glibc.arena=%.2fG glibc.hblkhd=%.2fG glibc.uordblks=%.2fG",
+            vm1 * 4096.0 / 1073741824.0,
+            (double)((int64_t)vm1 - (int64_t)vm0) * 4096.0 / 1073741824.0,
+            rss1 * 4096.0 / 1073741824.0,
+            (double)((int64_t)rss1 - (int64_t)rss0) * 4096.0 / 1073741824.0,
+            mi.arena    / 1073741824.0,
+            mi.hblkhd   / 1073741824.0,
+            mi.uordblks / 1073741824.0);
+    }
 }
 
 /* block_diff_revert is implemented in state.c (uses state_set_*_raw) */
@@ -851,7 +961,6 @@ uint64_t state_history_replay(state_history_t *sh,
             LOG_HIST_ERROR("history: replay failed to read block %lu", bn);
             return count;
         }
-
         state_history_apply_diff(es, &diff);
         block_diff_free(&diff);
         count++;

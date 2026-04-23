@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <xmmintrin.h>
 #include <sys/mman.h>
 
@@ -383,9 +384,25 @@ static hash_t addr_hash_cached(state_t *s, const uint8_t addr[20]) {
     return h;
 }
 
-/* Cached slot → keccak256(slot). Direct-mapped by first 2 bytes. */
+/* Cached slot → keccak256(slot). Direct-mapped.
+ *
+ * Slot keys come in two patterns on Ethereum:
+ *   - Small-integer slots for simple state vars (storage[0], storage[N]
+ *     with N < 2^16): bytes 0..29 are zero in big-endian representation.
+ *   - keccak256-derived slots for mappings / arrays: uniform random bytes.
+ *
+ * Hashing on the first 2 bytes collides every small-integer slot to idx 0,
+ * degenerating the cache to size 1 for the very pattern where it helps
+ * most. Mix four uint32 words from the whole key — covers both patterns. */
 static inline uint32_t slot_cache_idx(const uint8_t slot[32]) {
-    return ((uint32_t)slot[0] << 8 | slot[1]) & (SLOT_HASH_CACHE_SIZE - 1);
+    uint32_t a, b, c, d;
+    memcpy(&a, slot +  0, 4);
+    memcpy(&b, slot +  8, 4);
+    memcpy(&c, slot + 16, 4);
+    memcpy(&d, slot + 28, 4);
+    uint32_t x = a ^ b ^ c ^ d;
+    x ^= x >> 16;
+    return x & (SLOT_HASH_CACHE_SIZE - 1);
 }
 
 static hash_t slot_hash_cached(state_t *s, const uint8_t slot[32]) {
@@ -704,6 +721,10 @@ void state_set_prune_empty(state_t *s, bool enabled) {
     if (s) s->prune_empty = enabled;
 }
 
+bool state_get_prune_empty(const state_t *s) {
+    return s ? s->prune_empty : false;
+}
+
 /* =========================================================================
  * Account access
  * ========================================================================= */
@@ -892,6 +913,37 @@ void state_set_code(state_t *s, const address_t *addr,
         acct_clear_flag(a, ACCT_HAS_CODE);
         r->code_hash = EMPTY_CODE_HASH;
     }
+
+    acct_set_flag(a, ACCT_DIRTY);
+    mark_tx_dirty(s, addr);
+}
+
+void state_set_code_hash(state_t *s, const address_t *addr,
+                         const hash_t *code_hash) {
+    if (!s || !addr || !code_hash) return;
+    hash_t ah = addr_hash_cached(s, addr->bytes);
+    account_t *a = ensure_account_h(s, addr, &ah);
+    if (!a) return;
+
+    mark_blk_dirty_h(s, a, &ah);
+    resource_t *r = ensure_resource(s, a);
+    if (!r) return;
+
+    /* Journal for undo support — preserves bytes if any were attached. */
+    journal_entry_t je = { .type = JE_CODE, .addr = *addr,
+        .data.code = { .hash = r->code_hash, .code = r->code,
+                       .size = r->code_size, .flags = a->flags } };
+    if (!journal_push(s, &je))
+        free(r->code);
+
+    r->code = NULL;
+    r->code_size = 0;
+    if (r->jumpdest_bitmap) { free(r->jumpdest_bitmap); r->jumpdest_bitmap = NULL; }
+    r->code_hash = *code_hash;
+
+    bool is_empty = memcmp(code_hash->bytes, EMPTY_CODE_HASH.bytes, 32) == 0;
+    if (is_empty) acct_clear_flag(a, ACCT_HAS_CODE);
+    else          acct_set_flag(a, ACCT_HAS_CODE);
 
     acct_set_flag(a, ACCT_DIRTY);
     mark_tx_dirty(s, addr);
@@ -1485,16 +1537,71 @@ state_stats_t state_get_stats(const state_t *s) {
  * save/load — TODO: implement serialization
  * ========================================================================= */
 
+/* Worker: invalidate a contiguous range of storage-hart resources. Each
+ * resource's invalidate is independent of every other's, so this shards
+ * trivially across threads. Writes to disjoint r->storage entries + the
+ * global stor_dirty_bits bitmap (word-level atomic: different threads
+ * touch different byte ranges of the bitmap when ranges don't overlap). */
+typedef struct {
+    state_t  *s;
+    uint32_t  start;   /* inclusive */
+    uint32_t  end;     /* exclusive */
+} stor_invalidate_worker_t;
+
+static void *stor_invalidate_worker_fn(void *arg) {
+    stor_invalidate_worker_t *w = (stor_invalidate_worker_t *)arg;
+    for (uint32_t i = w->start; i < w->end; i++) {
+        resource_t *r = &w->s->resources[i];
+        if (!storage_hart_empty(&r->storage))
+            storage_hart_invalidate(w->s->stor_pool, &r->storage);
+    }
+    return NULL;
+}
+
 void state_invalidate_all(state_t *s) {
     if (!s) return;
-    hart_invalidate_all(&s->acct_index);
+
+    /* Account trie: parallel walk. */
+    hart_invalidate_all_parallel(&s->acct_index);
+
+    /* Storage harts: grow the bitmap, then shard invalidates across threads.
+     * stor_dirty_set is done serially on the main thread after the join —
+     * sets every bit in the resource range, bypassing the need for workers
+     * to contend on the bitmap. */
     stor_dirty_grow(s, s->res_count);
-    for (uint32_t i = 1; i < s->res_count; i++) {
-        resource_t *r = &s->resources[i];
-        if (!storage_hart_empty(&r->storage))
-            storage_hart_invalidate(s->stor_pool, &r->storage);
-        stor_dirty_set(s, i);
+
+    const uint32_t nres = s->res_count;
+    if (nres > 1) {
+        /* Parallel above a worthwhile threshold — otherwise serial overhead
+         * (pthread_create/join) dominates. 4 threads matches the account-
+         * trie parallel structure and mainnet-state cache behavior. */
+        enum { NTHR = 4 };
+        const uint32_t work = nres - 1;  /* idx 0 is reserved/unused */
+        if (work >= NTHR * 8) {
+            pthread_t tids[NTHR];
+            stor_invalidate_worker_t w[NTHR];
+            uint32_t chunk = work / NTHR;
+            for (int t = 0; t < NTHR; t++) {
+                w[t].s = s;
+                w[t].start = 1 + t * chunk;
+                w[t].end   = (t == NTHR - 1) ? nres : 1 + (t + 1) * chunk;
+                pthread_create(&tids[t], NULL, stor_invalidate_worker_fn, &w[t]);
+            }
+            for (int t = 0; t < NTHR; t++)
+                pthread_join(tids[t], NULL);
+        } else {
+            for (uint32_t i = 1; i < nres; i++) {
+                resource_t *r = &s->resources[i];
+                if (!storage_hart_empty(&r->storage))
+                    storage_hart_invalidate(s->stor_pool, &r->storage);
+            }
+        }
     }
+
+    /* Bitmap update is serial: fast (memset of the byte range) and avoids
+     * writer-writer races on the shared stor_dirty_bits buffer. */
+    for (uint32_t i = 1; i < nres; i++)
+        stor_dirty_set(s, i);
 }
 
 /* =========================================================================
@@ -1548,7 +1655,6 @@ uint256_t state_get_preblock_storage(const state_t *s, const address_t *addr,
  * Parallel storage root computation
  * ------------------------------------------------------------------------- */
 
-#include <pthread.h>
 #include <sched.h>
 
 typedef struct {
@@ -2059,6 +2165,137 @@ void state_collect_block_diff(state_t *s, block_diff_t *out) {
 
     out->groups = groups;
     out->group_count = group_count;
+}
+
+/* =========================================================================
+ * Block diff fast-apply — forward replay that bypasses journal/originals
+ * /storage_read-before-write. Used by state_history_apply_diff during
+ * catch-up replay from a snapshot. Does not support revert.
+ * ========================================================================= */
+
+void state_apply_diff_fast(state_t *s, const block_diff_t *diff) {
+    if (!s || !diff) return;
+
+    for (uint32_t i = 0; i < diff->group_count; i++) {
+        const addr_diff_t *g = &diff->groups[i];
+        hash_t ah = addr_hash_cached(s, g->addr.bytes);
+
+        if (g->flags & ACCT_DIFF_DESTRUCTED) {
+            /* Same as the fast path in finalize_block's SAFE_DELETE_IDX:
+             * drop the account entirely. If the same diff group ALSO has
+             * ACCT_DIFF_CREATED, a re-create will happen below. */
+            account_t *a = find_account_h(s, &ah);
+            if (a) {
+                resource_t *r = get_resource(s, a);
+                if (r) {
+                    free(r->code); r->code = NULL;
+                    free(r->jumpdest_bitmap); r->jumpdest_bitmap = NULL;
+                    r->code_size = 0;
+                    r->code_hash = EMPTY_CODE_HASH;
+                    r->storage_root = EMPTY_STORAGE_ROOT;
+                    if (s->stor_pool && !storage_hart_empty(&r->storage))
+                        storage_hart_clear(s->stor_pool, &r->storage);
+                    dead_vec_push(&s->res_free, &s->res_free_count,
+                                  &s->res_free_cap, a->resource_idx);
+                    a->resource_idx = 0;
+                }
+                uint32_t del_idx;
+                if (hart_delete_get(&s->acct_index, ah.bytes, &del_idx)) {
+                    dead_vec_push(&s->acct_free, &s->acct_free_count,
+                                  &s->acct_free_cap, del_idx);
+                }
+            }
+            /* Only skip further processing if the account wasn't re-created
+             * in the same block. A re-created account needs its new fields
+             * and storage applied via the code below. */
+            if (!(g->flags & ACCT_DIFF_CREATED)) continue;
+        }
+
+        account_t *a = ensure_account_h(s, &g->addr, &ah);
+        if (!a) continue;
+        acct_set_flag(a, ACCT_EXISTED);
+
+        if (g->field_mask & FIELD_NONCE)
+            a->nonce = g->nonce;
+
+        if (g->field_mask & FIELD_BALANCE)
+            a->balance = g->balance;
+
+        if (g->field_mask & FIELD_CODE_HASH) {
+            resource_t *r = ensure_resource(s, a);
+            if (r) {
+                free(r->code); r->code = NULL;
+                free(r->jumpdest_bitmap); r->jumpdest_bitmap = NULL;
+                r->code_size = 0;
+                r->code_hash = g->code_hash;
+                bool is_empty = memcmp(g->code_hash.bytes,
+                                       EMPTY_CODE_HASH.bytes, 32) == 0;
+                if (is_empty) acct_clear_flag(a, ACCT_HAS_CODE);
+                else          acct_set_flag(a, ACCT_HAS_CODE);
+            }
+        }
+
+        if (g->slot_count > 0) {
+            resource_t *r = ensure_resource(s, a);
+            if (r && s->stor_pool) {
+                for (uint16_t j = 0; j < g->slot_count; j++) {
+                    uint8_t slot_be[32];
+                    uint256_to_bytes(&g->slots[j].slot, slot_be);
+                    hash_t slot_hash = slot_hash_cached(s, slot_be);
+                    if (uint256_is_zero(&g->slots[j].value))
+                        storage_hart_del(s->stor_pool, &r->storage, slot_hash.bytes);
+                    else {
+                        uint8_t val_be[32];
+                        uint256_to_bytes(&g->slots[j].value, val_be);
+                        storage_hart_put(s->stor_pool, &r->storage,
+                                         slot_hash.bytes, val_be);
+                    }
+                }
+                stor_dirty_set(s, a->resource_idx);
+            }
+        }
+
+        /* EIP-161: an account drained to fully-empty (nonce=0, balance=0,
+         * no code) and with no storage is pruned from the trie when
+         * prune_empty is enabled. state_collect_block_diff emits the final
+         * zeroed fields without signalling pruning, so we detect it here
+         * after applying the diff. */
+        if (s->prune_empty && acct_is_empty(a)) {
+            resource_t *r = get_resource(s, a);
+            bool has_storage = r && s->stor_pool &&
+                               !storage_hart_empty(&r->storage);
+            if (!has_storage) {
+                if (r) {
+                    free(r->code); r->code = NULL;
+                    free(r->jumpdest_bitmap); r->jumpdest_bitmap = NULL;
+                    r->code_size = 0;
+                    r->code_hash = EMPTY_CODE_HASH;
+                    r->storage_root = EMPTY_STORAGE_ROOT;
+                    dead_vec_push(&s->res_free, &s->res_free_count,
+                                  &s->res_free_cap, a->resource_idx);
+                    a->resource_idx = 0;
+                }
+                uint32_t del_idx;
+                if (hart_delete_get(&s->acct_index, ah.bytes, &del_idx)) {
+                    dead_vec_push(&s->acct_free, &s->acct_free_count,
+                                  &s->acct_free_cap, del_idx);
+                }
+                /* acct_index path already marked dirty by the delete path,
+                 * so skip the final hart_mark_path_dirty. */
+                continue;
+            }
+        }
+
+        hart_mark_path_dirty(&s->acct_index, ah.bytes);
+    }
+
+    /* ensure_account_h pushes new slots to s->phantoms for the normal
+     * finalize_block to potentially garbage-collect. The fast path sets
+     * ACCT_EXISTED unconditionally for every ensure'd account (or removes
+     * the account outright for DESTRUCTED), so nothing in phantoms is
+     * actually a phantom — drop the tracking buffer without running the
+     * deletion pass. */
+    s->phantom_count = 0;
 }
 
 /* =========================================================================

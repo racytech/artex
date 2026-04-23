@@ -79,8 +79,43 @@ static void print_diff(const block_diff_t *diff) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <history_dir> [block_number] [end_block]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <history_dir> [block_number] [end_block]\n"
+                        "       %s --stats <history_dir> <start> <end>\n"
+                        "                 one line per block: groups, total slots, "
+                        "max slot_count in any one group\n",
+                argv[0], argv[0]);
         return 1;
+    }
+
+    /* Compact stats mode: --stats <dir> <start> <end> */
+    if (argc >= 5 && strcmp(argv[1], "--stats") == 0) {
+        const char *dir = argv[2];
+        uint64_t start = (uint64_t)atoll(argv[3]);
+        uint64_t end   = (uint64_t)atoll(argv[4]);
+        state_history_t *sh = state_history_create(dir);
+        if (!sh) { fprintf(stderr, "open %s failed\n", dir); return 1; }
+        printf("%10s  %8s  %10s  %10s  %s\n",
+               "block", "groups", "slots", "max_slots", "top_addr");
+        for (uint64_t bn = start; bn <= end; bn++) {
+            block_diff_t diff;
+            if (!state_history_get_diff(sh, bn, &diff)) { printf("%10lu  missing\n", bn); continue; }
+            uint32_t total_slots = 0, max_slots = 0;
+            const addr_diff_t *worst = NULL;
+            for (uint16_t i = 0; i < diff.group_count; i++) {
+                total_slots += diff.groups[i].slot_count;
+                if (diff.groups[i].slot_count > max_slots) {
+                    max_slots = diff.groups[i].slot_count;
+                    worst = &diff.groups[i];
+                }
+            }
+            printf("%10lu  %8u  %10u  %10u  ",
+                   bn, diff.group_count, total_slots, max_slots);
+            if (worst) print_address(&worst->addr);
+            printf("\n");
+            block_diff_free(&diff);
+        }
+        state_history_destroy(sh);
+        return 0;
     }
 
     const char *dir = argv[1];

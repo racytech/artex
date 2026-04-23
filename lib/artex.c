@@ -20,6 +20,9 @@
 #include "address.h"
 #include "code_store.h"
 #include "storage_hart2.h"
+#ifdef ENABLE_HISTORY
+#include "state_history.h"
+#endif
 
 #include <cjson/cJSON.h>
 #include <stdlib.h>
@@ -42,6 +45,9 @@ struct rx_engine {
     hash_t                  block_hashes[BLOCK_HASH_WINDOW];
     uint64_t                last_block;
     bool                    initialized;  /* genesis or snapshot loaded */
+#ifdef ENABLE_HISTORY
+    state_history_t        *history;      /* per-block diff log; NULL if disabled */
+#endif
 
     /* Logger */
     rx_log_fn               log_fn;
@@ -170,11 +176,48 @@ rx_engine_t *rx_engine_create(const rx_config_t *config) {
         return NULL;
     }
 
+#ifdef ENABLE_HISTORY
+    /* Resolve history_dir: NULL=off, ""=auto (data_dir/history), else explicit.
+     * Failure to open the history dir is non-fatal — the engine runs without
+     * it and the caller can detect via rx_history_range() returning false. */
+    if (config->history_dir) {
+        const char *hd = config->history_dir;
+        char auto_buf[1024];
+        if (hd[0] == '\0') {
+            if (!config->data_dir) {
+                fprintf(stderr,
+                    "WARNING: history_dir=\"\" (auto) requires data_dir to be set; history disabled\n");
+                hd = NULL;
+            } else {
+                snprintf(auto_buf, sizeof(auto_buf), "%s/history", config->data_dir);
+                hd = auto_buf;
+            }
+        }
+        if (hd) {
+            e->history = state_history_create(hd);
+            if (!e->history) {
+                fprintf(stderr,
+                    "WARNING: failed to open history dir %s; history disabled\n", hd);
+            }
+        }
+    }
+#else
+    if (config->history_dir && config->history_dir[0] != '\0') {
+        fprintf(stderr,
+            "WARNING: history_dir set but libartex was built without ENABLE_HISTORY; ignored\n");
+    }
+#endif
+
     return e;
 }
 
 void rx_engine_destroy(rx_engine_t *engine) {
     if (!engine) return;
+#ifdef ENABLE_HISTORY
+    /* Flush consumer thread + close files BEFORE destroying evm_state,
+     * since the consumer holds refs into the ring's diff slots. */
+    if (engine->history) state_history_destroy(engine->history);
+#endif
     if (engine->evm) evm_destroy(engine->evm);
     if (engine->state) evm_state_destroy(engine->state);
     if (engine->cs) code_store_destroy(engine->cs);
@@ -321,7 +364,7 @@ bool rx_engine_load_state(rx_engine_t *engine, const char *path) {
     engine_clear_error(engine);
 
     state_t *st = evm_state_get_state(engine->state);
-    hash_t loaded_root;
+    hash_t loaded_root;  /* read from header by state_load; discarded here */
     if (!state_load(st, path, &loaded_root)) {
         engine_set_error(engine, RX_ERR_FILE_IO, "failed to load state snapshot");
         engine_log(engine, RX_LOG_ERROR, "failed to load state snapshot");
@@ -330,32 +373,14 @@ bool rx_engine_load_state(rx_engine_t *engine, const char *path) {
 
     engine->last_block = state_get_block(st);
 
-    /* Verify snapshot integrity: recompute the MPT root from the loaded
-     * state and compare against the root stored in the file header.
-     * Catches corruption, bit rot, truncation, and any save/load bug
-     * at load time rather than during later execution.
-     *
-     * No explicit `invalidate_all` here — every node was just created
-     * by `state_load` and is born dirty (see hashed_art.c node
-     * allocation), and the cached `hash[32]` field is uninitialized
-     * out of the pool. `compute_mpt_root` therefore recomputes every
-     * node from scratch in a single traversal. */
-    fprintf(stderr, "recomputing state root on state load (block %lu)...\n",
-            engine->last_block);
-    bool prune = (engine->last_block >= 2675000); /* post-EIP-161 */
-    hash_t recomputed = evm_state_compute_mpt_root(engine->state, prune);
-    if (memcmp(recomputed.bytes, loaded_root.bytes, 32) != 0) {
-        char got[67], exp[67];
-        hash_to_hex(&recomputed, got);
-        hash_to_hex(&loaded_root, exp);
-        char msg[256];
-        snprintf(msg, sizeof(msg),
-                 "root mismatch at block %lu: computed %s vs header %s",
-                 engine->last_block, got, exp);
-        engine_set_error(engine, RX_ERR_PARSE, msg);
-        engine_log(engine, RX_LOG_ERROR, msg);
-        return false;
-    }
+    /* Snapshot integrity verification is intentionally NOT performed here.
+     * A full re-hash of the trie is ~35 min on mainnet-scale state and is
+     * redundant for the recovery flow (load → replay diffs → verify once).
+     * Callers who want trust-but-verify behavior should call
+     * rx_compute_state_root() after load and compare against whatever
+     * authoritative root they have (canonical header root, snapshot header
+     * root if they re-read it, etc.). Every node is born dirty out of
+     * state_load so the next compute walks the whole trie automatically. */
 
     /* Load block hash ring from the mandatory .hashes sidecar.
      * A snapshot without .hashes cannot safely execute new blocks —
@@ -580,7 +605,7 @@ static bool execute_block_internal(rx_engine_t *engine,
     block_result_t br = block_execute(engine->evm, header, body,
                                       engine->block_hashes
 #ifdef ENABLE_HISTORY
-                                      , NULL
+                                      , engine->history
 #endif
                                       );
 
@@ -661,8 +686,13 @@ rx_hash_t rx_compute_state_root(rx_engine_t *engine) {
 
     /* No invalidate_all needed — incremental dirty tracking is correct.
      * block_execute → finalize_block marks dirty paths, compute_root
-     * only rehashes those paths. Proven over 17M+ mainnet blocks. */
-    bool prune = (engine->evm->fork >= FORK_SPURIOUS_DRAGON);
+     * only rehashes those paths. Proven over 17M+ mainnet blocks.
+     *
+     * Prune policy is derived from last_block rather than evm->fork:
+     * fork is only updated by evm_set_block_env (per-block execution),
+     * so it's stale/FRONTIER immediately after a bare rx_engine_load_state.
+     * 2_675_000 is EIP-161 activation (Spurious Dragon) on mainnet. */
+    bool prune = (engine->last_block >= 2675000);
     hash_t root = evm_state_compute_root_only(engine->state, prune);
     memcpy(out.bytes, root.bytes, 32);
     return out;
@@ -671,6 +701,116 @@ rx_hash_t rx_compute_state_root(rx_engine_t *engine) {
 void rx_invalidate_state_cache(rx_engine_t *engine) {
     if (!engine) return;
     evm_state_invalidate_all(engine->state);
+}
+
+rx_hash_t rx_compute_state_root_full(rx_engine_t *engine) {
+    rx_hash_t out = {0};
+    if (!engine) return out;
+    /* Two walks today: invalidate every cached hash, then recompute.
+     * Per the header TODO this will collapse into a single walk once
+     * the MPT helper grows a "force full" gate-bypass mode. */
+    evm_state_invalidate_all(engine->state);
+    return rx_compute_state_root(engine);
+}
+
+bool rx_engine_history_range(const rx_engine_t *engine,
+                              uint64_t *first_block,
+                              uint64_t *last_block) {
+    if (!engine) return false;
+#ifdef ENABLE_HISTORY
+    if (!engine->history) return false;
+    return state_history_range(engine->history, first_block, last_block);
+#else
+    (void)first_block; (void)last_block;
+    return false;
+#endif
+}
+
+bool rx_engine_replay_history_to(rx_engine_t *engine, uint64_t target_block) {
+    if (!engine) return false;
+    engine_clear_error(engine);
+#ifdef ENABLE_HISTORY
+    if (!engine->initialized) {
+        engine_set_error(engine, RX_ERR_NULL_ARG,
+                         "engine state not loaded; call rx_engine_load_state first");
+        return false;
+    }
+    if (!engine->history) {
+        engine_set_error(engine, RX_ERR_NULL_ARG,
+                         "history disabled: set rx_config_t.history_dir at create time");
+        return false;
+    }
+    if (target_block <= engine->last_block) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "target_block %lu must be > last_block %lu",
+                 target_block, engine->last_block);
+        engine_set_error(engine, RX_ERR_NULL_ARG, msg);
+        return false;
+    }
+
+    /* EIP-161 pruning must be enabled for commit_tx (called inside
+     * apply_diff) to prune touched-empty accounts. Normal block execution
+     * sets this per-block in block_executor's pre_block_init; replay has
+     * no equivalent entry point. Mainnet activated EIP-161 at block
+     * 2,675,000 — any replay window past that point wants pruning on. */
+    evm_state_set_prune_empty(engine->state, engine->last_block >= 2675000);
+
+    uint64_t first = engine->last_block + 1;
+    uint64_t want = target_block - first + 1;
+    uint64_t got = state_history_replay(engine->history, engine->state,
+                                        first, target_block);
+    if (got != want) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "history replay incomplete: applied %lu/%lu blocks (range %lu..%lu)",
+                 got, want, first, target_block);
+        engine_set_error(engine, RX_ERR_FILE_IO, msg);
+        engine_log(engine, RX_LOG_ERROR, msg);
+        return false;
+    }
+
+    /* Defensive reset of the per-block originals log (blk_orig_acct /
+     * blk_orig_stor). The current fast replay path does not populate these,
+     * but an earlier code version did — and failed to clear them between
+     * blocks. The first execute() call after replay then captured every
+     * accumulated touch as a single bogus diff for that block. That
+     * malformed history record stalled later replays trying to apply a
+     * ~2M-slot synthetic diff. Call state_reset_block unconditionally here
+     * so a future regression in any apply path can't repeat that scenario.
+     *
+     * Why:         historic diff-corruption bug after replay→execute handoff
+     * How to apply: any code path that hands state off from replay to
+     *               live execute should flush per-block undo state first */
+    evm_state_reset_block(engine->state);
+
+    engine->last_block = target_block;
+    return true;
+#else
+    (void)target_block;
+    engine_set_error(engine, RX_ERR_NULL_ARG,
+                     "libartex built without ENABLE_HISTORY; replay unavailable");
+    return false;
+#endif
+}
+
+bool rx_engine_truncate_history(rx_engine_t *engine, uint64_t last_block) {
+    if (!engine) return false;
+    engine_clear_error(engine);
+#ifdef ENABLE_HISTORY
+    if (!engine->history) {
+        engine_set_error(engine, RX_ERR_NULL_ARG,
+                         "history disabled: set rx_config_t.history_dir at create time");
+        return false;
+    }
+    state_history_truncate(engine->history, last_block);
+    return true;
+#else
+    (void)last_block;
+    engine_set_error(engine, RX_ERR_NULL_ARG,
+                     "libartex built without ENABLE_HISTORY; truncate unavailable");
+    return false;
+#endif
 }
 
 /* ========================================================================
@@ -844,7 +984,7 @@ bool rx_build_block(rx_engine_t *engine,
     block_result_t br = block_execute(engine->evm, &hdr, &body,
                                       engine->block_hashes
 #ifdef ENABLE_HISTORY
-                                      , NULL
+                                      , engine->history
 #endif
                                       );
     if (!br.success) {

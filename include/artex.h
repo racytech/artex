@@ -110,6 +110,15 @@ typedef struct {
     rx_chain_id_t chain_id;    /* only RX_CHAIN_MAINNET supported */
     const char   *data_dir;    /* directory for code_store and other disk state.
                                   NULL = in-memory only (no persistence). */
+    const char   *history_dir; /* optional per-block state diff log directory.
+                                  NULL      = history disabled.
+                                  ""        = auto (data_dir/history). Requires
+                                              data_dir to be set.
+                                  "/path/…" = explicit directory.
+                                  Field is always present regardless of the
+                                  ENABLE_HISTORY build flag; when the library
+                                  was compiled without history support, a
+                                  non-NULL value is silently ignored. */
 } rx_config_t;
 
 /* ========================================================================
@@ -340,6 +349,91 @@ RX_API bool rx_execute_block(rx_engine_t *engine,
 RX_API rx_hash_t rx_compute_state_root(rx_engine_t *engine);
 
 /**
+ * Re-apply block diffs from the engine's configured history log to bring
+ * state from last_block + 1 up through `target_block`.
+ *
+ * Unlike rx_execute_block, this does no EVM execution: it reads each
+ * block's pre-recorded diff from the .idx/.dat files and applies the
+ * new account/storage values directly. Roughly one order of magnitude
+ * faster than re-execution; bounded by MPT rehashing when the final
+ * root is computed.
+ *
+ * Typical recovery flow:
+ *   rx_engine_load_state(engine, snapshot);
+ *   rx_engine_replay_history_to(engine, target_block);
+ *   rx_hash_t root = rx_compute_state_root(engine);
+ *   // compare root against canonical header at target_block
+ *
+ * Requires:
+ *   - libartex built with ENABLE_HISTORY=ON
+ *   - engine->history_dir configured in rx_config_t
+ *   - History log contains every block in [last_block + 1, target_block]
+ *     contiguously (no gaps; producer guard enforces this on write).
+ *
+ * Post-call: last_block = target_block on success. Block hash ring is
+ * NOT populated for the replayed range — the BLOCKHASH opcode will
+ * return zero for any block in the replayed window until 256 new
+ * blocks have been executed normally. Acceptable for the recovery
+ * flow where the next step is live execution at the tip.
+ *
+ * @return true on success. false if history is disabled, the engine
+ *         hasn't loaded state, target_block <= last_block, or any
+ *         block in the range is missing / corrupt.
+ */
+RX_API bool rx_engine_replay_history_to(rx_engine_t *engine,
+                                         uint64_t target_block);
+
+/**
+ * Query the range of block numbers currently persisted in the history log.
+ *
+ * Returns true and fills *first / *last with the block numbers bounding
+ * the contiguous stored range. Use to discover how far diffs can be
+ * replayed from the snapshot's block number:
+ *
+ *   uint64_t first, last;
+ *   rx_engine_history_range(engine, &first, &last);
+ *   // safe to: rx_engine_replay_history_to(engine, last)
+ *
+ * Returns false when:
+ *   - libartex built without ENABLE_HISTORY, or
+ *   - history disabled on this engine (history_dir unset in rx_config_t), or
+ *   - the log is empty (no blocks written yet).
+ *
+ * Either out-pointer may be NULL if the caller wants only the other bound.
+ */
+RX_API bool rx_engine_history_range(const rx_engine_t *engine,
+                                     uint64_t *first_block,
+                                     uint64_t *last_block);
+
+/**
+ * Truncate the history log so that its tail is at last_block.
+ *
+ * Keeps blocks [first_block .. last_block] and discards anything after.
+ * Use cases:
+ *   - the recorded history is known-bad past some point (e.g. diff for
+ *     block N was captured under a replay→execute handoff bug) and the
+ *     caller wants execute to re-write those blocks from scratch
+ *   - rolling back before a reorg
+ *   - trimming stale history after a fork
+ *
+ * Semantics:
+ *   - Idempotent when last_block >= current tail (no-op).
+ *   - If last_block < first_block, discards ALL entries (resets the log).
+ *   - Truncates both the .idx and .dat files on disk. No backup taken.
+ *
+ * Does NOT modify engine->state — state is whatever load_state /
+ * replay_history / execute have brought it to. Caller is responsible for
+ * ensuring state and history agree after the truncate.
+ *
+ * Returns false when:
+ *   - engine is NULL, or
+ *   - libartex built without ENABLE_HISTORY, or
+ *   - history disabled (no history_dir in rx_config_t at engine create).
+ */
+RX_API bool rx_engine_truncate_history(rx_engine_t *engine,
+                                        uint64_t last_block);
+
+/**
  * Mark every cached MPT hash dirty.
  *
  * The next call to rx_compute_state_root will walk the entire
@@ -363,31 +457,28 @@ RX_API rx_hash_t rx_compute_state_root(rx_engine_t *engine);
  */
 RX_API void rx_invalidate_state_cache(rx_engine_t *engine);
 
-/* TODO: collapse rx_invalidate_state_cache + rx_compute_state_root
- * into a single rx_compute_state_root_full(engine) entry point.
+/**
+ * Compute the state root with every node recomputed from scratch.
  *
- * Today the "force a from-scratch recompute" pattern is two separate
- * calls, which means two full traversals of the trie:
- *   1. invalidate_all walks every node and flips its dirty bit
- *   2. compute_state_root walks every node again, sees them all
- *      dirty, computes hashes, clears dirty bits
+ * Equivalent to calling rx_invalidate_state_cache() followed by
+ * rx_compute_state_root(). Use when you don't trust the incremental
+ * dirty cache — recovery flows, snapshot verification, paranoia after
+ * direct state manipulation, or validating a freshly-loaded snapshot
+ * against its file-stored root.
  *
- * Both walks are bound by the same memory-access pattern over the
- * same set of nodes; the per-node work for invalidate (one byte
- * write) is much cheaper than for compute (encode + keccak), but the
- * walk itself dominates either way. Measured: each walk costs
- * ~15 min on mainnet-scale state.
+ * Cost today: two full walks of the trie (one to invalidate, one to
+ * recompute). ~30 min on mainnet-scale state, ~half of that is the
+ * redundant invalidate pass.
  *
- * A unified entry point would skip the dirty-bit gate inside the
- * recursive helper, recompute every node in a single traversal, and
- * cut the "force full recompute" cost roughly in half. The internal
- * hashing helper already does the right work per node — only the
- * gating predicate needs to change.
- *
- * Once that lands, rx_invalidate_state_cache can be deleted: its
- * only purpose was to set up for the next compute_state_root call,
- * which the unified function would absorb.
+ * TODO: collapse into a single walk by teaching the MPT hashing helper
+ * to ignore the dirty bit when invoked in "force full" mode. The per-
+ * node work is identical — only the gating predicate needs to change,
+ * saving roughly half the wall time on cold-start recomputes. Once that
+ * lands, rx_invalidate_state_cache can be deleted: its only purpose was
+ * to stage for the next compute_state_root, which this function already
+ * absorbs.
  */
+RX_API rx_hash_t rx_compute_state_root_full(rx_engine_t *engine);
 
 /* ========================================================================
  * Block production

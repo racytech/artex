@@ -80,6 +80,7 @@ class RxConfig(ctypes.Structure):
     _fields_ = [
         ("chain_id", ctypes.c_int),
         ("data_dir", ctypes.c_char_p),
+        ("history_dir", ctypes.c_char_p),
     ]
 
 class RxReceipt(ctypes.Structure):
@@ -266,6 +267,19 @@ def _lib() -> ctypes.CDLL:
     lib.rx_engine_save_state.restype = ctypes.c_bool
     lib.rx_engine_save_state.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 
+    lib.rx_engine_replay_history_to.restype = ctypes.c_bool
+    lib.rx_engine_replay_history_to.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+
+    lib.rx_engine_history_range.restype = ctypes.c_bool
+    lib.rx_engine_history_range.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+
+    lib.rx_engine_truncate_history.restype = ctypes.c_bool
+    lib.rx_engine_truncate_history.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+
     lib.rx_execute_block_rlp.restype = ctypes.c_bool
     lib.rx_execute_block_rlp.argtypes = [
         ctypes.c_void_p,
@@ -312,6 +326,9 @@ def _lib() -> ctypes.CDLL:
 
     lib.rx_compute_state_root.restype = RxHash
     lib.rx_compute_state_root.argtypes = [ctypes.c_void_p]
+
+    lib.rx_compute_state_root_full.restype = RxHash
+    lib.rx_compute_state_root_full.argtypes = [ctypes.c_void_p]
 
     lib.rx_get_block_number.restype = ctypes.c_uint64
     lib.rx_get_block_number.argtypes = [ctypes.c_void_p]
@@ -387,13 +404,18 @@ def _u256_to_int(u: RxUint256) -> int:
 @dataclass
 class Config:
     """Engine configuration. Only mainnet supported today."""
-    chain_id: int = 1           # RX_CHAIN_MAINNET
-    data_dir: str | None = None  # None = in-memory only
+    chain_id: int = 1               # RX_CHAIN_MAINNET
+    data_dir: str | None = None      # None = in-memory only
+    history_dir: str | None = None   # None = history off.
+                                     # "" = auto (data_dir/history).
+                                     # "/path" = explicit directory.
+                                     # Ignored if libartex built without ENABLE_HISTORY.
 
     def _to_rx(self) -> RxConfig:
         c = RxConfig()
         c.chain_id = self.chain_id
         c.data_dir = self.data_dir.encode() if self.data_dir else None
+        c.history_dir = self.history_dir.encode() if self.history_dir is not None else None
         return c
 
 
@@ -554,6 +576,31 @@ class Engine:
         if not self._lib.rx_engine_save_state(self._p, str(path).encode()):
             self._raise_last(f"save_state({path}) failed")
 
+    def replay_history_to(self, target_block: int) -> None:
+        """Apply persisted block diffs from (last_block + 1) through
+        target_block. Requires libartex built with ENABLE_HISTORY=ON and
+        Config(history_dir=...) set at engine creation. Caller should
+        compute state_root() afterward and compare against the canonical
+        header root at target_block."""
+        if not self._lib.rx_engine_replay_history_to(self._p, int(target_block)):
+            self._raise_last(f"replay_history_to({target_block}) failed")
+
+    def history_range(self) -> tuple[int, int] | None:
+        """Return (first_block, last_block) stored in the history log,
+        or None if history is disabled / empty / unavailable."""
+        first = ctypes.c_uint64(0)
+        last = ctypes.c_uint64(0)
+        ok = self._lib.rx_engine_history_range(
+            self._p, ctypes.byref(first), ctypes.byref(last))
+        return (first.value, last.value) if ok else None
+
+    def truncate_history(self, last_block: int) -> None:
+        """Truncate the history log so that its tail is at last_block.
+        Use when you want execute to rewrite blocks past some point, or
+        when rolling back before a reorg. Raises on failure."""
+        if not self._lib.rx_engine_truncate_history(self._p, int(last_block)):
+            self._raise_last(f"truncate_history({last_block}) failed")
+
     # --- Execution -----------------------------------------------------
 
     def execute_block_rlp(
@@ -703,6 +750,13 @@ class Engine:
 
     def state_root(self) -> bytes:
         return bytes(self._lib.rx_compute_state_root(self._p).bytes)
+
+    def state_root_full(self) -> bytes:
+        """Compute state root from scratch, ignoring the incremental
+        dirty cache. Slower than state_root() but self-contained — use
+        after direct state manipulation or when verifying a freshly
+        loaded snapshot."""
+        return bytes(self._lib.rx_compute_state_root_full(self._p).bytes)
 
     def block_number(self) -> int:
         return int(self._lib.rx_get_block_number(self._p))

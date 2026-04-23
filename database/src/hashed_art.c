@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <immintrin.h>
+#include <pthread.h>
 
 /* =========================================================================
  * Constants
@@ -705,6 +706,107 @@ void hart_invalidate_all(hart_t *t) {
     invalidate_recursive(t, t->root);
 }
 
+/* Recursive counter. Visits every non-leaf, non-null node. Tallies total
+ * and how many are clean (cached-hash still valid). */
+static void count_recursive(const hart_t *t, hart_ref_t ref,
+                             uint32_t *total, uint32_t *clean) {
+    if (ref == HART_REF_NULL || HART_IS_LEAF(ref)) return;
+    (*total)++;
+    if (!is_node_dirty(t, ref)) (*clean)++;
+    void *n = ref_ptr((hart_t *)t, ref);
+    switch (node_type(n)) {
+    case NODE_4:   { node4_t *nn = n;   for (int i = 0; i < nn->num_children; i++) count_recursive(t, nn->children[i], total, clean); break; }
+    case NODE_16:  { node16_t *nn = n;  for (int i = 0; i < nn->num_children; i++) count_recursive(t, nn->children[i], total, clean); break; }
+    case NODE_48:  { node48_t *nn = n;  for (int i = 0; i < 256; i++) if (nn->index[i] != NODE48_EMPTY) count_recursive(t, nn->children[nn->index[i]], total, clean); break; }
+    case NODE_256: { node256_t *nn = n; for (int i = 0; i < 256; i++) if (nn->children[i]) count_recursive(t, nn->children[i], total, clean); break; }
+    }
+}
+
+uint32_t hart_count_internal_nodes(const hart_t *t, uint32_t *clean_out) {
+    uint32_t total = 0, clean = 0;
+    if (t && t->root != HART_REF_NULL)
+        count_recursive(t, t->root, &total, &clean);
+    if (clean_out) *clean_out = clean;
+    return total;
+}
+
+/* Shared by hart_invalidate_all_parallel and hart_root_hash_parallel.
+ * 4 threads × 4 hi-nibble groups each = 16 groups total. */
+#define HART_PAR_THREADS 4
+
+/* Worker-thread entry for parallel invalidate. Each worker flips dirty
+ * bits across a range of hi-nibble groups of the root. Leaves (which
+ * don't carry cached hashes) are skipped by invalidate_recursive's
+ * own gate. */
+typedef struct {
+    hart_t      *t;
+    int          hi_start;
+    int          hi_end;
+    uint8_t      gcounts[16];
+    hart_ref_t   lo_refs[16][16];
+} hart_invalidate_worker_t;
+
+static void *hart_invalidate_worker_fn(void *arg) {
+    hart_invalidate_worker_t *w = (hart_invalidate_worker_t *)arg;
+    for (int hi = w->hi_start; hi < w->hi_end; hi++) {
+        for (int j = 0; j < w->gcounts[hi]; j++)
+            invalidate_recursive(w->t, w->lo_refs[hi][j]);
+    }
+    return NULL;
+}
+
+void hart_invalidate_all_parallel(hart_t *t) {
+    if (!t || t->root == HART_REF_NULL) return;
+
+    /* Leaves and small roots aren't worth the pthread overhead. */
+    if (HART_IS_LEAF(t->root)) return;  /* leaves carry no cached hash */
+    void *n = ref_ptr(t, t->root);
+    int ntype = node_type(n);
+    if (ntype != NODE_48 && ntype != NODE_256) {
+        invalidate_recursive(t, t->root);
+        return;
+    }
+
+    /* Mark the root dirty ourselves — subtree walks only mark children. */
+    mark_dirty(t, t->root);
+
+    /* Decompose into 16 hi-groups (same layout as hart_root_hash_parallel). */
+    uint8_t     gcounts[16] = {0};
+    hart_ref_t  lo_refs[16][16];
+    if (ntype == NODE_48) {
+        node48_t *nn = n;
+        for (int i = 0; i < 256; i++) {
+            if (nn->index[i] != NODE48_EMPTY) {
+                uint8_t hi = i >> 4;
+                int g = gcounts[hi]++;
+                lo_refs[hi][g] = nn->children[nn->index[i]];
+            }
+        }
+    } else {
+        node256_t *nn = n;
+        for (int i = 0; i < 256; i++) {
+            if (nn->children[i]) {
+                uint8_t hi = i >> 4;
+                int g = gcounts[hi]++;
+                lo_refs[hi][g] = nn->children[i];
+            }
+        }
+    }
+
+    hart_invalidate_worker_t workers[HART_PAR_THREADS];
+    pthread_t tids[HART_PAR_THREADS];
+    for (int th = 0; th < HART_PAR_THREADS; th++) {
+        workers[th].t = t;
+        workers[th].hi_start = th * 4;
+        workers[th].hi_end = (th + 1) * 4;
+        memcpy(workers[th].gcounts, gcounts, sizeof(gcounts));
+        memcpy(workers[th].lo_refs, lo_refs, sizeof(lo_refs));
+        pthread_create(&tids[th], NULL, hart_invalidate_worker_fn, &workers[th]);
+    }
+    for (int th = 0; th < HART_PAR_THREADS; th++)
+        pthread_join(tids[th], NULL);
+}
+
 /* =========================================================================
  * MPT Root Hash — embedded hash version
  * ========================================================================= */
@@ -992,8 +1094,6 @@ void hart_root_hash(hart_t *t, hart_encode_t encode, void *ctx, uint8_t out[32])
  * Parallel root hash — split root node's 16 hi-nibble groups across threads
  * ========================================================================= */
 
-#include <pthread.h>
-
 typedef struct {
     hart_t        *t;
     hart_encode_t  encode;
@@ -1027,8 +1127,6 @@ static void *hart_hash_worker_fn(void *arg) {
     }
     return NULL;
 }
-
-#define HART_PAR_THREADS 4
 
 void hart_root_hash_parallel(hart_t *t, hart_encode_t encode, void *ctx,
                              uint8_t out[32]) {

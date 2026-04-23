@@ -82,6 +82,18 @@ bool hart_is_dirty(const hart_t *t);
 /* Force all nodes dirty — invalidates all cached hashes */
 void hart_invalidate_all(hart_t *t);
 
+/* Parallel variant of hart_invalidate_all — splits root's 16 hi-nibble
+ * groups across 4 threads, same structure as hart_root_hash_parallel.
+ * Falls back to serial for small roots (NODE_4 / NODE_16 / leaf). Safe:
+ * each subtree's dirty bits are independent, no shared mutable state. */
+void hart_invalidate_all_parallel(hart_t *t);
+
+/* Count internal (non-leaf, non-null) nodes reachable from the root, and
+ * how many of them currently have a clean (non-dirty) hash cache. After
+ * hart_invalidate_all / hart_invalidate_all_parallel, `*clean_out` should
+ * be 0 — used by tests to verify full-tree coverage of the parallel path. */
+uint32_t hart_count_internal_nodes(const hart_t *t, uint32_t *clean_out);
+
 /* Compute MPT root hash. Only rehashes dirty subtrees.
  * Clean subtrees use the hash embedded in the node. */
 void hart_root_hash(hart_t *t, hart_encode_t encode, void *ctx, uint8_t out[32]);

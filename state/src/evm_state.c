@@ -374,8 +374,7 @@ void evm_state_increment_nonce(evm_state_t *es, const address_t *addr) {
 
 void evm_state_set_code_hash(evm_state_t *es, const address_t *addr,
                               const hash_t *code_hash) {
-    (void)es; (void)addr; (void)code_hash;
-    /* Not needed — code_hash is derived from code in set_code */
+    if (es) state_set_code_hash(es->st, addr, code_hash);
 }
 
 uint256_t evm_state_get_committed_storage(evm_state_t *es, const address_t *addr,

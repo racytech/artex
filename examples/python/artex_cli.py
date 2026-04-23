@@ -76,13 +76,21 @@ class ArtexShell(cmd.Cmd):
     def __init__(
         self,
         data_dir: str | None = None,
+        history_dir: str | None = None,
     ):
         super().__init__()
         self.data_dir = data_dir
-        self.engine = Engine(Config(data_dir=data_dir))
+        self.history_dir = history_dir
+        self.engine = Engine(Config(data_dir=data_dir, history_dir=history_dir))
         print(f"libartex version: {version()}")
         if data_dir:
             print(f"data dir: {data_dir}")
+        if history_dir is not None:
+            if history_dir == "":
+                resolved = f"{data_dir}/history" if data_dir else "(disabled: data_dir unset)"
+                print(f"history dir: {resolved} (auto)")
+            else:
+                print(f"history dir: {history_dir}")
 
     # ------------------------------------------------------------------
     # Cleanup
@@ -123,9 +131,16 @@ class ArtexShell(cmd.Cmd):
         print(self.engine.block_number())
 
     def do_root(self, _):
-        """root                      compute + print current state root"""
+        """root                      compute + print current state root (incremental)"""
+        t0 = time.time()
         r = self.engine.state_root()
-        print("0x" + r.hex())
+        print(f"0x{r.hex()} ({time.time() - t0:.1f}s)")
+
+    def do_root_full(self, _):
+        """root-full                 recompute state root from scratch (ignores cache)"""
+        t0 = time.time()
+        r = self.engine.state_root_full()
+        print(f"0x{r.hex()} ({time.time() - t0:.1f}s)")
 
     def do_quit(self, _):
         """quit                      exit"""
@@ -157,7 +172,8 @@ class ArtexShell(cmd.Cmd):
         if self.data_dir is None:
             self.engine.close()
             self.data_dir = inferred
-            self.engine = Engine(Config(data_dir=inferred))
+            self.engine = Engine(Config(data_dir=inferred,
+                                        history_dir=self.history_dir))
             print(f"  data dir set to: {inferred}")
         elif self.data_dir != inferred:
             print(f"  warning: snapshot is in {inferred} but engine uses "
@@ -257,6 +273,131 @@ class ArtexShell(cmd.Cmd):
         print(f"  0x{val:064x}")
         if val != 0:
             print(f"  = {val} (decimal)")
+
+    # ------------------------------------------------------------------
+    # Replay from history log (no EVM re-execution)
+    # ------------------------------------------------------------------
+
+    def do_history_range(self, _):
+        """history-range              show first/last block numbers stored in the history log"""
+        r = self.engine.history_range()
+        if r is None:
+            print("  history unavailable (disabled, empty, or build lacks ENABLE_HISTORY)")
+            return
+        first, last = r
+        count = last - first + 1
+        print(f"  first : {first}")
+        print(f"  last  : {last}")
+        print(f"  count : {count} blocks")
+
+    def do_truncate_history(self, arg):
+        """truncate_history <last-block>
+           Truncate the history log so its tail sits at <last-block>.
+           Everything past that block is discarded. Does not modify state
+           — caller is responsible for ensuring state and history agree
+           afterwards. Typical uses: rewrite known-bad blocks via execute,
+           roll back before a reorg."""
+        parts = shlex.split(arg)
+        if len(parts) != 1:
+            print("usage: truncate_history <last-block>")
+            return
+        target = parse_int(parts[0])
+        r = self.engine.history_range()
+        if r is None:
+            print("  history unavailable (disabled or empty)")
+            return
+        first, last = r
+        if target >= last:
+            print(f"  no-op: target {target} >= current tail {last}")
+            return
+        kept = max(0, target - first + 1) if target >= first else 0
+        dropped = last - max(first - 1, target)
+        print(f"  truncating: keep {kept} block(s) [{first}..{target}], "
+              f"discarding {dropped} block(s) [{target + 1}..{last}]")
+        self.engine.truncate_history(target)
+        r2 = self.engine.history_range()
+        if r2 is None:
+            print(f"  done: history is now empty")
+        else:
+            f2, l2 = r2
+            print(f"  done: history now spans [{f2}..{l2}] ({l2 - f2 + 1} blocks)")
+
+    def do_replay_history(self, arg):
+        """replay-history <target-block>
+           Apply per-block diffs from the history log (configured via
+           --history / --history-dir at startup) to bring state from
+           current block + 1 through <target-block>. No EVM execution.
+           Requires libartex built with ENABLE_HISTORY=ON."""
+        parts = shlex.split(arg)
+        if len(parts) != 1:
+            print("usage: replay-history <target-block>")
+            return
+        self._safe(arg, lambda _: self._replay_history(parts[0]))
+
+    def _replay_history(self, target_s):
+        target = parse_int(target_s)
+        start_bn = self.engine.block_number()
+        if target <= start_bn:
+            print(f"  target {target} must be > current block {start_bn}")
+            return
+        n = target - start_bn
+        print(f"  replaying {n} diffs from {start_bn + 1} to {target} ...")
+        t0 = time.time()
+        self.engine.replay_history_to(target)
+        dt = time.time() - t0
+        now = self.engine.block_number()
+        rate = n / dt if dt > 0 else 0
+        print(f"  done: now at block {now} in {dt:.1f}s ({rate:.1f} blk/s)")
+
+    def do_seed_hashes(self, arg):
+        """seed-hashes <era-dir>
+           After replay-history, the 256-entry block-hash ring still holds
+           snapshot-era hashes — the BLOCKHASH opcode would return stale
+           values for any block in [last_block - 255, last_block]. This
+           command reads era files and repopulates the ring for that
+           window, making the state safe for forward execution.
+
+           Mandatory before `execute` following `replay-history`."""
+        parts = shlex.split(arg)
+        if len(parts) != 1:
+            print("usage: seed-hashes <era-dir>")
+            return
+        self._safe(arg, lambda _: self._seed_hashes(parts[0]))
+
+    def _seed_hashes(self, era_dir):
+        from era import iter_era_blocks, ep_to_header_body
+
+        last_bn = self.engine.block_number()
+        if last_bn == 0:
+            print("  no state loaded — nothing to seed")
+            return
+
+        start = max(0, last_bn - 255)
+        target_count = last_bn - start + 1
+        print(f"  seeding ring for [{start}..{last_bn}] ({target_count} entries) "
+              f"from era files at {era_dir} ...")
+
+        t0 = time.time()
+        seeded = 0
+        for b in iter_era_blocks(era_dir, start):
+            if b.number < start:
+                continue
+            if b.number > last_bn:
+                break
+            _, _, block_hash = ep_to_header_body(
+                b.ep, parent_beacon_root=b.parent_beacon_root)
+            self.engine.set_block_hash(b.number, block_hash)
+            seeded += 1
+
+        dt = time.time() - t0
+        if seeded == target_count:
+            print(f"  seeded {seeded} hashes in {dt:.1f}s — ring is current")
+        elif seeded == 0:
+            print(f"  ERROR: no era blocks found in [{start}..{last_bn}] under {era_dir}")
+        else:
+            print(f"  WARNING: seeded {seeded}/{target_count} hashes — "
+                  f"era coverage incomplete; BLOCKHASH may still return stale values "
+                  f"for the missing blocks")
 
     # ------------------------------------------------------------------
     # Execute from era
@@ -431,9 +572,29 @@ def main() -> int:
              "If unset, defaults to the directory of whichever snapshot "
              "you pass to 'load-state' later.",
     )
+    hgrp = ap.add_mutually_exclusive_group()
+    hgrp.add_argument(
+        "--history",
+        action="store_true",
+        help="enable per-block diff history under data_dir/history. "
+             "Requires libartex built with ENABLE_HISTORY=ON; otherwise silently ignored.",
+    )
+    hgrp.add_argument(
+        "--history-dir",
+        help="explicit directory for the diff history log "
+             "(overrides --history's auto-location).",
+    )
     args = ap.parse_args()
 
-    sh = ArtexShell(data_dir=args.data_dir)
+    # Resolve history_dir: explicit path > auto sentinel > unset.
+    if args.history_dir:
+        history_dir = args.history_dir
+    elif args.history:
+        history_dir = ""   # sentinel: libartex resolves to data_dir/history
+    else:
+        history_dir = None  # disabled
+
+    sh = ArtexShell(data_dir=args.data_dir, history_dir=history_dir)
     try:
         sh.cmdloop()
     except KeyboardInterrupt:

@@ -1,18 +1,20 @@
 cmake_minimum_required(VERSION 3.15)
 
-# Load project config if present (avoids -D flags on every cmake invocation)
-if(EXISTS "${CMAKE_SOURCE_DIR}/config.cmake")
-    include("${CMAKE_SOURCE_DIR}/config.cmake")
+# Default to Release unless the caller asked for something else.
+# The project runs 4x slower in the CMake-default empty/Debug mode, so
+# we refuse to let it ship unoptimized by accident.
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
 project(art_database C)
 
-# Build options (overridable via config.cmake or -D flags)
+# Build options (override via -D flags, e.g. -DENABLE_HISTORY=ON)
 option(ENABLE_EVM_TRACE "Enable EIP-3155 EVM execution tracing" OFF)
 option(ENABLE_DEBUG "Enable debug instrumentation (g_trace_calls, state dump, --no-evict)" OFF)
 option(ENABLE_HISTORY "Enable per-block state diff history tracking" OFF)
 
-# Tunable parameters (overridable via config.cmake or -D flags)
+# Tunable parameters (override via -D flags)
 if(NOT DEFINED CODE_CACHE_ENTRIES)
     set(CODE_CACHE_ENTRIES 32768)
 endif()
@@ -211,6 +213,29 @@ target_include_directories(era_reader PUBLIC
 target_link_libraries(era_reader common snappy)
 
 #==============================================================================
+# cJSON detection (used by libartex, chain_replay, integration tests)
+#==============================================================================
+
+find_package(PkgConfig QUIET)
+if(PKG_CONFIG_FOUND)
+    pkg_check_modules(CJSON QUIET libcjson)
+endif()
+if(NOT CJSON_FOUND)
+    find_library(CJSON_LIBRARY NAMES cjson)
+    find_path(CJSON_INCLUDE_DIR NAMES cjson/cJSON.h)
+    if(CJSON_LIBRARY AND CJSON_INCLUDE_DIR)
+        set(CJSON_FOUND TRUE)
+        set(CJSON_LIBRARIES ${CJSON_LIBRARY})
+        set(CJSON_INCLUDE_DIRS ${CJSON_INCLUDE_DIR})
+    endif()
+endif()
+if(CJSON_FOUND)
+    message(STATUS "Found cJSON: ${CJSON_LIBRARIES}")
+else()
+    message(FATAL_ERROR "cJSON not found. Install libcjson-dev.")
+endif()
+
+#==============================================================================
 # Libraries — Public API (libartex)
 #==============================================================================
 
@@ -280,6 +305,14 @@ target_include_directories(test_hart_parallel PRIVATE
     ${CMAKE_SOURCE_DIR}/common/include
 )
 target_link_libraries(test_hart_parallel hashed_art mem_mpt common pthread)
+
+add_executable(test_hart_invalidate_parallel database/tests/test_hart_invalidate_parallel.c)
+target_include_directories(test_hart_invalidate_parallel PRIVATE
+    ${CMAKE_SOURCE_DIR}/database/include
+    ${CMAKE_SOURCE_DIR}/common/include
+)
+target_link_libraries(test_hart_invalidate_parallel hashed_art mem_mpt common pthread)
+add_test(NAME test_hart_invalidate_parallel COMMAND test_hart_invalidate_parallel)
 
 add_executable(bench_hart_scale database/tests/bench_hart_scale.c)
 target_include_directories(bench_hart_scale PRIVATE
@@ -476,6 +509,10 @@ if(ENABLE_HISTORY)
     target_link_libraries(test_state_history block_executor evm common)
     add_test(NAME test_state_history COMMAND test_state_history)
 
+    add_executable(test_apply_diff_parity executor/tests/test_apply_diff_parity.c)
+    target_link_libraries(test_apply_diff_parity block_executor evm common)
+    add_test(NAME test_apply_diff_parity COMMAND test_apply_diff_parity)
+
     add_executable(history_dump tools/history_dump.c)
     target_link_libraries(history_dump block_executor evm common)
 
@@ -501,28 +538,7 @@ add_executable(test_byte_conv common/tests/test_byte_conv.c)
 target_link_libraries(test_byte_conv common)
 add_test(NAME test_byte_conv COMMAND test_byte_conv)
 
-#==============================================================================
-#==============================================================================
-# cJSON detection (used by chain_replay + integration tests)
-#==============================================================================
-
-find_package(PkgConfig QUIET)
-if(PKG_CONFIG_FOUND)
-    pkg_check_modules(CJSON QUIET libcjson)
-endif()
-if(NOT CJSON_FOUND)
-    find_library(CJSON_LIBRARY NAMES cjson)
-    find_path(CJSON_INCLUDE_DIR NAMES cjson/cJSON.h)
-    if(CJSON_LIBRARY AND CJSON_INCLUDE_DIR)
-        set(CJSON_FOUND TRUE)
-        set(CJSON_LIBRARIES ${CJSON_LIBRARY})
-        set(CJSON_INCLUDE_DIRS ${CJSON_INCLUDE_DIR})
-    endif()
-endif()
-
 if(CJSON_FOUND)
-    message(STATUS "Found cJSON: ${CJSON_LIBRARIES}")
-
     # Sync engine (reusable block execution + validation + checkpointing)
     add_library(sync STATIC sync/src/sync.c)
     target_include_directories(sync PUBLIC ${CMAKE_SOURCE_DIR}/sync/include)
