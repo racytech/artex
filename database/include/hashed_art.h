@@ -109,4 +109,17 @@ const uint8_t  *hart_iter_key(const hart_iter_t *it);
 const void     *hart_iter_value(const hart_iter_t *it);
 void            hart_iter_destroy(hart_iter_t *it);
 
+/* Pre-order DFS walk over every reachable node (internal + leaf).
+ * Child traversal is key-sorted (same order as the root-hash walk and the
+ * leaf iterator), so the emitted node sequence is deterministic given the
+ * tree's key set. For internal nodes, hash32 points at the cached 32-byte
+ * MPT hash embedded in the node — call hart_root_hash first so hashes are
+ * valid; dirty internals expose stale bytes. For leaves, hash32 is NULL. */
+typedef void (*hart_walk_cb)(hart_ref_t ref,
+                              int depth,
+                              const uint8_t *hash32,
+                              bool is_leaf,
+                              void *user);
+void hart_walk_dfs(const hart_t *t, hart_walk_cb cb, void *user);
+
 #endif /* HASHED_ART_H */

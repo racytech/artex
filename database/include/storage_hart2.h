@@ -108,4 +108,18 @@ static inline bool storage_hart_empty(const storage_hart_t *sh) {
     return !sh || sh->count == 0;
 }
 
+/* Pre-order DFS walk over every reachable node. Semantics match
+ * hart_walk_dfs: internal-node hash32 is the cached 32-byte MPT hash (call
+ * storage_hart_root_hash first to populate); leaves have hash32 == NULL.
+ * Child order is key-sorted for deterministic output. The ref argument is
+ * a raw 64-bit storage-hart node ref (pool offset | leaf bit). */
+typedef void (*storage_hart_walk_cb)(uint64_t ref,
+                                      int depth,
+                                      const uint8_t *hash32,
+                                      bool is_leaf,
+                                      void *user);
+void storage_hart_walk_dfs(const hart_pool_t *pool,
+                           const storage_hart_t *sh,
+                           storage_hart_walk_cb cb, void *user);
+
 #endif /* STORAGE_HART2_H */

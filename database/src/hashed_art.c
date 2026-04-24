@@ -1387,3 +1387,50 @@ const void *hart_iter_value(const hart_iter_t *it) {
 void hart_iter_destroy(hart_iter_t *it) {
     free(it);
 }
+
+static void walk_recurse(const hart_t *t, hart_ref_t ref, int depth,
+                          hart_walk_cb cb, void *user) {
+    if (ref == HART_REF_NULL) return;
+    if (HART_IS_LEAF(ref)) {
+        cb(ref, depth, NULL, true, user);
+        return;
+    }
+    const void *n = ref_ptr(t, ref);
+    cb(ref, depth, node_hash_ptr(n), false, user);
+
+    switch (node_type(n)) {
+    case NODE_4: {
+        const node4_t *nn = (const node4_t *)n;
+        for (int i = 0; i < nn->num_children; i++)
+            walk_recurse(t, nn->children[i], depth + 1, cb, user);
+        break;
+    }
+    case NODE_16: {
+        const node16_t *nn = (const node16_t *)n;
+        for (int i = 0; i < nn->num_children; i++)
+            walk_recurse(t, nn->children[i], depth + 1, cb, user);
+        break;
+    }
+    case NODE_48: {
+        const node48_t *nn = (const node48_t *)n;
+        for (int i = 0; i < 256; i++)
+            if (nn->index[i] != NODE48_EMPTY)
+                walk_recurse(t, nn->children[nn->index[i]], depth + 1, cb, user);
+        break;
+    }
+    case NODE_256: {
+        const node256_t *nn = (const node256_t *)n;
+        for (int i = 0; i < 256; i++)
+            if (nn->children[i] != HART_REF_NULL)
+                walk_recurse(t, nn->children[i], depth + 1, cb, user);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void hart_walk_dfs(const hart_t *t, hart_walk_cb cb, void *user) {
+    if (!t || !cb) return;
+    walk_recurse(t, t->root, 0, cb, user);
+}

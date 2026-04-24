@@ -1155,3 +1155,53 @@ void storage_hart_foreach(const hart_pool_t *pool, const storage_hart_t *sh,
     if (sh->root_ref == SH_REF_NULL) return;
     sh_foreach_recursive(pool, sh->root_ref, cb, ctx);
 }
+
+static void sh_walk_recurse(const hart_pool_t *pool, sh_ref_t ref, int depth,
+                             storage_hart_walk_cb cb, void *user) {
+    if (ref == SH_REF_NULL) return;
+    if (SH_IS_LEAF(ref)) {
+        cb(ref, depth, NULL, true, user);
+        return;
+    }
+    const void *n = sh_ref_ptr(pool, ref);
+    cb(ref, depth, sh_node_hash_ptr(n), false, user);
+
+    switch (sh_node_type(n)) {
+    case NODE_4: {
+        const sh_node4_t *nn = (const sh_node4_t *)n;
+        for (int i = 0; i < nn->num_children; i++)
+            sh_walk_recurse(pool, nn->children[i], depth + 1, cb, user);
+        break;
+    }
+    case NODE_16: {
+        const sh_node16_t *nn = (const sh_node16_t *)n;
+        for (int i = 0; i < nn->num_children; i++)
+            sh_walk_recurse(pool, nn->children[i], depth + 1, cb, user);
+        break;
+    }
+    case NODE_48: {
+        const sh_node48_t *nn = (const sh_node48_t *)n;
+        for (int i = 0; i < 256; i++)
+            if (nn->index[i] != NODE48_EMPTY)
+                sh_walk_recurse(pool, nn->children[nn->index[i]],
+                                 depth + 1, cb, user);
+        break;
+    }
+    case NODE_256: {
+        const sh_node256_t *nn = (const sh_node256_t *)n;
+        for (int i = 0; i < 256; i++)
+            if (nn->children[i] != SH_REF_NULL)
+                sh_walk_recurse(pool, nn->children[i], depth + 1, cb, user);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void storage_hart_walk_dfs(const hart_pool_t *pool, const storage_hart_t *sh,
+                            storage_hart_walk_cb cb, void *user) {
+    if (!pool || !sh || !cb) return;
+    if (sh->root_ref == SH_REF_NULL) return;
+    sh_walk_recurse(pool, sh->root_ref, 0, cb, user);
+}
