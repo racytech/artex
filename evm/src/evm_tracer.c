@@ -139,48 +139,65 @@ static void emit_pending(uint64_t gas_now, const char *error) {
     FILE *f = g_evm_tracer.out;
     uint64_t gas_cost = (pending.gas >= gas_now) ? (pending.gas - gas_now) : 0;
 
+    /* EIP-3155 field order: pc, op, gas, gasCost, memSize, stack, depth,
+     * returnData, refund, opName, error, memory, storage. */
+
     fprintf(f, "{\"pc\":%" PRIu64 ",\"op\":%u,\"gas\":\"0x%" PRIx64 "\","
                "\"gasCost\":\"0x%" PRIx64 "\",\"memSize\":%zu",
             pending.pc, pending.op, pending.gas, gas_cost, pending.mem_size);
 
-    /* Optional "memory" field — only emitted when dump_memory is on.
-     * Per EIP-3155: Array of Hex-Strings, one entry per 32-byte word
-     * of EVM memory. EVM memory is always word-aligned so the word
-     * count == memory_len / 32. */
-    if (g_evm_tracer.dump_memory) {
-        fprintf(f, ",\"memory\":[");
-        size_t n_words = pending.memory_len / 32;
-        for (size_t w = 0; w < n_words; w++) {
-            if (w > 0) fputc(',', f);
-            fprintf(f, "\"0x");
-            for (int b = 0; b < 32; b++)
-                fprintf(f, "%02x", pending.memory_buf[w * 32 + b]);
-            fprintf(f, "\"");
-        }
-        /* Safety: if memory_len isn't a multiple of 32 for some
-         * unexpected reason, emit a padded final word. */
-        size_t tail = pending.memory_len % 32;
-        if (tail != 0) {
-            if (n_words > 0) fputc(',', f);
-            fprintf(f, "\"0x");
-            for (size_t b = 0; b < tail; b++)
-                fprintf(f, "%02x", pending.memory_buf[n_words * 32 + b]);
-            for (size_t b = tail; b < 32; b++)
-                fprintf(f, "00");
-            fprintf(f, "\"");
-        }
-        fprintf(f, "]");
+    /* stack (bottom to top) */
+    fprintf(f, ",\"stack\":[");
+    for (int i = 0; i < pending.stack_count; i++) {
+        if (i > 0) fputc(',', f);
+        char hex[68];
+        u256_to_hex(pending.stack[i], hex, sizeof(hex));
+        fprintf(f, "\"%s\"", hex);
     }
+    fprintf(f, "]");
 
-    /* EIP-3155 requires returnData. Emit empty "0x" when no return
-     * data has been set yet (before any sub-call completes). */
+    fprintf(f, ",\"depth\":%d", pending.depth);
+
+    /* returnData — required. Empty "0x" when no sub-call has completed. */
     fprintf(f, ",\"returnData\":\"0x");
     for (size_t i = 0; i < pending.return_data_len; i++)
         fprintf(f, "%02x", pending.return_data_buf[i]);
     fprintf(f, "\"");
 
-    /* Optional "storage" field — touched slots in current tx filtered
-     * to the currently-executing contract. */
+    fprintf(f, ",\"refund\":\"0x%" PRIx64 "\"", (uint64_t)pending.refund);
+
+    fprintf(f, ",\"opName\":\"%s\"", opcode_name(pending.op));
+
+    if (error)
+        fprintf(f, ",\"error\":\"%s\"", error);
+
+    /* Optional "memory" — only emitted when dump_memory is on. Array of
+     * Hex-Strings, one entry per 32-byte word, leading zeros stripped
+     * (same minimal-hex encoding as stack items). */
+    if (g_evm_tracer.dump_memory) {
+        fprintf(f, ",\"memory\":[");
+        size_t n_words = pending.memory_len / 32;
+        char hex[68];
+        for (size_t w = 0; w < n_words; w++) {
+            if (w > 0) fputc(',', f);
+            u256_to_hex(&pending.memory_buf[w * 32], hex, sizeof(hex));
+            fprintf(f, "\"%s\"", hex);
+        }
+        /* Safety: if memory_len isn't a multiple of 32 for some
+         * unexpected reason, zero-pad into a 32-byte buffer and encode. */
+        size_t tail = pending.memory_len % 32;
+        if (tail != 0) {
+            if (n_words > 0) fputc(',', f);
+            uint8_t padded[32] = {0};
+            memcpy(padded, &pending.memory_buf[n_words * 32], tail);
+            u256_to_hex(padded, hex, sizeof(hex));
+            fprintf(f, "\"%s\"", hex);
+        }
+        fprintf(f, "]");
+    }
+
+    /* Optional "storage" — touched slots in current tx filtered to the
+     * currently-executing contract. Key/value stripped of leading zeros. */
     if (g_evm_tracer.dump_storage) {
         fprintf(f, ",\"storage\":{");
         bool first = true;
@@ -189,36 +206,15 @@ static void emit_pending(uint64_t gas_now, const char *error) {
                        pending.current_addr, 20) != 0) continue;
             if (!first) fputc(',', f);
             first = false;
-            fprintf(f, "\"0x");
-            for (int b = 0; b < 32; b++)
-                fprintf(f, "%02x", g_storage_map[i].key[b]);
-            fprintf(f, "\":\"0x");
-            for (int b = 0; b < 32; b++)
-                fprintf(f, "%02x", g_storage_map[i].value[b]);
-            fprintf(f, "\"");
+            char khex[68], vhex[68];
+            u256_to_hex(g_storage_map[i].key, khex, sizeof(khex));
+            u256_to_hex(g_storage_map[i].value, vhex, sizeof(vhex));
+            fprintf(f, "\"%s\":\"%s\"", khex, vhex);
         }
         fprintf(f, "}");
     }
 
-    fprintf(f, ",\"stack\":[");
-
-    /* Stack (bottom to top) */
-    for (int i = 0; i < pending.stack_count; i++) {
-        if (i > 0) fputc(',', f);
-        char hex[68];
-        u256_to_hex(pending.stack[i], hex, sizeof(hex));
-        fprintf(f, "\"%s\"", hex);
-    }
-
-    fprintf(f, "],\"depth\":%d,\"refund\":\"0x%" PRIx64 "\"",
-            pending.depth, (uint64_t)pending.refund);
-
-    if (error) {
-        fprintf(f, ",\"opName\":\"%s\",\"error\":\"%s\"}\n",
-                opcode_name(pending.op), error);
-    } else {
-        fprintf(f, ",\"opName\":\"%s\"}\n", opcode_name(pending.op));
-    }
+    fprintf(f, "}\n");
 
     pending.active = false;
 }
@@ -377,39 +373,15 @@ void evm_tracer_on_implicit_stop(evm_t *evm) {
     int depth = evm->msg.depth + 1;
     size_t mem_size = evm_memory_size(evm->memory);
 
+    /* EIP-3155 field order: pc, op, gas, gasCost, memSize, stack, depth,
+     * returnData, refund, opName, memory. */
+
     fprintf(f, "{\"pc\":%" PRIu64 ",\"op\":0,\"gas\":\"0x%" PRIx64 "\","
                "\"gasCost\":\"0x0\",\"memSize\":%zu",
             evm->pc, evm->gas_left, mem_size);
 
-    if (g_evm_tracer.dump_memory) {
-        fprintf(f, ",\"memory\":[");
-        const uint8_t *src = (mem_size > 0) ? evm_memory_get_ptr(evm->memory, 0) : NULL;
-        size_t n_words = mem_size / 32;
-        for (size_t w = 0; w < n_words; w++) {
-            if (w > 0) fputc(',', f);
-            fprintf(f, "\"0x");
-            if (src) {
-                for (int b = 0; b < 32; b++)
-                    fprintf(f, "%02x", src[w * 32 + b]);
-            } else {
-                for (int b = 0; b < 32; b++) fprintf(f, "00");
-            }
-            fprintf(f, "\"");
-        }
-        fprintf(f, "]");
-    }
-
-    /* EIP-3155 requires returnData on every line. */
-    fprintf(f, ",\"returnData\":\"0x");
-    if (evm->return_data && evm->return_data_size > 0) {
-        for (size_t i = 0; i < evm->return_data_size; i++)
-            fprintf(f, "%02x", evm->return_data[i]);
-    }
-    fprintf(f, "\"");
-
+    /* stack (bottom to top) */
     fprintf(f, ",\"stack\":[");
-
-    /* Stack snapshot (bottom to top) */
     size_t sz = evm_stack_size(evm->stack);
     for (size_t i = 0; i < sz; i++) {
         if (i > 0) fputc(',', f);
@@ -421,9 +393,36 @@ void evm_tracer_on_implicit_stop(evm_t *evm) {
         u256_to_hex(be, hex, sizeof(hex));
         fprintf(f, "\"%s\"", hex);
     }
+    fprintf(f, "]");
 
-    fprintf(f, "],\"depth\":%d,\"refund\":\"0x%" PRIx64 "\",\"opName\":\"STOP\"}\n",
-            depth, (uint64_t)evm->gas_refund);
+    fprintf(f, ",\"depth\":%d", depth);
+
+    fprintf(f, ",\"returnData\":\"0x");
+    if (evm->return_data && evm->return_data_size > 0) {
+        for (size_t i = 0; i < evm->return_data_size; i++)
+            fprintf(f, "%02x", evm->return_data[i]);
+    }
+    fprintf(f, "\"");
+
+    fprintf(f, ",\"refund\":\"0x%" PRIx64 "\"", (uint64_t)evm->gas_refund);
+
+    fprintf(f, ",\"opName\":\"STOP\"");
+
+    if (g_evm_tracer.dump_memory) {
+        fprintf(f, ",\"memory\":[");
+        const uint8_t *src = (mem_size > 0) ? evm_memory_get_ptr(evm->memory, 0) : NULL;
+        size_t n_words = mem_size / 32;
+        char hex[68];
+        uint8_t zero[32] = {0};
+        for (size_t w = 0; w < n_words; w++) {
+            if (w > 0) fputc(',', f);
+            u256_to_hex(src ? &src[w * 32] : zero, hex, sizeof(hex));
+            fprintf(f, "\"%s\"", hex);
+        }
+        fprintf(f, "]");
+    }
+
+    fprintf(f, "}\n");
 }
 
 void evm_tracer_on_return(const uint8_t *output, size_t output_len,
