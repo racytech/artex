@@ -458,10 +458,6 @@ static resource_t *ensure_resource(state_t *s, account_t *a) {
             if (nc < 1024) nc = 1024;
             size_t old_bytes = (size_t)s->res_capacity * sizeof(resource_t);
             size_t new_bytes = (size_t)nc * sizeof(resource_t);
-            fprintf(stderr, "RES_GROW: %uM -> %uM (%.1fGB -> %.1fGB)\n",
-                    s->res_capacity / 1000000, nc / 1000000,
-                    (double)old_bytes / (1024*1024*1024),
-                    (double)new_bytes / (1024*1024*1024));
             resource_t *nr = vec_grow(s->resources, old_bytes, new_bytes);
             if (!nr) return NULL;
             memset(nr + s->res_capacity, 0, (nc - s->res_capacity) * sizeof(resource_t));
@@ -498,10 +494,6 @@ static account_t *ensure_account_h(state_t *s, const address_t *addr,
             if (nc < ACCT_INIT_CAP) nc = ACCT_INIT_CAP;
             size_t old_bytes = (size_t)s->capacity * sizeof(account_t);
             size_t new_bytes = (size_t)nc * sizeof(account_t);
-            fprintf(stderr, "ACCT_GROW: %uM -> %uM (%.1fGB -> %.1fGB)\n",
-                    s->capacity / 1000000, nc / 1000000,
-                    (double)old_bytes / (1024*1024*1024),
-                    (double)new_bytes / (1024*1024*1024));
             account_t *na = vec_grow(s->accounts, old_bytes, new_bytes);
             if (!na) return NULL;
             memset(na + s->capacity, 0, (nc - s->capacity) * sizeof(account_t));
@@ -1727,15 +1719,8 @@ hash_t state_compute_root(state_t *s, bool prune_empty) {
             pthread_create(&tids[t], NULL, stor_root_worker_fn, &workers[t]);
         }
 
-        uint32_t total = 0;
-        for (int t = 0; t < nthreads; t++) {
+        for (int t = 0; t < nthreads; t++)
             pthread_join(tids[t], NULL);
-            total += workers[t].computed;
-        }
-
-        if (total > 0)
-            fprintf(stderr, "  storage roots: %u computed (%d threads)\n",
-                    total, nthreads);
     } else {
         /* Serial: small number of dirty resources */
         for (uint32_t b = 0; b < bitmap_bytes; b++) {
@@ -2819,8 +2804,6 @@ static bool state_load_impl(state_t *s, const char *path, hash_t *out_root,
     }
 
     fclose(f);
-    fprintf(stderr, "state_load: %u accounts from %s (block %lu)\n",
-            acct_count, path, block_number);
     return true;
 fail:
     fclose(f);

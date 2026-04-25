@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static void print_hash(const char *label, const uint8_t h[32]) {
     fprintf(stderr, "  %s: 0x", label);
@@ -94,7 +95,12 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "  save: %.1fs\n", seconds_since(&t0));
 
-    evm_state_destroy(es);
+    /* Skip the orderly destroy — at mainnet scale this is hundreds of
+     * millions of free() calls and storage-hart teardowns, all redundant
+     * because the OS will reclaim everything at process exit. _exit
+     * bypasses libc atexit handlers too, so nothing buffered remains
+     * (state_save already fclose'd the output file). */
     fprintf(stderr, "done.\n");
-    return 0;
+    fflush(stderr);
+    _exit(0);
 }

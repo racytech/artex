@@ -473,6 +473,12 @@ target_include_directories(state_migrate PRIVATE
     ${CMAKE_SOURCE_DIR}/state/include
     ${CMAKE_SOURCE_DIR}/evm/include)
 
+add_executable(state_soak tools/state_soak.c)
+target_link_libraries(state_soak state evm)
+target_include_directories(state_soak PRIVATE
+    ${CMAKE_SOURCE_DIR}/state/include
+    ${CMAKE_SOURCE_DIR}/evm/include)
+
 add_executable(test_finalize_bug state/tests/test_finalize_bug.c)
 target_link_libraries(test_finalize_bug state evm)
 target_include_directories(test_finalize_bug PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
