@@ -67,8 +67,11 @@ sanity baseline, not a spec.
 
 - **13.3 blk/s / 404 Mgas/s** average, bursting to ~30 blk/s /
   ~880 Mgas/s between root-validation points.
-- **~105 min cold-start sync** for this 49,017-block window:
-  ~35 min to load + verify a 140 GB snapshot, ~70 min to replay.
+- **~83 min cold-start sync** for this 49,017-block window:
+  ~13 min to load a ~150 GB snapshot, ~70 min to replay. Roughly
+  halves to **~49 min** when the catch-up uses recorded per-block
+  diffs (`replay-history`, ~36 min for the same window) instead of
+  re-executing — see [`history_replay.md`](examples/python/history_replay.md).
 - **~232 GB memory footprint** during replay (90 GB RSS + 142 GB
   swap) from a single engine instance.
 
@@ -86,9 +89,9 @@ sanity baseline, not a spec.
 
 | Resource | Minimum | Why |
 |---|---|---|
-| **RAM + swap (combined)** | 92 GB RAM + 254 GB swap | Load the 140 GB snapshot and have room to grow. Measured during replay: **RSS 90 GB + Swap 142 GB ≈ 232 GB total**, `VmData` ~234 GB. |
+| **RAM + swap (combined)** | 92 GB RAM + 254 GB swap | Load the ~150 GB snapshot and have room to grow. Measured during replay: **RSS 90 GB + Swap 142 GB ≈ 232 GB total**, `VmData` ~234 GB. |
 | **Swap media** | NVMe | Cold-account page faults dominate steady state; SATA SSD is a noticeable bottleneck, spinning disk is orders of magnitude worse. |
-| **Free disk** | ~300 GB | 140 GB snapshot + 16 GB code store + a few recent era files + headroom to save a new snapshot. |
+| **Free disk** | ~300 GB | ~150 GB snapshot + 16 GB code store + a few recent era files + headroom to save a new snapshot. |
 | **OS** | Linux | The pool uses `MAP_ANONYMOUS \| MAP_PRIVATE` + `mremap`. No macOS/Windows port. |
 
 ### Replay throughput
@@ -117,14 +120,13 @@ breakdown for this 49,017-block window:
 
 | Phase | Time | Notes |
 |---|---|---|
-| `state_load` + full root re-verification | **~35 min** | Cold page cache. Reads 140 GB from disk, then walks the entire account + storage tries and rehashes every node from scratch. `load_state` deliberately marks all nodes dirty so the first root computation traverses everything — that's how it verifies the snapshot's integrity against the header. Subsequent root computations are incremental (only dirty subtrees); see [What makes it different](#what-makes-it-different). |
+| `state_load` | **~13 min** | Cold page cache. Reads ~150 GB from disk and reconstructs the in-memory ART. Cached internal-node hashes are restored from the snapshot's persisted DFS stream, so the first `root` returns in seconds — no full re-verification walk. |
 | Forward replay (per-block gas, per-256 root) | **~70 min** | 49,017 blocks. |
-| **Total** | **~105 min** | From engine construction to a state caught up to block 24,913,378. |
+| **Total** | **~83 min** | From engine construction to a state caught up to block 24,913,378. |
 
-The `state_load` + full root re-verification cost is paid once per
-process. Keep the engine alive across your workload and subsequent
-block executions run at steady-state throughput without paying it
-again.
+The `state_load` cost is paid once per process. Keep the engine
+alive across your workload and subsequent block executions run at
+steady-state throughput without paying it again.
 
 Step-by-step to reproduce the run on your own machine — prereq
 checklist, exact commands, expected output, and useful variations —

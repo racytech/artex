@@ -5,7 +5,7 @@ window as the artex [Performance](../../README.md#performance)
 section: per-block gas validation against each header, plus
 state-root validation on a schedule of your choice (`--adaptive`
 below; `--every N` as an alternative). Expect ~60–70 min of wall
-time for the replay itself, on top of the ~35 min snapshot load.
+time for the replay itself, on top of the ~13 min snapshot load.
 
 ## Prerequisites
 
@@ -112,14 +112,12 @@ state reflects the last committed block.
 
 ## Expected timing
 
-- **`load-state` on cold OS page cache:** ~35 min for the 140 GiB
-  `state_24864361.bin`. The breakdown is roughly 10 min to read and
-  reconstruct the ART from disk, then ~25 min to re-verify the MPT
-  root (full walk + keccak per node). Second load in the same
-  session (file still in page cache, ART destroyed between loads)
-  skips most of the read cost but the root re-verification is still
-  CPU-bound — expect ~15–17 min, not seconds. The verification step
-  can't be skipped; it's what proves the snapshot's integrity.
+- **`load-state` on cold OS page cache:** ~13 min for the 148 GiB
+  `state_24864361.bin`, dominated by sequential disk I/O. Cached
+  internal-node hashes are restored from the snapshot's persisted
+  DFS stream, so the post-load `root` returns in seconds — no full
+  re-verification walk. Second load in the same session (file still
+  in page cache) is faster still.
 - **`execute`:** 20–25 blk/s / 600–700 Mgas/s between validation
   points on this window, averaging ~12–13 blk/s / ~370–400 Mgas/s
   once root checks are amortized in. `--adaptive` does ~43% fewer
@@ -130,8 +128,8 @@ state reflects the last committed block.
   block validates in the last 15), pick `--every N` for a flat,
   predictable cadence.
 - **Total for the 49,017-block window:** ~70 min from start of
-  `execute` to the block you stop at. Add the 35 min load to get
-  the ~105 min cold-start figure in the README.
+  `execute` to the block you stop at. Add the ~5 min load to get
+  the cold-start figure in the README.
 
 See [Total cold-start sync time](../../README.md#total-cold-start-sync-time)
 for the scaling formula if you want to close a different gap.
@@ -222,7 +220,7 @@ The replay halts and reverts the offending block. Double-check:
   snapshot would manifest as a root mismatch on first validation.
 
 **Swap thrashing on load**
-The `state_24864361.bin` is 140 GiB; most machines pull it through
+The `state_24864361.bin` is 148 GiB; most machines pull it through
 swap. Run `vmstat 1` in another terminal — sustained `si` rates of
 50–100k pages/s during load are normal. After load, steady-state
 `si` / `so` drop to the hundreds. The README's [Major-fault
