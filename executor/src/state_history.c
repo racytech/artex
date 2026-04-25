@@ -10,7 +10,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <pthread.h>
-#include <malloc.h>
 
 /* =========================================================================
  * CRC-32C (Castagnoli) — hardware-accelerated via SSE4.2
@@ -892,57 +891,12 @@ void state_history_truncate(state_history_t *sh, uint64_t last_block) {
  * Forward reconstruction: apply_diff + replay
  * ========================================================================= */
 
-/* Sample VmSize / VmRSS from /proc/self/statm (values in pages). Cheap — one
- * small file read. Only called every 500 applies to track replay memory. */
-static void sample_mem_pages(size_t *vm_pages, size_t *rss_pages) {
-    *vm_pages = 0; *rss_pages = 0;
-    FILE *f = fopen("/proc/self/statm", "r");
-    if (!f) return;
-    if (fscanf(f, "%zu %zu", vm_pages, rss_pages) != 2) {
-        *vm_pages = 0; *rss_pages = 0;
-    }
-    fclose(f);
-}
-
 void state_history_apply_diff(evm_state_t *es, const block_diff_t *diff) {
     if (!es || !diff) return;
     state_t *st = evm_state_get_state(es);
     if (!st) return;
 
-    /* Periodic progress + memory snapshot. Fires on the first apply and
-     * every 500th after. Cheap — two /proc reads + one mallinfo2 — and
-     * invaluable for spotting replay stalls, unexpected memory growth,
-     * or glibc arena bloat without rebuilding with diagnostics. */
-    static uint64_t apply_count = 0;
-    apply_count++;
-    bool trace = (apply_count == 1 || apply_count % 500 == 0);
-
-    size_t vm0 = 0, rss0 = 0, vm1 = 0, rss1 = 0;
-    if (trace) {
-        sample_mem_pages(&vm0, &rss0);
-        LOG_HIST_INFO(
-            "apply_diff #%lu block=%lu groups=%u  [vm=%.1fG rss=%.1fG]",
-            apply_count, diff->block_number, diff->group_count,
-            vm0 * 4096.0 / 1073741824.0,
-            rss0 * 4096.0 / 1073741824.0);
-    }
-
     state_apply_diff_fast(st, diff);
-
-    if (trace) {
-        sample_mem_pages(&vm1, &rss1);
-        struct mallinfo2 mi = mallinfo2();
-        LOG_HIST_INFO(
-            "  after_apply: vm=%.2fG (%+.2fG) rss=%.2fG (%+.2fG) "
-            "glibc.arena=%.2fG glibc.hblkhd=%.2fG glibc.uordblks=%.2fG",
-            vm1 * 4096.0 / 1073741824.0,
-            (double)((int64_t)vm1 - (int64_t)vm0) * 4096.0 / 1073741824.0,
-            rss1 * 4096.0 / 1073741824.0,
-            (double)((int64_t)rss1 - (int64_t)rss0) * 4096.0 / 1073741824.0,
-            mi.arena    / 1073741824.0,
-            mi.hblkhd   / 1073741824.0,
-            mi.uordblks / 1073741824.0);
-    }
 }
 
 /* block_diff_revert is implemented in state.c (uses state_set_*_raw) */

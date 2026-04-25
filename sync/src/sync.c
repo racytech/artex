@@ -592,10 +592,12 @@ uint64_t sync_replay_history(sync_t *sync, uint64_t target_block) {
     /* EIP-161 pruning must be on for commit_tx (inside apply_diff) to prune
      * empty accounts — matches the library's rx_engine_replay_history_to
      * gating. Mainnet activated EIP-161 at block 2,675,000. */
-    evm_state_set_prune_empty(sync->state, sync->last_block >= 2675000);
+    bool prune_empty = sync->last_block >= 2675000;
+    evm_state_set_prune_empty(sync->state, prune_empty);
 
-    uint64_t got = state_history_replay(sync->history, sync->state,
-                                        first, target_block);
+    uint64_t got = state_history_replay_ex(sync->history, sync->state,
+                                           first, target_block,
+                                           64, prune_empty);
     if (got != want) return got;
 
     /* Defensive reset of per-block undo log after replay — mirrors the

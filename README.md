@@ -302,14 +302,15 @@ header is `include/artex.h`). A Go example is not yet shipped.
 
 ## Data files
 
-The snippets above load a **snapshot package** — four files that
-travel together in one directory:
+The snippets above load a **snapshot package** — four files plus a
+history directory that travel together in one directory:
 
 ```
 state_<block>.bin          # ART state (accounts + storage + MPT roots)
 state_<block>.bin.hashes   # last 256 block hashes — required by load_state
 chain_replay_code.dat      # contract bytecode blobs (content-addressed)
 chain_replay_code.idx      # code_store index
+history/                   # per-block diff log — feeds replay-history (see history_replay.md)
 ```
 
 `load_state` refuses to open a snapshot whose `.hashes` sidecar is
@@ -320,8 +321,8 @@ Three ways to get a package:
 
 ### Option A — download the hosted snapshot
 
-Published block: **24,864,361**. Archive: **~63 GiB compressed
-(tar + zstd -9 --long=27) → ~156 GiB extracted.** Hosted on
+Published block: **24,864,361**. Archive: **~73 GiB compressed
+(tar + zstd -9 --long=27) → ~168 GiB extracted.** Hosted on
 Cloudflare R2 (zero-egress-fee public bucket):
 
 ```
@@ -339,7 +340,7 @@ mkdir -p ~/snapshot-download && cd ~/snapshot-download
 curl -fL -o state_24864361.tar.zst.sha256 "$BASE/state_24864361.tar.zst.sha256"
 curl -fL -o state_24864361.manifest.txt   "$BASE/state_24864361.manifest.txt"
 
-# 2. Fetch the 63 GiB archive — resumable on drop. If your connection
+# 2. Fetch the 73 GiB archive — resumable on drop. If your connection
 #    dies, re-run this exact command and curl will pick up from the
 #    last byte (R2 supports HTTP range requests).
 curl -fL -C - --retry 10 --retry-delay 15 \
@@ -365,11 +366,12 @@ a 403 HTML body into your archive file), `-L` follows redirects, `-C -`
 resumes from wherever the local file left off, and the retries cover
 transient network blips without restarting the whole download.
 
-Then point `load_state` at `~/.artex/state_24864361.bin` — the three
-sidecars are picked up from the same directory automatically.
+Then point `load_state` at `~/.artex/state_24864361.bin` — the
+sidecars and `history/` directory are picked up from the same
+directory automatically.
 
-Disk budget during setup: **~220 GiB free** (63 GiB archive +
-156 GiB extracted; you can reclaim the 63 GiB after step 4).
+Disk budget during setup: **~245 GiB free** (73 GiB archive +
+168 GiB extracted; you can reclaim the 73 GiB after step 4).
 
 ### Option B — boot from genesis (no download)
 

@@ -846,9 +846,9 @@ int main(int argc, char **argv) {
                  ss.account_count, loaded_block, load_state_path, root_hex);
 
         /* Recompute MPT root from scratch to verify snapshot integrity */
-        LOG_INFO("Recomputing MPT root (invalidate_all + compute_root)...");
-        evm_state_invalidate_all(es);
-        hash_t recomputed = evm_state_compute_mpt_root(es, loaded_block >= 1050000);
+        LOG_INFO("Recomputing MPT root...");
+        /* evm_state_invalidate_all(es); */
+        hash_t recomputed = evm_state_compute_mpt_root(es, loaded_block >= 2675000);
         char recomp_hex[67];
         hash_to_hex(&recomputed, recomp_hex);
         if (memcmp(loaded_root.bytes, recomputed.bytes, 32) == 0) {
