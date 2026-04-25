@@ -32,9 +32,34 @@ void     state_destroy(state_t *s);
 
 /* Load/save full state to file (graceful shutdown / restart).
  * state_save stores the given state_root in the header.
- * state_load returns the stored root via out_root (if non-NULL). */
+ * state_load returns the stored root via out_root (if non-NULL).
+ *
+ * state_save and state_load operate on the current ART2 format, which
+ * carries DFS hash streams so the post-load compute_root short-circuits.
+ *
+ * state_load_v1 reads the legacy ART1 format (no hash streams) — used by
+ * tools/state_migrate to upgrade old snapshots. After v1 load, every
+ * loaded storage hart is marked dirty: caller MUST run a compute_root to
+ * populate hash caches before re-saving. */
 bool state_load(state_t *s, const char *path, hash_t *out_root);
+bool state_load_v1(state_t *s, const char *path, hash_t *out_root);
 bool state_save(const state_t *s, const char *path, const hash_t *state_root);
+
+/* Test-only: write the legacy ART1 format. Used by tests that need to
+ * exercise the migration path. Production callers should use state_save. */
+bool state_save_v1(const state_t *s, const char *path, const hash_t *state_root);
+
+/* Diagnostic: count MPT internal nodes across the account trie and every
+ * loaded per-account storage hart. Returns the total internal node count;
+ * if non-NULL, *persistable_out gets the subset that carries a real cached
+ * hash (branch-producing nodes — single-child / single-hi-group internals
+ * are folded into their parent's extension prefix and intentionally don't
+ * cache). *clean_out gets how many of those persistable nodes are clean.
+ * After a successful state_load, persistable == clean — which is what
+ * lets compute_root short-circuit. Used by tests. */
+uint64_t state_count_internal_nodes(const state_t *s,
+                                     uint64_t *persistable_out,
+                                     uint64_t *clean_out);
 
 /* =========================================================================
  * Account access

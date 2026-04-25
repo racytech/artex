@@ -1434,3 +1434,204 @@ void hart_walk_dfs(const hart_t *t, hart_walk_cb cb, void *user) {
     if (!t || !cb) return;
     walk_recurse(t, t->root, 0, cb, user);
 }
+
+/* "Branch-producing" matches the cache-write decision in hash_ref: only
+ * internals with ≥2 children spread across ≥2 hi-nibble groups get a real
+ * branch RLP cached. Single-child / single-hi-group internals are folded
+ * into extensions in the parent's RLP and their hash[] field is never
+ * written — installing a hash onto them would corrupt later compute_root. */
+static bool node_is_branch_producing(int ntype, const void *n) {
+    int nch = 0;
+    int hi_occ = 0;
+    uint8_t seen[16] = {0};
+    switch (ntype) {
+    case NODE_4: {
+        const node4_t *nn = n;
+        nch = nn->num_children;
+        for (int i = 0; i < nch; i++) {
+            int hi = nn->keys[i] >> 4;
+            if (!seen[hi]) { seen[hi] = 1; hi_occ++; }
+        }
+        break;
+    }
+    case NODE_16: {
+        const node16_t *nn = n;
+        nch = nn->num_children;
+        for (int i = 0; i < nch; i++) {
+            int hi = nn->keys[i] >> 4;
+            if (!seen[hi]) { seen[hi] = 1; hi_occ++; }
+        }
+        break;
+    }
+    case NODE_48: {
+        const node48_t *nn = n;
+        for (int i = 0; i < 256; i++) {
+            if (nn->index[i] != NODE48_EMPTY) {
+                nch++;
+                int hi = i >> 4;
+                if (!seen[hi]) { seen[hi] = 1; hi_occ++; }
+            }
+        }
+        break;
+    }
+    case NODE_256: {
+        const node256_t *nn = n;
+        for (int i = 0; i < 256; i++) {
+            if (nn->children[i] != HART_REF_NULL) {
+                nch++;
+                int hi = i >> 4;
+                if (!seen[hi]) { seen[hi] = 1; hi_occ++; }
+            }
+        }
+        break;
+    }
+    default: return false;
+    }
+    return nch >= 2 && hi_occ >= 2;
+}
+
+static void install_recurse(hart_t *t, hart_ref_t ref,
+                             const uint8_t *stream, uint32_t *consumed,
+                             uint32_t cap) {
+    if (ref == HART_REF_NULL || HART_IS_LEAF(ref)) return;
+    void *n = ref_ptr(t, ref);
+    int ntype = node_type(n);
+
+    if (node_is_branch_producing(ntype, n)) {
+        if (*consumed >= cap) return;
+        memcpy(node_hash_mut(n), stream + (*consumed) * 32, 32);
+        (*consumed)++;
+        clear_dirty(t, ref);
+    }
+    /* Passthrough internals stay dirty — hash_ref recurses through them on
+     * the next compute_root, which is fast because their cached children
+     * are clean. */
+
+    switch (ntype) {
+    case NODE_4: {
+        node4_t *nn = (node4_t *)n;
+        for (int i = 0; i < nn->num_children; i++)
+            install_recurse(t, nn->children[i], stream, consumed, cap);
+        break;
+    }
+    case NODE_16: {
+        node16_t *nn = (node16_t *)n;
+        for (int i = 0; i < nn->num_children; i++)
+            install_recurse(t, nn->children[i], stream, consumed, cap);
+        break;
+    }
+    case NODE_48: {
+        node48_t *nn = (node48_t *)n;
+        for (int i = 0; i < 256; i++)
+            if (nn->index[i] != NODE48_EMPTY)
+                install_recurse(t, nn->children[nn->index[i]],
+                                 stream, consumed, cap);
+        break;
+    }
+    case NODE_256: {
+        node256_t *nn = (node256_t *)n;
+        for (int i = 0; i < 256; i++)
+            if (nn->children[i] != HART_REF_NULL)
+                install_recurse(t, nn->children[i], stream, consumed, cap);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static uint32_t count_persistable_recurse(const hart_t *t, hart_ref_t ref) {
+    if (ref == HART_REF_NULL || HART_IS_LEAF(ref)) return 0;
+    void *n = ref_ptr((hart_t *)t, ref);
+    int ntype = node_type(n);
+    uint32_t self = node_is_branch_producing(ntype, n) ? 1 : 0;
+    uint32_t sub = 0;
+    switch (ntype) {
+    case NODE_4: {
+        node4_t *nn = n;
+        for (int i = 0; i < nn->num_children; i++)
+            sub += count_persistable_recurse(t, nn->children[i]);
+        break;
+    }
+    case NODE_16: {
+        node16_t *nn = n;
+        for (int i = 0; i < nn->num_children; i++)
+            sub += count_persistable_recurse(t, nn->children[i]);
+        break;
+    }
+    case NODE_48: {
+        node48_t *nn = n;
+        for (int i = 0; i < 256; i++)
+            if (nn->index[i] != NODE48_EMPTY)
+                sub += count_persistable_recurse(t, nn->children[nn->index[i]]);
+        break;
+    }
+    case NODE_256: {
+        node256_t *nn = n;
+        for (int i = 0; i < 256; i++)
+            if (nn->children[i] != HART_REF_NULL)
+                sub += count_persistable_recurse(t, nn->children[i]);
+        break;
+    }
+    }
+    return self + sub;
+}
+
+uint32_t hart_count_persistable_hashes(const hart_t *t) {
+    if (!t || t->root == HART_REF_NULL) return 0;
+    return count_persistable_recurse(t, t->root);
+}
+
+static void persist_walk_recurse(const hart_t *t, hart_ref_t ref,
+                                  hart_persist_cb cb, void *user) {
+    if (ref == HART_REF_NULL || HART_IS_LEAF(ref)) return;
+    void *n = ref_ptr((hart_t *)t, ref);
+    int ntype = node_type(n);
+    if (node_is_branch_producing(ntype, n))
+        cb(node_hash_ptr(n), user);
+    switch (ntype) {
+    case NODE_4: {
+        node4_t *nn = n;
+        for (int i = 0; i < nn->num_children; i++)
+            persist_walk_recurse(t, nn->children[i], cb, user);
+        break;
+    }
+    case NODE_16: {
+        node16_t *nn = n;
+        for (int i = 0; i < nn->num_children; i++)
+            persist_walk_recurse(t, nn->children[i], cb, user);
+        break;
+    }
+    case NODE_48: {
+        node48_t *nn = n;
+        for (int i = 0; i < 256; i++)
+            if (nn->index[i] != NODE48_EMPTY)
+                persist_walk_recurse(t, nn->children[nn->index[i]], cb, user);
+        break;
+    }
+    case NODE_256: {
+        node256_t *nn = n;
+        for (int i = 0; i < 256; i++)
+            if (nn->children[i] != HART_REF_NULL)
+                persist_walk_recurse(t, nn->children[i], cb, user);
+        break;
+    }
+    }
+}
+
+void hart_walk_persistable_hashes(const hart_t *t,
+                                   hart_persist_cb cb, void *user) {
+    if (!t || !cb || t->root == HART_REF_NULL) return;
+    persist_walk_recurse(t, t->root, cb, user);
+}
+
+bool hart_install_dfs_hashes(hart_t *t, const uint8_t *stream, uint32_t count) {
+    if (!t) return false;
+    uint32_t total = hart_count_persistable_hashes(t);
+    if (total != count) return false;
+    if (count == 0) return true;
+    if (!stream) return false;
+    uint32_t consumed = 0;
+    install_recurse(t, t->root, stream, &consumed, count);
+    return consumed == count;
+}

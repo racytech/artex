@@ -1205,3 +1205,249 @@ void storage_hart_walk_dfs(const hart_pool_t *pool, const storage_hart_t *sh,
     if (sh->root_ref == SH_REF_NULL) return;
     sh_walk_recurse(pool, sh->root_ref, 0, cb, user);
 }
+
+static void sh_count_recurse(const hart_pool_t *pool, sh_ref_t ref,
+                              uint32_t *total, uint32_t *clean) {
+    if (ref == SH_REF_NULL || SH_IS_LEAF(ref)) return;
+    (*total)++;
+    if (!sh_is_node_dirty(pool, ref)) (*clean)++;
+    void *n = sh_ref_ptr(pool, ref);
+    switch (sh_node_type(n)) {
+    case NODE_4: {
+        sh_node4_t *nn = n;
+        for (int i = 0; i < nn->num_children; i++)
+            sh_count_recurse(pool, nn->children[i], total, clean);
+        break;
+    }
+    case NODE_16: {
+        sh_node16_t *nn = n;
+        for (int i = 0; i < nn->num_children; i++)
+            sh_count_recurse(pool, nn->children[i], total, clean);
+        break;
+    }
+    case NODE_48: {
+        sh_node48_t *nn = n;
+        for (int i = 0; i < 256; i++)
+            if (nn->index[i] != NODE48_EMPTY)
+                sh_count_recurse(pool, nn->children[nn->index[i]], total, clean);
+        break;
+    }
+    case NODE_256: {
+        sh_node256_t *nn = n;
+        for (int i = 0; i < 256; i++)
+            if (nn->children[i] != SH_REF_NULL)
+                sh_count_recurse(pool, nn->children[i], total, clean);
+        break;
+    }
+    }
+}
+
+uint32_t storage_hart_count_internal_nodes(const hart_pool_t *pool,
+                                            const storage_hart_t *sh,
+                                            uint32_t *clean_out) {
+    uint32_t total = 0, clean = 0;
+    if (pool && sh && sh->root_ref != SH_REF_NULL)
+        sh_count_recurse(pool, sh->root_ref, &total, &clean);
+    if (clean_out) *clean_out = clean;
+    return total;
+}
+
+/* Mirror of node_is_branch_producing in hashed_art.c — the storage hash
+ * pipeline uses the same MPT cache contract. */
+static bool sh_node_is_branch_producing(int ntype, const void *n) {
+    int nch = 0;
+    int hi_occ = 0;
+    uint8_t seen[16] = {0};
+    switch (ntype) {
+    case NODE_4: {
+        const sh_node4_t *nn = n;
+        nch = nn->num_children;
+        for (int i = 0; i < nch; i++) {
+            int hi = nn->keys[i] >> 4;
+            if (!seen[hi]) { seen[hi] = 1; hi_occ++; }
+        }
+        break;
+    }
+    case NODE_16: {
+        const sh_node16_t *nn = n;
+        nch = nn->num_children;
+        for (int i = 0; i < nch; i++) {
+            int hi = nn->keys[i] >> 4;
+            if (!seen[hi]) { seen[hi] = 1; hi_occ++; }
+        }
+        break;
+    }
+    case NODE_48: {
+        const sh_node48_t *nn = n;
+        for (int i = 0; i < 256; i++) {
+            if (nn->index[i] != NODE48_EMPTY) {
+                nch++;
+                int hi = i >> 4;
+                if (!seen[hi]) { seen[hi] = 1; hi_occ++; }
+            }
+        }
+        break;
+    }
+    case NODE_256: {
+        const sh_node256_t *nn = n;
+        for (int i = 0; i < 256; i++) {
+            if (nn->children[i] != SH_REF_NULL) {
+                nch++;
+                int hi = i >> 4;
+                if (!seen[hi]) { seen[hi] = 1; hi_occ++; }
+            }
+        }
+        break;
+    }
+    default: return false;
+    }
+    return nch >= 2 && hi_occ >= 2;
+}
+
+static uint32_t sh_count_persistable_recurse(const hart_pool_t *pool,
+                                              sh_ref_t ref) {
+    if (ref == SH_REF_NULL || SH_IS_LEAF(ref)) return 0;
+    void *n = sh_ref_ptr(pool, ref);
+    int ntype = sh_node_type(n);
+    uint32_t self = sh_node_is_branch_producing(ntype, n) ? 1 : 0;
+    uint32_t sub = 0;
+    switch (ntype) {
+    case NODE_4: {
+        sh_node4_t *nn = n;
+        for (int i = 0; i < nn->num_children; i++)
+            sub += sh_count_persistable_recurse(pool, nn->children[i]);
+        break;
+    }
+    case NODE_16: {
+        sh_node16_t *nn = n;
+        for (int i = 0; i < nn->num_children; i++)
+            sub += sh_count_persistable_recurse(pool, nn->children[i]);
+        break;
+    }
+    case NODE_48: {
+        sh_node48_t *nn = n;
+        for (int i = 0; i < 256; i++)
+            if (nn->index[i] != NODE48_EMPTY)
+                sub += sh_count_persistable_recurse(pool,
+                                                    nn->children[nn->index[i]]);
+        break;
+    }
+    case NODE_256: {
+        sh_node256_t *nn = n;
+        for (int i = 0; i < 256; i++)
+            if (nn->children[i] != SH_REF_NULL)
+                sub += sh_count_persistable_recurse(pool, nn->children[i]);
+        break;
+    }
+    }
+    return self + sub;
+}
+
+uint32_t storage_hart_count_persistable_hashes(const hart_pool_t *pool,
+                                                const storage_hart_t *sh) {
+    if (!pool || !sh || sh->root_ref == SH_REF_NULL) return 0;
+    return sh_count_persistable_recurse(pool, sh->root_ref);
+}
+
+static void sh_persist_walk_recurse(const hart_pool_t *pool, sh_ref_t ref,
+                                     storage_hart_persist_cb cb, void *user) {
+    if (ref == SH_REF_NULL || SH_IS_LEAF(ref)) return;
+    void *n = sh_ref_ptr(pool, ref);
+    int ntype = sh_node_type(n);
+    if (sh_node_is_branch_producing(ntype, n))
+        cb(sh_node_hash_ptr(n), user);
+    switch (ntype) {
+    case NODE_4: {
+        sh_node4_t *nn = n;
+        for (int i = 0; i < nn->num_children; i++)
+            sh_persist_walk_recurse(pool, nn->children[i], cb, user);
+        break;
+    }
+    case NODE_16: {
+        sh_node16_t *nn = n;
+        for (int i = 0; i < nn->num_children; i++)
+            sh_persist_walk_recurse(pool, nn->children[i], cb, user);
+        break;
+    }
+    case NODE_48: {
+        sh_node48_t *nn = n;
+        for (int i = 0; i < 256; i++)
+            if (nn->index[i] != NODE48_EMPTY)
+                sh_persist_walk_recurse(pool, nn->children[nn->index[i]],
+                                         cb, user);
+        break;
+    }
+    case NODE_256: {
+        sh_node256_t *nn = n;
+        for (int i = 0; i < 256; i++)
+            if (nn->children[i] != SH_REF_NULL)
+                sh_persist_walk_recurse(pool, nn->children[i], cb, user);
+        break;
+    }
+    }
+}
+
+void storage_hart_walk_persistable_hashes(const hart_pool_t *pool,
+                                           const storage_hart_t *sh,
+                                           storage_hart_persist_cb cb,
+                                           void *user) {
+    if (!pool || !sh || !cb || sh->root_ref == SH_REF_NULL) return;
+    sh_persist_walk_recurse(pool, sh->root_ref, cb, user);
+}
+
+static void sh_install_recurse(hart_pool_t *pool, sh_ref_t ref,
+                                const uint8_t *stream, uint32_t *consumed,
+                                uint32_t cap) {
+    if (ref == SH_REF_NULL || SH_IS_LEAF(ref)) return;
+    void *n = sh_ref_ptr(pool, ref);
+    int ntype = sh_node_type(n);
+
+    if (sh_node_is_branch_producing(ntype, n)) {
+        if (*consumed >= cap) return;
+        memcpy(sh_node_hash_mut(n), stream + (*consumed) * 32, 32);
+        (*consumed)++;
+        sh_clear_dirty(pool, ref);
+    }
+
+    switch (ntype) {
+    case NODE_4: {
+        sh_node4_t *nn = n;
+        for (int i = 0; i < nn->num_children; i++)
+            sh_install_recurse(pool, nn->children[i], stream, consumed, cap);
+        break;
+    }
+    case NODE_16: {
+        sh_node16_t *nn = n;
+        for (int i = 0; i < nn->num_children; i++)
+            sh_install_recurse(pool, nn->children[i], stream, consumed, cap);
+        break;
+    }
+    case NODE_48: {
+        sh_node48_t *nn = n;
+        for (int i = 0; i < 256; i++)
+            if (nn->index[i] != NODE48_EMPTY)
+                sh_install_recurse(pool, nn->children[nn->index[i]],
+                                    stream, consumed, cap);
+        break;
+    }
+    case NODE_256: {
+        sh_node256_t *nn = n;
+        for (int i = 0; i < 256; i++)
+            if (nn->children[i] != SH_REF_NULL)
+                sh_install_recurse(pool, nn->children[i], stream, consumed, cap);
+        break;
+    }
+    }
+}
+
+bool storage_hart_install_dfs_hashes(hart_pool_t *pool, storage_hart_t *sh,
+                                      const uint8_t *stream, uint32_t count) {
+    if (!pool || !sh) return false;
+    uint32_t total = storage_hart_count_persistable_hashes(pool, sh);
+    if (total != count) return false;
+    if (count == 0) return true;
+    if (!stream) return false;
+    uint32_t consumed = 0;
+    sh_install_recurse(pool, sh->root_ref, stream, &consumed, count);
+    return consumed == count;
+}

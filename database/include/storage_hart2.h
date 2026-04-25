@@ -122,4 +122,34 @@ void storage_hart_walk_dfs(const hart_pool_t *pool,
                            const storage_hart_t *sh,
                            storage_hart_walk_cb cb, void *user);
 
+/* Count internal (non-leaf, non-null) nodes reachable from sh's root, and
+ * how many of them are currently clean (cached hash valid). Mirrors
+ * hart_count_internal_nodes for the storage variant. */
+uint32_t storage_hart_count_internal_nodes(const hart_pool_t *pool,
+                                            const storage_hart_t *sh,
+                                            uint32_t *clean_out);
+
+/* Count internal nodes that carry a meaningful cached hash. Single-child /
+ * single-hi-group nodes are folded into their parent's extension prefix
+ * and never get a cache write — they MUST NOT be persisted. This is the
+ * count to use when emitting the save-side hash stream. */
+uint32_t storage_hart_count_persistable_hashes(const hart_pool_t *pool,
+                                                const storage_hart_t *sh);
+
+/* Pre-order DFS walk that emits one cached hash per branch-producing
+ * internal node, in the order storage_hart_install_dfs_hashes consumes. */
+typedef void (*storage_hart_persist_cb)(const uint8_t hash32[32], void *user);
+void storage_hart_walk_persistable_hashes(const hart_pool_t *pool,
+                                           const storage_hart_t *sh,
+                                           storage_hart_persist_cb cb,
+                                           void *user);
+
+/* Install cached hashes onto branch-producing internal nodes in DFS order.
+ * `count` must equal storage_hart_count_persistable_hashes(...). Mismatch
+ * returns false without touching the hart. Branch-producing nodes are
+ * marked clean; passthrough internals remain dirty so the next root
+ * computation walks through them naturally. */
+bool storage_hart_install_dfs_hashes(hart_pool_t *pool, storage_hart_t *sh,
+                                      const uint8_t *stream, uint32_t count);
+
 #endif /* STORAGE_HART2_H */

@@ -317,11 +317,227 @@ static int test_large_round_trip(void) {
     return errors;
 }
 
+/**
+ * Test that load installs cached hashes onto every internal node — so a
+ * post-load compute_root has nothing to recompute. This is the whole point
+ * of writing the DFS hash stream into the snapshot.
+ */
+static int test_load_skips_recompute(void) {
+    printf("\ntest_load_skips_recompute:\n");
+
+    evm_state_t *es = evm_state_create(NULL);
+    if (!es) { printf("  FAIL: create\n"); return 1; }
+    state_t *st = evm_state_get_state(es);
+    state_begin_block(st, 7);
+
+    /* 500 accounts, every 3rd with a few storage slots — enough to populate
+     * a non-trivial set of internal nodes in both the acct trie and several
+     * storage harts. */
+    address_t addrs[500];
+    for (int i = 0; i < 500; i++) {
+        addrs[i] = (address_t){0};
+        addrs[i].bytes[0] = (uint8_t)(i >> 8);
+        addrs[i].bytes[1] = (uint8_t)(i & 0xFF);
+        evm_state_set_nonce(es, &addrs[i], (uint64_t)(i + 1));
+        uint256_t bal = uint256_from_uint64((uint64_t)(i + 1) * 100);
+        evm_state_set_balance(es, &addrs[i], &bal);
+        evm_state_mark_existed(es, &addrs[i]);
+        if (i % 3 == 0) {
+            for (int j = 0; j < 4; j++) {
+                uint256_t sk = uint256_from_uint64((uint64_t)(i * 10 + j));
+                uint256_t sv = uint256_from_uint64((uint64_t)(i * 10 + j + 1));
+                evm_state_set_storage(es, &addrs[i], &sk, &sv);
+            }
+        }
+    }
+
+    evm_state_commit(es);
+    evm_state_clear_prestate_dirty(es);
+    evm_state_invalidate_all(es);
+    hash_t root1 = evm_state_compute_mpt_root(es, false);
+    print_hash("original root", root1.bytes);
+
+    if (!state_save(st, TEST_FILE, &root1)) {
+        printf("  FAIL: save\n");
+        evm_state_destroy(es);
+        return 1;
+    }
+    evm_state_destroy(es);
+
+    /* Load into fresh state. */
+    evm_state_t *es2 = evm_state_create(NULL);
+    state_t *st2 = evm_state_get_state(es2);
+    hash_t loaded_root;
+    if (!state_load(st2, TEST_FILE, &loaded_root)) {
+        printf("  FAIL: load\n");
+        evm_state_destroy(es2);
+        return 1;
+    }
+
+    int errors = 0;
+
+    /* Every persistable (branch-producing) internal must be clean. The
+     * remaining "passthrough" internals (single-child / single-hi-group)
+     * intentionally stay dirty — hash_ref folds them into extensions and
+     * they don't carry a cache. The point is that no work is left for the
+     * post-load compute_root: clean == persistable. */
+    uint64_t persistable = 0, clean = 0;
+    uint64_t total = state_count_internal_nodes(st2, &persistable, &clean);
+    printf("  internals: total=%lu persistable=%lu clean=%lu\n",
+           (unsigned long)total, (unsigned long)persistable,
+           (unsigned long)clean);
+    if (persistable == 0) {
+        printf("  FAIL: no persistable internal nodes (test setup too small?)\n");
+        errors++;
+    }
+    if (clean != persistable) {
+        printf("  FAIL: %lu persistable internals dirty after load\n",
+               (unsigned long)(persistable - clean));
+        errors++;
+    }
+
+    /* compute_root must produce the saved root without rebuilding. With
+     * every internal hash already cached, this is just a few pointer
+     * dereferences — but the assertion is correctness, not timing. */
+    hash_t root2 = state_compute_root(st2, false);
+    print_hash("post-load root", root2.bytes);
+    if (memcmp(root1.bytes, root2.bytes, 32) != 0) {
+        printf("  FAIL: root mismatch after install\n");
+        errors++;
+    }
+
+    if (errors == 0) printf("  OK: load installed every cached hash\n");
+
+    evm_state_destroy(es2);
+    unlink(TEST_FILE);
+    return errors;
+}
+
+/**
+ * Test V1 → V2 migration: save a snapshot in legacy ART1, load it via the
+ * v1 reader, recompute, save as ART2, then load and check.
+ */
+static int test_v1_migration(void) {
+    printf("\ntest_v1_migration:\n");
+
+    const char *v1_path = "/tmp/test_state_save_load_v1.bin";
+    const char *v2_path = "/tmp/test_state_save_load_v2.bin";
+
+    evm_state_t *es = evm_state_create(NULL);
+    state_t *st = evm_state_get_state(es);
+    state_begin_block(st, 4242);
+
+    address_t addrs[300];
+    for (int i = 0; i < 300; i++) {
+        addrs[i] = (address_t){0};
+        addrs[i].bytes[0] = (uint8_t)(i >> 8);
+        addrs[i].bytes[1] = (uint8_t)(i & 0xFF);
+        evm_state_set_nonce(es, &addrs[i], (uint64_t)(i + 1));
+        uint256_t bal = uint256_from_uint64((uint64_t)(i + 1) * 333);
+        evm_state_set_balance(es, &addrs[i], &bal);
+        evm_state_mark_existed(es, &addrs[i]);
+        if (i % 5 == 0) {
+            for (int j = 0; j < 3; j++) {
+                uint256_t sk = uint256_from_uint64((uint64_t)(i * 7 + j));
+                uint256_t sv = uint256_from_uint64((uint64_t)(i * 7 + j + 1));
+                evm_state_set_storage(es, &addrs[i], &sk, &sv);
+            }
+        }
+    }
+
+    evm_state_commit(es);
+    evm_state_clear_prestate_dirty(es);
+    evm_state_invalidate_all(es);
+    hash_t root1 = evm_state_compute_mpt_root(es, false);
+    print_hash("source root  ", root1.bytes);
+
+    /* Write the legacy V1 file. */
+    if (!state_save_v1(st, v1_path, &root1)) {
+        printf("  FAIL: state_save_v1\n");
+        evm_state_destroy(es);
+        return 1;
+    }
+    evm_state_destroy(es);
+
+    /* state_load (V2) must refuse the V1 file. */
+    {
+        evm_state_t *es_v2 = evm_state_create(NULL);
+        state_t *st_v2 = evm_state_get_state(es_v2);
+        if (state_load(st_v2, v1_path, NULL)) {
+            printf("  FAIL: state_load accepted a V1 file\n");
+            evm_state_destroy(es_v2);
+            return 1;
+        }
+        evm_state_destroy(es_v2);
+    }
+
+    /* Migrate via the same flow tools/state_migrate uses: load V1 →
+     * compute_root → save V2. */
+    evm_state_t *es_mig = evm_state_create(NULL);
+    state_t *st_mig = evm_state_get_state(es_mig);
+    hash_t v1_saved_root;
+    if (!state_load_v1(st_mig, v1_path, &v1_saved_root)) {
+        printf("  FAIL: state_load_v1\n");
+        evm_state_destroy(es_mig);
+        return 1;
+    }
+    if (memcmp(v1_saved_root.bytes, root1.bytes, 32) != 0) {
+        printf("  FAIL: V1 saved-root header mismatch\n");
+        evm_state_destroy(es_mig);
+        return 1;
+    }
+    hash_t recomputed = evm_state_compute_mpt_root(es_mig, false);
+    if (memcmp(recomputed.bytes, root1.bytes, 32) != 0) {
+        printf("  FAIL: recomputed root differs after V1 load\n");
+        evm_state_destroy(es_mig);
+        return 1;
+    }
+    if (!state_save(st_mig, v2_path, &recomputed)) {
+        printf("  FAIL: state_save (V2)\n");
+        evm_state_destroy(es_mig);
+        return 1;
+    }
+    evm_state_destroy(es_mig);
+
+    /* Verify the migrated V2 file behaves like a native V2 snapshot:
+     * load short-circuits, post-load root matches without recomputation. */
+    evm_state_t *es_load = evm_state_create(NULL);
+    state_t *st_load = evm_state_get_state(es_load);
+    hash_t loaded_root;
+    if (!state_load(st_load, v2_path, &loaded_root)) {
+        printf("  FAIL: state_load (V2) on migrated file\n");
+        evm_state_destroy(es_load);
+        return 1;
+    }
+
+    int errors = 0;
+    uint64_t persistable = 0, clean = 0;
+    state_count_internal_nodes(st_load, &persistable, &clean);
+    if (persistable == 0 || clean != persistable) {
+        printf("  FAIL: migrated V2 didn't restore all hashes (clean=%lu, persistable=%lu)\n",
+               (unsigned long)clean, (unsigned long)persistable);
+        errors++;
+    }
+    hash_t after_load_root = state_compute_root(st_load, false);
+    if (memcmp(after_load_root.bytes, root1.bytes, 32) != 0) {
+        printf("  FAIL: post-migrate-load root mismatch\n");
+        errors++;
+    }
+    if (errors == 0) printf("  OK: V1 → V2 migration round-trip\n");
+
+    evm_state_destroy(es_load);
+    unlink(v1_path);
+    unlink(v2_path);
+    return errors;
+}
+
 int main(void) {
     int errors = 0;
     errors += test_basic_round_trip();
     errors += test_empty_state();
     errors += test_large_round_trip();
+    errors += test_load_skips_recompute();
+    errors += test_v1_migration();
     printf("\n=== %s (%d errors) ===\n", errors ? "FAIL" : "PASS", errors);
     return errors ? 1 : 0;
 }

@@ -122,4 +122,28 @@ typedef void (*hart_walk_cb)(hart_ref_t ref,
                               void *user);
 void hart_walk_dfs(const hart_t *t, hart_walk_cb cb, void *user);
 
+/* Count internal nodes that carry a meaningful cached hash — i.e. those
+ * whose RLP is a real branch in the MPT (≥2 children, ≥2 distinct
+ * hi-nibbles). Single-child / single-hi-group internals are folded into
+ * their parent's extension prefix and never get a cache write, so they
+ * must NOT be persisted. This count matches what hart_install_dfs_hashes
+ * expects and what hart_walk_persistable_hashes will emit. */
+uint32_t hart_count_persistable_hashes(const hart_t *t);
+
+/* Pre-order DFS walk over branch-producing internals only, in the same
+ * order as hart_install_dfs_hashes consumes. Caller must have computed
+ * the root first so the cached hashes are valid. */
+typedef void (*hart_persist_cb)(const uint8_t hash32[32], void *user);
+void hart_walk_persistable_hashes(const hart_t *t,
+                                   hart_persist_cb cb, void *user);
+
+/* Install cached hashes onto branch-producing internal nodes in DFS order.
+ * Tree must already be fully built (all keys inserted). `count` must equal
+ * hart_count_persistable_hashes(t) — mismatch returns false without
+ * touching the tree. Branch-producing nodes get the supplied hash and are
+ * marked clean; passthrough internals stay dirty so the next root
+ * computation walks through them naturally (fast: their children are
+ * already cached). */
+bool hart_install_dfs_hashes(hart_t *t, const uint8_t *stream, uint32_t count);
+
 #endif /* HASHED_ART_H */

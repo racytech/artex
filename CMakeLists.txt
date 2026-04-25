@@ -467,6 +467,12 @@ target_link_libraries(test_state_save_load state evm)
 target_include_directories(test_state_save_load PRIVATE ${CMAKE_SOURCE_DIR}/state/include)
 add_test(NAME test_state_save_load COMMAND test_state_save_load)
 
+add_executable(state_migrate tools/state_migrate.c)
+target_link_libraries(state_migrate state evm)
+target_include_directories(state_migrate PRIVATE
+    ${CMAKE_SOURCE_DIR}/state/include
+    ${CMAKE_SOURCE_DIR}/evm/include)
+
 add_executable(test_finalize_bug state/tests/test_finalize_bug.c)
 target_link_libraries(test_finalize_bug state evm)
 target_include_directories(test_finalize_bug PRIVATE ${CMAKE_SOURCE_DIR}/state/include)

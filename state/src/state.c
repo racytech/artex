@@ -2419,18 +2419,59 @@ void state_compact(state_t *s) {
         stor_dirty_set(s, i);
 }
 
+uint64_t state_count_internal_nodes(const state_t *s,
+                                     uint64_t *persistable_out,
+                                     uint64_t *clean_out) {
+    uint64_t total = 0, persist = 0, clean = 0;
+    if (!s) {
+        if (persistable_out) *persistable_out = 0;
+        if (clean_out) *clean_out = 0;
+        return 0;
+    }
+
+    uint32_t a_clean = 0;
+    total += hart_count_internal_nodes(&s->acct_index, &a_clean);
+    clean += a_clean;
+    persist += hart_count_persistable_hashes(&s->acct_index);
+
+    if (s->stor_pool) {
+        for (uint32_t i = 1; i < s->res_count; i++) {
+            const resource_t *r = &s->resources[i];
+            if (storage_hart_empty(&r->storage)) continue;
+            uint32_t sc = 0;
+            total += storage_hart_count_internal_nodes(s->stor_pool,
+                                                       &r->storage, &sc);
+            clean += sc;
+            persist += storage_hart_count_persistable_hashes(s->stor_pool,
+                                                             &r->storage);
+        }
+    }
+    if (persistable_out) *persistable_out = persist;
+    if (clean_out) *clean_out = clean;
+    return total;
+}
+
 /* =========================================================================
  * Save / Load — binary snapshot of full state
  *
  * Format (little-endian):
- *   Header:  magic("ART1", 4) + block_number(8) + state_root(32) + account_count(4)
+ *   V2: magic("ART2", 4) + block_number(8) + state_root(32) + account_count(4)
+ *   V1 (legacy, read-only via state_load_v1): magic("ART1", ...)
  *   Per account:
  *     addr(20) + nonce(8) + balance(32) + code_hash(32) + storage_root(32) +
  *     code_size(4) + storage_count(4)
  *     [storage_count × (key(32) + value(32))]
+ *     [if storage_count > 0]: stor_internal_count(4) + [count × hash(32)]
+ *   Tail:
+ *     acct_internal_count(4) + [acct_internal_count × hash(32)]
+ *
+ * The internal-node hash streams are emitted in pre-order DFS (key-sorted
+ * children). They let state_load skip MPT recomputation: the rebuilt tree
+ * has the same DFS shape (proven by hart_determinism_test), so installing
+ * the hashes onto each internal node restores the cached state directly.
  *
  * Code bytes are NOT saved — code_store has them on disk.
- * On load, acct_index and storage harts are rebuilt from scratch.
+ * Caller must compute_root before save so the cached hashes are clean.
  * ========================================================================= */
 
 /* =========================================================================
@@ -2448,7 +2489,8 @@ void state_set_storage_path(state_t *s, const char *dir) {
  * State save/load
  * ========================================================================= */
 
-#define STATE_MAGIC "ART1"
+#define STATE_MAGIC_V1 "ART1"
+#define STATE_MAGIC_V2 "ART2"
 
 static bool write_all(FILE *f, const void *buf, size_t n) {
     return fwrite(buf, 1, n, f) == n;
@@ -2463,6 +2505,16 @@ static bool save_entry_cb(const uint8_t key[32], const uint8_t val[32], void *ct
         { sc->ok = false; return false; }
     sc->count++;
     return true;
+}
+
+/* Walk callback: write one branch-producing internal hash. */
+typedef struct { FILE *f; uint32_t count; bool ok; } save_hash_ctx_t;
+
+static void save_persist_cb(const uint8_t hash32[32], void *user) {
+    save_hash_ctx_t *hc = user;
+    if (!hc->ok) return;
+    if (!write_all(hc->f, hash32, 32)) { hc->ok = false; return; }
+    hc->count++;
 }
 
 static bool read_all(FILE *f, void *buf, size_t n) {
@@ -2482,7 +2534,9 @@ static bool read_all(FILE *f, void *buf, size_t n) {
  * entirely: either extend the ART1 header to carry 256 hashes, or append
  * them after the account/storage payload with a trailing magic.
  * Matching change goes in state_load below. */
-bool state_save(const state_t *s, const char *path, const hash_t *state_root) {
+static bool state_save_impl(const state_t *s, const char *path,
+                             const hash_t *state_root,
+                             const char *magic, bool with_hashes) {
     if (!s || !path) return false;
     FILE *f = fopen(path, "wb");
     if (!f) return false;
@@ -2495,7 +2549,7 @@ bool state_save(const state_t *s, const char *path, const hash_t *state_root) {
 
     /* Header */
     static const uint8_t zero_root[32] = {0};
-    if (!write_all(f, STATE_MAGIC, 4)) goto fail;
+    if (!write_all(f, magic, 4)) goto fail;
     if (!write_all(f, &s->current_block, 8)) goto fail;
     if (!write_all(f, state_root ? state_root->bytes : zero_root, 32)) goto fail;
     if (!write_all(f, &live, 4)) goto fail;
@@ -2532,6 +2586,33 @@ bool state_save(const state_t *s, const char *path, const hash_t *state_root) {
             storage_hart_foreach(s->stor_pool, &r->storage, save_entry_cb, &sc);
             if (!sc.ok) goto fail;
         }
+
+        /* Storage hash stream — V2 only; skipped on empty storage to keep
+         * EOA-heavy snapshots small. One entry per branch-producing
+         * internal; passthrough nodes are folded into extensions and
+         * never carry a cache. */
+        if (with_hashes && stor_count > 0 && r && s->stor_pool) {
+            uint32_t sh_total = storage_hart_count_persistable_hashes(
+                                    s->stor_pool, &r->storage);
+            if (!write_all(f, &sh_total, 4)) goto fail;
+            if (sh_total > 0) {
+                save_hash_ctx_t hc = { .f = f, .count = 0, .ok = true };
+                storage_hart_walk_persistable_hashes(s->stor_pool, &r->storage,
+                                                      save_persist_cb, &hc);
+                if (!hc.ok || hc.count != sh_total) goto fail;
+            }
+        }
+    }
+
+    /* Account-trie hash stream — V2 only. */
+    if (with_hashes) {
+        uint32_t ai_total = hart_count_persistable_hashes(&s->acct_index);
+        if (!write_all(f, &ai_total, 4)) goto fail;
+        if (ai_total > 0) {
+            save_hash_ctx_t hc = { .f = f, .count = 0, .ok = true };
+            hart_walk_persistable_hashes(&s->acct_index, save_persist_cb, &hc);
+            if (!hc.ok || hc.count != ai_total) goto fail;
+        }
     }
 
     fclose(f);
@@ -2541,16 +2622,34 @@ fail:
     return false;
 }
 
+bool state_save(const state_t *s, const char *path, const hash_t *state_root) {
+    return state_save_impl(s, path, state_root, STATE_MAGIC_V2, true);
+}
+
+bool state_save_v1(const state_t *s, const char *path, const hash_t *state_root) {
+    return state_save_impl(s, path, state_root, STATE_MAGIC_V1, false);
+}
+
 /* TODO(api): read block-hash ring here once state_save writes it.
  * See the TODO on state_save above. */
-bool state_load(state_t *s, const char *path, hash_t *out_root) {
+static bool state_load_impl(state_t *s, const char *path, hash_t *out_root,
+                             const char *expect_magic, bool with_hashes) {
     if (!s || !path) return false;
     FILE *f = fopen(path, "rb");
     if (!f) return false;
 
     /* Header */
     char magic[4];
-    if (!read_all(f, magic, 4) || memcmp(magic, STATE_MAGIC, 4) != 0) goto fail;
+    if (!read_all(f, magic, 4)) goto fail;
+    if (memcmp(magic, expect_magic, 4) != 0) {
+        fprintf(stderr, "state_load: magic mismatch — expected %.4s, got %.4s\n",
+                expect_magic, magic);
+        if (memcmp(magic, STATE_MAGIC_V1, 4) == 0 && with_hashes)
+            fprintf(stderr,
+                "  this is a legacy ART1 snapshot — run tools/state_migrate "
+                "to upgrade it to ART2\n");
+        goto fail;
+    }
     uint64_t block_number;
     if (!read_all(f, &block_number, 8)) goto fail;
     hash_t saved_root;
@@ -2655,17 +2754,69 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
                 fseek(f, (long)stor_count * 64, SEEK_CUR);
             }
         }
+
+        /* Storage hash stream — V2 only, and only present when stor_count
+         * > 0 (matches the save side). On install mismatch, the hart
+         * stays dirty and compute_root rebuilds it lazily. */
+        if (with_hashes && stor_count > 0) {
+            uint32_t sh_total;
+            if (!read_all(f, &sh_total, 4)) goto fail;
+            if (sh_total > 0) {
+                uint8_t *buf = malloc((size_t)sh_total * 32);
+                if (!buf) goto fail;
+                if (!read_all(f, buf, (size_t)sh_total * 32)) { free(buf); goto fail; }
+                if (a->resource_idx > 0 && s->stor_pool) {
+                    resource_t *rr = &s->resources[a->resource_idx];
+                    if (!storage_hart_install_dfs_hashes(s->stor_pool, &rr->storage,
+                                                         buf, sh_total)) {
+                        fprintf(stderr,
+                            "  state_load: storage hash install mismatch for acct %u "
+                            "(saved %u internals); will recompute\n", i, sh_total);
+                        stor_dirty_grow(s, a->resource_idx + 1);
+                        stor_dirty_set(s, a->resource_idx);
+                    }
+                }
+                free(buf);
+            }
+        }
+
         if ((i + 1) % 1000000 == 0)
             fprintf(stderr, "  state_load: %u/%u accounts...\n", i + 1, acct_count);
     }
 
+    /* Account-trie internal hash stream — V2 only. On mismatch, leaves the
+     * hart dirty so the next compute_root rebuilds it from the (correct)
+     * loaded storage_root + code_hash leaf data. */
+    if (with_hashes) {
+        uint32_t ai_total;
+        if (!read_all(f, &ai_total, 4)) goto fail;
+        if (ai_total > 0) {
+            uint8_t *buf = malloc((size_t)ai_total * 32);
+            if (!buf) goto fail;
+            if (!read_all(f, buf, (size_t)ai_total * 32)) { free(buf); goto fail; }
+            if (!hart_install_dfs_hashes(&s->acct_index, buf, ai_total)) {
+                fprintf(stderr,
+                    "  state_load: acct hash install mismatch (saved %u internals); "
+                    "will recompute\n", ai_total);
+            }
+            free(buf);
+        }
+    }
+
     /* hart_pool is MAP_ANONYMOUS — nothing to sync to disk. */
 
-    /* Grow bitmap to cover all loaded resources, then mark dirty —
-     * storage roots need recomputation from storage harts at next compute_root */
+    /* V2: caches are restored above; storage_root fields are loaded from
+     * the file. No bits set — future stor_dirty_set calls (block
+     * execution) just need bitmap capacity.
+     * V1: no hash streams, so every storage hart is dirty after fresh
+     * inserts. Set dirty bits on every loaded resource so the next
+     * compute_root rebuilds storage roots and populates caches — the
+     * migration tool relies on this to bake correct ART2 hash streams. */
     stor_dirty_grow(s, s->res_count);
-    for (uint32_t i = 1; i < s->res_count; i++)
-        stor_dirty_set(s, i);
+    if (!with_hashes) {
+        for (uint32_t i = 1; i < s->res_count; i++)
+            stor_dirty_set(s, i);
+    }
 
     fclose(f);
     fprintf(stderr, "state_load: %u accounts from %s (block %lu)\n",
@@ -2674,4 +2825,12 @@ bool state_load(state_t *s, const char *path, hash_t *out_root) {
 fail:
     fclose(f);
     return false;
+}
+
+bool state_load(state_t *s, const char *path, hash_t *out_root) {
+    return state_load_impl(s, path, out_root, STATE_MAGIC_V2, true);
+}
+
+bool state_load_v1(state_t *s, const char *path, hash_t *out_root) {
+    return state_load_impl(s, path, out_root, STATE_MAGIC_V1, false);
 }
