@@ -139,11 +139,34 @@ void state_history_apply_diff(struct evm_state *es, const block_diff_t *diff);
  * Replay diffs from first_block..last_block onto evm_state.
  * Reads each diff from the history files and applies it via apply_diff.
  * Returns the number of blocks successfully applied (0 on failure).
+ *
+ * Equivalent to state_history_replay_ex(sh, es, first, last, 0, false).
+ * Computes no intermediate roots — the dirty set, phantoms vector and
+ * resource pool grow unbounded across the window. Prefer the _ex form
+ * for long replays.
  */
 uint64_t state_history_replay(state_history_t *sh,
                                struct evm_state *es,
                                uint64_t first_block,
                                uint64_t last_block);
+
+/**
+ * Replay with periodic root computation.
+ *
+ * After every `root_interval` applied blocks (and once more at the end
+ * if the window length is not a multiple), invokes state_compute_root
+ * with the supplied prune_empty flag. This bounds dirty-set / phantom
+ * growth across long windows and amortises the final-compute cost.
+ *
+ * root_interval == 0 disables periodic compute (matches the original
+ * state_history_replay behaviour).
+ */
+uint64_t state_history_replay_ex(state_history_t *sh,
+                                  struct evm_state *es,
+                                  uint64_t first_block,
+                                  uint64_t last_block,
+                                  uint32_t root_interval,
+                                  bool prune_empty);
 
 /* block_diff_revert() is in block_diff.h (always available).
  * state_history_revert_to() uses the in-memory ring + block_diff_revert. */

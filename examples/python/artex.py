@@ -81,6 +81,7 @@ class RxConfig(ctypes.Structure):
         ("chain_id", ctypes.c_int),
         ("data_dir", ctypes.c_char_p),
         ("history_dir", ctypes.c_char_p),
+        ("replay_root_interval", ctypes.c_uint32),
     ]
 
 class RxReceipt(ctypes.Structure):
@@ -410,12 +411,18 @@ class Config:
                                      # "" = auto (data_dir/history).
                                      # "/path" = explicit directory.
                                      # Ignored if libartex built without ENABLE_HISTORY.
+    replay_root_interval: int = 0    # 0 = library default (64).
+                                     # N = compute_root every N applied blocks during
+                                     #     replay_history_to (bounds dirty-set growth,
+                                     #     amortises final compute cost).
+                                     # 0xFFFFFFFF = disable periodic compute.
 
     def _to_rx(self) -> RxConfig:
         c = RxConfig()
         c.chain_id = self.chain_id
         c.data_dir = self.data_dir.encode() if self.data_dir else None
         c.history_dir = self.history_dir.encode() if self.history_dir is not None else None
+        c.replay_root_interval = self.replay_root_interval
         return c
 
 

@@ -951,8 +951,19 @@ uint64_t state_history_replay(state_history_t *sh,
                                evm_state_t *es,
                                uint64_t first_block,
                                uint64_t last_block) {
+    return state_history_replay_ex(sh, es, first_block, last_block, 0, false);
+}
+
+uint64_t state_history_replay_ex(state_history_t *sh,
+                                  evm_state_t *es,
+                                  uint64_t first_block,
+                                  uint64_t last_block,
+                                  uint32_t root_interval,
+                                  bool prune_empty) {
     if (!sh || !es) return 0;
     if (first_block > last_block) return 0;
+
+    state_t *st = evm_state_get_state(es);
 
     uint64_t count = 0;
     for (uint64_t bn = first_block; bn <= last_block; bn++) {
@@ -968,6 +979,49 @@ uint64_t state_history_replay(state_history_t *sh,
         if (count % 10000 == 0)
             LOG_HIST_INFO("history: replay progress %lu/%lu blocks",
                    count, last_block - first_block + 1);
+
+        /* Periodic root compute: bounds the dirty set, flushes phantoms,
+         * and amortises the final walk. Skipped on the very last block —
+         * the trailing flush below handles it (or, if interval divides
+         * the window evenly, that final compute_root is the same walk
+         * we'd do here anyway). */
+        if (root_interval && st && bn != last_block &&
+            (count % root_interval) == 0) {
+            hash_t r = state_compute_root(st, prune_empty);
+            LOG_HIST_INFO("root at block %lu = "
+                "0x%02x%02x%02x%02x%02x%02x%02x%02x"
+                "%02x%02x%02x%02x%02x%02x%02x%02x"
+                "%02x%02x%02x%02x%02x%02x%02x%02x"
+                "%02x%02x%02x%02x%02x%02x%02x%02x", bn,
+                r.bytes[0],  r.bytes[1],  r.bytes[2],  r.bytes[3],
+                r.bytes[4],  r.bytes[5],  r.bytes[6],  r.bytes[7],
+                r.bytes[8],  r.bytes[9],  r.bytes[10], r.bytes[11],
+                r.bytes[12], r.bytes[13], r.bytes[14], r.bytes[15],
+                r.bytes[16], r.bytes[17], r.bytes[18], r.bytes[19],
+                r.bytes[20], r.bytes[21], r.bytes[22], r.bytes[23],
+                r.bytes[24], r.bytes[25], r.bytes[26], r.bytes[27],
+                r.bytes[28], r.bytes[29], r.bytes[30], r.bytes[31]);
+        }
+    }
+
+    /* Final flush: leave state with a fresh root so the caller doesn't
+     * inherit an accumulated dirty set. Cheap when periodic compute kept
+     * pace; equivalent to the once-at-end model when root_interval == 0. */
+    if (root_interval && st) {
+        hash_t r = state_compute_root(st, prune_empty);
+        LOG_HIST_INFO("root at block %lu = "
+            "0x%02x%02x%02x%02x%02x%02x%02x%02x"
+            "%02x%02x%02x%02x%02x%02x%02x%02x"
+            "%02x%02x%02x%02x%02x%02x%02x%02x"
+            "%02x%02x%02x%02x%02x%02x%02x%02x", last_block,
+            r.bytes[0],  r.bytes[1],  r.bytes[2],  r.bytes[3],
+            r.bytes[4],  r.bytes[5],  r.bytes[6],  r.bytes[7],
+            r.bytes[8],  r.bytes[9],  r.bytes[10], r.bytes[11],
+            r.bytes[12], r.bytes[13], r.bytes[14], r.bytes[15],
+            r.bytes[16], r.bytes[17], r.bytes[18], r.bytes[19],
+            r.bytes[20], r.bytes[21], r.bytes[22], r.bytes[23],
+            r.bytes[24], r.bytes[25], r.bytes[26], r.bytes[27],
+            r.bytes[28], r.bytes[29], r.bytes[30], r.bytes[31]);
     }
 
     LOG_HIST_INFO("history: replay complete — %lu blocks applied (%lu..%lu)",

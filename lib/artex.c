@@ -47,6 +47,9 @@ struct rx_engine {
     bool                    initialized;  /* genesis or snapshot loaded */
 #ifdef ENABLE_HISTORY
     state_history_t        *history;      /* per-block diff log; NULL if disabled */
+    uint32_t                replay_root_interval; /* periodic compute_root cadence
+                                                    during rx_engine_replay_history_to;
+                                                    UINT32_MAX disables (one walk at end) */
 #endif
 
     /* Logger */
@@ -201,6 +204,9 @@ rx_engine_t *rx_engine_create(const rx_config_t *config) {
             }
         }
     }
+    /* 0 = use default (64). Caller passes UINT32_MAX to disable periodic compute. */
+    e->replay_root_interval = config->replay_root_interval ?
+                              config->replay_root_interval : 64;
 #else
     if (config->history_dir && config->history_dir[0] != '\0') {
         fprintf(stderr,
@@ -754,12 +760,20 @@ bool rx_engine_replay_history_to(rx_engine_t *engine, uint64_t target_block) {
      * sets this per-block in block_executor's pre_block_init; replay has
      * no equivalent entry point. Mainnet activated EIP-161 at block
      * 2,675,000 — any replay window past that point wants pruning on. */
-    evm_state_set_prune_empty(engine->state, engine->last_block >= 2675000);
+    bool prune_empty = engine->last_block >= 2675000;
+    evm_state_set_prune_empty(engine->state, prune_empty);
+
+    /* UINT32_MAX → user opted out of periodic compute; pass 0 to the
+     * underlying replay so it skips the per-interval compute_root and
+     * the trailing flush, matching the historical behaviour. */
+    uint32_t interval = engine->replay_root_interval == UINT32_MAX ?
+                        0 : engine->replay_root_interval;
 
     uint64_t first = engine->last_block + 1;
     uint64_t want = target_block - first + 1;
-    uint64_t got = state_history_replay(engine->history, engine->state,
-                                        first, target_block);
+    uint64_t got = state_history_replay_ex(engine->history, engine->state,
+                                           first, target_block,
+                                           interval, prune_empty);
     if (got != want) {
         char msg[160];
         snprintf(msg, sizeof(msg),

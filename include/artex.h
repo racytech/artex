@@ -119,6 +119,14 @@ typedef struct {
                                   ENABLE_HISTORY build flag; when the library
                                   was compiled without history support, a
                                   non-NULL value is silently ignored. */
+    uint32_t      replay_root_interval; /* during rx_engine_replay_history_to,
+                                  recompute the state root every N applied
+                                  blocks to bound dirty-set / phantom-vec
+                                  growth and amortise the final-compute cost
+                                  across the run. 0 = use default (64).
+                                  UINT32_MAX = disable periodic compute (one
+                                  big walk at end, or whenever the caller
+                                  next asks for the root). */
 } rx_config_t;
 
 /* ========================================================================

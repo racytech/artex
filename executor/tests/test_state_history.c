@@ -270,6 +270,83 @@ static void test_empty_diff(void) {
 }
 
 /* =========================================================================
+ * Test 5: Replay equivalence — periodic compute vs once-at-end
+ *
+ * Records a window of diffs, replays into two fresh states (one with
+ * root_interval=N, one with interval=0 + manual final compute), and
+ * asserts the resulting roots match. Guards the periodic-compute path
+ * from drifting away from the batched baseline.
+ * ========================================================================= */
+
+static void capture_window(state_history_t *sh, evm_state_t *es,
+                            uint64_t blocks, uint64_t accts) {
+    for (uint64_t bn = 1; bn <= blocks; bn++) {
+        evm_state_begin_block(es, bn);
+        /* Touch a stride of accounts whose set varies per block, so dirty
+         * paths overlap between blocks but aren't identical. */
+        for (uint64_t i = 0; i < accts; i++) {
+            address_t a;
+            memset(a.bytes, 0, 20);
+            a.bytes[18] = (uint8_t)(((bn * 7 + i * 13) >> 8) & 0xFF);
+            a.bytes[19] = (uint8_t)((bn * 7 + i * 13) & 0xFF);
+            uint256_t bal = uint256_from_uint64(bn * 1000 + i);
+            evm_state_set_balance(es, &a, &bal);
+        }
+        evm_state_commit_tx(es);
+        evm_state_finalize(es);
+        state_history_capture(sh, es, bn);
+        evm_state_commit(es);
+    }
+}
+
+static void test_replay_periodic_equivalence(void) {
+    TEST("replay periodic equivalence");
+    cleanup_test_dir();
+
+    /* Step 1: record a window into history using a producer state. */
+    evm_state_t *producer = evm_state_create(NULL);
+    ASSERT(producer != NULL, "producer create");
+    state_history_t *sh = state_history_create(TEST_DIR);
+    ASSERT(sh != NULL, "history create");
+
+    const uint64_t BLOCKS = 50;
+    const uint64_t ACCTS  = 8;
+    capture_window(sh, producer, BLOCKS, ACCTS);
+    state_history_destroy(sh);
+    evm_state_destroy(producer);
+
+    /* Step 2: replay into state A with interval=7 (forces a couple of
+     * mid-replay compute_roots, plus the trailing flush). */
+    evm_state_t *a = evm_state_create(NULL);
+    ASSERT(a != NULL, "state A create");
+    sh = state_history_create(TEST_DIR);
+    ASSERT(sh != NULL, "history reopen A");
+    uint64_t got = state_history_replay_ex(sh, a, 1, BLOCKS, 7, false);
+    ASSERT(got == BLOCKS, "replay A applied wrong block count");
+    hash_t root_a = evm_state_compute_root_only(a, false);
+    state_history_destroy(sh);
+
+    /* Step 3: replay into state B with interval=0, then one explicit
+     * compute_root at the end — the historical "do it all at end" path. */
+    evm_state_t *b = evm_state_create(NULL);
+    ASSERT(b != NULL, "state B create");
+    sh = state_history_create(TEST_DIR);
+    ASSERT(sh != NULL, "history reopen B");
+    got = state_history_replay_ex(sh, b, 1, BLOCKS, 0, false);
+    ASSERT(got == BLOCKS, "replay B applied wrong block count");
+    hash_t root_b = evm_state_compute_root_only(b, false);
+    state_history_destroy(sh);
+
+    ASSERT(memcmp(root_a.bytes, root_b.bytes, 32) == 0,
+           "periodic-compute root differs from batched-compute root");
+
+    evm_state_destroy(a);
+    evm_state_destroy(b);
+    cleanup_test_dir();
+    PASS();
+}
+
+/* =========================================================================
  * Main
  * ========================================================================= */
 
@@ -280,6 +357,7 @@ int main(void) {
     test_direct_roundtrip();
     test_multiple_blocks();
     test_empty_diff();
+    test_replay_periodic_equivalence();
 
     printf("\n  Results: %d passed, %d failed\n", tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
