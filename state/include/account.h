@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 artex contributors
+
 #ifndef STATE_ACCOUNT_H
 #define STATE_ACCOUNT_H
 

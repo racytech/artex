@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 artex contributors
+
 /**
  * artex.h — Public C API for the artex Ethereum execution engine.
  *

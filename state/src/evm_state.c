@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 artex contributors
+
 /**
  * EVM State adapter — wraps state_t (v2) to implement the evm_state_t API.
  *

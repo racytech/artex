@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 artex contributors
+
 #ifndef CODE_STORE_H
 #define CODE_STORE_H
 

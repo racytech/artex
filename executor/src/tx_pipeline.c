@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 artex contributors
+
 #include "tx_pipeline.h"
 #include "tx_decoder.h"
 #include <string.h>
