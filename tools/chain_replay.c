@@ -649,9 +649,9 @@ int main(int argc, char **argv) {
     const char *load_state_path = NULL;
     bool no_validate = false;
     uint64_t snapshot_every = 0;  /* 0 = disabled */
+    uint64_t replay_history_to_block = 0;  /* 0 = no replay */
 #ifdef ENABLE_HISTORY
     bool no_history = false;
-    uint64_t replay_history_to_block = 0;  /* 0 = no replay */
 #endif
     uint32_t validate_every = CHECKPOINT_INTERVAL;
     /* Default data dir: ~/.artex */
