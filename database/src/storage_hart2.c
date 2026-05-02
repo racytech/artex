@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 artex contributors
+
 /**
  * Storage Hart v2 — per-account ART backed by hart_pool slab allocator.
  *

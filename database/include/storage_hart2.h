@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 artex contributors
+
 #ifndef STORAGE_HART2_H
 #define STORAGE_HART2_H
 
